@@ -1,0 +1,142 @@
+name: Security
+
+on:
+  push:
+    branches: [$default-branch]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/security.yml'
+  pull_request:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/security.yml'
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 6am UTC (always runs regardless of files)
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEFAULT_BRANCH: ${{ vars.DEFAULT_BRANCH || 'main' }}
+
+jobs:
+  # ─── Detect Go project ─────────────────────────────────────────────────────
+  check-go-files:
+    runs-on: ubuntu-latest
+    outputs:
+      has_go: ${{ steps.check.outputs.has_go }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for Go module
+        id: check
+        run: |
+          if [ -f go.mod ]; then
+            echo "has_go=true" >> $GITHUB_OUTPUT
+            echo "Go module detected"
+          else
+            echo "has_go=false" >> $GITHUB_OUTPUT
+            echo "No Go module — Go security jobs will be skipped"
+          fi
+
+  # ─── CodeQL (Go only) ───────────────────────────────────────────────────────
+  codeql:
+    needs: check-go-files
+    if: needs.check-go-files.outputs.has_go == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go
+          queries: security-extended
+
+      - name: Perform Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:go"
+
+  # ─── govulncheck (Go only) ─────────────────────────────────────────────────
+  govulncheck:
+    needs: check-go-files
+    if: needs.check-go-files.outputs.has_go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  # ─── Secrets scan (all repos — always runs) ─────────────────────────────────
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for committed secrets
+        run: |
+          echo "Checking for leaked secrets in commits..."
+          # Exclude issue templates (contain example patterns, not real secrets)
+          FOUND=$(find . \
+            \( -path './.github/ISSUE_TEMPLATE' -o -path './.git' \) -prune -o \
+            \( -name '*.go' -o -name '*.yaml' -o -name '*.yml' \
+               -o -name '*.sh' -o -name '*.json' -o -name '*.md' -o -name '*.py' \) \
+            -type f -exec grep -lE "ghp_[0-9a-zA-Z]{36}|gho_[0-9a-zA-Z]{36}|AKIA[0-9A-Z]{16}" {} \; 2>/dev/null)
+          if [ -n "$FOUND" ]; then
+            echo "WARNING: Potential secrets found in repository:"
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "No obvious secrets detected."
+
+  # ─── Dependency review (all repos) ─────────────────────────────────────────
+  dependency-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for vulnerable dependencies
+        uses: actions/dependency-review-action@v4
+        continue-on-error: true
+
+  # ─── Security anti-pattern grep (Go only) ───────────────────────────────────
+  security-grep:
+    needs: check-go-files
+    if: needs.check-go-files.outputs.has_go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for security anti-patterns
+        run: |
+          ISSUES=$(grep -rnE 'exec\.LookPath|os\.exec\.Command|eval\(|os\.MkdirAll.*0777' \
+            --include="*.go" \
+            --exclude-dir=vendor \
+            . 2>/dev/null | grep -v '_test.go' || true)
+          if [ -n "$ISSUES" ]; then
+            echo "Potential security issues found:"
+            echo "$ISSUES"
+          fi

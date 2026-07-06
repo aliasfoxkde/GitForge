@@ -1,0 +1,57 @@
+name: False Positive
+description: Report a false positive from security or quality scanners
+title: "false-positive: "
+labels: ["false-positive", "scanner"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## False Positive Report
+
+        Report a scanner result that is incorrect. Please be specific.
+
+  - type: input
+    id: scanner
+    attributes:
+      label: Scanner Name
+      description: Which scanner reported this? (e.g., golangci-lint, atheon, govulncheck)
+      placeholder: e.g., golangci-lint
+    validations:
+      required: true
+
+  - type: input
+    id: rule
+    attributes:
+      label: Rule ID
+      description: The specific rule that triggered (if applicable)
+      placeholder: e.g., govet, secretes[api-key]
+    validations:
+      required: false
+
+  - type: textarea
+    id: location
+    attributes:
+      label: File and Line
+      description: Which file and line number?
+      placeholder: |
+        src/auth/service.go:42
+    validations:
+      required: true
+
+  - type: textarea
+    id: explanation
+    attributes:
+      label: Why is this a false positive?
+      description: Explain why this result is incorrect
+      placeholder: |
+        This is a test fixture / This is a false positive because...
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+    validations:
+      required: false

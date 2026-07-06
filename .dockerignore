@@ -1,0 +1,72 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+bin/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+*.obj
+
+# Test artifacts
+*.test
+*.out
+coverage.out
+coverage.html
+*.log
+
+# IDE and editor
+.vs/
+.idea/
+*.iml
+.vscode/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Dependencies (vendored copies should be committed, external should be downloaded)
+vendor/
+
+# Documentation
+*.md
+docs/
+
+# CI/CD
+.github/
+.githooks/
+.circleci/
+.gitlab-ci.yml
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.docker/
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Coverage reports
+*.cover
+coverage/
+
+# Node (if applicable)
+node_modules/
+npm-debug.log
+yarn-error.log

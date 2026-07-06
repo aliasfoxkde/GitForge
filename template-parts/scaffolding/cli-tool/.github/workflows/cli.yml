@@ -1,0 +1,249 @@
+name: CLI Tool CI/CD
+
+on:
+  push:
+    branches: [main, master, develop]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+env:
+  GO_VERSION: '1.21'
+  BINARY_NAME: cli-tool
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Job 1: Quality checks (lint, vet, test)
+  quality:
+    name: Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Download dependencies
+        run: |
+          go mod download
+          go mod tidy
+
+      - name: Format check
+        run: |
+          if [ -n "$(go fmt ./...)" ]; then
+            echo "Code needs formatting. Run 'go fmt ./...' locally."
+            go fmt ./...
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Lint
+        run: |
+          if command -v golangci-lint >/dev/null 2>&1; then
+            golangci-lint run ./...
+          else
+            echo "Skipping golangci-lint (not installed)"
+          fi
+
+      - name: Test
+        run: |
+          go test -v -race -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  # Job 2: Cross-platform build
+  build:
+    name: Build (${{ matrix.os }}-${{ matrix.arch }})
+    needs: quality
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            artifact_suffix: linux-amd64
+          - os: linux
+            arch: arm64
+            artifact_suffix: linux-arm64
+          - os: darwin
+            arch: amd64
+            artifact_suffix: darwin-amd64
+          - os: darwin
+            arch: arm64
+            artifact_suffix: darwin-arm64
+          - os: windows
+            arch: amd64
+            artifact_suffix: windows-amd64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Set up QEMU for arm64
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          image: tonistiigi/binfmt:latest
+          platforms: linux/arm64
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          VERSION=${{ github.ref_name }}
+          COMMIT=${{ github.sha }}
+          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          OUTPUT_NAME=${{ env.BINARY_NAME }}
+          [ "${{ matrix.os }}" = "windows" ] && OUTPUT_NAME="${OUTPUT_NAME}.exe"
+
+          mkdir -p dist/${{ matrix.artifact_suffix }}
+
+          go build -ldflags="\
+            -s -w \
+            -X github.com/example/cli-tool/cmd.version=${VERSION} \
+            -X github.com/example/cli-tool/cmd.commit=${COMMIT} \
+            -X github.com/example/cli-tool/cmd.date=${DATE} \
+            -X github.com/example/cli-tool/cmd.builtBy=github-actions \
+          " -o dist/${{ matrix.artifact_suffix }}/${OUTPUT_NAME} ./src/main.go
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.artifact_suffix }}
+          path: dist/${{ matrix.artifact_suffix }}/${{ env.BINARY_NAME }}*
+          retention-days: 30
+
+  # Job 3: Docker build and push
+  docker:
+    name: Docker Build
+    needs: quality
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=branch
+            type=sha,prefix=
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ github.event.head_commit.timestamp }}
+            BUILDBY=github-actions
+          platforms: |
+            linux/amd64
+            linux/arm64
+
+  # Job 4: Create release (only on tags)
+  release:
+    name: Create Release
+    needs: [build, docker]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Display structure of downloaded files
+        run: ls -la dist/
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          for dir in */; do
+            [ -d "$dir" ] || continue
+            cd "$dir"
+            if ls *.exe >/dev/null 2>&1; then
+              sha256sum *.exe > SHA256SUMS
+            else
+              sha256sum * > SHA256SUMS
+            fi
+            cd ..
+          done
+          cat */SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/**/*.exe dist/*/cli-tool*
+          checksums: |
+            dist/*/SHA256SUMS
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

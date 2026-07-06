@@ -1,0 +1,34 @@
+# See https://docs.astral.sh/ruff/configuration/ for configuration.
+
+target-version = "py311"
+line-length = 100
+indent-width = 4
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "RUF", # Ruff-specific rules
+]
+
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+]
+
+[lint.per-file-ignores]
+"__init__.py" = ["F401", "I001"]
+"tests/*" = ["B011", "S101", "T201"]
+"e2e/*" = ["S101", "T201", "B011"]
+
+[format]
+quote-style = "double"
+indent-style = "space"

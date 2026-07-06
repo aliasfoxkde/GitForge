@@ -1,0 +1,38 @@
+# Docker Compose template for Dark Factory projects
+# Usage: Copy this to your project root and customize
+
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      - ENV=development
+      - LOG_LEVEL=info
+      - ADDR=:8080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Add database services as needed
+  # db:
+  #   image: postgres:15-alpine
+  #   environment:
+  #     POSTGRES_DB: ${DB_NAME:-app}
+  #     POSTGRES_USER: ${DB_USER:-app}
+  #     POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+  #   volumes:
+  #     - db_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+
+# volumes:
+#   db_data:

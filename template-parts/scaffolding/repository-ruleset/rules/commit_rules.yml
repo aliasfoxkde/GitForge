@@ -1,0 +1,32 @@
+# Commit Rules Configuration
+# Imported by setup-ruleset.sh
+
+name: "Safeguards - Commit Rules"
+target: commits
+enforcement: active
+
+rules:
+  # Require commit messages to follow conventional format
+  commit_message:
+    pattern: "^(feat|fix|docs|test|refactor|ci|chore|perf)(\\(.+\\))?: .+"
+    description: "Commit messages must follow conventional commit format"
+
+  # Require commit author to be verified
+  author_email_verified: false  # Set to true for strict enforcement
+
+  # Block force-pushes
+  force_push: false
+
+  # Block deletion of pushed commits
+  deletion: false
+
+# Additional rules for commits
+settings:
+  # Require commit body (long description)
+  require_body: false
+
+  # Maximum commit subject length
+  max_subject_length: 72
+
+  # Maximum commit body line length
+  max_body_length: 100

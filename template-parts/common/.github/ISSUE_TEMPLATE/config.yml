@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: GitHub Discussions
+    url: https://github.com/{{GITHUB_OWNER}}/{{PROJECT_NAME}}/discussions
+    about: Ask questions and discuss the project
+  - name: Security
+    url: https://github.com/{{GITHUB_OWNER}}/{{PROJECT_NAME}}/security
+    about: Report security issues responsibly

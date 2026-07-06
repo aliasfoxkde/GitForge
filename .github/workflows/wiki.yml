@@ -1,0 +1,36 @@
+name: Publish Wiki
+
+on:
+  push:
+    branches: [$default-branch]
+    paths:
+      - '.github/wiki/**'
+  workflow_dispatch:
+
+jobs:
+  publish-wiki:
+    if: github.repository_owner == 'aliasfoxkde'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GITHUB_REF_NAME }}
+
+      - name: Clone wiki repo
+        run: |
+          git clone "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" .wiki
+
+      - name: Copy wiki files
+        run: |
+          rm -rf .wiki/*
+          cp -r .github/wiki/* .wiki/
+          cd .wiki
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+      - name: Push wiki
+        run: |
+          cd .wiki
+          git add -A
+          git diff --staged --quiet || git commit -m "Wiki update from ${{ github.sha }}"
+          git push

@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# {{PROJECT_NAME}} CODEOWNERS
+# Replace '@GITHUB_OWNER' with your GitHub username or organization
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default owner for everything
+*                       @GITHUB_OWNER
+
+# CI/CD and release configuration
+/.github/               @GITHUB_OWNER
+/.githooks/             @GITHUB_OWNER
+/.pre-commit-config.yaml @GITHUB_OWNER
+
+# Core application code
+/core/                  @GITHUB_OWNER
+/internal/              @GITHUB_OWNER
+/pkg/                   @GITHUB_OWNER
+/cmd/                   @GITHUB_OWNER
+
+# Build and release
+/.goreleaser.yml        @GITHUB_OWNER
+/Makefile               @GITHUB_OWNER
+
+# Community patterns (if applicable)
+/community/             @GITHUB_OWNER
+
+# Documentation
+/docs/                  @GITHUB_OWNER
+/README.md               @GITHUB_OWNER
+/LICENSE                 @GITHUB_OWNER

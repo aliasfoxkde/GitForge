@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Dark Factory CODEOWNERS
+# Replace 'aliasfoxkde' with your GitHub username
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default owner for everything
+*                       @aliasfoxkde
+
+# CI/CD and release configuration
+/.github/               @aliasfoxkde
+/.githooks/             @aliasfoxkde
+/.pre-commit-config.yaml @aliasfoxkde
+
+# Core application code
+/core/                  @aliasfoxkde
+/internal/              @aliasfoxkde
+/pkg/                   @aliasfoxkde
+/cmd/                   @aliasfoxkde
+
+# Build and release
+/.goreleaser.yml        @aliasfoxkde
+/Makefile               @aliasfoxkde
+
+# Community patterns (if applicable)
+/community/             @aliasfoxkde
+
+# Documentation
+/docs/                  @aliasfoxkde
+/README.md               @aliasfoxkde
+/LICENSE                 @aliasfoxkde

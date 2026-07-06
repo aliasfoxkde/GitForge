@@ -1,0 +1,51 @@
+# GoReleaser configuration for Dark Factory projects
+# See: https://goreleaser.com
+
+project_name: {{PROJECT_NAME}}
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  - id: "{{PROJECT_NAME}}"
+    binary: "{{PROJECT_NAME}}"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    main: ./cmd/app
+    ldflags:
+      - "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}"
+
+archives:
+  - id: default
+    format: tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+    checksums:
+      algorithm: sha256
+
+release:
+  github:
+    owner: {{GITHUB_OWNER}}
+    name: "{{PROJECT_NAME}}"
+  draft: false
+  prerelease: auto
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^refactor:"
+      - "^merge:"

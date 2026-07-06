@@ -1,0 +1,58 @@
+name: False Positive
+description: Report a pattern that matches something that is NOT a secret
+title: "false-positive: "
+labels: ["false-positive", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## False Positive Report
+
+        A false positive is when a pattern matches something that is NOT a secret (e.g., a test fixture, example data, or intentionally public string).
+
+  - type: textarea
+    id: pattern_name
+    attributes:
+      label: Pattern name
+      description: The name of the pattern that produced the false positive
+      placeholder: e.g. "jwt-token", "aws-access-token"
+    validations:
+      required: true
+
+  - type: textarea
+    id: matched_content
+    attributes:
+      label: What was matched
+      description: The text/content that the pattern matched on
+      placeholder: |
+        The pattern matched: `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9`
+        But this is not a real JWT — it's a test fixture.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why_not_secret
+    attributes:
+      label: Why this is not a secret
+      description: Explain why the matched content is not a secret
+      placeholder: |
+        This is a test JWT with all-zero values.
+        The content is clearly labeled as test data.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Atheon version
+      placeholder: "v1.2.0-enhanced"
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Any other relevant context
+    validations:
+      required: false

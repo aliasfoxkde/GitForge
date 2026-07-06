@@ -1,0 +1,57 @@
+# Pull Request Rules Configuration
+# Imported by setup-ruleset.sh
+
+name: "Safeguards - PR Rules"
+target: pull_request
+enforcement: active
+
+conditions:
+  # Apply to these branches
+  branches:
+    - main
+    - stable
+
+rules:
+  # Require pull request
+  required: true
+
+  # Require code review
+  required_reviewers:
+    min: 1
+    dismiss_stale: true
+    require_code_owner: true
+
+  # Require conversation resolution before merge
+  conversation_resolution: true
+
+  # Require linear history (squash merge)
+  linear_history: true
+
+  # Require status checks to pass
+  required_status_checks:
+    strict: true
+    checks:
+      - name: "ci"
+        type: "required"
+      - name: "lint"
+        type: "required"
+
+  # Block merge until comments are resolved
+  comment_resolution: true
+
+  # Merge method preference
+  merge_methods:
+    - squash
+    - merge
+    - rebase
+
+  # Auto-delete head branches
+  auto_delete: true
+
+# Dismissals
+dismiss:
+  # Dismiss stale approvals
+  stale_review_dismissal: true
+
+  # Dismiss permission to bypass
+  bypass_pull_request_actor_dismissal: true

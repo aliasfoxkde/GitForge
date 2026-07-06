@@ -1,0 +1,66 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [$default-branch]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Go files
+        id: check-go
+        run: |
+          HAS_GO=$(find . -name "*.go" -not -path "./.git/*" | head -1 | wc -l)
+          echo "has_go=$HAS_GO" >> $GITHUB_OUTPUT
+
+      - name: Set up Go
+        if: steps.check-go.outputs.has_go == '1'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Run integration tests
+        if: steps.check-go.outputs.has_go == '1'
+        run: |
+          INTEGRATION_TESTS=$(go test -list 'Integration' ./... 2>/dev/null | grep -c 'Integration' || echo 0)
+          if [ "$INTEGRATION_TESTS" -gt 0 ]; then
+            go test -v -tags=integration -p 1 ./...
+          else
+            echo "No integration tests found."
+          fi
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Go files
+        id: check-go
+        run: |
+          HAS_GO=$(find . -name "*.go" -not -path "./.git/*" | head -1 | wc -l)
+          echo "has_go=$HAS_GO" >> $GITHUB_OUTPUT
+
+      - name: Set up Go
+        if: steps.check-go.outputs.has_go == '1'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Run E2E tests
+        if: steps.check-go.outputs.has_go == '1'
+        run: |
+          E2E_TESTS=$(go test -list 'E2E' ./... 2>/dev/null | grep -c 'E2E' || echo 0)
+          if [ "$E2E_TESTS" -gt 0 ]; then
+            go test -v -tags=e2e -p 1 ./...
+          else
+            echo "No E2E tests found."
+          fi

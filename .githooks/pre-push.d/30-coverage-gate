@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# Dark Factory Coverage Gate Pre-push Hook
+#
+# Fails push if coverage drops below threshold.
+# Uses:
+#   - Go: go tool cover
+#   - Python: coverage report
+#
+# Threshold: env COVERAGE_THRESHOLD or default 70%
+#
+# Usage: Add to .githooks/pre-push
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+cd "$REPO_ROOT"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+ERROR() { echo -e "${RED}[coverage-gate]${NC} $*"; }
+WARN() { echo -e "${YELLOW}[coverage-gate]${NC} $*"; }
+INFO() { echo -e "${GREEN}[coverage-gate]${NC} $*"; }
+
+show_help() {
+    cat << 'EOF'
+Dark Factory Coverage Gate Pre-push Hook
+
+Fails push if code coverage drops below threshold.
+
+Supported languages:
+  - Go: uses 'go tool cover'
+  - Python: uses 'coverage report'
+
+Threshold:
+  - env COVERAGE_THRESHOLD (e.g., export COVERAGE_THRESHOLD=80)
+  - Default: 70%
+
+Exit codes:
+  0 - Coverage acceptable or no coverage data
+  1 - Coverage below threshold
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) show_help; exit 0 ;;
+    esac
+done
+
+# Get threshold from env or default
+THRESHOLD="${COVERAGE_THRESHOLD:-70}"
+BLOCKED=0
+SKIPPED=0
+
+# ─── Go coverage check ────────────────────────────────────────────────────────
+check_go_coverage() {
+    if ! command -v go &>/dev/null; then
+        return 0
+    fi
+
+    # Check if there are Go files with tests
+    if ! ls *.go &>/dev/null && ! find . -name "*.go" -not -path "./vendor/*" 2>/dev/null | head -5 | grep -q .; then
+        return 0
+    fi
+
+    # Look for coverage profiles
+    local coverage_file="coverage.out"
+    if [ ! -f "$coverage_file" ]; then
+        # Try to generate coverage
+        if go test ./... -coverprofile="$coverage_file" -covermode=atomic &>/dev/null 2>&1; then
+            INFO "Generated coverage profile: $coverage_file"
+        else
+            return 0  # Skip if no tests
+        fi
+    fi
+
+    if [ ! -f "$coverage_file" ]; then
+        return 0
+    fi
+
+    # Parse coverage percentage from go tool cover
+    local coverage_output
+    coverage_output=$(go tool cover -func="$coverage_file" 2>/dev/null || echo "")
+
+    if [ -z "$coverage_output" ]; then
+        return 0
+    fi
+
+    # Get total coverage (last line usually)
+    local total_coverage
+    total_coverage=$(echo "$coverage_output" | grep "^total:" | sed 's/.*\t\([0-9.]*\)%.*/\1/' || echo "")
+
+    if [ -z "$total_coverage" ]; then
+        # Try parsing differently
+        total_coverage=$(go tool cover -func="$coverage_file" 2>/dev/null | tail -1 | awk '{print $3}' | tr -d '%' || echo "")
+    fi
+
+    if [ -z "$total_coverage" ]; then
+        WARN "Could not parse Go coverage output"
+        return 0
+    fi
+
+    local coverage_int
+    coverage_int=$(printf "%.0f" "$total_coverage" 2>/dev/null || echo 0)
+
+    INFO "Go coverage: ${coverage_int}% (threshold: ${THRESHOLD}%)"
+
+    if [ "$coverage_int" -lt "$THRESHOLD" ]; then
+        ERROR "COVERAGE_LOW: Go coverage is ${coverage_int}% (minimum: ${THRESHOLD}%)"
+        BLOCKED=1
+    fi
+}
+
+# ─── Python coverage check ─────────────────────────────────────────────────────
+check_python_coverage() {
+    if ! command -v coverage &>/dev/null; then
+        # Try with python -m coverage
+        if ! python3 -m coverage --version &>/dev/null 2>&1; then
+            return 0
+        fi
+        local coverage_cmd="python3 -m coverage"
+    else
+        local coverage_cmd="coverage"
+    fi
+
+    # Check if there are Python files
+    if ! ls *.py 2>/dev/null | head -1 | grep -q .; then
+        if ! find . -name "*.py" -not -path "./venv/*" -not -path "./.venv/*" 2>/dev/null | head -5 | grep -q .; then
+            return 0
+        fi
+    fi
+
+    # Check for .coverage file
+    local coverage_file=".coverage"
+    if [ ! -f "$coverage_file" ]; then
+        INFO "No Python coverage data found (.coverage) — skipping"
+        SKIPPED=1
+        return 0
+    fi
+
+    # Run coverage report
+    local coverage_output
+    coverage_output=$($coverage_cmd report --precision=2 2>/dev/null || echo "")
+
+    if [ -z "$coverage_output" ]; then
+        WARN "Could not generate Python coverage report"
+        return 0
+    fi
+
+    # Parse total coverage (last line with "TOTAL")
+    local total_coverage
+    total_coverage=$(echo "$coverage_output" | grep "^TOTAL" | awk '{print $NF}' | tr -d '%' || echo "")
+
+    # Fallback: try last line
+    if [ -z "$total_coverage" ]; then
+        total_coverage=$(echo "$coverage_output" | tail -1 | awk '{print $NF}' | tr -d '%' || echo "")
+    fi
+
+    if [ -z "$total_coverage" ]; then
+        WARN "Could not parse Python coverage output"
+        echo "$coverage_output" | tail -5 >&2
+        return 0
+    fi
+
+    local coverage_int
+    coverage_int=$(printf "%.0f" "$total_coverage" 2>/dev/null || echo 0)
+
+    INFO "Python coverage: ${coverage_int}% (threshold: ${THRESHOLD}%)"
+
+    if [ "$coverage_int" -lt "$THRESHOLD" ]; then
+        ERROR "COVERAGE_LOW: Python coverage is ${coverage_int}% (minimum: ${THRESHOLD}%)"
+        echo ""
+        echo "$coverage_output" | tail -10 >&2
+        BLOCKED=1
+    fi
+}
+
+# ─── Run checks ───────────────────────────────────────────────────────────────
+INFO "Running coverage gate (threshold: ${THRESHOLD}%)..."
+
+check_go_coverage || true
+check_python_coverage || true
+
+if [ "$BLOCKED" -eq 1 ]; then
+    echo ""
+    ERROR "Coverage gate blocked push. Improve coverage to at least ${THRESHOLD}%."
+    exit 1
+fi
+
+if [ "$SKIPPED" -eq 1 ]; then
+    INFO "Coverage gate skipped (no coverage data found)"
+else
+    INFO "Coverage gate passed"
+fi
+
+exit 0

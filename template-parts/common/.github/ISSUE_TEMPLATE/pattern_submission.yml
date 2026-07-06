@@ -1,0 +1,77 @@
+name: Pattern Submission
+description: Submit a new community pattern or snippet
+title: "pattern: "
+labels: ["community", "pattern"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Pattern Submission
+
+        Submit a reusable pattern or snippet for the community library.
+
+  - type: input
+    id: name
+    attributes:
+      label: Pattern Name
+      description: A descriptive name for the pattern
+      placeholder: e.g., circuit-breaker, retry-with-backoff
+    validations:
+      required: true
+
+  - type: select
+    id: language
+    attributes:
+      label: Language
+      options:
+        - Go
+        - Python
+        - TypeScript
+        - Bash
+        - Rust
+        - Common (multi-language)
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What does this pattern do?
+      placeholder: |
+        A brief description of the pattern and when to use it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: code
+    attributes:
+      label: Code
+      description: The pattern code
+      placeholder: |
+        ```language
+        // Your code here
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: example
+    attributes:
+      label: Usage Example
+      description: How to use this pattern
+      placeholder: |
+        ```language
+        // Example usage
+        ```
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Edge cases, trade-offs, related patterns
+    validations:
+      required: false

@@ -1,0 +1,32 @@
+name: Atheon Security Scan
+
+on:
+  push:
+    branches: [main, stable, '**']
+  pull_request:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
+
+jobs:
+  atheon-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Atheon-Enhanced
+        run: |
+          git clone https://github.com/aliasfoxkde/Atheon-Enhanced.git /tmp/atheon
+          cd /tmp/atheon && go build -o atheon ./cmd/atheon
+          sudo mv atheon /usr/local/bin/
+
+      - name: Run Atheon Security Scan
+        run: |
+          atheon --categories=secrets,pii,security,ai-detection,quality ./
+
+      - name: Upload results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atheon-results
+          path: atheon-results.json

@@ -1,0 +1,191 @@
+name: Setup Repository
+
+# Runs after repo is created from template, or manually via workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Full repo name (owner/repo)'
+        required: true
+        type: string
+      default_branch:
+        description: 'Default branch name'
+        required: false
+        type: string
+        default: main
+      owner:
+        description: 'Repository owner'
+        required: true
+        type: string
+      coverage_threshold:
+        description: 'Coverage threshold %'
+        required: false
+        type: string
+        default: '70'
+      golangci_version:
+        description: 'Golangci-lint version'
+        required: false
+        type: string
+        default: 'v2.1.6'
+      go_versions:
+        description: 'JSON array of Go versions'
+        required: false
+        type: string
+        default: '["1.21","1.22","1.23","1.24"]'
+
+env:
+  REPO: ${{ inputs.repo }}
+  OWNER: ${{ inputs.owner }}
+
+jobs:
+  configure-repo-settings:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate inputs
+        run: |
+          echo "Configuring: $REPO"
+          echo "Owner: $OWNER"
+
+      - name: Enable wiki, issues, projects, auto-merge
+        run: |
+          gh repo edit "$REPO" \
+            --enable-wiki \
+            --enable-issues \
+            --enable-projects \
+            --delete-branch-on-merge \
+            --allow-auto-merge \
+            --default-branch "${{ inputs.default_branch }}"
+
+      - name: Apply branch protection to default branch
+        run: |
+          gh api repos/$REPO/branches/${{ inputs.default_branch }}/protection \
+            -X PUT \
+            --header 'Accept: application/vnd.github.v3+json' \
+            --field strict=true \
+            --field enforce_admins=true \
+            --field required_pull_request_reviews='{"required_approving_review_count": 1,"dismiss_stale_reviews": true}' \
+            --field status_checks='{"strict": true, "contexts": ["ci/go-test","ci/lint","ci/build"]}'
+
+      - name: Create default labels
+        run: |
+          for label_data in \
+            "bug:Bug fix needed:ff0000" \
+            "enhancement:New feature or improvement:00ff00" \
+            "documentation:Documentation only:0077cc" \
+            "test:Test coverage:ffcc00" \
+            "refactor:Code refactoring:9933ff" \
+            "ci:CI/CD changes:00ccff" \
+            "dependencies:Dependency updates:cc99ff" \
+            "security:Security fix:ff3300" \
+            "good-first-issue:Good for newcomers:00cc33" \
+            "help-wanted:Help needed:ff9900" \
+            "wip:Work in progress:ff6600"; do
+            NAME="${label_data%%:*}"
+            DESC="${label_data##*:}"
+            COLOR="${label_data##*:}"
+            COLOR="${COLOR%%:*}"
+            DESC="${DESC#*:}"
+            gh api repos/$REPO/labels \
+              -f name="$NAME" -f description="$DESC" -f color="$COLOR" 2>/dev/null || true
+          done
+
+      - name: Create milestones
+        run: |
+          gh milestone create "v1.0" --repo "$REPO" --description "First stable release" 2>/dev/null || true
+          gh milestone create "Backlog" --repo "$REPO" --description "Future work" 2>/dev/null || true
+          gh milestone create "Technical Debt" --repo "$REPO" --description "Refactoring and cleanup" 2>/dev/null || true
+
+      - name: Create GitHub Project board
+        run: |
+          PROJECT_ID=$(gh project create \
+            --owner "$OWNER" \
+            --title "Roadmap" \
+            --type board \
+            --json id --jq '.id')
+          echo "Created project: $PROJECT_ID"
+
+          # Create default columns
+          gh api graphql -f query='
+            mutation {
+              createProjectV2Column(input: {name: "Backlog", projectId: "'$PROJECT_ID'"}) { column { id } }
+            }'
+          gh api graphql -f query='
+            mutation {
+              createProjectV2Column(input: {name: "In Progress", projectId: "'$PROJECT_ID'"}) { column { id } }
+            }'
+          gh api graphql -f query='
+            mutation {
+              createProjectV2Column(input: {name: "Review", projectId: "'$PROJECT_ID'"}) { column { id } }
+            }'
+          gh api graphql -f query='
+            mutation {
+              createProjectV2Column(input: {name: "Done", projectId: "'$PROJECT_ID'"}) { column { id } }
+            }'
+
+      - name: Configure repository variables
+        run: |
+          gh api repos/$REPO/variables --method POST \
+            -f name="DEFAULT_BRANCH" -f value="${{ inputs.default_branch }}" 2>/dev/null || true
+          gh api repos/$REPO/variables --method POST \
+            -f name="COVERAGE_THRESHOLD" -f value="${{ inputs.coverage_threshold }}" 2>/dev/null || true
+          gh api repos/$REPO/variables --method POST \
+            -f name="GOLANGCI_LINT_VERSION" -f value="${{ inputs.golangci_version }}" 2>/dev/null || true
+          gh api repos/$REPO/variables --method POST \
+            -f name="GO_VERSIONS" -f value='${{ inputs.go_versions }}' 2>/dev/null || true
+
+      - name: Enable required status checks via branch protection update
+        run: |
+          # Ensure CI workflow is the only required check
+          echo "Branch protection applied to ${{ inputs.default_branch }}"
+          echo "Required checks: ci/go-test, ci/lint, ci/build"
+
+      - name: Create initial issue (setup complete)
+        run: |
+          gh issue create \
+            --repo "$REPO" \
+            --title "Repository setup complete" \
+            --body "Dark Factory setup complete. Customize the repo by editing: \
+- `.github/CODEOWNERS` (replace `aliasfoxkde` with your username) \
+- `vars.COVERAGE_THRESHOLD` (default: ${{ inputs.coverage_threshold }}%) \
+- `vars.GO_VERSIONS` (default: 1.21-1.24) \
+- `.github/PULL_REQUEST_TEMPLATE.md` \
+- `.github/wiki/` files for your Wiki \
+\
+Delete this issue after customizing." \
+            --label "documentation" 2>/dev/null || true
+
+  setup-git-hooks:
+    needs: configure-repo-settings
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repo to configure hooks
+        run: |
+          gh repo clone "$REPO" /tmp/setup-repo
+          cd /tmp/setup-repo
+          git config core.hooksPath .githooks
+
+      - name: Confirm hooks configured
+        run: |
+          echo "Git hooks path set to .githooks/"
+          echo "Pre-commit and pre-push hooks will run on every commit/push"
+
+  summary:
+    needs: [configure-repo-settings, setup-git-hooks]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## Dark Factory Setup Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Repository | $REPO |" >> $GITHUB_STEP_SUMMARY
+          echo "| Default Branch | ${{ inputs.default_branch }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Coverage Threshold | ${{ inputs.coverage_threshold }}% |" >> $GITHUB_STEP_SUMMARY
+          echo "| Go Versions | ${{ inputs.go_versions }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next steps:**" >> $GITHUB_STEP_SUMMARY
+          echo "1. Edit `.github/CODEOWNERS` — replace `aliasfoxkde` with your GitHub username" >> $GITHUB_STEP_SUMMARY
+          echo "2. Push your first commit to trigger the full CI pipeline" >> $GITHUB_STEP_SUMMARY
+          echo "3. Customize `.github/wiki/` content for your project" >> $GITHUB_STEP_SUMMARY
+          echo "4. Add your language-specific template parts under `template-parts/`" >> $GITHUB_STEP_SUMMARY
