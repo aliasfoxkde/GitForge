@@ -49,3 +49,52 @@ where
         (self.f)(repo_id, input).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_fn_handler_upload_pack() {
+        let handler = FnHandler::new(|_repo_id: RepoId, input: Vec<u8>| async move {
+            Ok(input)
+        });
+
+        let repo_id = RepoId::new();
+        let result = handler.upload_pack(repo_id, vec![1, 2, 3]).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_fn_handler_receive_pack() {
+        let handler = FnHandler::new(|_repo_id: RepoId, input: Vec<u8>| async move {
+            Ok(input)
+        });
+
+        let repo_id = RepoId::new();
+        let result = handler.receive_pack(repo_id, vec![4, 5, 6]).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn test_fn_handler_empty_input() {
+        let handler = FnHandler::new(|_repo_id: RepoId, input: Vec<u8>| async move {
+            Ok(input)
+        });
+
+        let repo_id = RepoId::new();
+        let result = handler.upload_pack(repo_id, vec![]).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_fn_handler_new() {
+        let handler = FnHandler::new(|_repo_id: RepoId, _input: Vec<u8>| async move {
+            Ok::<Vec<u8>, gitforce_common::Error>(vec![])
+        });
+        assert!(matches!(handler, FnHandler { .. }));
+    }
+}

@@ -52,3 +52,48 @@ impl Repository {
         self.visibility == "public"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_visibility_as_str() {
+        assert_eq!(Visibility::Public.as_str(), "public");
+        assert_eq!(Visibility::Private.as_str(), "private");
+    }
+
+    #[test]
+    fn test_repository_creation() {
+        let owner_id = UserId::new();
+        let repo = Repository::new(
+            "test-repo".to_string(),
+            owner_id,
+            "/git/test-repo".to_string(),
+        );
+        assert_eq!(repo.name, "test-repo");
+        assert_eq!(repo.owner_id, owner_id);
+        assert_eq!(repo.visibility, "private");
+        assert!(!repo.is_public());
+    }
+
+    #[test]
+    fn test_repository_public_visibility() {
+        let owner_id = UserId::new();
+        let mut repo = Repository::new(
+            "public-repo".to_string(),
+            owner_id,
+            "/git/public-repo".to_string(),
+        );
+        repo.visibility = Visibility::Public.as_str().to_string();
+        assert!(repo.is_public());
+    }
+
+    #[test]
+    fn test_repository_id_unique() {
+        let owner_id = UserId::new();
+        let repo1 = Repository::new("repo1".to_string(), owner_id, "/git/repo1".to_string());
+        let repo2 = Repository::new("repo2".to_string(), owner_id, "/git/repo2".to_string());
+        assert_ne!(repo1.id, repo2.id);
+    }
+}

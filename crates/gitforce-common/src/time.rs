@@ -93,4 +93,40 @@ mod tests {
         assert!(is_older_than(old, chrono::Duration::hours(1)));
         assert!(!is_older_than(recent, chrono::Duration::hours(1)));
     }
+
+    #[test]
+    fn test_duration_ms() {
+        let start = Utc::now();
+        let end = start + chrono::Duration::seconds(5);
+        assert_eq!(duration_ms(start, end), 5000);
+    }
+
+    #[test]
+    fn test_duration_helpers_individual() {
+        assert_eq!(duration::seconds(30).num_seconds(), 30);
+        assert_eq!(duration::minutes(10).num_minutes(), 10);
+        assert_eq!(duration::hours(2).num_hours(), 2);
+        assert_eq!(duration::days(1).num_days(), 1);
+    }
+
+    #[test]
+    fn test_duration_comparison() {
+        let s1 = duration::seconds(60);
+        let m1 = duration::minutes(1);
+        let h1 = duration::hours(1);
+        let d1 = duration::days(1);
+
+        // All equal
+        assert_eq!(s1, m1);
+        assert_eq!(m1, chrono::Duration::minutes(1));
+        assert_eq!(h1, chrono::Duration::hours(1));
+        assert_eq!(d1, chrono::Duration::days(1));
+    }
+
+    #[test]
+    fn test_is_older_than_edge_cases() {
+        let now = Utc::now();
+        assert!(is_older_than(now - chrono::Duration::seconds(1), chrono::Duration::seconds(0)));
+        assert!(!is_older_than(now, chrono::Duration::days(1)));
+    }
 }

@@ -306,6 +306,9 @@ mod tests {
     fn test_event_type_str() {
         assert_eq!(EventType::PushReceived.as_str(), "push.received");
         assert_eq!(EventType::PipelineTriggered.as_str(), "pipeline.triggered");
+        assert_eq!(EventType::JobQueued.as_str(), "job.queued");
+        assert_eq!(EventType::JobStarted.as_str(), "job.started");
+        assert_eq!(EventType::JobFinished.as_str(), "job.finished");
     }
 
     #[test]
@@ -327,5 +330,86 @@ mod tests {
 
         assert_eq!(event.event_version, 1);
         assert!(event.timestamp > 0);
+    }
+
+    #[test]
+    fn test_job_queued_payload() {
+        let payload = JobQueuedPayload {
+            job_id: JobId::new(),
+            pipeline_run_id: PipelineRunId::new(),
+            name: "build".to_string(),
+        };
+        assert_eq!(payload.name, "build");
+    }
+
+    #[test]
+    fn test_job_started_payload() {
+        let payload = JobStartedPayload {
+            job_id: JobId::new(),
+            runner_id: RunnerId::new(),
+            started_at: 1234567890,
+        };
+        assert_eq!(payload.started_at, 1234567890);
+    }
+
+    #[test]
+    fn test_job_finished_payload() {
+        let payload = JobFinishedPayload {
+            job_id: JobId::new(),
+            status: "succeeded".to_string(),
+            exit_code: 0,
+            duration_ms: 5000,
+        };
+        assert_eq!(payload.status, "succeeded");
+        assert_eq!(payload.exit_code, 0);
+    }
+
+    #[test]
+    fn test_artifact_created_payload() {
+        let payload = ArtifactCreatedPayload {
+            artifact_id: Uuid::new_v4(),
+            job_id: JobId::new(),
+            path: "/artifacts/test.zip".to_string(),
+            checksum: "abc123".to_string(),
+            size_bytes: 1024,
+        };
+        assert_eq!(payload.path, "/artifacts/test.zip");
+        assert_eq!(payload.size_bytes, 1024);
+    }
+
+    #[test]
+    fn test_runner_registered_payload() {
+        let payload = RunnerRegisteredPayload {
+            runner_id: RunnerId::new(),
+            name: "runner-1".to_string(),
+            runner_type: "docker".to_string(),
+            capacity: 4,
+        };
+        assert_eq!(payload.name, "runner-1");
+        assert_eq!(payload.capacity, 4);
+    }
+
+    #[test]
+    fn test_runner_heartbeat_payload() {
+        let payload = RunnerHeartbeatPayload {
+            runner_id: RunnerId::new(),
+            capacity_used: 2,
+            active_jobs: 1,
+        };
+        assert_eq!(payload.capacity_used, 2);
+        assert_eq!(payload.active_jobs, 1);
+    }
+
+    #[test]
+    fn test_mirror_sync_completed_payload() {
+        let payload = MirrorSyncCompletedPayload {
+            repo_id: RepoId::new(),
+            github_repo: "owner/repo".to_string(),
+            commit_hash: "abc123".to_string(),
+            success: true,
+            error: None,
+        };
+        assert!(payload.success);
+        assert!(payload.error.is_none());
     }
 }

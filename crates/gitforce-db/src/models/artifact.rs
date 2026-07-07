@@ -29,3 +29,39 @@ impl Artifact {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_artifact_creation() {
+        let artifact = Artifact::new(
+            JobId::new(),
+            "/path/to/test.bin".to_string(),
+            "abc123".to_string(),
+            1024,
+        );
+        assert_eq!(artifact.path, "/path/to/test.bin");
+        assert_eq!(artifact.size_bytes, 1024);
+        assert_eq!(artifact.checksum, "abc123");
+    }
+
+    #[test]
+    fn test_artifact_id_unique() {
+        let artifact1 = Artifact::new(JobId::new(), "/path/1".to_string(), "abc".to_string(), 100);
+        let artifact2 = Artifact::new(JobId::new(), "/path/2".to_string(), "def".to_string(), 200);
+        assert_ne!(artifact1.id, artifact2.id);
+    }
+
+    #[test]
+    fn test_artifact_size() {
+        let artifact = Artifact::new(
+            JobId::new(),
+            "/path/to/artifact.zip".to_string(),
+            "checksum123".to_string(),
+            4096,
+        );
+        assert_eq!(artifact.size_bytes, 4096);
+    }
+}

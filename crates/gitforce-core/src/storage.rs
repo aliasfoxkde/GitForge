@@ -149,4 +149,77 @@ mod tests {
         backend.delete(repo_id).await.unwrap();
         assert!(!backend.exists(repo_id).await);
     }
+
+    #[tokio::test]
+    async fn test_file_storage_backend_repo_path() {
+        let dir = tempdir().unwrap();
+        let backend = FileStorageBackend::new(dir.path());
+        let repo_id = RepoId::new();
+
+        let path = backend.repo_path(repo_id);
+        assert!(path.to_str().unwrap().ends_with(&repo_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_file_storage_backend_root() {
+        let dir = tempdir().unwrap();
+        let backend = FileStorageBackend::new(dir.path());
+        assert_eq!(backend.root(), dir.path());
+    }
+
+    #[tokio::test]
+    async fn test_file_storage_backend_ensure_root() {
+        let dir = tempdir().unwrap();
+        let backend = FileStorageBackend::new(dir.path().join("nonexistent"));
+        backend.ensure_root().await.unwrap();
+        assert!(dir.path().join("nonexistent").exists());
+    }
+
+    #[tokio::test]
+    async fn test_file_storage_backend_delete_nonexistent() {
+        let dir = tempdir().unwrap();
+        let backend = FileStorageBackend::new(dir.path());
+        let repo_id = RepoId::new();
+
+        // Delete should not fail if repo doesn't exist
+        backend.delete(repo_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_file_storage_backend_exists_false() {
+        let dir = tempdir().unwrap();
+        let backend = FileStorageBackend::new(dir.path());
+        let repo_id = RepoId::new();
+
+        assert!(!backend.exists(repo_id).await);
+    }
+
+    #[tokio::test]
+    async fn test_file_storage_open_nonexistent() {
+        let dir = tempdir().unwrap();
+        let backend = FileStorageBackend::new(dir.path());
+        let repo_id = RepoId::new();
+
+        let result = backend.open(repo_id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_file_storage_backend_clone() {
+        let dir = tempdir().unwrap();
+        let backend1 = FileStorageBackend::new(dir.path());
+        let backend2 = backend1.clone();
+
+        let repo_id = RepoId::new();
+        let path1 = backend1.repo_path(repo_id);
+        let path2 = backend2.repo_path(repo_id);
+
+        assert_eq!(path1, path2);
+    }
+
+    #[test]
+    fn test_file_storage_backend_new() {
+        let backend = FileStorageBackend::new("/tmp/test");
+        assert_eq!(backend.root().to_str().unwrap(), "/tmp/test");
+    }
 }

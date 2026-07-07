@@ -311,4 +311,88 @@ mod tests {
         let display = format!("{}", id);
         assert_eq!(display, id.0.to_string());
     }
+
+    #[test]
+    fn test_pipeline_id_generation() {
+        let id1 = PipelineId::new();
+        let id2 = PipelineId::new();
+        assert_ne!(id1, id2);
+        assert!(id1.0.get_version_num() == 4);
+    }
+
+    #[test]
+    fn test_pipeline_run_id_generation() {
+        let id1 = PipelineRunId::new();
+        let id2 = PipelineRunId::new();
+        assert_ne!(id1, id2);
+        assert!(id1.0.get_version_num() == 4);
+    }
+
+    #[test]
+    fn test_job_id_generation() {
+        let id1 = JobId::new();
+        let id2 = JobId::new();
+        assert_ne!(id1, id2);
+        assert!(id1.0.get_version_num() == 4);
+    }
+
+    #[test]
+    fn test_runner_id_generation() {
+        let id1 = RunnerId::new();
+        let id2 = RunnerId::new();
+        assert_ne!(id1, id2);
+        assert!(id1.0.get_version_num() == 4);
+    }
+
+    #[test]
+    fn test_step_id_generation() {
+        let id1 = StepId::new();
+        let id2 = StepId::new();
+        assert_ne!(id1, id2);
+        assert!(id1.0.get_version_num() == 4);
+    }
+
+    #[test]
+    fn test_user_id_generation() {
+        let id1 = UserId::new();
+        let id2 = UserId::new();
+        assert_ne!(id1, id2);
+        assert!(id1.0.get_version_num() == 4);
+    }
+
+    #[test]
+    fn test_all_id_types_have_unique_uuids() {
+        let repo = RepoId::new();
+        let pipeline = PipelineId::new();
+        let run = PipelineRunId::new();
+        let job = JobId::new();
+        let runner = RunnerId::new();
+        let step = StepId::new();
+        let user = UserId::new();
+
+        // All should be unique
+        let ids = [repo.0, pipeline.0, run.0, job.0, runner.0, step.0, user.0];
+        let mut sorted = ids;
+        sorted.sort();
+        for i in 1..sorted.len() {
+            assert_ne!(sorted[i], sorted[i-1], "IDs should be unique");
+        }
+    }
+
+    #[test]
+    fn test_job_status_is_terminal() {
+        assert!(!crate::JobStatus::Pending.is_terminal());
+        assert!(!crate::JobStatus::Running.is_terminal());
+        assert!(crate::JobStatus::Succeeded.is_terminal());
+        assert!(crate::JobStatus::Failed.is_terminal());
+        assert!(crate::JobStatus::Cancelled.is_terminal());
+        assert!(crate::JobStatus::TimedOut.is_terminal());
+    }
+
+    #[test]
+    fn test_pipeline_status_values() {
+        use crate::PipelineStatus;
+        assert!(!matches!(PipelineStatus::Pending, PipelineStatus::Running));
+        assert!(!matches!(PipelineStatus::Running, PipelineStatus::Pending));
+    }
 }

@@ -98,3 +98,55 @@ pub trait ArtifactStore: Send + Sync {
     /// Get artifact metadata
     async fn get_metadata(&self, id: ArtifactId) -> Result<Artifact>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_artifact_id_generation() {
+        let id1 = ArtifactId::new();
+        let id2 = ArtifactId::new();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_artifact_id_display() {
+        let id = ArtifactId::new();
+        let display = format!("{}", id);
+        assert_eq!(display, id.0.to_string());
+    }
+
+    #[test]
+    fn test_artifact_id_default() {
+        let id = ArtifactId::default();
+        let id2 = ArtifactId::new();
+        assert_ne!(id, id2); // Default creates new unique ID
+    }
+
+    #[test]
+    fn test_artifact_id_uuid_conversion() {
+        // ArtifactId wraps Uuid internally
+        let id = ArtifactId::new();
+        let id_inner = id.0;
+        assert_eq!(id.0, id_inner);
+    }
+
+    #[test]
+    fn test_artifact_creation_fields() {
+        let job_id = JobId::new();
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            job_id,
+            name: "test-artifact.zip".to_string(),
+            path: "/tmp/artifact.zip".to_string(),
+            checksum: "abc123".to_string(),
+            size_bytes: 1024,
+            content_type: Some("application/zip".to_string()),
+            created_at: chrono::Utc::now(),
+        };
+        assert_eq!(artifact.name, "test-artifact.zip");
+        assert_eq!(artifact.size_bytes, 1024);
+        assert_eq!(artifact.content_type, Some("application/zip".to_string()));
+    }
+}

@@ -83,4 +83,46 @@ mod tests {
         assert_eq!(event.event_id, parsed.event_id);
         assert_eq!(event.event_type, parsed.event_type);
     }
+
+    #[test]
+    fn test_serialize_to_bytes() {
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id: gitforce_common::RepoId::new(),
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "abc123".to_string(),
+                new_hash: "def456".to_string(),
+                pusher_id: None,
+            }),
+            None,
+            None,
+        );
+
+        let bytes = EventSerializer::serialize(&event).unwrap();
+        assert!(!bytes.is_empty());
+
+        let parsed: EventEnvelope = EventSerializer::deserialize(&bytes).unwrap();
+        assert_eq!(event.event_id, parsed.event_id);
+    }
+
+    #[test]
+    fn test_json_event_from_envelope() {
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id: gitforce_common::RepoId::new(),
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "abc123".to_string(),
+                new_hash: "def456".to_string(),
+                pusher_id: None,
+            }),
+            None,
+            None,
+        );
+
+        let json_event = JsonEvent::from_envelope(&event);
+        assert_eq!(json_event.event_type, "push.received");
+        assert_eq!(json_event.event_version, 1);
+    }
 }

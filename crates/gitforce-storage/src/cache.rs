@@ -147,4 +147,97 @@ mod tests {
         let value = store.get(&key).await.unwrap();
         assert!(value.is_none());
     }
+
+    #[test]
+    fn test_cache_key_creation() {
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "cargo", "linux-x86_64");
+        assert_eq!(key.key, "cargo");
+        assert_eq!(key.target, "linux-x86_64");
+        assert_eq!(key.repo_id, repo_id);
+    }
+
+    #[test]
+    fn test_cache_key_hash() {
+        let repo_id = gitforce_common::RepoId::new();
+        let key1 = CacheKey::new(repo_id, "cargo", "linux-x86_64");
+        let key2 = CacheKey::new(repo_id, "cargo", "linux-x86_64");
+        let key3 = CacheKey::new(repo_id, "npm", "linux-x86_64");
+
+        // Same inputs produce same hash
+        assert_eq!(key1.hash(), key2.hash());
+        // Different inputs produce different hash
+        assert_ne!(key1.hash(), key3.hash());
+        // Hash is 16 characters
+        assert_eq!(key1.hash().len(), 16);
+    }
+
+    #[test]
+    fn test_cache_key_hash_unique() {
+        let repo_id1 = gitforce_common::RepoId::new();
+        let repo_id2 = gitforce_common::RepoId::new();
+        let key1 = CacheKey::new(repo_id1, "cargo", "linux-x86_64");
+        let key2 = CacheKey::new(repo_id2, "cargo", "linux-x86_64");
+
+        // Different repo_ids should produce different hashes
+        assert_ne!(key1.hash(), key2.hash());
+    }
+
+    #[tokio::test]
+    async fn test_cache_list() {
+        let store = InMemoryCacheStore::new();
+        let repo_id = gitforce_common::RepoId::new();
+        let key1 = CacheKey::new(repo_id, "cargo", "linux-x86_64");
+        let key2 = CacheKey::new(repo_id, "npm", "linux-x86_64");
+
+        store.put(key1.clone(), vec![1, 2, 3]).await.unwrap();
+        store.put(key2.clone(), vec![4, 5, 6]).await.unwrap();
+
+        let entries = store.list().await.unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cache_overwrite() {
+        let store = InMemoryCacheStore::new();
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "cargo", "linux-x86_64");
+
+        store.put(key.clone(), vec![1, 2, 3]).await.unwrap();
+        store.put(key.clone(), vec![4, 5, 6]).await.unwrap();
+
+        let value = store.get(&key).await.unwrap();
+        assert_eq!(value.unwrap(), vec![4, 5, 6]);
+
+        let entries = store.list().await.unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_empty() {
+        let store = InMemoryCacheStore::new();
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "cargo", "linux-x86_64");
+
+        let value = store.get(&key).await.unwrap();
+        assert!(value.is_none());
+
+        let entries = store.list().await.unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cache_entry_timestamps() {
+        let store = InMemoryCacheStore::new();
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "cargo", "linux-x86_64");
+
+        store.put(key.clone(), vec![1, 2, 3]).await.unwrap();
+
+        let entries = store.list().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.key, key);
+        assert_eq!(entry.size_bytes, 3);
+    }
 }

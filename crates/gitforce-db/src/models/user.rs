@@ -46,3 +46,28 @@ impl Role {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_user_creation() {
+        let user = User::new(
+            "testuser".to_string(),
+            "test@example.com".to_string(),
+            "hash123".to_string(),
+        );
+        assert_eq!(user.username, "testuser");
+        assert_eq!(user.email, "test@example.com");
+        assert_eq!(user.password_hash, "hash123");
+    }
+
+    #[test]
+    fn test_role_as_str() {
+        assert_eq!(Role::Admin.as_str(), "admin");
+        assert_eq!(Role::Maintainer.as_str(), "maintainer");
+        assert_eq!(Role::Developer.as_str(), "developer");
+        assert_eq!(Role::ReadOnly.as_str(), "read_only");
+    }
+}

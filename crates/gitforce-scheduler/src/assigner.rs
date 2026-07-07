@@ -239,6 +239,19 @@ impl Default for Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitforce_db::models::RunnerType;
+
+    fn make_runner(id: RunnerId, name: &str, status: &str, capacity: i32) -> Runner {
+        Runner {
+            id,
+            name: name.to_string(),
+            runner_type: RunnerType::Docker.as_str().to_string(),
+            status: status.to_string(),
+            capacity,
+            last_heartbeat: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
 
     #[tokio::test]
     async fn test_enqueue_dequeue() {
@@ -251,7 +264,7 @@ mod tests {
         assert_eq!(scheduler.queue_len().await, 1);
 
         // Register a runner
-        let runner = Runner::new("test-runner".to_string(), gitforce_db::models::RunnerType::Docker, 2);
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
         scheduler.register_runner(runner.clone()).await;
 
         // Process queue
@@ -270,5 +283,146 @@ mod tests {
 
         scheduler.cancel(job_id).await;
         assert_eq!(scheduler.queue_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_with_priority() {
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+        let job_id = JobId::new();
+
+        scheduler.enqueue_with_priority(job_id, run_id, repo_id, Priority::High).await;
+        assert_eq!(scheduler.queue_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_register_runner() {
+        let scheduler = Scheduler::new();
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
+        let runner_id = runner.id;
+
+        scheduler.register_runner(runner).await;
+        // Verify runner is registered by checking process_queue doesn't emit NoRunnerAvailable
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+        let job_id = JobId::new();
+
+        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.process_queue().await;
+
+        let assigned = scheduler.is_assigned(job_id).await;
+        assert_eq!(assigned, Some(runner_id));
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat() {
+        let scheduler = Scheduler::new();
+        let runner_id = RunnerId::new();
+        let runner = make_runner(runner_id, "test-runner", "online", 2);
+
+        scheduler.register_runner(runner).await;
+        scheduler.heartbeat(runner_id).await;
+        // No panic means success
+    }
+
+    #[tokio::test]
+    async fn test_runner_offline() {
+        let scheduler = Scheduler::new();
+        let runner_id = RunnerId::new();
+        let runner = make_runner(runner_id, "test-runner", "online", 2);
+
+        scheduler.register_runner(runner).await;
+        scheduler.runner_offline(runner_id).await;
+        // No panic means success
+    }
+
+    #[tokio::test]
+    async fn test_cancel_nonexistent_job() {
+        let scheduler = Scheduler::new();
+        let job_id = JobId::new();
+
+        // Cancel should not panic
+        scheduler.cancel(job_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_subscribe() {
+        let scheduler = Scheduler::new();
+        let mut rx = scheduler.subscribe();
+
+        // Try to receive with a timeout - should get an error since no event sent
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(result.is_err() || result.unwrap().is_err()); // Timeout or channel closed
+    }
+
+    #[test]
+    fn test_scheduler_command_debug() {
+        let cmd = SchedulerCommand::Enqueue {
+            job_id: JobId::new(),
+            pipeline_run_id: PipelineRunId::new(),
+            repo_id: RepoId::new(),
+            priority: Priority::Normal,
+        };
+        assert!(format!("{:?}", cmd).contains("Enqueue"));
+    }
+
+    #[test]
+    fn test_scheduler_event_debug() {
+        let evt = SchedulerEvent::NoRunnerAvailable { job_id: JobId::new() };
+        assert!(format!("{:?}", evt).contains("NoRunnerAvailable"));
+    }
+
+    #[test]
+    fn test_scheduler_state_new() {
+        let state = SchedulerState::new();
+        assert!(state.queue.is_empty());
+        assert!(state.runners.is_empty());
+        assert!(state.job_assignments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_state_add_remove_runner() {
+        let mut state = SchedulerState::new();
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
+
+        state.add_runner(runner.clone());
+        assert_eq!(state.runners.len(), 1);
+
+        state.remove_runner(runner.id);
+        assert!(state.runners.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_state_get_runner() {
+        let mut state = SchedulerState::new();
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
+
+        state.add_runner(runner.clone());
+        assert!(state.get_runner(runner.id).is_some());
+        assert!(state.get_runner(RunnerId::new()).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_state_list_online_runners() {
+        let mut state = SchedulerState::new();
+        state.add_runner(make_runner(RunnerId::new(), "runner1", "online", 2));
+        state.add_runner(make_runner(RunnerId::new(), "runner2", "offline", 2));
+
+        let online = state.list_online_runners();
+        assert_eq!(online.len(), 1);
+        assert_eq!(online[0].name, "runner1");
+    }
+
+    #[test]
+    fn test_priority_ord() {
+        assert!(Priority::High > Priority::Normal);
+        assert!(Priority::Normal > Priority::Low);
+        assert!(Priority::High > Priority::Low);
+    }
+
+    #[test]
+    fn test_priority_default() {
+        assert_eq!(Priority::default(), Priority::Normal);
     }
 }

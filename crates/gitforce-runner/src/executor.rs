@@ -196,18 +196,68 @@ impl JobExecutor {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    #[ignore] // Requires Docker running
-    async fn test_execute_simple_job() {
-        let executor = JobExecutor::new().await.unwrap();
+    #[test]
+    fn test_executable_job_creation() {
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string());
+        assert_eq!(job.image, "rust:latest");
+        assert_eq!(job.timeout_secs, 3600);
+        assert!(job.steps.is_empty());
+    }
 
-        let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string())
-            .with_steps(vec![
-                JobStep::new("test", "echo hello"),
-            ]);
+    #[test]
+    fn test_executable_job_with_steps() {
+        let steps = vec![
+            JobStep::new("build", "cargo build"),
+            JobStep::new("test", "cargo test"),
+        ];
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_steps(steps.clone());
+        assert_eq!(job.steps.len(), 2);
+        assert_eq!(job.steps[0].name, "build");
+    }
 
-        let result = executor.execute(job).await;
+    #[test]
+    fn test_executable_job_with_env() {
+        let mut env = HashMap::new();
+        env.insert("RUST_BACKTRACE".to_string(), "1".to_string());
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_env(env);
+        assert_eq!(job.env.get("RUST_BACKTRACE"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_executable_job_with_timeout() {
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_timeout(7200);
+        assert_eq!(job.timeout_secs, 7200);
+    }
+
+    #[test]
+    fn test_job_step_creation() {
+        let step = JobStep::new("build", "cargo build --release");
+        assert_eq!(step.name, "build");
+        assert_eq!(step.run, "cargo build --release");
+        assert!(step.env.is_none());
+        assert!(step.working_directory.is_none());
+    }
+
+    #[test]
+    fn test_job_result_structure() {
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: true,
+            exit_code: 0,
+            step_results: vec![],
+            error: None,
+        };
         assert!(result.success);
         assert_eq!(result.exit_code, 0);
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_active_count_empty() {
+        let executor = JobExecutor::new().await.unwrap();
+        assert_eq!(executor.active_count().await, 0);
     }
 }

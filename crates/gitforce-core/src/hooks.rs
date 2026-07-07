@@ -171,4 +171,141 @@ mod tests {
         assert!(!payload.is_tag_push());
         assert_eq!(payload.branch_name(), Some("main".to_string()));
     }
+
+    #[test]
+    fn test_hook_payload_tag() {
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/tags/v1.0".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            None,
+        );
+
+        assert!(!payload.is_branch_push());
+        assert!(payload.is_tag_push());
+        assert_eq!(payload.tag_name(), Some("v1.0".to_string()));
+    }
+
+    #[test]
+    fn test_hook_payload_no_prefix() {
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/heads/feature/test".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            None,
+        );
+
+        assert!(payload.is_branch_push());
+        assert_eq!(payload.branch_name(), Some("feature/test".to_string()));
+    }
+
+    #[test]
+    fn test_hook_payload_with_pusher() {
+        let user_id = UserId::new();
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/heads/main".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            Some(user_id),
+        );
+
+        assert_eq!(payload.pusher_id, Some(user_id));
+    }
+
+    #[tokio::test]
+    async fn test_logging_hook_executor_pre_receive() {
+        let executor = LoggingHookExecutor::new();
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/heads/main".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            None,
+        );
+
+        let result = executor.pre_receive(payload).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_logging_hook_executor_post_receive() {
+        let executor = LoggingHookExecutor::new();
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/heads/main".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            None,
+        );
+
+        let result = executor.post_receive(payload).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_hook_manager_pre_receive() {
+        let mut manager = HookManager::new();
+        manager.add_executor(LoggingHookExecutor::new());
+
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/heads/main".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            None,
+        );
+
+        let result = manager.pre_receive(payload).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_hook_manager_post_receive() {
+        let mut manager = HookManager::new();
+        manager.add_executor(LoggingHookExecutor::new());
+
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/heads/main".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            None,
+        );
+
+        let result = manager.post_receive(payload).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_hook_manager_multiple_executors() {
+        let mut manager = HookManager::new();
+        manager.add_executor(LoggingHookExecutor::new());
+        manager.add_executor(LoggingHookExecutor::new());
+
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/heads/main".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            None,
+        );
+
+        let result = manager.pre_receive(payload).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_logging_hook_executor_new() {
+        let executor = LoggingHookExecutor::new();
+        assert!(matches!(executor, LoggingHookExecutor));
+    }
+
+    #[test]
+    fn test_hook_manager_new() {
+        let manager = HookManager::new();
+        assert!(matches!(manager, HookManager { .. }));
+    }
 }

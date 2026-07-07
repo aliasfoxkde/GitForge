@@ -91,3 +91,93 @@ impl Runner {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_runner_creation() {
+        let runner = Runner::new(
+            "test-runner".to_string(),
+            RunnerType::Docker,
+            4,
+        );
+        assert_eq!(runner.name, "test-runner");
+        assert_eq!(runner.runner_type, "docker");
+        assert_eq!(runner.capacity, 4);
+        assert_eq!(runner.status, "online");
+    }
+
+    #[test]
+    fn test_runner_heartbeat() {
+        let mut runner = Runner::new(
+            "test-runner".to_string(),
+            RunnerType::Docker,
+            2,
+        );
+        runner.heartbeat();
+        assert!(runner.last_heartbeat.is_some());
+    }
+
+    #[test]
+    fn test_runner_set_busy() {
+        let mut runner = Runner::new(
+            "test-runner".to_string(),
+            RunnerType::Firecracker,
+            2,
+        );
+        runner.set_busy();
+        assert_eq!(runner.status, "busy");
+    }
+
+    #[test]
+    fn test_runner_set_online() {
+        let mut runner = Runner::new(
+            "test-runner".to_string(),
+            RunnerType::BareMetal,
+            1,
+        );
+        runner.set_busy();
+        runner.set_online();
+        assert_eq!(runner.status, "online");
+    }
+
+    #[test]
+    fn test_runner_is_healthy() {
+        let mut runner = Runner::new(
+            "test-runner".to_string(),
+            RunnerType::Docker,
+            2,
+        );
+        runner.heartbeat();
+        assert!(runner.is_healthy(60));
+        assert!(!runner.is_healthy(0));
+    }
+
+    #[test]
+    fn test_runner_is_not_healthy_without_heartbeat() {
+        // Create a runner and manually set last_heartbeat to None
+        let mut runner = Runner::new(
+            "test-runner".to_string(),
+            RunnerType::Docker,
+            2,
+        );
+        runner.last_heartbeat = None;
+        assert!(!runner.is_healthy(60));
+    }
+
+    #[test]
+    fn test_runner_type_as_str() {
+        assert_eq!(RunnerType::Docker.as_str(), "docker");
+        assert_eq!(RunnerType::Firecracker.as_str(), "firecracker");
+        assert_eq!(RunnerType::BareMetal.as_str(), "bare_metal");
+    }
+
+    #[test]
+    fn test_runner_status_as_str() {
+        assert_eq!(RunnerStatus::Online.as_str(), "online");
+        assert_eq!(RunnerStatus::Busy.as_str(), "busy");
+        assert_eq!(RunnerStatus::Offline.as_str(), "offline");
+    }
+}
