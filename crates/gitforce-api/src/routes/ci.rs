@@ -1,7 +1,7 @@
 //! CI API routes
 
 use axum::{
-    extract::{Path, State},
+    extract::Path,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},

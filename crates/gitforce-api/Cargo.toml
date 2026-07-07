@@ -21,8 +21,11 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
-tower-http = { workspace = true }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
 async-trait = { workspace = true }
 jsonwebtoken = { workspace = true }
 bcrypt = { workspace = true }
 reqwest = { workspace = true }
+
+# Prometheus metrics
+prometheus = "0.13"

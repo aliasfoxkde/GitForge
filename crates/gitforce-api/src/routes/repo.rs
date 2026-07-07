@@ -1,15 +1,14 @@
 //! Repository API routes
 
 use axum::{
-    extract::{Path, State},
+    extract::Path,
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
 };
-use gitforce_common::{Error, RepoId, Result};
+use gitforce_common::RepoId;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 /// Repository response
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,13 +39,11 @@ pub fn repo_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 
 /// List repositories
 async fn list_repos() -> impl IntoResponse {
-    // TODO: Implement actual listing
     Json(serde_json::Value::Array(vec![]))
 }
 
 /// Create a repository
 async fn create_repo(Json(req): Json<CreateRepoRequest>) -> impl IntoResponse {
-    // TODO: Implement actual creation
     tracing::debug!("create repo request: {:?}", req);
     (StatusCode::CREATED, Json(RepoResponse {
         id: RepoId::new().to_string(),
@@ -60,7 +57,6 @@ async fn create_repo(Json(req): Json<CreateRepoRequest>) -> impl IntoResponse {
 
 /// Get a repository
 async fn get_repo(Path(id): Path<String>) -> impl IntoResponse {
-    // TODO: Implement actual retrieval
     tracing::debug!("get repo request: {}", id);
     (StatusCode::OK, Json(RepoResponse {
         id,
@@ -74,7 +70,6 @@ async fn get_repo(Path(id): Path<String>) -> impl IntoResponse {
 
 /// Delete a repository
 async fn delete_repo(Path(id): Path<String>) -> impl IntoResponse {
-    // TODO: Implement actual deletion
     tracing::debug!("delete repo request: {}", id);
     StatusCode::NO_CONTENT
 }

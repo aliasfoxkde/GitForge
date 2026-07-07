@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 pub struct RunnerResponse {
     pub id: String,
     pub name: String,
-    pub r#type: String,
+    #[serde(rename = "type")]
+    pub runner_type: String,
     pub status: String,
     pub capacity: i32,
     pub last_heartbeat: Option<String>,
@@ -40,7 +41,7 @@ async fn register_runner(Json(payload): Json<serde_json::Value>) -> impl IntoRes
     (StatusCode::CREATED, Json(RunnerResponse {
         id: RunnerId::new().to_string(),
         name: payload["name"].as_str().unwrap_or("runner").to_string(),
-        r#type: payload["type"].as_str().unwrap_or("docker").to_string(),
+        runner_type: payload["type"].as_str().unwrap_or("docker").to_string(),
         status: "online".to_string(),
         capacity: payload["capacity"].as_i64().unwrap_or(1) as i32,
         last_heartbeat: Some(chrono::Utc::now().to_rfc3339()),
@@ -53,7 +54,7 @@ async fn get_runner(Path(id): Path<String>) -> impl IntoResponse {
     (StatusCode::OK, Json(RunnerResponse {
         id,
         name: "test-runner".to_string(),
-        r#type: "docker".to_string(),
+        runner_type: "docker".to_string(),
         status: "online".to_string(),
         capacity: 2,
         last_heartbeat: Some(chrono::Utc::now().to_rfc3339()),
