@@ -26,9 +26,8 @@ pub struct ArtifactResponse {
 pub fn artifact_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/artifacts", get(list_artifacts))
-        .route("/artifacts/:id", get(get_artifact))
-        .route("/artifacts/:id", delete(delete_artifact))
-        .route("/jobs/:job_id/artifacts", get(get_job_artifacts))
+        .route("/artifacts/{id}", get(get_artifact).delete(delete_artifact))
+        .route("/jobs/{job_id}/artifacts", get(get_job_artifacts))
 }
 
 /// List artifacts

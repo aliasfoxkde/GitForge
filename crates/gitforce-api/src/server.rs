@@ -2,6 +2,7 @@
 
 use crate::auth::ApiAuth;
 use crate::metrics::Metrics;
+use crate::openapi::api_docs_routes;
 use crate::routes::{artifact_routes, ci_routes, repo_routes, runner_routes};
 use axum::{
     extract::Extension,
@@ -35,6 +36,7 @@ impl ApiServer {
         let app = Router::new()
             .route("/health", get(health_check))
             .route("/metrics", get(metrics_handler))
+            .merge(api_docs_routes())
             .merge(repo_routes())
             .merge(ci_routes())
             .merge(runner_routes())
@@ -56,6 +58,8 @@ impl ApiServer {
     pub async fn start(self) -> anyhow::Result<()> {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         tracing::info!("API server listening on {}", addr);
+        tracing::info!("Swagger UI available at /swagger-ui");
+        tracing::info!("OpenAPI spec at /api-docs/openapi.json");
         tracing::info!("Metrics available at /metrics");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -73,7 +77,7 @@ async fn health_check() -> impl IntoResponse {
     })
 }
 
-/// Health response for OpenAPI
+/// Health response
 #[derive(serde::Serialize)]
 pub struct HealthResponse {
     pub status: String,

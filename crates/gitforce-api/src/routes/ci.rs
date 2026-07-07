@@ -4,10 +4,10 @@ use axum::{
     extract::Path,
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
-use gitforce_common::{PipelineId, PipelineRunId};
+use gitforce_common::PipelineId;
 use serde::{Deserialize, Serialize};
 
 /// Pipeline run response
@@ -37,12 +37,12 @@ pub struct JobResponse {
 pub fn ci_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/pipelines", get(list_pipelines))
-        .route("/pipelines/:id", get(get_pipeline))
+        .route("/pipelines/{id}", get(get_pipeline))
         .route("/pipeline-runs", get(list_pipeline_runs))
-        .route("/pipeline-runs/:id", get(get_pipeline_run))
-        .route("/pipeline-runs/:id/jobs", get(get_pipeline_run_jobs))
-        .route("/jobs/:id", get(get_job))
-        .route("/jobs/:id/logs", get(get_job_logs))
+        .route("/pipeline-runs/{id}", get(get_pipeline_run))
+        .route("/pipeline-runs/{id}/jobs", get(get_pipeline_run_jobs))
+        .route("/jobs/{id}", get(get_job))
+        .route("/jobs/{id}/logs", get(get_job_logs))
 }
 
 /// List pipelines

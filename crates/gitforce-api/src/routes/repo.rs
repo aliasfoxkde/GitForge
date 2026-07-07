@@ -31,10 +31,8 @@ pub struct CreateRepoRequest {
 /// Repository routes
 pub fn repo_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
-        .route("/repos", get(list_repos))
-        .route("/repos", post(create_repo))
-        .route("/repos/:id", get(get_repo))
-        .route("/repos/:id", delete(delete_repo))
+        .route("/repos", get(list_repos).post(create_repo))
+        .route("/repos/{id}", get(get_repo).delete(delete_repo))
 }
 
 /// List repositories

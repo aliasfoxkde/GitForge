@@ -25,9 +25,8 @@ pub struct RunnerResponse {
 /// Runner routes
 pub fn runner_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
-        .route("/runners", get(list_runners))
-        .route("/runners", post(register_runner))
-        .route("/runners/:id", get(get_runner))
+        .route("/runners", get(list_runners).post(register_runner))
+        .route("/runners/{id}", get(get_runner))
 }
 
 /// List runners
