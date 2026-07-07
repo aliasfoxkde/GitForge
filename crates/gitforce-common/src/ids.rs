@@ -1,0 +1,314 @@
+//! UUID type definitions for all GitForce entities
+//!
+//! Each entity type has its own dedicated UUID type to prevent
+//! mixing up IDs across different entity types.
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Repository identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RepoId(pub Uuid);
+
+impl RepoId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for RepoId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for RepoId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<Uuid> for RepoId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl From<RepoId> for Uuid {
+    fn from(id: RepoId) -> Self {
+        id.0
+    }
+}
+
+/// Pipeline identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PipelineId(pub Uuid);
+
+impl PipelineId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for PipelineId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for PipelineId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<Uuid> for PipelineId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl From<PipelineId> for Uuid {
+    fn from(id: PipelineId) -> Self {
+        id.0
+    }
+}
+
+/// Pipeline run identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PipelineRunId(pub Uuid);
+
+impl PipelineRunId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for PipelineRunId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for PipelineRunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<Uuid> for PipelineRunId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl From<PipelineRunId> for Uuid {
+    fn from(id: PipelineRunId) -> Self {
+        id.0
+    }
+}
+
+/// Job identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JobId(pub Uuid);
+
+impl JobId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for JobId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for JobId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<Uuid> for JobId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl From<JobId> for Uuid {
+    fn from(id: JobId) -> Self {
+        id.0
+    }
+}
+
+/// Runner identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunnerId(pub Uuid);
+
+impl RunnerId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for RunnerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for RunnerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<Uuid> for RunnerId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl From<RunnerId> for Uuid {
+    fn from(id: RunnerId) -> Self {
+        id.0
+    }
+}
+
+/// Step identifier within a job
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StepId(pub Uuid);
+
+impl StepId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for StepId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for StepId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<Uuid> for StepId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl From<StepId> for Uuid {
+    fn from(id: StepId) -> Self {
+        id.0
+    }
+}
+
+/// User identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UserId(pub Uuid);
+
+impl UserId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for UserId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for UserId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<Uuid> for UserId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl From<UserId> for Uuid {
+    fn from(id: UserId) -> Self {
+        id.0
+    }
+}
+
+/// Job status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Pending,
+    Queued,
+    Assigned,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+impl JobStatus {
+    /// Check if this status is terminal (no further transitions possible)
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled | JobStatus::TimedOut
+        )
+    }
+}
+
+/// Pipeline status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_repo_id_generation() {
+        let id1 = RepoId::new();
+        let id2 = RepoId::new();
+        assert_ne!(id1, id2);
+        // Verify it's a valid UUID (v4)
+        assert!(id1.0.get_version_num() == 4);
+    }
+
+    #[test]
+    fn test_id_conversion() {
+        let id = RepoId::new();
+        let uuid: Uuid = id.into();
+        let id2: RepoId = uuid.into();
+        assert_eq!(id, id2);
+    }
+
+    #[test]
+    fn test_id_display() {
+        let id = RepoId::new();
+        let display = format!("{}", id);
+        assert_eq!(display, id.0.to_string());
+    }
+}

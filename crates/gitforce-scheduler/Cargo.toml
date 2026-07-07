@@ -1,0 +1,19 @@
+[package]
+name = "gitforce-scheduler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+gitforce-common = { path = "../gitforce-common" }
+gitforce-db = { path = "../gitforce-db" }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }

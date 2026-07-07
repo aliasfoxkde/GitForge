@@ -1,0 +1,21 @@
+[package]
+name = "ci"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ci"
+path = "src/main.rs"
+
+[dependencies]
+gitforce-common = { path = "../../crates/gitforce-common" }
+gitforce-db = { path = "../../crates/gitforce-db" }
+gitforce-events = { path = "../../crates/gitforce-events" }
+gitforce-ci = { path = "../../crates/gitforce-ci" }
+gitforce-scheduler = { path = "../../crates/gitforce-scheduler" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

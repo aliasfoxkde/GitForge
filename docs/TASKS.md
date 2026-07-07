@@ -1,7 +1,7 @@
-# Task Ledger — Dark Factory
+# GitForge Task Ledger
 
-**Last Updated:** 2026-06-26
-**Status:** Phase 2 PR open (#3)
+**Last Updated:** 2026-07-06
+**Status:** MVP Implementation Complete
 
 ---
 
@@ -14,60 +14,100 @@
 
 ---
 
-## Phase 1: Foundation (PR #1 — Merged)
+## Implementation Tasks
 
-- [x] Python template part (`template-parts/python/`)
-- [x] Python CI workflow (uv, ruff, mypy, pytest, coverage)
-- [x] Quality gates pre-commit hook (secrets, console.log, fake data, placeholder code)
-- [x] SDLC, Branch Strategy, Testing Strategy, Hooks documentation
-- [x] Issue templates (false_positive, pattern_submission)
-- [x] Discussions, Template repo, Secret scanning, Push protection
-- [x] CI path filters + check-go-files gate
-- [x] Code library expansion (9 → 16 snippets)
+### Phase 1: Foundation ✅
+
+- [x] Set up Rust workspace with 10 crates
+- [x] Implement gitforce-common (UUIDs, errors, time)
+- [x] Implement gitforce-db (models, connection pool)
+- [x] Implement gitforce-events (event bus, types)
+
+### Phase 2: Git Server ✅
+
+- [x] Implement gitforce-core
+- [x] Repository storage (FileStorageBackend)
+- [x] Repository service (RepoService)
+- [x] Git protocol handlers (SSH/HTTP)
+- [x] Hook system
+
+### Phase 3: CI Orchestrator ✅
+
+- [x] Implement gitforce-ci
+- [x] Pipeline loader
+- [x] DAG builder
+- [x] Job state machine
+- [x] CI engine
+- [x] Implement gitforce-scheduler
+- [x] Priority queue
+- [x] Scheduling policies
+
+### Phase 4: Runner ✅
+
+- [x] Implement gitforce-runner
+- [x] Runner agent
+- [x] Job executor
+- [x] Implement gitforce-sandbox
+- [x] Docker sandbox
+
+### Phase 5: Storage ✅
+
+- [x] Implement gitforce-storage
+- [x] Artifact store
+- [x] Cache store
+
+### Phase 6: API ✅
+
+- [x] Implement gitforce-api
+- [x] Axum server
+- [x] Repository routes
+- [x] CI routes
+- [x] Runner routes
+- [x] Artifact routes
+- [x] JWT auth
+
+### Phase 7: Integration ✅
+
+- [x] git-server binary
+- [x] ci binary
+- [x] runner binary
+- [x] api binary
+- [x] Workspace builds successfully
 
 ---
 
-## Phase 2: Expansion (PR #3 — Open)
+## Testing & Documentation
 
-### Template Parts
-- [x] TypeScript template part (`template-parts/typescript/`)
-- [x] Rust template part (`template-parts/rust/`)
-- [x] Scaffolding templates (`template-parts/scaffolding/` — api-service, cli-tool, worker-service, data-pipeline)
-- [x] E2E runner expansion (runner.sh, playwright.config.ts, smoke tests)
+### Testing
+- [ ] Fix gitforce-ci test failures (3 tests)
+- [ ] Fix gitforce-storage test compilation
+- [ ] Add integration tests
+- [ ] Add Docker Compose for local dev
 
-### Enforcement Hooks
-- [x] `pre-push.d/10-complexity-gate` — function/file size, cyclomatic complexity
-- [x] `pre-push.d/20-clean-branch` — advisory warnings
-- [x] `pre-push.d/30-coverage-gate` — coverage threshold
-- [x] `pre-rebase.d/01-check-clean-state` — dirty branch rebase guard
-
-### CI/CD
-- [x] Benchmark tracking workflow (`.github/workflows/benchmark.yml`)
-- [x] E2E GitHub Actions workflow (`template-parts/e2e-testing/.github/workflows/e2e.yml`)
-
-### Code Library
-- [x] +16 new snippets: circuit breaker, rate limiter, worker pool, OTEL tracing, k8s, Docker, auth patterns, API versioning
+### Documentation
+- [x] PROGRESS.md updated
+- [x] RUNBOOK.md created
+- [ ] API documentation (OpenAPI/Swagger)
+- [ ] Architecture diagrams
 
 ---
 
-## Onboarding (per-project, after copying template)
+## Production Hardening
 
-- [ ] Replace `aliasfoxkde` with actual GitHub username in CODEOWNERS, FUNDING.yml, README.md
-- [ ] Customize `.github/wiki/` content
-- [ ] Configure repository variables: `COVERAGE_THRESHOLD`, `GO_VERSIONS`, `PYTHON_VERSIONS`, `GOLANGCI_LINT_VERSION`
-- [ ] Set up Codecov dashboard and add `CODECOV_TOKEN` secret
-- [ ] Enable auto-merge manually on PRs (GitHub limitation — see PR #3)
-- [ ] Customize `.github/PULL_REQUEST_TEMPLATE.md`
+- [ ] Health check endpoints for all services
+- [ ] Graceful shutdown
+- [ ] Prometheus metrics
+- [ ] Structured logging improvements
+- [ ] Database migrations system
+- [ ] GitHub mirror service
 
 ---
 
-## Ideas
+## Future Enhancements
 
-- [ ] GitHub App for automated PR review assignments
-- [ ] Slack/Discord integration for CI notifications
-- [ ] Stale issue/PR automation
-- [ ] Auto-close resolved issues after 30 days
-- [ ] JS/TS template part expansion (NestJS, Next.js scaffolds)
-- [ ] Python template part expansion (FastAPI, Django scaffolds)
-- [ ] Terraform/IaC template part
-- [ ] Mobile (React Native, Flutter) template part
+- [ ] Firecracker microVM sandbox
+- [ ] NATS event bus
+- [ ] S3-compatible storage
+- [ ] GitHub App authentication
+- [ ] Webhook support
+- [ ] Self-hosted runner registration

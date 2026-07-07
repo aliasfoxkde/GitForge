@@ -1,0 +1,28 @@
+[package]
+name = "gitforce-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+gitforce-common = { path = "../gitforce-common" }
+gitforce-db = { path = "../gitforce-db" }
+gitforce-events = { path = "../gitforce-events" }
+gitforce-ci = { path = "../gitforce-ci" }
+gitforce-storage = { path = "../gitforce-storage" }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+async-trait = { workspace = true }
+jsonwebtoken = { workspace = true }
+bcrypt = { workspace = true }
+reqwest = { workspace = true }

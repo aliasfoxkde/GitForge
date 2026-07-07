@@ -1,0 +1,129 @@
+//! API authentication
+
+use chrono::{DateTime, Utc};
+use gitforce_common::{Error, UserId};
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use serde::{Deserialize, Serialize};
+
+/// JWT claims for API authentication
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Claims {
+    /// Subject (user ID)
+    pub sub: String,
+    /// User ID
+    pub user_id: UserId,
+    /// Username
+    pub username: String,
+    /// Role
+    pub role: String,
+    /// Expiration time (as UTC timestamp)
+    pub exp: i64,
+    /// Issued at
+    pub iat: i64,
+}
+
+impl Claims {
+    /// Create new claims
+    pub fn new(user_id: UserId, username: &str, role: &str, expiry_hours: i64) -> Self {
+        let now = Utc::now();
+        Self {
+            sub: user_id.to_string(),
+            user_id,
+            username: username.to_string(),
+            role: role.to_string(),
+            exp: now.timestamp() + (expiry_hours * 3600),
+            iat: now.timestamp(),
+        }
+    }
+
+    /// Check if the token is expired
+    pub fn is_expired(&self) -> bool {
+        Utc::now().timestamp() > self.exp
+    }
+}
+
+/// API authentication handler
+#[derive(Clone)]
+pub struct ApiAuth {
+    jwt_secret: String,
+    encoding_key: EncodingKey,
+    decoding_key: DecodingKey,
+}
+
+impl ApiAuth {
+    /// Create a new API authenticator
+    pub fn new(jwt_secret: &str) -> Self {
+        let encoding_key = EncodingKey::from_secret(jwt_secret.as_bytes());
+        let decoding_key = DecodingKey::from_secret(jwt_secret.as_bytes());
+
+        Self {
+            jwt_secret: jwt_secret.to_string(),
+            encoding_key,
+            decoding_key,
+        }
+    }
+
+    /// Generate a JWT token for a user
+    pub fn generate_token(&self, user_id: UserId, username: &str, role: &str) -> Result<String, Error> {
+        let claims = Claims::new(user_id, username, role, 24); // 24 hour expiry
+
+        let token = encode(&Header::default(), &claims, &self.encoding_key)
+            .map_err(|e| Error::auth(format!("failed to generate token: {}", e)))?;
+
+        Ok(token)
+    }
+
+    /// Validate and decode a JWT token
+    pub fn validate_token(&self, token: &str) -> Result<Claims, Error> {
+        let token_data = decode::<Claims>(token, &self.decoding_key, &Validation::default())
+            .map_err(|e| Error::auth(format!("invalid token: {}", e)))?;
+
+        let claims = token_data.claims;
+
+        if claims.is_expired() {
+            return Err(Error::auth("token expired".to_string()));
+        }
+
+        Ok(claims)
+    }
+
+    /// Extract token from Authorization header
+    pub fn extract_token(auth_header: &str) -> Option<&str> {
+        if auth_header.starts_with("Bearer ") {
+            Some(&auth_header[7..])
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_claims_expiry() {
+        let claims = Claims::new(UserId::new(), "test", "admin", 1);
+        assert!(!claims.is_expired());
+
+        let expired_claims = Claims {
+            exp: Utc::now().timestamp() - 3600,
+            iat: Utc::now().timestamp() - 7200,
+            ..claims
+        };
+        assert!(expired_claims.is_expired());
+    }
+
+    #[test]
+    fn test_token_generation_and_validation() {
+        let auth = ApiAuth::new("test-secret");
+        let user_id = UserId::new();
+
+        let token = auth.generate_token(user_id, "testuser", "admin").unwrap();
+        assert!(!token.is_empty());
+
+        let claims = auth.validate_token(&token).unwrap();
+        assert_eq!(claims.username, "testuser");
+        assert_eq!(claims.role, "admin");
+    }
+}

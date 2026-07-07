@@ -1,0 +1,21 @@
+[package]
+name = "runner"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "runner"
+path = "src/main.rs"
+
+[dependencies]
+gitforce-common = { path = "../../crates/gitforce-common" }
+gitforce-db = { path = "../../crates/gitforce-db" }
+gitforce-runner = { path = "../../crates/gitforce-runner" }
+gitforce-sandbox = { path = "../../crates/gitforce-sandbox" }
+gitforce-storage = { path = "../../crates/gitforce-storage" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

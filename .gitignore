@@ -35,3 +35,7 @@ go.work.sum
 .claude/
 CLAUDE.md
 template-parts/rust/target/
+
+# ─── Rust ─────────────────────────────────────────────────────────────────────
+target/
+Cargo.lock
