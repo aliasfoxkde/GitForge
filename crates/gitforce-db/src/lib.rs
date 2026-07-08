@@ -6,5 +6,5 @@ pub mod connection;
 pub mod models;
 pub mod queries;
 
-pub use connection::{Connection, Pool};
+pub use connection::Pool;
 pub use models::*;
