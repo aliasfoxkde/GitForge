@@ -127,3 +127,35 @@ mod tests {
         assert_eq!(claims.role, "admin");
     }
 }
+
+    #[test]
+    fn test_claims_creation() {
+        let user_id = UserId::new();
+        let claims = Claims::new(user_id, "user1", "developer", 2);
+        assert_eq!(claims.username, "user1");
+        assert_eq!(claims.role, "developer");
+    }
+
+    #[test]
+    fn test_extract_token() {
+        assert_eq!(ApiAuth::extract_token("Bearer abc123"), Some("abc123"));
+        assert_eq!(ApiAuth::extract_token("abc123"), None);
+        assert_eq!(ApiAuth::extract_token("Basic abc"), None);
+    }
+
+    #[test]
+    fn test_invalid_token() {
+        let auth = ApiAuth::new("test-secret");
+        let result = auth.validate_token("invalid.token.here");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wrong_secret_validation() {
+        let auth1 = ApiAuth::new("secret1");
+        let auth2 = ApiAuth::new("secret2");
+        let user_id = UserId::new();
+        let token = auth1.generate_token(user_id, "testuser", "admin").unwrap();
+        let result = auth2.validate_token(&token);
+        assert!(result.is_err());
+    }

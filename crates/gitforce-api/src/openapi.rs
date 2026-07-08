@@ -468,3 +468,61 @@ pub fn api_docs_routes() -> Router {
         .route("/openapi.json", get(openapi_spec))
         .route("/", get(swagger_ui))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_openapi_spec_contains_required_fields() {
+        let spec = get_openapi_spec();
+        assert!(spec.get("openapi").is_some());
+        assert!(spec.get("info").is_some());
+        assert!(spec.get("paths").is_some());
+        assert!(spec.get("components").is_some());
+    }
+
+    #[test]
+    fn test_openapi_version() {
+        let spec = get_openapi_spec();
+        assert_eq!(spec.get("openapi").unwrap(), "3.0.3");
+    }
+
+    #[test]
+    fn test_api_info() {
+        let spec = get_openapi_spec();
+        let info = spec.get("info").unwrap();
+        assert_eq!(info.get("title").unwrap(), "GitForge API");
+        assert_eq!(info.get("version").unwrap(), "1.0.0");
+    }
+
+    #[test]
+    fn test_api_paths_exist() {
+        let spec = get_openapi_spec();
+        let paths = spec.get("paths").unwrap().as_object().unwrap();
+        assert!(paths.contains_key("/health"));
+        assert!(paths.contains_key("/repos"));
+        assert!(paths.contains_key("/pipelines"));
+        assert!(paths.contains_key("/runners"));
+        assert!(paths.contains_key("/artifacts"));
+    }
+
+    #[test]
+    fn test_api_components_schemas() {
+        let spec = get_openapi_spec();
+        let components = spec.get("components").unwrap();
+        let schemas = components.get("schemas").unwrap().as_object().unwrap();
+        assert!(schemas.contains_key("HealthResponse"));
+        assert!(schemas.contains_key("RepoResponse"));
+        assert!(schemas.contains_key("PipelineRunResponse"));
+        assert!(schemas.contains_key("JobResponse"));
+        assert!(schemas.contains_key("RunnerResponse"));
+        assert!(schemas.contains_key("ArtifactResponse"));
+    }
+
+    #[tokio::test]
+    async fn test_openapi_spec_endpoint() {
+        let response = openapi_spec().await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+}
