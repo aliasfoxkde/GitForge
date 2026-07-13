@@ -29,13 +29,14 @@ Authorization: Bearer <your-token>
 GET /health
 ```
 
-Returns server health status.
+Returns server health status including database connectivity.
 
 **Response:**
 ```json
 {
   "status": "healthy",
-  "timestamp": "2024-01-01T00:00:00Z"
+  "timestamp": "2024-01-01T00:00:00Z",
+  "database": "connected"
 }
 ```
 
@@ -64,7 +65,8 @@ DELETE /repos/{id}
   "owner_id": "user-uuid",
   "visibility": "private",
   "git_path": "/git/my-repo",
-  "created_at": "2024-01-01T00:00:00Z"
+  "created_at": "2024-01-01T00:00:00Z",
+  "updated_at": "2024-01-01T00:00:00Z"
 }
 ```
 

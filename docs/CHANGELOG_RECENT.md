@@ -29,7 +29,7 @@ All notable changes to GitForge will be documented in this file.
 - `gitforce-runner` - Job execution agent
 - Runner registration and heartbeat
 - `gitforce-sandbox` - Container isolation
-- Docker sandbox implementation (MVP)
+- Docker sandbox implementation with bollard (real Docker integration)
 - Resource limits support
 
 #### Storage
@@ -39,11 +39,12 @@ All notable changes to GitForge will be documented in this file.
 
 #### API
 - `gitforce-api` - REST API gateway
-- Repository endpoints
-- CI/CD endpoints (pipelines, jobs, logs)
-- Runner management endpoints
+- Repository endpoints (wired to SQLite)
+- CI/CD endpoints (pipelines, jobs, logs - wired to SQLite)
+- Runner management endpoints (wired to SQLite)
 - Artifact endpoints
 - JWT authentication
+- OpenAPI 3.0 / Swagger UI documentation
 
 #### Services
 - `git-server` - Git SSH/HTTP server binary
@@ -56,19 +57,16 @@ All notable changes to GitForge will be documented in this file.
 - **Language**: Rust (10 crates, 4 service binaries)
 - **Async Runtime**: Tokio
 - **Web Framework**: Axum 0.7
-- **Database**: PostgreSQL (via sqlx, future)
+- **Database**: SQLite (MVP) via sqlx
 - **Git Library**: git2
+- **Container Runtime**: bollard (Docker client)
 
 ### Known Issues
 
-- Some test failures in gitforce-ci due to evolving API
-- gitforce-storage tests need dependency fixes
-- Docker sandbox is MVP stub (no actual container execution)
+- None - all tests passing
 
 ### Next Steps
 
-- Fix test failures
-- Add integration tests
-- Implement health checks
-- Add Prometheus metrics
-- Database migration system
+- VPS deployment with Docker Compose
+- CLI tool for GitForge
+- Cloud sync protocol
