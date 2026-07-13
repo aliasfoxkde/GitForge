@@ -16,3 +16,5 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+bollard = "0.17"
+futures-util = "0.3"

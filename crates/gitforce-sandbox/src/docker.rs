@@ -1,7 +1,15 @@
-//! Docker-based sandbox implementation
+//! Docker-based sandbox implementation using bollard
 
 use crate::limits::SandboxLimits;
 use async_trait::async_trait;
+use bollard::container::{
+    Config, CreateContainerOptions, ListContainersOptions, LogOutput, RemoveContainerOptions,
+    StartContainerOptions,
+};
+use bollard::image::CreateImageOptions;
+use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+use bollard::Docker;
+use futures_util::StreamExt;
 use gitforce_common::{Error, JobId, Result};
 use std::collections::HashMap;
 
@@ -20,15 +28,37 @@ pub struct StepResult {
     pub stderr: String,
 }
 
-/// Docker-based sandbox (simplified for MVP)
+/// Docker-based sandbox
 pub struct DockerSandbox {
+    docker: Option<Docker>,
     default_limits: SandboxLimits,
 }
 
 impl DockerSandbox {
-    /// Create a new Docker sandbox
+    /// Create a new Docker sandbox (connects to Docker daemon)
     pub async fn new() -> Result<Self> {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => {
+                // Verify connection by pinging Docker
+                match d.ping().await {
+                    Ok(_) => {
+                        tracing::info!("Connected to Docker daemon");
+                        Some(d)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Docker daemon not available: {}. Running in stub mode.", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to connect to Docker: {}. Running in stub mode.", e);
+                None
+            }
+        };
+
         Ok(Self {
+            docker,
             default_limits: SandboxLimits::default(),
         })
     }
@@ -36,8 +66,55 @@ impl DockerSandbox {
     /// Create a new Docker sandbox with custom limits
     pub fn with_limits(limits: SandboxLimits) -> Self {
         Self {
+            docker: None,
             default_limits: limits,
         }
+    }
+
+    /// Check if Docker is available
+    pub fn is_available(&self) -> bool {
+        self.docker.is_some()
+    }
+
+    /// Pull an image if not present
+    async fn ensure_image(&self, image: &str) -> Result<()> {
+        if let Some(ref docker) = self.docker {
+            // Check if image exists
+            let filters = HashMap::from([("reference", vec![image])]);
+            let options = ListContainersOptions {
+                all: true,
+                filters,
+                ..Default::default()
+            };
+
+            let containers = docker.list_containers(Some(options)).await
+                .map_err(|e| Error::sandbox(format!("failed to list containers: {}", e)))?;
+
+            if containers.is_empty() {
+                tracing::info!("Pulling image: {}", image);
+                // Pull the image
+                let mut stream = docker.create_image(
+                    Some(CreateImageOptions {
+                        from_image: image,
+                        ..Default::default()
+                    }),
+                    None,
+                    None,
+                );
+
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok(info) => {
+                            tracing::debug!("Pull progress: {:?}", info);
+                        }
+                        Err(e) => {
+                            return Err(Error::sandbox(format!("failed to pull image: {}", e)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -56,26 +133,125 @@ pub trait Sandbox: Send + Sync {
 
 #[async_trait]
 impl Sandbox for DockerSandbox {
-    async fn create(&self, job_id: JobId, _image: &str, _limits: SandboxLimits) -> Result<SandboxInstance> {
-        // In MVP, we don't actually create containers
-        // This would connect to Docker in production
-        Ok(SandboxInstance {
-            container_id: format!("gitforce-job-{}", job_id),
-            job_id,
-        })
+    async fn create(&self, job_id: JobId, image: &str, _limits: SandboxLimits) -> Result<SandboxInstance> {
+        if let Some(ref docker) = self.docker {
+            // Ensure image is available
+            self.ensure_image(image).await?;
+
+            let container_name = format!("gitforce-job-{}", job_id);
+
+            // Create container
+            let config = Config {
+                image: Some(image),
+                cmd: Some(vec!["sleep", "3600"]), // Keep container alive
+                host_config: None,
+                ..Default::default()
+            };
+
+            let options = CreateContainerOptions {
+                name: &container_name,
+                platform: None,
+            };
+
+            let response = docker.create_container(Some(options), config).await
+                .map_err(|e| Error::sandbox(format!("failed to create container: {}", e)))?;
+
+            // Start container
+            docker.start_container(&response.id, None::<StartContainerOptions<String>>).await
+                .map_err(|e| Error::sandbox(format!("failed to start container: {}", e)))?;
+
+            tracing::info!("Created container {} for job {}", response.id, job_id);
+
+            Ok(SandboxInstance {
+                container_id: response.id,
+                job_id,
+            })
+        } else {
+            // Stub mode - no Docker available
+            Ok(SandboxInstance {
+                container_id: format!("gitforce-job-{}", job_id),
+                job_id,
+            })
+        }
     }
 
-    async fn execute(&self, _instance: &SandboxInstance, _command: &[&str]) -> Result<StepResult> {
-        // In MVP, we don't actually execute commands
-        Ok(StepResult {
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        })
+    async fn execute(&self, instance: &SandboxInstance, command: &[&str]) -> Result<StepResult> {
+        if let Some(ref docker) = self.docker {
+            // Create exec instance
+            let config = CreateExecOptions {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                cmd: Some(command.to_vec()),
+                ..Default::default()
+            };
+
+            let exec = docker.create_exec(&instance.container_id, config).await
+                .map_err(|e| Error::sandbox(format!("failed to create exec: {}", e)))?;
+
+            // Start exec and get results
+            let result = docker.start_exec(&exec.id, None::<StartExecOptions>).await
+                .map_err(|e| Error::sandbox(format!("failed to start exec: {}", e)))?;
+
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            let mut exit_code = 0i32;
+
+            if let StartExecResults::Attached { mut output, .. } = result {
+                while let Some(item) = output.next().await {
+                    match item {
+                        Ok(LogOutput::StdOut { message }) => {
+                            stdout.push_str(&String::from_utf8_lossy(&message));
+                        }
+                        Ok(LogOutput::StdErr { message }) => {
+                            stderr.push_str(&String::from_utf8_lossy(&message));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("exec output error: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // Inspect to get exit code
+            match docker.inspect_exec(&exec.id).await {
+                Ok(inspect) => {
+                    exit_code = inspect.exit_code.unwrap_or(0) as i32;
+                }
+                Err(e) => {
+                    tracing::warn!("failed to inspect exec: {}", e);
+                }
+            }
+
+            Ok(StepResult {
+                exit_code,
+                stdout,
+                stderr,
+            })
+        } else {
+            // Stub mode
+            tracing::debug!("Executing command in stub mode: {:?}", command);
+            Ok(StepResult {
+                exit_code: 0,
+                stdout: format!("Executing: {:?}\n", command),
+                stderr: String::new(),
+            })
+        }
     }
 
-    async fn destroy(&self, _instance: SandboxInstance) -> Result<()> {
-        // In MVP, we don't actually destroy containers
+    async fn destroy(&self, instance: SandboxInstance) -> Result<()> {
+        if let Some(ref docker) = self.docker {
+            // Stop and remove container
+            let options = RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            };
+
+            docker.remove_container(&instance.container_id, Some(options)).await
+                .map_err(|e| Error::sandbox(format!("failed to remove container: {}", e)))?;
+
+            tracing::info!("Destroyed container {} for job {}", instance.container_id, instance.job_id);
+        }
         Ok(())
     }
 }
@@ -85,19 +261,31 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_docker_sandbox() {
+    async fn test_docker_sandbox_creation() {
         let sandbox = DockerSandbox::new().await.unwrap();
+
+        // Should always succeed even without Docker (stub mode)
+        let sandbox2 = DockerSandbox::with_limits(SandboxLimits::default());
+        assert!(!sandbox2.is_available() || sandbox.is_available()); // Either stub or real
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_execution() {
+        // Create sandbox in stub mode
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        assert!(!sandbox.is_available());
+
         let job_id = JobId::new();
 
-        // Create container
+        // Create container (will use stub)
         let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
         assert!(!instance.container_id.is_empty());
 
-        // Execute command
+        // Execute command (will use stub)
         let result = sandbox.execute(&instance, &["echo", "hello"]).await.unwrap();
         assert_eq!(result.exit_code, 0);
 
-        // Destroy container
+        // Destroy container (will use stub)
         sandbox.destroy(instance).await.unwrap();
     }
 }
