@@ -72,10 +72,23 @@ impl ApiServer {
 }
 
 /// Health check endpoint
-async fn health_check() -> impl IntoResponse {
+async fn health_check(
+    Extension(pool): Extension<Arc<Pool>>,
+) -> impl IntoResponse {
+    let db_status = match pool.health_check().await {
+        Ok(_) => "connected",
+        Err(e) => {
+            tracing::warn!("database health check failed: {}", e);
+            "disconnected"
+        }
+    };
+
+    let overall_status = if db_status == "connected" { "healthy" } else { "unhealthy" };
+
     Json(HealthResponse {
-        status: "healthy".to_string(),
+        status: overall_status.to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
+        database: db_status.to_string(),
     })
 }
 
@@ -84,6 +97,7 @@ async fn health_check() -> impl IntoResponse {
 pub struct HealthResponse {
     pub status: String,
     pub timestamp: String,
+    pub database: String,
 }
 
 /// Metrics endpoint handler
@@ -128,7 +142,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check() {
-        let response = health_check().await.into_response();
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let response = health_check(Extension(Arc::new(pool))).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
 }
