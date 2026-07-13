@@ -11,6 +11,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use gitforce_db::Pool;
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,7 +25,7 @@ pub struct ApiServer {
 
 impl ApiServer {
     /// Create a new API server
-    pub fn new(jwt_secret: &str) -> Self {
+    pub fn new(jwt_secret: &str, pool: Pool) -> Self {
         let auth = ApiAuth::new(jwt_secret);
         let metrics = Metrics::new();
 
@@ -43,7 +44,8 @@ impl ApiServer {
             .merge(artifact_routes())
             .layer(cors)
             .layer(Extension(Arc::new(auth)))
-            .layer(Extension(Arc::new(metrics)));
+            .layer(Extension(Arc::new(metrics)))
+            .layer(Extension(Arc::new(pool)));
 
         Self { router: app, port: 8080 }
     }
@@ -119,7 +121,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_creation() {
-        let server = ApiServer::new("test-secret");
+        let pool = Pool::memory().await.unwrap();
+        let server = ApiServer::new("test-secret", pool);
         assert_eq!(server.port, 8080);
     }
 

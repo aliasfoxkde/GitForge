@@ -182,6 +182,21 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create artifacts table: {}", e)))?;
 
+        // Create events table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create events table: {}", e)))?;
+
         tracing::info!("database migrations completed successfully");
         Ok(())
     }

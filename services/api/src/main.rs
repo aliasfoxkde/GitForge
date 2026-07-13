@@ -3,6 +3,7 @@
 //! Main entry point for the REST API gateway.
 
 use gitforce_api::ApiServer;
+use gitforce_db::Pool;
 use tokio::signal;
 
 #[tokio::main]
@@ -23,9 +24,17 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "8080".to_string())
         .parse::<u16>()
         .unwrap_or(8080);
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite:/gitforge.db".to_string());
+
+    // Create database pool
+    tracing::info!("connecting to database: {}", database_url);
+    let pool = Pool::new(&database_url).await?;
+    pool.migrate().await?;
+    tracing::info!("database connection established");
 
     // Create and start API server
-    let server = ApiServer::new(&jwt_secret).with_port(port);
+    let server = ApiServer::new(&jwt_secret, pool).with_port(port);
 
     tracing::info!("API Gateway listening on port {}", port);
 
