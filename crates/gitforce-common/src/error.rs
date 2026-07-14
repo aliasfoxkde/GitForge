@@ -195,4 +195,116 @@ mod tests {
         let err = Error::with_source(ErrorKind::Storage, "failed to read", inner);
         assert!(err.source.is_some());
     }
+
+    #[test]
+    fn test_error_kind_display() {
+        assert_eq!(format!("{}", ErrorKind::NotFound), "not_found");
+        assert_eq!(format!("{}", ErrorKind::Authentication), "authentication");
+        assert_eq!(format!("{}", ErrorKind::Authorization), "authorization");
+        assert_eq!(format!("{}", ErrorKind::AlreadyExists), "already_exists");
+        assert_eq!(format!("{}", ErrorKind::InvalidInput), "invalid_input");
+        assert_eq!(format!("{}", ErrorKind::Database), "database");
+        assert_eq!(format!("{}", ErrorKind::GitProtocol), "git_protocol");
+        assert_eq!(format!("{}", ErrorKind::GitRepo), "git_repo");
+        assert_eq!(format!("{}", ErrorKind::EventSystem), "event_system");
+        assert_eq!(format!("{}", ErrorKind::Storage), "storage");
+        assert_eq!(format!("{}", ErrorKind::Sandbox), "sandbox");
+        assert_eq!(format!("{}", ErrorKind::Network), "network");
+        assert_eq!(format!("{}", ErrorKind::Timeout), "timeout");
+        assert_eq!(format!("{}", ErrorKind::Internal), "internal");
+        assert_eq!(format!("{}", ErrorKind::Cancelled), "cancelled");
+    }
+
+    #[test]
+    fn test_error_already_exists() {
+        let err = Error::already_exists("repository", "my-repo");
+        assert_eq!(err.kind, ErrorKind::AlreadyExists);
+        assert!(err.message.contains("my-repo"));
+    }
+
+    #[test]
+    fn test_error_internal() {
+        let err = Error::internal("unexpected condition");
+        assert_eq!(err.kind, ErrorKind::Internal);
+        assert!(err.message.contains("unexpected condition"));
+    }
+
+    #[test]
+    fn test_error_database() {
+        let err = Error::database("connection failed");
+        assert_eq!(err.kind, ErrorKind::Database);
+        assert!(err.message.contains("connection failed"));
+    }
+
+    #[test]
+    fn test_error_git() {
+        let err = Error::git("repository not found");
+        assert_eq!(err.kind, ErrorKind::GitRepo);
+        assert!(err.message.contains("repository not found"));
+    }
+
+    #[test]
+    fn test_error_auth() {
+        let err = Error::auth("invalid token");
+        assert_eq!(err.kind, ErrorKind::Authentication);
+        assert!(err.message.contains("invalid token"));
+    }
+
+    #[test]
+    fn test_error_forbidden() {
+        let err = Error::forbidden("access denied");
+        assert_eq!(err.kind, ErrorKind::Authorization);
+        assert!(err.message.contains("access denied"));
+    }
+
+    #[test]
+    fn test_error_storage() {
+        let err = Error::storage("disk full");
+        assert_eq!(err.kind, ErrorKind::Storage);
+        assert!(err.message.contains("disk full"));
+    }
+
+    #[test]
+    fn test_error_sandbox() {
+        let err = Error::sandbox("container failed to start");
+        assert_eq!(err.kind, ErrorKind::Sandbox);
+        assert!(err.message.contains("container failed to start"));
+    }
+
+    #[test]
+    fn test_error_timeout() {
+        let err = Error::timeout("operation timed out");
+        assert_eq!(err.kind, ErrorKind::Timeout);
+        assert!(err.message.contains("operation timed out"));
+    }
+
+    #[test]
+    fn test_error_cancelled() {
+        let err = Error::cancelled();
+        assert_eq!(err.kind, ErrorKind::Cancelled);
+        assert!(err.message.contains("operation cancelled"));
+    }
+
+    #[test]
+    fn test_error_event_system() {
+        let err = Error::event_system("event channel closed");
+        assert_eq!(err.kind, ErrorKind::EventSystem);
+        assert!(err.message.contains("event channel closed"));
+    }
+
+    #[test]
+    fn test_error_new() {
+        let err = Error::new(ErrorKind::NotFound, "test message");
+        assert_eq!(err.kind, ErrorKind::NotFound);
+        assert_eq!(err.message, "test message");
+        assert!(err.source.is_none());
+    }
+
+    #[test]
+    fn test_error_clone() {
+        let err = Error::not_found("repo", "123");
+        // Error doesn't implement Clone, but we can verify kind and message are correct
+        assert_eq!(err.kind, ErrorKind::NotFound);
+        assert_eq!(err.message, "repo not found: 123");
+    }
 }

@@ -208,4 +208,109 @@ mod tests {
 
         assert!(received.is_some());
     }
+
+    #[test]
+    fn test_event_filter_all() {
+        let filter = EventFilter::all();
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id: gitforce_common::RepoId::new(),
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "abc".to_string(),
+                new_hash: "def".to_string(),
+                pusher_id: None,
+            }),
+            None,
+            None,
+        );
+        assert!(filter.matches(&event));
+    }
+
+    #[test]
+    fn test_event_filter_for_types() {
+        let filter = EventFilter::for_types(vec![EventType::PushReceived]);
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id: gitforce_common::RepoId::new(),
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "abc".to_string(),
+                new_hash: "def".to_string(),
+                pusher_id: None,
+            }),
+            None,
+            None,
+        );
+        assert!(filter.matches(&event));
+    }
+
+    #[test]
+    fn test_event_filter_for_types_no_match() {
+        let filter = EventFilter::for_types(vec![EventType::PushReceived]);
+        let event = EventEnvelope::new(
+            EventType::JobQueued,
+            EventPayload::JobQueued(crate::event::JobQueuedPayload {
+                job_id: gitforce_common::JobId::new(),
+                pipeline_run_id: gitforce_common::PipelineRunId::new(),
+                name: "test-job".to_string(),
+            }),
+            None,
+            None,
+        );
+        assert!(!filter.matches(&event));
+    }
+
+    #[test]
+    fn test_event_filter_for_repo() {
+        let repo_id = gitforce_common::RepoId::new();
+        let filter = EventFilter::for_repo(repo_id);
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "abc".to_string(),
+                new_hash: "def".to_string(),
+                pusher_id: None,
+            }),
+            Some(repo_id),  // Pass repo_id to EventEnvelope::new
+            None,
+        );
+        assert!(filter.matches(&event));
+    }
+
+    #[test]
+    fn test_event_filter_for_repo_no_match() {
+        let filter = EventFilter::for_repo(gitforce_common::RepoId::new());
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id: gitforce_common::RepoId::new(),
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "abc".to_string(),
+                new_hash: "def".to_string(),
+                pusher_id: None,
+            }),
+            None,
+            None,
+        );
+        assert!(!filter.matches(&event));
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_event_bus_new() {
+        let bus = InMemoryEventBus::new();
+        // subscriber_count is async but always returns 0 currently
+        assert_eq!(bus.subscriber_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_event_bus_subscribe_all() {
+        let bus = InMemoryEventBus::new();
+        let stream = bus.subscribe(EventFilter::all()).await.unwrap();
+        let filter = stream.filter();
+        assert!(filter.event_types.is_none());
+        assert!(filter.repo_id.is_none());
+    }
 }
