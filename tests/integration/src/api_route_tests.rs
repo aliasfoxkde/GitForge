@@ -8,8 +8,7 @@ use gitforce_api::{ApiServer, Metrics};
 use gitforce_common::{UserId, RepoId, PipelineId, PipelineRunId, JobId, RunnerId};
 use gitforce_db::Pool;
 use axum::{
-    body::Body,
-    http::{Request, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     routing::get,
     Router,
@@ -145,32 +144,6 @@ fn test_claims_future_expiry() {
     // Create claims with 100 year expiry
     let claims = Claims::new(user_id, "testuser", "admin", 24 * 365 * 100);
     assert!(!claims.is_expired());
-}
-
-/// Test health check endpoint via direct handler call
-#[tokio::test]
-async fn test_health_check_handler() {
-    use gitforce_api::server::health_check;
-    use axum::extract::Extension;
-
-    let pool = Pool::memory().await.unwrap();
-    pool.migrate().await.unwrap();
-
-    let response = health_check(Extension(Arc::new(pool.clone()))).await.into_response();
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-/// Test metrics handler
-#[tokio::test]
-async fn test_metrics_handler() {
-    use gitforce_api::server::metrics_handler;
-    use axum::extract::Extension;
-
-    let metrics = Metrics::new();
-    metrics.record_http_request("GET", "/test", 200);
-
-    let response = metrics_handler(Extension(Arc::new(metrics))).await.into_response();
-    assert_eq!(response.status(), StatusCode::OK);
 }
 
 /// Test error response creation

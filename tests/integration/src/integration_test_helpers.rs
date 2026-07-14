@@ -3,11 +3,9 @@
 use gitforce_common::{JobId, PipelineId, PipelineRunId, RepoId, RunnerId, UserId};
 use gitforce_db::models::{Pipeline, PipelineRun, Repository, Runner, RunnerType, User};
 use gitforce_db::Pool;
-use gitforce_scheduler::{Scheduler, SchedulerServerState, scheduler_routes, create_state};
-use gitforce_ci::{CiEngine, PipelineDefinition, PipelineTriggerEvent, TriggerType, JobDefinition, StepDefinition};
+use gitforce_scheduler::{Scheduler, scheduler_routes, create_state};
+use gitforce_ci::{PipelineDefinition, PipelineTriggerEvent, TriggerType, JobDefinition, StepDefinition};
 use std::collections::HashMap;
-use axum::{Router, extract::Request, body::Body};
-use tower::util::ServiceExt;
 
 /// Create a test user
 pub fn create_test_user(username: &str) -> User {
@@ -102,8 +100,8 @@ pub fn create_test_scheduler() -> Scheduler {
 }
 
 /// Create scheduler routes for testing
-pub fn create_scheduler_test_app() -> Router {
-    let scheduler = create_test_scheduler();
+pub fn create_scheduler_test_app() -> axum::Router {
+    let scheduler = Scheduler::new();
     let state = create_state(scheduler);
     scheduler_routes(state)
 }

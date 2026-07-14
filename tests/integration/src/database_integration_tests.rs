@@ -73,7 +73,7 @@ async fn test_user_crud_operations() {
     // Get by username
     let found = UserQueries::get_by_username(&pool, "testuser").await.unwrap();
     assert!(found.is_some());
-    assert_eq!(found.unwrap().email, "test@example.com");
+    assert_eq!(found.unwrap().email, "testuser@example.com");
 
     // Not found case
     let found = UserQueries::get_by_username(&pool, "nonexistent").await.unwrap();

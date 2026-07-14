@@ -9,6 +9,7 @@
 //! - **RESTful Endpoints**: Repos, CI, Runners, Artifacts
 
 pub mod auth;
+pub mod dashboard;
 pub mod metrics;
 pub mod metrics_middleware;
 pub mod middleware;

@@ -1,6 +1,7 @@
 //! API server
 
 use crate::auth::ApiAuth;
+use crate::dashboard::dashboard_routes;
 use crate::metrics::Metrics;
 use crate::metrics_middleware::MetricsLayer;
 use crate::openapi::api_docs_routes;
@@ -47,6 +48,7 @@ impl ApiServer {
         let public_routes = Router::new()
             .route("/health", get(health_check))
             .route("/metrics", get(metrics_handler))
+            .merge(dashboard_routes())
             .merge(api_docs_routes());
 
         // Protected routes (auth required)
