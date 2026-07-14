@@ -1,10 +1,8 @@
 //! API server
 
 use crate::auth::ApiAuth;
-use crate::dashboard::dashboard_routes;
 use crate::metrics::Metrics;
 use crate::metrics_middleware::MetricsLayer;
-use crate::openapi::api_docs_routes;
 use crate::routes::{artifact_routes, ci_routes, repo_routes, runner_routes};
 use axum::{
     extract::Extension,
@@ -45,11 +43,18 @@ impl ApiServer {
             .allow_headers(Any);
 
         // Public routes (no auth required)
-        let public_routes = Router::new()
-            .route("/health", get(health_check))
-            .route("/metrics", get(metrics_handler))
-            .merge(dashboard_routes())
-            .merge(api_docs_routes());
+        let health = Router::new().route("/health", get(health_check));
+        let metrics = Router::new().route("/metrics", get(metrics_handler));
+        let swagger = Router::new()
+            .route("/swagger-ui", get(crate::openapi::swagger_ui))
+            .route("/api-docs/openapi.json", get(crate::openapi::openapi_spec));
+        let dashboard = crate::dashboard::dashboard_routes();
+
+        let mut public_routes = Router::new();
+        public_routes = public_routes.merge(health);
+        public_routes = public_routes.merge(metrics);
+        public_routes = public_routes.merge(dashboard);
+        public_routes = public_routes.merge(swagger);
 
         // Protected routes (auth required)
         let protected_routes = Router::new()

@@ -465,7 +465,7 @@ pub async fn swagger_ui() -> impl IntoResponse {
 pub fn api_docs_routes() -> Router {
     Router::new()
         .route("/api-docs/openapi.json", get(openapi_spec))
-        .route("/", get(swagger_ui))
+        .route("/swagger-ui", get(swagger_ui))
 }
 
 #[cfg(test)]
