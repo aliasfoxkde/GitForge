@@ -13,34 +13,34 @@ import (
 
 // CoverageTarget defines minimum coverage requirements.
 type CoverageTarget struct {
-	Branch    float64 // e.g., 0.80 for 80%
-	Function  float64
-	Line      float64
-	Path      float64
+	Branch   float64 // e.g., 0.80 for 80%
+	Function float64
+	Line     float64
+	Path     float64
 }
 
 // HarnessConfig configures the test harness.
 type HarnessConfig struct {
 	// Test configuration
-	Timeout       time.Duration
-	RetryCount    int
-	Parallelism   int
+	Timeout     time.Duration
+	RetryCount  int
+	Parallelism int
 
 	// Coverage targets
 	CoverageTarget CoverageTarget
 
 	// AI configuration
-	AIEnabled     bool
-	AIModel       string
-	AICoverageMode bool  // Analyze uncovered code with AI
+	AIEnabled      bool
+	AIModel        string
+	AICoverageMode bool // Analyze uncovered code with AI
 
 	// Reporter configuration
-	ReportPath    string
-	ReportFormat  string // "json", "html", "sarif"
+	ReportPath   string
+	ReportFormat string // "json", "html", "sarif"
 
 	// Debug
-	Verbose       bool
-	DebugPort     int
+	Verbose   bool
+	DebugPort int
 }
 
 // Harness is the main E2E testing harness.
@@ -62,10 +62,10 @@ type Harness struct {
 
 // CoverageReport holds coverage data.
 type CoverageReport struct {
-	Branch  float64 `json:"branch"`
+	Branch   float64 `json:"branch"`
 	Function float64 `json:"function"`
-	Line    float64 `json:"line"`
-	Path    float64 `json:"path"`
+	Line     float64 `json:"line"`
+	Path     float64 `json:"path"`
 
 	Uncovered []UncoveredBlock `json:"uncovered,omitempty"`
 
@@ -82,12 +82,12 @@ type UncoveredBlock struct {
 
 // TestResult holds the result of a single test.
 type TestResult struct {
-	Name      string        `json:"name"`
-	Status    string        `json:"status"` // pass, fail, skip
-	Duration  time.Duration `json:"duration"`
+	Name      string          `json:"name"`
+	Status    string          `json:"status"` // pass, fail, skip
+	Duration  time.Duration   `json:"duration"`
 	Coverage  *CoverageReport `json:"coverage,omitempty"`
-	Errors    []string      `json:"errors,omitempty"`
-	DebugInfo string        `json:"debug_info,omitempty"`
+	Errors    []string        `json:"errors,omitempty"`
+	DebugInfo string          `json:"debug_info,omitempty"`
 }
 
 // NewHarness creates and initializes a new test harness.
@@ -105,11 +105,11 @@ func NewHarness(ctx context.Context, config HarnessConfig) (*Harness, error) {
 	ctx, cancel := context.WithTimeout(ctx, config.Timeout)
 
 	h := &Harness{
-		config:     config,
-		ctx:        ctx,
-		cancel:     cancel,
-		sessionID:  generateSessionID(),
-		startTime:  time.Now(),
+		config:      config,
+		ctx:         ctx,
+		cancel:      cancel,
+		sessionID:   generateSessionID(),
+		startTime:   time.Now(),
 		testResults: make([]TestResult, 0),
 	}
 

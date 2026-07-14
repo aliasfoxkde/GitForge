@@ -1,11 +1,12 @@
 // Package health provides health check patterns for Go services.
 // Purpose: Kubernetes-compatible health endpoints with readiness and liveness probes.
 // Usage:
-//   checker := health.NewChecker()
-//   checker.AddReadiness("db", db.Ping)
-//   checker.AddLiveness("goroutines", health.GoroutineCountCheck)
-//   http.HandleFunc("/health/ready", checker.ReadinessHandler())
-//   http.HandleFunc("/health/live", checker.LivenessHandler())
+//
+//	checker := health.NewChecker()
+//	checker.AddReadiness("db", db.Ping)
+//	checker.AddLiveness("goroutines", health.GoroutineCountCheck)
+//	http.HandleFunc("/health/ready", checker.ReadinessHandler())
+//	http.HandleFunc("/health/live", checker.LivenessHandler())
 //
 // Dependencies: standard library only
 package health

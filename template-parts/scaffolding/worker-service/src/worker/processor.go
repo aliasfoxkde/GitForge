@@ -21,11 +21,11 @@ type Job struct {
 
 // JobResult holds the outcome of processing a job.
 type JobResult struct {
-	JobID      string
-	Success    bool
-	Output     interface{}
-	Error      error
-	Duration   time.Duration
+	JobID       string
+	Success     bool
+	Output      interface{}
+	Error       error
+	Duration    time.Duration
 	ShouldRetry bool
 }
 
@@ -62,8 +62,8 @@ func (p *Processor) ProcessMessage(ctx context.Context, job *Job) *JobResult {
 		return &JobResult{
 			JobID:       job.ID,
 			Success:     false,
-			Error:      ctx.Err(),
-			Duration:   time.Since(start),
+			Error:       ctx.Err(),
+			Duration:    time.Since(start),
 			ShouldRetry: false,
 		}
 	default:
@@ -77,10 +77,10 @@ func (p *Processor) ProcessMessage(ctx context.Context, job *Job) *JobResult {
 	default:
 		logger.Warn("unknown job type, acknowledging to prevent requeue")
 		result = &JobResult{
-			JobID:      job.ID,
-			Success:   true,
-			Output:    "unknown job type acknowledged",
-			Duration:  time.Since(start),
+			JobID:    job.ID,
+			Success:  true,
+			Output:   "unknown job type acknowledged",
+			Duration: time.Since(start),
 		}
 	}
 
@@ -106,9 +106,9 @@ func (p *Processor) handleExampleJob(ctx context.Context, job *Job) *JobResult {
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return &JobResult{
 			JobID:       job.ID,
-			Success:    false,
-			Error:      err,
-			Duration:   time.Since(time.Now()),
+			Success:     false,
+			Error:       err,
+			Duration:    time.Since(time.Now()),
 			ShouldRetry: false,
 		}
 	}
@@ -118,9 +118,9 @@ func (p *Processor) handleExampleJob(ctx context.Context, job *Job) *JobResult {
 	case <-ctx.Done():
 		return &JobResult{
 			JobID:       job.ID,
-			Success:    false,
-			Error:      ctx.Err(),
-			Duration:   time.Since(time.Now()),
+			Success:     false,
+			Error:       ctx.Err(),
+			Duration:    time.Since(time.Now()),
 			ShouldRetry: true,
 		}
 	case <-time.After(100 * time.Millisecond):
@@ -134,7 +134,7 @@ func (p *Processor) handleExampleJob(ctx context.Context, job *Job) *JobResult {
 			"processed": payload.Message,
 			"status":    "ok",
 		},
-		Duration:   time.Since(time.Now()),
+		Duration:    time.Since(time.Now()),
 		ShouldRetry: false,
 	}
 }

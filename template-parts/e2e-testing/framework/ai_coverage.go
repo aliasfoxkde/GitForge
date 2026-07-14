@@ -7,8 +7,8 @@ import (
 
 // AICoverageAnalyzer uses AI to identify coverage gaps and suggest tests.
 type AICoverageAnalyzer struct {
-	model   string
-	mode    bool
+	model string
+	mode  bool
 }
 
 // NewAICoverageAnalyzer creates a new AI coverage analyzer.

@@ -53,11 +53,11 @@ type Session struct {
 	err   error
 
 	// Metadata
-	Browser   string
-	Viewport  string
-	BaseURL   string
-	Tags      []string
-	Metadata  map[string]string
+	Browser  string
+	Viewport string
+	BaseURL  string
+	Tags     []string
+	Metadata map[string]string
 
 	// Parallel execution support
 	Workers   int
@@ -92,7 +92,7 @@ func NewSession(ctx context.Context, name string, opts ...SessionOption) (*Sessi
 		Timeout:   30 * time.Minute,
 		state:     SessionStateInit,
 		Metadata:  make(map[string]string),
-		Workers:  1,
+		Workers:   1,
 	}
 
 	for _, opt := range opts {

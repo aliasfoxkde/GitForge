@@ -18,9 +18,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -151,9 +151,9 @@ type Record map[string]interface{}
 type Stage string
 
 const (
-	StageExtract  Stage = "extract"
+	StageExtract   Stage = "extract"
 	StageTransform Stage = "transform"
-	StageLoad     Stage = "load"
+	StageLoad      Stage = "load"
 )
 
 // Pipeline represents the ETL pipeline state
@@ -169,7 +169,7 @@ type Pipeline struct {
 	doneChan   chan struct{}
 
 	// External connections
-	dbPool    *pgxpool.Pool
+	dbPool      *pgxpool.Pool
 	redisClient *redis.Client
 
 	// Metrics

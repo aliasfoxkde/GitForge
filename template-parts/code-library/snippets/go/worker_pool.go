@@ -1,15 +1,16 @@
 // Package workerpool implements a fixed-size worker pool with fan-in for Go.
 // Purpose: Execute tasks concurrently with bounded parallelism and collect results.
 // Usage:
-//   pool := workerpool.New(4, 100) // 4 workers, buffer for 100 tasks
-//   pool.Start()
-//   for _, task := range tasks {
-//       pool.Submit(task)
-//   }
-//   pool.Stop()
-//   for result := range pool.Results() {
-//       // process result
-//   }
+//
+//	pool := workerpool.New(4, 100) // 4 workers, buffer for 100 tasks
+//	pool.Start()
+//	for _, task := range tasks {
+//	    pool.Submit(task)
+//	}
+//	pool.Stop()
+//	for result := range pool.Results() {
+//	    // process result
+//	}
 //
 // Dependencies: standard library only
 package workerpool
@@ -30,14 +31,14 @@ type Result struct {
 
 // Pool manages a pool of workers that process tasks and collect results.
 type Pool struct {
-	workers   int
-	taskCh    chan Task
-	resultCh  chan Result
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	started   bool
-	mu        sync.RWMutex
+	workers  int
+	taskCh   chan Task
+	resultCh chan Result
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	started  bool
+	mu       sync.RWMutex
 }
 
 // New creates a new worker pool with the specified number of workers.

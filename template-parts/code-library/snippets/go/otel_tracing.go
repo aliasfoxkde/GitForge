@@ -1,12 +1,15 @@
 // Package otel provides OpenTelemetry tracing setup and propagation for Go.
 // Purpose: Distributed tracing for observability across service boundaries.
 // Usage:
-//   tp, shutdown := otel.SetupTracing(ctx, "myservice", "localhost:4317")
-   defer shutdown()
-//   span := otel.StartSpan(ctx, "operation-name")
-//   defer span.End()
-//   // ... do work
-//   span.RecordError(err)
+//
+//	tp, shutdown := otel.SetupTracing(ctx, "myservice", "localhost:4317")
+//
+// defer shutdown()
+//
+//	span := otel.StartSpan(ctx, "operation-name")
+//	defer span.End()
+//	// ... do work
+//	span.RecordError(err)
 //
 // Dependencies: go.opentelemetry.io/otel, go.opentelemetry.io/otel/trace
 // Install: go get go.opentelemetry.io/otel@latest
@@ -46,7 +49,7 @@ func DefaultConfig(serviceName string) Config {
 
 // TracerProvider holds the trace provider and cleanup function.
 type TracerProvider struct {
-	TP      *sdktrace.TracerProvider
+	TP       *sdktrace.TracerProvider
 	Shutdown func(context.Context) error
 }
 
@@ -166,10 +169,10 @@ func IsRecording(ctx context.Context) bool {
 
 // Attributes helper for common attribute types.
 var (
-	AttrString  = attribute.String
-	AttrInt     = attribute.Int64
-	AttrFloat   = attribute.Float64
-	AttrBool    = attribute.Bool
+	AttrString   = attribute.String
+	AttrInt      = attribute.Int64
+	AttrFloat    = attribute.Float64
+	AttrBool     = attribute.Bool
 	AttrIntSlice = func(k string, v []int) attribute.KeyValue {
 		return attribute.Int64Slice(k, toInt64Slice(v))
 	}

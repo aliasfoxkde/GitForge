@@ -11,10 +11,10 @@ import (
 
 // Version info set at build time via ldflags
 var (
-	version   = "dev"
-	commit    = "unknown"
-	date      = "unknown"
-	builtBy   = "unknown"
+	version = "dev"
+	commit  = "unknown"
+	date    = "unknown"
+	builtBy = "unknown"
 )
 
 // rootCmd represents the base command when called without any subcommands

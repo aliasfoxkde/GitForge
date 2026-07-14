@@ -13,7 +13,7 @@ type Config struct {
 	MaxAttempts int
 	BaseDelay   time.Duration
 	MaxDelay    time.Duration
-	Jitter      bool  // Add randomness to delay
+	Jitter      bool                         // Add randomness to delay
 	OnRetry     func(attempt int, err error) // Called before each retry
 }
 

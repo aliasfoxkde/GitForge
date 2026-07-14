@@ -1,9 +1,10 @@
 // Package ratelimiter implements a token bucket rate limiter for Go.
 // Purpose: Control the rate of operations to prevent overwhelming downstream services.
 // Usage:
-//   limiter := ratelimiter.New(100, time.Second) // 100 requests per second
-//   if err := limiter.Wait(ctx); err != nil { return err }
-//   doWork()
+//
+//	limiter := ratelimiter.New(100, time.Second) // 100 requests per second
+//	if err := limiter.Wait(ctx); err != nil { return err }
+//	doWork()
 //
 // Dependencies: standard library only
 package ratelimiter
@@ -21,10 +22,10 @@ var ErrRateLimited = errors.New("rate limit exceeded")
 // Limiter implements a token bucket rate limiter.
 type Limiter struct {
 	mu       sync.Mutex
-	rate     float64         // tokens per second
-	capacity int             // max tokens (bucket size)
-	tokens   float64         // current available tokens
-	lastTime time.Time       // last token refill time
+	rate     float64   // tokens per second
+	capacity int       // max tokens (bucket size)
+	tokens   float64   // current available tokens
+	lastTime time.Time // last token refill time
 
 	// Optional channel for async notification
 	notifyCh chan struct{}
@@ -34,11 +35,11 @@ type Limiter struct {
 // rate specifies tokens per second, capacity is the max bucket size.
 func New(rate float64, capacity int) *Limiter {
 	return &Limiter{
-		rate:       rate,
-		capacity:   capacity,
-		tokens:     float64(capacity),
-		lastTime:   time.Now(),
-		notifyCh:   make(chan struct{}, 1),
+		rate:     rate,
+		capacity: capacity,
+		tokens:   float64(capacity),
+		lastTime: time.Now(),
+		notifyCh: make(chan struct{}, 1),
 	}
 }
 

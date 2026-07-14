@@ -43,11 +43,11 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		AMQPURL:         getEnv("AMQP_URL", ""),
 		KAFKABrokers:    getEnv("KAFKA_BROKERS", ""),
-		WorkerCount:    4,
-		LogLevel:       "info",
+		WorkerCount:     4,
+		LogLevel:        "info",
 		ShutdownTimeout: 30,
-		DatabaseDSN:    getEnv("DATABASE_DSN", ""),
-		MetricsAddr:    getEnv("METRICS_ADDR", ":9090"),
+		DatabaseDSN:     getEnv("DATABASE_DSN", ""),
+		MetricsAddr:     getEnv("METRICS_ADDR", ":9090"),
 	}
 
 	if v := getEnv("WORKER_COUNT", ""); v != "" {

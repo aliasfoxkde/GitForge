@@ -46,7 +46,7 @@ func GetItem(id uint64) (*models.Item, error) {
 	if !ok {
 		return nil, ErrItemNotFound
 	}
-副本 := *item
+	副本 := *item
 	return &副本, nil
 }
 
@@ -86,7 +86,7 @@ func UpdateItem(id uint64, req *models.UpdateItemRequest) (*models.Item, error) 
 	}
 	item.UpdatedAt = time.Now()
 
-副本 := *item
+	副本 := *item
 	return &副本, nil
 }
 

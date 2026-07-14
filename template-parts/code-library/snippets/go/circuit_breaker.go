@@ -1,12 +1,13 @@
 // Package circuitbreaker implements the circuit breaker pattern for Go.
 // Purpose: Prevent cascading failures by stopping requests to a failing service.
 // Usage:
-//   cb := circuitbreaker.New(breaker.Config{
-//       MaxRequests: 3,
-//       Interval:   30 * time.Second,
-//       Timeout:    10 * time.Second,
-//   })
-//   err := cb.Execute(func() error { return callService() })
+//
+//	cb := circuitbreaker.New(breaker.Config{
+//	    MaxRequests: 3,
+//	    Interval:   30 * time.Second,
+//	    Timeout:    10 * time.Second,
+//	})
+//	err := cb.Execute(func() error { return callService() })
 //
 // Dependencies: standard library only
 package circuitbreaker
@@ -56,8 +57,8 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		MaxRequests: 1,
-		Interval:   30 * time.Second,
-		Timeout:    10 * time.Second,
+		Interval:    30 * time.Second,
+		Timeout:     10 * time.Second,
 	}
 }
 

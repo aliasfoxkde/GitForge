@@ -69,23 +69,23 @@ func (r *Reporter) GenerateReport(results []TestResult, summary *Summary) error 
 
 // Summary holds aggregated test statistics.
 type Summary struct {
-	Total      int
-	Passed     int
-	Failed     int
-	Skipped    int
-	TotalTime  time.Duration
-	Coverage   *CoverageReport
-	PassRate   float64
-	SessionID  string
+	Total       int
+	Passed      int
+	Failed      int
+	Skipped     int
+	TotalTime   time.Duration
+	Coverage    *CoverageReport
+	PassRate    float64
+	SessionID   string
 	GeneratedAt time.Time
 }
 
 // GenerateSummary creates a summary from test results.
 func GenerateSummary(results []TestResult, sessionID string) *Summary {
 	s := &Summary{
-		Total:      len(results),
-		PassRate:   100.0,
-		SessionID:  sessionID,
+		Total:       len(results),
+		PassRate:    100.0,
+		SessionID:   sessionID,
 		GeneratedAt: time.Now(),
 	}
 
@@ -192,9 +192,9 @@ type Run struct {
 }
 
 type Result struct {
-	RuleID    string   `json:"ruleId"`
-	Level    string   `json:"level"`
-	Message   string   `json:"message"`
+	RuleID    string     `json:"ruleId"`
+	Level     string     `json:"level"`
+	Message   string     `json:"message"`
 	Locations []Location `json:"locations"`
 }
 
@@ -226,7 +226,7 @@ func toSARIF(results []TestResult, summary *Summary) *SARIF {
 			sarif.Runs[0].Results = append(sarif.Runs[0].Results, Result{
 				RuleID:  "e2e-test",
 				Level:   level,
-				Message:  strings.Join(r.Errors, "; "),
+				Message: strings.Join(r.Errors, "; "),
 				Locations: []Location{
 					{URI: r.Name},
 				},

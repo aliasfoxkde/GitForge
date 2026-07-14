@@ -65,10 +65,10 @@ func (c *RabbitConsumer) Connect() error {
 	// Declare the queue (idempotent)
 	_, err = ch.QueueDeclare(
 		"jobs", // name
-		true,  // durable
-		false, // delete when unused
-		false, // exclusive
-		false, // no-wait
+		true,   // durable
+		false,  // delete when unused
+		false,  // exclusive
+		false,  // no-wait
 		amqp.Table{
 			"x-message-ttl": int32(86400000), // 24 hours
 		},

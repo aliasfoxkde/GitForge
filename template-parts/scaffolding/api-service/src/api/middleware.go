@@ -67,8 +67,8 @@ func RateLimitMiddleware() gin.HandlerFunc {
 	var (
 		mu             sync.Mutex
 		windows        = make(map[string]*window)
-		limit          = 100          // requests per window
-		windowDuration = time.Minute  // window duration
+		limit          = 100         // requests per window
+		windowDuration = time.Minute // window duration
 	)
 
 	cleanup := func() {

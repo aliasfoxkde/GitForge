@@ -12,11 +12,11 @@ import (
 
 // Config holds all application configuration
 type Config struct {
-	ConfigPath    string
-	Verbose       bool
-	OutputFormat  string
-	Timeout       int
-	Environment   string
+	ConfigPath   string
+	Verbose      bool
+	OutputFormat string
+	Timeout      int
+	Environment  string
 }
 
 // Viper instance for configuration management

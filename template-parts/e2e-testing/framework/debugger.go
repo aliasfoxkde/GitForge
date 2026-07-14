@@ -15,25 +15,25 @@ import (
 type DebugConfig struct {
 	Enabled bool
 
-	ScreenshotPath string
-	CaptureConsole bool
-	ConsoleLogPath string
-	CaptureNetwork bool
-	NetworkLogPath string
+	ScreenshotPath     string
+	CaptureConsole     bool
+	ConsoleLogPath     string
+	CaptureNetwork     bool
+	NetworkLogPath     string
 	DumpStateOnFailure bool
 	StateDumpPath      string
-	DebugServer bool
-	DebugPort   int
+	DebugServer        bool
+	DebugPort          int
 }
 
 // Debugger provides debugging utilities for E2E tests.
 type Debugger struct {
-	config     DebugConfig
-	sessionID  string
+	config    DebugConfig
+	sessionID string
 
-	consoleLogs  []ConsoleLog
-	networkLogs  []NetworkLog
-	screenshots  []Screenshot
+	consoleLogs []ConsoleLog
+	networkLogs []NetworkLog
+	screenshots []Screenshot
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -49,14 +49,14 @@ type ConsoleLog struct {
 
 // NetworkLog represents a captured network request/response.
 type NetworkLog struct {
-	Method         string            `json:"method"`
-	URL            string            `json:"url"`
-	Status         int               `json:"status"`
+	Method          string            `json:"method"`
+	URL             string            `json:"url"`
+	Status          int               `json:"status"`
 	RequestHeaders  map[string]string `json:"request_headers"`
 	ResponseHeaders map[string]string `json:"response_headers"`
-	Body           string            `json:"body,omitempty"`
-	Duration       time.Duration     `json:"duration"`
-	Timestamp      time.Time         `json:"timestamp"`
+	Body            string            `json:"body,omitempty"`
+	Duration        time.Duration     `json:"duration"`
+	Timestamp       time.Time         `json:"timestamp"`
 }
 
 // Screenshot represents a captured screenshot.
@@ -70,13 +70,13 @@ type Screenshot struct {
 
 // StateDump represents a captured application state.
 type StateDump struct {
-	SessionID  string                 `json:"session_id"`
-	Timestamp  time.Time              `json:"timestamp"`
-	URL        string                 `json:"url"`
+	SessionID      string                 `json:"session_id"`
+	Timestamp      time.Time              `json:"timestamp"`
+	URL            string                 `json:"url"`
 	LocalStorage   map[string]interface{} `json:"local_storage,omitempty"`
 	SessionStorage map[string]interface{} `json:"session_storage,omitempty"`
-	Cookies    []Cookie               `json:"cookies,omitempty"`
-	CustomData map[string]interface{}  `json:"custom_data,omitempty"`
+	Cookies        []Cookie               `json:"cookies,omitempty"`
+	CustomData     map[string]interface{} `json:"custom_data,omitempty"`
 }
 
 // Cookie represents a browser cookie.
@@ -95,8 +95,8 @@ func NewDebugger(sessionID string, config DebugConfig) *Debugger {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	d := &Debugger{
-		config:     config,
-		sessionID:  sessionID,
+		config:      config,
+		sessionID:   sessionID,
 		consoleLogs: make([]ConsoleLog, 0),
 		networkLogs: make([]NetworkLog, 0),
 		screenshots: make([]Screenshot, 0),

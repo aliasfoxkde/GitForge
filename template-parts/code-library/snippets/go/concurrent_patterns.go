@@ -24,9 +24,9 @@ func NewRunner(concurrency int) *Runner {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{
 		concurrency: concurrency,
-		errCh:      make(chan error, concurrency),
-		ctx:        ctx,
-		cancel:     cancel,
+		errCh:       make(chan error, concurrency),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
@@ -68,11 +68,11 @@ func (r *Runner) Cancel() {
 
 // WorkerPool creates a fixed-size pool of workers.
 type WorkerPool struct {
-	workers   int
-	taskCh    chan Task
-	resultCh  chan error
-	ctx       context.Context
-	cancel    context.CancelFunc
+	workers  int
+	taskCh   chan Task
+	resultCh chan error
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 // NewWorkerPool creates a new worker pool.
