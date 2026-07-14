@@ -1,6 +1,6 @@
 //! Job executor
 
-use gitforce_common::{Error, JobId, Result, RunnerId};
+use gitforce_common::{JobId, Result};
 use gitforce_sandbox::{DockerSandbox, Sandbox, SandboxInstance, SandboxLimits, StepResult};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -126,7 +126,7 @@ impl JobExecutor {
             tracing::debug!("executing step: {}", step.name);
 
             // Build command
-            let mut cmd = vec!["sh", "-c", &step.run];
+            let cmd = vec!["sh", "-c", &step.run];
 
             // Execute step
             let result = self.sandbox.execute(&instance, &cmd).await;

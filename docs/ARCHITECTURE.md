@@ -1,67 +1,150 @@
-# Architecture
+# GitForge Architecture
 
 ## Overview
 
-Dark Factory is a template repository for bootstrapping production-grade
-software projects with built-in CI/CD, testing, and documentation coverage.
+GitForge is a self-hosted Git platform with CI/CD capabilities, built in Rust. It provides Git hosting, pipeline automation, and job execution through a modular microservice architecture.
 
-## Core Principles
+## System Architecture
 
-1. **Test coverage as you go** — Not deferred to the end
-2. **Git as the source of truth** — All configuration in git
-3. **Automation everywhere** — Human intervention only when necessary
-4. **Documentation is code** — Inline docs, ADRs, and READMEs kept in sync
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                         GitForge Platform                              │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  ┌─────────────┐      ┌─────────────┐      ┌─────────────┐         │
+│  │   Client     │─────▶│  API Server │─────▶│  Database   │         │
+│  │  (curl/CLI) │      │  (Axum)     │      │  (SQLite)   │         │
+│  └─────────────┘      └─────────────┘      └─────────────┘         │
+│                              │                                       │
+│                              ▼                                       │
+│  ┌─────────────┐      ┌─────────────┐      ┌─────────────┐         │
+│  │ Git Server  │◀────▶│  CI Service │◀────▶│  Scheduler  │         │
+│  │  (SSH/HTTP) │      │             │      │             │         │
+│  └─────────────┘      └─────────────┘      └─────────────┘         │
+│                              │                    │                  │
+│                              │                    │                  │
+│                              ▼                    ▼                  │
+│                       ┌─────────────┐      ┌─────────────┐         │
+│                       │   Runner    │◀────▶│   Docker    │         │
+│                       │  (Agent)    │      │  (bollard)  │         │
+│                       └─────────────┘      └─────────────┘         │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 ## Components
 
-### GitHub Actions Workflows
+### Crates (Library Code)
 
-| Workflow | Trigger | Purpose |
-|----------|---------|---------|
-| `ci.yml` | push, PR | Main test + lint + build pipeline |
-| `security.yml` | push, schedule | CodeQL, govulncheck, secrets scan |
-| `auto-merge.yml` | PR | Auto-merge Dependabot + same-repo PRs |
-| `release.yml` | tag push | GoReleaser cross-platform builds |
-| `wiki.yml` | push to wiki/ | Publish wiki from `.github/wiki/` |
-| `setup-repo.yml` | manual | Configure non-templatable GitHub settings |
+| Crate | Purpose |
+|-------|---------|
+| `gitforce-common` | Shared types, UUIDs, errors, time utilities |
+| `gitforce-db` | Database models, connection pool, SQLite queries |
+| `gitforce-events` | Event bus, event types, event streaming |
+| `gitforce-ci` | Pipeline orchestration, DAG execution |
+| `gitforce-scheduler` | Job queue, runner assignment, scheduling policies |
+| `gitforce-runner` | Job execution agent, Docker integration |
+| `gitforce-sandbox` | Container isolation via Docker |
+| `gitforce-storage` | Artifact storage, cache management |
+| `gitforce-core` | Git protocol handlers, repository management |
+| `gitforce-api` | REST API gateway |
 
-### Git Hooks
+### Services (Binaries)
 
-| Hook | Purpose |
-|------|---------|
-| `pre-commit` | Format, vet, selective tests, coverage, bundle rebuild |
-| `pre-push` | Full test suite with coverage gate |
-
-### Template Parts
-
-Modular, language-specific starter kits:
-
-- `template-parts/go/` — Go module structure
-- `template-parts/e2e-testing/` — E2E test harness
-- `template-parts/code-library/` — Reusable snippets
+| Service | Port | Purpose |
+|---------|------|---------|
+| `api` | 8080 | REST API gateway |
+| `ci` | - | CI orchestration |
+| `git-server` | 2222 (SSH), 8082 (HTTP) | Git hosting |
+| `runner` | - | Job execution |
 
 ## Data Flow
 
+### Push to Pipeline Trigger
+
 ```
-Developer → git commit → pre-commit hook
-                          ├── gofmt / goimports
-                          ├── go vet
-                          ├── selective tests (if core/ changed)
-                          └── coverage gate
-
-git push → GitHub Actions
-              ├── ci.yml (required checks)
-              ├── security.yml
-              └── auto-merge.yml (on PR merge)
-
-Tag push → release.yml → GoReleaser → GitHub Releases
+Git Push → Git Server → PushReceived Event → Event Bus
+                                              │
+                                              ▼
+                                    CI Service (Event Consumer)
+                                              │
+                                              ▼
+                                    Pipeline Engine (DAG build)
+                                              │
+                                              ▼
+                                    Scheduler (Job enqueue)
+                                              │
+                                              ▼
+                                    Runner (Job fetch & execute)
+                                              │
+                                              ▼
+                                    Docker Container (Job run)
 ```
 
-## Configuration
+### API Request Flow
 
-All configuration is environment-driven:
+```
+Client → API Server → Auth Middleware → Route Handler
+                    │                      │
+                    │                      ▼
+                    │              Database (SQLite)
+                    │
+                    ▼
+              Response
+```
 
-- `vars.COVERAGE_THRESHOLD` — Minimum coverage % (default: 70)
-- `vars.GO_VERSIONS` — JSON array of Go versions to test
-- `vars.GOLANGCI_LINT_VERSION` — golangci-lint version
-- `vars.DEFAULT_BRANCH` — Default branch name
+## Event System
+
+The event system uses an in-memory broadcast channel:
+
+- `PushReceived` - Git push received
+- `PipelineTriggered` - Pipeline started
+- `PipelineFinished` - Pipeline completed
+- `JobQueued` - Job added to queue
+- `JobStarted` - Job execution started
+- `JobFinished` - Job execution completed
+- `RunnerRegistered` - Runner joined cluster
+- `RunnerHeartbeat` - Runner health ping
+- `RunnerOffline` - Runner disconnected
+
+## Security
+
+### Authentication
+
+All API endpoints (except `/health`, `/metrics`, `/swagger-ui`, `/api-docs`) require JWT authentication.
+
+Token format:
+- Algorithm: HS256
+- Expiry: 24 hours
+- Claims: user_id, username, role
+
+### CORS
+
+Configurable CORS origins. Default allows any origin in development.
+
+## Database Schema
+
+### Core Tables
+
+- `users` - User accounts
+- `repositories` - Git repositories
+- `pipelines` - Pipeline definitions
+- `pipeline_runs` - Pipeline execution instances
+- `jobs` - Individual job executions
+- `runners` - Runner agents
+- `events` - Event log
+
+## Deployment
+
+GitForge is deployed via Docker Compose:
+
+```yaml
+services:
+  api:        # REST gateway
+  ci:         # Pipeline orchestrator
+  scheduler:  # Job queue manager
+  runner:     # Job executor (scalable)
+  git-server: # Git SSH/HTTP
+```
+
+See `docs/DEPLOYMENT.md` for detailed deployment instructions.

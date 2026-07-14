@@ -1,0 +1,113 @@
+# GitForge Configuration Example
+# Copy to config.toml and customize for your environment
+
+# =============================================================================
+# Server Configuration
+# =============================================================================
+[server]
+host = "0.0.0.0"
+port = 8080
+
+# =============================================================================
+# Database Configuration
+# =============================================================================
+[database]
+# SQLite for MVP (single instance)
+url = "sqlite:/data/gitforge.db"
+
+# PostgreSQL for production (recommended)
+# url = "postgres://gitforge:password@postgres:5432/gitforge"
+
+# =============================================================================
+# Authentication
+# =============================================================================
+[auth]
+# JWT secret - CHANGE THIS IN PRODUCTION!
+jwt_secret = "changeme-in-production-min-32-chars"
+token_expiry_hours = 24
+
+# =============================================================================
+# Git Server
+# =============================================================================
+[git_server]
+ssh_port = 2222
+http_port = 8082
+git_root = "/git"
+
+# =============================================================================
+# CI/CD Configuration
+# =============================================================================
+[ci]
+# Path to pipeline definitions
+pipeline_path = "/data/pipelines"
+
+# Default timeout for jobs (in seconds)
+job_timeout = 3600
+
+# =============================================================================
+# Runner Configuration
+# =============================================================================
+[runner]
+# URL of the scheduler service
+scheduler_url = "http://scheduler:8081"
+
+# Runner name (unique identifier)
+name = "docker-runner-1"
+
+# Runner type (docker, firecracker, bare-metal)
+runner_type = "docker"
+
+# Number of concurrent jobs
+capacity = 4
+
+# Heartbeat interval in seconds
+heartbeat_interval_secs = 30
+
+# Job fetch interval in seconds
+fetch_interval_secs = 5
+
+# =============================================================================
+# Scheduler Configuration
+# =============================================================================
+[scheduler]
+# Scheduler HTTP port
+port = 8081
+
+# Maximum jobs to assign per runner
+max_jobs_per_runner = 10
+
+# =============================================================================
+# Storage Configuration
+# =============================================================================
+[storage]
+# Artifact storage path
+artifact_path = "/data/artifacts"
+
+# Cache storage path
+cache_path = "/data/cache"
+
+# =============================================================================
+# Logging
+# =============================================================================
+[logging]
+level = "info"
+format = "json"  # or "pretty" for development
+
+# =============================================================================
+# Metrics & Observability
+# =============================================================================
+[metrics]
+# Enable Prometheus metrics endpoint
+enabled = true
+port = 9090
+path = "/metrics"
+
+# =============================================================================
+# Security
+# =============================================================================
+[security]
+# CORS allowed origins (comma-separated)
+cors_allowed_origins = "http://localhost:3000"
+
+# Rate limiting (requests per minute)
+rate_limit_per_minute = 100

@@ -1,13 +1,18 @@
 //! Artifact API routes
 
+use crate::auth::ApiAuth;
+use crate::server::ErrorResponse;
 use axum::{
-    extract::Path,
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{Extension, Path},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{delete, get},
     Json, Router,
 };
+use gitforce_common::JobId;
+use gitforce_storage::{Artifact, ArtifactId, ArtifactStore, FileStorage};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Artifact response
@@ -30,33 +35,151 @@ pub fn artifact_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/jobs/{job_id}/artifacts", get(get_job_artifacts))
 }
 
+/// Helper to extract and validate user from headers
+fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok());
+
+    let token = auth_header
+        .and_then(|h| ApiAuth::extract_token(h))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    auth.validate_token(&token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    Ok(())
+}
+
+/// Convert storage artifact to response
+fn artifact_to_response(artifact: &Artifact) -> ArtifactResponse {
+    ArtifactResponse {
+        id: artifact.id.to_string(),
+        job_id: artifact.job_id.to_string(),
+        name: artifact.name.clone(),
+        path: artifact.path.clone(),
+        checksum: artifact.checksum.clone(),
+        size_bytes: artifact.size_bytes,
+        created_at: artifact.created_at.to_rfc3339(),
+    }
+}
+
 /// List artifacts
-async fn list_artifacts() -> impl IntoResponse {
-    Json(serde_json::Value::Array(vec![]))
+async fn list_artifacts(
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    Extension(storage): Extension<Arc<FileStorage>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    match extract_user(&auth, &headers) {
+        Err(e) => e.into_response(),
+        Ok(_) => {
+            tracing::debug!("list artifacts");
+            // TODO: Implement list all artifacts (requires scanning directory)
+            Json(serde_json::Value::Array(vec![])).into_response()
+        }
+    }
 }
 
 /// Get artifact metadata
-async fn get_artifact(Path(id): Path<String>) -> impl IntoResponse {
-    tracing::debug!("get artifact: {}", id);
-    (StatusCode::OK, Json(ArtifactResponse {
-        id,
-        job_id: Uuid::new_v4().to_string(),
-        name: "test-artifact.zip".to_string(),
-        path: "/artifacts/test-artifact.zip".to_string(),
-        checksum: "abc123def456".to_string(),
-        size_bytes: 1024,
-        created_at: chrono::Utc::now().to_rfc3339(),
-    }))
+async fn get_artifact(
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    Extension(storage): Extension<Arc<FileStorage>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match extract_user(&auth, &headers) {
+        Err(e) => e.into_response(),
+        Ok(_) => {
+            tracing::debug!("get artifact: {}", id);
+
+            let artifact_id = match Uuid::parse_str(&id) {
+                Ok(uuid) => ArtifactId::from(uuid),
+                Err(_) => {
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
+                        error: "invalid_id".to_string(),
+                        message: "Invalid artifact ID format".to_string(),
+                    })).into_response();
+                }
+            };
+
+            match storage.get_metadata(artifact_id).await {
+                Ok(artifact) => {
+                    let response = artifact_to_response(&artifact);
+                    (StatusCode::OK, Json(response)).into_response()
+                }
+                Err(e) => {
+                    tracing::error!("failed to get artifact metadata: {}", e);
+                    (StatusCode::NOT_FOUND, Json(ErrorResponse {
+                        error: "not_found".to_string(),
+                        message: "Artifact not found".to_string(),
+                    })).into_response()
+                }
+            }
+        }
+    }
 }
 
 /// Delete artifact
-async fn delete_artifact(Path(id): Path<String>) -> impl IntoResponse {
-    tracing::debug!("delete artifact: {}", id);
-    StatusCode::NO_CONTENT
+async fn delete_artifact(
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    Extension(storage): Extension<Arc<FileStorage>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match extract_user(&auth, &headers) {
+        Err(e) => e.into_response(),
+        Ok(_) => {
+            tracing::debug!("delete artifact: {}", id);
+
+            let artifact_id = match Uuid::parse_str(&id) {
+                Ok(uuid) => ArtifactId::from(uuid),
+                Err(_) => {
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
+                        error: "invalid_id".to_string(),
+                        message: "Invalid artifact ID format".to_string(),
+                    })).into_response();
+                }
+            };
+
+            match storage.delete(artifact_id).await {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(e) => {
+                    tracing::error!("failed to delete artifact: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+                        error: "storage_error".to_string(),
+                        message: e.to_string(),
+                    })).into_response()
+                }
+            }
+        }
+    }
 }
 
 /// Get artifacts for a job
-async fn get_job_artifacts(Path(job_id): Path<String>) -> impl IntoResponse {
-    tracing::debug!("get job artifacts: {}", job_id);
-    Json(serde_json::Value::Array(vec![]))
+async fn get_job_artifacts(
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    Extension(storage): Extension<Arc<FileStorage>>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    match extract_user(&auth, &headers) {
+        Err(e) => e.into_response(),
+        Ok(_) => {
+            tracing::debug!("get job artifacts: {}", job_id);
+            // TODO: Implement listing artifacts by job_id
+            Json(serde_json::Value::Array(vec![])).into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_artifact_id_from_uuid() {
+        let uuid = Uuid::new_v4();
+        let _artifact_id = ArtifactId::from(uuid);
+        // Just verify it doesn't panic
+    }
 }

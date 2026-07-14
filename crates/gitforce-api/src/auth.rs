@@ -102,6 +102,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_claims_creation() {
+        let user_id = UserId::new();
+        let claims = Claims::new(user_id, "user1", "developer", 2);
+        assert_eq!(claims.username, "user1");
+        assert_eq!(claims.role, "developer");
+    }
+
+    #[test]
     fn test_claims_expiry() {
         let claims = Claims::new(UserId::new(), "test", "admin", 1);
         assert!(!claims.is_expired());
@@ -125,15 +133,6 @@ mod tests {
         let claims = auth.validate_token(&token).unwrap();
         assert_eq!(claims.username, "testuser");
         assert_eq!(claims.role, "admin");
-    }
-}
-
-    #[test]
-    fn test_claims_creation() {
-        let user_id = UserId::new();
-        let claims = Claims::new(user_id, "user1", "developer", 2);
-        assert_eq!(claims.username, "user1");
-        assert_eq!(claims.role, "developer");
     }
 
     #[test]
@@ -159,3 +158,4 @@ mod tests {
         let result = auth2.validate_token(&token);
         assert!(result.is_err());
     }
+}

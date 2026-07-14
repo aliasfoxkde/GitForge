@@ -31,6 +31,12 @@ impl std::fmt::Display for ArtifactId {
     }
 }
 
+impl From<Uuid> for ArtifactId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
 /// Artifact metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {

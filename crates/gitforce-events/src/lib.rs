@@ -7,7 +7,7 @@ pub mod event;
 pub mod serializer;
 pub mod types;
 
-pub use bus::{EventBus, EventStream, InMemoryEventBus};
+pub use bus::{EventBus, EventStream, InMemoryEventBus, EventFilter};
 pub use event::EventEnvelope;
 pub use serializer::EventSerializer;
 pub use types::*;

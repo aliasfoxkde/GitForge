@@ -1,0 +1,165 @@
+# GitForge Docker Compose
+# Self-hosted Git platform with CI/CD
+
+services:
+  # =============================================================================
+  # API Gateway
+  # =============================================================================
+  api:
+    build:
+      context: .
+      target: api-prod
+    container_name: gitforge-api
+    ports:
+      - "8080:8080"
+    volumes:
+      - api-data:/data
+      - ./config.toml.example:/config.toml:ro
+    environment:
+      - DATABASE_URL=sqlite:/data/gitforge.db
+      - RUST_LOG=info
+      - JWT_SECRET=${JWT_SECRET:-changeme-in-production}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      - git-server
+    networks:
+      - gitforge
+
+  # =============================================================================
+  # CI Orchestrator
+  # =============================================================================
+  ci:
+    build:
+      context: .
+      target: ci-prod
+    container_name: gitforge-ci
+    volumes:
+      - ci-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DATABASE_URL=sqlite:/data/gitforge.db
+      - RUST_LOG=info
+      - SCHEDULER_URL=http://scheduler:8081
+    depends_on:
+      - scheduler
+      - git-server
+    networks:
+      - gitforge
+
+  # =============================================================================
+  # Job Scheduler
+  # =============================================================================
+  scheduler:
+    build:
+      context: .
+      target: ci-prod
+    container_name: gitforge-scheduler
+    ports:
+      - "8081:8081"
+    volumes:
+      - scheduler-data:/data
+    environment:
+      - DATABASE_URL=sqlite:/data/gitforge.db
+      - RUST_LOG=info
+    networks:
+      - gitforge
+
+  # =============================================================================
+  # Runner Agent
+  # =============================================================================
+  runner:
+    build:
+      context: .
+      target: runner-prod
+    container_name: gitforge-runner
+    privileged: true  # Required for Docker-in-Docker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-data:/data
+    environment:
+      - RUST_LOG=info
+      - SCHEDULER_URL=http://scheduler:8081
+      - RUNNER_NAME=docker-runner-1
+      - RUNNER_CAPACITY=4
+    depends_on:
+      - scheduler
+    networks:
+      - gitforge
+
+  # =============================================================================
+  # Git SSH/HTTP Server
+  # =============================================================================
+  git-server:
+    build:
+      context: .
+      target: git-server-prod
+    container_name: gitforge-git-server
+    ports:
+      - "2222:2222"
+      - "8082:8082"  # Git HTTP
+    volumes:
+      - git-data:/git
+      - ssh-data:/home/gitforge/.ssh
+    environment:
+      - RUST_LOG=info
+      - SSH_PORT=2222
+      - HTTP_PORT=8082
+    networks:
+      - gitforge
+
+  # =============================================================================
+  # Additional Runners (scale horizontally)
+  # =============================================================================
+  runner-2:
+    build:
+      context: .
+      target: runner-prod
+    container_name: gitforge-runner-2
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner2-data:/data
+    environment:
+      - RUST_LOG=info
+      - SCHEDULER_URL=http://scheduler:8081
+      - RUNNER_NAME=docker-runner-2
+      - RUNNER_CAPACITY=2
+    depends_on:
+      - scheduler
+    networks:
+      - gitforge
+    deploy:
+      replicas: 0  # Set to 1 to enable second runner
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  api-data:
+    driver: local
+  ci-data:
+    driver: local
+  scheduler-data:
+    driver: local
+  runner-data:
+    driver: local
+  runner2-data:
+    driver: local
+  git-data:
+    driver: local
+  ssh-data:
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  gitforge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

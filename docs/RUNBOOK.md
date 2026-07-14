@@ -1,6 +1,6 @@
 # GitForge Runbook
 
-**Last Updated**: 2026-07-06
+**Last Updated**: 2026-07-14
 
 ## Overview
 
@@ -13,16 +13,16 @@ GitForge is a self-hosted Git platform with event-driven CI/CD capabilities. Thi
 │                    GitForge Services                      │
 ├─────────────┬─────────────┬─────────────┬───────────────┤
 │  git-server │     ci     │   runner    │      api      │
-│   (Port 22) │  (Internal) │  (Internal) │   (Port 8080) │
+│  (2222/8082)│  (Internal)│  (Internal) │   (Port 8080) │
 └─────────────┴─────────────┴─────────────┴───────────────┘
 ```
 
 ## Prerequisites
 
-- Rust 1.70+ toolchain
-- PostgreSQL 15+ (for future production use)
+- Rust 1.80+ toolchain
 - Docker (for runner sandbox execution)
 - 4GB RAM minimum
+- 20GB disk space
 
 ## Building
 
@@ -45,27 +45,23 @@ The API gateway exposes the REST API for frontend integration.
 cargo run -p api
 
 # Production
-PORT=8080 JWT_SECRET=your-secret ./target/release/api
+JWT_SECRET=your-secret ./target/release/api --host 0.0.0.0 --port 8080
 ```
 
 **Environment Variables:**
-- `PORT` - API server port (default: 8080)
-- `JWT_SECRET` - Secret for JWT token signing
+- `JWT_SECRET` - Secret for JWT token signing (required)
+- `DATABASE_URL` - SQLite or PostgreSQL URL
 
 **Endpoints:**
-- `GET /health` - Health check
-- `GET /api/v1/repos` - List repositories
-- `POST /api/v1/repos` - Create repository
-- `GET /api/v1/repos/:id` - Get repository
-- `DELETE /api/v1/repos/:id` - Delete repository
-- `GET /api/v1/pipelines` - List pipelines
-- `GET /api/v1/pipeline-runs` - List pipeline runs
-- `GET /api/v1/pipeline-runs/:id` - Get pipeline run
-- `GET /api/v1/jobs/:id` - Get job status
-- `GET /api/v1/jobs/:id/logs` - Get job logs
-- `GET /api/v1/runners` - List runners
-- `POST /api/v1/runners` - Register runner
-- `GET /api/v1/artifacts` - List artifacts
+- `GET /health` - Health check (public)
+- `GET /metrics` - Prometheus metrics (public)
+- `GET /swagger-ui` - API documentation (public)
+- `POST /api/repos` - Create repository (auth required)
+- `GET /api/repos` - List repositories (auth required)
+- `GET /api/pipelines` - List pipelines (auth required)
+- `GET /api/pipeline-runs` - List pipeline runs (auth required)
+- `GET /api/jobs/:id` - Get job status (auth required)
+- `GET /api/runners` - List runners (auth required)
 
 ### 2. Git Server
 
@@ -75,11 +71,13 @@ The Git server handles Git protocol over SSH and HTTP.
 # Development
 cargo run -p git-server
 
-# Production (requires root for port 22)
+# Production
 sudo ./target/release/git-server
 ```
 
-**Note:** The MVP implementation logs hooks but doesn't actually start Git servers.
+**Ports:**
+- SSH: 2222
+- HTTP: 8082
 
 ### 3. CI Orchestrator
 
@@ -94,9 +92,9 @@ cargo run -p ci
 ```
 
 **Responsibilities:**
-- Subscribes to push events
+- Subscribes to push events from event bus
 - Triggers pipeline execution
-- Manages job queue
+- Manages job queue via scheduler
 - Assigns jobs to runners
 
 ### 4. Runner Agent
@@ -108,62 +106,37 @@ The runner agent executes jobs in Docker containers.
 cargo run -p runner
 
 # Production
-./target/release/runner
+SCHEDULER_URL=http://localhost:8081 ./target/release/runner
 ```
 
 **Environment Variables:**
 - `RUNNER_NAME` - Runner name (default: runner)
-- `SCHEDULER_URL` - Scheduler URL (default: http://localhost:8080)
-- `CAPACITY` - Concurrent job capacity (default: 2)
+- `SCHEDULER_URL` - Scheduler URL (default: http://localhost:8081)
+- `RUNNER_CAPACITY` - Concurrent job capacity (default: 2)
+- `HEARTBEAT_INTERVAL_SECS` - Heartbeat interval (default: 30)
+- `FETCH_INTERVAL_SECS` - Job fetch interval (default: 5)
 
-## Docker Compose (Development)
+## Docker Compose
 
-```yaml
-version: '3.8'
-services:
-  api:
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      - JWT_SECRET=dev-secret
-    depends_on:
-      - git-server
-      - ci
+```bash
+# Start all services
+docker-compose up -d
 
-  git-server:
-    build: .
-    ports:
-      - "2222:22"
-    volumes:
-      - git-data:/var/lib/gitforce
+# Check health
+curl http://localhost:8080/health
 
-  ci:
-    build: .
-    depends_on:
-      - git-server
-
-  runner:
-    build: .
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      - SCHEDULER_URL=http://ci:8080
-
-volumes:
-  git-data:
+# View logs
+docker-compose logs -f
 ```
 
 ## Health Checks
-
-All services expose health information via structured logging.
 
 ```bash
 # Check API health
 curl http://localhost:8080/health
 
 # Expected response:
-# {"status":"healthy","timestamp":"2026-07-06T12:00:00Z"}
+# {"status":"healthy","timestamp":"2026-07-14T12:00:00Z","database":"connected"}
 ```
 
 ## Troubleshooting
@@ -173,12 +146,13 @@ curl http://localhost:8080/health
 1. Check ports aren't already in use:
    ```bash
    lsof -i :8080  # API
-   lsof -i :22    # Git SSH
+   lsof -i :2222  # Git SSH
+   lsof -i :8082  # Git HTTP
    ```
 
 2. Check logs for errors:
    ```bash
-   RUST_LOG=debug cargo run -p <service>
+   RUST_LOG=debug cargo run -p api
    ```
 
 ### Jobs Not Being Scheduled
@@ -186,7 +160,7 @@ curl http://localhost:8080/health
 1. Verify CI orchestrator is running
 2. Check scheduler has runners registered:
    ```bash
-   curl http://localhost:8080/api/v1/runners
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/runners
    ```
 3. Check CI logs for queue processing
 
@@ -194,10 +168,19 @@ curl http://localhost:8080/health
 
 1. Verify runner is registered:
    ```bash
-   curl http://localhost:8080/api/v1/runners
+   curl http://localhost:8081/runners  # Scheduler API
    ```
 2. Check runner logs for heartbeat errors
-3. Verify runner can reach CI orchestrator
+3. Verify runner can reach scheduler
+
+### Database Locked
+
+SQLite doesn't support concurrent writes. For multi-runner setups, use PostgreSQL:
+
+```toml
+[database]
+url = "postgres://gitforge:password@localhost:5432/gitforge"
+```
 
 ## Development
 
@@ -219,31 +202,43 @@ RUST_LOG=debug cargo test -p gitforce-events
 ```bash
 # Lint
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --workspace -- -D warnings
 
 # Format
 cargo fmt
 ```
 
-### Adding a New Crate
-
-1. Create crate under `crates/`
-2. Add to workspace `Cargo.toml`
-3. Add dependencies to workspace root
-4. Create lib.rs and mod.rs files
-
 ## Configuration
+
+### config.toml
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 8080
+
+[database]
+url = "sqlite:/data/gitforge.db"
+
+[auth]
+jwt_secret = "your-secret-here"
+
+[runner]
+scheduler_url = "http://scheduler:8081"
+capacity = 4
+```
 
 ### Environment Variables
 
 | Variable | Service | Default | Description |
 |----------|---------|---------|-------------|
-| `PORT` | api | 8080 | API server port |
-| `JWT_SECRET` | api | dev-secret | JWT signing secret |
+| `JWT_SECRET` | api | - | JWT signing secret (required) |
+| `DATABASE_URL` | api | sqlite:/data/gitforge.db | Database URL |
 | `RUNNER_NAME` | runner | runner | Runner identifier |
-| `SCHEDULER_URL` | runner | http://localhost:8080 | Scheduler endpoint |
-| `CAPACITY` | runner | 2 | Max concurrent jobs |
-| `GIT_ROOT` | git-server | /var/lib/gitforce/repos | Git repository storage |
+| `SCHEDULER_URL` | runner | http://localhost:8081 | Scheduler endpoint |
+| `RUNNER_CAPACITY` | runner | 2 | Max concurrent jobs |
+| `SSH_PORT` | git-server | 2222 | SSH port |
+| `HTTP_PORT` | git-server | 8082 | HTTP port |
 
 ## Logging
 
@@ -257,11 +252,38 @@ RUST_LOG=debug cargo run -p api
 RUST_LOG=json cargo run -p api
 ```
 
-## Metrics (Future)
+## Metrics
 
-Planned Prometheus metrics endpoint at `/metrics`:
+Prometheus metrics available at `/metrics`:
 
-- `gitforge_jobs_total` - Total jobs executed
-- `gitforge_jobs_running` - Currently running jobs
-- `gitforge_queue_length` - Jobs waiting for runner
-- `gitforge_runner_heartbeats` - Runner heartbeat count
+- `gitforge_http_requests_total` - HTTP request count by method and path
+- `gitforge_job_duration_seconds` - Job execution duration
+- `gitforge_runners_online` - Number of online runners
+- `gitforge_pipeline_runs_total` - Pipeline runs by status
+- `gitforge_artifact_size_bytes` - Artifact sizes
+
+## Backup
+
+```bash
+# Backup database
+docker-compose cp api:/data/gitforge.db ./backup/
+
+# Backup artifacts
+docker-compose cp api:/data/artifacts ./backup/
+```
+
+## Scaling Runners
+
+```bash
+# Scale horizontally
+docker-compose up -d --scale runner=3
+```
+
+## Security Checklist
+
+- [ ] Change JWT secret from default
+- [ ] Configure CORS origins
+- [ ] Use PostgreSQL for production
+- [ ] Set up TLS reverse proxy
+- [ ] Configure firewall rules
+- [ ] Enable rate limiting

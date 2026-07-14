@@ -1,8 +1,9 @@
 //! CI API routes
 
+use crate::auth::ApiAuth;
 use axum::{
     extract::{Extension, Path},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -48,244 +49,305 @@ pub fn ci_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/jobs/{id}/logs", get(get_job_logs))
 }
 
+/// Helper to extract and validate user from headers
+fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok());
+
+    let token = auth_header
+        .and_then(|h| ApiAuth::extract_token(h))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    auth.validate_token(&token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    Ok(())
+}
+
 /// List pipelines
 async fn list_pipelines(
     Extension(pool): Extension<Arc<Pool>>,
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    match PipelineQueries::list(&pool).await {
-        Ok(pipelines) => {
-            let response: Vec<serde_json::Value> = pipelines.into_iter().map(|p| {
-                serde_json::json!({
-                    "id": p.id.to_string(),
-                    "repo_id": p.repo_id.to_string(),
-                    "name": p.name,
-                    "trigger_type": p.trigger_type,
-                    "created_at": p.created_at.to_rfc3339()
-                })
-            }).collect();
-            return Json(response).into_response();
-        }
-        Err(e) => {
-            tracing::error!("failed to list pipelines: {}", e);
+    match extract_user(&auth, &headers) {
+        Err(e) => e.into_response(),
+        Ok(_) => {
+            match PipelineQueries::list(&pool).await {
+                Ok(pipelines) => {
+                    let response: Vec<serde_json::Value> = pipelines.into_iter().map(|p| {
+                        serde_json::json!({
+                            "id": p.id.to_string(),
+                            "repo_id": p.repo_id.to_string(),
+                            "name": p.name,
+                            "trigger_type": p.trigger_type,
+                            "created_at": p.created_at.to_rfc3339()
+                        })
+                    }).collect();
+                    Json(response).into_response()
+                }
+                Err(e) => {
+                    tracing::error!("failed to list pipelines: {}", e);
+                    Json(serde_json::Value::Array(vec![])).into_response()
+                }
+            }
         }
     }
-    Json(serde_json::Value::Array(vec![])).into_response()
 }
 
 /// Get pipeline
 async fn get_pipeline(
     Extension(pool): Extension<Arc<Pool>>,
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    tracing::debug!("get pipeline: {}", id);
+    match extract_user(&auth, &headers) {
+        Err(e) => e.into_response(),
+        Ok(_) => {
+            tracing::debug!("get pipeline: {}", id);
 
-    let response = match Uuid::parse_str(&id) {
-        Ok(uuid) => {
-            let pipeline_id = PipelineId::from(uuid);
-            match PipelineQueries::get(&pool, pipeline_id).await {
-                Ok(Some(pipeline)) => {
-                    return (StatusCode::OK, Json(serde_json::json!({
-                        "id": pipeline.id.to_string(),
-                        "repo_id": pipeline.repo_id.to_string(),
-                        "name": pipeline.name,
-                        "trigger_type": pipeline.trigger_type,
-                        "created_at": pipeline.created_at.to_rfc3339()
-                    }))).into_response();
+            match Uuid::parse_str(&id) {
+                Ok(uuid) => {
+                    let pipeline_id = PipelineId::from(uuid);
+                    match PipelineQueries::get(&pool, pipeline_id).await {
+                        Ok(Some(pipeline)) => {
+                            (StatusCode::OK, Json(serde_json::json!({
+                                "id": pipeline.id.to_string(),
+                                "repo_id": pipeline.repo_id.to_string(),
+                                "name": pipeline.name,
+                                "trigger_type": pipeline.trigger_type,
+                                "created_at": pipeline.created_at.to_rfc3339()
+                            }))).into_response()
+                        }
+                        Ok(None) => {
+                            (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                                "error": "not_found",
+                                "message": "Pipeline not found"
+                            }))).into_response()
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to get pipeline: {}", e);
+                            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                "error": "database_error",
+                                "message": format!("failed to get pipeline: {}", e)
+                            }))).into_response()
+                        }
+                    }
                 }
-                Ok(None) => {
-                    serde_json::json!({
-                        "error": "not_found",
-                        "message": "Pipeline not found"
-                    })
-                }
-                Err(e) => {
-                    tracing::error!("failed to get pipeline: {}", e);
-                    serde_json::json!({
-                        "error": "database_error",
-                        "message": format!("failed to get pipeline: {}", e)
-                    })
+                Err(_) => {
+                    (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                        "error": "invalid_id",
+                        "message": "Invalid pipeline ID format"
+                    }))).into_response()
                 }
             }
         }
-        Err(_) => {
-            serde_json::json!({
-                "error": "invalid_id",
-                "message": "Invalid pipeline ID format"
-            })
-        }
-    };
-    (StatusCode::BAD_REQUEST, Json(response)).into_response()
+    }
 }
 
 /// List pipeline runs
 async fn list_pipeline_runs(
     Extension(pool): Extension<Arc<Pool>>,
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    match PipelineRunQueries::list(&pool).await {
-        Ok(runs) => {
-            let response: Vec<serde_json::Value> = runs.into_iter().map(|r| {
-                serde_json::json!({
-                    "id": r.id.to_string(),
-                    "pipeline_id": r.pipeline_id.to_string(),
-                    "status": r.status,
-                    "commit_hash": r.commit_hash,
-                    "triggered_by": r.triggered_by,
-                    "started_at": r.started_at.map(|dt| dt.to_rfc3339()),
-                    "finished_at": r.finished_at.map(|dt| dt.to_rfc3339())
-                })
-            }).collect();
-            return Json(response).into_response();
-        }
-        Err(e) => {
-            tracing::error!("failed to list pipeline runs: {}", e);
+    match extract_user(&auth, &headers) {
+        Err(e) => e.into_response(),
+        Ok(_) => {
+            match PipelineRunQueries::list(&pool).await {
+                Ok(runs) => {
+                    let response: Vec<serde_json::Value> = runs.into_iter().map(|r| {
+                        serde_json::json!({
+                            "id": r.id.to_string(),
+                            "pipeline_id": r.pipeline_id.to_string(),
+                            "status": r.status,
+                            "commit_hash": r.commit_hash,
+                            "triggered_by": r.triggered_by,
+                            "started_at": r.started_at.map(|dt| dt.to_rfc3339()),
+                            "finished_at": r.finished_at.map(|dt| dt.to_rfc3339())
+                        })
+                    }).collect();
+                    Json(response).into_response()
+                }
+                Err(e) => {
+                    tracing::error!("failed to list pipeline runs: {}", e);
+                    Json(serde_json::Value::Array(vec![])).into_response()
+                }
+            }
         }
     }
-    Json(serde_json::Value::Array(vec![])).into_response()
 }
 
 /// Get pipeline run
 async fn get_pipeline_run(
     Extension(pool): Extension<Arc<Pool>>,
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    tracing::debug!("get pipeline run: {}", id);
+    match extract_user(&auth, &headers) {
+        Err(e) => e.into_response(),
+        Ok(_) => {
+            tracing::debug!("get pipeline run: {}", id);
 
-    let response = match Uuid::parse_str(&id) {
-        Ok(uuid) => {
-            let run_id = PipelineRunId::from(uuid);
-            match PipelineRunQueries::get(&pool, run_id).await {
-                Ok(Some(run)) => {
-                    return (StatusCode::OK, Json(serde_json::json!({
-                        "id": run.id.to_string(),
-                        "pipeline_id": run.pipeline_id.to_string(),
-                        "status": run.status,
-                        "commit_hash": run.commit_hash,
-                        "triggered_by": run.triggered_by,
-                        "started_at": run.started_at.map(|dt| dt.to_rfc3339()),
-                        "finished_at": run.finished_at.map(|dt| dt.to_rfc3339())
-                    }))).into_response();
+            match Uuid::parse_str(&id) {
+                Ok(uuid) => {
+                    let run_id = PipelineRunId::from(uuid);
+                    match PipelineRunQueries::get(&pool, run_id).await {
+                        Ok(Some(run)) => {
+                            (StatusCode::OK, Json(serde_json::json!({
+                                "id": run.id.to_string(),
+                                "pipeline_id": run.pipeline_id.to_string(),
+                                "status": run.status,
+                                "commit_hash": run.commit_hash,
+                                "triggered_by": run.triggered_by,
+                                "started_at": run.started_at.map(|dt| dt.to_rfc3339()),
+                                "finished_at": run.finished_at.map(|dt| dt.to_rfc3339())
+                            }))).into_response()
+                        }
+                        Ok(None) => {
+                            (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                                "error": "not_found",
+                                "message": "Pipeline run not found"
+                            }))).into_response()
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to get pipeline run: {}", e);
+                            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                "error": "database_error",
+                                "message": format!("failed to get pipeline run: {}", e)
+                            }))).into_response()
+                        }
+                    }
                 }
-                Ok(None) => {
-                    serde_json::json!({
-                        "error": "not_found",
-                        "message": "Pipeline run not found"
-                    })
-                }
-                Err(e) => {
-                    tracing::error!("failed to get pipeline run: {}", e);
-                    serde_json::json!({
-                        "error": "database_error",
-                        "message": format!("failed to get pipeline run: {}", e)
-                    })
+                Err(_) => {
+                    (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                        "error": "invalid_id",
+                        "message": "Invalid pipeline run ID format"
+                    }))).into_response()
                 }
             }
         }
-        Err(_) => {
-            serde_json::json!({
-                "error": "invalid_id",
-                "message": "Invalid pipeline run ID format"
-            })
-        }
-    };
-    (StatusCode::BAD_REQUEST, Json(response)).into_response()
+    }
 }
 
 /// Get pipeline run jobs
 async fn get_pipeline_run_jobs(
     Extension(pool): Extension<Arc<Pool>>,
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    tracing::debug!("get pipeline run jobs: {}", id);
+    match extract_user(&auth, &headers) {
+        Err(e) => e.into_response(),
+        Ok(_) => {
+            tracing::debug!("get pipeline run jobs: {}", id);
 
-    let response = match Uuid::parse_str(&id) {
-        Ok(uuid) => {
-            let run_id = PipelineRunId::from(uuid);
-            match JobQueries::list_by_run(&pool, run_id).await {
-                Ok(jobs) => {
-                    let jobs_json: Vec<serde_json::Value> = jobs.into_iter().map(|j| {
-                        serde_json::json!({
-                            "id": j.id.to_string(),
-                            "name": j.name,
-                            "status": j.status,
-                            "runner_id": j.runner_id.map(|id| id.to_string()),
-                            "started_at": j.started_at.map(|dt| dt.to_rfc3339()),
-                            "finished_at": j.finished_at.map(|dt| dt.to_rfc3339())
-                        })
-                    }).collect();
-                    return Json(jobs_json).into_response();
+            match Uuid::parse_str(&id) {
+                Ok(uuid) => {
+                    let run_id = PipelineRunId::from(uuid);
+                    match JobQueries::list_by_run(&pool, run_id).await {
+                        Ok(jobs) => {
+                            let jobs_json: Vec<serde_json::Value> = jobs.into_iter().map(|j| {
+                                serde_json::json!({
+                                    "id": j.id.to_string(),
+                                    "name": j.name,
+                                    "status": j.status,
+                                    "runner_id": j.runner_id.map(|id| id.to_string()),
+                                    "started_at": j.started_at.map(|dt| dt.to_rfc3339()),
+                                    "finished_at": j.finished_at.map(|dt| dt.to_rfc3339())
+                                })
+                            }).collect();
+                            Json(jobs_json).into_response()
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to list jobs: {}", e);
+                            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                "error": "database_error",
+                                "message": format!("failed to list jobs: {}", e)
+                            }))).into_response()
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("failed to list jobs: {}", e);
-                    serde_json::json!({
-                        "error": "database_error",
-                        "message": format!("failed to list jobs: {}", e)
-                    })
+                Err(_) => {
+                    (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                        "error": "invalid_id",
+                        "message": "Invalid pipeline run ID format"
+                    }))).into_response()
                 }
             }
         }
-        Err(_) => {
-            serde_json::json!({
-                "error": "invalid_id",
-                "message": "Invalid pipeline run ID format"
-            })
-        }
-    };
-    (StatusCode::BAD_REQUEST, Json(response)).into_response()
+    }
 }
 
 /// Get job
 async fn get_job(
     Extension(pool): Extension<Arc<Pool>>,
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    tracing::debug!("get job: {}", id);
+    match extract_user(&auth, &headers) {
+        Err(e) => e.into_response(),
+        Ok(_) => {
+            tracing::debug!("get job: {}", id);
 
-    let response = match Uuid::parse_str(&id) {
-        Ok(uuid) => {
-            let job_id = JobId::from(uuid);
-            match JobQueries::get(&pool, job_id).await {
-                Ok(Some(job)) => {
-                    return (StatusCode::OK, Json(serde_json::json!({
-                        "id": job.id.to_string(),
-                        "name": job.name,
-                        "status": job.status,
-                        "runner_id": job.runner_id.map(|id| id.to_string()),
-                        "started_at": job.started_at.map(|dt| dt.to_rfc3339()),
-                        "finished_at": job.finished_at.map(|dt| dt.to_rfc3339())
-                    }))).into_response();
+            match Uuid::parse_str(&id) {
+                Ok(uuid) => {
+                    let job_id = JobId::from(uuid);
+                    match JobQueries::get(&pool, job_id).await {
+                        Ok(Some(job)) => {
+                            (StatusCode::OK, Json(serde_json::json!({
+                                "id": job.id.to_string(),
+                                "name": job.name,
+                                "status": job.status,
+                                "runner_id": job.runner_id.map(|id| id.to_string()),
+                                "started_at": job.started_at.map(|dt| dt.to_rfc3339()),
+                                "finished_at": job.finished_at.map(|dt| dt.to_rfc3339())
+                            }))).into_response()
+                        }
+                        Ok(None) => {
+                            (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                                "error": "not_found",
+                                "message": "Job not found"
+                            }))).into_response()
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to get job: {}", e);
+                            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                "error": "database_error",
+                                "message": format!("failed to get job: {}", e)
+                            }))).into_response()
+                        }
+                    }
                 }
-                Ok(None) => {
-                    serde_json::json!({
-                        "error": "not_found",
-                        "message": "Job not found"
-                    })
-                }
-                Err(e) => {
-                    tracing::error!("failed to get job: {}", e);
-                    serde_json::json!({
-                        "error": "database_error",
-                        "message": format!("failed to get job: {}", e)
-                    })
+                Err(_) => {
+                    (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                        "error": "invalid_id",
+                        "message": "Invalid job ID format"
+                    }))).into_response()
                 }
             }
         }
-        Err(_) => {
-            serde_json::json!({
-                "error": "invalid_id",
-                "message": "Invalid job ID format"
-            })
-        }
-    };
-    (StatusCode::BAD_REQUEST, Json(response)).into_response()
+    }
 }
 
 /// Get job logs (placeholder - logs would come from storage)
 async fn get_job_logs(
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    tracing::debug!("get job logs: {}", id);
-    (StatusCode::OK, Json(serde_json::json!({
-        "job_id": id,
-        "logs": "Logs not yet implemented - coming soon"
-    })))
+    match extract_user(&auth, &headers) {
+        Err(e) => e.into_response(),
+        Ok(_) => {
+            tracing::debug!("get job logs: {}", id);
+            (StatusCode::OK, Json(serde_json::json!({
+                "job_id": id,
+                "logs": "Logs not yet implemented - coming soon"
+            }))).into_response()
+        }
+    }
 }

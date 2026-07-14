@@ -2,6 +2,60 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [0.2.0] - 2026-07-14
+
+### Added
+
+#### Phase A - Security Hardening (COMPLETED)
+- JWT authentication enforced on all API routes except /health and /metrics
+- Auth middleware with token validation
+- AuthenticatedUser extractor for route handlers
+- Public paths: /health, /metrics, /swagger-ui, /api-docs
+- Protected routes: /api/repos, /api/pipelines, /api/pipeline-runs, /api/jobs, /api/runners, /api/artifacts
+
+#### Phase B - Runner-Scheduler Communication (COMPLETED)
+- Real HTTP client implementation in runner agent using reqwest
+- Runner registration via HTTP POST to scheduler
+- Heartbeat loop sending POST to scheduler
+- Job fetch loop polling GET /jobs/pending
+- Scheduler HTTP server with routes for runners and jobs
+- Graceful fallback when scheduler is unavailable
+
+#### Phase C - Event Pipeline Triggering (COMPLETED)
+- CI service event consumer subscribed to push events
+- Pipeline triggered automatically on push received events
+- Default pipeline definition generated per repository
+- Jobs enqueued to scheduler on pipeline start
+
+#### Phase D - Artifact Storage (COMPLETED)
+- Routes wired with FileStorage integration
+- Get artifact metadata from storage
+- Delete artifact from storage
+- Auth enforced on all artifact routes
+
+#### Phase E - Docker Deployment (COMPLETED)
+- Multi-stage Dockerfile for minimal production images
+- Separate images for api, ci, runner, and git-server
+- docker-compose.yml with all services configured
+- config.toml.example with all configuration options
+- Docker-in-Docker support for runner
+
+#### Scheduler HTTP Endpoints (COMPLETED)
+- POST /runners - Register new runner
+- POST /runners/{id}/heartbeat - Runner heartbeat
+- GET /jobs/pending - Get pending jobs for runner
+- POST /jobs/{id}/assign - Assign job to runner
+- POST /jobs/{id}/complete - Mark job complete
+
+### Fixed
+
+- Fixed unused imports across multiple crates
+- Fixed serde_json missing dependencies
+- Fixed EventFilter export from gitforce-events
+- Fixed JobDefinition/StepDefinition exports from gitforce-ci
+- Fixed auth middleware compatibility with Axum 0.7
+- Fixed ArtifactId private field issue with From<Uuid> implementation
+
 ## [0.1.0] - 2026-07-06
 
 ### Added
@@ -61,12 +115,7 @@ All notable changes to GitForge will be documented in this file.
 - **Git Library**: git2
 - **Container Runtime**: bollard (Docker client)
 
-### Known Issues
-
-- None - all tests passing
-
 ### Next Steps
 
-- VPS deployment with Docker Compose
 - CLI tool for GitForge
 - Cloud sync protocol

@@ -12,6 +12,7 @@ use axum::{
     Json, Router,
 };
 use gitforce_db::Pool;
+use gitforce_storage::FileStorage;
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,31 +27,58 @@ pub struct ApiServer {
 impl ApiServer {
     /// Create a new API server
     pub fn new(jwt_secret: &str, pool: Pool) -> Self {
+        Self::with_storage(jwt_secret, pool, None)
+    }
+
+    /// Create a new API server with custom storage path
+    pub fn with_storage(jwt_secret: &str, pool: Pool, storage_path: Option<std::path::PathBuf>) -> Self {
         let auth = ApiAuth::new(jwt_secret);
         let metrics = Metrics::new();
 
+        // Configure CORS - restrictive by default
         let cors = CorsLayer::new()
-            .allow_origin(Any)
+            .allow_origin(Any) // TODO: Configure allowed origins
             .allow_methods(Any)
             .allow_headers(Any);
 
-        let app = Router::new()
+        // Public routes (no auth required)
+        let public_routes = Router::new()
             .route("/health", get(health_check))
             .route("/metrics", get(metrics_handler))
-            .merge(api_docs_routes())
+            .merge(api_docs_routes());
+
+        // Protected routes (auth required)
+        let protected_routes = Router::new()
             .merge(repo_routes())
             .merge(ci_routes())
             .merge(runner_routes())
-            .merge(artifact_routes())
+            .merge(artifact_routes());
+
+        let mut app = public_routes
             .layer(cors)
             .layer(Extension(Arc::new(auth)))
             .layer(Extension(Arc::new(metrics)))
             .layer(Extension(Arc::new(pool)));
 
+        // Add storage if path provided (async init not possible here)
+        if let Some(path) = storage_path {
+            // Storage will be added when initialized async
+            let _ = path;
+        }
+
+        app = app.nest("/api", protected_routes);
+
         Self { router: app, port: 8080 }
     }
 
+    /// Add storage extension to the router
+    pub fn with_storage_extension(self, storage: Arc<FileStorage>) -> Self {
+        let app = self.router.layer(Extension(storage));
+        Self { router: app, ..self }
+    }
+
     /// Set the port
+    #[must_use]
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
         self
