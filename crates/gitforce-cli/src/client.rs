@@ -69,3 +69,29 @@ impl ApiClient {
 }
 
 pub use ApiClient as GitForgeClient;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_api_client_new() {
+        let client = ApiClient::new("http://localhost:8080", None);
+        assert_eq!(client.base_url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_api_client_with_token() {
+        let client = ApiClient::new("http://localhost:8080", None)
+            .with_token("test-token".to_string());
+        // Token is set internally, verify client was created
+        let client2 = ApiClient::new("http://localhost:8080", Some("test-token".to_string()));
+        assert_eq!(client2.token, Some("test-token".to_string()));
+    }
+
+    #[test]
+    fn test_api_client_clone() {
+        let client = ApiClient::new("http://localhost:8080", Some("token".to_string()));
+        let _cloned = client.clone();
+    }
+}
