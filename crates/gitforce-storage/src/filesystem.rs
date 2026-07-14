@@ -238,4 +238,102 @@ mod tests {
         let data = ArtifactStore::get(&storage, artifact.id).await;
         assert!(data.is_err());
     }
+
+    #[tokio::test]
+    async fn test_cache_put_and_get() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "test-key", "main");
+        let data = b"cache content";
+
+        CacheStore::put(&storage, key.clone(), data.to_vec()).await.unwrap();
+
+        let retrieved = CacheStore::get(&storage, &key).await.unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn test_cache_get_nonexistent() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "nonexistent", "main");
+        let result = CacheStore::get(&storage, &key).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_delete() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "delete-me", "main");
+        CacheStore::put(&storage, key.clone(), b"data".to_vec()).await.unwrap();
+
+        CacheStore::delete(&storage, &key).await.unwrap();
+
+        let result = CacheStore::get(&storage, &key).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_list() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let entries = CacheStore::list(&storage).await.unwrap();
+        // Currently returns empty list
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_artifact_delete_nonexistent() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        // Deleting nonexistent artifact should not error
+        let artifact_id = ArtifactId::new();
+        let result = ArtifactStore::delete(&storage, artifact_id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_artifact_get_nonexistent() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let artifact_id = ArtifactId::new();
+        let result = ArtifactStore::get(&storage, artifact_id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_multiple_artifacts() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        for i in 0..5 {
+            let artifact = Artifact {
+                id: ArtifactId::new(),
+                job_id: gitforce_common::JobId::new(),
+                name: format!("artifact-{}", i),
+                path: "/fake/path".to_string(),
+                checksum: format!("checksum{}", i),
+                size_bytes: 1024 + i as u64,
+                content_type: None,
+                created_at: chrono::Utc::now(),
+            };
+
+            let data = format!("content{}", i);
+            ArtifactStore::put(&storage, &artifact, data.as_bytes()).await.unwrap();
+
+            let retrieved = ArtifactStore::get(&storage, artifact.id).await.unwrap();
+            assert_eq!(retrieved, data.as_bytes());
+        }
+    }
 }
