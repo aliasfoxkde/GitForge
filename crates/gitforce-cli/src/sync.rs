@@ -350,4 +350,114 @@ mod tests {
         let state = client.state.read().await;
         assert!(state.repos.contains_key("test-repo"));
     }
+
+    #[test]
+    fn test_sync_metadata_default() {
+        let metadata = SyncMetadata::default();
+        assert_eq!(metadata.local_rev, 0);
+        assert_eq!(metadata.remote_rev, 0);
+        assert!(metadata.last_push.is_none());
+        assert!(metadata.last_pull.is_none());
+        assert_eq!(metadata.status, SyncStatus::InSync);
+    }
+
+    #[test]
+    fn test_sync_status_variants() {
+        assert_eq!(SyncStatus::InSync, SyncStatus::InSync);
+        assert_eq!(SyncStatus::PendingPush, SyncStatus::PendingPush);
+        assert_eq!(SyncStatus::PendingPull, SyncStatus::PendingPull);
+        assert_eq!(SyncStatus::Conflict, SyncStatus::Conflict);
+    }
+
+    #[test]
+    fn test_sync_status_serialization() {
+        let status = SyncStatus::PendingPush;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"pendingpush\"");
+        let parsed: SyncStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, SyncStatus::PendingPush);
+    }
+
+    #[test]
+    fn test_local_state_default() {
+        let state = LocalState::default();
+        assert!(state.repos.is_empty());
+        assert!(state.pipelines.is_empty());
+    }
+
+    #[test]
+    fn test_repo_state_creation() {
+        let repo = RepoState {
+            id: "repo-1".to_string(),
+            name: "test-repo".to_string(),
+            local_path: Some(PathBuf::from("/tmp/repo")),
+            synced_at: Some("2024-01-01T00:00:00Z".to_string()),
+            local_rev: 5,
+        };
+        assert_eq!(repo.name, "test-repo");
+        assert_eq!(repo.local_rev, 5);
+    }
+
+    #[test]
+    fn test_pipeline_state_creation() {
+        let pipeline = PipelineState {
+            id: "pipe-1".to_string(),
+            repo_id: "repo-1".to_string(),
+            name: "build".to_string(),
+            definition: "steps: [build]".to_string(),
+            synced_at: None,
+            local_rev: 0,
+        };
+        assert_eq!(pipeline.name, "build");
+        assert!(pipeline.synced_at.is_none());
+    }
+
+    #[test]
+    fn test_push_payload_structure() {
+        let payload = PushPayload {
+            local_rev: 10,
+            repos: HashMap::new(),
+            pipelines: HashMap::new(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+        };
+        assert_eq!(payload.local_rev, 10);
+    }
+
+    #[test]
+    fn test_pull_request_structure() {
+        let request = PullRequest {
+            local_rev: 5,
+            last_sync: Some("2024-01-01T00:00:00Z".to_string()),
+        };
+        assert_eq!(request.local_rev, 5);
+        assert!(request.last_sync.is_some());
+    }
+
+    #[test]
+    fn test_pull_response_structure() {
+        let response = PullResponse {
+            repos: HashMap::new(),
+            pipelines: HashMap::new(),
+            remote_rev: 15,
+            has_more: false,
+        };
+        assert_eq!(response.remote_rev, 15);
+        assert!(!response.has_more);
+    }
+
+    #[tokio::test]
+    async fn test_sync_client_new() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        assert_eq!(client.sync_dir(), temp_dir.path().join(".gitforge"));
+    }
+
+    #[tokio::test]
+    async fn test_mark_pending_push() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        client.init().await.unwrap();
+        client.mark_pending_push().await.unwrap();
+        assert_eq!(client.status().await, SyncStatus::PendingPush);
+    }
 }
