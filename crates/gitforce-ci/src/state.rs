@@ -199,4 +199,158 @@ mod tests {
         // Can't go from pending to running directly
         assert!(state.start().is_err());
     }
+
+    #[test]
+    fn test_fail_transition() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        state.queue().unwrap();
+        state.assign(RunnerId::new()).unwrap();
+        state.start().unwrap();
+        state.fail(1, "build error".to_string()).unwrap();
+
+        assert_eq!(state.status(), JobStatus::Failed);
+        assert_eq!(state.exit_code(), Some(1));
+        assert_eq!(state.error_message(), Some("build error"));
+    }
+
+    #[test]
+    fn test_cancel_from_pending() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        state.cancel().unwrap();
+        assert_eq!(state.status(), JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_cancel_from_queued() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        state.queue().unwrap();
+        state.cancel().unwrap();
+        assert_eq!(state.status(), JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_cancel_from_assigned() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        state.queue().unwrap();
+        state.assign(RunnerId::new()).unwrap();
+        state.cancel().unwrap();
+        assert_eq!(state.status(), JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_cancel_from_running() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        state.queue().unwrap();
+        state.assign(RunnerId::new()).unwrap();
+        state.start().unwrap();
+        state.cancel().unwrap();
+        assert_eq!(state.status(), JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_timeout_transition() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        state.queue().unwrap();
+        state.assign(RunnerId::new()).unwrap();
+        state.start().unwrap();
+        state.timeout().unwrap();
+
+        assert_eq!(state.status(), JobStatus::TimedOut);
+    }
+
+    #[test]
+    fn test_runner_id_accessor() {
+        let job_id = JobId::new();
+        let runner_id = RunnerId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        assert!(state.runner_id().is_none());
+
+        state.queue().unwrap();
+        state.assign(runner_id).unwrap();
+
+        assert_eq!(state.runner_id(), Some(runner_id));
+    }
+
+    #[test]
+    fn test_is_terminal() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        assert!(!state.is_terminal());
+
+        state.queue().unwrap();
+        assert!(!state.is_terminal());
+
+        state.assign(RunnerId::new()).unwrap();
+        assert!(!state.is_terminal());
+
+        state.start().unwrap();
+        assert!(!state.is_terminal());
+
+        state.succeed(0).unwrap();
+        assert!(state.is_terminal());
+    }
+
+    #[test]
+    fn test_summary() {
+        let job_id = JobId::new();
+        let runner_id = RunnerId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        state.queue().unwrap();
+        state.assign(runner_id).unwrap();
+        state.start().unwrap();
+        state.succeed(0).unwrap();
+
+        let summary = state.summary();
+        assert_eq!(summary.job_id, job_id);
+        assert_eq!(summary.status, JobStatus::Succeeded);
+        assert_eq!(summary.runner_id, Some(runner_id));
+        assert_eq!(summary.exit_code, Some(0));
+        assert!(summary.error_message.is_none());
+    }
+
+    #[test]
+    fn test_summary_with_error() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        state.queue().unwrap();
+        state.assign(RunnerId::new()).unwrap();
+        state.start().unwrap();
+        state.fail(1, "test error".to_string()).unwrap();
+
+        let summary = state.summary();
+        assert_eq!(summary.error_message, Some("test error".to_string()));
+    }
+
+    #[test]
+    fn test_pending_to_cancelled() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+        // Direct cancel from pending
+        state.cancel().unwrap();
+        assert_eq!(state.status(), JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_cannot_assign_from_pending() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+        // Can't assign directly from pending - must queue first
+        assert!(state.assign(RunnerId::new()).is_err());
+    }
 }
