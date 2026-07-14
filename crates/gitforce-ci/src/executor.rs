@@ -73,3 +73,108 @@ impl PipelineExecutor {
         engine.cancel().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::{PipelineDefinition, PipelineTriggerEvent, TriggerType};
+    use gitforce_common::{PipelineId, RepoId};
+    use std::collections::HashMap;
+
+    async fn create_test_engine() -> CiEngine {
+        let pipeline_id = PipelineId::new();
+        let repo_id = RepoId::new();
+        let trigger = PipelineTriggerEvent::new(
+            pipeline_id,
+            repo_id,
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![],
+        };
+        CiEngine::new(trigger, pipeline).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_executor_new() {
+        let engine = create_test_engine().await;
+        let executor = PipelineExecutor::new(engine);
+        let state = executor.state().await;
+        assert_eq!(state.status, gitforce_common::PipelineStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_executor_ready_jobs() {
+        let engine = create_test_engine().await;
+        let executor = PipelineExecutor::new(engine);
+        let jobs = executor.ready_jobs().await;
+        assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_executor_graph() {
+        let engine = create_test_engine().await;
+        let executor = PipelineExecutor::new(engine);
+        let graph = executor.graph().await;
+        assert_eq!(graph.nodes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_executor_start() {
+        let engine = create_test_engine().await;
+        let executor = PipelineExecutor::new(engine);
+        let result = executor.start().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_executor_cancel() {
+        let engine = create_test_engine().await;
+        let executor = PipelineExecutor::new(engine);
+        let result = executor.cancel().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_executor_assign_job() {
+        let engine = create_test_engine().await;
+        let executor = PipelineExecutor::new(engine);
+        let job_id = JobId::new();
+        let runner_id = RunnerId::new();
+        // Assigning non-existent job should be no-op (returns Ok)
+        let result = executor.assign_job(job_id, runner_id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_executor_start_job() {
+        let engine = create_test_engine().await;
+        let executor = PipelineExecutor::new(engine);
+        let job_id = JobId::new();
+        let result = executor.start_job(job_id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_executor_succeed_job() {
+        let engine = create_test_engine().await;
+        let executor = PipelineExecutor::new(engine);
+        let job_id = JobId::new();
+        let result = executor.succeed_job(job_id, 0).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_executor_fail_job() {
+        let engine = create_test_engine().await;
+        let executor = PipelineExecutor::new(engine);
+        let job_id = JobId::new();
+        let result = executor.fail_job(job_id, 1, "test error".to_string()).await;
+        assert!(result.is_ok());
+    }
+}

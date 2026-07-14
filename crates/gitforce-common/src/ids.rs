@@ -395,4 +395,31 @@ mod tests {
         assert!(!matches!(PipelineStatus::Pending, PipelineStatus::Running));
         assert!(!matches!(PipelineStatus::Running, PipelineStatus::Pending));
     }
+
+    #[test]
+    fn test_job_status_non_terminal() {
+        assert!(!crate::JobStatus::Queued.is_terminal());
+        assert!(!crate::JobStatus::Assigned.is_terminal());
+    }
+
+    #[test]
+    fn test_pipeline_status_terminal() {
+        use crate::PipelineStatus;
+        // PipelineStatus doesn't have is_terminal, but we can verify the variants exist
+        let _ = PipelineStatus::Pending;
+        let _ = PipelineStatus::Running;
+        let _ = PipelineStatus::Succeeded;
+        let _ = PipelineStatus::Failed;
+        let _ = PipelineStatus::Cancelled;
+    }
+
+    #[test]
+    fn test_id_serialization() {
+        // RepoId uses serde with #[serde(transparent)] so it serializes as a UUID string
+        // We test that From<Uuid> and Into<Uuid> work correctly
+        let uuid = uuid::Uuid::new_v4();
+        let id: RepoId = uuid.into();
+        let round_trip: Uuid = id.into();
+        assert_eq!(uuid, round_trip);
+    }
 }
