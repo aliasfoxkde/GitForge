@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# Dark Factory pre-push hook
+# Runs: full test suite with coverage gate before first push
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+INFO() { echo -e "${GREEN}[pre-push]${NC} $*"; }
+WARN() { echo -e "${YELLOW}[pre-push]${NC} $*"; }
+ERROR() { echo -e "${RED}[pre-push]${NC} $*"; }
+
+COVERAGE_THRESHOLD="${COVERAGE_THRESHOLD:-70}"
+
+INFO "Running full test suite before push..."
+COVERAGE_OUT=$(mktemp)
+if ! go test -p 1 -race -timeout 15m -coverprofile="$COVERAGE_OUT" ./... 2>&1; then
+    rm -f "$COVERAGE_OUT"
+    ERROR "Tests failed — fix before pushing"
+    exit 1
+fi
+
+COV=$(go tool cover -func="$COVERAGE_OUT" | grep total | awk '{print $3}' | tr -d '%')
+rm -f "$COVERAGE_OUT"
+
+INFO "Coverage: ${COV}%"
+
+if (( $(echo "$COV < $COVERAGE_THRESHOLD" | bc -l) )); then
+    ERROR "Coverage ${COV}% is below threshold ${COVERAGE_THRESHOLD}%"
+    exit 1
+fi
+
+INFO "Pre-push checks passed — pushing..."

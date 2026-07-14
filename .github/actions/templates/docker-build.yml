@@ -1,0 +1,68 @@
+# GitForge CI - Docker Build Template
+# Standard Docker build workflow for projects using GitForge CI
+
+name: Docker Build
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        description: 'Dockerfile path'
+        required: false
+        default: 'Dockerfile'
+      image_name:
+        description: 'Docker image name'
+        required: true
+      registry:
+        description: 'Container registry'
+        required: false
+        default: 'ghcr.io'
+      push:
+        description: 'Push to registry'
+        required: false
+        default: 'false'
+        type: boolean
+    secrets:
+      REGISTRY_USERNAME:
+        required: false
+      REGISTRY_PASSWORD:
+        required: false
+
+jobs:
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: ${{ inputs.push == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ inputs.registry }}/${{ inputs.image_name }}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest
+        run: echo "Docker image built: ${{ steps.meta.outputs.tags }}"

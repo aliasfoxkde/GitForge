@@ -10,6 +10,7 @@
 
 pub mod auth;
 pub mod metrics;
+pub mod metrics_middleware;
 pub mod middleware;
 pub mod openapi;
 pub mod routes;

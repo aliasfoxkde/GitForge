@@ -11,6 +11,7 @@ members = [
     "crates/gitforce-sandbox",
     "crates/gitforce-storage",
     "crates/gitforce-api",
+    "crates/gitforce-cli",
     "services/git-server",
     "services/ci",
     "services/runner",

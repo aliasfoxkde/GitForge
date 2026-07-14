@@ -2,6 +2,7 @@
 
 use crate::auth::ApiAuth;
 use crate::metrics::Metrics;
+use crate::metrics_middleware::MetricsLayer;
 use crate::openapi::api_docs_routes;
 use crate::routes::{artifact_routes, ci_routes, repo_routes, runner_routes};
 use axum::{
@@ -34,6 +35,7 @@ impl ApiServer {
     pub fn with_storage(jwt_secret: &str, pool: Pool, storage_path: Option<std::path::PathBuf>) -> Self {
         let auth = ApiAuth::new(jwt_secret);
         let metrics = Metrics::new();
+        let metrics_arc = Arc::new(metrics);
 
         // Configure CORS - restrictive by default
         let cors = CorsLayer::new()
@@ -54,10 +56,14 @@ impl ApiServer {
             .merge(runner_routes())
             .merge(artifact_routes());
 
+        // Metrics layer for automatic request recording
+        let metrics_layer = MetricsLayer::new(metrics_arc.clone());
+
         let mut app = public_routes
             .layer(cors)
             .layer(Extension(Arc::new(auth)))
-            .layer(Extension(Arc::new(metrics)))
+            .layer(metrics_layer)
+            .layer(Extension(metrics_arc))
             .layer(Extension(Arc::new(pool)));
 
         // Add storage if path provided (async init not possible here)
