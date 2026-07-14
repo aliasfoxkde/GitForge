@@ -179,6 +179,182 @@ async fn complete_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
+
+    fn assert_status(response: axum::response::Response, expected: StatusCode) {
+        let status = response.status();
+        assert_eq!(status, expected, "Expected status {:?}, got {:?}", expected, status);
+    }
+
+    #[tokio::test]
+    async fn test_register_runner_handler() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+
+        let request = RegisterRunnerRequest {
+            name: "test-runner".to_string(),
+            runner_type: "docker".to_string(),
+            capacity: 4,
+        };
+
+        let response = register_runner(
+            axum::extract::State(state),
+            axum::Json(request),
+        )
+        .await;
+
+        assert_status(response.into_response(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_register_runner_bare_metal_handler() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+
+        let request = RegisterRunnerRequest {
+            name: "bare-runner".to_string(),
+            runner_type: "bare-metal".to_string(),
+            capacity: 8,
+        };
+
+        let response = register_runner(
+            axum::extract::State(state),
+            axum::Json(request),
+        )
+        .await;
+
+        assert_status(response.into_response(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_runner_heartbeat_valid_uuid() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let runner_id = uuid::Uuid::new_v4();
+
+        let response = runner_heartbeat(
+            axum::extract::State(state),
+            axum::extract::Path(runner_id.to_string()),
+        )
+        .await;
+
+        assert_status(response.into_response(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_runner_heartbeat_invalid_uuid() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+
+        let response = runner_heartbeat(
+            axum::extract::State(state),
+            axum::extract::Path("not-a-uuid".to_string()),
+        )
+        .await;
+
+        assert_status(response.into_response(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_pending_jobs_handler() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+
+        let response = get_pending_jobs(axum::extract::State(state)).await;
+
+        let resp = response.into_response();
+        assert_status(resp, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_assign_job_valid_uuid() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let job_id = uuid::Uuid::new_v4();
+        let runner_id = uuid::Uuid::new_v4();
+
+        let response = assign_job(
+            axum::extract::State(state),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(serde_json::json!({
+                "runner_id": runner_id.to_string()
+            })),
+        )
+        .await;
+
+        assert_status(response.into_response(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_assign_job_invalid_uuid() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+
+        let response = assign_job(
+            axum::extract::State(state),
+            axum::extract::Path("not-a-uuid".to_string()),
+            axum::Json(serde_json::json!({
+                "runner_id": "something"
+            })),
+        )
+        .await;
+
+        assert_status(response.into_response(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_complete_job_success_handler() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let job_id = uuid::Uuid::new_v4();
+
+        let response = complete_job(
+            axum::extract::State(state),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(serde_json::json!({
+                "success": true
+            })),
+        )
+        .await;
+
+        assert_status(response.into_response(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_complete_job_failure_handler() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let job_id = uuid::Uuid::new_v4();
+
+        let response = complete_job(
+            axum::extract::State(state),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(serde_json::json!({
+                "success": false,
+                "error": "test error"
+            })),
+        )
+        .await;
+
+        assert_status(response.into_response(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_complete_job_invalid_uuid() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+
+        let response = complete_job(
+            axum::extract::State(state),
+            axum::extract::Path("not-a-uuid".to_string()),
+            axum::Json(serde_json::json!({
+                "success": true
+            })),
+        )
+        .await;
+
+        assert_status(response.into_response(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn test_register_runner_request_deserialize() {
@@ -201,5 +377,19 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("job-123"));
         assert!(json.contains("build"));
+    }
+
+    #[test]
+    fn test_create_state_fn() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let _ = state.scheduler;
+    }
+
+    #[test]
+    fn test_scheduler_routes_creation() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let _routes: Router = scheduler_routes(state);
     }
 }
