@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 mod config;
 mod client;
+mod sync;
 
 pub use config::Config;
 pub use client::GitForgeClient;
@@ -149,19 +150,62 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Sync { status, push, pull, init } => {
+            let local_dir = config.local_data_dir.clone();
+            let sync_client = sync::SyncClient::new(local_dir.clone());
+
+            if let Err(e) = sync_client.init().await {
+                tracing::warn!("Failed to initialize sync: {}", e);
+            }
+
             if *status {
-                println!("Local storage: Not initialized");
-                println!("Sync status: Not yet implemented");
+                let sync_status = sync_client.status().await;
+                println!("Local storage: {}", local_dir.display());
+                println!("Sync status: {:?}", sync_status);
             } else if *push {
-                println!("Push not yet implemented");
+                if let Some(token) = &config.token {
+                    match sync_client.push(&config.api_url(), token).await {
+                        Ok(response) => {
+                            println!("Push successful!");
+                            println!("  Remote revision: {}", response.remote_rev);
+                            if response.conflicts.is_empty() {
+                                println!("  No conflicts");
+                            } else {
+                                println!("  Conflicts: {}", response.conflicts.join(", "));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Push failed: {}", e);
+                            println!("Push failed: {}", e);
+                        }
+                    }
+                } else {
+                    println!("Not authenticated. Run `gitforge auth login` first.");
+                }
             } else if *pull {
-                println!("Pull not yet implemented");
+                if let Some(token) = &config.token {
+                    match sync_client.pull(&config.api_url(), token).await {
+                        Ok(response) => {
+                            println!("Pull successful!");
+                            println!("  Remote revision: {}", response.remote_rev);
+                            println!("  Repositories synced: {}", response.repos.len());
+                            println!("  Pipelines synced: {}", response.pipelines.len());
+                        }
+                        Err(e) => {
+                            tracing::error!("Pull failed: {}", e);
+                            println!("Pull failed: {}", e);
+                        }
+                    }
+                } else {
+                    println!("Not authenticated. Run `gitforge auth login` first.");
+                }
             } else if let Some(directory) = init {
                 let path = PathBuf::from(directory);
                 if path.exists() {
                     anyhow::bail!("Directory {} already exists", directory);
                 }
                 std::fs::create_dir_all(&path)?;
+                let init_client = sync::SyncClient::new(path.clone());
+                init_client.init().await?;
                 println!("Initialized local storage at {}", path.display());
             }
         }
