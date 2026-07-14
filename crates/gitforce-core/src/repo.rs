@@ -216,4 +216,123 @@ mod tests {
         let repos = service.list_by_owner(owner_id).await;
         assert!(repos.is_empty());
     }
+
+    #[test]
+    fn test_git_ref_creation() {
+        let git_ref = GitRef {
+            name: "refs/heads/main".to_string(),
+            hash: "abc123".to_string(),
+            is_branch: true,
+            is_tag: false,
+        };
+        assert_eq!(git_ref.name, "refs/heads/main");
+        assert!(git_ref.is_branch);
+        assert!(!git_ref.is_tag);
+    }
+
+    #[test]
+    fn test_repo_metadata_creation() {
+        let meta = RepoMetadata {
+            id: RepoId::new(),
+            name: "test-repo".to_string(),
+            owner_id: UserId::new(),
+            git_path: "/git/repos/test".to_string(),
+        };
+        assert_eq!(meta.name, "test-repo");
+    }
+
+    #[tokio::test]
+    async fn test_repo_create_invalid_name() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let service = RepoService::new(storage);
+
+        let owner_id = UserId::new();
+
+        // Empty name should fail
+        let result = service.create("".to_string(), owner_id).await;
+        assert!(result.is_err());
+
+        // Name with invalid chars should fail
+        let result = service.create("invalid name!".to_string(), owner_id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_repo_get_not_found() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let service = RepoService::new(storage);
+
+        let result = service.get(RepoId::new()).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_repo_list() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let service = RepoService::new(storage);
+
+        let owner_id = UserId::new();
+
+        service.create("repo1".to_string(), owner_id).await.unwrap();
+        service.create("repo2".to_string(), owner_id).await.unwrap();
+
+        let repos = service.list().await;
+        assert_eq!(repos.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_repo_git_path() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let service = RepoService::new(storage);
+
+        let owner_id = UserId::new();
+
+        let meta = service.create("test-repo".to_string(), owner_id).await.unwrap();
+        let path = service.get_git_path(meta.id).await.unwrap();
+        assert!(!path.is_empty());
+
+        // Non-existent repo should fail
+        let result = service.get_git_path(RepoId::new()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_repo_list_by_owner() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let service = RepoService::new(storage);
+
+        let owner1 = UserId::new();
+        let owner2 = UserId::new();
+
+        service.create("repo1".to_string(), owner1).await.unwrap();
+        service.create("repo2".to_string(), owner1).await.unwrap();
+        service.create("repo3".to_string(), owner2).await.unwrap();
+
+        let owner1_repos = service.list_by_owner(owner1).await;
+        assert_eq!(owner1_repos.len(), 2);
+
+        let owner2_repos = service.list_by_owner(owner2).await;
+        assert_eq!(owner2_repos.len(), 1);
+    }
+
+    #[test]
+    fn test_repo_error_display() {
+        let repo_id = RepoId::new();
+        let err = RepoError::NotFound(repo_id);
+        assert!(format!("{}", err).contains("not found"));
+
+        let err = RepoError::AlreadyExists("test".to_string());
+        assert!(format!("{}", err).contains("already exists"));
+
+        let err = RepoError::InvalidName("bad".to_string());
+        assert!(format!("{}", err).contains("Invalid repository name"));
+
+        let err = RepoError::Storage("disk error".to_string());
+        assert!(format!("{}", err).contains("Storage error"));
+    }
 }
