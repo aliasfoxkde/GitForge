@@ -324,4 +324,104 @@ mod tests {
         let state = engine.state().await;
         assert!(!state.failed_jobs().is_empty() || state.status == PipelineStatus::Succeeded || state.jobs.values().any(|j| j.status() == JobStatus::Succeeded));
     }
+
+    #[tokio::test]
+    async fn test_engine_fail_job() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+
+        let engine = CiEngine::new(event, make_pipeline()).await.unwrap();
+        engine.start().await.unwrap();
+
+        let ready = engine.ready_jobs().await;
+        let build_job = ready[0];
+        let runner_id = gitforce_common::RunnerId::new();
+
+        engine.assign_job(build_job, runner_id).await.unwrap();
+        engine.start_job(build_job).await.unwrap();
+        engine.fail_job(build_job, 1, "build failed".to_string()).await.unwrap();
+
+        let state = engine.state().await;
+        assert_eq!(state.status, PipelineStatus::Failed);
+        assert!(state.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_engine_cancel() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+
+        let engine = CiEngine::new(event, make_pipeline()).await.unwrap();
+        engine.start().await.unwrap();
+
+        engine.cancel().await.unwrap();
+
+        let state = engine.state().await;
+        assert_eq!(state.status, PipelineStatus::Cancelled);
+        assert!(state.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_engine_get_job() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+
+        let engine = CiEngine::new(event, make_pipeline()).await.unwrap();
+        engine.start().await.unwrap();
+
+        let ready = engine.ready_jobs().await;
+        let build_job = ready[0];
+
+        let job = engine.get_job(build_job).await;
+        assert!(job.is_some());
+
+        let non_existent = gitforce_common::JobId::new();
+        let not_found = engine.get_job(non_existent).await;
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_engine_state_all_jobs_finished() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+
+        let engine = CiEngine::new(event, make_pipeline()).await.unwrap();
+        let state = engine.state().await;
+
+        // No jobs finished yet
+        assert!(!state.all_jobs_finished());
+    }
+
+    #[tokio::test]
+    async fn test_engine_state_pending_jobs() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+
+        let engine = CiEngine::new(event, make_pipeline()).await.unwrap();
+        engine.start().await.unwrap();
+
+        let state = engine.state().await;
+        let pending = state.pending_jobs();
+        assert!(!pending.is_empty());
+    }
 }
