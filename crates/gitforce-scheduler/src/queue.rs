@@ -182,4 +182,114 @@ mod tests {
         let first = queue.dequeue().unwrap();
         assert_eq!(first.job_id, job1.job_id);
     }
+
+    #[test]
+    fn test_queue_peek() {
+        let mut queue = JobQueue::new();
+        let repo_id = RepoId::new();
+
+        assert!(queue.peek().is_none());
+
+        let job = QueuedJob::new(JobId::new(), PipelineRunId::new(), repo_id)
+            .with_priority(Priority::High);
+        queue.enqueue(job.clone());
+
+        let peeked = queue.peek().unwrap();
+        assert_eq!(peeked.job_id, job.job_id);
+    }
+
+    #[test]
+    fn test_queue_contains() {
+        let mut queue = JobQueue::new();
+        let repo_id = RepoId::new();
+
+        let job_id = JobId::new();
+        let job = QueuedJob::new(job_id, PipelineRunId::new(), repo_id);
+        queue.enqueue(job);
+
+        assert!(queue.contains(job_id));
+        assert!(!queue.contains(JobId::new()));
+    }
+
+    #[test]
+    fn test_queue_remove() {
+        let mut queue = JobQueue::new();
+        let repo_id = RepoId::new();
+
+        let job_id = JobId::new();
+        let job = QueuedJob::new(job_id, PipelineRunId::new(), repo_id);
+        queue.enqueue(job.clone());
+
+        let removed = queue.remove(job_id);
+        assert!(removed.is_some());
+        assert!(!queue.contains(job_id));
+    }
+
+    #[test]
+    fn test_queue_remove_nonexistent() {
+        let mut queue = JobQueue::new();
+        let removed = queue.remove(JobId::new());
+        assert!(removed.is_none());
+    }
+
+    #[test]
+    fn test_queue_len() {
+        let mut queue = JobQueue::new();
+        let repo_id = RepoId::new();
+
+        assert_eq!(queue.len(), 0);
+
+        queue.enqueue(QueuedJob::new(JobId::new(), PipelineRunId::new(), repo_id));
+        assert_eq!(queue.len(), 1);
+
+        queue.enqueue(QueuedJob::new(JobId::new(), PipelineRunId::new(), repo_id));
+        assert_eq!(queue.len(), 2);
+
+        queue.dequeue();
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn test_queue_is_empty() {
+        let mut queue = JobQueue::new();
+        let repo_id = RepoId::new();
+
+        assert!(queue.is_empty());
+
+        queue.enqueue(QueuedJob::new(JobId::new(), PipelineRunId::new(), repo_id));
+        assert!(!queue.is_empty());
+
+        queue.dequeue();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_queue_all() {
+        let mut queue = JobQueue::new();
+        let repo_id = RepoId::new();
+
+        let job1 = QueuedJob::new(JobId::new(), PipelineRunId::new(), repo_id);
+        let job2 = QueuedJob::new(JobId::new(), PipelineRunId::new(), repo_id);
+        queue.enqueue(job1.clone());
+        queue.enqueue(job2.clone());
+
+        let all = queue.all();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_priority_ordering() {
+        assert!(Priority::High > Priority::Normal);
+        assert!(Priority::High > Priority::Low);
+        assert!(Priority::Normal > Priority::Low);
+        assert!(Priority::Low < Priority::High);
+    }
+
+    #[test]
+    fn test_queued_job_with_priority() {
+        let repo_id = RepoId::new();
+        let job = QueuedJob::new(JobId::new(), PipelineRunId::new(), repo_id)
+            .with_priority(Priority::High);
+        assert_eq!(job.priority, Priority::High);
+    }
 }
