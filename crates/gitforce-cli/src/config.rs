@@ -30,7 +30,7 @@ pub struct Config {
     pub features: HashMap<String, bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub enum OutputFormat {
     #[default]
     Table,
@@ -92,5 +92,46 @@ impl Config {
     /// Get the API base URL
     pub fn api_url(&self) -> String {
         format!("{}/api", self.server_url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert_eq!(config.server_url, "http://localhost:8080");
+        assert!(config.token.is_none());
+        assert_eq!(config.output_format, OutputFormat::Table);
+    }
+
+    #[test]
+    fn test_config_api_url() {
+        let config = Config {
+            server_url: "https://gitforge.example.com".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.api_url(), "https://gitforge.example.com/api");
+    }
+
+    #[test]
+    fn test_output_format_default() {
+        assert_eq!(OutputFormat::default(), OutputFormat::Table);
+    }
+
+    #[test]
+    fn test_config_with_token() {
+        let mut config = Config::default();
+        config.token = Some("test-token".to_string());
+        assert_eq!(config.token.as_ref().unwrap(), "test-token");
+    }
+
+    #[test]
+    fn test_config_with_features() {
+        let mut config = Config::default();
+        config.features.insert("sync".to_string(), true);
+        assert_eq!(config.features.get("sync"), Some(&true));
     }
 }
