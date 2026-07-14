@@ -10,6 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Filesystem-based storage for artifacts and cache
 pub struct FileStorage {
+    #[allow(dead_code)]
     root: PathBuf,
     artifacts_dir: PathBuf,
     cache_dir: PathBuf,

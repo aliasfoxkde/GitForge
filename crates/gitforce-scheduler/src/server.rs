@@ -122,7 +122,7 @@ async fn get_pending_jobs(
 
 /// Assign a job to a runner (runner claims a job)
 async fn assign_job(
-    State(state): State<SchedulerServerState>,
+    State(_state): State<SchedulerServerState>,
     Path(job_id): Path<String>,
     Json(request): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -153,7 +153,7 @@ async fn assign_job(
 
 /// Complete a job
 async fn complete_job(
-    State(state): State<SchedulerServerState>,
+    State(_state): State<SchedulerServerState>,
     Path(job_id): Path<String>,
     Json(request): Json<serde_json::Value>,
 ) -> impl IntoResponse {

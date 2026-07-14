@@ -6,7 +6,6 @@ use futures::StreamExt;
 use gitforce_ci::{CiEngine, PipelineDefinition, PipelineTriggerEvent, TriggerType, JobDefinition, StepDefinition};
 use gitforce_events::{
     EventBus, EventEnvelope, EventFilter, EventType, EventPayload, InMemoryEventBus,
-    PushReceivedPayload,
 };
 use gitforce_scheduler::Scheduler;
 use std::collections::HashMap;
@@ -80,7 +79,7 @@ async fn run_event_consumer(
 
     // Subscribe to push events
     let filter = EventFilter::for_types(vec![EventType::PushReceived]);
-    let mut stream = event_bus.subscribe(filter).await?;
+    let stream = event_bus.subscribe(filter).await?;
 
     // Pin the stream for async iteration
     tokio::pin!(stream);

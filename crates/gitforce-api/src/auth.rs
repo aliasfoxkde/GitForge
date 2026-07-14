@@ -1,6 +1,6 @@
 //! API authentication
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use gitforce_common::{Error, UserId};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,7 @@ impl Claims {
 /// API authentication handler
 #[derive(Clone)]
 pub struct ApiAuth {
+    #[allow(dead_code)]
     jwt_secret: String,
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
@@ -89,11 +90,7 @@ impl ApiAuth {
 
     /// Extract token from Authorization header
     pub fn extract_token(auth_header: &str) -> Option<&str> {
-        if auth_header.starts_with("Bearer ") {
-            Some(&auth_header[7..])
-        } else {
-            None
-        }
+        auth_header.strip_prefix("Bearer ")
     }
 }
 

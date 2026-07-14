@@ -5,7 +5,7 @@
 use super::GitProtocolHandler;
 use crate::storage::StorageBackend;
 use async_trait::async_trait;
-use gitforce_common::{Error, RepoId, Result};
+use gitforce_common::{RepoId, Result};
 use std::sync::Arc;
 
 /// SSH Git protocol handler

@@ -15,7 +15,7 @@ pub trait ResultExt<T, E> {
         F: FnOnce(E) -> C;
 
     /// Convert to a different error type
-    fn context<C>(self, context: C) -> std::result::Result<T, C>
+    fn context<C>(self, _context: C) -> std::result::Result<T, C>
     where
         E: Into<C>;
 }
@@ -28,7 +28,7 @@ impl<T, E> ResultExt<T, E> for std::result::Result<T, E> {
         self.map_err(f)
     }
 
-    fn context<C>(self, context: C) -> std::result::Result<T, C>
+    fn context<C>(self, _context: C) -> std::result::Result<T, C>
     where
         E: Into<C>,
     {

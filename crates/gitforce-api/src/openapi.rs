@@ -3,12 +3,10 @@
 //! Interactive API documentation available at /swagger-ui when server is running.
 
 use axum::{
-    extract::Extension,
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// OpenAPI 3.0 specification for GitForge API

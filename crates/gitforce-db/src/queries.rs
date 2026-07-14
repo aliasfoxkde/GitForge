@@ -241,7 +241,7 @@ impl PipelineQueries {
         .bind(pipeline.repo_id.to_string())
         .bind(&pipeline.name)
         .bind(&pipeline.trigger_type)
-        .bind(&pipeline.config.to_string())
+        .bind(pipeline.config.to_string())
         .bind(pipeline.created_at.to_rfc3339())
         .execute(pool.pool())
         .await
@@ -759,7 +759,7 @@ impl EventQueries {
         )
         .bind(event.id.to_string())
         .bind(&event.event_type)
-        .bind(&event.payload.to_string())
+        .bind(event.payload.to_string())
         .bind(event.created_at.to_rfc3339())
         .execute(pool.pool())
         .await

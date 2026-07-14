@@ -8,21 +8,12 @@ use std::pin::Pin;
 use tokio::sync::broadcast;
 
 /// Event filter for subscriptions
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EventFilter {
     /// Filter by event types
     pub event_types: Option<Vec<EventType>>,
     /// Filter by repository ID
     pub repo_id: Option<gitforce_common::RepoId>,
-}
-
-impl Default for EventFilter {
-    fn default() -> Self {
-        Self {
-            event_types: None,
-            repo_id: None,
-        }
-    }
 }
 
 impl EventFilter {

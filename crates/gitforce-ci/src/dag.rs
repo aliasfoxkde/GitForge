@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_detect_cycle() {
-        let mut jobs = vec![
+        let jobs = vec![
             make_job("a", vec!["c"]),
             make_job("b", vec!["a"]),
             make_job("c", vec!["b"]), // Creates cycle: a -> c -> b -> a

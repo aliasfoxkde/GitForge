@@ -60,7 +60,7 @@ pub async fn auth_middleware(
     };
 
     // Validate token
-    match auth.validate_token(&token) {
+    match auth.validate_token(token) {
         Ok(claims) => {
             // Store claims in extensions for route handlers
             let mut request = request;

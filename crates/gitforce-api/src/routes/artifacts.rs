@@ -5,11 +5,10 @@ use crate::server::ErrorResponse;
 use axum::{
     extract::{Extension, Path},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{delete, get},
+    response::IntoResponse,
+    routing::get,
     Json, Router,
 };
-use gitforce_common::JobId;
 use gitforce_storage::{Artifact, ArtifactId, ArtifactStore, FileStorage};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -45,7 +44,7 @@ fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
         .and_then(|h| ApiAuth::extract_token(h))
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    auth.validate_token(&token)
+    auth.validate_token(token)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     Ok(())
@@ -67,7 +66,7 @@ fn artifact_to_response(artifact: &Artifact) -> ArtifactResponse {
 /// List artifacts
 async fn list_artifacts(
     Extension(auth): Extension<Arc<ApiAuth>>,
-    Extension(storage): Extension<Arc<FileStorage>>,
+    Extension(_storage): Extension<Arc<FileStorage>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     match extract_user(&auth, &headers) {
@@ -158,7 +157,7 @@ async fn delete_artifact(
 /// Get artifacts for a job
 async fn get_job_artifacts(
     Extension(auth): Extension<Arc<ApiAuth>>,
-    Extension(storage): Extension<Arc<FileStorage>>,
+    Extension(_storage): Extension<Arc<FileStorage>>,
     headers: HeaderMap,
     Path(job_id): Path<String>,
 ) -> impl IntoResponse {

@@ -31,6 +31,7 @@ pub struct StepResult {
 /// Docker-based sandbox
 pub struct DockerSandbox {
     docker: Option<Docker>,
+    #[allow(dead_code)]
     default_limits: SandboxLimits,
 }
 

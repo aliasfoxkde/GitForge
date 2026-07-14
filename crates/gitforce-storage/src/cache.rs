@@ -1,7 +1,7 @@
 //! Cache storage
 
 use async_trait::async_trait;
-use gitforce_common::{Error, Result};
+use gitforce_common::Result;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +44,7 @@ pub struct CacheEntry {
 }
 
 /// In-memory cache store (for MVP)
+#[allow(clippy::type_complexity)]
 pub struct InMemoryCacheStore {
     entries: Arc<RwLock<HashMap<CacheKey, (Vec<u8>, CacheEntry)>>>,
 }

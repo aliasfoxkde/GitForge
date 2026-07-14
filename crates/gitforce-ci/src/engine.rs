@@ -1,7 +1,7 @@
 //! CI Engine - orchestrates pipeline execution
 
 use crate::dag::{DagBuilder, JobGraph};
-use crate::pipeline::{PipelineDefinition, PipelineTriggerEvent, TriggerType};
+use crate::pipeline::{PipelineDefinition, PipelineTriggerEvent};
 use crate::state::JobStateMachine;
 use gitforce_common::{JobId, JobStatus, PipelineRunId, PipelineStatus, RepoId, Result};
 use std::collections::HashMap;
@@ -148,7 +148,7 @@ impl CiEngine {
                 .dependencies
                 .iter()
                 .all(|dep_id| {
-                    state.jobs.get(dep_id).map_or(false, |s| {
+                    state.jobs.get(dep_id).is_some_and(|s| {
                         s.status() == JobStatus::Succeeded
                     })
                 });
@@ -243,8 +243,8 @@ impl CiEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::{JobDefinition, StepDefinition};
-    use gitforce_common::{PipelineId, UserId};
+    use crate::pipeline::{JobDefinition, StepDefinition, TriggerType};
+    use gitforce_common::PipelineId;
     use std::collections::HashMap;
 
     fn make_pipeline() -> PipelineDefinition {

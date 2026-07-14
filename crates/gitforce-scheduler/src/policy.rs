@@ -1,7 +1,7 @@
 //! Scheduling policies
 
 use async_trait::async_trait;
-use gitforce_common::{JobId, Result, RunnerId};
+use gitforce_common::{JobId, RunnerId};
 use gitforce_db::models::Runner;
 
 /// Scheduling policy trait

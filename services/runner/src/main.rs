@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("runner registered with ID: {}", runner_id);
 
     // Create job executor
-    let executor = Arc::new(JobExecutor::new().await?);
+    let _executor = Arc::new(JobExecutor::new().await?);
 
     // Start agent loop
     // In production, this would:

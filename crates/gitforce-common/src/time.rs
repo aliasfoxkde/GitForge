@@ -3,7 +3,6 @@
 //! Provides timezone-aware datetime types and utilities.
 
 use chrono::{DateTime as ChronoDateTime, Utc};
-use serde::{Deserialize, Serialize};
 
 /// GitForge's standard timestamp type (UTC)
 pub type DateTime = ChronoDateTime<Utc>;

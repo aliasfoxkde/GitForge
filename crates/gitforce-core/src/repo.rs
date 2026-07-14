@@ -1,7 +1,6 @@
 //! Repository management service
 
 use crate::storage::StorageBackend;
-use async_trait::async_trait;
 use gitforce_common::{Error, RepoId, Result, UserId};
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -59,7 +59,7 @@ fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
         .and_then(|h| ApiAuth::extract_token(h))
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    auth.validate_token(&token)
+    auth.validate_token(token)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     Ok(())

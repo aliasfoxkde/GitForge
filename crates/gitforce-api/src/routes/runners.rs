@@ -5,7 +5,7 @@ use axum::{
     extract::{Extension, Path},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use gitforce_common::RunnerId;
@@ -43,7 +43,7 @@ fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
         .and_then(|h| ApiAuth::extract_token(h))
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    auth.validate_token(&token)
+    auth.validate_token(token)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     Ok(())

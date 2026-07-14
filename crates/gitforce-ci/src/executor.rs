@@ -2,7 +2,6 @@
 
 use crate::dag::JobGraph;
 use crate::engine::{CiEngine, CiEngineState};
-use crate::pipeline::{PipelineDefinition, PipelineTriggerEvent};
 use gitforce_common::{JobId, Result, RunnerId};
 use std::sync::Arc;
 use tokio::sync::RwLock;

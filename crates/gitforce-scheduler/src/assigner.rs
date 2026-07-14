@@ -2,12 +2,11 @@
 
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
-use futures::StreamExt;
-use gitforce_common::{JobId, PipelineRunId, RepoId, Result, RunnerId};
+use gitforce_common::{JobId, PipelineRunId, RepoId, RunnerId};
 use gitforce_db::models::Runner;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, RwLock};
 
 /// Scheduler command
 #[derive(Debug)]
@@ -187,7 +186,7 @@ impl Scheduler {
         // Try to assign jobs while we have available runners
         let mut assigned = None;
 
-        while let Some(job) = state.queue.peek() {
+        if let Some(job) = state.queue.peek() {
             let job_id = job.job_id;
 
             // Select runner using policy
@@ -200,12 +199,10 @@ impl Scheduler {
                     state.job_assignments.insert(job_id, r_id);
                     tracing::info!("assigned job {} to runner {}", job_id, r_id);
                     assigned = Some((job_id, r_id));
-                    break; // Process one at a time for simplicity
                 }
                 None => {
                     // No runner available
                     tracing::debug!("no runner available for job {}", job_id);
-                    break;
                 }
             }
         }

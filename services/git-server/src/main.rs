@@ -5,7 +5,6 @@
 use gitforce_core::{FileStorageBackend, HookManager, RepoService};
 use gitforce_events::{EventBus, InMemoryEventBus};
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tokio::signal;
 
 #[tokio::main]
@@ -25,13 +24,13 @@ async fn main() -> anyhow::Result<()> {
     storage.ensure_root().await?;
 
     // Initialize repository service
-    let repo_service = RepoService::new(storage);
+    let _repo_service = RepoService::new(storage);
 
     // Initialize event bus
-    let event_bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
+    let _event_bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
 
     // Initialize hook manager
-    let hook_manager = HookManager::new();
+    let _hook_manager = HookManager::new();
 
     // In production, we would:
     // 1. Start SSH server on port 22

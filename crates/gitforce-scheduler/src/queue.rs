@@ -1,21 +1,16 @@
 //! Job queue implementation
 
-use gitforce_common::{JobId, PipelineRunId, RepoId, Result};
+use gitforce_common::{JobId, PipelineRunId, RepoId};
 use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
 
 /// Job priority
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Priority {
-    High = 2,
+    #[default]
     Normal = 1,
+    High = 2,
     Low = 0,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Priority::Normal
-    }
 }
 
 impl Ord for Priority {
