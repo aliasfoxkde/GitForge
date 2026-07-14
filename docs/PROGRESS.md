@@ -10,7 +10,6 @@
 - [x] Set up Rust workspace structure with 10 crates and 4 services
 - [x] Implement `gitforce-common` crate - UUID types, error handling, time utilities
 - [x] Implement `gitforce-db` crate - Connection pool, database models
-- [x] Implement `gitforce-events` crate - Event bus, event types, filtering
 
 #### Phase 2: Git Server Core
 - [x] Implement `gitforce-core` crate - FileStorageBackend, RepoService, Git protocol handlers, Hook system
@@ -33,7 +32,7 @@
 - [x] Create service binaries - git-server, ci, runner, api
 - [x] Docker deployment - Dockerfile, docker-compose.yml, config.toml.example
 
-#### Phase 8: Quality & Tools (NEW)
+#### Phase 8: Quality & Tools
 - [x] gitforce-cli - CLI tool with auth, repo, pipeline, runner, sync commands
 - [x] Observability - Prometheus metrics middleware auto-wiring
 - [x] CI Templates - Reusable GitHub Actions templates (rust-build, rust-test, docker-build, security-audit)
@@ -43,8 +42,28 @@
 
 ```
 cargo build --workspace     ✅ SUCCESS
-cargo test --workspace     ✅ SUCCESS (200+ tests)
+cargo test --workspace      ✅ SUCCESS (211 tests)
 cargo clippy --workspace    ✅ ZERO WARNINGS with -D warnings
+```
+
+## Working Routes (as of 2026-07-14)
+
+| Route | Status | Description |
+|-------|--------|-------------|
+| `/health` | ✅ 200 | Health check with DB status |
+| `/metrics` | ✅ 200 | Prometheus metrics |
+| `/dashboard` | ✅ 200 | HTML dashboard with system status |
+| `/swagger-ui` | ✅ 200 | Interactive API documentation |
+| `/api-docs/openapi.json` | ✅ 200 | OpenAPI specification |
+
+## Cloud Sync Protocol (Implemented)
+
+```rust
+SyncClient {
+  push(api_url, token) -> PushResponse  // Upload local state
+  pull(api_url, token) -> PullResponse // Download cloud state
+  status() -> SyncStatus                // Current sync state
+}
 ```
 
 ## Test Status ✅
@@ -60,16 +79,23 @@ cargo clippy --workspace    ✅ ZERO WARNINGS with -D warnings
 | gitforce-runner | 10 passed | ✅ |
 | gitforce-sandbox | 2 passed | ✅ |
 | gitforce-storage | 14 passed | ✅ |
-| gitforce-api | 24 passed | ✅ |
-| **Total** | **200+** | ✅ |
+| gitforce-api | 32 passed | ✅ |
+| gitforce-cli | 3 passed | ✅ |
+| **Total** | **211** | ✅ |
+
+## Coverage
+
+| Metric | Value | Target |
+|--------|-------|--------|
+| Lines covered | 53.27% | 99% |
+
+Note: 99% coverage requires HTTP mocking infrastructure and service-level integration tests.
 
 ## Key Files
 
-### New Additions (2026-07-14)
-
 | File | Purpose |
 |------|---------|
-| `crates/gitforce-cli/` | CLI tool for local-first Git platform client |
+| `crates/gitforce-cli/src/sync.rs` | Cloud sync protocol implementation |
 | `crates/gitforce-api/src/metrics_middleware.rs` | Auto-recording Prometheus metrics |
 | `.github/actions/templates/` | Reusable CI/CD templates |
 | `tests/integration/` | Integration tests |
@@ -78,15 +104,20 @@ cargo clippy --workspace    ✅ ZERO WARNINGS with -D warnings
 
 ### Phase 9: Cloud Platform Foundation
 - [ ] VPS deployment guide with PostgreSQL + Redis
-- [ ] Cloud sync protocol for local CLI ↔ cloud API
+- [ ] Sync server endpoints (/sync/push, /sync/pull)
 - [ ] S3-compatible artifact storage
 
 ### Phase 10: GitHub Alternative Features
 - [ ] Issues and PRs data models
 - [ ] Teams and Organizations
-- [ ] Web UI dashboard
+- [ ] Full web UI dashboard
 
 ### Phase 11: Advanced CI/CD
 - [ ] Matrix builds
 - [ ] Caching strategies
 - [ ] Action templates marketplace
+
+### Phase 12: Enterprise
+- [ ] SSO/SAML authentication
+- [ ] Audit logging
+- [ ] Role-based access control (RBAC)
