@@ -61,3 +61,40 @@ impl SandboxLimits {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sandbox_limits_default() {
+        let limits = SandboxLimits::default();
+        assert_eq!(limits.cpu_ms, 3600000);
+        assert_eq!(limits.memory_mb, 4096);
+        assert!(limits.network);
+    }
+
+    #[test]
+    fn test_sandbox_limits_small() {
+        let limits = SandboxLimits::small();
+        assert_eq!(limits.cpu_ms, 300000);
+        assert_eq!(limits.memory_mb, 512);
+        assert!(!limits.network);
+    }
+
+    #[test]
+    fn test_sandbox_limits_medium() {
+        let limits = SandboxLimits::medium();
+        assert_eq!(limits.cpu_ms, 1800000);
+        assert_eq!(limits.memory_mb, 2048);
+        assert!(limits.network);
+    }
+
+    #[test]
+    fn test_sandbox_limits_large() {
+        let limits = SandboxLimits::large();
+        assert_eq!(limits.cpu_ms, 3600000);
+        assert_eq!(limits.memory_mb, 8192);
+        assert!(limits.network);
+    }
+}
