@@ -172,3 +172,89 @@ async fn get_runner(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_runner_response_serialization() {
+        let response = RunnerResponse {
+            id: "runner-123".to_string(),
+            name: "docker-runner-1".to_string(),
+            runner_type: "docker".to_string(),
+            status: "online".to_string(),
+            capacity: 4,
+            last_heartbeat: Some("2024-01-01T00:00:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("runner-123"));
+        assert!(json.contains("docker"));
+        assert!(json.contains("4"));
+    }
+
+    #[test]
+    fn test_runner_response_deserialization() {
+        let json = r#"{
+            "id": "runner-456",
+            "name": "firecracker-runner",
+            "type": "firecracker",
+            "status": "busy",
+            "capacity": 8,
+            "last_heartbeat": "2024-01-01T12:30:00Z"
+        }"#;
+        let response: RunnerResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.id, "runner-456");
+        assert_eq!(response.name, "firecracker-runner");
+        assert_eq!(response.runner_type, "firecracker");
+        assert_eq!(response.capacity, 8);
+    }
+
+    #[test]
+    fn test_runner_response_without_heartbeat() {
+        let response = RunnerResponse {
+            id: "runner-new".to_string(),
+            name: "new-runner".to_string(),
+            runner_type: "docker".to_string(),
+            status: "online".to_string(),
+            capacity: 2,
+            last_heartbeat: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("runner-new"));
+        // The field is still present in JSON but as null
+        assert!(json.contains("null") || !json.contains("last_heartbeat"));
+    }
+
+    #[test]
+    fn test_runner_response_all_statuses() {
+        for status in &["online", "offline", "busy"] {
+            let response = RunnerResponse {
+                id: "runner-1".to_string(),
+                name: "test".to_string(),
+                runner_type: "docker".to_string(),
+                status: status.to_string(),
+                capacity: 1,
+                last_heartbeat: None,
+            };
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains(status));
+        }
+    }
+
+    #[test]
+    fn test_runner_response_different_types() {
+        for rt in &["docker", "firecracker", "bare_metal"] {
+            let response = RunnerResponse {
+                id: "runner-1".to_string(),
+                name: "test".to_string(),
+                runner_type: rt.to_string(),
+                status: "online".to_string(),
+                capacity: 4,
+                last_heartbeat: None,
+            };
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains(rt));
+        }
+    }
+}

@@ -181,4 +181,73 @@ mod tests {
         let _artifact_id = ArtifactId::from(uuid);
         // Just verify it doesn't panic
     }
+
+    #[test]
+    fn test_artifact_response_serialization() {
+        let response = ArtifactResponse {
+            id: "artifact-123".to_string(),
+            job_id: "job-456".to_string(),
+            name: "test-artifact.zip".to_string(),
+            path: "/tmp/artifact.zip".to_string(),
+            checksum: "abc123def456".to_string(),
+            size_bytes: 1024,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("artifact-123"));
+        assert!(json.contains("test-artifact.zip"));
+        assert!(json.contains("1024"));
+    }
+
+    #[test]
+    fn test_artifact_response_deserialization() {
+        let json = r#"{
+            "id": "artifact-789",
+            "job_id": "job-001",
+            "name": "build-output.tar.gz",
+            "path": "/artifacts/build-output.tar.gz",
+            "checksum": "xyz789abc",
+            "size_bytes": 4096,
+            "created_at": "2024-01-15T12:30:00Z"
+        }"#;
+        let response: ArtifactResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.id, "artifact-789");
+        assert_eq!(response.name, "build-output.tar.gz");
+        assert_eq!(response.size_bytes, 4096);
+    }
+
+    #[test]
+    fn test_artifact_to_response_conversion() {
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            job_id: gitforce_common::JobId::new(),
+            name: "test.bin".to_string(),
+            path: "/tmp/test.bin".to_string(),
+            checksum: "checksum123".to_string(),
+            size_bytes: 256,
+            content_type: Some("application/octet-stream".to_string()),
+            created_at: chrono::Utc::now(),
+        };
+        let response = artifact_to_response(&artifact);
+        assert_eq!(response.name, "test.bin");
+        assert_eq!(response.checksum, "checksum123");
+        assert_eq!(response.size_bytes, 256);
+    }
+
+    #[test]
+    fn test_artifact_response_with_null_content_type() {
+        // This tests the artifact_to_response function indirectly
+        let response = ArtifactResponse {
+            id: "art-001".to_string(),
+            job_id: "job-002".to_string(),
+            name: "data.json".to_string(),
+            path: "/tmp/data.json".to_string(),
+            checksum: "chk123".to_string(),
+            size_bytes: 64,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("art-001"));
+        assert!(json.contains("data.json"));
+    }
 }

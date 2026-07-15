@@ -226,3 +226,89 @@ async fn delete_repo(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_repo_response_serialization() {
+        let response = RepoResponse {
+            id: "repo-123".to_string(),
+            name: "test-repo".to_string(),
+            owner_id: "user-456".to_string(),
+            visibility: "private".to_string(),
+            git_path: "/git/repos/test-repo".to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("repo-123"));
+        assert!(json.contains("test-repo"));
+        assert!(json.contains("private"));
+    }
+
+    #[test]
+    fn test_repo_response_deserialization() {
+        let json = r#"{
+            "id": "repo-789",
+            "name": "my-project",
+            "owner_id": "user-001",
+            "visibility": "public",
+            "git_path": "/git/repos/my-project",
+            "created_at": "2024-01-15T10:30:00Z",
+            "updated_at": "2024-01-15T10:30:00Z"
+        }"#;
+        let response: RepoResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.id, "repo-789");
+        assert_eq!(response.name, "my-project");
+        assert_eq!(response.visibility, "public");
+    }
+
+    #[test]
+    fn test_create_repo_request_deserialization() {
+        let json = r#"{"name": "new-repo", "visibility": "private"}"#;
+        let request: CreateRepoRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.name, "new-repo");
+        assert_eq!(request.visibility, Some("private".to_string()));
+    }
+
+    #[test]
+    fn test_create_repo_request_without_visibility() {
+        let json = r#"{"name": "another-repo"}"#;
+        let request: CreateRepoRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.name, "another-repo");
+        assert!(request.visibility.is_none());
+    }
+
+    #[test]
+    fn test_repo_response_public_visibility() {
+        let response = RepoResponse {
+            id: "repo-001".to_string(),
+            name: "public-repo".to_string(),
+            owner_id: "user-100".to_string(),
+            visibility: "public".to_string(),
+            git_path: "/git/repos/public-repo".to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("public"));
+    }
+
+    #[test]
+    fn test_repo_response_all_fields() {
+        let response = RepoResponse {
+            id: "repo-full".to_string(),
+            name: "complete-repo".to_string(),
+            owner_id: "owner-123".to_string(),
+            visibility: "private".to_string(),
+            git_path: "/git/repos/complete-repo".to_string(),
+            created_at: "2024-06-01T12:00:00Z".to_string(),
+            updated_at: "2024-06-15T18:30:00Z".to_string(),
+        };
+        assert_eq!(response.id, "repo-full");
+        assert_eq!(response.name, "complete-repo");
+        assert_eq!(response.git_path, "/git/repos/complete-repo");
+    }
+}
