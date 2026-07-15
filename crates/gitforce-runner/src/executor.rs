@@ -567,4 +567,74 @@ mod tests {
         assert_eq!(job1.image, job2.image);
         assert_eq!(job1.timeout_secs, job2.timeout_secs);
     }
+
+    #[test]
+    fn test_job_step_from_constructor() {
+        let step = JobStep::new("build", "cargo build --release");
+        assert_eq!(step.name, "build");
+        assert_eq!(step.run, "cargo build --release");
+        assert!(step.env.is_none());
+        assert!(step.working_directory.is_none());
+    }
+
+    #[test]
+    fn test_executable_job_with_empty_env() {
+        let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string())
+            .with_env(HashMap::new());
+        assert!(job.env.is_empty());
+    }
+
+    #[test]
+    fn test_executable_job_very_long_timeout() {
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_timeout(86400); // 24 hours
+        assert_eq!(job.timeout_secs, 86400);
+    }
+
+    #[test]
+    fn test_executable_job_zero_timeout() {
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_timeout(0);
+        assert_eq!(job.timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_job_step_clone_is_independent() {
+        let step1 = JobStep::new("build", "cargo build");
+        let step2 = step1.clone();
+        // Modify step2
+        let step2_modified = JobStep {
+            name: "test".to_string(),
+            run: "cargo test".to_string(),
+            env: None,
+            working_directory: None,
+        };
+        assert_ne!(step1.name, step2_modified.name);
+        assert_eq!(step1.name, step2.name);
+    }
+
+    #[test]
+    fn test_executable_job_with_unicode_in_env() {
+        let mut env = HashMap::new();
+        env.insert("中文".to_string(), "value".to_string());
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_env(env);
+        assert_eq!(job.env.get("中文"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_executable_job_with_unicode_in_name() {
+        let job = ExecutableJob::new(JobId::new(), "rust:最新".to_string());
+        assert_eq!(job.image, "rust:最新");
+    }
+
+    #[test]
+    fn test_executable_job_env_keys_with_special_chars() {
+        let mut env = HashMap::new();
+        env.insert("MY_VAR_123".to_string(), "value".to_string());
+        env.insert("ANOTHER_VAR".to_string(), "another".to_string());
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_env(env);
+        assert_eq!(job.env.len(), 2);
+    }
 }

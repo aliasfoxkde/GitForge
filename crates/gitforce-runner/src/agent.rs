@@ -474,4 +474,60 @@ mod tests {
         assert!(json.contains("test"));
         assert!(json.contains("minimal-job"));
     }
+
+    #[tokio::test]
+    async fn test_runner_stop_when_not_running() {
+        let config = RunnerConfig::default();
+        let agent = RunnerAgent::new(config).await.unwrap();
+        // Stop without running should not panic
+        agent.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_runner_stop_after_registration() {
+        let mut config = RunnerConfig::default();
+        config.scheduler_url = "http://localhost:99999".to_string();
+        let mut agent = RunnerAgent::new(config).await.unwrap();
+        agent.register().await.unwrap();
+        // Stop after registration should not panic
+        agent.stop().await;
+    }
+
+    #[test]
+    fn test_runner_config_all_default_values() {
+        let config = RunnerConfig::default();
+        // Verify all default values
+        assert_eq!(config.scheduler_url, "http://localhost:8081");
+        assert_eq!(config.name, "runner");
+        assert_eq!(config.runner_type, "docker");
+        assert_eq!(config.capacity, 2);
+        assert_eq!(config.heartbeat_interval_secs, 30);
+        assert_eq!(config.fetch_interval_secs, 5);
+    }
+
+    #[test]
+    fn test_runner_config_with_zero_capacity() {
+        let config = RunnerConfig {
+            scheduler_url: "http://localhost:8081".to_string(),
+            name: "zero-cap".to_string(),
+            runner_type: "docker".to_string(),
+            capacity: 0,
+            heartbeat_interval_secs: 30,
+            fetch_interval_secs: 5,
+        };
+        assert_eq!(config.capacity, 0);
+    }
+
+    #[test]
+    fn test_job_assignment_with_many_commands() {
+        let commands: Vec<String> = (0..100).map(|i| format!("echo step{}", i)).collect();
+        let assignment = JobAssignment {
+            job_id: "job-many".to_string(),
+            name: "many-steps".to_string(),
+            pipeline_run_id: "run-many".to_string(),
+            commands,
+            working_dir: None,
+        };
+        assert_eq!(assignment.commands.len(), 100);
+    }
 }

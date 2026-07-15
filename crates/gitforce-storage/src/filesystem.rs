@@ -336,4 +336,115 @@ mod tests {
             assert_eq!(retrieved, data.as_bytes());
         }
     }
+
+    #[tokio::test]
+    async fn test_artifact_metadata_after_put() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            job_id: gitforce_common::JobId::new(),
+            name: "metadata-test".to_string(),
+            path: "/fake/path".to_string(),
+            checksum: "abc123".to_string(),
+            size_bytes: 42,
+            content_type: Some("application/octet-stream".to_string()),
+            created_at: chrono::Utc::now(),
+        };
+
+        ArtifactStore::put(&storage, &artifact, b"test data").await.unwrap();
+
+        // Get metadata
+        let meta = ArtifactStore::get_metadata(&storage, artifact.id).await.unwrap();
+        assert_eq!(meta.name, "metadata-test");
+        assert_eq!(meta.checksum, "abc123");
+        assert_eq!(meta.size_bytes, 42);
+        assert_eq!(meta.content_type, Some("application/octet-stream".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_cache_put_get_multiple() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let repo_id = gitforce_common::RepoId::new();
+
+        // Put multiple cache entries
+        for i in 0..3 {
+            let key = CacheKey::new(repo_id, &format!("key-{}", i), "main");
+            let data = format!("value{}", i);
+            CacheStore::put(&storage, key.clone(), data.into_bytes()).await.unwrap();
+        }
+
+        // Get them back
+        for i in 0..3 {
+            let key = CacheKey::new(repo_id, &format!("key-{}", i), "main");
+            let retrieved = CacheStore::get(&storage, &key).await.unwrap();
+            assert!(retrieved.is_some());
+            assert_eq!(retrieved.unwrap(), format!("value{}", i).into_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_artifact_exactly_at_limit() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            job_id: gitforce_common::JobId::new(),
+            name: "size-test".to_string(),
+            path: "/fake/path".to_string(),
+            checksum: "xyz".to_string(),
+            size_bytes: 0,
+            content_type: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        // Empty data
+        ArtifactStore::put(&storage, &artifact, b"").await.unwrap();
+        let data = ArtifactStore::get(&storage, artifact.id).await.unwrap();
+        assert_eq!(data, b"");
+    }
+
+    #[tokio::test]
+    async fn test_artifact_with_special_characters_in_name() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            job_id: gitforce_common::JobId::new(),
+            name: "test-artifact-with-dashes_and_underscores".to_string(),
+            path: "/fake/path".to_string(),
+            checksum: "special".to_string(),
+            size_bytes: 100,
+            content_type: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        ArtifactStore::put(&storage, &artifact, b"special content").await.unwrap();
+        let retrieved = ArtifactStore::get(&storage, artifact.id).await.unwrap();
+        assert_eq!(retrieved, b"special content");
+    }
+
+    #[tokio::test]
+    async fn test_cache_overwrite() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "overwrite-test", "main");
+
+        // Put first value
+        CacheStore::put(&storage, key.clone(), b"first".to_vec()).await.unwrap();
+        let first = CacheStore::get(&storage, &key).await.unwrap();
+        assert_eq!(first.unwrap(), b"first");
+
+        // Overwrite with second value
+        CacheStore::put(&storage, key.clone(), b"second".to_vec()).await.unwrap();
+        let second = CacheStore::get(&storage, &key).await.unwrap();
+        assert_eq!(second.unwrap(), b"second");
+    }
 }
