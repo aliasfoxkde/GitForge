@@ -1,6 +1,6 @@
 # GitForge Progress Report
 
-**Last Updated**: 2026-07-14
+**Last Updated**: 2026-07-15
 
 ## Implementation Status
 
@@ -36,17 +36,17 @@
 - [x] gitforce-cli - CLI tool with auth, repo, pipeline, runner, sync commands
 - [x] Observability - Prometheus metrics middleware auto-wiring
 - [x] CI Templates - Reusable GitHub Actions templates (rust-build, rust-test, docker-build, security-audit)
-- [x] Integration tests - API, pipeline, scheduler tests in tests/integration/
+- [x] Integration tests - API, pipeline, database tests
 
 ## Build Status ✅
 
 ```
 cargo build --workspace     ✅ SUCCESS
-cargo test --workspace      ✅ SUCCESS (211 tests)
+cargo test --workspace      ✅ SUCCESS (382+ tests)
 cargo clippy --workspace    ✅ ZERO WARNINGS with -D warnings
 ```
 
-## Working Routes (as of 2026-07-14)
+## Working Routes (as of 2026-07-15)
 
 | Route | Status | Description |
 |-------|--------|-------------|
@@ -55,6 +55,9 @@ cargo clippy --workspace    ✅ ZERO WARNINGS with -D warnings
 | `/dashboard` | ✅ 200 | HTML dashboard with system status |
 | `/swagger-ui` | ✅ 200 | Interactive API documentation |
 | `/api-docs/openapi.json` | ✅ 200 | OpenAPI specification |
+| `/api/repos` | ✅ 200 | List repositories (auth required) |
+| `/api/runners` | ✅ 200/201 | List/create runners |
+| `/api/ci/*` | ✅ 200 | CI endpoints |
 
 ## Cloud Sync Protocol (Implemented)
 
@@ -72,24 +75,41 @@ SyncClient {
 |-------|-------|--------|
 | gitforce-common | 24 passed | ✅ |
 | gitforce-db | 51 passed | ✅ |
+| gitforce-db (integration) | 7 passed | ✅ |
 | gitforce-events | 13 passed | ✅ |
 | gitforce-core | 28 passed | ✅ |
-| gitforce-ci | 8 passed | ✅ |
+| gitforce-ci | 42 passed | ✅ |
+| gitforce-ci (integration) | 4 passed | ✅ |
 | gitforce-scheduler | 29 passed | ✅ |
 | gitforce-runner | 10 passed | ✅ |
 | gitforce-sandbox | 2 passed | ✅ |
 | gitforce-storage | 14 passed | ✅ |
 | gitforce-api | 32 passed | ✅ |
+| gitforce-api (integration) | 9 passed | ✅ |
 | gitforce-cli | 3 passed | ✅ |
-| **Total** | **211** | ✅ |
+| gitforce-cli (tests) | 19 passed | ✅ |
+| **Total** | **382+** | ✅ |
 
-## Coverage
+## Coverage (2026-07-15)
 
 | Metric | Value | Target |
 |--------|-------|--------|
-| Lines covered | 53.27% | 99% |
+| Lines covered | 67.05% (2381/3551) | 99% |
+| Change this session | +2.81% | - |
 
-Note: 99% coverage requires HTTP mocking infrastructure and service-level integration tests.
+### Coverage by Crate
+
+| Crate | Coverage | Priority |
+|-------|----------|----------|
+| gitforce-db | 90.8% | ✅ |
+| gitforce-scheduler | 91.4% | ✅ |
+| gitforce-events | 78.8% | 🔄 |
+| gitforce-storage | 72.7% | 🔄 |
+| gitforce-ci | ~65% | 🔄 |
+| gitforce-api | ~50% | 🔄 |
+| gitforce-runner | 38.5% | 📋 |
+| gitforce-sandbox | 30.6% | 📋 |
+| gitforce-cli | ~20% | 📋 |
 
 ## Key Files
 
@@ -97,27 +117,37 @@ Note: 99% coverage requires HTTP mocking infrastructure and service-level integr
 |------|---------|
 | `crates/gitforce-cli/src/sync.rs` | Cloud sync protocol implementation |
 | `crates/gitforce-api/src/metrics_middleware.rs` | Auto-recording Prometheus metrics |
+| `crates/gitforce-api/tests/integration.rs` | API integration tests |
+| `crates/gitforce-cli/tests/cli.rs` | CLI argument parsing tests |
 | `.github/actions/templates/` | Reusable CI/CD templates |
-| `tests/integration/` | Integration tests |
+| `crates/gitforce-db/tests/integration.rs` | Database integration tests |
+| `crates/gitforce-ci/tests/integration.rs` | CI integration tests |
 
 ## Roadmap - Next Steps
 
-### Phase 9: Cloud Platform Foundation
+### Phase 9: Coverage to 99%
+- [ ] Add runner agent integration tests
+- [ ] Add scheduler integration tests
+- [ ] Add API route handler tests (repos, pipelines, artifacts)
+- [ ] Add Docker sandbox tests (when daemon available)
+- [ ] Add CLI integration tests
+
+### Phase 10: Cloud Platform Foundation
 - [ ] VPS deployment guide with PostgreSQL + Redis
 - [ ] Sync server endpoints (/sync/push, /sync/pull)
 - [ ] S3-compatible artifact storage
 
-### Phase 10: GitHub Alternative Features
+### Phase 11: GitHub Alternative Features
 - [ ] Issues and PRs data models
 - [ ] Teams and Organizations
 - [ ] Full web UI dashboard
 
-### Phase 11: Advanced CI/CD
+### Phase 12: Advanced CI/CD
 - [ ] Matrix builds
 - [ ] Caching strategies
 - [ ] Action templates marketplace
 
-### Phase 12: Enterprise
+### Phase 13: Enterprise
 - [ ] SSO/SAML authentication
 - [ ] Audit logging
 - [ ] Role-based access control (RBAC)
