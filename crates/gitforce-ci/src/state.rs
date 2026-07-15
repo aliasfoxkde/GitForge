@@ -353,4 +353,20 @@ mod tests {
         // Can't assign directly from pending - must queue first
         assert!(state.assign(RunnerId::new()).is_err());
     }
+
+    #[test]
+    fn test_cannot_fail_from_pending() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+        // Can't fail directly from pending - must go through queue/assigned/running
+        assert!(state.fail(1, "error".to_string()).is_err());
+    }
+
+    #[test]
+    fn test_cannot_succeed_from_pending() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+        // Can't succeed directly from pending
+        assert!(state.succeed(0).is_err());
+    }
 }
