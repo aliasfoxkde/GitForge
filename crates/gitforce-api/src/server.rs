@@ -20,8 +20,8 @@ use tower_http::cors::{Any, CorsLayer};
 
 /// API server
 pub struct ApiServer {
-    router: Router,
-    port: u16,
+    pub router: Router,
+    pub port: u16,
 }
 
 impl ApiServer {
@@ -95,6 +95,11 @@ impl ApiServer {
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
         self
+    }
+
+    /// Get the router (for testing)
+    pub fn into_router(self) -> Router {
+        self.router
     }
 
     /// Start the server
