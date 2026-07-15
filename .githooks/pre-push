@@ -17,8 +17,6 @@ INFO() { echo -e "${GREEN}[pre-push]${NC} $*"; }
 WARN() { echo -e "${YELLOW}[pre-push]${NC} $*"; }
 ERROR() { echo -e "${RED}[pre-push]${NC} $*"; }
 
-COVERAGE_THRESHOLD="${COVERAGE_THRESHOLD:-70}"
-
 INFO "Running full test suite before push..."
 cd "$REPO_ROOT"
 if ! cargo test --workspace --no-fail-fast 2>&1; then
