@@ -326,4 +326,85 @@ mod tests {
         // Clone to verify all fields are cloneable
         let _ = job.clone();
     }
+
+    #[test]
+    fn test_executable_job_builder_pattern() {
+        let steps = vec![
+            JobStep::new("setup", "cargo fetch"),
+            JobStep::new("build", "cargo build"),
+            JobStep::new("test", "cargo test"),
+        ];
+        let mut env = HashMap::new();
+        env.insert("CI".to_string(), "true".to_string());
+
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_steps(steps)
+            .with_env(env)
+            .with_timeout(7200);
+
+        assert_eq!(job.steps.len(), 3);
+        assert_eq!(job.env.get("CI"), Some(&"true".to_string()));
+        assert_eq!(job.timeout_secs, 7200);
+    }
+
+    #[test]
+    fn test_job_step_working_directory() {
+        let step = JobStep {
+            name: "build".to_string(),
+            run: "cargo build".to_string(),
+            env: None,
+            working_directory: Some("/workspace".to_string()),
+        };
+        assert_eq!(step.working_directory, Some("/workspace".to_string()));
+    }
+
+    #[test]
+    fn test_job_result_with_step_results() {
+        use gitforce_sandbox::StepResult;
+        let step_result = StepResult {
+            exit_code: 0,
+            stdout: "Build successful".to_string(),
+            stderr: String::new(),
+        };
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: true,
+            exit_code: 0,
+            step_results: vec![step_result],
+            error: None,
+        };
+        assert_eq!(result.step_results.len(), 1);
+        assert_eq!(result.step_results[0].stdout, "Build successful");
+    }
+
+    #[test]
+    fn test_executable_job_with_multiple_steps() {
+        let steps = vec![
+            JobStep::new("step1", "echo 1"),
+            JobStep::new("step2", "echo 2"),
+            JobStep::new("step3", "echo 3"),
+        ];
+        let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string())
+            .with_steps(steps);
+        assert_eq!(job.steps.len(), 3);
+    }
+
+    #[test]
+    fn test_executable_job_default_values() {
+        let job = ExecutableJob::new(JobId::new(), "ubuntu:latest".to_string());
+        assert!(job.steps.is_empty());
+        assert!(job.env.is_empty());
+        assert!(job.working_dir.is_none());
+        assert_eq!(job.timeout_secs, 3600);
+    }
+
+    #[test]
+    fn test_job_step_equality() {
+        let step1 = JobStep::new("build", "cargo build");
+        let step2 = JobStep::new("build", "cargo build");
+        let step3 = JobStep::new("test", "cargo test");
+        assert_eq!(step1.name, step2.name);
+        assert_eq!(step1.run, step2.run);
+        assert_ne!(step1.name, step3.name);
+    }
 }

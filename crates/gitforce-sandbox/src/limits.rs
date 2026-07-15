@@ -97,4 +97,39 @@ mod tests {
         assert_eq!(limits.memory_mb, 8192);
         assert!(limits.network);
     }
+
+    #[test]
+    fn test_sandbox_limits_debug() {
+        let limits = SandboxLimits::default();
+        let debug_str = format!("{:?}", limits);
+        assert!(debug_str.contains("cpu_ms"));
+        assert!(debug_str.contains("memory_mb"));
+    }
+
+    #[test]
+    fn test_sandbox_limits_clone() {
+        let limits = SandboxLimits::large();
+        let cloned = limits.clone();
+        assert_eq!(cloned.cpu_ms, limits.cpu_ms);
+        assert_eq!(cloned.memory_mb, limits.memory_mb);
+    }
+
+    #[test]
+    fn test_sandbox_limits_all_tiers() {
+        let small = SandboxLimits::small();
+        let medium = SandboxLimits::medium();
+        let large = SandboxLimits::large();
+        let default = SandboxLimits::default();
+
+        // Verify tier ordering
+        assert!(small.memory_mb < medium.memory_mb);
+        assert!(medium.memory_mb < large.memory_mb);
+        assert!(default.memory_mb <= large.memory_mb);
+
+        // Verify network settings
+        assert!(!small.network);  // Small has no network
+        assert!(medium.network);
+        assert!(large.network);
+        assert!(default.network);
+    }
 }

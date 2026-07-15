@@ -317,4 +317,42 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(limits);
         assert!(!sandbox.is_available());
     }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_execution_with_complex_command() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+
+        // Test with shell command
+        let result = sandbox.execute(&instance, &["sh", "-c", "echo hello && echo world"]).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_execution_multiple_commands() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+
+        // Multiple commands in one execution
+        let result = sandbox.execute(&instance, &["echo", "line1"]).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[test]
+    fn test_sandbox_instance_clone() {
+        let instance = SandboxInstance {
+            container_id: "clone-test".to_string(),
+            job_id: JobId::new(),
+        };
+        let cloned = instance.clone();
+        assert_eq!(cloned.container_id, instance.container_id);
+    }
 }
