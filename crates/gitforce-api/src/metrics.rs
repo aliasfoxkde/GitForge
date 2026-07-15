@@ -314,4 +314,18 @@ mod tests {
         metrics.record_artifact_size(1024);
         metrics.record_artifact_size(10485760);
     }
+
+    #[test]
+    fn test_record_http_duration() {
+        let metrics = Metrics::new();
+        metrics.record_http_duration("GET", "/api/repos", 0.05);
+        metrics.record_http_duration("POST", "/api/repos", 0.123);
+    }
+
+    #[test]
+    fn test_record_job_assignment() {
+        let metrics = Metrics::new();
+        metrics.record_job_assignment();
+        metrics.record_job_assignment();
+    }
 }
