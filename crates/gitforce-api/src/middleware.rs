@@ -168,4 +168,11 @@ mod tests {
         let response = auth_error_response("invalid_token", "Invalid or expired token");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[test]
+    fn test_authenticated_user_error_response() {
+        // Test that the error response for missing auth context has correct status
+        let response = auth_error_response("unauthenticated", "No authentication context");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
