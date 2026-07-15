@@ -159,5 +159,118 @@ jobs:
     fn test_trigger_type() {
         assert_eq!(TriggerType::Push.as_str(), "push");
         assert_eq!(TriggerType::Tag.as_str(), "tag");
+        assert_eq!(TriggerType::PullRequest.as_str(), "pull_request");
+        assert_eq!(TriggerType::Manual.as_str(), "manual");
+    }
+
+    #[test]
+    fn test_trigger_type_variants() {
+        assert!(matches!(TriggerType::Push, TriggerType::Push));
+        assert!(matches!(TriggerType::Tag, TriggerType::Tag));
+        assert!(matches!(TriggerType::PullRequest, TriggerType::PullRequest));
+        assert!(matches!(TriggerType::Manual, TriggerType::Manual));
+    }
+
+    #[test]
+    fn test_pipeline_definition_to_yaml() {
+        let def = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![],
+        };
+        let yaml = def.to_yaml().unwrap();
+        assert!(yaml.contains("test"));
+    }
+
+    #[test]
+    fn test_job_definition_has_dependencies() {
+        let job = JobDefinition {
+            name: "build".to_string(),
+            image: "rust:latest".to_string(),
+            needs: vec!["dep".to_string()],
+            env: HashMap::new(),
+            steps: vec![],
+            timeout: None,
+            retry: None,
+        };
+        assert!(job.has_dependencies());
+
+        let job2 = JobDefinition {
+            name: "build".to_string(),
+            image: "rust:latest".to_string(),
+            needs: vec![],
+            env: HashMap::new(),
+            steps: vec![],
+            timeout: None,
+            retry: None,
+        };
+        assert!(!job2.has_dependencies());
+    }
+
+    #[test]
+    fn test_step_definition_get_env() {
+        let mut env = HashMap::new();
+        env.insert("RUST_BACKTRACE".to_string(), "1".to_string());
+
+        let step = StepDefinition {
+            name: "build".to_string(),
+            run: "cargo build".to_string(),
+            env: Some(env),
+            working_directory: None,
+            condition: None,
+        };
+        assert_eq!(step.get_env().get("RUST_BACKTRACE"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_step_definition_get_env_empty() {
+        let step = StepDefinition {
+            name: "build".to_string(),
+            run: "cargo build".to_string(),
+            env: None,
+            working_directory: None,
+            condition: None,
+        };
+        assert!(step.get_env().is_empty());
+    }
+
+    #[test]
+    fn test_pipeline_trigger_event_new() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        assert_eq!(event.commit_hash, "abc123");
+        assert!(event.ref_name.is_none());
+        assert!(event.actor_id.is_none());
+    }
+
+    #[test]
+    fn test_pipeline_trigger_event_with_ref() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        ).with_ref("refs/heads/main".to_string());
+
+        assert_eq!(event.ref_name, Some("refs/heads/main".to_string()));
+    }
+
+    #[test]
+    fn test_pipeline_trigger_event_with_actor() {
+        let user_id = gitforce_common::UserId::new();
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        ).with_actor(user_id);
+
+        assert_eq!(event.actor_id, Some(user_id));
     }
 }
