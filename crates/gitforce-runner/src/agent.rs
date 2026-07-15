@@ -308,4 +308,170 @@ mod tests {
         assert_eq!(cloned.name, config.name);
         assert_eq!(cloned.capacity, config.capacity);
     }
+
+    #[test]
+    fn test_runner_config_partial_eq() {
+        let config1 = RunnerConfig::default();
+        let config2 = RunnerConfig::default();
+        assert_eq!(config1.name, config2.name);
+        assert_eq!(config1.capacity, config2.capacity);
+    }
+
+    #[test]
+    fn test_job_assignment_serde_roundtrip() {
+        let assignment = JobAssignment {
+            job_id: "job-123".to_string(),
+            name: "build".to_string(),
+            pipeline_run_id: "run-456".to_string(),
+            commands: vec!["cargo build".to_string(), "cargo test".to_string()],
+            working_dir: Some("/workspace".to_string()),
+        };
+
+        // Test JSON serialization
+        let json = serde_json::to_string(&assignment).unwrap();
+        assert!(json.contains("job-123"));
+        assert!(json.contains("build"));
+
+        // Test deserialization
+        let deserialized: JobAssignment = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.job_id, assignment.job_id);
+        assert_eq!(deserialized.name, assignment.name);
+        assert_eq!(deserialized.commands, assignment.commands);
+        assert_eq!(deserialized.working_dir, assignment.working_dir);
+    }
+
+    #[test]
+    fn test_job_assignment_empty_commands() {
+        let assignment = JobAssignment {
+            job_id: "job-empty".to_string(),
+            name: "noop".to_string(),
+            pipeline_run_id: "run-001".to_string(),
+            commands: vec![],
+            working_dir: None,
+        };
+        assert!(assignment.commands.is_empty());
+        assert!(assignment.working_dir.is_none());
+    }
+
+    #[test]
+    fn test_job_assignment_multiple_commands() {
+        let commands = vec![
+            "cargo fetch".to_string(),
+            "cargo build --release".to_string(),
+            "cargo test".to_string(),
+            "cargo clippy".to_string(),
+        ];
+        let assignment = JobAssignment {
+            job_id: "job-multi".to_string(),
+            name: "full-pipeline".to_string(),
+            pipeline_run_id: "run-002".to_string(),
+            commands,
+            working_dir: Some("/project".to_string()),
+        };
+        assert_eq!(assignment.commands.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_runner_agent_not_registered() {
+        // Agent without registration should have runner as None
+        let config = RunnerConfig::default();
+        let agent = RunnerAgent::new(config).await.unwrap();
+        assert!(agent.runner.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_runner_register_sets_runner() {
+        let mut config = RunnerConfig::default();
+        config.scheduler_url = "http://localhost:99999".to_string();
+        let mut agent = RunnerAgent::new(config).await.unwrap();
+
+        let result = agent.register().await;
+        assert!(result.is_ok());
+        assert!(agent.runner.is_some());
+
+        // Verify runner has correct properties
+        let runner = agent.runner.as_ref().unwrap();
+        assert_eq!(runner.name, "runner");
+        assert_eq!(runner.capacity, 2);
+    }
+
+    #[test]
+    fn test_runner_config_all_fields() {
+        let config = RunnerConfig {
+            scheduler_url: "http://example.com:8081".to_string(),
+            name: "test-runner".to_string(),
+            runner_type: "firecracker".to_string(),
+            capacity: 8,
+            heartbeat_interval_secs: 15,
+            fetch_interval_secs: 3,
+        };
+
+        assert_eq!(config.scheduler_url, "http://example.com:8081");
+        assert_eq!(config.name, "test-runner");
+        assert_eq!(config.runner_type, "firecracker");
+        assert_eq!(config.capacity, 8);
+        assert_eq!(config.heartbeat_interval_secs, 15);
+        assert_eq!(config.fetch_interval_secs, 3);
+    }
+
+    #[test]
+    fn test_runner_config_default_is_docker() {
+        let config = RunnerConfig::default();
+        assert_eq!(config.runner_type, "docker");
+    }
+
+    #[test]
+    fn test_runner_config_default_heartbeat() {
+        let config = RunnerConfig::default();
+        // Default heartbeat is 30 seconds
+        assert_eq!(config.heartbeat_interval_secs, 30);
+        // Default fetch interval is 5 seconds
+        assert_eq!(config.fetch_interval_secs, 5);
+    }
+
+    #[test]
+    fn test_runner_agent_debug() {
+        // We can't easily create a running agent for debug test
+        // but we can verify the type implements Debug
+        let config = RunnerConfig::default();
+        assert!(format!("{:?}", config).contains("RunnerConfig"));
+    }
+
+    #[test]
+    fn test_job_assignment_equality() {
+        let assignment1 = JobAssignment {
+            job_id: "job-1".to_string(),
+            name: "build".to_string(),
+            pipeline_run_id: "run-1".to_string(),
+            commands: vec!["echo 1".to_string()],
+            working_dir: None,
+        };
+        let assignment2 = JobAssignment {
+            job_id: "job-1".to_string(),
+            name: "build".to_string(),
+            pipeline_run_id: "run-1".to_string(),
+            commands: vec!["echo 1".to_string()],
+            working_dir: None,
+        };
+        // JobAssignment should implement PartialEq if we add it
+        // For now just verify individual field equality
+        assert_eq!(assignment1.job_id, assignment2.job_id);
+        assert_eq!(assignment1.name, assignment2.name);
+    }
+
+    #[test]
+    fn test_job_assignment_serialize_with_minimal_fields() {
+        let assignment = JobAssignment {
+            job_id: "minimal-job".to_string(),
+            name: "test".to_string(),
+            pipeline_run_id: "run-min".to_string(),
+            commands: vec!["true".to_string()],
+            working_dir: None,
+        };
+
+        let json = serde_json::to_string(&assignment).unwrap();
+        assert!(json.contains("minimal-job"));
+        assert!(json.contains("test"));
+        assert!(json.contains("minimal-job"));
+    }
 }

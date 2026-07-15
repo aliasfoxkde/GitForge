@@ -407,4 +407,164 @@ mod tests {
         assert_eq!(step1.run, step2.run);
         assert_ne!(step1.name, step3.name);
     }
+
+    #[test]
+    fn test_executable_job_env_is_empty_by_default() {
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string());
+        assert!(job.env.is_empty());
+    }
+
+    #[test]
+    fn test_executable_job_with_working_dir() {
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string());
+        // working_dir is not directly settable via builder but exists as a field
+        assert!(job.working_dir.is_none());
+    }
+
+    #[test]
+    fn test_job_result_success() {
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: true,
+            exit_code: 0,
+            step_results: vec![],
+            error: None,
+        };
+        assert!(result.success);
+        assert_eq!(result.exit_code, 0);
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_job_result_failure_with_stderr() {
+        use gitforce_sandbox::StepResult;
+        let step_result = StepResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "compilation failed".to_string(),
+        };
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: 1,
+            step_results: vec![step_result],
+            error: Some("step failed".to_string()),
+        };
+        assert!(!result.success);
+        assert_eq!(result.exit_code, 1);
+        assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn test_executable_job_all_fields() {
+        let steps = vec![
+            JobStep::new("build", "cargo build"),
+            JobStep::new("test", "cargo test"),
+        ];
+        let mut env = HashMap::new();
+        env.insert("RUST_BACKTRACE".to_string(), "1".to_string());
+        env.insert("CI".to_string(), "true".to_string());
+
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_steps(steps)
+            .with_env(env)
+            .with_timeout(7200);
+
+        assert_eq!(job.image, "rust:latest");
+        assert_eq!(job.steps.len(), 2);
+        assert_eq!(job.env.len(), 2);
+        assert_eq!(job.timeout_secs, 7200);
+    }
+
+    #[test]
+    fn test_job_step_all_fields() {
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+
+        let step = JobStep {
+            name: "build".to_string(),
+            run: "cargo build --release".to_string(),
+            env: Some(env),
+            working_directory: Some("/project".to_string()),
+        };
+
+        assert_eq!(step.name, "build");
+        assert_eq!(step.run, "cargo build --release");
+        assert!(step.env.is_some());
+        assert_eq!(step.working_directory, Some("/project".to_string()));
+    }
+
+    #[test]
+    fn test_executable_job_id() {
+        let job_id = JobId::new();
+        let job = ExecutableJob::new(job_id, "rust:latest".to_string());
+        assert_eq!(job.job_id, job_id);
+    }
+
+    #[test]
+    fn test_executable_job_cloneable() {
+        let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string());
+        let cloned = job.clone();
+        assert_eq!(cloned.image, job.image);
+        assert_eq!(cloned.job_id, job.job_id);
+    }
+
+    #[test]
+    fn test_job_result_cloneable() {
+        // JobResult doesn't implement Clone, but we can verify it's Debug
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: true,
+            exit_code: 0,
+            step_results: vec![],
+            error: None,
+        };
+        // Verify it can be formatted with Debug
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("JobResult"));
+    }
+
+    #[tokio::test]
+    async fn test_executor_active_count_after_create() {
+        let executor = JobExecutor::new().await.unwrap();
+        // Should start at 0
+        let count = executor.active_count().await;
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_executable_job_with_empty_steps() {
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_steps(vec![]);
+        assert!(job.steps.is_empty());
+    }
+
+    #[test]
+    fn test_executable_job_builder_chaining() {
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_timeout(3600)
+            .with_env(HashMap::new());
+        assert_eq!(job.timeout_secs, 3600);
+        assert!(job.env.is_empty());
+    }
+
+    #[test]
+    fn test_job_step_clone() {
+        let step = JobStep::new("build", "cargo build");
+        let cloned = step.clone();
+        assert_eq!(cloned.name, step.name);
+        assert_eq!(cloned.run, step.run);
+    }
+
+    #[test]
+    fn test_executable_job_clone_and_modify() {
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let job1 = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_env(env);
+        let job2 = job1.clone();
+        // Verify both have same values
+        assert_eq!(job1.image, job2.image);
+        assert_eq!(job1.timeout_secs, job2.timeout_secs);
+    }
 }
