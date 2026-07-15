@@ -127,4 +127,45 @@ mod tests {
         let response = auth_error_response("test_error", "test message");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[test]
+    fn test_public_paths_includes_swagger_ui() {
+        assert!(PUBLIC_PATHS.iter().any(|p| "/swagger-ui".starts_with(p)));
+        assert!(PUBLIC_PATHS.iter().any(|p| "/api-docs".starts_with(p)));
+    }
+
+    #[test]
+    fn test_public_paths_includes_docs() {
+        assert!(PUBLIC_PATHS.iter().any(|p| "/docs".starts_with(p)));
+    }
+
+    #[test]
+    fn test_auth_error_response_content() {
+        let response = auth_error_response("invalid_token", "Token has expired");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_auth_middleware_skips_public_paths() {
+        // Test that the path matching logic works correctly
+        let public_path = "/health";
+        let protected_path = "/api/repos";
+
+        // Public paths should match their prefixes
+        assert!(PUBLIC_PATHS.iter().any(|p| public_path.starts_with(p)));
+        // Protected paths should not match public prefixes
+        assert!(!PUBLIC_PATHS.iter().any(|p| protected_path.starts_with(p)));
+    }
+
+    #[test]
+    fn test_auth_error_response_missing_token() {
+        let response = auth_error_response("missing_token", "Missing Authorization header");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_auth_error_response_invalid_token() {
+        let response = auth_error_response("invalid_token", "Invalid or expired token");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

@@ -303,4 +303,50 @@ mod tests {
             assert_eq!(artifact.content_type, Some(content_type.to_string()));
         }
     }
+
+    #[tokio::test]
+    async fn test_artifact_from_file() {
+        use tokio::fs;
+        use tempfile::tempdir;
+
+        // Create a temp file with known content
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test-file.txt");
+        let content = b"hello world";
+        fs::write(&file_path, content).await.unwrap();
+
+        let job_id = JobId::new();
+        let artifact = Artifact::from_file(job_id, "test-file.txt".to_string(), &file_path).await.unwrap();
+
+        assert_eq!(artifact.job_id, job_id);
+        assert_eq!(artifact.name, "test-file.txt");
+        assert_eq!(artifact.size_bytes, content.len() as u64);
+        // SHA256 of "hello world"
+        assert_eq!(artifact.checksum, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        assert!(artifact.content_type.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_artifact_from_file_empty() {
+        use tokio::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("empty.txt");
+        fs::write(&file_path, b"").await.unwrap();
+
+        let artifact = Artifact::from_file(JobId::new(), "empty.txt".to_string(), &file_path).await.unwrap();
+
+        assert_eq!(artifact.size_bytes, 0);
+        // SHA256 of empty string
+        assert_eq!(artifact.checksum, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    #[tokio::test]
+    async fn test_artifact_from_file_not_found() {
+        use std::path::PathBuf;
+
+        let result = Artifact::from_file(JobId::new(), "missing.txt".to_string(), &PathBuf::from("/nonexistent/path/file.txt")).await;
+        assert!(result.is_err());
+    }
 }
