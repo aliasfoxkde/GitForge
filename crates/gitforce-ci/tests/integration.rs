@@ -3,7 +3,7 @@
 //! These tests require Docker and a running test database.
 
 use gitforce_ci::{CiEngine, PipelineDefinition, PipelineTriggerEvent, TriggerType, DagBuilder};
-use gitforce_common::{PipelineId, RepoId, JobId, PipelineRunId};
+use gitforce_common::{PipelineId, RepoId, PipelineRunId};
 use std::collections::HashMap;
 
 /// Create a test pipeline definition

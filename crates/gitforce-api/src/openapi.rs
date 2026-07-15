@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_api_docs_routes_creation() {
-        let routes = api_docs_routes();
+        let _routes = api_docs_routes();
         // Routes should be created successfully
         assert!(true);
     }

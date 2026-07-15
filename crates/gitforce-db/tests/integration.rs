@@ -5,7 +5,7 @@
 use gitforce_db::Pool;
 use gitforce_db::queries::{RepoQueries, UserQueries, RunnerQueries, PipelineQueries, PipelineRunQueries, JobQueries, EventQueries};
 use gitforce_db::models::{Repository, User, Runner, RunnerType, Pipeline, PipelineRun, Job, Event};
-use gitforce_common::{PipelineId, JobId};
+use gitforce_common::PipelineId;
 
 #[tokio::test]
 async fn test_database_in_memory_pool() {
