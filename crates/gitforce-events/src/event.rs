@@ -412,4 +412,166 @@ mod tests {
         assert!(payload.success);
         assert!(payload.error.is_none());
     }
+
+    #[test]
+    fn test_pipeline_triggered_payload() {
+        let payload = PipelineTriggeredPayload {
+            pipeline_id: PipelineId::new(),
+            pipeline_run_id: PipelineRunId::new(),
+            repo_id: RepoId::new(),
+            commit_hash: "abc123".to_string(),
+            trigger_source: "push".to_string(),
+        };
+        assert_eq!(payload.trigger_source, "push");
+    }
+
+    #[test]
+    fn test_pipeline_started_payload() {
+        let payload = PipelineStartedPayload {
+            pipeline_run_id: PipelineRunId::new(),
+            started_at: 1234567890,
+        };
+        assert_eq!(payload.started_at, 1234567890);
+    }
+
+    #[test]
+    fn test_pipeline_finished_payload() {
+        let payload = PipelineFinishedPayload {
+            pipeline_run_id: PipelineRunId::new(),
+            status: "succeeded".to_string(),
+            duration_ms: 60000,
+        };
+        assert_eq!(payload.status, "succeeded");
+        assert_eq!(payload.duration_ms, 60000);
+    }
+
+    #[test]
+    fn test_push_received_payload() {
+        let payload = PushReceivedPayload {
+            repo_id: RepoId::new(),
+            ref_name: "refs/heads/main".to_string(),
+            old_hash: "abc123".to_string(),
+            new_hash: "def456".to_string(),
+            pusher_id: Some(UserId::new()),
+        };
+        assert!(payload.pusher_id.is_some());
+        assert_eq!(payload.old_hash, "abc123");
+    }
+
+    #[test]
+    fn test_ref_updated_payload() {
+        let payload = RefUpdatedPayload {
+            repo_id: RepoId::new(),
+            ref_name: "refs/tags/v1.0".to_string(),
+            old_hash: "abc123".to_string(),
+            new_hash: "def456".to_string(),
+        };
+        assert_eq!(payload.ref_name, "refs/tags/v1.0");
+    }
+
+    #[test]
+    fn test_repo_created_payload() {
+        let payload = RepoCreatedPayload {
+            repo_id: RepoId::new(),
+            name: "test-repo".to_string(),
+            owner_id: UserId::new(),
+            visibility: "public".to_string(),
+        };
+        assert_eq!(payload.visibility, "public");
+    }
+
+    #[test]
+    fn test_repo_deleted_payload() {
+        let payload = RepoDeletedPayload {
+            repo_id: RepoId::new(),
+            name: "test-repo".to_string(),
+        };
+        assert_eq!(payload.name, "test-repo");
+    }
+
+    #[test]
+    fn test_runner_offline_payload() {
+        let payload = RunnerOfflinePayload {
+            runner_id: RunnerId::new(),
+            reason: "heartbeat timeout".to_string(),
+        };
+        assert_eq!(payload.reason, "heartbeat timeout");
+    }
+
+    #[test]
+    fn test_mirror_sync_requested_payload() {
+        let payload = MirrorSyncRequestedPayload {
+            repo_id: RepoId::new(),
+            github_repo: "owner/repo".to_string(),
+            branch: Some("main".to_string()),
+        };
+        assert_eq!(payload.github_repo, "owner/repo");
+        assert_eq!(payload.branch, Some("main".to_string()));
+    }
+
+    #[test]
+    fn test_event_envelope_with_correlation() {
+        let payload = PushReceivedPayload {
+            repo_id: RepoId::new(),
+            ref_name: "refs/heads/main".to_string(),
+            old_hash: "abc123".to_string(),
+            new_hash: "def456".to_string(),
+            pusher_id: None,
+        };
+
+        let correlation_id = Uuid::new_v4();
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(payload),
+            None,
+            None,
+        ).with_correlation(correlation_id);
+
+        assert_eq!(event.correlation_id, Some(correlation_id));
+    }
+
+    #[test]
+    fn test_event_envelope_timestamp_datetime() {
+        let payload = PushReceivedPayload {
+            repo_id: RepoId::new(),
+            ref_name: "refs/heads/main".to_string(),
+            old_hash: "abc123".to_string(),
+            new_hash: "def456".to_string(),
+            pusher_id: None,
+        };
+
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(payload),
+            None,
+            None,
+        );
+
+        let dt = event.timestamp_datetime();
+        assert_eq!(dt.timestamp_millis(), event.timestamp);
+    }
+
+    #[test]
+    fn test_event_type_display() {
+        assert_eq!(format!("{}", EventType::PushReceived), "push.received");
+        assert_eq!(format!("{}", EventType::PipelineTriggered), "pipeline.triggered");
+        assert_eq!(format!("{}", EventType::RunnerHeartbeat), "runner.heartbeat");
+    }
+
+    #[test]
+    fn test_event_type_equality() {
+        assert_eq!(EventType::PushReceived, EventType::PushReceived);
+        assert_ne!(EventType::PushReceived, EventType::PipelineTriggered);
+    }
+
+    #[test]
+    fn test_event_type_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(EventType::PushReceived);
+        set.insert(EventType::PipelineTriggered);
+        assert_eq!(set.len(), 2);
+        set.insert(EventType::PushReceived);
+        assert_eq!(set.len(), 2);
+    }
 }

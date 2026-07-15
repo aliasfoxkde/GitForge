@@ -134,4 +134,74 @@ mod tests {
         config.features.insert("sync".to_string(), true);
         assert_eq!(config.features.get("sync"), Some(&true));
     }
+
+    #[test]
+    fn test_output_format_variants() {
+        assert!(matches!(OutputFormat::Table, OutputFormat::Table));
+        assert!(matches!(OutputFormat::Json, OutputFormat::Json));
+        assert!(matches!(OutputFormat::Yaml, OutputFormat::Yaml));
+    }
+
+    #[test]
+    fn test_output_format_serialize() {
+        let fmt = OutputFormat::Json;
+        let serialized = serde_json::to_string(&fmt).unwrap();
+        assert_eq!(serialized, "\"Json\"");
+    }
+
+    #[test]
+    fn test_output_format_deserialize() {
+        let fmt: OutputFormat = serde_json::from_str("\"Yaml\"").unwrap();
+        assert!(matches!(fmt, OutputFormat::Yaml));
+    }
+
+    #[test]
+    fn test_config_serialize() {
+        let config = Config::default();
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(serialized.contains("http://localhost:8080"));
+    }
+
+    #[test]
+    fn test_config_deserialize() {
+        let json = r#"{
+            "server_url": "https://custom.example.com",
+            "token": null,
+            "local_data_dir": "/tmp/gitforge",
+            "organization": null,
+            "editor": null,
+            "output_format": "Json",
+            "features": {}
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.server_url, "https://custom.example.com");
+        assert!(matches!(config.output_format, OutputFormat::Json));
+    }
+
+    #[test]
+    fn test_config_clone() {
+        let config = Config::default();
+        let cloned = config.clone();
+        assert_eq!(config.server_url, cloned.server_url);
+    }
+
+    #[test]
+    fn test_config_local_data_dir_default() {
+        let config = Config::default();
+        assert!(config.local_data_dir.to_string_lossy().contains("gitforge"));
+    }
+
+    #[test]
+    fn test_config_organization() {
+        let mut config = Config::default();
+        config.organization = Some("my-org".to_string());
+        assert_eq!(config.organization.unwrap(), "my-org");
+    }
+
+    #[test]
+    fn test_config_editor() {
+        let mut config = Config::default();
+        config.editor = Some("vim".to_string());
+        assert_eq!(config.editor.unwrap(), "vim");
+    }
 }

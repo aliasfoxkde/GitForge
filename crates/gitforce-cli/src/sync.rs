@@ -460,4 +460,75 @@ mod tests {
         client.mark_pending_push().await.unwrap();
         assert_eq!(client.status().await, SyncStatus::PendingPush);
     }
+
+    #[test]
+    fn test_sync_metadata_serialization() {
+        let metadata = SyncMetadata {
+            last_push: Some("2024-01-01T00:00:00Z".to_string()),
+            last_pull: Some("2024-01-02T00:00:00Z".to_string()),
+            local_rev: 5,
+            remote_rev: 10,
+            status: SyncStatus::PendingPush,
+        };
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(json.contains("pendingpush"));
+        let parsed: SyncMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.local_rev, 5);
+    }
+
+    #[test]
+    fn test_local_state_serialization() {
+        let state = LocalState {
+            repos: HashMap::new(),
+            pipelines: HashMap::new(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("2024-01-01"));
+    }
+
+    #[test]
+    fn test_repo_state_serialization() {
+        let repo = RepoState {
+            id: "repo-1".to_string(),
+            name: "test-repo".to_string(),
+            local_path: Some(PathBuf::from("/tmp/repo")),
+            synced_at: None,
+            local_rev: 0,
+        };
+        let json = serde_json::to_string(&repo).unwrap();
+        assert!(json.contains("test-repo"));
+    }
+
+    #[test]
+    fn test_pipeline_state_serialization() {
+        let pipeline = PipelineState {
+            id: "pipe-1".to_string(),
+            repo_id: "repo-1".to_string(),
+            name: "build".to_string(),
+            definition: "steps: [build]".to_string(),
+            synced_at: None,
+            local_rev: 0,
+        };
+        let json = serde_json::to_string(&pipeline).unwrap();
+        assert!(json.contains("build"));
+    }
+
+    #[test]
+    fn test_sync_status_all_variants() {
+        let variants = vec![
+            SyncStatus::InSync,
+            SyncStatus::PendingPush,
+            SyncStatus::PendingPull,
+            SyncStatus::Conflict,
+        ];
+        assert_eq!(variants.len(), 4);
+    }
+
+    #[test]
+    fn test_sync_status_partial_eq() {
+        assert_eq!(SyncStatus::InSync, SyncStatus::InSync);
+        assert_ne!(SyncStatus::InSync, SyncStatus::PendingPush);
+        assert_ne!(SyncStatus::PendingPush, SyncStatus::PendingPull);
+    }
 }

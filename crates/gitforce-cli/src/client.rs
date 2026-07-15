@@ -86,12 +86,37 @@ mod tests {
             .with_token("test-token".to_string());
         // Token is set internally, verify client was created
         let client2 = ApiClient::new("http://localhost:8080", Some("test-token".to_string()));
-        assert_eq!(client2.token, Some("test-token".to_string()));
+        assert_eq!(client.token, client2.token);
     }
 
     #[test]
     fn test_api_client_clone() {
         let client = ApiClient::new("http://localhost:8080", Some("token".to_string()));
         let _cloned = client.clone();
+    }
+
+    #[test]
+    fn test_api_client_base_url() {
+        let client = ApiClient::new("http://localhost:9090", None);
+        assert_eq!(client.base_url, "http://localhost:9090");
+    }
+
+    #[test]
+    fn test_api_client_token_none() {
+        let client = ApiClient::new("http://localhost:8080", None);
+        assert!(client.token.is_none());
+    }
+
+    #[test]
+    fn test_api_client_with_token_method() {
+        let client = ApiClient::new("http://localhost:8080", None).with_token("my-token".to_string());
+        assert_eq!(client.token, Some("my-token".to_string()));
+    }
+
+    #[test]
+    fn test_api_client_clone_preserves_url() {
+        let client = ApiClient::new("http://custom:8080", Some("token".to_string()));
+        let cloned = client.clone();
+        assert_eq!(cloned.base_url, client.base_url);
     }
 }

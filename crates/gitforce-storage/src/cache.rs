@@ -45,6 +45,7 @@ pub struct CacheEntry {
 
 /// In-memory cache store (for MVP)
 #[allow(clippy::type_complexity)]
+#[derive(Debug)]
 pub struct InMemoryCacheStore {
     entries: Arc<RwLock<HashMap<CacheKey, (Vec<u8>, CacheEntry)>>>,
 }
@@ -240,5 +241,67 @@ mod tests {
         let entry = &entries[0];
         assert_eq!(entry.key, key);
         assert_eq!(entry.size_bytes, 3);
+    }
+
+    #[test]
+    fn test_cache_key_debug() {
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "cargo", "linux-x86_64");
+        let debug_str = format!("{:?}", key);
+        assert!(debug_str.contains("CacheKey"));
+    }
+
+    #[test]
+    fn test_cache_entry_debug() {
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "cargo", "linux-x86_64");
+        let entry = CacheEntry {
+            key,
+            size_bytes: 100,
+            created_at: chrono::Utc::now(),
+            accessed_at: chrono::Utc::now(),
+        };
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("CacheEntry"));
+    }
+
+    #[test]
+    fn test_cache_key_clone() {
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "cargo", "linux-x86_64");
+        let cloned = key.clone();
+        assert_eq!(key, cloned);
+    }
+
+    #[test]
+    fn test_in_memory_cache_store_debug() {
+        let store = InMemoryCacheStore::new();
+        let debug_str = format!("{:?}", store);
+        assert!(debug_str.contains("InMemoryCacheStore"));
+    }
+
+    #[tokio::test]
+    async fn test_cache_store_delete_nonexistent() {
+        let store = InMemoryCacheStore::new();
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "nonexistent", "linux-x86_64");
+
+        // Deleting nonexistent key should not error
+        let result = store.delete(&key).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cache_multiple_keys_same_repo() {
+        let store = InMemoryCacheStore::new();
+        let repo_id = gitforce_common::RepoId::new();
+
+        for i in 0..10 {
+            let key = CacheKey::new(repo_id, &format!("key{}", i), "linux-x86_64");
+            store.put(key, vec![i as u8]).await.unwrap();
+        }
+
+        let entries = store.list().await.unwrap();
+        assert_eq!(entries.len(), 10);
     }
 }

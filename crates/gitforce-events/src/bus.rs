@@ -76,6 +76,7 @@ pub trait EventStream: Send + Sync + Stream<Item = EventEnvelope> + Unpin {
 }
 
 /// In-memory event bus implementation using broadcast channels
+#[derive(Debug)]
 pub struct InMemoryEventBus {
     sender: broadcast::Sender<EventEnvelope>,
 }
@@ -310,6 +311,61 @@ mod tests {
         let bus = InMemoryEventBus::new();
         let stream = bus.subscribe(EventFilter::all()).await.unwrap();
         let filter = stream.filter();
+        assert!(filter.event_types.is_none());
+        assert!(filter.repo_id.is_none());
+    }
+
+    #[test]
+    fn test_event_filter_debug() {
+        let filter = EventFilter::all();
+        let debug_str = format!("{:?}", filter);
+        assert!(debug_str.contains("EventFilter"));
+    }
+
+    #[test]
+    fn test_in_memory_event_bus_debug() {
+        let bus = InMemoryEventBus::new();
+        let debug_str = format!("{:?}", bus);
+        assert!(debug_str.contains("InMemoryEventBus"));
+    }
+
+    #[test]
+    fn test_event_filter_clone() {
+        let filter = EventFilter::for_types(vec![EventType::PushReceived]);
+        let cloned = filter.clone();
+        assert!(cloned.event_types.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_publish_multiple_events() {
+        use crate::event::{EventEnvelope, EventPayload, EventType, PushReceivedPayload};
+        let bus = InMemoryEventBus::new();
+
+        // Subscribe first so broadcast has a receiver
+        let _stream = bus.subscribe(EventFilter::all()).await.unwrap();
+
+        // Publish multiple events
+        for i in 0..5 {
+            let event = EventEnvelope::new(
+                EventType::PushReceived,
+                EventPayload::PushReceived(PushReceivedPayload {
+                    repo_id: gitforce_common::RepoId::new(),
+                    ref_name: format!("refs/heads/branch{}", i),
+                    old_hash: "abc".to_string(),
+                    new_hash: "def".to_string(),
+                    pusher_id: None,
+                }),
+                None,
+                None,
+            );
+            bus.publish(event).await.unwrap();
+        }
+        // If we get here without panic, the test passes
+    }
+
+    #[test]
+    fn test_event_filter_default() {
+        let filter = EventFilter::default();
         assert!(filter.event_types.is_none());
         assert!(filter.repo_id.is_none());
     }

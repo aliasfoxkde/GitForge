@@ -289,4 +289,32 @@ mod tests {
         // Destroy container (will use stub)
         sandbox.destroy(instance).await.unwrap();
     }
+
+    #[test]
+    fn test_sandbox_instance_debug() {
+        let instance = SandboxInstance {
+            container_id: "test-container".to_string(),
+            job_id: JobId::new(),
+        };
+        let debug_str = format!("{:?}", instance);
+        assert!(debug_str.contains("test-container"));
+    }
+
+    #[test]
+    fn test_step_result_debug() {
+        let result = StepResult {
+            exit_code: 0,
+            stdout: "hello".to_string(),
+            stderr: String::new(),
+        };
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("hello"));
+    }
+
+    #[test]
+    fn test_docker_sandbox_with_custom_limits() {
+        let limits = SandboxLimits::small();
+        let sandbox = DockerSandbox::with_limits(limits);
+        assert!(!sandbox.is_available());
+    }
 }

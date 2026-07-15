@@ -228,4 +228,44 @@ mod tests {
         assert!(result.is_ok());
         assert!(agent.runner.is_some());
     }
+
+    #[tokio::test]
+    async fn test_runner_agent_stop() {
+        let config = RunnerConfig::default();
+        let agent = RunnerAgent::new(config).await.unwrap();
+        agent.stop().await;
+        // No panic means success
+    }
+
+    #[test]
+    fn test_runner_config_custom_values() {
+        let config = RunnerConfig {
+            scheduler_url: "http://custom:8081".to_string(),
+            name: "custom-runner".to_string(),
+            runner_type: "kubernetes".to_string(),
+            capacity: 5,
+            heartbeat_interval_secs: 60,
+            fetch_interval_secs: 10,
+        };
+        assert_eq!(config.name, "custom-runner");
+        assert_eq!(config.capacity, 5);
+        assert_eq!(config.heartbeat_interval_secs, 60);
+        assert_eq!(config.fetch_interval_secs, 10);
+    }
+
+    #[test]
+    fn test_job_assignment_serialization() {
+        let assignment = JobAssignment {
+            job_id: "job-123".to_string(),
+            name: "build".to_string(),
+            pipeline_run_id: "run-456".to_string(),
+            commands: vec!["cargo build".to_string(), "cargo test".to_string()],
+            working_dir: Some("/workspace".to_string()),
+        };
+
+        let json = serde_json::to_string(&assignment).unwrap();
+        let deserialized: JobAssignment = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.job_id, "job-123");
+        assert_eq!(deserialized.commands.len(), 2);
+    }
 }

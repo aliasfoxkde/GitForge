@@ -155,4 +155,57 @@ mod tests {
         assert_eq!(artifact.size_bytes, 1024);
         assert_eq!(artifact.content_type, Some("application/zip".to_string()));
     }
+
+    #[test]
+    fn test_artifact_id_equality() {
+        let id1 = ArtifactId::new();
+        let id2 = ArtifactId::new();
+        assert!(id1 == id1);
+        assert!(id1 != id2);
+    }
+
+    #[test]
+    fn test_artifact_id_hash() {
+        use std::collections::HashSet;
+        let id1 = ArtifactId::new();
+        let id2 = ArtifactId::new();
+        let mut set = HashSet::new();
+        set.insert(id1);
+        set.insert(id2);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_artifact_id_clone() {
+        let id = ArtifactId::new();
+        let cloned = id;
+        assert_eq!(id, cloned);
+    }
+
+    #[test]
+    fn test_artifact_checksum_calculation() {
+        // Test that checksum is computed correctly
+        use sha2::{Digest, Sha256};
+        let data = b"hello world";
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let result = hex::encode(hasher.finalize());
+        // SHA256 of "hello world"
+        assert_eq!(result, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+    }
+
+    #[test]
+    fn test_artifact_without_content_type() {
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            job_id: JobId::new(),
+            name: "test.bin".to_string(),
+            path: "/tmp/test.bin".to_string(),
+            checksum: "def456".to_string(),
+            size_bytes: 256,
+            content_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        assert!(artifact.content_type.is_none());
+    }
 }
