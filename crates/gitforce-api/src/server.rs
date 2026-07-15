@@ -193,4 +193,76 @@ mod tests {
         let response = health_check(Extension(Arc::new(pool))).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn test_health_check_no_migration() {
+        let pool = Pool::memory().await.unwrap();
+        // Don't migrate - health check should still work
+        let response = health_check(Extension(Arc::new(pool))).await.into_response();
+        // May return unhealthy but shouldn't panic
+        assert!(response.status() == StatusCode::OK || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_error_response_returns_correct_status() {
+        let response = error_response(StatusCode::NOT_FOUND, "not_found", "Resource not found");
+        let resp = response.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_error_response_serialization() {
+        let response = ErrorResponse {
+            error: "not_found".to_string(),
+            message: "Item not found".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("not_found"));
+        assert!(json.contains("Item not found"));
+    }
+
+    #[test]
+    fn test_health_response_serialization() {
+        let response = HealthResponse {
+            status: "healthy".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            database: "connected".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("healthy"));
+        assert!(json.contains("connected"));
+    }
+
+    #[test]
+    fn test_error_response_content() {
+        let response = ErrorResponse {
+            error: "bad_request".to_string(),
+            message: "Invalid input".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("bad_request"));
+        assert!(json.contains("Invalid input"));
+    }
+
+    #[tokio::test]
+    async fn test_server_with_port() {
+        let pool = Pool::memory().await.unwrap();
+        let server = ApiServer::new("test-secret", pool).with_port(3000);
+        assert_eq!(server.port, 3000);
+    }
+
+    #[tokio::test]
+    async fn test_server_with_storage() {
+        let pool = Pool::memory().await.unwrap();
+        let server = ApiServer::with_storage("test-secret", pool, Some(std::path::PathBuf::from("/tmp/storage")));
+        assert_eq!(server.port, 8080);
+    }
+
+    #[tokio::test]
+    async fn test_server_into_router() {
+        let pool = Pool::memory().await.unwrap();
+        let server = ApiServer::new("test-secret", pool);
+        let _router = server.into_router();
+        // Router was created successfully
+    }
 }
