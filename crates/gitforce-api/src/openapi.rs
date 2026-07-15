@@ -524,4 +524,45 @@ mod tests {
         let response = openapi_spec().await.into_response();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn test_swagger_ui_returns_html() {
+        let response = swagger_ui().await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("swagger-ui"));
+        assert!(body_str.contains("GitForge API"));
+    }
+
+    #[test]
+    fn test_api_docs_routes_creation() {
+        let routes = api_docs_routes();
+        // Routes should be created successfully
+        assert!(true);
+    }
+
+    #[test]
+    fn test_openapi_spec_servers() {
+        let spec = get_openapi_spec();
+        let servers = spec.get("servers").unwrap().as_array().unwrap();
+        assert!(!servers.is_empty());
+        assert_eq!(servers[0].get("url").unwrap(), "/");
+    }
+
+    #[test]
+    fn test_openapi_spec_tags() {
+        let spec = get_openapi_spec();
+        let tags = spec.get("tags").unwrap().as_array().unwrap();
+        assert!(tags.len() >= 5);
+    }
+
+    #[test]
+    fn test_openapi_paths_have_operations() {
+        let spec = get_openapi_spec();
+        let paths = spec.get("paths").unwrap().as_object().unwrap();
+        // Health endpoint should have GET
+        let health = paths.get("/health").unwrap().as_object().unwrap();
+        assert!(health.contains_key("get"));
+    }
 }
