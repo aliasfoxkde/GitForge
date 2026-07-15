@@ -260,4 +260,70 @@ mod tests {
         let executor = JobExecutor::new().await.unwrap();
         assert_eq!(executor.active_count().await, 0);
     }
+
+    #[test]
+    fn test_executable_job_debug() {
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string());
+        let debug_str = format!("{:?}", job);
+        assert!(debug_str.contains("rust:latest"));
+    }
+
+    #[test]
+    fn test_job_step_debug() {
+        let step = JobStep::new("build", "cargo build");
+        let debug_str = format!("{:?}", step);
+        assert!(debug_str.contains("build"));
+    }
+
+    #[test]
+    fn test_job_result_debug() {
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: 1,
+            step_results: vec![],
+            error: Some("failed".to_string()),
+        };
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("failed"));
+    }
+
+    #[test]
+    fn test_job_step_with_env() {
+        let mut env = HashMap::new();
+        env.insert("KEY".to_string(), "value".to_string());
+        let step = JobStep {
+            name: "test".to_string(),
+            run: "echo test".to_string(),
+            env: Some(env),
+            working_directory: Some("/tmp".to_string()),
+        };
+        assert_eq!(step.env.as_ref().unwrap().get("KEY"), Some(&"value".to_string()));
+        assert_eq!(step.working_directory, Some("/tmp".to_string()));
+    }
+
+    #[test]
+    fn test_job_result_with_error() {
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: 127,
+            step_results: vec![],
+            error: Some("command not found".to_string()),
+        };
+        assert!(!result.success);
+        assert_eq!(result.exit_code, 127);
+        assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn test_executable_job_clone() {
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_env(env)
+            .with_timeout(1800);
+        // Clone to verify all fields are cloneable
+        let _ = job.clone();
+    }
 }

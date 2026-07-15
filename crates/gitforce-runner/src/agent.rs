@@ -268,4 +268,44 @@ mod tests {
         assert_eq!(deserialized.job_id, "job-123");
         assert_eq!(deserialized.commands.len(), 2);
     }
+
+    #[test]
+    fn test_job_assignment_without_working_dir() {
+        let assignment = JobAssignment {
+            job_id: "job-456".to_string(),
+            name: "test".to_string(),
+            pipeline_run_id: "run-789".to_string(),
+            commands: vec!["cargo test".to_string()],
+            working_dir: None,
+        };
+        assert!(assignment.working_dir.is_none());
+    }
+
+    #[test]
+    fn test_runner_config_debug() {
+        let config = RunnerConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("runner"));
+    }
+
+    #[test]
+    fn test_job_assignment_debug() {
+        let assignment = JobAssignment {
+            job_id: "job-123".to_string(),
+            name: "build".to_string(),
+            pipeline_run_id: "run-456".to_string(),
+            commands: vec!["cargo build".to_string()],
+            working_dir: None,
+        };
+        let debug_str = format!("{:?}", assignment);
+        assert!(debug_str.contains("job-123"));
+    }
+
+    #[test]
+    fn test_runner_config_clone() {
+        let config = RunnerConfig::default();
+        let cloned = config.clone();
+        assert_eq!(cloned.name, config.name);
+        assert_eq!(cloned.capacity, config.capacity);
+    }
 }
