@@ -95,6 +95,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_content_type_edge_cases() {
+        // Empty string
+        assert_eq!(parse_content_type(""), Some(""));
+        // Just whitespace - trims to empty
+        assert_eq!(parse_content_type("   "), Some(""));
+        // Multiple semicolons
+        assert_eq!(parse_content_type("text/plain; charset=utf-8; boundary=abc"), Some("text/plain"));
+    }
+
+    #[test]
     fn test_parse_service() {
         assert_eq!(
             parse_service("/git-upload-pack/owner/repo"),
@@ -104,5 +114,29 @@ mod tests {
             parse_service("git-receive-pack/owner/repo.git/info/refs"),
             Some(("git-receive-pack".to_string(), "owner/repo.git/info/refs".to_string()))
         );
+    }
+
+    #[test]
+    fn test_parse_service_edge_cases() {
+        // No leading slash
+        assert_eq!(
+            parse_service("git-upload-pack/repo"),
+            Some(("git-upload-pack".to_string(), "repo".to_string()))
+        );
+        // Deep path
+        assert_eq!(
+            parse_service("/git-upload-pack/owner/repo/path/to/refs"),
+            Some(("git-upload-pack".to_string(), "owner/repo/path/to/refs".to_string()))
+        );
+        // Single segment (should return None)
+        assert_eq!(parse_service("git-upload-pack"), None);
+        // Empty
+        assert_eq!(parse_service(""), None);
+    }
+
+    #[test]
+    fn test_parse_service_empty_path() {
+        assert_eq!(parse_service("/"), None);
+        assert_eq!(parse_service(""), None);
     }
 }
