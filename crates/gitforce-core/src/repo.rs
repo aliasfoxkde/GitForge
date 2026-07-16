@@ -335,4 +335,31 @@ mod tests {
         let err = RepoError::Storage("disk error".to_string());
         assert!(format!("{}", err).contains("Storage error"));
     }
+
+    #[tokio::test]
+    async fn test_repo_list_refs_empty() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let service = RepoService::new(storage);
+
+        let owner_id = UserId::new();
+        let meta = service.create("test-repo".to_string(), owner_id).await.unwrap();
+
+        // Fresh repo has no refs
+        let refs = service.list_refs(meta.id).await.unwrap();
+        assert!(refs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_repo_git_ref_fields() {
+        let git_ref = GitRef {
+            name: "refs/tags/v1.0".to_string(),
+            hash: "abc123".to_string(),
+            is_branch: false,
+            is_tag: true,
+        };
+        assert!(!git_ref.is_branch);
+        assert!(git_ref.is_tag);
+        assert_eq!(git_ref.name, "refs/tags/v1.0");
+    }
 }
