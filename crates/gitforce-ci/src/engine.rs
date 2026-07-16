@@ -424,4 +424,44 @@ mod tests {
         let pending = state.pending_jobs();
         assert!(!pending.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_engine_ready_jobs_before_start() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+
+        let engine = CiEngine::new(event, make_pipeline()).await.unwrap();
+
+        // Before start, no jobs should be ready
+        let ready = engine.ready_jobs().await;
+        assert!(ready.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_engine_state_failed_jobs() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+
+        let engine = CiEngine::new(event, make_pipeline()).await.unwrap();
+        engine.start().await.unwrap();
+
+        let ready = engine.ready_jobs().await;
+        let build_job = ready[0];
+        let runner_id = gitforce_common::RunnerId::new();
+
+        engine.assign_job(build_job, runner_id).await.unwrap();
+        engine.start_job(build_job).await.unwrap();
+        engine.fail_job(build_job, 1, "test failure".to_string()).await.unwrap();
+
+        let state = engine.state().await;
+        assert!(!state.failed_jobs().is_empty());
+    }
 }
