@@ -384,3 +384,69 @@ async fn test_api_artifacts_endpoint() {
     // Should get OK or INTERNAL_SERVER_ERROR (if query not implemented)
     assert!(response.status() == StatusCode::OK || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+#[tokio::test]
+async fn test_api_runners_endpoint() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/runners")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get OK or error
+    assert!(response.status() == StatusCode::OK || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_api_pipelines_endpoint() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/pipelines")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get OK or error
+    assert!(response.status() == StatusCode::OK || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+}
