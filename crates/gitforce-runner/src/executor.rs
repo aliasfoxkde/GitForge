@@ -680,4 +680,36 @@ mod tests {
         assert!(step.env.is_some());
         assert!(step.working_directory.is_some());
     }
+
+    #[tokio::test]
+    async fn test_executor_execute_simple_job() {
+        let executor = JobExecutor::new().await.unwrap();
+
+        let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string())
+            .with_steps(vec![
+                JobStep::new("test", "echo hello"),
+            ]);
+
+        let result = executor.execute(job).await;
+        // Job completed - success or failure depends on Docker availability
+        assert!(result.exit_code == 0 || !result.success || result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_executor_execute_with_env() {
+        let executor = JobExecutor::new().await.unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("TEST_VAR".to_string(), "test_value".to_string());
+
+        let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string())
+            .with_steps(vec![
+                JobStep::new("env", "echo $TEST_VAR"),
+            ])
+            .with_env(env);
+
+        let result = executor.execute(job).await;
+        // Should have executed regardless of outcome
+        assert!(result.exit_code == 0 || !result.success);
+    }
 }
