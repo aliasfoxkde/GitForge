@@ -233,4 +233,19 @@ mod tests {
         let result = pool.health_check().await;
         assert!(result.is_ok());
     }
+
+    #[tokio::test]
+    async fn test_pool_new_with_memory_url() {
+        // Test with explicit memory URL
+        let pool = Pool::new("sqlite::memory:").await;
+        assert!(pool.is_ok());
+    }
+
+    #[test]
+    fn test_pool_clone() {
+        // Pool is Clone, verify it can be cloned
+        // We can't clone without &self but we can verify the type is Clone
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<Pool>();
+    }
 }

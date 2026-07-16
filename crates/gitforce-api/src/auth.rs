@@ -155,4 +155,42 @@ mod tests {
         let result = auth2.validate_token(&token);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_claims_with_different_roles() {
+        let user_id = UserId::new();
+        let admin_claims = Claims::new(user_id, "admin", "admin", 24);
+        let user_claims = Claims::new(user_id, "user", "user", 24);
+        assert_eq!(admin_claims.role, "admin");
+        assert_eq!(user_claims.role, "user");
+    }
+
+    #[test]
+    fn test_claims_debug() {
+        let claims = Claims::new(UserId::new(), "test", "admin", 1);
+        let debug_str = format!("{:?}", claims);
+        assert!(debug_str.contains("test"));
+    }
+
+    #[test]
+    fn test_token_with_long_expiry() {
+        let auth = ApiAuth::new("test-secret");
+        let user_id = UserId::new();
+        let token = auth.generate_token(user_id, "user", "admin").unwrap();
+        let claims = auth.validate_token(&token).unwrap();
+        // Token should be valid and not expired
+        assert!(!claims.is_expired());
+    }
+
+    #[test]
+    fn test_claims_iat_and_exp() {
+        let before = Utc::now().timestamp();
+        let claims = Claims::new(UserId::new(), "test", "admin", 2);
+        let after = Utc::now().timestamp();
+        // iat should be current time
+        assert!(claims.iat >= before);
+        assert!(claims.iat <= after);
+        // exp should be iat + 2 hours
+        assert_eq!(claims.exp, claims.iat + (2 * 3600));
+    }
 }

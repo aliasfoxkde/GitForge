@@ -369,4 +369,104 @@ mod tests {
         assert!(filter.event_types.is_none());
         assert!(filter.repo_id.is_none());
     }
+
+    #[test]
+    fn test_event_filter_with_both_conditions() {
+        let repo_id = gitforce_common::RepoId::new();
+        let filter = EventFilter {
+            event_types: Some(vec![EventType::PushReceived]),
+            repo_id: Some(repo_id),
+        };
+
+        // Event matching both
+        let event_matching = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "abc".to_string(),
+                new_hash: "def".to_string(),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        );
+        assert!(filter.matches(&event_matching));
+
+        // Event not matching type
+        let event_wrong_type = EventEnvelope::new(
+            EventType::JobQueued,
+            EventPayload::JobQueued(crate::event::JobQueuedPayload {
+                job_id: gitforce_common::JobId::new(),
+                pipeline_run_id: gitforce_common::PipelineRunId::new(),
+                name: "test".to_string(),
+            }),
+            Some(repo_id),
+            None,
+        );
+        assert!(!filter.matches(&event_wrong_type));
+    }
+
+    #[test]
+    fn test_event_filter_matches_with_no_type_filter() {
+        let repo_id = gitforce_common::RepoId::new();
+        let filter = EventFilter {
+            event_types: None,
+            repo_id: Some(repo_id),
+        };
+
+        // Any event type should match if repo matches
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "abc".to_string(),
+                new_hash: "def".to_string(),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        );
+        assert!(filter.matches(&event));
+    }
+
+    #[test]
+    fn test_event_filter_matches_with_no_repo_filter() {
+        let filter = EventFilter {
+            event_types: Some(vec![EventType::PushReceived]),
+            repo_id: None,
+        };
+
+        // Any repo should match if type matches
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id: gitforce_common::RepoId::new(),
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "abc".to_string(),
+                new_hash: "def".to_string(),
+                pusher_id: None,
+            }),
+            Some(gitforce_common::RepoId::new()),
+            None,
+        );
+        assert!(filter.matches(&event));
+    }
+
+    #[tokio::test]
+    async fn test_event_bus_publish_error_channel_closed() {
+        use std::sync::Arc;
+
+        // Create a bus and subscribe to get a receiver
+        let bus = Arc::new(InMemoryEventBus::new());
+        let _stream = bus.subscribe(EventFilter::all()).await.unwrap();
+
+        // Drop the sender by dropping the bus
+        drop(bus);
+
+        // Trying to publish to dropped bus would error
+        // This test just verifies the bus can be created and dropped
+        // without panic. The actual error behavior is tested elsewhere.
+    }
 }

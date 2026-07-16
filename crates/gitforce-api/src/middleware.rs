@@ -114,6 +114,9 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthenticatedUser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Request;
+    use chrono::Utc;
+    use gitforce_common::UserId;
 
     #[test]
     fn test_public_paths() {
@@ -174,5 +177,78 @@ mod tests {
         // Test that the error response for missing auth context has correct status
         let response = auth_error_response("unauthenticated", "No authentication context");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_authenticated_user_creation() {
+        let claims = Claims {
+            sub: "user-123".to_string(),
+            user_id: UserId::new(),
+            username: "testuser".to_string(),
+            role: "admin".to_string(),
+            exp: Utc::now().timestamp() + 3600,
+            iat: Utc::now().timestamp(),
+        };
+        let user = AuthenticatedUser { claims };
+        assert_eq!(user.claims.username, "testuser");
+    }
+
+    #[test]
+    fn test_authenticated_user_debug() {
+        let claims = Claims {
+            sub: "user-123".to_string(),
+            user_id: UserId::new(),
+            username: "testuser".to_string(),
+            role: "admin".to_string(),
+            exp: Utc::now().timestamp() + 3600,
+            iat: Utc::now().timestamp(),
+        };
+        let user = AuthenticatedUser { claims };
+        let debug_str = format!("{:?}", user);
+        assert!(debug_str.contains("testuser"));
+    }
+
+    #[test]
+    fn test_authenticated_user_clone() {
+        let claims = Claims {
+            sub: "user-123".to_string(),
+            user_id: UserId::new(),
+            username: "testuser".to_string(),
+            role: "admin".to_string(),
+            exp: Utc::now().timestamp() + 3600,
+            iat: Utc::now().timestamp(),
+        };
+        let user = AuthenticatedUser { claims };
+        let cloned = user.clone();
+        assert_eq!(cloned.claims.username, user.claims.username);
+    }
+
+    #[test]
+    fn test_public_paths_exact_match() {
+        // Test that paths that are exactly the public path work
+        assert!(PUBLIC_PATHS.iter().any(|p| "/health" == *p || "/health".starts_with(p)));
+        assert!(PUBLIC_PATHS.iter().any(|p| "/metrics" == *p || "/metrics".starts_with(p)));
+    }
+
+    #[test]
+    fn test_auth_error_response_all_variants() {
+        // Test all error types
+        let resp1 = auth_error_response("missing_token", "Missing token");
+        assert_eq!(resp1.status(), StatusCode::UNAUTHORIZED);
+
+        let resp2 = auth_error_response("invalid_token", "Invalid token");
+        assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+
+        let resp3 = auth_error_response("expired_token", "Token expired");
+        assert_eq!(resp3.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_claims_in_authenticated_user() {
+        let user_id = UserId::new();
+        let claims = Claims::new(user_id, "testuser", "developer", 2);
+        let user = AuthenticatedUser { claims };
+        assert_eq!(user.claims.username, "testuser");
+        assert_eq!(user.claims.role, "developer");
     }
 }

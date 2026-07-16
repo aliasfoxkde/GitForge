@@ -328,4 +328,17 @@ mod tests {
         metrics.record_job_assignment();
         metrics.record_job_assignment();
     }
+
+    #[test]
+    fn test_runners_gauges() {
+        let metrics = Metrics::new();
+        // Test that we can access the runner gauges
+        metrics.runners_online.inc();
+        metrics.runners_busy.inc();
+        metrics.runners_offline.inc();
+        metrics.repos_total.set(10);
+        metrics.pipelines_total.set(5);
+        metrics.jobs_total.set(20);
+        metrics.artifacts_total.set(100);
+    }
 }
