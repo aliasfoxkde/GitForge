@@ -1111,6 +1111,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_job_queries_list_pending() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        // Create user, repo, pipeline, run, job
+        let user = crate::models::User::new(
+            "owner".to_string(),
+            "owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+
+        let repo = crate::models::Repository::new(
+            "test-repo".to_string(),
+            user.id,
+            "/git/test-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "Test Pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        let job = crate::models::Job::new(run.id, "build".to_string());
+        JobQueries::create(&pool, &job).await.unwrap();
+
+        // List pending jobs
+        let pending = JobQueries::list_pending(&pool).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "build");
+    }
+
+    #[tokio::test]
+    async fn test_runner_queries_list_online() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let runner = crate::models::Runner::new(
+            "test-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            2,
+        );
+        RunnerQueries::create(&pool, &runner).await.unwrap();
+
+        // List online runners
+        let online = RunnerQueries::list_online(&pool).await.unwrap();
+        assert_eq!(online.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_event_queries_list_by_type_none() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let event = crate::models::Event::new(
+            "push.received".to_string(),
+            serde_json::json!({"repo": "test"}),
+        );
+        EventQueries::create(&pool, &event).await.unwrap();
+
+        // List non-existent type
+        let events = EventQueries::list_by_type(&pool, "nonexistent.type", 10).await.unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_event_queries_list_recent_limit() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        // Create multiple events
+        for i in 0..5 {
+            let event = crate::models::Event::new(
+                "push.received".to_string(),
+                serde_json::json!({"repo": format!("test{}", i)}),
+            );
+            EventQueries::create(&pool, &event).await.unwrap();
+        }
+
+        // List with limit 3
+        let recent = EventQueries::list_recent(&pool, 3).await.unwrap();
+        assert_eq!(recent.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_event_queries_empty() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        // List when no events
+        let events = EventQueries::list_by_type(&pool, "push.received", 10).await.unwrap();
+        assert!(events.is_empty());
+
+        let recent = EventQueries::list_recent(&pool, 10).await.unwrap();
+        assert!(recent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_job_queries_get_nonexistent() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let found = JobQueries::get(&pool, JobId::new()).await.unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_queries_get_nonexistent() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let found = PipelineQueries::get(&pool, PipelineId::new()).await.unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_run_queries_get_nonexistent() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let found = PipelineRunQueries::get(&pool, PipelineRunId::new()).await.unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_runner_queries_get_nonexistent() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let found = RunnerQueries::get(&pool, RunnerId::new()).await.unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_user_queries_get_nonexistent() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let found = UserQueries::get(&pool, UserId::new()).await.unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
     async fn test_event_queries() {
         let pool = Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
