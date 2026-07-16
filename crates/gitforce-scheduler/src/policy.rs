@@ -204,4 +204,40 @@ mod tests {
         let policy = PriorityPolicy::new();
         assert!(matches!(policy, PriorityPolicy));
     }
+
+    #[tokio::test]
+    async fn test_simple_policy_with_single_runner() {
+        let policy = SimplePolicy::new();
+        let runner_id = RunnerId::new();
+        let runners = vec![
+            make_runner(runner_id, "solo-runner", "online", 1),
+        ];
+        let job_id = JobId::new();
+
+        let selected = policy.select_runner(job_id, &runners).await;
+        assert_eq!(selected, Some(runner_id));
+    }
+
+    #[tokio::test]
+    async fn test_simple_policy_all_zero_capacity() {
+        let policy = SimplePolicy::new();
+        let runners = vec![
+            make_runner(RunnerId::new(), "runner-1", "online", 0),
+            make_runner(RunnerId::new(), "runner-2", "online", 0),
+        ];
+        let job_id = JobId::new();
+
+        let selected = policy.select_runner(job_id, &runners).await;
+        assert!(selected.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_priority_policy_no_runners() {
+        let policy = PriorityPolicy::new();
+        let runners: Vec<gitforce_db::models::Runner> = vec![];
+        let job_id = JobId::new();
+
+        let selected = policy.select_runner(job_id, &runners).await;
+        assert!(selected.is_none());
+    }
 }
