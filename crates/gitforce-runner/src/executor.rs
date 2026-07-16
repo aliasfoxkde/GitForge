@@ -637,4 +637,18 @@ mod tests {
             .with_env(env);
         assert_eq!(job.env.len(), 2);
     }
+
+    #[tokio::test]
+    async fn test_executor_cancel_nonexistent_job() {
+        let executor = JobExecutor::new().await.unwrap();
+        // Cancel a job that doesn't exist should not error
+        let result = executor.cancel(JobId::new()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_executor_active_count_initial() {
+        let executor = JobExecutor::new().await.unwrap();
+        assert_eq!(executor.active_count().await, 0);
+    }
 }
