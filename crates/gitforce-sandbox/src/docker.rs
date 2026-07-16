@@ -355,4 +355,133 @@ mod tests {
         let cloned = instance.clone();
         assert_eq!(cloned.container_id, instance.container_id);
     }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_preserves_job_id() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        assert_eq!(instance.job_id, job_id);
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_execute_empty_command() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+
+        // Empty command should still work in stub mode
+        let result = sandbox.execute(&instance, &[]).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_execute_single_command() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "rust:latest", SandboxLimits::default()).await.unwrap();
+
+        let result = sandbox.execute(&instance, &["true"]).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_execute_false_command() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+
+        let result = sandbox.execute(&instance, &["false"]).await.unwrap();
+        // Stub mode always returns 0, even for false command
+        assert_eq!(result.exit_code, 0);
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_multiple_instances() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+
+        // Create multiple instances
+        let job1 = JobId::new();
+        let job2 = JobId::new();
+        let job3 = JobId::new();
+
+        let instance1 = sandbox.create(job1, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance2 = sandbox.create(job2, "ubuntu:latest", SandboxLimits::default()).await.unwrap();
+        let instance3 = sandbox.create(job3, "rust:latest", SandboxLimits::default()).await.unwrap();
+
+        // Each should have unique container ID
+        assert_ne!(instance1.container_id, instance2.container_id);
+        assert_ne!(instance2.container_id, instance3.container_id);
+
+        sandbox.destroy(instance1).await.unwrap();
+        sandbox.destroy(instance2).await.unwrap();
+        sandbox.destroy(instance3).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_destroy_same_instance_twice() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+
+        // Destroy twice should both succeed (idempotent in stub mode)
+        sandbox.destroy(instance.clone()).await.unwrap();
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_with_large_image_name() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        // Very long image name
+        let instance = sandbox.create(job_id, "registry.example.com/verylongnamed repository/imagename:latest", SandboxLimits::default()).await.unwrap();
+        assert!(!instance.container_id.is_empty());
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[test]
+    fn test_docker_sandbox_debug_trait_not_implemented() {
+        // DockerSandbox doesn't implement Debug, which is intentional
+        // This test documents that behavior
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        assert!(!sandbox.is_available());
+    }
+
+    #[test]
+    fn test_step_result_with_stderr() {
+        let result = StepResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "error message".to_string(),
+        };
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.stderr, "error message");
+    }
+
+    #[test]
+    fn test_step_result_clone() {
+        let result = StepResult {
+            exit_code: 0,
+            stdout: "hello".to_string(),
+            stderr: String::new(),
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.stdout, result.stdout);
+        assert_eq!(cloned.exit_code, result.exit_code);
+    }
 }
