@@ -85,4 +85,57 @@ mod tests {
             Some(("git-receive-pack", "owner/repo"))
         );
     }
+
+    #[test]
+    fn test_parse_ssh_command_edge_cases() {
+        // Single word
+        assert_eq!(parse_ssh_command("git-upload-pack"), None);
+        // Empty string
+        assert_eq!(parse_ssh_command(""), None);
+        // Extra whitespace
+        assert_eq!(
+            parse_ssh_command("git-upload-pack   /repo"),
+            Some(("git-upload-pack", "/repo"))
+        );
+        // Multiple spaces between
+        assert_eq!(
+            parse_ssh_command("git-receive-pack  owner/repo"),
+            Some(("git-receive-pack", "owner/repo"))
+        );
+        // Deep path
+        assert_eq!(
+            parse_ssh_command("git-upload-pack /owner/repo/path/to/refs"),
+            Some(("git-upload-pack", "/owner/repo/path/to/refs"))
+        );
+    }
+
+    #[test]
+    fn test_parse_ssh_command_with_special_chars() {
+        // Dot in repo name
+        assert_eq!(
+            parse_ssh_command("git-upload-pack /repo.with.dots.git"),
+            Some(("git-upload-pack", "/repo.with.dots.git"))
+        );
+        // Underscore and hyphen
+        assert_eq!(
+            parse_ssh_command("git-upload-pack /my_repo-name"),
+            Some(("git-upload-pack", "/my_repo-name"))
+        );
+    }
+
+    #[test]
+    fn test_parse_ssh_command_only_whitespace() {
+        assert_eq!(parse_ssh_command("   "), None);
+    }
+
+    #[test]
+    fn test_ssh_git_handler_creation() {
+        use crate::storage::FileStorageBackend;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let _handler = SshGitHandler::new(storage);
+        // Handler created successfully
+    }
 }
