@@ -304,4 +304,55 @@ mod tests {
         let entries = store.list().await.unwrap();
         assert_eq!(entries.len(), 10);
     }
+
+    #[tokio::test]
+    async fn test_cache_key_with_special_characters() {
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "key-with-dashes_and_underscores", "target");
+        assert_eq!(key.key, "key-with-dashes_and_underscores");
+        assert_eq!(key.target, "target");
+    }
+
+    #[tokio::test]
+    async fn test_cache_entry_timestamps_different() {
+        let store = InMemoryCacheStore::new();
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "test", "linux");
+
+        store.put(key.clone(), vec![1, 2, 3]).await.unwrap();
+
+        let entries = store.list().await.unwrap();
+        let entry = &entries[0];
+
+        // created_at and accessed_at should be set
+        assert!(entry.created_at <= entry.accessed_at);
+    }
+
+    #[test]
+    fn test_cache_key_with_unicode() {
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "中文key", "target");
+        assert_eq!(key.key, "中文key");
+    }
+
+    #[test]
+    fn test_cache_key_with_empty_strings() {
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "", "");
+        assert_eq!(key.key, "");
+        assert_eq!(key.target, "");
+    }
+
+    #[test]
+    fn test_cache_entry_size_bytes() {
+        let repo_id = gitforce_common::RepoId::new();
+        let key = CacheKey::new(repo_id, "test", "linux");
+        let entry = CacheEntry {
+            key,
+            size_bytes: 1024,
+            created_at: chrono::Utc::now(),
+            accessed_at: chrono::Utc::now(),
+        };
+        assert_eq!(entry.size_bytes, 1024);
+    }
 }
