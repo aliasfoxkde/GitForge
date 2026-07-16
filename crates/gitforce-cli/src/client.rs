@@ -119,4 +119,32 @@ mod tests {
         let cloned = client.clone();
         assert_eq!(cloned.base_url, client.base_url);
     }
+
+    #[test]
+    fn test_api_client_clone_preserves_token() {
+        let client = ApiClient::new("http://localhost:8080", Some("secret-token".to_string()));
+        let cloned = client.clone();
+        assert_eq!(cloned.token, client.token);
+    }
+
+    #[test]
+    fn test_api_client_different_tokens() {
+        let client1 = ApiClient::new("http://localhost:8080", Some("token1".to_string()));
+        let client2 = ApiClient::new("http://localhost:8080", Some("token2".to_string()));
+        assert_ne!(client1.token, client2.token);
+    }
+
+    #[test]
+    fn test_api_client_with_empty_token() {
+        let client = ApiClient::new("http://localhost:8080", Some("".to_string()));
+        assert!(client.token.is_some());
+        assert_eq!(client.token.unwrap(), "");
+    }
+
+    #[test]
+    fn test_gitforge_client_is_api_client() {
+        // GitForgeClient is an alias for ApiClient
+        let client = GitForgeClient::new("http://localhost:8080", None);
+        assert_eq!(client.base_url, "http://localhost:8080");
+    }
 }

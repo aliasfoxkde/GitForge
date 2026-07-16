@@ -531,4 +531,105 @@ mod tests {
         assert_ne!(SyncStatus::InSync, SyncStatus::PendingPush);
         assert_ne!(SyncStatus::PendingPush, SyncStatus::PendingPull);
     }
+
+    #[tokio::test]
+    async fn test_add_pipeline() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        client.init().await.unwrap();
+        client.add_pipeline(
+            "pipe-1".to_string(),
+            "repo-1".to_string(),
+            "build".to_string(),
+            "steps: [build]".to_string(),
+        ).await.unwrap();
+        let state = client.state.read().await;
+        assert!(state.pipelines.contains_key("pipe-1"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_client_sync_dir() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        let sync_dir = client.sync_dir();
+        assert_eq!(sync_dir, temp_dir.path().join(".gitforge"));
+    }
+
+    #[tokio::test]
+    async fn test_add_repo_updates_timestamp() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        client.init().await.unwrap();
+        let before = client.state.read().await.updated_at.clone();
+        client.add_repo("test-repo".to_string(), "repo-123".to_string()).await.unwrap();
+        let after = client.state.read().await.updated_at.clone();
+        assert!(!after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_pipeline_updates_timestamp() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        client.init().await.unwrap();
+        client.add_pipeline(
+            "pipe-1".to_string(),
+            "repo-1".to_string(),
+            "build".to_string(),
+            "steps: [build]".to_string(),
+        ).await.unwrap();
+        let state = client.state.read().await;
+        assert!(!state.updated_at.is_empty());
+    }
+
+    #[test]
+    fn test_sync_metadata_with_all_fields() {
+        let metadata = SyncMetadata {
+            last_push: Some("2024-01-01T00:00:00Z".to_string()),
+            last_pull: Some("2024-01-02T00:00:00Z".to_string()),
+            local_rev: 100,
+            remote_rev: 200,
+            status: SyncStatus::Conflict,
+        };
+        assert_eq!(metadata.local_rev, 100);
+        assert_eq!(metadata.remote_rev, 200);
+        assert!(matches!(metadata.status, SyncStatus::Conflict));
+    }
+
+    #[test]
+    fn test_push_response_structure() {
+        let response = PushResponse {
+            success: true,
+            remote_rev: 42,
+            conflicts: vec![],
+        };
+        assert!(response.success);
+        assert_eq!(response.remote_rev, 42);
+        assert!(response.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_push_response_with_conflicts() {
+        let response = PushResponse {
+            success: false,
+            remote_rev: 10,
+            conflicts: vec!["repo-1".to_string(), "repo-2".to_string()],
+        };
+        assert!(!response.success);
+        assert_eq!(response.conflicts.len(), 2);
+    }
+
+    #[test]
+    fn test_local_state_with_data() {
+        let mut state = LocalState::default();
+        state.updated_at = "2024-06-15T12:00:00Z".to_string();
+        state.repos.insert("test".to_string(), RepoState {
+            id: "id-1".to_string(),
+            name: "test".to_string(),
+            local_path: Some(PathBuf::from("/tmp/test")),
+            synced_at: None,
+            local_rev: 1,
+        });
+        assert_eq!(state.repos.len(), 1);
+        assert_eq!(state.updated_at, "2024-06-15T12:00:00Z");
+    }
 }
