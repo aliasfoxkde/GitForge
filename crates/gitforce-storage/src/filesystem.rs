@@ -144,6 +144,40 @@ impl ArtifactStore for FileStorage {
 
         Ok(artifact)
     }
+
+    async fn list(&self) -> Result<Vec<Artifact>> {
+        let mut artifacts = Vec::new();
+
+        let mut entries = fs::read_dir(&self.artifacts_dir).await.map_err(|e| {
+            Error::storage(format!("failed to read artifacts directory: {}", e))
+        })?;
+
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            Error::storage(format!("failed to read artifact entry: {}", e))
+        })? {
+            let path = entry.path();
+            // Check if filename ends with .meta.json
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                if filename.ends_with(".meta.json") {
+                    let mut contents = Vec::new();
+                    if let Ok(mut file) = fs::File::open(&path).await {
+                        if file.read_to_end(&mut contents).await.is_ok() {
+                            if let Ok(artifact) = serde_json::from_slice::<Artifact>(&contents) {
+                                artifacts.push(artifact);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(artifacts)
+    }
+
+    async fn list_by_job(&self, job_id: gitforce_common::JobId) -> Result<Vec<Artifact>> {
+        let all_artifacts = ArtifactStore::list(self).await?;
+        Ok(all_artifacts.into_iter().filter(|a| a.job_id == job_id).collect())
+    }
 }
 
 #[async_trait]
@@ -446,5 +480,116 @@ mod tests {
         CacheStore::put(&storage, key.clone(), b"second".to_vec()).await.unwrap();
         let second = CacheStore::get(&storage, &key).await.unwrap();
         assert_eq!(second.unwrap(), b"second");
+    }
+
+    #[tokio::test]
+    async fn test_artifact_list() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        // List should be empty initially
+        let artifacts = ArtifactStore::list(&storage).await.unwrap();
+        assert!(artifacts.is_empty());
+
+        // Add an artifact
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            job_id: gitforce_common::JobId::new(),
+            name: "list-test".to_string(),
+            path: "/fake/path".to_string(),
+            checksum: "abc123".to_string(),
+            size_bytes: 100,
+            content_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        ArtifactStore::put(&storage, &artifact, b"test data").await.unwrap();
+
+        // List should have one artifact
+        let artifacts = ArtifactStore::list(&storage).await.unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "list-test");
+    }
+
+    #[tokio::test]
+    async fn test_artifact_list_by_job() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let job_id = gitforce_common::JobId::new();
+        let other_job_id = gitforce_common::JobId::new();
+
+        // Add artifact for job_id
+        let artifact1 = Artifact {
+            id: ArtifactId::new(),
+            job_id,
+            name: "job-artifact".to_string(),
+            path: "/fake/path1".to_string(),
+            checksum: "abc123".to_string(),
+            size_bytes: 100,
+            content_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        ArtifactStore::put(&storage, &artifact1, b"data1").await.unwrap();
+
+        // Add artifact for other_job_id
+        let artifact2 = Artifact {
+            id: ArtifactId::new(),
+            job_id: other_job_id,
+            name: "other-job-artifact".to_string(),
+            path: "/fake/path2".to_string(),
+            checksum: "def456".to_string(),
+            size_bytes: 200,
+            content_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        ArtifactStore::put(&storage, &artifact2, b"data2").await.unwrap();
+
+        // List by job_id should return only artifact1
+        let artifacts = ArtifactStore::list_by_job(&storage, job_id).await.unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "job-artifact");
+
+        // List by other_job_id should return only artifact2
+        let artifacts = ArtifactStore::list_by_job(&storage, other_job_id).await.unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "other-job-artifact");
+    }
+
+    #[tokio::test]
+    async fn test_artifact_list_by_job_none() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let job_id = gitforce_common::JobId::new();
+
+        // List by job_id with no artifacts should return empty
+        let artifacts = ArtifactStore::list_by_job(&storage, job_id).await.unwrap();
+        assert!(artifacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_artifact_list_multiple() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let job_id = gitforce_common::JobId::new();
+
+        // Add multiple artifacts for same job
+        for i in 0..5 {
+            let artifact = Artifact {
+                id: ArtifactId::new(),
+                job_id,
+                name: format!("artifact-{}", i),
+                path: format!("/fake/path{}", i),
+                checksum: format!("checksum{}", i),
+                size_bytes: 100 + i as u64,
+                content_type: None,
+                created_at: chrono::Utc::now(),
+            };
+            ArtifactStore::put(&storage, &artifact, format!("data{}", i).as_bytes()).await.unwrap();
+        }
+
+        let artifacts = ArtifactStore::list_by_job(&storage, job_id).await.unwrap();
+        assert_eq!(artifacts.len(), 5);
     }
 }

@@ -66,15 +66,29 @@ fn artifact_to_response(artifact: &Artifact) -> ArtifactResponse {
 /// List artifacts
 async fn list_artifacts(
     Extension(auth): Extension<Arc<ApiAuth>>,
-    Extension(_storage): Extension<Arc<FileStorage>>,
+    Extension(storage): Extension<Arc<FileStorage>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     match extract_user(&auth, &headers) {
         Err(e) => e.into_response(),
         Ok(_) => {
             tracing::debug!("list artifacts");
-            // TODO: Implement list all artifacts (requires scanning directory)
-            Json(serde_json::Value::Array(vec![])).into_response()
+            match storage.list().await {
+                Ok(artifacts) => {
+                    let responses: Vec<ArtifactResponse> = artifacts
+                        .iter()
+                        .map(artifact_to_response)
+                        .collect();
+                    Json(responses).into_response()
+                }
+                Err(e) => {
+                    tracing::error!("failed to list artifacts: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+                        error: "storage_error".to_string(),
+                        message: e.to_string(),
+                    })).into_response()
+                }
+            }
         }
     }
 }
@@ -157,7 +171,7 @@ async fn delete_artifact(
 /// Get artifacts for a job
 async fn get_job_artifacts(
     Extension(auth): Extension<Arc<ApiAuth>>,
-    Extension(_storage): Extension<Arc<FileStorage>>,
+    Extension(storage): Extension<Arc<FileStorage>>,
     headers: HeaderMap,
     Path(job_id): Path<String>,
 ) -> impl IntoResponse {
@@ -165,8 +179,33 @@ async fn get_job_artifacts(
         Err(e) => e.into_response(),
         Ok(_) => {
             tracing::debug!("get job artifacts: {}", job_id);
-            // TODO: Implement listing artifacts by job_id
-            Json(serde_json::Value::Array(vec![])).into_response()
+
+            let job_id_val = match Uuid::parse_str(&job_id) {
+                Ok(uuid) => gitforce_common::JobId::from(uuid),
+                Err(_) => {
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
+                        error: "invalid_id".to_string(),
+                        message: "Invalid job ID format".to_string(),
+                    })).into_response();
+                }
+            };
+
+            match storage.list_by_job(job_id_val).await {
+                Ok(artifacts) => {
+                    let responses: Vec<ArtifactResponse> = artifacts
+                        .iter()
+                        .map(artifact_to_response)
+                        .collect();
+                    Json(responses).into_response()
+                }
+                Err(e) => {
+                    tracing::error!("failed to list artifacts for job: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+                        error: "storage_error".to_string(),
+                        message: e.to_string(),
+                    })).into_response()
+                }
+            }
         }
     }
 }

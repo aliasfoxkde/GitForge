@@ -103,6 +103,12 @@ pub trait ArtifactStore: Send + Sync {
 
     /// Get artifact metadata
     async fn get_metadata(&self, id: ArtifactId) -> Result<Artifact>;
+
+    /// List all artifacts
+    async fn list(&self) -> Result<Vec<Artifact>>;
+
+    /// List artifacts by job ID
+    async fn list_by_job(&self, job_id: JobId) -> Result<Vec<Artifact>>;
 }
 
 #[cfg(test)]

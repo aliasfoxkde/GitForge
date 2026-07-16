@@ -257,6 +257,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires Docker and is slow - run manually with `cargo test -- --ignored`
     async fn test_docker_sandbox_real_when_available() {
         let sandbox = DockerSandbox::new().await.unwrap();
 
@@ -286,6 +287,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires Docker and is slow - run manually with `cargo test -- --ignored`
     async fn test_docker_sandbox_real_with_longer_command() {
         let sandbox = DockerSandbox::new().await.unwrap();
 
@@ -309,6 +311,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires Docker and is slow - run manually with `cargo test -- --ignored`
     async fn test_docker_sandbox_real_multiple_commands() {
         let sandbox = DockerSandbox::new().await.unwrap();
 
