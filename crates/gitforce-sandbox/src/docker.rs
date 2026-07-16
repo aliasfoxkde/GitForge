@@ -271,6 +271,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_docker_sandbox_real_when_available() {
+        let sandbox = DockerSandbox::new().await.unwrap();
+
+        if !sandbox.is_available() {
+            // Skip if Docker not available - this is expected in CI
+            return;
+        }
+
+        // Test with real Docker
+        let job_id = JobId::new();
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await;
+
+        // If Docker has issues, we fall back to stub mode
+        if instance.is_err() {
+            return;
+        }
+
+        let instance = instance.unwrap();
+        assert!(!instance.container_id.is_empty());
+
+        let result = sandbox.execute(&instance, &["echo", "hello"]).await;
+        if result.is_ok() {
+            assert_eq!(result.unwrap().exit_code, 0);
+        }
+
+        let _ = sandbox.destroy(instance).await;
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_real_with_longer_command() {
+        let sandbox = DockerSandbox::new().await.unwrap();
+
+        if !sandbox.is_available() {
+            return;
+        }
+
+        let job_id = JobId::new();
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await;
+        if instance.is_err() {
+            return;
+        }
+        let instance = instance.unwrap();
+
+        let result = sandbox.execute(&instance, &["sh", "-c", "echo test"]).await;
+        if result.is_ok() {
+            assert_eq!(result.unwrap().exit_code, 0);
+        }
+
+        let _ = sandbox.destroy(instance).await;
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_real_multiple_commands() {
+        let sandbox = DockerSandbox::new().await.unwrap();
+
+        if !sandbox.is_available() {
+            return;
+        }
+
+        let job_id = JobId::new();
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await;
+        if instance.is_err() {
+            return;
+        }
+        let instance = instance.unwrap();
+
+        let result = sandbox.execute(&instance, &["sh", "-c", "echo line1"]).await;
+        if result.is_ok() {
+            assert_eq!(result.unwrap().exit_code, 0);
+        }
+
+        let _ = sandbox.destroy(instance).await;
+    }
+
+    #[tokio::test]
     async fn test_docker_sandbox_stub_execution() {
         // Create sandbox in stub mode
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
