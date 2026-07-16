@@ -3,7 +3,7 @@
 use crate::limits::SandboxLimits;
 use async_trait::async_trait;
 use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, LogOutput, RemoveContainerOptions,
+    Config, CreateContainerOptions, LogOutput, RemoveContainerOptions,
     StartContainerOptions,
 };
 use bollard::image::CreateImageOptions;
@@ -11,7 +11,6 @@ use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::Docker;
 use futures_util::StreamExt;
 use gitforce_common::{Error, JobId, Result};
-use std::collections::HashMap;
 
 /// Sandbox instance handle
 #[derive(Debug, Clone)]
@@ -80,37 +79,24 @@ impl DockerSandbox {
     /// Pull an image if not present
     async fn ensure_image(&self, image: &str) -> Result<()> {
         if let Some(ref docker) = self.docker {
-            // Check if image exists
-            let filters = HashMap::from([("reference", vec![image])]);
-            let options = ListContainersOptions {
-                all: true,
-                filters,
-                ..Default::default()
-            };
+            tracing::info!("Pulling image: {}", image);
+            // Pull the image - Docker is idempotent, so this works even if image exists
+            let mut stream = docker.create_image(
+                Some(CreateImageOptions {
+                    from_image: image,
+                    ..Default::default()
+                }),
+                None,
+                None,
+            );
 
-            let containers = docker.list_containers(Some(options)).await
-                .map_err(|e| Error::sandbox(format!("failed to list containers: {}", e)))?;
-
-            if containers.is_empty() {
-                tracing::info!("Pulling image: {}", image);
-                // Pull the image
-                let mut stream = docker.create_image(
-                    Some(CreateImageOptions {
-                        from_image: image,
-                        ..Default::default()
-                    }),
-                    None,
-                    None,
-                );
-
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(info) => {
-                            tracing::debug!("Pull progress: {:?}", info);
-                        }
-                        Err(e) => {
-                            return Err(Error::sandbox(format!("failed to pull image: {}", e)));
-                        }
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(info) => {
+                        tracing::debug!("Pull progress: {:?}", info);
+                    }
+                    Err(e) => {
+                        return Err(Error::sandbox(format!("failed to pull image: {}", e)));
                     }
                 }
             }
