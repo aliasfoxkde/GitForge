@@ -1,0 +1,14 @@
+[toml]
+# Exclude files that require infrastructure to test
+exclude-files = [
+    "services/*/src/main.rs",
+    "template-parts/**",
+]
+
+# Exclude crates that are templates/scaffolding
+exclude-packages = [
+    "template-parts",
+]
+
+# Only run tests (not doctests)
+test-threads = 1
