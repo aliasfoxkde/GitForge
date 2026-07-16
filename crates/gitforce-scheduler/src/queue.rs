@@ -306,4 +306,22 @@ mod tests {
         let cloned = priority;
         assert_eq!(priority, cloned);
     }
+
+    #[test]
+    fn test_priority_eq() {
+        assert_eq!(Priority::High, Priority::High);
+        assert_eq!(Priority::Normal, Priority::Normal);
+        assert_eq!(Priority::Low, Priority::Low);
+        assert_ne!(Priority::High, Priority::Low);
+    }
+
+    #[test]
+    fn test_priority_ord_consistency() {
+        // Verify ordering is consistent with comparison
+        assert!(Priority::High >= Priority::High);
+        assert!(Priority::High > Priority::Normal);
+        assert!(Priority::Normal >= Priority::Normal);
+        assert!(Priority::Normal > Priority::Low);
+        assert!(Priority::Low >= Priority::Low);
+    }
 }

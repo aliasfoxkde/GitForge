@@ -422,4 +422,143 @@ mod tests {
     fn test_priority_default() {
         assert_eq!(Priority::default(), Priority::Normal);
     }
+
+    #[tokio::test]
+    async fn test_scheduler_with_multiple_jobs_and_runners() {
+        let scheduler = Scheduler::new();
+
+        // Add multiple runners
+        let runner1 = make_runner(RunnerId::new(), "runner1", "online", 4);
+        let runner2 = make_runner(RunnerId::new(), "runner2", "online", 2);
+        scheduler.register_runner(runner1.clone()).await;
+        scheduler.register_runner(runner2.clone()).await;
+
+        // Add multiple jobs
+        for i in 0..5 {
+            let job_id = JobId::new();
+            let run_id = PipelineRunId::new();
+            let repo_id = RepoId::new();
+            scheduler.enqueue(job_id, run_id, repo_id).await;
+        }
+
+        assert_eq!(scheduler.queue_len().await, 5);
+
+        // Process queue should assign jobs
+        scheduler.process_queue().await;
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_assign_job_multiple_times() {
+        let scheduler = Scheduler::new();
+        let runner = make_runner(RunnerId::new(), "runner1", "online", 4);
+        scheduler.register_runner(runner.clone()).await;
+
+        let job_id = JobId::new();
+        let run_id = PipelineRunId::new();
+        let repo_id = RepoId::new();
+        scheduler.enqueue(job_id, run_id, repo_id).await;
+
+        // Process queue twice - second time should be no-op since job is assigned
+        scheduler.process_queue().await;
+        scheduler.process_queue().await;
+
+        // Job should be assigned
+        let assigned = scheduler.is_assigned(job_id).await;
+        assert!(assigned.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_cancel_assigned_job() {
+        let scheduler = Scheduler::new();
+        let runner = make_runner(RunnerId::new(), "runner1", "online", 4);
+        scheduler.register_runner(runner.clone()).await;
+
+        let job_id = JobId::new();
+        let run_id = PipelineRunId::new();
+        let repo_id = RepoId::new();
+        scheduler.enqueue(job_id, run_id, repo_id).await;
+
+        // Assign job
+        scheduler.process_queue().await;
+        assert!(scheduler.is_assigned(job_id).await.is_some());
+
+        // Cancel should remove assignment
+        scheduler.cancel(job_id).await;
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_queue_len_after_dequeue() {
+        let scheduler = Scheduler::new();
+        let runner = make_runner(RunnerId::new(), "runner1", "online", 4);
+        scheduler.register_runner(runner.clone()).await;
+
+        let job_id = JobId::new();
+        let run_id = PipelineRunId::new();
+        let repo_id = RepoId::new();
+        scheduler.enqueue(job_id, run_id, repo_id).await;
+        assert_eq!(scheduler.queue_len().await, 1);
+
+        // Process queue - job should be dequeued
+        scheduler.process_queue().await;
+        assert_eq!(scheduler.queue_len().await, 0);
+    }
+
+    #[test]
+    fn test_scheduler_state_with_multiple_runners() {
+        let mut state = SchedulerState::new();
+        state.add_runner(make_runner(RunnerId::new(), "runner1", "online", 4));
+        state.add_runner(make_runner(RunnerId::new(), "runner2", "online", 2));
+        state.add_runner(make_runner(RunnerId::new(), "runner3", "offline", 1));
+
+        assert_eq!(state.runners.len(), 3);
+        let online = state.list_online_runners();
+        assert_eq!(online.len(), 2);
+    }
+
+    #[test]
+    fn test_scheduler_state_remove_nonexistent() {
+        let mut state = SchedulerState::new();
+        state.remove_runner(RunnerId::new());
+        assert!(state.runners.is_empty());
+    }
+
+    #[test]
+    fn test_scheduler_state_get_nonexistent() {
+        let state = SchedulerState::new();
+        assert!(state.get_runner(RunnerId::new()).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_is_assigned_not_found() {
+        let scheduler = Scheduler::new();
+        let assigned = scheduler.is_assigned(JobId::new()).await;
+        assert!(assigned.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_enqueue_with_priority_high() {
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+
+        scheduler.enqueue_with_priority(JobId::new(), run_id, repo_id, Priority::High).await;
+        assert_eq!(scheduler.queue_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_with_policy() {
+        use crate::policy::PriorityPolicy;
+        let scheduler = Scheduler::new().with_policy(PriorityPolicy::new());
+        let runner = make_runner(RunnerId::new(), "runner1", "online", 4);
+        scheduler.register_runner(runner.clone()).await;
+
+        let job_id = JobId::new();
+        let run_id = PipelineRunId::new();
+        let repo_id = RepoId::new();
+        scheduler.enqueue(job_id, run_id, repo_id).await;
+
+        scheduler.process_queue().await;
+        assert!(scheduler.is_assigned(job_id).await.is_some());
+    }
 }
