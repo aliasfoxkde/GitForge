@@ -544,4 +544,93 @@ mod tests {
         assert_eq!(cloned.job_id, assignment.job_id);
         assert_eq!(cloned.commands, assignment.commands);
     }
+
+    #[test]
+    fn test_job_assignment_with_unicode_in_name() {
+        let assignment = JobAssignment {
+            job_id: "job-unicode".to_string(),
+            name: "测试任务".to_string(),
+            pipeline_run_id: "run-unicode".to_string(),
+            commands: vec!["echo 测试".to_string()],
+            working_dir: None,
+        };
+        assert_eq!(assignment.name, "测试任务");
+    }
+
+    #[test]
+    fn test_job_assignment_with_special_chars_in_commands() {
+        let assignment = JobAssignment {
+            job_id: "special-cmd".to_string(),
+            name: "special".to_string(),
+            pipeline_run_id: "run-special".to_string(),
+            commands: vec![
+                "echo $HOME".to_string(),
+                "echo \"quoted\"".to_string(),
+                "echo 'single'".to_string(),
+            ],
+            working_dir: None,
+        };
+        assert_eq!(assignment.commands.len(), 3);
+    }
+
+    #[test]
+    fn test_runner_config_with_special_url() {
+        let config = RunnerConfig {
+            scheduler_url: "http://user:pass@host:9090/path".to_string(),
+            name: "special-url-runner".to_string(),
+            runner_type: "docker".to_string(),
+            capacity: 4,
+            heartbeat_interval_secs: 45,
+            fetch_interval_secs: 10,
+        };
+        assert!(config.scheduler_url.contains("user:pass"));
+    }
+
+    #[test]
+    fn test_job_assignment_deserialize() {
+        let json = r#"{
+            "job_id": "deserialized-job",
+            "name": "deserialized",
+            "pipeline_run_id": "run-123",
+            "commands": ["cargo build", "cargo test"],
+            "working_dir": "/workspace"
+        }"#;
+        let assignment: JobAssignment = serde_json::from_str(json).unwrap();
+        assert_eq!(assignment.job_id, "deserialized-job");
+        assert_eq!(assignment.commands.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_runner_agent_with_custom_config() {
+        let config = RunnerConfig {
+            scheduler_url: "http://custom-scheduler:8081".to_string(),
+            name: "custom-runner".to_string(),
+            runner_type: "kubernetes".to_string(),
+            capacity: 10,
+            heartbeat_interval_secs: 60,
+            fetch_interval_secs: 15,
+        };
+        let agent = RunnerAgent::new(config).await.unwrap();
+        assert!(agent.runner.is_none());
+    }
+
+    #[test]
+    fn test_runner_config_clone_is_independent() {
+        let config1 = RunnerConfig::default();
+        let mut config2 = config1.clone();
+        config2.name = "modified".to_string();
+        assert_ne!(config1.name, config2.name);
+    }
+
+    #[test]
+    fn test_job_assignment_with_empty_working_dir() {
+        let assignment = JobAssignment {
+            job_id: "empty-wd".to_string(),
+            name: "test".to_string(),
+            pipeline_run_id: "run-1".to_string(),
+            commands: vec!["echo test".to_string()],
+            working_dir: Some("".to_string()),
+        };
+        assert!(assignment.working_dir.is_some());
+    }
 }
