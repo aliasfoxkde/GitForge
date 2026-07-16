@@ -292,4 +292,18 @@ mod tests {
             .with_priority(Priority::High);
         assert_eq!(job.priority, Priority::High);
     }
+
+    #[test]
+    fn test_priority_debug() {
+        let priority = Priority::High;
+        let debug_str = format!("{:?}", priority);
+        assert!(debug_str.contains("High"));
+    }
+
+    #[test]
+    fn test_priority_clone() {
+        let priority = Priority::Normal;
+        let cloned = priority;
+        assert_eq!(priority, cloned);
+    }
 }

@@ -422,4 +422,181 @@ mod tests {
         let round_trip: Uuid = id.into();
         assert_eq!(uuid, round_trip);
     }
+
+    #[test]
+    fn test_pipeline_id_from_uuid() {
+        let uuid = Uuid::new_v4();
+        let id: PipelineId = uuid.into();
+        assert_eq!(id.0, uuid);
+    }
+
+    #[test]
+    fn test_pipeline_id_into_uuid() {
+        let id = PipelineId::new();
+        let uuid: Uuid = id.into();
+        assert_eq!(uuid, id.0);
+    }
+
+    #[test]
+    fn test_pipeline_run_id_from_uuid() {
+        let uuid = Uuid::new_v4();
+        let id: PipelineRunId = uuid.into();
+        assert_eq!(id.0, uuid);
+    }
+
+    #[test]
+    fn test_pipeline_run_id_into_uuid() {
+        let id = PipelineRunId::new();
+        let uuid: Uuid = id.into();
+        assert_eq!(uuid, id.0);
+    }
+
+    #[test]
+    fn test_job_id_from_uuid() {
+        let uuid = Uuid::new_v4();
+        let id: JobId = uuid.into();
+        assert_eq!(id.0, uuid);
+    }
+
+    #[test]
+    fn test_job_id_into_uuid() {
+        let id = JobId::new();
+        let uuid: Uuid = id.into();
+        assert_eq!(uuid, id.0);
+    }
+
+    #[test]
+    fn test_runner_id_from_uuid() {
+        let uuid = Uuid::new_v4();
+        let id: RunnerId = uuid.into();
+        assert_eq!(id.0, uuid);
+    }
+
+    #[test]
+    fn test_runner_id_into_uuid() {
+        let id = RunnerId::new();
+        let uuid: Uuid = id.into();
+        assert_eq!(uuid, id.0);
+    }
+
+    #[test]
+    fn test_step_id_from_uuid() {
+        let uuid = Uuid::new_v4();
+        let id: StepId = uuid.into();
+        assert_eq!(id.0, uuid);
+    }
+
+    #[test]
+    fn test_step_id_into_uuid() {
+        let id = StepId::new();
+        let uuid: Uuid = id.into();
+        assert_eq!(uuid, id.0);
+    }
+
+    #[test]
+    fn test_user_id_from_uuid() {
+        let uuid = Uuid::new_v4();
+        let id: UserId = uuid.into();
+        assert_eq!(id.0, uuid);
+    }
+
+    #[test]
+    fn test_user_id_into_uuid() {
+        let id = UserId::new();
+        let uuid: Uuid = id.into();
+        assert_eq!(uuid, id.0);
+    }
+
+    #[test]
+    fn test_all_ids_default() {
+        assert!(RepoId::default() != RepoId::new()); // Default calls new()
+        assert!(PipelineId::default() != PipelineId::new());
+        assert!(PipelineRunId::default() != PipelineRunId::new());
+        assert!(JobId::default() != JobId::new());
+        assert!(RunnerId::default() != RunnerId::new());
+        assert!(StepId::default() != StepId::new());
+        assert!(UserId::default() != UserId::new());
+    }
+
+    #[test]
+    fn test_all_ids_display() {
+        assert!(!format!("{}", RepoId::new()).is_empty());
+        assert!(!format!("{}", PipelineId::new()).is_empty());
+        assert!(!format!("{}", PipelineRunId::new()).is_empty());
+        assert!(!format!("{}", JobId::new()).is_empty());
+        assert!(!format!("{}", RunnerId::new()).is_empty());
+        assert!(!format!("{}", StepId::new()).is_empty());
+        assert!(!format!("{}", UserId::new()).is_empty());
+    }
+
+    #[test]
+    fn test_all_ids_debug() {
+        let repo = RepoId::new();
+        let pipeline = PipelineId::new();
+        let run = PipelineRunId::new();
+        let job = JobId::new();
+        let runner = RunnerId::new();
+        let step = StepId::new();
+        let user = UserId::new();
+
+        assert!(format!("{:?}", repo).contains("RepoId"));
+        assert!(format!("{:?}", pipeline).contains("PipelineId"));
+        assert!(format!("{:?}", run).contains("PipelineRunId"));
+        assert!(format!("{:?}", job).contains("JobId"));
+        assert!(format!("{:?}", runner).contains("RunnerId"));
+        assert!(format!("{:?}", step).contains("StepId"));
+        assert!(format!("{:?}", user).contains("UserId"));
+    }
+
+    #[test]
+    fn test_all_ids_clone() {
+        let repo = RepoId::new();
+        let pipeline = PipelineId::new();
+        let run = PipelineRunId::new();
+        let job = JobId::new();
+        let runner = RunnerId::new();
+        let step = StepId::new();
+        let user = UserId::new();
+
+        assert_eq!(repo, repo.clone());
+        assert_eq!(pipeline, pipeline.clone());
+        assert_eq!(run, run.clone());
+        assert_eq!(job, job.clone());
+        assert_eq!(runner, runner.clone());
+        assert_eq!(step, step.clone());
+        assert_eq!(user, user.clone());
+    }
+
+    #[test]
+    fn test_id_hash_trait() {
+        use std::collections::HashSet;
+        let mut set: HashSet<RepoId> = HashSet::new();
+        set.insert(RepoId::new());
+        set.insert(RepoId::new());
+        assert!(set.len() >= 1);
+    }
+
+    #[test]
+    fn test_job_status_debug() {
+        assert!(format!("{:?}", JobStatus::Pending).contains("Pending"));
+        assert!(format!("{:?}", JobStatus::Succeeded).contains("Succeeded"));
+    }
+
+    #[test]
+    fn test_pipeline_status_debug() {
+        assert!(format!("{:?}", PipelineStatus::Pending).contains("Pending"));
+        assert!(format!("{:?}", PipelineStatus::Failed).contains("Failed"));
+    }
+
+    #[test]
+    fn test_job_status_partialeq() {
+        assert_eq!(JobStatus::Pending, JobStatus::Pending);
+        assert_ne!(JobStatus::Pending, JobStatus::Running);
+    }
+
+    #[test]
+    fn test_pipeline_status_partialeq() {
+        assert_eq!(PipelineStatus::Pending, PipelineStatus::Pending);
+        assert_ne!(PipelineStatus::Pending, PipelineStatus::Running);
+    }
 }

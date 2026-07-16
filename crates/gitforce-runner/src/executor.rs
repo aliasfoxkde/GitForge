@@ -651,4 +651,33 @@ mod tests {
         let executor = JobExecutor::new().await.unwrap();
         assert_eq!(executor.active_count().await, 0);
     }
+
+    #[test]
+    fn test_executable_job_clone_preserves_id() {
+        let job_id = JobId::new();
+        let job = ExecutableJob::new(job_id, "rust:latest".to_string());
+        let cloned = job.clone();
+        assert_eq!(cloned.job_id, job_id);
+    }
+
+    #[test]
+    fn test_executable_job_preserves_timeout() {
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_timeout(7200);
+        assert_eq!(job.timeout_secs, 7200);
+    }
+
+    #[test]
+    fn test_job_step_with_both_env_and_working_dir() {
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), "/root".to_string());
+        let step = JobStep {
+            name: "build".to_string(),
+            run: "cargo build".to_string(),
+            env: Some(env),
+            working_directory: Some("/project".to_string()),
+        };
+        assert!(step.env.is_some());
+        assert!(step.working_directory.is_some());
+    }
 }

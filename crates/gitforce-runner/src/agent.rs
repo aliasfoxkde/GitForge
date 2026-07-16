@@ -530,4 +530,18 @@ mod tests {
         };
         assert_eq!(assignment.commands.len(), 100);
     }
+
+    #[test]
+    fn test_job_assignment_clone() {
+        let assignment = JobAssignment {
+            job_id: "clone-test".to_string(),
+            name: "test".to_string(),
+            pipeline_run_id: "run-1".to_string(),
+            commands: vec!["echo clone".to_string()],
+            working_dir: None,
+        };
+        let cloned = assignment.clone();
+        assert_eq!(cloned.job_id, assignment.job_id);
+        assert_eq!(cloned.commands, assignment.commands);
+    }
 }

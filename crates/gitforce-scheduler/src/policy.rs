@@ -240,4 +240,16 @@ mod tests {
         let selected = policy.select_runner(job_id, &runners).await;
         assert!(selected.is_none());
     }
+
+    #[test]
+    fn test_priority_policy_default() {
+        let policy: PriorityPolicy = Default::default();
+        assert!(matches!(policy, PriorityPolicy));
+    }
+
+    #[test]
+    fn test_simple_policy_default() {
+        let policy: SimplePolicy = Default::default();
+        assert!(matches!(policy, SimplePolicy));
+    }
 }

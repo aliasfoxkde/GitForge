@@ -574,4 +574,151 @@ mod tests {
         set.insert(EventType::PushReceived);
         assert_eq!(set.len(), 2);
     }
+
+    #[test]
+    fn test_event_envelope_all_event_types() {
+        let test_cases = vec![
+            (EventType::RepoCreated, "repo.created"),
+            (EventType::RepoDeleted, "repo.deleted"),
+            (EventType::PushReceived, "push.received"),
+            (EventType::RefUpdated, "ref.updated"),
+            (EventType::PipelineTriggered, "pipeline.triggered"),
+            (EventType::PipelineStarted, "pipeline.started"),
+            (EventType::PipelineFinished, "pipeline.finished"),
+            (EventType::JobQueued, "job.queued"),
+            (EventType::JobStarted, "job.started"),
+            (EventType::JobFinished, "job.finished"),
+            (EventType::ArtifactCreated, "artifact.created"),
+            (EventType::RunnerRegistered, "runner.registered"),
+            (EventType::RunnerHeartbeat, "runner.heartbeat"),
+            (EventType::RunnerOffline, "runner.offline"),
+            (EventType::MirrorSyncRequested, "mirror.sync_requested"),
+            (EventType::MirrorSyncCompleted, "mirror.sync_completed"),
+        ];
+
+        for (event_type, expected_str) in test_cases {
+            assert_eq!(event_type.as_str(), expected_str);
+            assert_eq!(format!("{}", event_type), expected_str);
+        }
+    }
+
+    #[test]
+    fn test_event_envelope_debug() {
+        let payload = PushReceivedPayload {
+            repo_id: RepoId::new(),
+            ref_name: "refs/heads/main".to_string(),
+            old_hash: "abc123".to_string(),
+            new_hash: "def456".to_string(),
+            pusher_id: None,
+        };
+
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(payload),
+            None,
+            None,
+        );
+
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("PushReceived"));
+        assert!(debug_str.contains("event_id"));
+    }
+
+    #[test]
+    fn test_event_envelope_serde_roundtrip() {
+        let payload = PushReceivedPayload {
+            repo_id: RepoId::new(),
+            ref_name: "refs/heads/main".to_string(),
+            old_hash: "abc123".to_string(),
+            new_hash: "def456".to_string(),
+            pusher_id: None,
+        };
+
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(payload),
+            None,
+            None,
+        );
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("push_received"));
+
+        let deserialized: EventEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.event_type, EventType::PushReceived);
+    }
+
+    #[test]
+    fn test_event_payload_serde() {
+        let payloads = vec![
+            EventPayload::RepoCreated(RepoCreatedPayload {
+                repo_id: RepoId::new(),
+                name: "test-repo".to_string(),
+                owner_id: UserId::new(),
+                visibility: "public".to_string(),
+            }),
+            EventPayload::RepoDeleted(RepoDeletedPayload {
+                repo_id: RepoId::new(),
+                name: "test-repo".to_string(),
+            }),
+        ];
+
+        for payload in payloads {
+            let json = serde_json::to_string(&payload).unwrap();
+            assert!(!json.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_event_type_serde() {
+        let event_type = EventType::PushReceived;
+        let json = serde_json::to_string(&event_type).unwrap();
+        assert_eq!(json, "\"push_received\"");
+        let deserialized: EventType = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, EventType::PushReceived);
+    }
+
+    #[test]
+    fn test_event_envelope_with_both_ids() {
+        let payload = PushReceivedPayload {
+            repo_id: RepoId::new(),
+            ref_name: "refs/heads/main".to_string(),
+            old_hash: "abc123".to_string(),
+            new_hash: "def456".to_string(),
+            pusher_id: None,
+        };
+
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(payload),
+            Some(RepoId::new()),
+            Some(UserId::new()),
+        );
+
+        assert!(event.repo_id.is_some());
+        assert!(event.actor_id.is_some());
+    }
+
+    #[test]
+    fn test_event_envelope_timestamp_valid() {
+        let payload = PushReceivedPayload {
+            repo_id: RepoId::new(),
+            ref_name: "refs/heads/main".to_string(),
+            old_hash: "abc123".to_string(),
+            new_hash: "def456".to_string(),
+            pusher_id: None,
+        };
+
+        let before = chrono::Utc::now().timestamp_millis();
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(payload),
+            None,
+            None,
+        );
+        let after = chrono::Utc::now().timestamp_millis();
+
+        assert!(event.timestamp >= before);
+        assert!(event.timestamp <= after);
+    }
 }
