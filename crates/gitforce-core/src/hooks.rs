@@ -308,4 +308,56 @@ mod tests {
         let manager = HookManager::new();
         assert!(matches!(manager, HookManager { .. }));
     }
+
+    #[test]
+    fn test_hook_payload_branch_name_none_for_non_branch() {
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/tags/v1.0".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            None,
+        );
+        assert_eq!(payload.branch_name(), None);
+    }
+
+    #[test]
+    fn test_hook_payload_tag_name_none_for_non_tag() {
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/heads/main".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            None,
+        );
+        assert_eq!(payload.tag_name(), None);
+    }
+
+    #[test]
+    fn test_hook_payload_debug() {
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/heads/main".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            None,
+        );
+        let debug_str = format!("{:?}", payload);
+        assert!(debug_str.contains("HookPayload"));
+    }
+
+    #[tokio::test]
+    async fn test_hook_manager_empty_executors() {
+        let manager = HookManager::new();
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/heads/main".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            None,
+        );
+        // Empty manager should still work
+        let result = manager.pre_receive(payload).await;
+        assert!(result.is_ok());
+    }
 }
