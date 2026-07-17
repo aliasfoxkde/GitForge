@@ -362,4 +362,122 @@ mod tests {
         assert!(git_ref.is_tag);
         assert_eq!(git_ref.name, "refs/tags/v1.0");
     }
+
+    #[tokio::test]
+    async fn test_repo_create_invalid_name_too_long() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let service = RepoService::new(storage);
+
+        let owner_id = UserId::new();
+        let long_name = "a".repeat(256);
+
+        let result = service.create(long_name, owner_id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_repo_create_invalid_chars() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let service = RepoService::new(storage);
+
+        let owner_id = UserId::new();
+
+        // Test various invalid characters
+        for name in ["has!space", "has@at", "has#hash", "has$dollar", "has%percent"] {
+            let result = service.create(name.to_string(), owner_id).await;
+            assert!(result.is_err(), "Expected '{}' to be invalid", name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_repo_create_valid_special_chars() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let service = RepoService::new(storage);
+
+        let owner_id = UserId::new();
+
+        // Valid names with dashes, underscores, dots
+        for name in ["my-repo", "my_repo", "my.repo", "repo.1", "repo-2_name"] {
+            let result = service.create(name.to_string(), owner_id).await;
+            assert!(result.is_ok(), "Expected '{}' to be valid", name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_repo_delete_nonexistent() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let service = RepoService::new(storage);
+
+        // Deleting non-existent repo should not panic
+        let result = service.delete(RepoId::new()).await;
+        assert!(result.is_ok()); // delete is idempotent
+    }
+
+    #[tokio::test]
+    async fn test_repo_list_by_owner_empty() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let service = RepoService::new(storage);
+
+        let repos = service.list_by_owner(UserId::new()).await;
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn test_git_ref_debug() {
+        let git_ref = GitRef {
+            name: "refs/heads/main".to_string(),
+            hash: "abc123def456".to_string(),
+            is_branch: true,
+            is_tag: false,
+        };
+        let debug_str = format!("{:?}", git_ref);
+        assert!(debug_str.contains("main"));
+        assert!(debug_str.contains("abc123"));
+    }
+
+    #[test]
+    fn test_repo_metadata_debug() {
+        let meta = RepoMetadata {
+            id: RepoId::new(),
+            name: "debug-test".to_string(),
+            owner_id: UserId::new(),
+            git_path: "/tmp/git".to_string(),
+        };
+        let debug_str = format!("{:?}", meta);
+        assert!(debug_str.contains("debug-test"));
+    }
+
+    #[test]
+    fn test_repo_error_not_found_display() {
+        let repo_id = RepoId::new();
+        let err = RepoError::NotFound(repo_id);
+        let display = format!("{}", err);
+        assert!(display.contains("Repository not found"));
+    }
+
+    #[test]
+    fn test_repo_error_already_exists_display() {
+        let err = RepoError::AlreadyExists("my-repo".to_string());
+        let display = format!("{}", err);
+        assert!(display.contains("already exists"));
+    }
+
+    #[test]
+    fn test_repo_error_invalid_name_display() {
+        let err = RepoError::InvalidName("bad!name".to_string());
+        let display = format!("{}", err);
+        assert!(display.contains("Invalid repository name"));
+    }
+
+    #[test]
+    fn test_repo_error_storage_display() {
+        let err = RepoError::Storage("disk full".to_string());
+        let display = format!("{}", err);
+        assert!(display.contains("Storage error"));
+    }
 }

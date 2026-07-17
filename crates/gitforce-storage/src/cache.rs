@@ -2,13 +2,14 @@
 
 use async_trait::async_trait;
 use gitforce_common::Result;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Cache key
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CacheKey {
     pub repo_id: gitforce_common::RepoId,
     pub key: String,
@@ -35,7 +36,7 @@ impl CacheKey {
 }
 
 /// Cache entry metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
     pub key: CacheKey,
     pub size_bytes: u64,

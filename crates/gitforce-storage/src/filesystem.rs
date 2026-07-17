@@ -53,6 +53,11 @@ impl FileStorage {
     fn cache_path(&self, key: &CacheKey) -> PathBuf {
         self.cache_dir.join(format!("{}.data", key.hash()))
     }
+
+    /// Get cache metadata path
+    fn cache_meta_path(&self, key: &CacheKey) -> PathBuf {
+        self.cache_dir.join(format!("{}.meta.json", key.hash()))
+    }
 }
 
 #[async_trait]
@@ -184,6 +189,7 @@ impl ArtifactStore for FileStorage {
 impl CacheStore for FileStorage {
     async fn put(&self, key: CacheKey, data: Vec<u8>) -> Result<()> {
         let path = self.cache_path(&key);
+        let meta_path = self.cache_meta_path(&key);
 
         let mut file = fs::File::create(&path).await.map_err(|e| {
             Error::storage(format!("failed to create cache file: {}", e))
@@ -191,6 +197,27 @@ impl CacheStore for FileStorage {
 
         file.write_all(&data).await.map_err(|e| {
             Error::storage(format!("failed to write cache data: {}", e))
+        })?;
+
+        // Write metadata
+        let now = chrono::Utc::now();
+        let entry = crate::cache::CacheEntry {
+            key: key.clone(),
+            size_bytes: data.len() as u64,
+            created_at: now,
+            accessed_at: now,
+        };
+
+        let meta_json = serde_json::to_string(&entry).map_err(|e| {
+            Error::storage(format!("failed to serialize cache metadata: {}", e))
+        })?;
+
+        let mut meta_file = fs::File::create(&meta_path).await.map_err(|e| {
+            Error::storage(format!("failed to create cache metadata file: {}", e))
+        })?;
+
+        meta_file.write_all(meta_json.as_bytes()).await.map_err(|e| {
+            Error::storage(format!("failed to write cache metadata: {}", e))
         })?;
 
         tracing::debug!("cached {} bytes at {:?}", data.len(), path);
@@ -218,6 +245,7 @@ impl CacheStore for FileStorage {
 
     async fn delete(&self, key: &CacheKey) -> Result<()> {
         let path = self.cache_path(key);
+        let meta_path = self.cache_meta_path(key);
 
         if path.exists() {
             fs::remove_file(&path).await.map_err(|e| {
@@ -225,13 +253,41 @@ impl CacheStore for FileStorage {
             })?;
         }
 
+        if meta_path.exists() {
+            fs::remove_file(&meta_path).await.map_err(|e| {
+                Error::storage(format!("failed to delete cache metadata file: {}", e))
+            })?;
+        }
+
         Ok(())
     }
 
     async fn list(&self) -> Result<Vec<CacheEntry>> {
-        // For filesystem, we'd need to scan the cache directory
-        // This is a simplified implementation
-        Ok(Vec::new())
+        let mut entries = Vec::new();
+
+        let mut dir_entries = fs::read_dir(&self.cache_dir).await.map_err(|e| {
+            Error::storage(format!("failed to read cache directory: {}", e))
+        })?;
+
+        while let Some(entry) = dir_entries.next_entry().await.map_err(|e| {
+            Error::storage(format!("failed to read cache entry: {}", e))
+        })? {
+            let path = entry.path();
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                if filename.ends_with(".meta.json") {
+                    let mut contents = Vec::new();
+                    if let Ok(mut file) = fs::File::open(&path).await {
+                        if file.read_to_end(&mut contents).await.is_ok() {
+                            if let Ok(cache_entry) = serde_json::from_slice::<CacheEntry>(&contents) {
+                                entries.push(cache_entry);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(entries)
     }
 }
 
@@ -309,10 +365,19 @@ mod tests {
         let key = CacheKey::new(repo_id, "delete-me", "main");
         CacheStore::put(&storage, key.clone(), b"data".to_vec()).await.unwrap();
 
+        // Verify it exists
+        let result = CacheStore::get(&storage, &key).await.unwrap();
+        assert!(result.is_some());
+
+        // Delete and verify gone
         CacheStore::delete(&storage, &key).await.unwrap();
 
         let result = CacheStore::get(&storage, &key).await.unwrap();
         assert!(result.is_none());
+
+        // List should also not include deleted entry
+        let entries = CacheStore::list(&storage).await.unwrap();
+        assert!(entries.is_empty());
     }
 
     #[tokio::test]
@@ -320,9 +385,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = FileStorage::new(dir.path()).await.unwrap();
 
+        let repo_id = gitforce_common::RepoId::new();
+        let key1 = CacheKey::new(repo_id, "key1", "main");
+        let key2 = CacheKey::new(repo_id, "key2", "main");
+
+        // Initially empty
         let entries = CacheStore::list(&storage).await.unwrap();
-        // Currently returns empty list
         assert!(entries.is_empty());
+
+        // Add entries
+        CacheStore::put(&storage, key1.clone(), b"data1".to_vec()).await.unwrap();
+        CacheStore::put(&storage, key2.clone(), b"data2".to_vec()).await.unwrap();
+
+        // Now list should return entries
+        let entries = CacheStore::list(&storage).await.unwrap();
+        assert_eq!(entries.len(), 2);
     }
 
     #[tokio::test]
@@ -591,5 +668,87 @@ mod tests {
 
         let artifacts = ArtifactStore::list_by_job(&storage, job_id).await.unwrap();
         assert_eq!(artifacts.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_artifact_list_all_jobs() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let job1 = gitforce_common::JobId::new();
+        let job2 = gitforce_common::JobId::new();
+
+        // Add artifacts for different jobs
+        for (i, job_id) in [job1, job1, job2].iter().enumerate() {
+            let artifact = Artifact {
+                id: ArtifactId::new(),
+                job_id: *job_id,
+                name: format!("artifact-{}", i),
+                path: format!("/fake/path{}", i),
+                checksum: format!("checksum{}", i),
+                size_bytes: 100,
+                content_type: None,
+                created_at: chrono::Utc::now(),
+            };
+            ArtifactStore::put(&storage, &artifact, format!("data{}", i).as_bytes()).await.unwrap();
+        }
+
+        // list() should return all artifacts
+        let all = ArtifactStore::list(&storage).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // list_by_job should filter correctly
+        let job1_artifacts = ArtifactStore::list_by_job(&storage, job1).await.unwrap();
+        assert_eq!(job1_artifacts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_artifact_list_empty_directory() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        // Empty artifacts directory
+        let artifacts = ArtifactStore::list(&storage).await.unwrap();
+        assert!(artifacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_artifact_overwrite() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let artifact_id = ArtifactId::new();
+        let job_id = gitforce_common::JobId::new();
+
+        let artifact = Artifact {
+            id: artifact_id,
+            job_id,
+            name: "overwrite-test".to_string(),
+            path: "/fake/path".to_string(),
+            checksum: "original".to_string(),
+            size_bytes: 100,
+            content_type: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        // First write
+        ArtifactStore::put(&storage, &artifact, b"original data").await.unwrap();
+        let data1 = ArtifactStore::get(&storage, artifact_id).await.unwrap();
+        assert_eq!(data1, b"original data");
+
+        // Overwrite with same ID
+        let artifact2 = Artifact {
+            id: artifact_id,
+            job_id,
+            name: "overwrite-test".to_string(),
+            path: "/fake/path".to_string(),
+            checksum: "updated".to_string(),
+            size_bytes: 200,
+            content_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        ArtifactStore::put(&storage, &artifact2, b"updated data").await.unwrap();
+        let data2 = ArtifactStore::get(&storage, artifact_id).await.unwrap();
+        assert_eq!(data2, b"updated data");
     }
 }

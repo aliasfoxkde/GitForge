@@ -89,8 +89,8 @@ impl InMemoryEventBus {
     }
 
     /// Get the number of active subscribers
-    pub async fn subscriber_count(&self) -> usize {
-        0
+    pub fn subscriber_count(&self) -> usize {
+        self.sender.receiver_count()
     }
 }
 
@@ -302,8 +302,23 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_event_bus_new() {
         let bus = InMemoryEventBus::new();
-        // subscriber_count is async but always returns 0 currently
-        assert_eq!(bus.subscriber_count().await, 0);
+        // Initially no subscribers
+        assert_eq!(bus.subscriber_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_event_bus_subscriber_count() {
+        let bus = InMemoryEventBus::new();
+        // Initially no subscribers
+        assert_eq!(bus.subscriber_count(), 0);
+
+        // Subscribe and verify count increases
+        let _stream = bus.subscribe(EventFilter::all()).await.unwrap();
+        assert_eq!(bus.subscriber_count(), 1);
+
+        // Subscribe another and verify count increases
+        let _stream2 = bus.subscribe(EventFilter::all()).await.unwrap();
+        assert_eq!(bus.subscriber_count(), 2);
     }
 
     #[tokio::test]

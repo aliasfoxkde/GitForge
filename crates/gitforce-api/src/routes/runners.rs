@@ -257,4 +257,63 @@ mod tests {
             assert!(json.contains(rt));
         }
     }
+
+    #[test]
+    fn test_runner_response_debug() {
+        let response = RunnerResponse {
+            id: "runner-debug".to_string(),
+            name: "debug-runner".to_string(),
+            runner_type: "docker".to_string(),
+            status: "online".to_string(),
+            capacity: 4,
+            last_heartbeat: Some("2024-01-01T00:00:00Z".to_string()),
+        };
+        let debug_str = format!("{:?}", response);
+        assert!(debug_str.contains("runner-debug"));
+    }
+
+    #[test]
+    fn test_runner_response_all_capacities() {
+        for capacity in &[1, 2, 4, 8, 16, 32] {
+            let response = RunnerResponse {
+                id: "runner-cap".to_string(),
+                name: "capacity-test".to_string(),
+                runner_type: "docker".to_string(),
+                status: "online".to_string(),
+                capacity: *capacity,
+                last_heartbeat: None,
+            };
+            assert_eq!(response.capacity, *capacity);
+        }
+    }
+
+    #[test]
+    fn test_runner_response_with_special_heartbeat() {
+        let response = RunnerResponse {
+            id: "runner-hb".to_string(),
+            name: "heartbeat-test".to_string(),
+            runner_type: "firecracker".to_string(),
+            status: "busy".to_string(),
+            capacity: 4,
+            last_heartbeat: Some("2026-07-16T22:00:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("2026-07-16T22:00:00Z"));
+    }
+
+    #[test]
+    fn test_runner_response_all_runner_types() {
+        for rt in &["docker", "firecracker", "bare_metal", "kubernetes"] {
+            let response = RunnerResponse {
+                id: "runner-rt".to_string(),
+                name: "type-test".to_string(),
+                runner_type: rt.to_string(),
+                status: "online".to_string(),
+                capacity: 2,
+                last_heartbeat: None,
+            };
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains(rt));
+        }
+    }
 }

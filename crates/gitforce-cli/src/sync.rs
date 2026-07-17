@@ -6,10 +6,165 @@
 //! - Conflict resolution: Last-write-wins with local priority
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+
+/// HTTP client trait for sync operations (allows mocking in tests)
+#[async_trait]
+pub trait HttpClient: Send + Sync {
+    async fn post_json<T: Serialize + Send + Sync, R: for<'de> Deserialize<'de> + Send>(
+        &self,
+        url: &str,
+        token: &str,
+        payload: &T,
+    ) -> Result<R>;
+    async fn get_json<T: for<'de> Deserialize<'de> + Send>(
+        &self,
+        url: &str,
+        token: &str,
+    ) -> Result<T>;
+}
+
+/// Real HTTP client using reqwest
+pub struct RealHttpClient {
+    client: reqwest::Client,
+}
+
+impl RealHttpClient {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl Default for RealHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl HttpClient for RealHttpClient {
+    async fn post_json<T: Serialize + Send + Sync, R: for<'de> Deserialize<'de> + Send>(
+        &self,
+        url: &str,
+        token: &str,
+        payload: &T,
+    ) -> Result<R> {
+        let response = self
+            .client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .json(payload)
+            .send()
+            .await
+            .context("failed to push to cloud")?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Push failed: {}", response.status());
+        }
+
+        let result = response.json().await?;
+        Ok(result)
+    }
+
+    async fn get_json<T: for<'de> Deserialize<'de> + Send>(
+        &self,
+        url: &str,
+        token: &str,
+    ) -> Result<T> {
+        let response = self
+            .client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .context("failed to pull from cloud")?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Pull failed: {}", response.status());
+        }
+
+        let result = response.json().await?;
+        Ok(result)
+    }
+}
+
+/// Mock HTTP client for testing
+#[allow(dead_code)]
+pub struct MockHttpClient {
+    pub push_response: Option<Result<PushResponse>>,
+    pub pull_response: Option<Result<PullResponse>>,
+}
+
+#[allow(dead_code)]
+impl MockHttpClient {
+    pub fn new() -> Self {
+        Self {
+            push_response: None,
+            pull_response: None,
+        }
+    }
+
+    pub fn with_push_response(mut self, response: PushResponse) -> Self {
+        self.push_response = Some(Ok(response));
+        self
+    }
+
+    pub fn with_pull_response(mut self, response: PullResponse) -> Self {
+        self.pull_response = Some(Ok(response));
+        self
+    }
+
+    pub fn with_push_error(mut self, err: anyhow::Error) -> Self {
+        self.push_response = Some(Err(err));
+        self
+    }
+}
+
+impl Default for MockHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl HttpClient for MockHttpClient {
+    async fn post_json<T: Serialize + Send + Sync, R: for<'de> Deserialize<'de> + Send>(
+        &self,
+        _url: &str,
+        _token: &str,
+        _payload: &T,
+    ) -> Result<R> {
+        match &self.push_response {
+            Some(Ok(resp)) => {
+                let json = serde_json::to_string(resp).unwrap();
+                Ok(serde_json::from_str(&json).unwrap())
+            }
+            Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+            None => anyhow::bail!("mock push not configured"),
+        }
+    }
+
+    async fn get_json<T: for<'de> Deserialize<'de> + Send>(
+        &self,
+        _url: &str,
+        _token: &str,
+    ) -> Result<T> {
+        match &self.pull_response {
+            Some(Ok(resp)) => {
+                let json = serde_json::to_string(resp).unwrap();
+                Ok(serde_json::from_str(&json).unwrap())
+            }
+            Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+            None => anyhow::bail!("mock pull not configured"),
+        }
+    }
+}
 
 /// Sync metadata for tracking state
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -69,22 +224,39 @@ pub struct PipelineState {
 }
 
 /// Cloud sync protocol client
-pub struct SyncClient {
+pub struct SyncClient<C: HttpClient = RealHttpClient> {
     local_dir: PathBuf,
     metadata: tokio::sync::RwLock<SyncMetadata>,
     state: tokio::sync::RwLock<LocalState>,
+    http_client: C,
 }
 
-impl SyncClient {
-    /// Create a new sync client
-    pub fn new(local_dir: PathBuf) -> Self {
+impl<C: HttpClient> SyncClient<C> {
+    /// Create a new sync client with the given HTTP client
+    #[allow(dead_code)]
+    pub fn new(local_dir: PathBuf, http_client: C) -> Self {
+        Self {
+            local_dir,
+            metadata: tokio::sync::RwLock::new(SyncMetadata::default()),
+            state: tokio::sync::RwLock::new(LocalState::default()),
+            http_client,
+        }
+    }
+}
+
+impl SyncClient<RealHttpClient> {
+    /// Create a new sync client with a real HTTP client
+    pub fn with_real_client(local_dir: PathBuf) -> Self {
         Self {
             local_dir: local_dir.clone(),
             metadata: tokio::sync::RwLock::new(SyncMetadata::default()),
             state: tokio::sync::RwLock::new(LocalState::default()),
+            http_client: RealHttpClient::new(),
         }
     }
+}
 
+impl<C: HttpClient> SyncClient<C> {
     /// Initialize sync directory
     pub async fn init(&self) -> Result<()> {
         let sync_dir = self.local_dir.join(".gitforge");
@@ -169,20 +341,11 @@ impl SyncClient {
         };
 
         // POST to cloud sync endpoint
-        let client = reqwest::Client::new();
-        let response = client
-            .post(format!("{}/sync/push", api_url))
-            .header("Authorization", format!("Bearer {}", token))
-            .json(&payload)
-            .send()
+        let url = format!("{}/sync/push", api_url);
+        let push_response: PushResponse = self.http_client
+            .post_json(&url, token, &payload)
             .await
             .context("failed to push to cloud")?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("Push failed: {}", response.status());
-        }
-
-        let push_response: PushResponse = response.json().await?;
 
         // Update metadata
         let mut metadata = self.metadata.write().await;
@@ -197,29 +360,12 @@ impl SyncClient {
 
     /// Pull cloud state to local
     pub async fn pull(&self, api_url: &str, token: &str) -> Result<PullResponse> {
-        let metadata = self.metadata.read().await.clone();
-
-        // Prepare pull request
-        let request = PullRequest {
-            local_rev: metadata.local_rev,
-            last_sync: metadata.last_pull.clone(),
-        };
-
         // GET from cloud sync endpoint
-        let client = reqwest::Client::new();
-        let response = client
-            .get(format!("{}/sync/pull", api_url))
-            .header("Authorization", format!("Bearer {}", token))
-            .json(&request)
-            .send()
+        let url = format!("{}/sync/pull", api_url);
+        let pull_response: PullResponse = self.http_client
+            .get_json(&url, token)
             .await
             .context("failed to pull from cloud")?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("Pull failed: {}", response.status());
-        }
-
-        let pull_response: PullResponse = response.json().await?;
 
         // Update local state
         {
@@ -297,7 +443,7 @@ pub struct PushPayload {
     pub timestamp: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PushResponse {
     #[allow(dead_code)]
     pub success: bool,
@@ -307,12 +453,13 @@ pub struct PushResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct PullRequest {
     pub local_rev: u64,
     pub last_sync: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PullResponse {
     pub repos: HashMap<String, RepoState>,
     pub pipelines: HashMap<String, PipelineState>,
@@ -328,7 +475,7 @@ mod tests {
     #[tokio::test]
     async fn test_sync_client_init() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         client.init().await.unwrap();
         assert!(client.sync_dir().exists());
     }
@@ -336,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn test_sync_status_default() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         client.init().await.unwrap();
         assert_eq!(client.status().await, SyncStatus::InSync);
     }
@@ -344,7 +491,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_repo() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         client.init().await.unwrap();
         client.add_repo("test-repo".to_string(), "repo-123".to_string()).await.unwrap();
         let state = client.state.read().await;
@@ -448,14 +595,14 @@ mod tests {
     #[tokio::test]
     async fn test_sync_client_new() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         assert_eq!(client.sync_dir(), temp_dir.path().join(".gitforge"));
     }
 
     #[tokio::test]
     async fn test_mark_pending_push() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         client.init().await.unwrap();
         client.mark_pending_push().await.unwrap();
         assert_eq!(client.status().await, SyncStatus::PendingPush);
@@ -535,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_pipeline() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         client.init().await.unwrap();
         client.add_pipeline(
             "pipe-1".to_string(),
@@ -550,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn test_sync_client_sync_dir() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         let sync_dir = client.sync_dir();
         assert_eq!(sync_dir, temp_dir.path().join(".gitforge"));
     }
@@ -558,7 +705,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_repo_updates_timestamp() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         client.init().await.unwrap();
         let before = client.state.read().await.updated_at.clone();
         client.add_repo("test-repo".to_string(), "repo-123".to_string()).await.unwrap();
@@ -569,7 +716,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_pipeline_updates_timestamp() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let client = SyncClient::new(temp_dir.path().to_path_buf());
+        let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         client.init().await.unwrap();
         client.add_pipeline(
             "pipe-1".to_string(),
@@ -631,5 +778,93 @@ mod tests {
         });
         assert_eq!(state.repos.len(), 1);
         assert_eq!(state.updated_at, "2024-06-15T12:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn test_sync_client_push_with_mock() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mock_client = MockHttpClient::new()
+            .with_push_response(PushResponse {
+                success: true,
+                remote_rev: 42,
+                conflicts: vec![],
+            });
+        let client = SyncClient::new(temp_dir.path().to_path_buf(), mock_client);
+        client.init().await.unwrap();
+
+        let result = client.push("http://localhost:8080", "test-token").await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.remote_rev, 42);
+        assert!(response.conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sync_client_push_with_mock_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mock_client = MockHttpClient::new()
+            .with_push_error(anyhow::anyhow!("server error"));
+        let client = SyncClient::new(temp_dir.path().to_path_buf(), mock_client);
+        client.init().await.unwrap();
+
+        let result = client.push("http://localhost:8080", "test-token").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sync_client_pull_with_mock() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mock_client = MockHttpClient::new()
+            .with_pull_response(PullResponse {
+                repos: HashMap::new(),
+                pipelines: HashMap::new(),
+                remote_rev: 100,
+                has_more: false,
+            });
+        let client = SyncClient::new(temp_dir.path().to_path_buf(), mock_client);
+        client.init().await.unwrap();
+
+        let result = client.pull("http://localhost:8080", "test-token").await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.remote_rev, 100);
+        assert!(!response.has_more);
+    }
+
+    #[tokio::test]
+    async fn test_sync_client_pull_with_mock_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mock_client = MockHttpClient::new()
+            .with_push_error(anyhow::anyhow!("server error"));
+        let client = SyncClient::new(temp_dir.path().to_path_buf(), mock_client);
+        client.init().await.unwrap();
+
+        let result = client.pull("http://localhost:8080", "test-token").await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mock_http_client_push_response() {
+        let mock = MockHttpClient::new()
+            .with_push_response(PushResponse {
+                success: true,
+                remote_rev: 5,
+                conflicts: vec!["a".to_string()],
+            });
+        assert!(mock.push_response.is_some());
+        assert!(mock.pull_response.is_none());
+    }
+
+    #[test]
+    fn test_mock_http_client_pull_response() {
+        let mock = MockHttpClient::new()
+            .with_pull_response(PullResponse {
+                repos: HashMap::new(),
+                pipelines: HashMap::new(),
+                remote_rev: 10,
+                has_more: true,
+            });
+        assert!(mock.pull_response.is_some());
+        assert!(mock.push_response.is_none());
     }
 }

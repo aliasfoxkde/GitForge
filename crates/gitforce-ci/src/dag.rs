@@ -307,4 +307,197 @@ mod tests {
         assert!(build_idx < test_idx);
         assert!(test_idx < deploy_idx);
     }
+
+    #[test]
+    fn test_max_depth_single_job() {
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![make_job("build", vec![])],
+        };
+
+        let run_id = gitforce_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&pipeline, run_id).unwrap();
+        assert_eq!(DagBuilder::max_depth(&graph), 0);
+    }
+
+    #[test]
+    fn test_max_depth_nested() {
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![
+                make_job("a", vec![]),
+                make_job("b", vec!["a"]),
+                make_job("c", vec!["b"]),
+                make_job("d", vec!["c"]),
+            ],
+        };
+
+        let run_id = gitforce_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&pipeline, run_id).unwrap();
+        // Depth: a=0, b=1, c=2, d=3
+        assert_eq!(DagBuilder::max_depth(&graph), 3);
+    }
+
+    #[test]
+    fn test_get_by_name_found() {
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![make_job("build", vec![])],
+        };
+
+        let run_id = gitforce_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&pipeline, run_id).unwrap();
+        assert!(graph.get_by_name("build").is_some());
+    }
+
+    #[test]
+    fn test_get_by_name_not_found() {
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![make_job("build", vec![])],
+        };
+
+        let run_id = gitforce_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&pipeline, run_id).unwrap();
+        assert!(graph.get_by_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_dependents() {
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![
+                make_job("build", vec![]),
+                make_job("test", vec!["build"]),
+                make_job("deploy", vec!["test"]),
+            ],
+        };
+
+        let run_id = gitforce_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&pipeline, run_id).unwrap();
+
+        // Find the build node
+        let build_id = graph.get_by_name("build").unwrap().id;
+        let deps = graph.dependents(build_id);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "test");
+    }
+
+    #[test]
+    fn test_dependents_none() {
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![
+                make_job("build", vec![]),
+                make_job("test", vec!["build"]),
+            ],
+        };
+
+        let run_id = gitforce_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&pipeline, run_id).unwrap();
+
+        // Find the deploy node (which doesn't exist as a dependency)
+        let test_id = graph.get_by_name("test").unwrap().id;
+        let deps = graph.dependents(test_id);
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_entry_points() {
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![
+                make_job("build", vec![]),
+                make_job("test", vec!["build"]),
+            ],
+        };
+
+        let run_id = gitforce_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&pipeline, run_id).unwrap();
+
+        let entry = graph.entry_points();
+        assert_eq!(entry.len(), 1);
+        assert_eq!(entry[0].name, "build");
+    }
+
+    #[test]
+    fn test_multiple_entry_points() {
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![
+                make_job("setup", vec![]),
+                make_job("teardown", vec![]),
+                make_job("test", vec!["setup", "teardown"]),
+            ],
+        };
+
+        let run_id = gitforce_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&pipeline, run_id).unwrap();
+
+        let entries = graph.entry_points();
+        assert_eq!(entries.len(), 2);
+        let names: Vec<_> = entries.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"setup"));
+        assert!(names.contains(&"teardown"));
+    }
+
+    #[test]
+    fn test_get_node_by_id() {
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![make_job("build", vec![])],
+        };
+
+        let run_id = gitforce_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&pipeline, run_id).unwrap();
+
+        let node = graph.get_by_name("build").unwrap();
+        let found = graph.get(node.id);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "build");
+    }
+
+    #[test]
+    fn test_get_node_by_id_not_found() {
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![make_job("build", vec![])],
+        };
+
+        let run_id = gitforce_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&pipeline, run_id).unwrap();
+
+        let fake_id = gitforce_common::JobId::new();
+        assert!(graph.get(fake_id).is_none());
+    }
 }

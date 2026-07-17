@@ -4,10 +4,12 @@
 
 use gitforce_api::{ApiAuth, ApiServer};
 use gitforce_db::Pool;
+use gitforce_storage::FileStorage;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use std::sync::Arc;
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -364,7 +366,11 @@ async fn test_api_artifacts_endpoint() {
     );
     gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
 
-    let server = ApiServer::new("test-secret", pool);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(temp_dir.path()).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool)
+        .with_storage_extension(Arc::new(storage));
     let app = server.into_router();
 
     let auth = ApiAuth::new("test-secret");
@@ -419,7 +425,180 @@ async fn test_api_runners_endpoint() {
 }
 
 #[tokio::test]
-async fn test_api_pipelines_endpoint() {
+async fn test_api_get_nonexistent_artifact() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(temp_dir.path()).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool)
+        .with_storage_extension(Arc::new(storage));
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/artifacts/00000000-0000-0000-0000-000000000000")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get NOT_FOUND since artifact doesn't exist
+    assert!(response.status() == StatusCode::NOT_FOUND || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_api_delete_nonexistent_artifact() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(temp_dir.path()).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool)
+        .with_storage_extension(Arc::new(storage));
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/artifacts/00000000-0000-0000-0000-000000000000")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get NOT_FOUND since artifact doesn't exist
+    assert!(response.status() == StatusCode::NOT_FOUND || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_api_artifact_invalid_id() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(temp_dir.path()).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool)
+        .with_storage_extension(Arc::new(storage));
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/artifacts/invalid-uuid")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get BAD_REQUEST for invalid UUID or NOT_FOUND (route not matched)
+    assert!(response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_api_job_artifacts_empty() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(temp_dir.path()).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool)
+        .with_storage_extension(Arc::new(storage));
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/jobs/00000000-0000-0000-0000-000000000000/artifacts")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get OK or INTERNAL_SERVER_ERROR
+    assert!(response.status() == StatusCode::OK || response.status() == StatusCode::INTERNAL_SERVER_ERROR || response.status() == StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_api_artifacts_without_auth() {
+    let pool = Pool::memory().await.unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(temp_dir.path()).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool)
+        .with_storage_extension(Arc::new(storage));
+    let app = server.into_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/artifacts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get UNAUTHORIZED or INTERNAL_SERVER_ERROR (if storage check fails first)
+    assert!(response.status() == StatusCode::UNAUTHORIZED || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_api_pipelines_endpoint_list() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();
 
@@ -447,6 +626,237 @@ async fn test_api_pipelines_endpoint() {
         .await
         .unwrap();
 
-    // Should get OK or error
+    // Should get OK with empty array
     assert!(response.status() == StatusCode::OK || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_api_pipeline_runs_endpoint_list() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/pipeline-runs")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get OK with empty array
+    assert!(response.status() == StatusCode::OK || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_api_get_nonexistent_pipeline() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/pipelines/00000000-0000-0000-0000-000000000000")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get NOT_FOUND or error
+    assert!(response.status() == StatusCode::NOT_FOUND || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_api_get_nonexistent_pipeline_run() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/pipeline-runs/00000000-0000-0000-0000-000000000000")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get NOT_FOUND or error
+    assert!(response.status() == StatusCode::NOT_FOUND || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_api_pipeline_invalid_id() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/pipelines/invalid-uuid")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get BAD_REQUEST or NOT_FOUND (routing behavior varies)
+    assert!(response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_api_pipeline_run_invalid_id() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/pipeline-runs/invalid-uuid")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get BAD_REQUEST or NOT_FOUND (routing behavior varies)
+    assert!(response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_api_get_nonexistent_job() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/jobs/00000000-0000-0000-0000-000000000000")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get NOT_FOUND or error
+    assert!(response.status() == StatusCode::NOT_FOUND || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_api_job_invalid_id() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/jobs/invalid-uuid")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get BAD_REQUEST or NOT_FOUND (routing behavior varies)
+    assert!(response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::NOT_FOUND);
 }

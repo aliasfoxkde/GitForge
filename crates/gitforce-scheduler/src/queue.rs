@@ -324,4 +324,42 @@ mod tests {
         assert!(Priority::Normal > Priority::Low);
         assert!(Priority::Low >= Priority::Low);
     }
+
+    #[test]
+    fn test_queue_remove_after_dequeue() {
+        let mut queue = JobQueue::new();
+        let repo_id = RepoId::new();
+
+        let job_id = JobId::new();
+        let job = QueuedJob::new(job_id, PipelineRunId::new(), repo_id);
+        queue.enqueue(job);
+
+        // Dequeue first
+        queue.dequeue();
+
+        // Now try to remove - should return None since already dequeued
+        let removed = queue.remove(job_id);
+        assert!(removed.is_none());
+    }
+
+    #[test]
+    fn test_queued_job_all_fields() {
+        let repo_id = RepoId::new();
+        let job_id = JobId::new();
+        let pipeline_run_id = PipelineRunId::new();
+
+        let job = QueuedJob {
+            job_id,
+            pipeline_run_id,
+            repo_id,
+            priority: Priority::High,
+            queued_at: 1234567890,
+        };
+
+        assert_eq!(job.job_id, job_id);
+        assert_eq!(job.pipeline_run_id, pipeline_run_id);
+        assert_eq!(job.repo_id, repo_id);
+        assert_eq!(job.priority, Priority::High);
+        assert_eq!(job.queued_at, 1234567890);
+    }
 }

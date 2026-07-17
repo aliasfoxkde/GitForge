@@ -55,6 +55,7 @@ pub struct JobAssignment {
 }
 
 /// Runner agent that fetches and executes jobs
+#[derive(Clone)]
 pub struct RunnerAgent {
     config: RunnerConfig,
     client: Client,
@@ -138,10 +139,15 @@ impl RunnerAgent {
         let heartbeat_interval = self.config.heartbeat_interval_secs;
         let heartbeat_client = self.client.clone();
         let heartbeat_url = self.config.scheduler_url.clone();
+        let is_running = self.is_running.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(heartbeat_interval));
             loop {
                 ticker.tick().await;
+                if !*is_running.read().await {
+                    tracing::debug!("heartbeat loop stopping");
+                    break;
+                }
                 tracing::debug!("runner {} sending heartbeat", heartbeat_runner_id);
                 let url = format!("{}/runners/{}/heartbeat", heartbeat_url, heartbeat_runner_id);
                 if let Err(e) = heartbeat_client.post(&url).send().await {
@@ -154,10 +160,15 @@ impl RunnerAgent {
         let fetch_interval = self.config.fetch_interval_secs;
         let fetch_client = self.client.clone();
         let fetch_url = self.config.scheduler_url.clone();
+        let is_running = self.is_running.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(fetch_interval));
             loop {
                 ticker.tick().await;
+                if !*is_running.read().await {
+                    tracing::debug!("job fetch loop stopping");
+                    break;
+                }
                 tracing::debug!("runner checking for jobs...");
 
                 let jobs_url = format!("{}/jobs/pending", fetch_url);
@@ -195,6 +206,11 @@ impl RunnerAgent {
         *self.is_running.write().await = false;
         let runner_id = self.runner.as_ref().map(|r| r.id.to_string()).unwrap_or_default();
         tracing::info!("runner {} stopped", runner_id);
+    }
+
+    /// Check if agent is running
+    pub async fn is_running(&self) -> bool {
+        *self.is_running.read().await
     }
 }
 
@@ -632,5 +648,56 @@ mod tests {
             working_dir: Some("".to_string()),
         };
         assert!(assignment.working_dir.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_runner_is_running() {
+        let config = RunnerConfig::default();
+        let agent = RunnerAgent::new(config).await.unwrap();
+        assert!(!agent.is_running().await);
+    }
+
+    #[tokio::test]
+    async fn test_runner_run_and_stop() {
+        let mut config = RunnerConfig::default();
+        config.scheduler_url = "http://localhost:99999".to_string();
+
+        // Create and register agent
+        let mut agent = RunnerAgent::new(config.clone()).await.unwrap();
+        agent.register().await.unwrap();
+
+        // Clone for use in spawn
+        let agent_clone = agent.clone();
+
+        // Start run in background
+        let run_handle = tokio::spawn(async move {
+            agent_clone.run().await
+        });
+
+        // Wait for start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Check is_running
+        assert!(agent.is_running().await);
+
+        // Stop it
+        agent.stop().await;
+
+        // Give it time to shutdown
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Verify run completed
+        let result = run_handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_runner_run_requires_registration() {
+        let config = RunnerConfig::default();
+        let agent = RunnerAgent::new(config).await.unwrap();
+
+        // Agent is not registered, run should fail
+        let result = agent.run().await;
+        assert!(result.is_err());
     }
 }

@@ -452,4 +452,125 @@ mod tests {
         assert_eq!(response.status, "running");
         assert_eq!(response.runner_id, Some("runner-5".to_string()));
     }
+
+    #[test]
+    fn test_pipeline_run_response_debug() {
+        let response = PipelineRunResponse {
+            id: "run-debug".to_string(),
+            pipeline_id: "pipe-debug".to_string(),
+            status: "debugging".to_string(),
+            commit_hash: "abc123debug".to_string(),
+            triggered_by: "debug-user".to_string(),
+            started_at: Some("2024-01-01T00:00:00Z".to_string()),
+            finished_at: None,
+        };
+        let debug_str = format!("{:?}", response);
+        assert!(debug_str.contains("run-debug"));
+    }
+
+    #[test]
+    fn test_job_response_debug() {
+        let response = JobResponse {
+            id: "job-debug".to_string(),
+            name: "debug-job".to_string(),
+            status: "debugging".to_string(),
+            runner_id: None,
+            started_at: None,
+            finished_at: None,
+        };
+        let debug_str = format!("{:?}", response);
+        assert!(debug_str.contains("job-debug"));
+    }
+
+    #[test]
+    fn test_pipeline_run_response_with_all_statuses() {
+        for status in &["pending", "running", "succeeded", "failed", "cancelled"] {
+            let response = PipelineRunResponse {
+                id: "run-status".to_string(),
+                pipeline_id: "pipe-status".to_string(),
+                status: status.to_string(),
+                commit_hash: "abc123".to_string(),
+                triggered_by: "test".to_string(),
+                started_at: None,
+                finished_at: None,
+            };
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains(status));
+        }
+    }
+
+    #[test]
+    fn test_job_response_with_all_statuses() {
+        for status in &["queued", "assigned", "running", "succeeded", "failed"] {
+            let response = JobResponse {
+                id: "job-status".to_string(),
+                name: "status-test".to_string(),
+                status: status.to_string(),
+                runner_id: None,
+                started_at: None,
+                finished_at: None,
+            };
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains(status));
+        }
+    }
+
+    #[test]
+    fn test_pipeline_run_response_large_commit_hash() {
+        let response = PipelineRunResponse {
+            id: "run-large".to_string(),
+            pipeline_id: "pipe-large".to_string(),
+            status: "running".to_string(),
+            commit_hash: "abc123def456789012345678901234567890".to_string(),
+            triggered_by: "test".to_string(),
+            started_at: Some("2024-01-01T00:00:00Z".to_string()),
+            finished_at: None,
+        };
+        assert!(response.commit_hash.len() > 20);
+    }
+
+    #[test]
+    fn test_job_response_with_runner_assignment() {
+        let response = JobResponse {
+            id: "job-assigned".to_string(),
+            name: "assigned-job".to_string(),
+            status: "assigned".to_string(),
+            runner_id: Some("runner-assigned-123".to_string()),
+            started_at: None,
+            finished_at: None,
+        };
+        assert!(response.runner_id.is_some());
+        assert_eq!(response.runner_id.unwrap(), "runner-assigned-123");
+    }
+
+    #[test]
+    fn test_pipeline_run_response_complete_cycle() {
+        let response = PipelineRunResponse {
+            id: "run-complete".to_string(),
+            pipeline_id: "pipe-complete".to_string(),
+            status: "succeeded".to_string(),
+            commit_hash: "abc123".to_string(),
+            triggered_by: "ci-bot".to_string(),
+            started_at: Some("2024-01-01T00:00:00Z".to_string()),
+            finished_at: Some("2024-01-01T00:10:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("succeeded"));
+        assert!(json.contains("ci-bot"));
+    }
+
+    #[test]
+    fn test_job_response_complete_with_timestamps() {
+        let response = JobResponse {
+            id: "job-complete".to_string(),
+            name: "complete-job".to_string(),
+            status: "succeeded".to_string(),
+            runner_id: Some("runner-1".to_string()),
+            started_at: Some("2024-01-01T00:00:00Z".to_string()),
+            finished_at: Some("2024-01-01T00:05:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("succeeded"));
+        assert!(json.contains("runner-1"));
+    }
 }

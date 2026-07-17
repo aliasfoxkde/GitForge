@@ -392,4 +392,24 @@ mod tests {
         let state = create_state(scheduler);
         let _routes: Router = scheduler_routes(state);
     }
+
+    #[tokio::test]
+    async fn test_register_runner_firecracker_handler() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+
+        let request = RegisterRunnerRequest {
+            name: "fire-runner".to_string(),
+            runner_type: "firecracker".to_string(),
+            capacity: 2,
+        };
+
+        let response = register_runner(
+            axum::extract::State(state),
+            axum::Json(request),
+        )
+        .await;
+
+        assert_status(response.into_response(), StatusCode::CREATED);
+    }
 }

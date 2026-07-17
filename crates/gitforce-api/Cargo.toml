@@ -32,3 +32,4 @@ prometheus = "0.13"
 
 [dev-dependencies]
 hyper = "1.5"
+tempfile = "3"

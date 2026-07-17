@@ -289,4 +289,80 @@ mod tests {
         assert!(json.contains("art-001"));
         assert!(json.contains("data.json"));
     }
+
+    #[test]
+    fn test_artifact_response_debug() {
+        let response = ArtifactResponse {
+            id: "art-debug".to_string(),
+            job_id: "job-debug".to_string(),
+            name: "debug.bin".to_string(),
+            path: "/tmp/debug.bin".to_string(),
+            checksum: "debug123".to_string(),
+            size_bytes: 128,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        let debug_str = format!("{:?}", response);
+        assert!(debug_str.contains("art-debug"));
+    }
+
+    #[test]
+    fn test_artifact_response_large_size() {
+        let response = ArtifactResponse {
+            id: "large-art".to_string(),
+            job_id: "large-job".to_string(),
+            name: "large-file.tar.gz".to_string(),
+            path: "/tmp/large-file.tar.gz".to_string(),
+            checksum: "large123".to_string(),
+            size_bytes: 1_073_741_824, // 1GB
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        assert_eq!(response.size_bytes, 1_073_741_824);
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("1073741824"));
+    }
+
+    #[test]
+    fn test_artifact_response_various_timestamps() {
+        for ts in &["2024-01-01T00:00:00Z", "2025-12-31T23:59:59Z", "2026-07-16T12:00:00Z"] {
+            let response = ArtifactResponse {
+                id: "art-ts".to_string(),
+                job_id: "job-ts".to_string(),
+                name: "timestamped.bin".to_string(),
+                path: "/tmp/ts.bin".to_string(),
+                checksum: "ts123".to_string(),
+                size_bytes: 32,
+                created_at: ts.to_string(),
+            };
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains(ts));
+        }
+    }
+
+    #[test]
+    fn test_artifact_to_response_all_fields() {
+        use gitforce_common::JobId;
+        let job_id = JobId::new();
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            job_id,
+            name: "full-artifact.bin".to_string(),
+            path: "/tmp/full.bin".to_string(),
+            checksum: "fullchecksum".to_string(),
+            size_bytes: 512,
+            content_type: Some("application/octet-stream".to_string()),
+            created_at: chrono::Utc::now(),
+        };
+        let response = artifact_to_response(&artifact);
+        assert_eq!(response.name, "full-artifact.bin");
+        assert_eq!(response.checksum, "fullchecksum");
+        assert_eq!(response.size_bytes, 512);
+    }
+
+    #[test]
+    fn test_artifact_response_deserialization_minimal() {
+        let json = r#"{"id":"min","job_id":"min-job","name":"min.bin","path":"/min","checksum":"min","size_bytes":1,"created_at":"2024-01-01T00:00:00Z"}"#;
+        let response: ArtifactResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.id, "min");
+        assert_eq!(response.size_bytes, 1);
+    }
 }

@@ -682,6 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires Docker and is slow - run manually with `cargo test -- --ignored`
     async fn test_executor_execute_simple_job() {
         let executor = JobExecutor::new().await.unwrap();
 
@@ -701,6 +702,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires Docker and is slow - run manually with `cargo test -- --ignored`
     async fn test_executor_execute_with_env() {
         let executor = JobExecutor::new().await.unwrap();
 
@@ -721,5 +723,144 @@ mod tests {
         let result = executor.execute(job).await;
         // Should have executed regardless of outcome
         assert!(result.exit_code == 0 || !result.success);
+    }
+
+    #[tokio::test]
+    async fn test_executor_active_count_after_execute() {
+        let executor = JobExecutor::new().await.unwrap();
+
+        // Initially 0
+        assert_eq!(executor.active_count().await, 0);
+
+        let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string())
+            .with_steps(vec![JobStep::new("test", "echo hello")]);
+
+        // Execute (may succeed or fail depending on Docker)
+        let _ = executor.execute(job).await;
+
+        // After execute, active count should be 0 (job completes)
+        assert_eq!(executor.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_executor_cancel_idempotent() {
+        let executor = JobExecutor::new().await.unwrap();
+        let job_id = JobId::new();
+
+        // Cancel non-existent job should not error
+        let result = executor.cancel(job_id).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_job_result_with_step_results_struct() {
+        use gitforce_sandbox::StepResult;
+        let step_results = vec![
+            StepResult {
+                exit_code: 0,
+                stdout: "step1 output".to_string(),
+                stderr: String::new(),
+            },
+            StepResult {
+                exit_code: 0,
+                stdout: "step2 output".to_string(),
+                stderr: String::new(),
+            },
+        ];
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: true,
+            exit_code: 0,
+            step_results,
+            error: None,
+        };
+        assert_eq!(result.step_results.len(), 2);
+        assert!(result.success);
+    }
+
+    #[test]
+    fn test_job_result_failure_with_error_message() {
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: 1,
+            step_results: vec![],
+            error: Some("step 2 failed: command not found".to_string()),
+        };
+        assert!(!result.success);
+        assert_eq!(result.exit_code, 1);
+        assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn test_job_result_multiple_step_results() {
+        use gitforce_sandbox::StepResult;
+        let step_results = vec![
+            StepResult { exit_code: 0, stdout: "build success".to_string(), stderr: String::new() },
+            StepResult { exit_code: 0, stdout: "test success".to_string(), stderr: String::new() },
+            StepResult { exit_code: 0, stdout: "deploy success".to_string(), stderr: String::new() },
+        ];
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: true,
+            exit_code: 0,
+            step_results,
+            error: None,
+        };
+        assert_eq!(result.step_results.len(), 3);
+    }
+
+    #[test]
+    fn test_executable_job_with_working_dir_field() {
+        let mut job = ExecutableJob::new(JobId::new(), "rust:latest".to_string());
+        job.working_dir = Some("/workspace".to_string());
+        assert_eq!(job.working_dir, Some("/workspace".to_string()));
+    }
+
+    #[test]
+    fn test_executable_job_all_builder_methods() {
+        let steps = vec![JobStep::new("build", "cargo build")];
+        let mut env = HashMap::new();
+        env.insert("KEY".to_string(), "value".to_string());
+
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+            .with_steps(steps)
+            .with_env(env)
+            .with_timeout(7200);
+
+        assert_eq!(job.image, "rust:latest");
+        assert_eq!(job.steps.len(), 1);
+        assert_eq!(job.env.get("KEY"), Some(&"value".to_string()));
+        assert_eq!(job.timeout_secs, 7200);
+    }
+
+    #[test]
+    fn test_job_step_with_all_fields() {
+        let mut env = HashMap::new();
+        env.insert("VAR".to_string(), "val".to_string());
+
+        let step = JobStep {
+            name: "full-step".to_string(),
+            run: "echo test".to_string(),
+            env: Some(env),
+            working_directory: Some("/dir".to_string()),
+        };
+        assert_eq!(step.name, "full-step");
+        assert_eq!(step.env.as_ref().unwrap().get("VAR"), Some(&"val".to_string()));
+        assert_eq!(step.working_directory, Some("/dir".to_string()));
+    }
+
+    #[test]
+    fn test_job_result_debug_format() {
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: 127,
+            step_results: vec![],
+            error: Some("not found".to_string()),
+        };
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("JobResult"));
+        assert!(debug_str.contains("127"));
     }
 }
