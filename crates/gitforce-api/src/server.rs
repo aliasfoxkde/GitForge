@@ -31,7 +31,7 @@ impl ApiServer {
     }
 
     /// Create a new API server with custom storage path
-    pub fn with_storage(jwt_secret: &str, pool: Pool, storage_path: Option<std::path::PathBuf>) -> Self {
+    pub fn with_storage(jwt_secret: &str, pool: Pool, _storage_path: Option<std::path::PathBuf>) -> Self {
         let auth = ApiAuth::new(jwt_secret);
         let metrics = Metrics::new();
         let metrics_arc = Arc::new(metrics);

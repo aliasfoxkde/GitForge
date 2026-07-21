@@ -14,8 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
-use tower::{Layer, Service};
-use std::sync::atomic::{AtomicU64, Ordering};
+use tower::Layer;
 
 /// Rate limit configuration
 #[derive(Clone, Debug)]

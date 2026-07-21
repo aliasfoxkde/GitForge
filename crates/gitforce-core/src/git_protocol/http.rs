@@ -53,14 +53,12 @@ impl<S: StorageBackend> HttpGitHandler<S> {
 
         // Get references from packed-refs and loose refs
         if let Ok(refs) = repo.references() {
-            for reference in refs {
-                if let Ok(r) = reference {
-                    if let (Some(name), Some(target)) = (r.name(), r.target()) {
-                        // Skip symbolic refs and HEAD (already handled)
-                        if name.starts_with("refs/") && !name.contains("^{}") {
-                            let ref_line = format!("{} {}\n", target, name);
-                            response.extend_from_slice(&Self::format_pkt_line(&ref_line));
-                        }
+            for reference in refs.flatten() {
+                if let (Some(name), Some(target)) = (reference.name(), reference.target()) {
+                    // Skip symbolic refs and HEAD (already handled)
+                    if name.starts_with("refs/") && !name.contains("^{}") {
+                        let ref_line = format!("{} {}\n", target, name);
+                        response.extend_from_slice(&Self::format_pkt_line(&ref_line));
                     }
                 }
             }
@@ -161,12 +159,10 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
         // Get current refs to report
         let mut updated_refs = Vec::new();
         if let Ok(references) = repo.references() {
-            for reference in references {
-                if let Ok(r) = reference {
-                    if let Some(name) = r.name() {
-                        if name.starts_with("refs/") && !name.contains("^{}") {
-                            updated_refs.push(name.to_string());
-                        }
+            for reference in references.flatten() {
+                if let Some(name) = reference.name() {
+                    if name.starts_with("refs/") && !name.contains("^{}") {
+                        updated_refs.push(name.to_string());
                     }
                 }
             }
@@ -193,15 +189,6 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
 
         Ok(response)
     }
-}
-
-/// Format a pkt-line (helper function)
-fn format_pkt_line(content: &str) -> Vec<u8> {
-    let len = 4 + content.len();
-    let mut result = Vec::with_capacity(len);
-    result.extend_from_slice(format!("{:04x}", len).as_bytes());
-    result.extend_from_slice(content.as_bytes());
-    result
 }
 
 /// Write pack data to repository's object database
