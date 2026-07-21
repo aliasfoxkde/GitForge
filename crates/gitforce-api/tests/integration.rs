@@ -958,3 +958,63 @@ async fn test_api_webhook_trigger_unauthorized() {
     // Unauthorized
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn test_api_webhook_trigger_success() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    // Create user first
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    // Create repo first (pipeline has FK to repo)
+    let repo_id = gitforce_common::RepoId::new();
+    let repo = gitforce_db::models::Repository {
+        id: repo_id,
+        name: "test-repo".to_string(),
+        owner_id: user.id,
+        visibility: "private".to_string(),
+        git_path: "/tmp/test".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    gitforce_db::queries::RepoQueries::create(&pool, &repo).await.unwrap();
+
+    // Create a pipeline first
+    let pipeline = gitforce_db::models::Pipeline {
+        id: gitforce_common::PipelineId::new(),
+        repo_id,
+        name: "test-pipeline".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    gitforce_db::queries::PipelineQueries::create(&pool, &pipeline).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&format!("/api/webhook/trigger/{}", pipeline.id))
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"repo_id":"{}","commit_hash":"abc123","branch":"main","pipeline_name":"ci-pipeline"}}"#, repo_id)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Pipeline found, trigger accepted
+    assert_eq!(response.status(), StatusCode::OK);
+}
