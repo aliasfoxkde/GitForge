@@ -3,7 +3,7 @@
 use crate::auth::ApiAuth;
 use crate::metrics::Metrics;
 use crate::metrics_middleware::MetricsLayer;
-use crate::routes::{artifact_routes, ci_routes, repo_routes, runner_routes};
+use crate::routes::{artifact_routes, ci_routes, repo_routes, runner_routes, webhook_routes};
 use axum::{
     extract::Extension,
     http::StatusCode,
@@ -63,6 +63,7 @@ impl ApiServer {
             .merge(ci_routes())
             .merge(runner_routes())
             .merge(artifact_routes())
+            .merge(webhook_routes())
             .layer(Extension(Arc::new(auth)))
             .layer(Extension(pool_arc.clone()));
 
