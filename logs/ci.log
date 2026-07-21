@@ -1,0 +1,3 @@
+[2m2026-07-21T01:58:37.102657Z[0m [32m INFO[0m [2mci[0m[2m:[0m starting GitForce CI Orchestrator
+[2m2026-07-21T01:58:37.102826Z[0m [32m INFO[0m [2mci[0m[2m:[0m CI Orchestrator initialized successfully
+[2m2026-07-21T01:58:37.102855Z[0m [32m INFO[0m [2mci[0m[2m:[0m starting event consumer loop

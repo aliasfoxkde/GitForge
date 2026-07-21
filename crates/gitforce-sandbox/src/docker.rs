@@ -9,6 +9,7 @@ use bollard::container::{
 use bollard::image::CreateImageOptions;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::Docker;
+use bollard::models::HostConfig;
 use futures_util::StreamExt;
 use gitforce_common::{Error, JobId, Result};
 
@@ -120,18 +121,27 @@ pub trait Sandbox: Send + Sync {
 
 #[async_trait]
 impl Sandbox for DockerSandbox {
-    async fn create(&self, job_id: JobId, image: &str, _limits: SandboxLimits) -> Result<SandboxInstance> {
+    async fn create(&self, job_id: JobId, image: &str, limits: SandboxLimits) -> Result<SandboxInstance> {
         if let Some(ref docker) = self.docker {
             // Ensure image is available
             self.ensure_image(image).await?;
 
             let container_name = format!("gitforce-job-{}", job_id);
 
+            // Build host config with resource limits
+            let host_config = HostConfig {
+                memory: Some((limits.memory_mb * 1024 * 1024) as i64),
+                cpu_period: Some(100000), // 100ms in microseconds
+                cpu_quota: Some((limits.cpu_ms * 1000) as i64), // Convert ms to microseconds
+                network_mode: if limits.network { None } else { Some("none".to_string()) },
+                ..Default::default()
+            };
+
             // Create container
             let config = Config {
                 image: Some(image),
                 cmd: Some(vec!["sleep", "3600"]), // Keep container alive
-                host_config: None,
+                host_config: Some(host_config),
                 ..Default::default()
             };
 

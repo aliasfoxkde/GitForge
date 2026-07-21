@@ -1,44 +1,104 @@
-# GoReleaser configuration for Dark Factory projects
+# GoReleaser configuration for GitForge
+# Multi-platform release builds for Linux, macOS, and Windows
 # See: https://goreleaser.com
 
-project_name: {{PROJECT_NAME}}
+project_name: gitforge
+
+version: 1
+
+env:
+  - CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
 before:
   hooks:
-    - go mod tidy
-    - go generate ./...
+    - cargo fetch --locked
 
 builds:
-  - id: "{{PROJECT_NAME}}"
-    binary: "{{PROJECT_NAME}}"
+  - id: linux-amd64
+    binary: gitforge
+    main: ./crates/gitforce-cli/src/main.rs
     env:
       - CGO_ENABLED=0
     goos:
       - linux
+    goarch:
+      - amd64
+    ldflags:
+      - "-s -w"
+    files: []
+
+  - id: linux-arm64
+    binary: gitforge
+    main: ./crates/gitforce-cli/src/main.rs
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - arm64
+    ldflags:
+      - "-s -w"
+
+  - id: darwin-amd64
+    binary: gitforge
+    main: ./crates/gitforce-cli/src/main.rs
+    env:
+      - CGO_ENABLED=0
+    goos:
       - darwin
+    goarch:
+      - amd64
+    ldflags:
+      - "-s -w"
+
+  - id: darwin-arm64
+    binary: gitforge
+    main: ./crates/gitforce-cli/src/main.rs
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - arm64
+    ldflags:
+      - "-s -w"
+
+  - id: windows-amd64
+    binary: gitforge.exe
+    main: ./crates/gitforce-cli/src/main.rs
+    env:
+      - CGO_ENABLED=0
+    goos:
       - windows
     goarch:
       - amd64
-      - arm64
-    main: ./cmd/app
     ldflags:
-      - "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}"
+      - "-s -w"
 
 archives:
   - id: default
-    format: tar.gz
     format_overrides:
       - goos: windows
         format: zip
-    checksums:
-      algorithm: sha256
+    files:
+      - config.toml.example
+
+checksums:
+  algorithm: sha256
+
+# Docker manifest for multi-platform builds
+docker:
+  - image_template: "gitforge/gitforge:{{ .Tag }}"
+    ids:
+      - linux-amd64
 
 release:
   github:
-    owner: {{GITHUB_OWNER}}
-    name: "{{PROJECT_NAME}}"
+    owner: gitforge
+    name: gitforge
   draft: false
   prerelease: auto
+  name_template: "{{ .ProjectName }} v{{ .Version }}"
 
 changelog:
   sort: asc

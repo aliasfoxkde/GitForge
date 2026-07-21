@@ -9,11 +9,12 @@ use gitforce_events::{
 };
 use gitforce_scheduler::Scheduler;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal;
-use tokio::time::{interval, Duration};
+use tokio::time::timeout;
 
-/// Pipeline definitions cache (in production, this would be from database)
 type PipelineCache = HashMap<gitforce_common::RepoId, PipelineDefinition>;
 
 #[tokio::main]
@@ -43,18 +44,44 @@ async fn main() -> anyhow::Result<()> {
     let scheduler_clone = scheduler.clone();
     let pipeline_cache_clone = pipeline_cache.clone();
 
-    // Start event consumer loop
+    // Shared shutdown flag
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_flag = shutdown.clone();
+
+    // Spawn graceful shutdown handler
     tokio::spawn(async move {
-        if let Err(e) = run_event_consumer(event_bus_clone, scheduler_clone, pipeline_cache_clone).await {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
+        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt()).unwrap();
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM, initiating graceful shutdown...");
+            }
+            _ = sigint.recv() => {
+                tracing::info!("received SIGINT, initiating graceful shutdown...");
+            }
+        }
+        shutdown_flag.store(true, Ordering::SeqCst);
+    });
+
+    // Start event consumer loop
+    let shutdown_consumer = shutdown.clone();
+    let consumer_handle = tokio::spawn(async move {
+        if let Err(e) = run_event_consumer(event_bus_clone, scheduler_clone, pipeline_cache_clone, shutdown_consumer).await {
             tracing::error!("event consumer error: {}", e);
         }
     });
 
     // Start scheduler loop
     let scheduler_clone = scheduler.clone();
-    tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(5));
+    let shutdown_scheduler = shutdown.clone();
+    let scheduler_handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
         loop {
+            if shutdown_scheduler.load(Ordering::SeqCst) {
+                tracing::info!("scheduler loop shutting down");
+                break;
+            }
             ticker.tick().await;
             scheduler_clone.process_queue().await;
         }
@@ -63,9 +90,26 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("CI Orchestrator initialized successfully");
 
     // Wait for shutdown signal
-    signal::ctrl_c().await?;
+    let shutdown_future = async {
+        while !shutdown.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+
+    // Wait for either shutdown or tasks to complete
+    timeout(Duration::MAX, shutdown_future).await.ok();
 
     tracing::info!("shutting down CI Orchestrator");
+
+    // Wait for in-flight work to complete (with timeout)
+    timeout(Duration::from_secs(5), async {
+        let _ = consumer_handle.await;
+        let _ = scheduler_handle.await;
+    })
+    .await
+    .ok();
+
+    tracing::info!("CI Orchestrator stopped");
     Ok(())
 }
 
@@ -74,27 +118,39 @@ async fn run_event_consumer(
     event_bus: Arc<dyn EventBus>,
     scheduler: Arc<Scheduler>,
     pipeline_cache: Arc<std::sync::Mutex<PipelineCache>>,
+    shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     tracing::info!("starting event consumer loop");
 
     // Subscribe to push events
     let filter = EventFilter::for_types(vec![EventType::PushReceived]);
-    let stream = event_bus.subscribe(filter).await?;
-
-    // Pin the stream for async iteration
-    tokio::pin!(stream);
+    let mut stream = event_bus.subscribe(filter).await?;
 
     loop {
-        match stream.next().await {
-            Some(event) => {
-                tracing::debug!("received event: {:?}", event.event_type);
-                if let Err(e) = handle_push_event(&event, &scheduler, &pipeline_cache).await {
-                    tracing::error!("failed to handle push event: {}", e);
+        if shutdown.load(Ordering::SeqCst) {
+            tracing::info!("event consumer loop shutting down");
+            break;
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
                 }
             }
-            None => {
-                tracing::info!("event stream closed");
-                break;
+            event = stream.next() => {
+                match event {
+                    Some(event) => {
+                        tracing::debug!("received event: {:?}", event.event_type);
+                        if let Err(e) = handle_push_event(&event, &scheduler, &pipeline_cache).await {
+                            tracing::error!("failed to handle push event: {}", e);
+                        }
+                    }
+                    None => {
+                        tracing::info!("event stream closed");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -128,7 +184,6 @@ async fn handle_push_event(
     let pipeline = {
         let mut cache = pipeline_cache.lock().unwrap();
         cache.entry(repo_id).or_insert_with(|| {
-            // Default pipeline for demo purposes - in production, load from DB
             create_default_pipeline(&repo_id.to_string())
         }).clone()
     };
@@ -154,14 +209,7 @@ async fn handle_push_event(
     let state = engine.state().await;
     for job_id in ready_jobs {
         if let Some(_job_state) = state.jobs.get(&job_id) {
-            // Enqueue job to scheduler
-            scheduler
-                .enqueue(
-                    job_id,
-                    state.run_id,
-                    repo_id,
-                )
-                .await;
+            scheduler.enqueue(job_id, state.run_id, repo_id).await;
             tracing::debug!("enqueued job {} for pipeline run {}", job_id, state.run_id);
         }
     }

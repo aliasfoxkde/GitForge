@@ -1,0 +1,28 @@
+# Cross.toml - Cross-compilation configuration for GitForge
+# See: https://github.com/cross-rs/cross
+
+[target.x86_64-unknown-linux-musl]
+image = "x86_64-unknown-linux-musl:cross"
+
+[target.aarch64-unknown-linux-musl]
+image = "aarch64-unknown-linux-musl:cross"
+
+[target.x86_64-apple-darwin]
+image = "x86_64-apple-darwin:crosstool"
+
+[target.aarch64-apple-darwin]
+image = "aarch64-apple-darwin:crosstool"
+
+[target.x86_64-pc-windows-gnu]
+image = "x86_64-pc-windows-gnu:crosstool"
+
+[target.aarch64-pc-windows-gnu]
+image = "aarch64-pc-windows-gnu:crosstool"
+
+# Default build image
+[build.default]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
+
+# Environment variables
+[env]
+CARGO_INCREMENTAL = "0"

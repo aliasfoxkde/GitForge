@@ -14,9 +14,11 @@ pub mod metrics;
 pub mod metrics_middleware;
 pub mod middleware;
 pub mod openapi;
+pub mod rate_limit;
 pub mod routes;
 pub mod server;
 
 pub use auth::{ApiAuth, Claims};
 pub use metrics::Metrics;
+pub use rate_limit::{RateLimiter, RateLimitConfig};
 pub use server::ApiServer;

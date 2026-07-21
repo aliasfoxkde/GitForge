@@ -57,29 +57,24 @@ impl ApiServer {
         public_routes = public_routes.merge(swagger);
 
         // Protected routes (auth required)
+        let pool_arc = Arc::new(pool);
         let protected_routes = Router::new()
             .merge(repo_routes())
             .merge(ci_routes())
             .merge(runner_routes())
-            .merge(artifact_routes());
+            .merge(artifact_routes())
+            .layer(Extension(Arc::new(auth)))
+            .layer(Extension(pool_arc.clone()));
 
         // Metrics layer for automatic request recording
         let metrics_layer = MetricsLayer::new(metrics_arc.clone());
 
-        let mut app = public_routes
+        let app = public_routes
             .layer(cors)
-            .layer(Extension(Arc::new(auth)))
             .layer(metrics_layer)
+            .layer(Extension(pool_arc.clone()))
             .layer(Extension(metrics_arc))
-            .layer(Extension(Arc::new(pool)));
-
-        // Add storage if path provided (async init not possible here)
-        if let Some(path) = storage_path {
-            // Storage will be added when initialized async
-            let _ = path;
-        }
-
-        app = app.nest("/api", protected_routes);
+            .nest("/api", protected_routes);
 
         Self { router: app, port: 8080 }
     }

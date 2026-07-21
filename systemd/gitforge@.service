@@ -1,0 +1,30 @@
+[Unit]
+Description=GitForge %i Service
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gitforge
+Group=gitforge
+WorkingDirectory=/nas/Temp/repos/GitForge
+Environment=RUST_LOG=info
+ExecStart=/nas/Temp/repos/GitForge/target/release/%i
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/nas/Temp/repos/GitForge/data
+
+# Security
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
