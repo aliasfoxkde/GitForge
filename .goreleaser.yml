@@ -1,8 +1,9 @@
-# GoReleaser configuration for GitForge
-# Multi-platform release builds for Linux, macOS, and Windows
+# GoReleaser configuration for GitForge Rust CLI
+# This is used for the gitforce-cli crate only
+# For full multi-platform Rust builds, use: make build-cross-all
 # See: https://goreleaser.com
 
-project_name: gitforge
+project_name: gitforge-cli
 
 version: 1
 
@@ -23,9 +24,10 @@ builds:
       - linux
     goarch:
       - amd64
+    flags:
+      - --release
     ldflags:
       - "-s -w"
-    files: []
 
   - id: linux-arm64
     binary: gitforge
@@ -36,6 +38,8 @@ builds:
       - linux
     goarch:
       - arm64
+    flags:
+      - --release
     ldflags:
       - "-s -w"
 
@@ -48,6 +52,8 @@ builds:
       - darwin
     goarch:
       - amd64
+    flags:
+      - --release
     ldflags:
       - "-s -w"
 
@@ -60,6 +66,8 @@ builds:
       - darwin
     goarch:
       - arm64
+    flags:
+      - --release
     ldflags:
       - "-s -w"
 
@@ -72,6 +80,8 @@ builds:
       - windows
     goarch:
       - amd64
+    flags:
+      - --release
     ldflags:
       - "-s -w"
 
@@ -80,22 +90,15 @@ archives:
     format_overrides:
       - goos: windows
         format: zip
-    files:
-      - config.toml.example
+    files: []
 
 checksums:
   algorithm: sha256
 
-# Docker manifest for multi-platform builds
-docker:
-  - image_template: "gitforge/gitforge:{{ .Tag }}"
-    ids:
-      - linux-amd64
-
 release:
   github:
-    owner: gitforge
-    name: gitforge
+    owner: aliasfoxkde
+    name: GitForge
   draft: false
   prerelease: auto
   name_template: "{{ .ProjectName }} v{{ .Version }}"

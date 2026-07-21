@@ -14,6 +14,52 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Validate repository name to prevent path traversal and injection attacks
+fn validate_repo_name(name: &str) -> Result<(), String> {
+    // Check for empty name
+    if name.is_empty() {
+        return Err("Repository name cannot be empty".to_string());
+    }
+
+    // Check for path traversal attempts
+    if name.contains("..") {
+        return Err("Repository name cannot contain '..'".to_string());
+    }
+
+    // Check for path separators that could create directories
+    if name.contains('/') && !name.contains("./") {
+        // Allow org/repo format but validate each part
+        for part in name.split('/') {
+            validate_repo_name(part)?;
+        }
+        return Ok(());
+    }
+
+    // Check length
+    if name.len() > 255 {
+        return Err("Repository name too long (max 255 characters)".to_string());
+    }
+
+    // Check for special characters that could be problematic
+    let invalid_chars = ['\0', '\n', '\r', '\t', '\\', '"', '\'', '`', '>', '<', '|', '&', ';', '$', '!', '{', '}', '[', ']', '(', ')'];
+    for c in invalid_chars {
+        if name.contains(c) {
+            return Err(format!("Repository name contains invalid character: {:?}", c));
+        }
+    }
+
+    // Must start and end with alphanumeric
+    let chars: Vec<char> = name.chars().collect();
+    if !chars.first().map(|c| c.is_alphanumeric()).unwrap_or(false) {
+        return Err("Repository name must start with an alphanumeric character".to_string());
+    }
+    if !chars.last().map(|c| c.is_alphanumeric()).unwrap_or(false) {
+        return Err("Repository name must end with an alphanumeric character".to_string());
+    }
+
+    Ok(())
+}
+
 /// Repository response
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RepoResponse {
@@ -102,6 +148,14 @@ async fn create_repo(
     };
 
     tracing::debug!("create repo request: {:?} by user {}", req, owner_id);
+
+    // Validate repository name to prevent path traversal and injection
+    if let Err(e) = validate_repo_name(&req.name) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "invalid_name",
+            "message": e
+        }))).into_response();
+    }
 
     let git_path = format!("/git/repos/{}", req.name);
 

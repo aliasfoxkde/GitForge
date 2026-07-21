@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod ids;
+pub mod password;
 pub mod time;
 pub mod result;
 

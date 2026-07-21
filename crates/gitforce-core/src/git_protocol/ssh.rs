@@ -104,21 +104,99 @@ impl<S: StorageBackend> GitProtocolHandler for SshGitHandler<S> {
             )));
         }
 
-        // For receive-pack, acknowledge the push
+        // Open the repository
+        let repo = self.storage.open(repo_id).await?;
+
+        // Process the pack data if present
+        let mut unpack_ok = false;
+
+        if !input.is_empty() {
+            // Find the pack data start
+            // Pack data starts with "PACK" magic bytes (0x50 0x41 0x43 0x4b)
+            let pack_start = input.windows(4).position(|w| w == [0x50, 0x41, 0x43, 0x4b]);
+
+            if let Some(pos) = pack_start {
+                let pack_data = &input[pos..];
+                if pack_data.len() > 8 {
+                    match write_pack_to_odb(&repo, pack_data) {
+                        Ok(()) => {
+                            unpack_ok = true;
+                            tracing::info!("Successfully unpacked pack data for repo {}", repo_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to process pack data: {}", e);
+                        }
+                    }
+                }
+            } else {
+                // No pack data - could be a ref-only update
+                unpack_ok = true;
+            }
+        } else {
+            // Empty input - just checking capabilities, that's ok
+            unpack_ok = true;
+        }
+
+        // Get current refs to report
+        let mut updated_refs = Vec::new();
+        if let Ok(references) = repo.references() {
+            for reference in references {
+                if let Ok(r) = reference {
+                    if let Some(name) = r.name() {
+                        if name.starts_with("refs/") && !name.contains("^{}") {
+                            updated_refs.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build response
         let mut response = Vec::new();
 
-        // Report unpack success
+        // Report unpack result
         response.extend_from_slice(b"0000"); // flush
-        response.extend_from_slice(b"unpack ok\n");
+        if unpack_ok {
+            response.extend_from_slice(b"unpack ok\n");
+        } else {
+            response.extend_from_slice(b"unpack error\n");
+        }
 
-        // Acknowledge each ref
-        response.extend_from_slice(b"ok refs/heads/main\n");
+        // Report each ref update
+        for ref_name in &updated_refs {
+            let ok_line = format!("ok {}\n", ref_name);
+            response.extend_from_slice(ok_line.as_bytes());
+        }
 
         // End
         response.extend_from_slice(b"0000");
 
         Ok(response)
     }
+}
+
+/// Write pack data to repository's object database
+fn write_pack_to_odb(repo: &git2::Repository, pack_data: &[u8]) -> gitforce_common::Result<()> {
+    // Write pack data to repository's odb
+    let odb = repo.odb().map_err(|e| {
+        gitforce_common::Error::git(format!("Failed to get odb: {}", e))
+    })?;
+
+    // Create a packwriter to write the pack
+    let mut packwriter = odb.packwriter().map_err(|e| {
+        gitforce_common::Error::git(format!("Failed to create packwriter: {}", e))
+    })?;
+
+    // Write the pack data
+    std::io::Write::write_all(&mut packwriter, pack_data).map_err(|e| {
+        gitforce_common::Error::git(format!("Failed to write pack: {}", e))
+    })?;
+
+    // The pack is finalized when packwriter is dropped
+    drop(packwriter);
+
+    tracing::debug!("Wrote pack data ({} bytes) to odb", pack_data.len());
+    Ok(())
 }
 
 /// Extract command from SSH original_command

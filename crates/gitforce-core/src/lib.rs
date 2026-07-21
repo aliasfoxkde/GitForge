@@ -7,6 +7,6 @@ pub mod hooks;
 pub mod repo;
 pub mod storage;
 
-pub use hooks::{HookExecutor, HookManager, HookPayload};
+pub use hooks::{HookExecutor, HookManager, HookPayload, execute_push_hooks};
 pub use repo::{GitRef, RepoService};
 pub use storage::{FileStorageBackend, StorageBackend};

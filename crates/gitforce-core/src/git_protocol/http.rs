@@ -124,27 +124,69 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
             )));
         }
 
-        // For receive-pack (push), we would need to:
-        // 1. Parse the pack data from input
-        // 2. Update refs based on the push
-        // 3. Return acknowledgment
-        //
-        // This is complex - typically requires calling git-receive-pack or
-        // using a library that can process packfiles. For now, return success.
-        //
-        // In production, this would use git2 to process the push:
-        // - Receive the pack data
-        // - Write to temporary file
-        // - Call git receive-pack or use git2::push
+        // Open the repository
+        let repo = self.storage.open(repo_id).await?;
 
-        // Return acknowledgment (unpack ok)
-        let ack = "unpack ok\n";
-        let mut response = Self::format_pkt_line(ack);
+        // Process the pack data if present
+        let mut unpack_ok = false;
 
-        // Add ok for each ref that was updated
-        // For now, just acknowledge
-        let ok_line = format_pkt_line("ok refs/heads/main\n");
-        response.extend_from_slice(&ok_line);
+        if !input.is_empty() {
+            // Find the pack data start
+            // Git pack protocol: after flush pkt (0000), the pack data begins
+            // Pack data starts with "PACK" magic bytes (0x50 0x41 0x43 0x4b)
+            let pack_start = input.windows(4).position(|w| w == [0x50, 0x41, 0x43, 0x4b]);
+
+            if let Some(pos) = pack_start {
+                let pack_data = &input[pos..];
+                if pack_data.len() > 8 {
+                    match write_pack_to_odb(&repo, pack_data) {
+                        Ok(()) => {
+                            unpack_ok = true;
+                            tracing::info!("Successfully unpacked pack data for repo {}", repo_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to process pack data: {}", e);
+                        }
+                    }
+                }
+            } else {
+                // No pack data - could be a ref-only update
+                unpack_ok = true;
+            }
+        } else {
+            // Empty input - just checking capabilities, that's ok
+            unpack_ok = true;
+        }
+
+        // Get current refs to report
+        let mut updated_refs = Vec::new();
+        if let Ok(references) = repo.references() {
+            for reference in references {
+                if let Ok(r) = reference {
+                    if let Some(name) = r.name() {
+                        if name.starts_with("refs/") && !name.contains("^{}") {
+                            updated_refs.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build response
+        let mut response = Vec::new();
+
+        // Report unpack result
+        if unpack_ok {
+            response.extend_from_slice(b"unpack ok\n");
+        } else {
+            response.extend_from_slice(b"unpack error\n");
+        }
+
+        // Report each ref update
+        for ref_name in &updated_refs {
+            let ok_line = format!("ok {}\n", ref_name);
+            response.extend_from_slice(ok_line.as_bytes());
+        }
 
         // End with flush
         response.extend_from_slice(b"0000");
@@ -160,6 +202,32 @@ fn format_pkt_line(content: &str) -> Vec<u8> {
     result.extend_from_slice(format!("{:04x}", len).as_bytes());
     result.extend_from_slice(content.as_bytes());
     result
+}
+
+/// Write pack data to repository's object database
+fn write_pack_to_odb(repo: &git2::Repository, pack_data: &[u8]) -> gitforce_common::Result<()> {
+    // Write pack data to repository's odb
+    let odb = repo.odb().map_err(|e| {
+        gitforce_common::Error::git(format!("Failed to get odb: {}", e))
+    })?;
+
+    // Create a packwriter to write the pack
+    let mut packwriter = odb.packwriter().map_err(|e| {
+        gitforce_common::Error::git(format!("Failed to create packwriter: {}", e))
+    })?;
+
+    // Write the pack data
+    // The packwriter implements Write trait
+    std::io::Write::write_all(&mut packwriter, pack_data).map_err(|e| {
+        gitforce_common::Error::git(format!("Failed to write pack: {}", e))
+    })?;
+
+    // The pack is finalized when packwriter is dropped
+    // (git2's OdbPackwriter::Drop implementation calls finalize)
+    drop(packwriter);
+
+    tracing::debug!("Wrote pack data ({} bytes) to odb", pack_data.len());
+    Ok(())
 }
 
 /// Parse Content-Type header for git protocol

@@ -147,6 +147,53 @@ impl HookManager {
     }
 }
 
+/// Execute hooks for a push operation
+///
+/// This is a convenience function that creates appropriate payloads and executes
+/// both pre-receive and post-receive hooks.
+///
+/// # Arguments
+/// * `manager` - The hook manager to use
+/// * `repo_id` - The repository ID
+/// * `ref_name` - The reference that was pushed (e.g., "refs/heads/main")
+/// * `old_hash` - The old commit hash
+/// * `new_hash` - The new commit hash
+/// * `pusher_id` - The user ID of the pusher (if known)
+///
+/// # Returns
+/// Returns `Ok(())` if all hooks succeed, or the first error encountered
+pub async fn execute_push_hooks(
+    manager: &HookManager,
+    repo_id: RepoId,
+    ref_name: &str,
+    old_hash: &str,
+    new_hash: &str,
+    pusher_id: Option<gitforce_common::UserId>,
+) -> Result<()> {
+    let payload = HookPayload::new(
+        repo_id,
+        ref_name.to_string(),
+        old_hash.to_string(),
+        new_hash.to_string(),
+        pusher_id,
+    );
+
+    // Execute pre-receive hooks first
+    if let Err(e) = manager.pre_receive(payload.clone()).await {
+        tracing::error!("pre-receive hook failed: {}", e);
+        return Err(e);
+    }
+
+    // Execute post-receive hooks
+    if let Err(e) = manager.post_receive(payload.clone()).await {
+        tracing::error!("post-receive hook failed: {}", e);
+        return Err(e);
+    }
+
+    tracing::info!("Successfully executed hooks for push to {} on repo {}", ref_name, repo_id);
+    Ok(())
+}
+
 impl Default for HookManager {
     fn default() -> Self {
         Self::new()

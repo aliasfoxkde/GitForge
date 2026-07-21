@@ -1,5 +1,13 @@
 # Cross.toml - Cross-compilation configuration for GitForge
 # See: https://github.com/cross-rs/cross
+#
+# IMPORTANT: macOS cross-compilation from Linux requires Apple's SDK
+# which cannot be legally redistributed. Options:
+# 1. Use GitHub Actions macOS runners for Apple Silicon builds
+# 2. Set up a dedicated macOS build machine with Xcode
+# 3. Build on macOS hardware directly
+#
+# Linux and Windows targets work from Linux.
 
 [target.x86_64-unknown-linux-musl]
 image = "x86_64-unknown-linux-musl:cross"
@@ -7,11 +15,17 @@ image = "x86_64-unknown-linux-musl:cross"
 [target.aarch64-unknown-linux-musl]
 image = "aarch64-unknown-linux-musl:cross"
 
+# macOS targets - these require macOS build environment
+# For GitHub Actions, builds run on macOS runners directly
 [target.x86_64-apple-darwin]
-image = "x86_64-apple-darwin:crosstool"
+# Cross-compilation not supported from Linux due to Apple SDK restrictions
+# Use GitHub Actions macos-latest runner or dedicated macOS build machine
+image = "messense/macos-swift:latest"
 
 [target.aarch64-apple-darwin]
-image = "aarch64-apple-darwin:crosstool"
+# Apple Silicon builds require macOS hardware
+# Use GitHub Actions macos-latest runner (macOS 14+ has Apple Silicon)
+image = "messense/macos-swift:latest"
 
 [target.x86_64-pc-windows-gnu]
 image = "x86_64-pc-windows-gnu:crosstool"
