@@ -22,15 +22,7 @@ image = "ghcr.io/messense/cross:arm64-linux-android"
 image = "ghcr.io/messense/cross:arm64-linux-android"
 
 [target.x86_64-pc-windows-gnu]
-image = "x86_64-pc-windows-gnu:crosstool"
+image = "ghcr.io/cross-rs/x86_64-pc-windows-gnu:0.2.5"
 
 [target.aarch64-pc-windows-gnu]
-image = "aarch64-pc-windows-gnu:crosstool"
-
-# Default build image
-[build.default]
-image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
-
-# Environment variables
-[env]
-CARGO_INCREMENTAL = "0"
+image = "ghcr.io/cross-rs/aarch64-pc-windows-gnu:0.2.5"
