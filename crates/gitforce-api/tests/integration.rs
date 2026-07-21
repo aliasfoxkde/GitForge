@@ -860,3 +860,101 @@ async fn test_api_job_invalid_id() {
     // Should get BAD_REQUEST or NOT_FOUND (routing behavior varies)
     assert!(response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn test_api_webhook_trigger_invalid_pipeline_id() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/webhook/trigger/invalid-uuid")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"repo_id":"550e8400-e29b-41d4-a716-446655440000","commit_hash":"abc123","branch":"main"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Invalid UUID should return BAD_REQUEST
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_api_webhook_trigger_not_found() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+    let valid_uuid = uuid::Uuid::new_v4().to_string();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&format!("/api/webhook/trigger/{}", valid_uuid))
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"repo_id":"550e8400-e29b-41d4-a716-446655440000","commit_hash":"abc123","branch":"main"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Pipeline not found should return NOT_FOUND
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_api_webhook_trigger_unauthorized() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let valid_uuid = uuid::Uuid::new_v4().to_string();
+
+    // No auth header
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&format!("/api/webhook/trigger/{}", valid_uuid))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"repo_id":"550e8400-e29b-41d4-a716-446655440000","commit_hash":"abc123","branch":"main"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Unauthorized
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
