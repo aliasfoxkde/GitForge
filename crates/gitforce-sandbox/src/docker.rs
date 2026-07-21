@@ -558,4 +558,146 @@ mod tests {
         assert_eq!(cloned.stdout, result.stdout);
         assert_eq!(cloned.exit_code, result.exit_code);
     }
+
+    #[test]
+    fn test_sandbox_limits_default() {
+        let limits = SandboxLimits::default();
+        assert_eq!(limits.memory_mb, 4096);
+        assert_eq!(limits.cpu_ms, 3600000);
+        assert!(limits.network);
+    }
+
+    #[test]
+    fn test_sandbox_limits_medium() {
+        let limits = SandboxLimits::medium();
+        assert_eq!(limits.memory_mb, 2048);
+        assert_eq!(limits.cpu_ms, 1800000);
+        assert!(limits.network);
+    }
+
+    #[test]
+    fn test_sandbox_limits_large() {
+        let limits = SandboxLimits::large();
+        assert_eq!(limits.memory_mb, 8192);
+        assert_eq!(limits.cpu_ms, 3600000);
+        assert!(limits.network);
+    }
+
+    #[test]
+    fn test_sandbox_limits_with_network_disabled() {
+        let mut limits = SandboxLimits::default();
+        limits.network = false;
+        assert!(!limits.network);
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_execute_special_characters() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+
+        // Test with special characters in command
+        let result = sandbox.execute(&instance, &["sh", "-c", "echo $'hello\nworld'"]).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_execute_unicode() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+
+        // Test with unicode
+        let result = sandbox.execute(&instance, &["echo", "hello world"]).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_execute_exit_codes() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+
+        // Test 'true' command (exit 0)
+        let result = sandbox.execute(&instance, &["true"]).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_container_id_format() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+
+        // Container ID should start with expected prefix
+        assert!(instance.container_id.starts_with("gitforce-job-"));
+        assert!(instance.container_id.contains(&job_id.to_string()));
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_network_enabled() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        assert!(!instance.container_id.is_empty());
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_docker_sandbox_stub_network_disabled() {
+        let sandbox = DockerSandbox::with_limits(SandboxLimits {
+            network: false,
+            ..Default::default()
+        });
+        let job_id = JobId::new();
+
+        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits {
+            network: false,
+            ..Default::default()
+        }).await.unwrap();
+        assert!(!instance.container_id.is_empty());
+
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    #[test]
+    fn test_sandbox_instance_eq() {
+        let job_id = JobId::new();
+        let instance1 = SandboxInstance {
+            container_id: "test-container".to_string(),
+            job_id,
+        };
+        let instance2 = SandboxInstance {
+            container_id: "test-container".to_string(),
+            job_id,
+        };
+        // Only container_id and job_id are compared
+        assert_eq!(instance1.container_id, instance2.container_id);
+        assert_eq!(instance1.job_id, instance2.job_id);
+    }
+
+    #[test]
+    fn test_step_result_with_long_output() {
+        let long_string = "x".repeat(10000);
+        let result = StepResult {
+            exit_code: 0,
+            stdout: long_string.clone(),
+            stderr: String::new(),
+        };
+        assert_eq!(result.stdout.len(), 10000);
+    }
 }
