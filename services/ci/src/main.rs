@@ -269,3 +269,77 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
         ],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_default_pipeline() {
+        let pipeline = create_default_pipeline("test-repo");
+
+        assert_eq!(pipeline.name, "test-repo-pipeline");
+        assert_eq!(pipeline.version, "1.0");
+        assert_eq!(pipeline.trigger_on, vec![TriggerType::Push]);
+        assert!(pipeline.environment.is_empty());
+        assert_eq!(pipeline.jobs.len(), 2);
+    }
+
+    #[test]
+    fn test_create_default_pipeline_has_build_job() {
+        let pipeline = create_default_pipeline("my-repo");
+
+        let build_job = pipeline.jobs.iter().find(|j| j.name == "build").unwrap();
+        assert_eq!(build_job.image, "rust:latest");
+        assert!(build_job.needs.is_empty());
+        assert_eq!(build_job.steps.len(), 2);
+    }
+
+    #[test]
+    fn test_create_default_pipeline_has_test_job() {
+        let pipeline = create_default_pipeline("my-repo");
+
+        let test_job = pipeline.jobs.iter().find(|j| j.name == "test").unwrap();
+        assert_eq!(test_job.image, "rust:latest");
+        assert_eq!(test_job.needs, vec!["build".to_string()]);
+        assert!(test_job.retry.is_some());
+    }
+
+    #[test]
+    fn test_create_default_pipeline_build_steps() {
+        let pipeline = create_default_pipeline("my-repo");
+
+        let build_job = pipeline.jobs.iter().find(|j| j.name == "build").unwrap();
+        let step_names: Vec<&str> = build_job.steps.iter().map(|s| s.name.as_str()).collect();
+        assert!(step_names.contains(&"setup"));
+        assert!(step_names.contains(&"build"));
+    }
+
+    #[test]
+    fn test_create_default_pipeline_test_depends_on_build() {
+        let pipeline = create_default_pipeline("my-repo");
+
+        let test_job = pipeline.jobs.iter().find(|j| j.name == "test").unwrap();
+        assert!(test_job.needs.contains(&"build".to_string()));
+    }
+
+    #[test]
+    fn test_create_default_pipeline_timeout() {
+        let pipeline = create_default_pipeline("my-repo");
+
+        for job in &pipeline.jobs {
+            assert!(job.timeout.is_some());
+            assert_eq!(job.timeout.as_ref().unwrap(), "30m");
+        }
+    }
+
+    #[test]
+    fn test_create_default_pipeline_retry() {
+        let pipeline = create_default_pipeline("my-repo");
+
+        for job in &pipeline.jobs {
+            assert!(job.retry.is_some());
+            assert_eq!(job.retry.unwrap(), 1);
+        }
+    }
+}

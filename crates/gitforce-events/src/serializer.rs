@@ -60,7 +60,7 @@ impl JsonEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{PushReceivedPayload, EventType, EventPayload};
+    use crate::event::{PushReceivedPayload, EventType, EventPayload, PipelineStartedPayload};
 
     #[test]
     fn test_serialize_roundtrip() {
@@ -124,5 +124,132 @@ mod tests {
         let json_event = JsonEvent::from_envelope(&event);
         assert_eq!(json_event.event_type, "push.received");
         assert_eq!(json_event.event_version, 1);
+    }
+
+    #[test]
+    fn test_json_event_from_envelope_with_actor() {
+        let actor_id = gitforce_common::UserId::new();
+        let repo_id = gitforce_common::RepoId::new();
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "abc123".to_string(),
+                new_hash: "def456".to_string(),
+                pusher_id: Some(actor_id),
+            }),
+            Some(repo_id),
+            Some(actor_id),
+        );
+
+        let json_event = JsonEvent::from_envelope(&event);
+        assert!(json_event.actor_id.is_some());
+        assert!(json_event.repo_id.is_some());
+        assert!(json_event.correlation_id.is_none());
+    }
+
+    #[test]
+    fn test_json_event_from_envelope_with_correlation() {
+        let correlation_id = uuid::Uuid::new_v4();
+        let event = EventEnvelope::new(
+            EventType::PipelineStarted,
+            EventPayload::PipelineStarted(PipelineStartedPayload {
+                pipeline_run_id: gitforce_common::PipelineRunId::new(),
+                started_at: chrono::Utc::now().timestamp(),
+            }),
+            None,
+            None,
+        ).with_correlation(correlation_id);
+
+        let json_event = JsonEvent::from_envelope(&event);
+        assert!(json_event.correlation_id.is_some());
+    }
+
+    #[test]
+    fn test_json_event_serialization_roundtrip() {
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id: gitforce_common::RepoId::new(),
+                ref_name: "refs/heads/develop".to_string(),
+                old_hash: "old123".to_string(),
+                new_hash: "new456".to_string(),
+                pusher_id: None,
+            }),
+            None,
+            None,
+        );
+
+        let json_event = JsonEvent::from_envelope(&event);
+        let json_str = serde_json::to_string(&json_event).unwrap();
+        assert!(json_str.contains("push_received"));
+        assert!(json_str.contains("event_version"));
+    }
+
+    #[test]
+    fn test_json_event_debug_trait() {
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id: gitforce_common::RepoId::new(),
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "abc123".to_string(),
+                new_hash: "def456".to_string(),
+                pusher_id: None,
+            }),
+            None,
+            None,
+        );
+
+        let json_event = JsonEvent::from_envelope(&event);
+        let debug_str = format!("{:?}", json_event);
+        assert!(debug_str.contains("event_id"));
+        assert!(debug_str.contains("event_type"));
+    }
+
+    #[test]
+    fn test_serializer_deserialize_invalid_json() {
+        let invalid_json = b"not valid json";
+        let result: Result<EventEnvelope, _> = EventSerializer::deserialize(invalid_json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_serializer_deserialize_from_str_invalid() {
+        let result: Result<EventEnvelope, _> = EventSerializer::deserialize_from_str("invalid json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_json_event_all_event_types() {
+        let event_types = vec![
+            EventType::PushReceived,
+            EventType::RepoCreated,
+            EventType::RepoDeleted,
+            EventType::PipelineTriggered,
+            EventType::PipelineStarted,
+            EventType::PipelineFinished,
+            EventType::JobQueued,
+            EventType::JobStarted,
+            EventType::JobFinished,
+        ];
+
+        for event_type in event_types {
+            let event = EventEnvelope::new(
+                event_type.clone(),
+                EventPayload::PushReceived(PushReceivedPayload {
+                    repo_id: gitforce_common::RepoId::new(),
+                    ref_name: "refs/heads/main".to_string(),
+                    old_hash: "abc123".to_string(),
+                    new_hash: "def456".to_string(),
+                    pusher_id: None,
+                }),
+                None,
+                None,
+            );
+            let json_event = JsonEvent::from_envelope(&event);
+            assert!(!json_event.event_type.is_empty());
+        }
     }
 }
