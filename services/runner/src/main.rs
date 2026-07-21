@@ -36,11 +36,39 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Runner Agent initialized successfully");
 
-    // Shared shutdown flag
-    let shutdown = Arc::new(AtomicBool::new(false));
+    // Set up shutdown handling
+    let shutdown = create_shutdown_flag();
     let shutdown_flag = shutdown.clone();
 
     // Spawn graceful shutdown handler
+    spawn_shutdown_handler(shutdown_flag);
+
+    // Wait for shutdown signal
+    let shutdown_future = create_shutdown_future(shutdown.clone());
+    tracing::info!("Runner Agent running, press Ctrl+C to stop");
+
+    // Wait for shutdown signal
+    timeout(Duration::MAX, shutdown_future).await.ok();
+
+    tracing::info!("shutting down Runner Agent");
+
+    // Stop the agent gracefully
+    agent.stop().await;
+
+    // Graceful shutdown delay
+    graceful_shutdown_delay().await;
+
+    tracing::info!("Runner Agent stopped");
+    Ok(())
+}
+
+/// Create a shutdown flag
+pub fn create_shutdown_flag() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+/// Spawn the shutdown signal handler
+pub fn spawn_shutdown_handler(shutdown_flag: Arc<AtomicBool>) {
     tokio::spawn(async move {
         let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
         let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt()).unwrap();
@@ -55,31 +83,64 @@ async fn main() -> anyhow::Result<()> {
         }
         shutdown_flag.store(true, Ordering::SeqCst);
     });
+}
 
-    // Wait for shutdown signal
-    let shutdown_future = async {
-        while !shutdown.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    };
+/// Create the shutdown future that waits for shutdown signal
+pub async fn create_shutdown_future(shutdown: Arc<AtomicBool>) {
+    while !shutdown.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 
-    tracing::info!("Runner Agent running, press Ctrl+C to stop");
-
-    // Wait for shutdown signal
-    timeout(Duration::MAX, shutdown_future).await.ok();
-
-    tracing::info!("shutting down Runner Agent");
-
-    // Stop the agent gracefully
-    agent.stop().await;
-
-    // Graceful shutdown delay
+/// Perform graceful shutdown delay
+pub async fn graceful_shutdown_delay() {
     timeout(Duration::from_secs(2), async {
         tokio::time::sleep(Duration::from_secs(1)).await;
     })
     .await
     .ok();
+}
 
-    tracing::info!("Runner Agent stopped");
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_shutdown_flag_initial_state() {
+        let flag = create_shutdown_flag();
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_create_shutdown_flag_clone() {
+        let flag1 = create_shutdown_flag();
+        let flag2 = flag1.clone();
+        flag1.store(true, Ordering::SeqCst);
+        assert!(flag2.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_graceful_shutdown_delay_does_not_panic() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                graceful_shutdown_delay().await;
+            });
+    }
+
+    #[tokio::test]
+    async fn test_create_shutdown_future() {
+        let shutdown = create_shutdown_flag();
+        let shutdown_flag = shutdown.clone();
+
+        // Set shutdown after a short delay
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            shutdown_flag.store(true, Ordering::SeqCst);
+        });
+
+        create_shutdown_future(shutdown).await;
+    }
 }

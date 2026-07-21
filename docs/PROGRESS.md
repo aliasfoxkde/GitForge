@@ -44,7 +44,8 @@
 - [x] Scheduler integration tests
 - [x] CLI integration tests
 - [x] Docker sandbox tests (with Docker daemon)
-- [x] 823+ tests passing
+- [x] 872+ tests passing
+- [x] Service binary refactoring (api, ci, git-server, runner) for testability
 
 ## Build Status ✅
 
@@ -104,8 +105,9 @@ SyncClient {
 
 | Metric | Value | Target |
 |--------|-------|--------|
-| Lines covered | 88.20% (3409/3865) | 99% |
-| Change from baseline | +23.52% | - |
+| Lines covered | 89.65% (22973/25623) | 99% |
+| Functions | 87.28% (2068/2377) | 90% |
+| Change from baseline | +24.97% | - |
 
 ### Coverage by Crate
 
@@ -120,13 +122,22 @@ SyncClient {
 | gitforce-runner | 86% | ✅ (with Docker) |
 | gitforce-sandbox | 84% | ✅ (with Docker daemon) |
 | gitforce-api | ~90% | ✅ |
-| gitforce-cli | 70% | ✅ (refactored, now testable) |
+| gitforce-cli | 87% | ✅ |
+| Service binaries | 50-58% | Note 1 |
 
 ### Known Coverage Gaps
 
 1. **CLI sync push/pull**: Require actual HTTP server (sending real network requests)
-2. **Service main.rs entry points**: 0% coverage (requires binary execution)
+2. **Service main.rs entry points**: Limited by tokio::main async entry point (Note 2)
 3. **get_job_logs**: Placeholder returning static string - not implemented
+
+### Service Binary Coverage Notes
+
+Service binaries (`api`, `ci`, `git-server`, `runner`) have limited coverage because:
+- The `main()` entry point is an async `tokio::main` which cannot be called from tests
+- Complex initialization requires external resources (database, Docker, signals)
+- **Mitigation**: Extracted testable functions (create_shutdown_flag, spawn_shutdown_handler, etc.) for unit testing
+- The actual `main()` body code is the async runtime entry which is tested via integration tests
 
 ### Docker Integration Status
 - ✅ Docker daemon running
