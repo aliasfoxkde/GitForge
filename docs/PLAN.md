@@ -1,31 +1,31 @@
 # GitForge Project Plan
 
-**Version**: 1.1.0
-**Last Updated**: 2026-07-14
+**Version**: 1.2.0
+**Last Updated**: 2026-07-21
 **Status**: IN PROGRESS
 
 ---
 
 ## Current Implementation Status
 
-**Coverage**: 64.24% (2104/3275 lines) and growing
-**Tests**: 382 passing
-**Last Updated**: 2026-07-14
+**Coverage**: 88.20% (3409/3865 lines)
+**Tests**: 823+ passing
+**Last Updated**: 2026-07-21
 
 ### Implemented Components
 
 | Crate | Status | Coverage |
 |-------|--------|----------|
-| `gitforce-common` | ✅ Implemented | ~60% |
-| `gitforce-db` | ✅ Implemented | ~70% |
-| `gitforce-events` | ✅ Implemented | ~70% |
-| `gitforce-storage` | ✅ Implemented | ~80% |
-| `gitforce-ci` | ✅ Implemented | ~65% |
-| `gitforce-scheduler` | 🔄 Partial | ~70% |
-| `gitforce-runner` | 🔄 Partial | ~40% |
-| `gitforce-sandbox` | 🔄 Partial | ~28% |
-| `gitforce-api` | ✅ Implemented | ~50% |
-| `gitforce-cli` | 🔄 Partial | ~20% |
+| `gitforce-common` | ✅ Implemented | ~80% |
+| `gitforce-db` | ✅ Implemented | ~100% |
+| `gitforce-events` | ✅ Implemented | ~80% |
+| `gitforce-storage` | ✅ Implemented | ~81% |
+| `gitforce-ci` | ✅ Implemented | ~85% |
+| `gitforce-scheduler` | ✅ Implemented | ~94% |
+| `gitforce-runner` | ✅ Implemented | ~86% |
+| `gitforce-sandbox` | ✅ Implemented | ~84% |
+| `gitforce-api` | ✅ Implemented | ~90% |
+| `gitforce-cli` | ✅ Implemented | ~70% |
 
 ### Remaining Coverage Areas
 
@@ -38,6 +38,16 @@
 | `gitforce-cli/src/main.rs` | 0% | 80% |
 | `gitforce-sandbox/src/docker.rs` | 26% | 80% |
 | `gitforce-api/src/routes/` | 0% | 80% |
+
+### Cross-Platform Build Support
+
+| Platform | Architecture | Status | Documentation |
+|----------|--------------|--------|----------------|
+| Linux | x86_64, ARM64 | ✅ Ready | Native and cross-compiled (musl) |
+| Windows | x86_64, ARM64 | ✅ Ready | Cross-compiled via mingw |
+| macOS | x86_64, ARM64 | 🔲 Planned | See [MACOS_BUILD.md](./MACOS_BUILD.md) |
+
+**Note**: macOS cross-compilation from Linux is not supported due to Apple SDK licensing restrictions. Builds require native macOS environment or GitHub Actions macOS runners.
 
 ### Path to 99% Coverage
 
@@ -470,11 +480,11 @@ The system is complete when:
 
 | Metric | Current | Target |
 |--------|---------|--------|
-| Code Coverage (core logic) | 64% | 99% |
-| Code Coverage (API handlers) | 50% | 85%+ |
+| Code Coverage (core logic) | 88% | 99% |
+| Code Coverage (API handlers) | 90% | 95%+ |
 | Linting | Zero warnings | Zero warnings |
 | Security | Passes audit | No CVEs |
-| Tests | 382 | 500+ |
+| Tests | 823+ | 900+ |
 
 ---
 

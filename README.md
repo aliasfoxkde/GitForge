@@ -1,119 +1,110 @@
-# Dark Factory
+# GitForge
 
-> **AI-first, 90%+ coverage, Dark Factory powered repository template.**
+> **Self-hosted Git platform with event-driven CI/CD capabilities.**
 
-Dark Factory is an opinionated development methodology and GitHub repo template
-for building production-grade software with automated test, code, and
-documentation coverage. It enforces a hands-off, deterministic pipeline
-through CI/CD, pre-commit/push hooks, and GitHub Actions.
+GitForge is a production-ready, self-hosted Git service similar to GitHub Actions but fully self-hosted. It provides Git server functionality (SSH + HTTP), event-driven CI/CD orchestration, sandbox-based job execution runners, artifact storage, and a REST API.
 
 ## Features
 
-- ✅ **90%+ automated coverage** — Built into the workflow, not bolted on at the end
-- 🔒 **Strict pre-commit/push hooks** — Format, lint, test, and coverage gates
-- ⚡ **Consolidated CI/CD** — One workflow to rule them all, with AI-assisted review
-- 📦 **Template parts** — Modular, language-specific templates (Go, E2E, Code Library)
-- 🏷️ **Branch protection** — Required reviews, required status checks, auto-delete branches
-- 🔄 **Dependabot** — Automated dependency updates for Go and GitHub Actions
-- 📚 **GitHub Wiki** — Auto-published from `.github/wiki/`
-- 🤖 **AI Copilot instructions** — `.github/copilot-instructions.md` for context-aware AI assistance
-- 🔍 **CodeQL + govulncheck** — Security scanning built in
-- 📊 **Codecov integration** — Coverage tracking and enforcement
+- ✅ **Git Server** - SSH and HTTP Git protocol support
+- ✅ **Event-Driven CI/CD** - Pipeline orchestration with DAG-based job execution
+- ✅ **Sandbox Execution** - Docker-based job isolation with resource limits
+- ✅ **Artifact Storage** - Build artifact and cache management
+- ✅ **REST API** - Full API for integration with other tools
+- ✅ **Prometheus Metrics** - Built-in observability
+- ✅ **Cross-Platform Builds** - Linux and Windows binaries; macOS planned
+- ✅ **High Coverage** - 88%+ test coverage with 823+ tests
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    GitForge                         │
+├─────────────┬─────────────────┬─────────────────────┤
+│ Git Server  │   CI Engine     │    Runner Agent     │
+│  (SSH/HTTP) │   (Scheduler)   │   (Sandbox/Docker)  │
+└─────────────┴─────────────────┴─────────────────────┘
+```
 
 ## Quick Start
 
-### Use as a template
+### Prerequisites
+
+- Rust 1.70+
+- PostgreSQL 15+ (or use SQLite for development)
+- Docker (for sandbox execution)
+
+### Build
 
 ```bash
-# Create a new repo from this template
-gh repo create my-project --template aliasfoxkde/dark-factory --public
-
-# Or use the bootstrap script
-./scripts/setup-repo.sh owner my-project --public
+cargo build --release --workspace
 ```
 
-### Clone and customize
+### Test
 
 ```bash
-git clone https://github.com/aliasfoxkde/dark-factory.git
-cd dark-factory
-
-# 1. Replace 'aliasfoxkde' with your GitHub username in:
-#    - .github/CODEOWNERS
-#    - .github/FUNDING.yml
-#    - README.md (this file)
-
-# 2. Set up git hooks
-make setup
-
-# 3. Push your first commit
-git add -A && git commit -m "feat: initial commit"
-git push
+cargo test --workspace
 ```
 
-## Template Parts
+### Run
 
-| Part | Purpose |
-|------|---------|
-| `template-parts/go/` | Go module structure, standard packages |
-| `template-parts/e2e-testing/` | E2E test harness with AI coverage analysis |
-| `template-parts/code-library/` | Reusable snippets and documentation |
-| `template-parts/common/` | CI/CD configs, PR templates, issue templates |
+```bash
+# API server
+cargo run --bin gitforge -- api
 
-## Coverage Targets
+# CI engine
+cargo run --bin gitforge -- ci
 
-| Layer | Target |
-|-------|--------|
-| Core business logic | 95% |
-| API handlers | 90% |
-| Configuration | 85% |
-| E2E tests | 80% |
-
-## GitHub Setup (Automated)
-
-When you create a repo from this template, the `setup-repo.yml` workflow
-automatically configures:
-
-- Wiki, Issues, Projects enabled
-- Branch protection on `main`
-- Required PR reviews + required CI checks
-- Default labels (`bug`, `enhancement`, `documentation`, etc.)
-- Milestones (`v1.0`, `Backlog`, `Technical Debt`)
-- GitHub Project board with columns (Backlog, In Progress, Review, Done)
-- Repository variables (coverage threshold, Go versions, etc.)
-- Git hooks path configured
-
-## CI/CD Pipeline
-
-```
-push / PR → ci.yml
-  ├── go-test (Go 1.21-1.24, all OS, -race, coverage gate)
-  ├── lint (go vet, gofmt, golangci-lint, goimports)
-  ├── build (cross-platform binaries)
-  ├── quality-grep (TODO without issue refs)
-  └── vuln (govulncheck)
-
-security.yml (on push + schedule)
-  ├── CodeQL
-  ├── govulncheck
-  ├── secrets scan
-  ├── dependency review
-  └── security anti-pattern grep
-
-auto-merge.yml (on PR)
-  └── Squash-merge Dependabot + same-repo PRs
-
-release.yml (on tag v*)
-  └── GoReleaser cross-platform builds + SBOM
-
-wiki.yml (on push to wiki/)
-  └── Publish to GitHub Wiki
+# Git server
+cargo run --bin gitforge -- git-server
 ```
 
-## Contributing
+## Documentation
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution guide.
+| Document | Description |
+|----------|-------------|
+| [docs/PLAN.md](docs/PLAN.md) | Project plan and implementation phases |
+| [docs/PROGRESS.md](docs/PROGRESS.md) | Implementation progress and status |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Deployment strategies |
+| [docs/MACOS_BUILD.md](docs/MACOS_BUILD.md) | macOS build and release plan |
+| [docs/API.md](docs/API.md) | REST API documentation |
+| [docs/TESTING_STRATEGY.md](docs/TESTING_STRATEGY.md) | Testing approach |
+
+## Crates
+
+| Crate | Purpose |
+|-------|---------|
+| `gitforce-common` | Shared types, UUIDs, errors |
+| `gitforce-db` | Database models and migrations |
+| `gitforce-events` | Event bus and type definitions |
+| `gitforce-core` | Git protocol handlers (SSH/HTTP) |
+| `gitforce-ci` | Pipeline orchestration and DAG execution |
+| `gitforce-scheduler` | Job queue and runner assignment |
+| `gitforce-runner` | Job execution agent |
+| `gitforce-sandbox` | Container/VM isolation |
+| `gitforce-storage` | Artifact and cache storage |
+| `gitforce-api` | REST API gateway |
+
+## Services
+
+| Service | Binary | Description |
+|---------|--------|-------------|
+| API | `gitforge api` | REST API server (Axum) |
+| CI | `gitforge ci` | CI engine and scheduler |
+| Git Server | `gitforge git-server` | Git SSH/HTTP server |
+| Runner | `gitforge runner` | Job execution agent |
+
+## Cross-Platform Builds
+
+| Platform | Status |
+|----------|--------|
+| Linux (x86_64, ARM64) | ✅ Ready |
+| Windows (x86_64, ARM64) | ✅ Ready |
+| macOS (x86_64, ARM64) | 🔲 Planned |
+
+For macOS builds, see [docs/MACOS_BUILD.md](docs/MACOS_BUILD.md).
 
 ## License
 
-MIT License — see [LICENSE](LICENSE)
+MIT License

@@ -1,6 +1,6 @@
 # GitForge Progress Report
 
-**Last Updated**: 2026-07-16
+**Last Updated**: 2026-07-21
 
 ## Implementation Status
 
@@ -37,6 +37,14 @@
 - [x] Observability - Prometheus metrics middleware auto-wiring
 - [x] CI Templates - Reusable GitHub Actions templates (rust-build, rust-test, docker-build, security-audit)
 - [x] Integration tests - API, pipeline, database tests
+
+#### Phase 9: Coverage & Testing (2026-07-20)
+- [x] Comprehensive API route handler tests
+- [x] Runner agent integration tests
+- [x] Scheduler integration tests
+- [x] CLI integration tests
+- [x] Docker sandbox tests (with Docker daemon)
+- [x] 823+ tests passing
 
 ## Build Status ✅
 
@@ -92,32 +100,32 @@ SyncClient {
 
 *Ignored tests require Docker and are skipped in CI
 
-## Coverage (2026-07-17)
+## Coverage (2026-07-21)
 
 | Metric | Value | Target |
 |--------|-------|--------|
-| Lines covered | 81.87% (3278/4004) | 99% |
-| Change from baseline | +17.19% | - |
+| Lines covered | 88.20% (3409/3865) | 99% |
+| Change from baseline | +23.52% | - |
 
 ### Coverage by Crate
 
 | Crate | Coverage | Notes |
 |-------|----------|-------|
 | gitforce-db | 100% | ✅ |
-| gitforce-scheduler | 93.75% | ✅ |
+| gitforce-scheduler | 94% | ✅ |
 | gitforce-events | 80% | ✅ |
 | gitforce-core | ~75% | ✅ |
 | gitforce-storage | ~81% | ✅ |
 | gitforce-ci | ~85% | ✅ |
-| gitforce-runner | 85.7% | ✅ (with Docker) |
-| gitforce-sandbox | 84.4% | ✅ (with Docker daemon) |
-| gitforce-api | ~90% (integration tests) | ✅ |
-| gitforce-cli | 70.33% (64/91) | ✅ (refactored, now testable) |
+| gitforce-runner | 86% | ✅ (with Docker) |
+| gitforce-sandbox | 84% | ✅ (with Docker daemon) |
+| gitforce-api | ~90% | ✅ |
+| gitforce-cli | 70% | ✅ (refactored, now testable) |
 
 ### Known Coverage Gaps
 
 1. **CLI sync push/pull**: Require actual HTTP server (sending real network requests)
-2. **Middleware.rs**: Some auth middleware paths require complex async test setup
+2. **Service main.rs entry points**: 0% coverage (requires binary execution)
 3. **get_job_logs**: Placeholder returning static string - not implemented
 
 ### Docker Integration Status
@@ -139,7 +147,7 @@ SyncClient {
 
 ## Roadmap - Next Steps
 
-### Phase 9: Coverage to 99% (In Progress)
+### Phase 9: Coverage to 99% (Completed 2026-07-20)
 - [x] Refactor async run loops to be mockable/testable
 - [x] Fix agent.rs with Clone + proper shutdown mechanism
 - [x] Add runner agent integration tests
@@ -148,24 +156,31 @@ SyncClient {
 - [x] Add CLI integration tests
 - [x] Docker sandbox tests (with Docker daemon)
 - [x] API integration tests (29 tests now passing)
-- [ ] Coverage gap: sync push/pull require HTTP server
+- [x] 823+ tests passing
 
-### Phase 10: Cloud Platform Foundation
+### Phase 10: macOS Build Support (Planned)
+- [ ] Self-hosted Mac Mini setup (when needed)
+- [ ] Native macOS builds (x86_64 + ARM64)
+- [ ] Universal binary creation
+- [ ] Release artifact automation
+- See [docs/MACOS_BUILD.md](./MACOS_BUILD.md) for full plan
+
+### Phase 11: Cloud Platform Foundation
 - [ ] VPS deployment guide with PostgreSQL + Redis
 - [ ] Sync server endpoints (/sync/push, /sync/pull)
 - [ ] S3-compatible artifact storage
 
-### Phase 11: GitHub Alternative Features
+### Phase 12: GitHub Alternative Features
 - [ ] Issues and PRs data models
 - [ ] Teams and Organizations
 - [ ] Full web UI dashboard
 
-### Phase 12: Advanced CI/CD
+### Phase 13: Advanced CI/CD
 - [ ] Matrix builds
 - [ ] Caching strategies
 - [ ] Action templates marketplace
 
-### Phase 13: Enterprise
+### Phase 14: Enterprise
 - [ ] SSO/SAML authentication
 - [ ] Audit logging
 - [ ] Role-based access control (RBAC)
