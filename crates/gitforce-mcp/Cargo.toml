@@ -1,0 +1,24 @@
+[package]
+name = "gitforce-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "GitForge MCP server — exposes CI/CD tools to Claude Code CLI"
+authors = ["GitForge Team"]
+license = "MIT"
+
+[[bin]]
+name = "gitforge-mcp"
+path = "src/main.rs"
+
+[dependencies]
+gitforce-ci = { path = "../gitforce-ci" }
+gitforce-delta = { path = "../gitforce-delta" }
+gitforce-common = { path = "../gitforce-common" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
