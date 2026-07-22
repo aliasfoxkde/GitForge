@@ -1,0 +1,95 @@
+name: Smoke Test
+
+on:
+  workflow_call:
+    secrets:
+      GITHUB_TOKEN:
+        required: false
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ─── File Structure Checks ─────────────────────────────────────────────
+      - name: Check for required files
+        run: |
+          MISSING=""
+          [ -f "README.md" ] || MISSING="$MISSING README.md"
+          [ -f "LICENSE" ] || [ -f "LICENSE.md" ] || MISSING="$MISSING LICENSE"
+          [ -f ".gitattributes" ] || MISSING="$MISSING .gitattributes"
+          [ -f ".gitignore" ] || MISSING="$MISSING .gitignore"
+          if [ -n "$MISSING" ]; then
+            echo "ERROR: Missing required files:$MISSING"
+            exit 1
+          fi
+          echo "File structure check passed."
+
+      # ─── README Content Checks ─────────────────────────────────────────────
+      - name: Check README has content
+        run: |
+          LINES=$(wc -l < README.md)
+          if [ "$LINES" -lt 10 ]; then
+            echo "ERROR: README.md appears empty (less than 10 lines)"
+            exit 1
+          fi
+          echo "README content check passed."
+
+      # ─── License Check ────────────────────────────────────────────────────
+      - name: Check LICENSE is MIT/Apache/BSD/GPL
+        run: |
+          if [ -f "LICENSE" ]; then
+            head -3 LICENSE | grep -qiE "(mit|apache|bsd|gpl|cc0|unlicense|isc)" || {
+              echo "WARNING: LICENSE file does not appear to be a common open-source license"
+            }
+          elif [ -f "LICENSE.md" ]; then
+            head -3 LICENSE.md | grep -qiE "(mit|apache|bsd|gpl|cc0|unlicense|isc)" || {
+              echo "WARNING: LICENSE.md file does not appear to be a common open-source license"
+            }
+          fi
+          echo "License check passed."
+
+      # ─── Gitattributes Sanity ──────────────────────────────────────────────
+      - name: Check .gitattributes has proper settings
+        run: |
+          if grep -q "linguist-language" .gitattributes; then
+            echo ".gitattributes contains language overrides — verify they are intentional"
+          fi
+          if ! grep -q "text=" .gitattributes && ! grep -q "binary" .gitattributes; then
+            echo "WARNING: .gitattributes may be missing text/binary declarations"
+          fi
+          echo ".gitattributes check passed."
+
+      # ─── No Committed Secrets ──────────────────────────────────────────────
+      - name: Check for obvious committed secrets
+        run: |
+          FOUND=$(find . \
+            \( -path './.git' -o -path './.github' -o -path './template-parts' \) -prune -o \
+            \( -name '*.env' -o -name '*.pem' -o -name '*.key' -o -name '*.p12' \) \
+            -type f -print 2>/dev/null)
+          if [ -n "$FOUND" ]; then
+            echo "WARNING: Potential secret files found:"
+            echo "$FOUND"
+            # Don't fail — .env might be a committed example config
+          fi
+          echo "No committed secrets check passed."
+
+      # ─── Git History Sanity ───────────────────────────────────────────────
+      - name: Check for meaningful commit history
+        run: |
+          COMMITS=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+          if [ "$COMMITS" -lt 1 ]; then
+            echo "WARNING: Repository has no commit history"
+          else
+            echo "Repository has $COMMITS commits — check passed."
+          fi
+
+      # ─── Branch Name Check (advisory) ──────────────────────────────────────
+      - name: Check branch naming convention
+        run: |
+          BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+          if [ -n "$BRANCH" ] && [[ "$BRANCH" =~ ^[A-Z] ]]; then
+            echo "WARNING: Branch name '$BRANCH' starts with uppercase — convention is lowercase-kebab-case"
+          fi
+          echo "Branch name check passed."

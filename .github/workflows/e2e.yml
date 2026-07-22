@@ -1,0 +1,120 @@
+name: E2E Tests
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      browser:
+        description: 'Browser to test'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - chromium
+          - firefox
+          - webkit
+  # Run when e2e test files change
+  push:
+    branches: [$default-branch]
+    paths:
+      - 'tests/e2e/**'
+      - 'playwright.config.ts'
+      - 'package.json'
+      - '.github/workflows/e2e.yml'
+  pull_request:
+    paths:
+      - 'tests/e2e/**'
+      - 'playwright.config.ts'
+      - 'package.json'
+      - '.github/workflows/e2e.yml'
+
+env:
+  DEFAULT_BRANCH: ${{ vars.DEFAULT_BRANCH || 'main' }}
+  E2E_TIMEOUT: ${{ vars.E2E_TIMEOUT || '30000' }}
+  PARALLEL_WORKERS: ${{ vars.PARALLEL_WORKERS || '2' }}
+
+jobs:
+  # ─── Detect E2E files ────────────────────────────────────────────────────
+  check-e2e:
+    runs-on: ubuntu-latest
+    outputs:
+      has_e2e: ${{ steps.check.outputs.has_e2e }}
+      has_playwright: ${{ steps.check.outputs.has_playwright }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: check
+        run: |
+          E2E_FILES=$(find . -type f \( -name "*.test.ts" -o -name "*.spec.ts" -o -name "*.test.js" \) -path "*/e2e/*" 2>/dev/null | head -1)
+          if [ -n "$E2E_FILES" ]; then
+            echo "has_e2e=true" >> $GITHUB_OUTPUT
+            echo "E2E test files detected"
+          else
+            echo "has_e2e=false" >> $GITHUB_OUTPUT
+            echo "No E2E test files found"
+          fi
+
+          if [ -f "playwright.config.ts" ] || [ -f "playwright.config.js" ]; then
+            echo "has_playwright=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_playwright=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ─── Playwright E2E Tests ───────────────────────────────────────────────
+  e2e-tests:
+    needs: check-e2e
+    if: needs.check-e2e.outputs.has_e2e == 'true' && needs.check-e2e.outputs.has_playwright == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Run E2E tests (${{ matrix.browser }})
+        env:
+          E2E_BASE_URL: ${{ vars.E2E_BASE_URL || 'http://localhost:3000' }}
+          E2E_TIMEOUT: ${{ env.E2E_TIMEOUT }}
+          PARALLEL_WORKERS: ${{ env.PARALLEL_WORKERS }}
+        run: |
+          npx playwright test \
+            --project=${{ matrix.browser }} \
+            --timeout=${{ env.E2E_TIMEOUT }} \
+            --workers=${{ env.PARALLEL_WORKERS }} \
+            --reporter=list
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report-${{ matrix.browser }}
+          path: |
+            test-results/
+            playwright-report/
+          retention-days: 7
+
+  # ─── No E2E files notice ────────────────────────────────────────────────
+  no-e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    if: needs.check-e2e.outputs.has_e2e == 'false'
+    steps:
+      - name: No E2E tests found
+        run: |
+          echo "No E2E test files found in tests/e2e/ directory."
+          echo "To enable E2E tests, add playwright test files to tests/e2e/"

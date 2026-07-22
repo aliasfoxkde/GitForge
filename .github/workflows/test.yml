@@ -1,0 +1,215 @@
+name: Test
+
+on:
+  workflow_call:
+    inputs:
+      has_go:
+        required: true
+        type: string
+      has_python:
+        required: true
+        type: string
+      has_rust:
+        required: true
+        type: string
+      has_typescript:
+        required: true
+        type: string
+      has_bash:
+        required: true
+        type: string
+    secrets:
+      GITHUB_TOKEN:
+        required: false
+
+env:
+  DEFAULT_BRANCH: ${{ vars.DEFAULT_BRANCH || 'main' }}
+  COVERAGE_THRESHOLD: ${{ vars.COVERAGE_THRESHOLD || 70 }}
+  GO_VERSIONS: ${{ vars.GO_VERSIONS || '["1.21","1.22","1.23","1.24"]' }}
+  PYTHON_VERSIONS: ${{ vars.PYTHON_VERSIONS || '["3.11","3.12","3.13"]' }}
+
+jobs:
+  # ─── Go Tests ───────────────────────────────────────────────────────────
+  test-go:
+    name: Test Go
+    if: inputs.has_go == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ${{ fromJSON(env.GO_VERSIONS) }}
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go ${{ matrix.go }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ matrix.go }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.go }}-
+
+      - name: Run tests with coverage
+        run: go test -p 1 -race -timeout 15m -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Coverage check
+        run: |
+          COV=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | tr -d '%')
+          echo "Coverage: $COV%"
+          if (( $(echo "$COV < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) )); then
+            echo "ERROR: coverage $COV% below threshold ${{ env.COVERAGE_THRESHOLD }}%"
+            exit 1
+          fi
+
+      - name: Upload coverage to Codecov
+        if: matrix.os == 'ubuntu-latest' && matrix.go == '1.24'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.out
+          flags: unittests
+          fail_ci_if_error: false
+
+      - name: Upload test results
+        if: matrix.os == 'ubuntu-latest' && matrix.go == '1.24'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: coverage.out
+
+  # ─── Python Tests ────────────────────────────────────────────────────────
+  test-python:
+    name: Test Python
+    runs-on: ubuntu-latest
+    if: inputs.has_python == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ${{ fromJSON(env.PYTHON_VERSIONS) }}
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      UV_VERSION: ${{ vars.UV_VERSION || '0.5.18' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+
+      - name: Set up Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }}
+
+      - name: Install dependencies
+        run: uv sync --frozen-lockfile
+
+      - name: Run unit tests
+        run: uv run pytest -m unit --timeout=60 -v --cov=. --cov-report=xml
+
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+      - name: Check coverage threshold
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        run: |
+          uv run coverage report --precision=2
+          uv run coverage report --fail-under=${{ env.COVERAGE_THRESHOLD }}
+
+  # ─── Rust Tests ─────────────────────────────────────────────────────────
+  test-rust:
+    name: Test Rust
+    runs-on: ubuntu-latest
+    if: inputs.has_rust == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-target-
+
+      - name: Run tests
+        run: cargo test --workspace --no-fail-fast --all-features
+
+      - name: Run doc tests
+        run: cargo test --doc --workspace
+
+  # ─── TypeScript Tests ────────────────────────────────────────────────────
+  test-ts:
+    name: Test TypeScript
+    runs-on: ubuntu-latest
+    if: inputs.has_typescript == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npx vitest run --coverage
+
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-ts
+          path: coverage/
+
+      - name: Check coverage threshold
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          COV=$(npx vitest run --coverage --coverage.reporter=json | jq '.results[0].statements.pct' || echo "0")
+          if (( $(echo "$COV < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) )); then
+            echo "ERROR: coverage $COV% below threshold ${{ env.COVERAGE_THRESHOLD }}%"
+            exit 1
+          fi

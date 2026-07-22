@@ -1,0 +1,53 @@
+name: AI Review
+
+# Runs on PR open/update — architecture supports TaskWizer CLI swap-in later.
+# Controlled by ENABLE_AI_REVIEW repo variable (default: false).
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+env:
+  ENABLE_AI_REVIEW: ${{ vars.ENABLE_AI_REVIEW || 'false' }}
+
+jobs:
+  # ─── Claude Code Review (interim — replaces with TaskWizer CLI later) ──────
+  claude-review:
+    name: AI Code Review
+    runs-on: ubuntu-latest
+    if: env.ENABLE_AI_REVIEW == 'true'
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run AI review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          claude-code review \
+            --repo "${{ github.repository }}" \
+            --pr "${{ github.event.pull_request.number }}" \
+            --github-token "$GITHUB_TOKEN"
+
+      - name: Post review summary
+        if: always()
+        run: |
+          echo "AI review completed. Check PR comments for findings."
+
+  # ─── Disabled notice ────────────────────────────────────────────────────
+  disabled:
+    name: AI Review
+    runs-on: ubuntu-latest
+    if: env.ENABLE_AI_REVIEW != 'true'
+    steps:
+      - name: AI Review is disabled
+        run: |
+          echo "AI review is disabled. Set ENABLE_AI_REVIEW=true in repo variables to enable."
+          echo "When TaskWizer CLI is available, it will replace the Claude Code CLI."

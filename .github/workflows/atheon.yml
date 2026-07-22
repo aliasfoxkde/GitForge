@@ -1,0 +1,86 @@
+name: Atheon Security Scan
+
+# Runs on push to main/stable and on all PRs.
+# Produces SARIF output → GitHub Security tab.
+# Categories: secrets, pii, security, ai-detection, quality (384+ patterns, 28 categories)
+on:
+  push:
+    branches: [main, stable]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 6am UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─── Security + PII Scan ─────────────────────────────────────────────────
+  atheon-security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Atheon-Enhanced
+        run: |
+          wget -q https://github.com/aliasfoxkde/Atheon-Enhanced/releases/latest/download/atheon-linux-amd64
+          chmod +x atheon-linux-amd64
+          sudo mv atheon-linux-amd64 /usr/local/bin/atheon
+
+      - name: Run Atheon Security Scan (secrets + PII + security)
+        run: |
+          atheon --categories=secrets,pii,security --sarif results.sarif ./
+
+      - name: Run Atheon Quality Scan
+        run: |
+          atheon --categories=ai-detection,quality --sarif quality-results.sarif ./ || true
+
+      - name: Upload SARIF results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: results.sarif
+          category: atheon-security
+
+      - name: Upload Quality SARIF results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: quality-results.sarif
+          category: atheon-quality
+
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: atheon-results
+          path: |
+            results.sarif
+            quality-results.sarif
+
+  # ─── PR Changed Files Scan ────────────────────────────────────────────────
+  atheon-pattern-check:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Atheon-Enhanced
+        run: |
+          wget -q https://github.com/aliasfoxkde/Atheon-Enhanced/releases/latest/download/atheon-linux-amd64
+          chmod +x atheon-linux-amd64
+          sudo mv atheon-linux-amd64 /usr/local/bin/atheon
+
+      - name: Check for sensitive data in PR
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          if [ -n "$CHANGED_FILES" ]; then
+            atheon --categories=secrets,pii $CHANGED_FILES || {
+              echo "Secrets or PII detected in changed files!"
+              exit 1
+            }
+          fi

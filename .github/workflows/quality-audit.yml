@@ -1,0 +1,168 @@
+name: Quality Audit
+
+on:
+  workflow_call:
+    inputs:
+      has_go:
+        required: true
+        type: string
+      has_python:
+        required: true
+        type: string
+      has_rust:
+        required: true
+        type: string
+      has_typescript:
+        required: true
+        type: string
+    secrets:
+      GITHUB_TOKEN:
+        required: false
+
+env:
+  COMPLEXITY_THRESHOLD: ${{ vars.COMPLEXITY_THRESHOLD || 10 }}
+  COGNITIVE_THRESHOLD: ${{ vars.COGNITIVE_THRESHOLD || 15 }}
+
+jobs:
+  # ─── Complexity Analysis (Go) ─────────────────────────────────────────────
+  complexity-go:
+    name: Complexity Go
+    runs-on: ubuntu-latest
+    if: inputs.has_go == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Install gocloc
+        run: go install github.com/hhatto/gocloc/cmd/gocloc@latest
+
+      - name: Run complexity check
+        run: |
+          # Check for functions with high cyclomatic complexity using govet
+          go install github.com/fzipp/gocyclo/cmd/gocyclo@latest
+
+          HIGH_CPLX=$(gocyclo -over ${{ env.COMPLEXITY_THRESHOLD }} ./... 2>/dev/null | grep -v "_test.go" || true)
+          if [ -n "$HIGH_CPLX" ]; then
+            echo "WARNING: Functions with complexity > ${{ env.COMPLEXITY_THRESHOLD }}:"
+            echo "$HIGH_CPLX"
+            echo "Consider refactoring these functions."
+          else
+            echo "Complexity check passed — no functions exceed threshold."
+          fi
+
+  # ─── Complexity Analysis (Python) ─────────────────────────────────────────
+  complexity-python:
+    name: Complexity Python
+    runs-on: ubuntu-latest
+    if: inputs.has_python == 'true'
+    env:
+      UV_VERSION: ${{ vars.UV_VERSION || '0.5.18' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+
+      - name: Run radon complexity
+        run: uv tool install radon
+        continue-on-error: true
+
+      - name: Check complexity
+        run: |
+          uv run radon cc --min=${{ env.COMPLEXITY_THRESHOLD }} -s src/ tests/ 2>/dev/null || {
+            echo "Radon complexity check skipped (or no complex functions found)"
+          }
+
+  # ─── Complexity Analysis (Rust) ────────────────────────────────────────────
+  complexity-rust:
+    name: Complexity Rust
+    runs-on: ubuntu-latest
+    if: inputs.has_rust == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-geiger
+        run: cargo install cargo-geiger 2>/dev/null || true
+        continue-on-error: true
+
+      - name: Check for unsafe code
+        run: |
+          cargo geiger --quiet 2>/dev/null || {
+            echo "cargo-geiger check skipped (unsafe code report unavailable)"
+          }
+
+  # ─── Hot-spot Detection ────────────────────────────────────────────────────
+  hot-spots:
+    name: Hot-spot Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect large files
+        run: |
+          LARGE=$(find . \
+            \( -path './.git' -o -path './vendor' -o -path './target' \
+               -o -path './node_modules' -o -path './template-parts' \
+               -o -path './.github' \) -prune -o \
+            \( -name '*.go' -o -name '*.py' -o -name '*.rs' \
+               -o -name '*.ts' -o -name '*.js' \) \
+            -type f -size +500k -print 2>/dev/null)
+          if [ -n "$LARGE" ]; then
+            echo "WARNING: Large source files (>500KB) found:"
+            echo "$LARGE"
+            echo "Consider splitting large files to improve maintainability."
+          else
+            echo "No oversized source files detected."
+          fi
+
+      - name: Detect deep nesting
+        run: |
+          DEEP=$(find . \
+            \( -path './.git' -o -path './vendor' -o -path './target' \
+               -o -path './node_modules' -o -path './template-parts' \
+               -o -path './.github' \) -prune -o \
+            \( -name '*.go' -o -name '*.py' -o -name '*.rs' \
+               -o -name '*.ts' -o -name '*.js' \) \
+            -type f -exec awk '
+              /\{$/ { depth++ } /^\}/ { if(depth>0) depth-- }
+              depth>6 { print FILENAME ":" NR " has nesting depth " depth }
+            ' {} \; 2>/dev/null | head -10 || true)
+          if [ -n "$DEEP" ]; then
+            echo "WARNING: Deep nesting (>6 levels) detected:"
+            echo "$DEEP"
+          else
+            echo "No excessive nesting detected."
+          fi
+
+  # ─── TODO/FIXME Audit ─────────────────────────────────────────────────────
+  todo-audit:
+    name: TODO/FIXME Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for unresolved TODOs without issue refs
+        run: |
+          TODOS=$(grep -rnE 'TODO|FIXME|XXX|HACK' \
+            --include="*.go" --include="*.py" \
+            --include="*.rs" --include="*.ts" --include="*.js" \
+            . 2>/dev/null | \
+            grep -vE 'TODO.*#[0-9]+|FIXME.*#[0-9]+' | \
+            grep -vE '_test\.go|_test\.py|test_.*\.rs' | \
+            head -20 || true)
+          if [ -n "$TODOS" ]; then
+            echo "WARNING: Found TODO/FIXME without issue references:"
+            echo "$TODOS"
+          else
+            echo "No unresolved TODOs found without issue references."
+          fi

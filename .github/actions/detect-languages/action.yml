@@ -1,0 +1,29 @@
+name: Detect Languages
+description: |
+  Detects project languages and sets outputs:
+  has_go, has_python, has_rust, has_typescript, has_bash
+
+outputs:
+  has_go:
+    description: "True if Go module (go.mod) detected"
+    value: ${{ steps.detect.outputs.has_go }}
+  has_python:
+    description: "True if Python project (pyproject.toml + .py files) detected"
+    value: ${{ steps.detect.outputs.has_python }}
+  has_rust:
+    description: "True if Rust project (Cargo.toml) detected"
+    value: ${{ steps.detect.outputs.has_rust }}
+  has_typescript:
+    description: "True if TypeScript project (package.json + .ts files) detected"
+    value: ${{ steps.detect.outputs.has_typescript }}
+  has_bash:
+    description: "True if Bash/Shell scripts detected"
+    value: ${{ steps.detect.outputs.has_bash }}
+
+runs:
+  using: composite
+  steps:
+    - name: Detect languages
+      id: detect
+      shell: bash
+      run: ${{ github.action_path }}/detect.sh

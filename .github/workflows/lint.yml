@@ -1,0 +1,151 @@
+name: Lint
+
+on:
+  workflow_call:
+    inputs:
+      has_go:
+        required: true
+        type: string
+      has_python:
+        required: true
+        type: string
+      has_rust:
+        required: true
+        type: string
+      has_typescript:
+        required: true
+        type: string
+      has_bash:
+        required: true
+        type: string
+    secrets:
+      GITHUB_TOKEN:
+        required: false
+
+env:
+  GOLANGCI_LINT_VERSION: ${{ vars.GOLANGCI_LINT_VERSION || 'v2.1.6' }}
+
+jobs:
+  # ─── Go Lint ─────────────────────────────────────────────────────────────
+  lint-go:
+    name: Lint Go
+    runs-on: ubuntu-latest
+    if: inputs.has_go == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Check gofmt
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "gofmt must format these files:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${{ env.GOLANGCI_LINT_VERSION }}/install.sh" | sh -s -- -b "$(go env GOPATH)/bin" "${{ env.GOLANGCI_LINT_VERSION }}"
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run golangci-lint
+        run: golangci-lint run --timeout=5m --concurrency=2
+
+      - name: Check goimports
+        run: |
+          which goimports || go install golang.org/x/tools/cmd/goimports@latest
+          UNIMPORTED=$(goimports -l .)
+          if [ -n "$UNIMPORTED" ]; then
+            echo "goimports must format these files:"
+            echo "$UNIMPORTED"
+            exit 1
+          fi
+
+  # ─── Python Lint ─────────────────────────────────────────────────────────
+  lint-python:
+    name: Lint Python
+    runs-on: ubuntu-latest
+    if: inputs.has_python == 'true'
+    env:
+      UV_VERSION: ${{ vars.UV_VERSION || '0.5.18' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+
+      - name: Lint with ruff
+        run: uv run ruff check . --output-format=github
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+  # ─── Rust Lint ───────────────────────────────────────────────────────────
+  lint-rust:
+    name: Lint Rust
+    runs-on: ubuntu-latest
+    if: inputs.has_rust == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-features -- -D warnings
+
+  # ─── TypeScript Lint ─────────────────────────────────────────────────────
+  lint-ts:
+    name: Lint TypeScript
+    runs-on: ubuntu-latest
+    if: inputs.has_typescript == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npx eslint . --max-warnings 0
+
+      - name: Check Prettier
+        run: npx prettier --check .
+
+  # ─── Shell Lint ──────────────────────────────────────────────────────────
+  lint-shell:
+    name: Lint Shell
+    runs-on: ubuntu-latest
+    if: inputs.has_bash == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Find shell scripts
+        run: |
+          find . \
+            \( -path './.githooks/*' -o -path './.github/workflows/*' -o -path './template-parts/*' \) -prune -o \
+            -name "*.sh" -type f -print | xargs shellcheck --severity=warning || true
