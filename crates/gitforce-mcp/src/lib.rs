@@ -19,6 +19,7 @@
 //! - `get_repo_config` — Get CI configuration for a repo
 
 pub mod handlers;
+pub mod http_server;
 pub mod server;
 pub mod tools;
 

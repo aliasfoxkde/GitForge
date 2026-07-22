@@ -2,15 +2,16 @@
 //!
 //! Entry point for the GitForge MCP server — exposes CI/CD tools to Claude Code CLI.
 //!
-//! Usage:
+//! Usage (stdio mode — for Claude Code CLI):
 //!   gitforge-mcp               # Runs as MCP server (stdio) — default
-//!   gitforge-mcp serve           # Explicit MCP server mode
-//!   gitforge-mcp run <tool>     # Run a single tool directly (future)
+//!   gitforge-mcp serve        # Explicit stdio mode
+//!
+//! Usage (HTTP mode — for LM Studio and HTTP-based MCP clients):
+//!   gitforge-mcp http        # Runs HTTP server on port 8080
+//!   gitforge-mcp http --port 3000
 
 use clap::Parser;
-use gitforce_mcp::McpServer;
 use std::process;
-use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -23,16 +24,14 @@ use tracing_subscriber::EnvFilter;
 struct Cli {
     #[arg(default_value = "serve", hide_default_value = true)]
     command: String,
-    /// Tool name (when command = run)
-    #[arg(default_value = "")]
-    tool: String,
-    /// Tool arguments as JSON (when command = run)
-    #[arg(default_value = "", hide_default_value = true)]
-    args: Vec<String>,
+    /// HTTP server port (when command = http)
+    #[arg(long, default_value = "8080")]
+    port: u16,
 }
 
-fn main() {
-    // Initialize logging to stderr (stdout is reserved for JSON-RPC)
+#[tokio::main]
+async fn main() {
+    // Initialize logging to stderr (stdout is reserved for JSON-RPC in stdio mode)
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -46,20 +45,22 @@ fn main() {
 
     match cli.command.as_str() {
         "serve" => {
-            info!("Starting GitForge MCP server");
-            if let Err(e) = McpServer::run() {
+            // Stdio MCP mode — for Claude Code CLI
+            if let Err(e) = gitforce_mcp::McpServer::run() {
                 eprintln!("MCP server error: {}", e);
                 process::exit(1);
             }
         }
-        "run" => {
-            eprintln!("Direct tool execution not yet implemented");
-            eprintln!("Run as MCP server: gitforge-mcp");
-            process::exit(1);
+        "http" => {
+            // HTTP MCP mode — for LM Studio and HTTP-based clients
+            if let Err(e) = gitforce_mcp::http_server::run_http(cli.port).await {
+                eprintln!("HTTP server error: {}", e);
+                process::exit(1);
+            }
         }
         _ => {
             eprintln!("Unknown command: {}", cli.command);
-            eprintln!("Usage: gitforge-mcp [serve|run]");
+            eprintln!("Usage: gitforge-mcp [serve|http]");
             process::exit(1);
         }
     }

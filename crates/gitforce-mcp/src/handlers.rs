@@ -28,6 +28,7 @@ impl ToolCall {
 }
 
 /// Main handler — dispatches tool calls to implementations
+#[derive(Clone)]
 pub struct McPHandler;
 
 impl McPHandler {
