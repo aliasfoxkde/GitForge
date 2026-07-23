@@ -1,13 +1,16 @@
 //! GitForge Process Supervision
 //!
 //! This crate provides process supervision utilities for GitForge,
-//! including subreaper setup, SIGCHLD handling, and process pools
-//! to prevent zombie processes and manage concurrent builds.
+//! including subreaper setup, SIGCHLD handling, process pools,
+//! and cgroup-based resource limits to prevent zombie processes
+//! and manage concurrent builds.
 
+pub mod limits;
 pub mod pool;
 pub mod signal;
 pub mod subreaper;
 
+pub use limits::{apply_limits, get_cgroup_path, is_in_cgroup_v2, CpuLimit, MemoryLimit, ResourceLimits};
 pub use pool::{JobWeight, PoolConfig, ProcessPool};
 pub use signal::install_sigchld_handler;
 pub use subreaper::become_subreaper;

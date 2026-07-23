@@ -250,12 +250,12 @@ POST /api/queue/jobs/{id}/complete {result}
 | 4 | 2 | Queue API endpoints | High | ✅ DONE |
 | 5 | 2 | Worker pool implementation | High | ✅ DONE |
 | 6 | 3 | Concurrency limits | High | ✅ DONE |
-| 7 | 3 | Memory/CPU limits | Medium | ⏳ PENDING |
+| 7 | 3 | Memory/CPU limits (prlimit-based) | Medium | ✅ DONE |
 | 8 | 4 | Runner queue integration | Medium | ✅ DONE |
 | 9 | 4 | Webhook → job trigger | Medium | ✅ DONE |
 | 10 | 4 | GitForge-native CI workflow | Medium | ✅ DONE |
 | 11 | 4 | Disable legacy direct-build workflows | Medium | ✅ DONE |
-| 12 | 4 | Results reporting | Medium | ⏳ PENDING |
+| 12 | 4 | Results reporting (step results) | Medium | ✅ DONE |
 
 ## Files to Create
 

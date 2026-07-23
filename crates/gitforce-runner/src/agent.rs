@@ -274,12 +274,27 @@ impl RunnerAgent {
             result.exit_code
         );
 
-        // Report completion to scheduler
+        // Report completion to scheduler with full results
         let complete_url = format!("{}/jobs/{}/complete", scheduler_url, assignment.job_id);
+
+        // Build step results for reporting
+        let step_results_json: Vec<serde_json::Value> = result
+            .step_results
+            .iter()
+            .map(|sr| {
+                serde_json::json!({
+                    "exit_code": sr.exit_code,
+                    "stdout": sr.stdout,
+                    "stderr": sr.stderr,
+                })
+            })
+            .collect();
+
         let complete_request = serde_json::json!({
             "success": result.success,
             "exit_code": result.exit_code,
             "error": result.error,
+            "step_results": step_results_json,
         });
 
         if let Err(e) = client.post(&complete_url).json(&complete_request).send().await {
