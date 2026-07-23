@@ -242,18 +242,18 @@ POST /api/queue/jobs/{id}/complete {result}
 
 ## Implementation Order
 
-| # | Phase | Task | Priority | Est. Effort |
-|---|-------|------|----------|-------------|
-| 1 | 1 | Subreaper setup + SIGCHLD | Critical | 2h |
-| 2 | 1 | Process cleanup on startup | Critical | 1h |
-| 3 | 2 | SQLite job queue model | High | 4h |
-| 4 | 2 | Queue API endpoints | High | 4h |
-| 5 | 2 | Worker pool implementation | High | 6h |
-| 6 | 3 | Concurrency limits | High | 2h |
-| 7 | 3 | Memory/CPU limits | Medium | 8h |
-| 8 | 4 | Runner queue integration | Medium | 6h |
-| 9 | 4 | Webhook → job trigger | Medium | 4h |
-| 10 | 4 | Results reporting | Medium | 4h |
+| # | Phase | Task | Priority | Status |
+|---|-------|------|----------|--------|
+| 1 | 1 | Subreaper setup + SIGCHLD | Critical | ✅ DONE |
+| 2 | 1 | Process cleanup on startup | Critical | ✅ DONE |
+| 3 | 2 | SQLite job queue model | High | ✅ DONE |
+| 4 | 2 | Queue API endpoints | High | ✅ DONE |
+| 5 | 2 | Worker pool implementation | High | ⚠️ PARTIAL |
+| 6 | 3 | Concurrency limits | High | ✅ DONE |
+| 7 | 3 | Memory/CPU limits | Medium | ⏳ PENDING |
+| 8 | 4 | Runner queue integration | Medium | ⚠️ PARTIAL |
+| 9 | 4 | Webhook → job trigger | Medium | ⏳ PENDING |
+| 10 | 4 | Results reporting | Medium | ⏳ PENDING |
 
 ## Files to Create
 

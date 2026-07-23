@@ -122,9 +122,22 @@ async fn get_pending_jobs(State(state): State<SchedulerServerState>) -> impl Int
     // Process queue to assign pending jobs
     state.scheduler.process_queue().await;
 
-    // Return empty array - actual job info would come from database
-    // In real implementation, this would query job details from DB
-    Json(serde_json::json!([]))
+    // Get jobs assigned to runners (these are pending execution)
+    let assigned_jobs = state.scheduler.get_assigned_jobs().await;
+
+    // Convert to response format
+    let job_infos: Vec<PendingJobInfo> = assigned_jobs
+        .into_iter()
+        .map(|(job_id, runner_id, pipeline_run_id)| PendingJobInfo {
+            job_id: job_id.to_string(),
+            name: format!("job-{}", job_id),
+            pipeline_run_id: pipeline_run_id.to_string(),
+            commands: vec!["echo 'job assigned'".to_string()], // Placeholder - real impl would query DB
+            working_dir: None,
+        })
+        .collect();
+
+    Json(serde_json::json!(job_infos))
 }
 
 /// Assign a job to a runner (runner claims a job)
