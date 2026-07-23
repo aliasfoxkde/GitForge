@@ -389,4 +389,82 @@ mod tests {
         assert_eq!(response.name, "complete-repo");
         assert_eq!(response.git_path, "/git/repos/complete-repo");
     }
+
+    #[test]
+    fn test_extract_user_without_auth_header() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let headers = HeaderMap::new();
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_extract_user_with_invalid_token() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer invalid-token".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_extract_user_with_valid_token() {
+        use crate::auth::ApiAuth;
+        use gitforce_common::UserId;
+
+        let auth = ApiAuth::new("test-secret");
+        let user_id = UserId::new();
+        let token = auth.generate_token(user_id, "testuser", "user").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {}", token).parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), user_id);
+    }
+
+    #[test]
+    fn test_validate_repo_name_empty() {
+        let result = validate_repo_name("");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn test_validate_repo_name_path_traversal() {
+        let result = validate_repo_name("../etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains(".."));
+    }
+
+    #[test]
+    fn test_validate_repo_name_too_long() {
+        let long_name = "a".repeat(256);
+        let result = validate_repo_name(&long_name);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("255"));
+    }
+
+    #[test]
+    fn test_validate_repo_name_valid() {
+        let result = validate_repo_name("valid-repo-name");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_repo_name_with_org_format() {
+        let result = validate_repo_name("org/repo");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_repo_name_invalid_char() {
+        let result = validate_repo_name("repo|name");
+        assert!(result.is_err());
+    }
 }
