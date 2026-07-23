@@ -30,8 +30,9 @@ jobs:
       - name: Enqueue build job
         id: enqueue
         run: |
+          set +e  # Don't fail on curl error
           # Call GitForge webhook API to enqueue build job
-          RESPONSE=$(curl -s -X POST \
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "$GITFORGE_API_URL/api/webhook/trigger/${{ github.event.repository.id }}" \
             -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
             -H "Content-Type: application/json" \
@@ -40,25 +41,34 @@ jobs:
               "commit_hash": "${{ github.sha }}",
               "branch": "${{ github.ref_name }}",
               "pipeline_name": "rust-ci"
-            }')
+            }' 2>&1)
 
-          echo "Response: $RESPONSE"
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
 
-          # Extract job_id from response (if available)
-          JOB_ID=$(echo "$RESPONSE" | jq -r '.pipeline_id // empty')
-          if [ -n "$JOB_ID" ]; then
-            echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
-            echo "status=enqueued" >> $GITHUB_OUTPUT
-          else
-            # Fallback: GitForge unavailable, use legacy direct build
-            echo "status=fallback" >> $GITHUB_OUTPUT
+          echo "HTTP Code: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          # Check if we got a successful response
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+            JOB_ID=$(echo "$BODY" | jq -r '.pipeline_id // empty')
+            if [ -n "$JOB_ID" ] && [ "$JOB_ID" != "null" ]; then
+              echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
+              echo "status=enqueued" >> $GITHUB_OUTPUT
+              echo "Successfully enqueued job $JOB_ID"
+              exit 0
+            fi
           fi
 
-      # Fallback: If GitForge unavailable, run directly
+          # Fallback: GitForge unavailable or error, use direct build
+          echo "status=fallback" >> $GITHUB_OUTPUT
+          echo "GitForge unavailable (HTTP $HTTP_CODE), will run direct build"
+
+      # Fallback: If GitForge unavailable, run tests directly
       - name: Fallback - Run tests directly
         if: steps.enqueue.outputs.build_status == 'fallback'
         run: |
-          echo "GitForge unavailable, running tests directly on Actions runner"
+          echo "Running tests directly on Actions runner..."
           cargo test --workspace --no-fail-fast
 
   # Poll GitForge for build status (when GitForge is available)
@@ -71,9 +81,8 @@ jobs:
       - name: Poll for build completion
         run: |
           echo "Build enqueued, polling GitForge for status..."
-          # In production, this would poll GET /api/jobs/{id}/status
-          # For now, we rely on GitForge's runner to pick up the job
           echo "Runner should pick up job: ${{ needs.enqueue-build.outputs.job_id }}"
+          # In production, poll GET /api/jobs/{id}/status until complete
 
   # Report final status to GitHub
   report-status:
