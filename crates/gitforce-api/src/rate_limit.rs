@@ -329,4 +329,70 @@ mod tests {
         limiter.check_rate_limit("test-client").await;
         assert_eq!(limiter.remaining("test-client").await, 3);
     }
+
+    #[tokio::test]
+    async fn test_rate_limiter_cleanup_removes_old_entries() {
+        use std::time::{Duration, Instant};
+
+        let limiter = RateLimiter::new(RateLimitConfig {
+            requests_per_minute: 60,
+            burst_size: 5,
+        });
+
+        // Add a client
+        limiter.check_rate_limit("old-client").await;
+
+        // Manually manipulate the client's last_update to be old
+        {
+            let mut clients = limiter.clients.write().await;
+            if let Some(client) = clients.get_mut("old-client") {
+                client.last_update = Instant::now() - Duration::from_secs(400);
+            }
+        }
+
+        // Cleanup should remove the old entry
+        limiter.cleanup().await;
+
+        let clients = limiter.clients.read().await;
+        assert!(clients.get("old-client").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_preserves_recent_entries() {
+        use std::time::{Duration, Instant};
+
+        let limiter = RateLimiter::new(RateLimitConfig {
+            requests_per_minute: 60,
+            burst_size: 5,
+        });
+
+        // Add a client
+        limiter.check_rate_limit("recent-client").await;
+
+        // Manually manipulate the client's last_update to be recent
+        {
+            let mut clients = limiter.clients.write().await;
+            if let Some(client) = clients.get_mut("recent-client") {
+                client.last_update = Instant::now() - Duration::from_secs(60);
+            }
+        }
+
+        // Cleanup should preserve the recent entry
+        limiter.cleanup().await;
+
+        let clients = limiter.clients.read().await;
+        assert!(clients.get("recent-client").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_remaining_unknown_client() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            requests_per_minute: 60,
+            burst_size: 3,
+        });
+
+        // Unknown client should get full burst size
+        let remaining = limiter.remaining("unknown-client").await;
+        assert_eq!(remaining, 3);
+    }
 }
