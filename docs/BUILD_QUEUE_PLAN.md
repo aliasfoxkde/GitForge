@@ -254,7 +254,8 @@ POST /api/queue/jobs/{id}/complete {result}
 | 8 | 4 | Runner queue integration | Medium | ✅ DONE |
 | 9 | 4 | Webhook → job trigger | Medium | ✅ DONE |
 | 10 | 4 | GitForge-native CI workflow | Medium | ✅ DONE |
-| 11 | 4 | Results reporting | Medium | ⏳ PENDING |
+| 11 | 4 | Disable legacy direct-build workflows | Medium | ✅ DONE |
+| 12 | 4 | Results reporting | Medium | ⏳ PENDING |
 
 ## Files to Create
 
