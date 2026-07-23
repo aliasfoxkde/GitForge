@@ -470,4 +470,98 @@ mod tests {
         let result = validate_repo_name("repo|name");
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_validate_repo_name_starts_with_non_alphanumeric() {
+        let result = validate_repo_name("-starts-with-dash");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("start"));
+    }
+
+    #[test]
+    fn test_validate_repo_name_ends_with_non_alphanumeric() {
+        let result = validate_repo_name("ends-with-dash-");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("end"));
+    }
+
+    #[test]
+    fn test_validate_repo_name_with_underscore() {
+        // underscores should be valid in the middle
+        let result = validate_repo_name("repo_with_underscore");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_repo_name_with_period() {
+        // periods should be valid in the middle
+        let result = validate_repo_name("repo.name");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_repo_name_with_hyphen() {
+        // hyphens should be valid
+        let result = validate_repo_name("repo-name");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_repo_name_org_format_valid() {
+        let result = validate_repo_name("my-org/my-repo");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_repo_name_org_format_invalid_second_part() {
+        // org/repo where second part starts with dash
+        let result = validate_repo_name("org/-invalid");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_user_malformed_auth_header() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "NotBearer token123".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_extract_user_empty_bearer_token() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_extract_user_basic_auth_header() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_user_bearer_with_leading_space() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", " Bearer token123".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+    }
 }
