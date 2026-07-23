@@ -812,4 +812,103 @@ mod tests {
         assert!(json.contains("started_at"));
         assert!(json.contains("finished_at"));
     }
+
+    #[test]
+    fn test_extract_user_malformed_header() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Malformed".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_user_bearer_with_leading_space() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", " Bearer token123".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_user_multiple_auth_headers() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer token1".parse().unwrap());
+        headers.append("Authorization", "Bearer token2".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        // First header should be used
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pipeline_run_response_all_commit_hashes() {
+        for hash in &["a", "abc", "abcdef123456", "a1b2c3d4e5f6789012345678901234"] {
+            let response = PipelineRunResponse {
+                id: "run-hash".to_string(),
+                pipeline_id: "pipe-hash".to_string(),
+                status: "running".to_string(),
+                commit_hash: hash.to_string(),
+                triggered_by: "test".to_string(),
+                started_at: None,
+                finished_at: None,
+            };
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains(hash));
+        }
+    }
+
+    #[test]
+    fn test_pipeline_run_response_all_triggered_by() {
+        for user in &["alice", "bob", "ci-bot", "webhook", "schedule"] {
+            let response = PipelineRunResponse {
+                id: "run-trigger".to_string(),
+                pipeline_id: "pipe-trigger".to_string(),
+                status: "running".to_string(),
+                commit_hash: "abc123".to_string(),
+                triggered_by: user.to_string(),
+                started_at: None,
+                finished_at: None,
+            };
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains(user));
+        }
+    }
+
+    #[test]
+    fn test_job_response_all_names() {
+        for name in &["build", "test", "deploy", "lint", "security-scan"] {
+            let response = JobResponse {
+                id: "job-name".to_string(),
+                name: name.to_string(),
+                status: "queued".to_string(),
+                runner_id: None,
+                started_at: None,
+                finished_at: None,
+            };
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains(name));
+        }
+    }
+
+    #[test]
+    fn test_job_response_with_future_timestamps() {
+        let response = JobResponse {
+            id: "job-future".to_string(),
+            name: "future-job".to_string(),
+            status: "running".to_string(),
+            runner_id: Some("runner-1".to_string()),
+            started_at: Some("2026-12-01T00:00:00Z".to_string()),
+            finished_at: Some("2026-12-01T00:10:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("2026-12-01"));
+    }
 }
