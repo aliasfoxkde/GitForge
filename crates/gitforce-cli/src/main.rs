@@ -802,4 +802,305 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
+
+    #[tokio::test]
+    async fn test_git_init() {
+        let cli = test_cli(Commands::Git {
+            init: Some("/tmp/test-repo".to_string()),
+            clone: None,
+            status: false,
+            push: false,
+            pull: false,
+            add: None,
+            commit: None,
+            log: false,
+            remote: false,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_git_clone() {
+        let cli = test_cli(Commands::Git {
+            init: None,
+            clone: Some("https://example.com/repo.git".to_string()),
+            status: false,
+            push: false,
+            pull: false,
+            add: None,
+            commit: None,
+            log: false,
+            remote: false,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_git_push() {
+        let cli = test_cli(Commands::Git {
+            init: None,
+            clone: None,
+            status: false,
+            push: true,
+            pull: false,
+            add: None,
+            commit: None,
+            log: false,
+            remote: false,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_git_pull() {
+        let cli = test_cli(Commands::Git {
+            init: None,
+            clone: None,
+            status: false,
+            push: false,
+            pull: true,
+            add: None,
+            commit: None,
+            log: false,
+            remote: false,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_git_add() {
+        let cli = test_cli(Commands::Git {
+            init: None,
+            clone: None,
+            status: false,
+            push: false,
+            pull: false,
+            add: Some(".".to_string()),
+            commit: None,
+            log: false,
+            remote: false,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_git_add_specific_file() {
+        let cli = test_cli(Commands::Git {
+            init: None,
+            clone: None,
+            status: false,
+            push: false,
+            pull: false,
+            add: Some("src/main.rs".to_string()),
+            commit: None,
+            log: false,
+            remote: false,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_git_commit() {
+        let cli = test_cli(Commands::Git {
+            init: None,
+            clone: None,
+            status: false,
+            push: false,
+            pull: false,
+            add: None,
+            commit: Some("Initial commit".to_string()),
+            log: false,
+            remote: false,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_show() {
+        let cli = test_cli(Commands::Pipeline {
+            list: false,
+            show: Some("pipeline-123".to_string()),
+            run: None,
+            watch: None,
+            create: None,
+            delete: None,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_run() {
+        let cli = test_cli(Commands::Pipeline {
+            list: false,
+            show: None,
+            run: Some("pipeline-123".to_string()),
+            watch: None,
+            create: None,
+            delete: None,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_watch() {
+        let cli = test_cli(Commands::Pipeline {
+            list: false,
+            show: None,
+            run: None,
+            watch: Some("pipeline-123".to_string()),
+            create: None,
+            delete: None,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_create() {
+        let cli = test_cli(Commands::Pipeline {
+            list: false,
+            show: None,
+            run: None,
+            watch: None,
+            create: Some("new-pipeline".to_string()),
+            delete: None,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_delete() {
+        let cli = test_cli(Commands::Pipeline {
+            list: false,
+            show: None,
+            run: None,
+            watch: None,
+            create: None,
+            delete: Some("pipeline-123".to_string()),
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_runner_info() {
+        let cli = test_cli(Commands::Runner {
+            list: false,
+            info: Some("runner-123".to_string()),
+            register: None,
+            capacity: None,
+            deregister: None,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_runner_register() {
+        let cli = test_cli(Commands::Runner {
+            list: false,
+            info: None,
+            register: Some("new-runner".to_string()),
+            capacity: None,
+            deregister: None,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_runner_deregister() {
+        let cli = test_cli(Commands::Runner {
+            list: false,
+            info: None,
+            register: None,
+            capacity: None,
+            deregister: Some("runner-123".to_string()),
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_runner_capacity() {
+        let cli = test_cli(Commands::Runner {
+            list: false,
+            info: None,
+            register: None,
+            capacity: Some(4),
+            deregister: None,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_repo_create() {
+        let cli = test_cli(Commands::Repo {
+            list: false,
+            create: Some("new-repo".to_string()),
+            info: None,
+            delete: None,
+            clone: None,
+            init: None,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_repo_info() {
+        let cli = test_cli(Commands::Repo {
+            list: false,
+            create: None,
+            info: Some("repo-123".to_string()),
+            delete: None,
+            clone: None,
+            init: None,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_repo_delete() {
+        let cli = test_cli(Commands::Repo {
+            list: false,
+            create: None,
+            info: None,
+            delete: Some("repo-123".to_string()),
+            clone: None,
+            init: None,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_repo_clone() {
+        let cli = test_cli(Commands::Repo {
+            list: false,
+            create: None,
+            info: None,
+            delete: None,
+            clone: Some("my-repo".to_string()),
+            init: None,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_repo_init() {
+        let cli = test_cli(Commands::Repo {
+            list: false,
+            create: None,
+            info: None,
+            delete: None,
+            clone: None,
+            init: Some("/tmp/my-repo".to_string()),
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_auth_whoami() {
+        let cli = test_cli(Commands::Auth {
+            login: None,
+            logout: false,
+            status: false,
+            whoami: true,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
 }
