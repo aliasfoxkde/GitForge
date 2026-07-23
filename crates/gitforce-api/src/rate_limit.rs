@@ -291,10 +291,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_extract_client_id() {
+    async fn test_extract_client_id_x_forwarded_for() {
+        use axum::http::Request;
+
+        let request = Request::builder()
+            .header("x-forwarded-for", "192.168.1.100")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let client_id = extract_client_id(&request);
+        assert_eq!(client_id, "192.168.1.100");
+    }
+
+    #[tokio::test]
+    async fn test_extract_client_id_x_real_ip() {
+        use axum::http::Request;
+
+        let request = Request::builder()
+            .header("x-real-ip", "10.0.0.50")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let client_id = extract_client_id(&request);
+        assert_eq!(client_id, "10.0.0.50");
+    }
+
+    #[tokio::test]
+    async fn test_extract_client_id_cf_connecting_ip() {
+        use axum::http::Request;
+
+        let request = Request::builder()
+            .header("cf-connecting-ip", "203.0.113.50")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let client_id = extract_client_id(&request);
+        assert_eq!(client_id, "203.0.113.50");
+    }
+
+    #[tokio::test]
+    async fn test_extract_client_id_multiple_forwarded_ips() {
+        use axum::http::Request;
+
+        // Should take first IP when multiple are present
+        let request = Request::builder()
+            .header("x-forwarded-for", "192.168.1.1, 192.168.1.2, 10.0.0.1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let client_id = extract_client_id(&request);
+        assert_eq!(client_id, "192.168.1.1");
+    }
+
+    #[tokio::test]
+    async fn test_extract_client_id_no_headers() {
+        use axum::http::Request;
+
+        let request = Request::builder()
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let client_id = extract_client_id(&request);
+        assert_eq!(client_id, "unknown");
+    }
+
+    #[test]
+    fn test_rate_limit_layer_new() {
         let limiter = RateLimiter::new(RateLimitConfig::default());
-        let _ = limiter;
-        // Note: This is a simplified test placeholder
+        let layer = RateLimitLayer::new(limiter);
+        let _ = layer;
+    }
+
+    #[test]
+    fn test_rate_limit_config_debug() {
+        let config = RateLimitConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("requests_per_minute"));
+    }
+
+    #[test]
+    fn test_rate_limit_error_response_debug() {
+        let error = RateLimitErrorResponse {
+            error: "rate_limit_exceeded".to_string(),
+            message: "Too many requests".to_string(),
+            retry_after_secs: 60,
+        };
+        let debug_str = format!("{:?}", error);
+        assert!(debug_str.contains("rate_limit_exceeded"));
     }
 
     #[tokio::test]
