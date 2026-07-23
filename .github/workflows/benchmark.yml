@@ -6,10 +6,16 @@ on:
       - main
     paths:
       - '**.go'
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
       - '.github/workflows/benchmark.yml'
   pull_request:
     paths:
       - '**.go'
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
       - '.github/workflows/benchmark.yml'
 
 jobs:
