@@ -59,7 +59,7 @@ fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
 /// Trigger a pipeline via webhook
 async fn trigger_pipeline(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(scheduler): Extension<Arc<Scheduler>>,
+    Extension(scheduler): Extension<Option<Arc<Scheduler>>>,
     Extension(auth): Extension<Arc<ApiAuth>>,
     headers: HeaderMap,
     Path(pipeline_id): Path<String>,
@@ -110,15 +110,18 @@ async fn trigger_pipeline(
             let run_id = PipelineRunId::new();
             let job_id = JobId::new();
 
-            // Enqueue the job to the scheduler
-            scheduler.enqueue(job_id, run_id, repo_id).await;
-
-            tracing::info!(
-                "Enqueued job {} for pipeline {} on branch {}",
-                job_id,
-                pipeline_id,
-                payload.branch
-            );
+            // Enqueue the job to the scheduler (if available)
+            if let Some(sched) = &scheduler {
+                sched.enqueue(job_id, run_id, repo_id).await;
+                tracing::info!(
+                    "Enqueued job {} for pipeline {} on branch {}",
+                    job_id,
+                    pipeline_id,
+                    payload.branch
+                );
+            } else {
+                tracing::warn!("No scheduler available, job not enqueued");
+            }
 
             (
                 StatusCode::OK,

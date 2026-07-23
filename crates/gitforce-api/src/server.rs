@@ -97,7 +97,8 @@ impl ApiServer {
             .merge(artifact_routes())
             .merge(webhook_routes())
             .layer(Extension(Arc::new(auth.clone())))
-            .layer(Extension(pool_arc.clone()));
+            .layer(Extension(pool_arc.clone()))
+            .layer(Extension(Option::<Arc<Scheduler>>::None)); // Default: no scheduler
 
         // Metrics layer for automatic request recording
         let metrics_layer = MetricsLayer::new(metrics_arc.clone());
@@ -127,7 +128,7 @@ impl ApiServer {
 
     /// Add scheduler extension for job queuing
     pub fn with_scheduler_extension(self, scheduler: Arc<Scheduler>) -> Self {
-        let app = self.router.layer(Extension(scheduler));
+        let app = self.router.layer(Extension(Some(scheduler)));
         Self {
             router: app,
             ..self
