@@ -695,4 +695,121 @@ mod tests {
         assert_eq!(response.status, "pending");
         assert!(response.runner_id.is_none());
     }
+
+    #[test]
+    fn test_extract_user_malformed_auth_header() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        // Malformed header without proper Bearer prefix
+        headers.insert("Authorization", "NotBearer token123".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_extract_user_empty_bearer_token() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        // Empty token after Bearer should fail
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_extract_user_basic_auth_header() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        // Basic auth instead of Bearer
+        headers.insert("Authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_user_bearer_with_extra_spaces() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        // Bearer with leading/trailing spaces
+        headers.insert("Authorization", "Bearer   ".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        // Should fail because "   " is not a valid token
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pipeline_run_response_with_empty_commit_hash() {
+        let response = PipelineRunResponse {
+            id: "run-empty".to_string(),
+            pipeline_id: "pipe-empty".to_string(),
+            status: "pending".to_string(),
+            commit_hash: "".to_string(),
+            triggered_by: "user".to_string(),
+            started_at: None,
+            finished_at: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"commit_hash\":\"\""));
+    }
+
+    #[test]
+    fn test_job_response_with_empty_name() {
+        let response = JobResponse {
+            id: "job-empty".to_string(),
+            name: "".to_string(),
+            status: "pending".to_string(),
+            runner_id: None,
+            started_at: None,
+            finished_at: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"name\":\"\""));
+    }
+
+    #[test]
+    fn test_pipeline_run_response_special_characters_in_triggered_by() {
+        let response = PipelineRunResponse {
+            id: "run-special".to_string(),
+            pipeline_id: "pipe-special".to_string(),
+            status: "running".to_string(),
+            commit_hash: "abc123".to_string(),
+            triggered_by: "user@domain.com".to_string(),
+            started_at: None,
+            finished_at: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("user@domain.com"));
+    }
+
+    #[test]
+    fn test_pipeline_run_response_all_json_fields() {
+        let response = PipelineRunResponse {
+            id: "run-all".to_string(),
+            pipeline_id: "pipe-all".to_string(),
+            status: "failed".to_string(),
+            commit_hash: "xyz789".to_string(),
+            triggered_by: "tester".to_string(),
+            started_at: Some("2024-06-15T10:30:00Z".to_string()),
+            finished_at: Some("2024-06-15T10:45:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        // Verify all fields are present
+        assert!(json.contains("\"id\":\"run-all\""));
+        assert!(json.contains("\"pipeline_id\":\"pipe-all\""));
+        assert!(json.contains("\"status\":\"failed\""));
+        assert!(json.contains("\"commit_hash\":\"xyz789\""));
+        assert!(json.contains("\"triggered_by\":\"tester\""));
+        assert!(json.contains("started_at"));
+        assert!(json.contains("finished_at"));
+    }
 }

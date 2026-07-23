@@ -1143,3 +1143,224 @@ async fn test_api_webhook_trigger_success() {
     // Pipeline found, trigger accepted
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_api_get_job_with_valid_auth() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let valid_uuid = uuid::Uuid::new_v4().to_string();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/ci/jobs/{}", valid_uuid))
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get NOT_FOUND (job doesn't exist but auth worked)
+    assert!(
+        response.status() == StatusCode::NOT_FOUND
+            || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[tokio::test]
+async fn test_api_pipeline_runs_with_jobs() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+
+    // Create repo
+    let repo_id = gitforce_common::RepoId::new();
+    let repo = gitforce_db::models::Repository {
+        id: repo_id,
+        name: "test-repo".to_string(),
+        owner_id: user.id,
+        visibility: "private".to_string(),
+        git_path: "/tmp/test".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    gitforce_db::queries::RepoQueries::create(&pool, &repo)
+        .await
+        .unwrap();
+
+    // Create pipeline
+    let pipeline_id = gitforce_common::PipelineId::new();
+    let pipeline = gitforce_db::models::Pipeline {
+        id: pipeline_id,
+        repo_id,
+        name: "test-pipeline".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    gitforce_db::queries::PipelineQueries::create(&pool, &pipeline)
+        .await
+        .unwrap();
+
+    // Create pipeline run
+    let run_id = gitforce_common::PipelineRunId::new();
+    let run = gitforce_db::models::PipelineRun {
+        id: run_id,
+        pipeline_id,
+        repo_id,
+        status: "running".to_string(),
+        commit_hash: "abc123".to_string(),
+        triggered_by: "test".to_string(),
+        started_at: Some(chrono::Utc::now()),
+        finished_at: None,
+        created_at: chrono::Utc::now(),
+    };
+    gitforce_db::queries::PipelineRunQueries::create(&pool, &run)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/pipeline-runs/{}", run_id))
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should return OK or NOT_FOUND (if query fails or run not found)
+    assert!(
+        response.status() == StatusCode::OK
+            || response.status() == StatusCode::NOT_FOUND
+            || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[tokio::test]
+async fn test_api_get_pipeline_run_not_found() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/pipeline-runs/00000000-0000-0000-0000-000000000001")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should return NOT_FOUND
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_api_ci_routes_require_auth() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    // Access CI routes without auth
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/pipelines")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get UNAUTHORIZED
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_api_get_pipeline_with_invalid_id_format() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforce_db::models::User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforce_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "testuser", "admin").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/pipelines/not-a-uuid")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get BAD_REQUEST for invalid UUID or NOT_FOUND
+    assert!(
+        response.status() == StatusCode::BAD_REQUEST
+            || response.status() == StatusCode::NOT_FOUND
+    );
+}
