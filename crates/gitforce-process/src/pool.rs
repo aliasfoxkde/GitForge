@@ -5,25 +5,20 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::process::{Child, Command};
-use tokio::sync::{Semaphore, OwnedSemaphorePermit};
+use tokio::process::Command;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Duration};
 
 /// Resource weight for different job types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum JobWeight {
     /// Lightweight job - compile, test
+    #[default]
     Light = 2,
     /// Medium job - coverage, integration test
     Medium = 4,
     /// Heavy job - cross-platform release build
     Heavy = 8,
-}
-
-impl Default for JobWeight {
-    fn default() -> Self {
-        JobWeight::Light
-    }
 }
 
 /// A managed process in the pool
@@ -70,13 +65,17 @@ impl ProcessPool {
     }
 
     /// Create with default configuration (4 concurrent)
-    pub fn default() -> Self {
+    pub fn with_default_config() -> Self {
         Self::new(PoolConfig::default())
     }
 
     /// Get a permit for running a job
-    pub async fn acquire(&self, weight: JobWeight) -> OwnedSemaphorePermit {
-        self.semaphore.clone().acquire_owned().await.expect("semaphore closed")
+    pub async fn acquire(&self, _weight: JobWeight) -> OwnedSemaphorePermit {
+        self.semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore closed")
     }
 
     /// Spawn a managed process
@@ -85,7 +84,7 @@ impl ProcessPool {
         weight: JobWeight,
         program: &str,
         args: &[&str],
-        mut on_output: F,
+        _on_output: F,
     ) -> std::io::Result<u32>
     where
         F: FnMut(String) + Send + 'static,
@@ -99,13 +98,7 @@ impl ProcessPool {
 
         {
             let mut running = self.running.lock().unwrap();
-            running.insert(
-                pid,
-                ManagedProcess {
-                    pid,
-                    weight,
-                },
-            );
+            running.insert(pid, ManagedProcess { pid, weight });
         }
 
         // Spawn output handler
@@ -160,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_pool_creation() {
-        let pool = ProcessPool::default();
+        let pool = ProcessPool::with_default_config();
         assert_eq!(pool.running_count(), 0);
     }
 

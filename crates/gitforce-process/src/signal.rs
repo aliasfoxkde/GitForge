@@ -3,10 +3,10 @@
 //! This module provides proper SIGCHLD handling to prevent zombie processes
 //! by actively reaping terminated child processes.
 
+use libc::{waitpid, WEXITSTATUS, WIFEXITED, WIFSIGNALED, WNOHANG, WTERMSIG};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
-use libc::{waitpid, WNOHANG, WIFEXITED, WIFSIGNALED, WEXITSTATUS, WTERMSIG};
 
 static SIGCHLD_HANDLER_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -51,11 +51,7 @@ pub fn install_sigchld_handler() {
                             WEXITSTATUS(status)
                         );
                     } else if WIFSIGNALED(status) {
-                        tracing::trace!(
-                            "child {} killed by signal: {}",
-                            result,
-                            WTERMSIG(status)
-                        );
+                        tracing::trace!("child {} killed by signal: {}", result, WTERMSIG(status));
                     }
                 }
             }

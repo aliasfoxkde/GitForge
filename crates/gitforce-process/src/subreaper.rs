@@ -4,9 +4,9 @@
 //! This prevents zombie processes from accumulating when child processes
 //! terminate but are not explicitly waited on.
 
-use std::io::Result;
 use libc::prctl;
 use libc::PR_SET_CHILD_SUBREAPER;
+use std::io::Result;
 
 /// Set this process as a subreaper.
 ///
@@ -33,7 +33,13 @@ pub fn become_subreaper() -> Result<()> {
 pub fn is_subreaper() -> bool {
     let mut reaper: i32 = 0;
     unsafe {
-        libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut reaper as *mut i32, 0, 0, 0);
+        libc::prctl(
+            libc::PR_GET_CHILD_SUBREAPER,
+            &mut reaper as *mut i32,
+            0,
+            0,
+            0,
+        );
     }
     reaper != 0
 }

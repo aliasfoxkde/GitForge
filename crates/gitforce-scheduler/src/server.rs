@@ -128,7 +128,7 @@ async fn get_pending_jobs(State(state): State<SchedulerServerState>) -> impl Int
     // Convert to response format
     let job_infos: Vec<PendingJobInfo> = assigned_jobs
         .into_iter()
-        .map(|(job_id, runner_id, pipeline_run_id)| PendingJobInfo {
+        .map(|(job_id, _runner_id, pipeline_run_id)| PendingJobInfo {
             job_id: job_id.to_string(),
             name: format!("job-{}", job_id),
             pipeline_run_id: pipeline_run_id.to_string(),

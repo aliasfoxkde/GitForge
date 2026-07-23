@@ -146,7 +146,9 @@ impl Scheduler {
             if let Err(e) = gitforce_db::queries::JobQueries::create(pool, &db_job).await {
                 tracing::error!("failed to persist job to DB: {}", e);
             }
-            if let Err(e) = gitforce_db::queries::JobQueries::update_status(pool, job_id, "queued").await {
+            if let Err(e) =
+                gitforce_db::queries::JobQueries::update_status(pool, job_id, "queued").await
+            {
                 tracing::error!("failed to update job status in DB: {}", e);
             }
         }
@@ -238,10 +240,14 @@ impl Scheduler {
 
             // Persist assignment to database if available
             if let Some(pool) = &self.db_pool {
-                if let Err(e) = gitforce_db::queries::JobQueries::assign(pool, job_id, runner_id).await {
+                if let Err(e) =
+                    gitforce_db::queries::JobQueries::assign(pool, job_id, runner_id).await
+                {
                     tracing::error!("failed to persist job assignment to DB: {}", e);
                 }
-                if let Err(e) = gitforce_db::queries::JobQueries::update_status(pool, job_id, "assigned").await {
+                if let Err(e) =
+                    gitforce_db::queries::JobQueries::update_status(pool, job_id, "assigned").await
+                {
                     tracing::error!("failed to update job status in DB: {}", e);
                 }
             }

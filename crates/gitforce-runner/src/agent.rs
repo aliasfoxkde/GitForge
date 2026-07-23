@@ -192,7 +192,8 @@ impl RunnerAgent {
                                         job.job_id
                                     );
                                     // Execute the job
-                                    Self::execute_job(&executor, &job, &fetch_client, &fetch_url).await;
+                                    Self::execute_job(&executor, &job, &fetch_client, &fetch_url)
+                                        .await;
                                 }
                             }
                         }
@@ -297,7 +298,12 @@ impl RunnerAgent {
             "step_results": step_results_json,
         });
 
-        if let Err(e) = client.post(&complete_url).json(&complete_request).send().await {
+        if let Err(e) = client
+            .post(&complete_url)
+            .json(&complete_request)
+            .send()
+            .await
+        {
             tracing::error!("failed to report job completion: {}", e);
         }
     }

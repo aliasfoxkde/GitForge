@@ -426,7 +426,7 @@ mod tests {
     fn test_hook_manager_default() {
         let manager = HookManager::default();
         // Default manager should be empty
-        let payload = HookPayload::new(
+        let _payload = HookPayload::new(
             RepoId::new(),
             "refs/heads/main".to_string(),
             "abc123".to_string(),

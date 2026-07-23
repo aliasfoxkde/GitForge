@@ -10,7 +10,9 @@ pub mod pool;
 pub mod signal;
 pub mod subreaper;
 
-pub use limits::{apply_limits, get_cgroup_path, is_in_cgroup_v2, CpuLimit, MemoryLimit, ResourceLimits};
+pub use limits::{
+    apply_limits, get_cgroup_path, is_in_cgroup_v2, CpuLimit, MemoryLimit, ResourceLimits,
+};
 pub use pool::{JobWeight, PoolConfig, ProcessPool};
 pub use signal::install_sigchld_handler;
 pub use subreaper::become_subreaper;
