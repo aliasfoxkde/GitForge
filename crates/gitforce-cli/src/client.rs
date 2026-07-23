@@ -30,6 +30,70 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// Repository response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoResponse {
+    pub id: String,
+    pub name: String,
+    pub owner_id: String,
+    pub visibility: String,
+    pub git_path: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Pipeline response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineResponse {
+    pub id: String,
+    pub name: String,
+    pub repo_id: String,
+    pub enabled: bool,
+}
+
+/// Pipeline run response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineRunResponse {
+    pub id: String,
+    pub pipeline_id: String,
+    pub status: String,
+    pub commit_hash: String,
+    pub triggered_by: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+/// Job response
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobResponse {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub runner_id: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+/// Runner response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerResponse {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub runner_type: String,
+    pub status: String,
+    pub capacity: i32,
+    pub last_heartbeat: Option<String>,
+}
+
+/// Create repo request
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateRepoRequest {
+    pub name: String,
+    pub visibility: Option<String>,
+}
+
 /// GitForge API client
 #[derive(Clone)]
 pub struct ApiClient {
@@ -125,6 +189,163 @@ impl ApiClient {
         let resp = req.send().await?;
         let auth_resp: AuthStatusResponse = resp.json().await?;
         Ok(auth_resp)
+    }
+
+    /// List repositories
+    pub async fn list_repos(&self) -> Result<Vec<RepoResponse>> {
+        let url = format!("{}/api/repos", self.base_url);
+        let mut req = self.http.get(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to list repos: {}", resp.status());
+        }
+        let repos: Vec<RepoResponse> = resp.json().await?;
+        Ok(repos)
+    }
+
+    /// Get repository by ID
+    pub async fn get_repo(&self, id: &str) -> Result<RepoResponse> {
+        let url = format!("{}/api/repos/{}", self.base_url, id);
+        let mut req = self.http.get(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to get repo: {}", resp.status());
+        }
+        let repo: RepoResponse = resp.json().await?;
+        Ok(repo)
+    }
+
+    /// Create a repository
+    pub async fn create_repo(&self, name: &str, visibility: Option<String>) -> Result<RepoResponse> {
+        let url = format!("{}/api/repos", self.base_url);
+        let body = CreateRepoRequest {
+            name: name.to_string(),
+            visibility,
+        };
+
+        let mut req = self.http.post(&url).json(&body);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to create repo: {}", resp.status());
+        }
+        let repo: RepoResponse = resp.json().await?;
+        Ok(repo)
+    }
+
+    /// Delete a repository
+    pub async fn delete_repo(&self, id: &str) -> Result<()> {
+        let url = format!("{}/api/repos/{}", self.base_url, id);
+        let mut req = self.http.delete(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to delete repo: {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// List pipelines
+    pub async fn list_pipelines(&self) -> Result<Vec<PipelineResponse>> {
+        let url = format!("{}/api/pipelines", self.base_url);
+        let mut req = self.http.get(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to list pipelines: {}", resp.status());
+        }
+        let pipelines: Vec<PipelineResponse> = resp.json().await?;
+        Ok(pipelines)
+    }
+
+    /// Get pipeline by ID
+    pub async fn get_pipeline(&self, id: &str) -> Result<PipelineResponse> {
+        let url = format!("{}/api/pipelines/{}", self.base_url, id);
+        let mut req = self.http.get(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to get pipeline: {}", resp.status());
+        }
+        let pipeline: PipelineResponse = resp.json().await?;
+        Ok(pipeline)
+    }
+
+    /// List pipeline runs
+    pub async fn list_pipeline_runs(&self) -> Result<Vec<PipelineRunResponse>> {
+        let url = format!("{}/api/pipeline-runs", self.base_url);
+        let mut req = self.http.get(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to list pipeline runs: {}", resp.status());
+        }
+        let runs: Vec<PipelineRunResponse> = resp.json().await?;
+        Ok(runs)
+    }
+
+    /// List runners
+    pub async fn list_runners(&self) -> Result<Vec<RunnerResponse>> {
+        let url = format!("{}/api/runners", self.base_url);
+        let mut req = self.http.get(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to list runners: {}", resp.status());
+        }
+        let runners: Vec<RunnerResponse> = resp.json().await?;
+        Ok(runners)
+    }
+
+    /// Get runner by ID
+    pub async fn get_runner(&self, id: &str) -> Result<RunnerResponse> {
+        let url = format!("{}/api/runners/{}", self.base_url, id);
+        let mut req = self.http.get(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to get runner: {}", resp.status());
+        }
+        let runner: RunnerResponse = resp.json().await?;
+        Ok(runner)
     }
 }
 

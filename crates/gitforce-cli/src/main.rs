@@ -270,27 +270,65 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             clone,
             init,
         } => {
+            let api_client = GitForgeClient::new(&config.api_url(), token.clone());
+
             if *list {
-                println!("📦 Repositories on {}:", server);
-                println!();
-                println!("  (API not yet wired - showing sample format)");
-                println!("  my-project     - My awesome project       [active]");
-                println!("  another-repo   - Another repository        [active]");
-                println!();
-                println!("  Run `gitforge repo create <name>` to create a new repository.");
+                match api_client.list_repos().await {
+                    Ok(repos) => {
+                        println!("📦 Repositories on {}:", server);
+                        println!();
+                        if repos.is_empty() {
+                            println!("  No repositories found.");
+                        } else {
+                            for repo in repos {
+                                println!("  {:20} - {} [{}]", repo.name, repo.git_path, repo.visibility);
+                            }
+                        }
+                        println!();
+                        println!("  Run `gitforge repo create <name>` to create a new repository.");
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to list repositories: {}", e);
+                    }
+                }
             } else if let Some(name) = create {
                 println!("📦 Creating repository '{}'...", name);
-                println!("   Server: {}", server);
-                println!("   Visibility: private (default)");
-                println!("   (API not yet wired)");
-            } else if let Some(name) = info {
-                println!("📋 Repository: {}", name);
-                println!("   Server: {}", server);
-                println!("   (API not yet wired)");
-            } else if let Some(name) = delete {
-                println!("⚠️  Deleting repository '{}'...", name);
+                match api_client.create_repo(name, Some("private".to_string())).await {
+                    Ok(repo) => {
+                        println!("✅ Repository created successfully!");
+                        println!("   ID: {}", repo.id);
+                        println!("   Name: {}", repo.name);
+                        println!("   Visibility: {}", repo.visibility);
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to create repository: {}", e);
+                    }
+                }
+            } else if let Some(id) = info {
+                match api_client.get_repo(id).await {
+                    Ok(repo) => {
+                        println!("📋 Repository: {}", repo.name);
+                        println!("   ID: {}", repo.id);
+                        println!("   Owner: {}", repo.owner_id);
+                        println!("   Visibility: {}", repo.visibility);
+                        println!("   Git Path: {}", repo.git_path);
+                        println!("   Created: {}", repo.created_at);
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to get repository: {}", e);
+                    }
+                }
+            } else if let Some(id) = delete {
+                println!("⚠️  Deleting repository '{}'...", id);
                 println!("   This action is irreversible!");
-                println!("   (API not yet wired)");
+                match api_client.delete_repo(id).await {
+                    Ok(_) => {
+                        println!("✅ Repository deleted successfully.");
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to delete repository: {}", e);
+                    }
+                }
             } else if let Some(url_or_name) = clone {
                 println!("📥 Cloning repository...");
                 println!("   Source: {}", url_or_name);
@@ -378,31 +416,52 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             create,
             delete,
         } => {
+            let api_client = GitForgeClient::new(&config.api_url(), token.clone());
+
             if *list {
-                println!("⚙️  Pipelines on {}:", server);
-                println!();
-                println!("  (API not yet wired - showing sample format)");
-                println!("  build-and-test  - Build and run tests     [active]");
-                println!("  deploy-prod      - Deploy to production     [active]");
-                println!();
-                println!("  Run `gitforge pipeline create <name>` to create a pipeline.");
+                match api_client.list_pipelines().await {
+                    Ok(pipelines) => {
+                        println!("⚙️  Pipelines on {}:", server);
+                        println!();
+                        if pipelines.is_empty() {
+                            println!("  No pipelines found.");
+                        } else {
+                            for pipeline in pipelines {
+                                let status = if pipeline.enabled { "active" } else { "disabled" };
+                                println!("  {:20} - {} [{}]", pipeline.name, pipeline.repo_id, status);
+                            }
+                        }
+                        println!();
+                        println!("  Run `gitforge pipeline create <name>` to create a pipeline.");
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to list pipelines: {}", e);
+                    }
+                }
             } else if let Some(id) = show {
-                println!("⚙️  Pipeline: {}", id);
-                println!("   Server: {}", server);
-                println!("   Status: (API not yet wired)");
+                match api_client.get_pipeline(id).await {
+                    Ok(pipeline) => {
+                        println!("⚙️  Pipeline: {}", pipeline.name);
+                        println!("   ID: {}", pipeline.id);
+                        println!("   Repository: {}", pipeline.repo_id);
+                        println!("   Enabled: {}", pipeline.enabled);
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to get pipeline: {}", e);
+                    }
+                }
             } else if let Some(id) = run {
                 println!("🚀 Triggering pipeline: {}", id);
-                println!("   (API not yet wired)");
+                println!("   (Pipeline trigger not yet implemented)");
             } else if let Some(id) = watch {
                 println!("👁️  Watching pipeline: {}", id);
-                println!("   (API not yet wired)");
-            } else if let Some(name) = create {
-                println!("⚙️  Creating pipeline '{}'...", name);
-                println!("   (API not yet wired)");
-            } else if let Some(id) = delete {
-                println!("⚠️  Deleting pipeline '{}'...", id);
-                println!("   This action is irreversible!");
-                println!("   (API not yet wired)");
+                println!("   (Pipeline watch not yet implemented)");
+            } else if let Some(_name) = create {
+                println!("⚙️  Creating pipeline...");
+                println!("   (Pipeline creation not yet implemented)");
+            } else if let Some(_id) = delete {
+                println!("⚠️  Deleting pipeline...");
+                println!("   (Pipeline deletion not yet implemented)");
             }
         }
 
@@ -413,31 +472,57 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             capacity,
             deregister,
         } => {
+            let api_client = GitForgeClient::new(&config.api_url(), token.clone());
+
             if *list {
-                println!("🤖 Runners on {}:", server);
-                println!();
-                println!("  (API not yet wired - showing sample format)");
-                println!("  runner-01    - Linux x86_64    [idle]    capacity: 2");
-                println!("  runner-02    - Linux ARM64     [busy]    capacity: 4");
-                println!();
-                println!("  Run `gitforge runner register <name>` to register a runner.");
+                match api_client.list_runners().await {
+                    Ok(runners) => {
+                        println!("🤖 Runners on {}:", server);
+                        println!();
+                        if runners.is_empty() {
+                            println!("  No runners registered.");
+                        } else {
+                            for runner in runners {
+                                println!("  {:15} - {} [{}] capacity: {}",
+                                    runner.name, runner.runner_type, runner.status, runner.capacity);
+                            }
+                        }
+                        println!();
+                        println!("  Run `gitforge runner register <name>` to register a runner.");
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to list runners: {}", e);
+                    }
+                }
             } else if let Some(id) = info {
-                println!("🤖 Runner: {}", id);
-                println!("   Server: {}", server);
-                println!("   Status: (API not yet wired)");
+                match api_client.get_runner(id).await {
+                    Ok(runner) => {
+                        println!("🤖 Runner: {}", runner.name);
+                        println!("   ID: {}", runner.id);
+                        println!("   Type: {}", runner.runner_type);
+                        println!("   Status: {}", runner.status);
+                        println!("   Capacity: {}", runner.capacity);
+                        if let Some(lhb) = runner.last_heartbeat {
+                            println!("   Last Heartbeat: {}", lhb);
+                        }
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to get runner: {}", e);
+                    }
+                }
             } else if let Some(name) = register {
                 let cap = capacity.unwrap_or(2);
                 println!("🤖 Registering runner: {}", name);
                 println!("   Server: {}", server);
                 println!("   Capacity: {} concurrent jobs", cap);
-                println!("   (API not yet wired)");
+                println!("   (Runner registration not yet implemented)");
             } else if deregister.is_some() {
-                let id = deregister.clone().unwrap_or_default();
-                println!("🤖 Deregistering runner: {}", id);
-                println!("   (API not yet wired)");
+                let _id = deregister.clone().unwrap_or_default();
+                println!("🤖 Deregistering runner...");
+                println!("   (Runner deregistration not yet implemented)");
             } else if let Some(cap) = capacity {
                 println!("🤖 Updating runner capacity to: {}", cap);
-                println!("   (API not yet wired)");
+                println!("   (Runner capacity update not yet implemented)");
             }
         }
 
