@@ -248,10 +248,10 @@ POST /api/queue/jobs/{id}/complete {result}
 | 2 | 1 | Process cleanup on startup | Critical | ✅ DONE |
 | 3 | 2 | SQLite job queue model | High | ✅ DONE |
 | 4 | 2 | Queue API endpoints | High | ✅ DONE |
-| 5 | 2 | Worker pool implementation | High | ⚠️ PARTIAL |
+| 5 | 2 | Worker pool implementation | High | ✅ DONE |
 | 6 | 3 | Concurrency limits | High | ✅ DONE |
 | 7 | 3 | Memory/CPU limits | Medium | ⏳ PENDING |
-| 8 | 4 | Runner queue integration | Medium | ⚠️ PARTIAL |
+| 8 | 4 | Runner queue integration | Medium | ✅ DONE |
 | 9 | 4 | Webhook → job trigger | Medium | ⏳ PENDING |
 | 10 | 4 | Results reporting | Medium | ⏳ PENDING |
 
