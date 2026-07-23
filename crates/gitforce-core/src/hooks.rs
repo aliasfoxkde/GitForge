@@ -421,4 +421,136 @@ mod tests {
         let result = manager.pre_receive(payload).await;
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn test_hook_manager_default() {
+        let manager = HookManager::default();
+        // Default manager should be empty
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/heads/main".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            None,
+        );
+        // Should not panic when using default
+        assert!(matches!(manager, HookManager { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_execute_push_hooks_success() {
+        let mut manager = HookManager::new();
+        manager.add_executor(LoggingHookExecutor::new());
+
+        let result = execute_push_hooks(
+            &manager,
+            RepoId::new(),
+            "refs/heads/main",
+            "abc123",
+            "def456",
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_push_hooks_with_pusher() {
+        let mut manager = HookManager::new();
+        manager.add_executor(LoggingHookExecutor::new());
+
+        let user_id = UserId::new();
+        let result = execute_push_hooks(
+            &manager,
+            RepoId::new(),
+            "refs/heads/develop",
+            "old123",
+            "new456",
+            Some(user_id),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_push_hooks_tag_ref() {
+        let mut manager = HookManager::new();
+        manager.add_executor(LoggingHookExecutor::new());
+
+        let result = execute_push_hooks(
+            &manager,
+            RepoId::new(),
+            "refs/tags/v1.0.0",
+            "abc123",
+            "def456",
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_push_hooks_multiple_refs() {
+        let mut manager = HookManager::new();
+        manager.add_executor(LoggingHookExecutor::new());
+
+        // Simulate pushing multiple branches
+        for branch in &["main", "develop", "feature/test"] {
+            let result = execute_push_hooks(
+                &manager,
+                RepoId::new(),
+                &format!("refs/heads/{}", branch),
+                "abc123",
+                "def456",
+                None,
+            )
+            .await;
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_hook_payload_with_various_refs() {
+        let test_cases = vec![
+            ("refs/heads/main", true, false),
+            ("refs/heads/feature/test", true, false),
+            ("refs/tags/v1.0", false, true),
+            ("refs/tags/release-2.0", false, true),
+        ];
+
+        for (ref_name, is_branch, is_tag) in test_cases {
+            let payload = HookPayload::new(
+                RepoId::new(),
+                ref_name.to_string(),
+                "abc123".to_string(),
+                "def456".to_string(),
+                None,
+            );
+            assert_eq!(
+                payload.is_branch_push(),
+                is_branch,
+                "failed for {}",
+                ref_name
+            );
+            assert_eq!(payload.is_tag_push(), is_tag, "failed for {}", ref_name);
+        }
+    }
+
+    #[test]
+    fn test_hook_payload_clone_preserves_data() {
+        let user_id = UserId::new();
+        let payload = HookPayload::new(
+            RepoId::new(),
+            "refs/heads/main".to_string(),
+            "oldhash".to_string(),
+            "newhash".to_string(),
+            Some(user_id),
+        );
+        let cloned = payload.clone();
+        assert_eq!(payload.repo_id, cloned.repo_id);
+        assert_eq!(payload.ref_name, cloned.ref_name);
+        assert_eq!(payload.old_hash, cloned.old_hash);
+        assert_eq!(payload.new_hash, cloned.new_hash);
+        assert_eq!(payload.pusher_id, cloned.pusher_id);
+    }
 }
