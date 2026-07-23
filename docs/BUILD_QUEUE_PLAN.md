@@ -42,9 +42,10 @@
 ### 1.1 Subreaper Configuration
 **Priority: CRITICAL** - Prevents zombie process accumulation
 
+Based on Buildkite/ArgoCD/Tekton patterns: The agent process must become a subreaper to ensure orphaned children are reaped.
+
 ```rust
 // crates/gitforce-process/src/subreaper.rs
-use std::os::unix::process::Parent as UnixParent;
 
 pub fn become_subreaper() -> Result<(), std::io::Error> {
     // Set the process as a subreaper via prctl
@@ -58,17 +59,41 @@ pub fn become_subreaper() -> Result<(), std::io::Error> {
 ### 1.2 SIGCHLD Handler
 **Priority: CRITICAL** - Ensures proper child reaping
 
+Using SIG_DFL (default handler) is sufficient - kernel will reap children automatically when they exit. Using waitpid() in a loop is more robust.
+
 ```rust
 // crates/gitforce-process/src/signal.rs
-pub fn install_sigchld_handler() {
-    unsafe {
-        signal(SIGCHLD, SIG_DFL);  // Use default handling
-    }
+
+// Proper SIGCHLD handling with waitpid loop
+pub fn setup_sigchld_handler() {
+    std::thread::spawn(|| {
+        loop {
+            // Wait for any child process
+            let mut status = 0;
+            match waitpid(-1, Some(&mut status), wait::WNOHANG) {
+                Ok(WaitStatus::Exited(_, code)) => {
+                    tracing::debug!("child exited with code: {}", code);
+                }
+                Ok(WaitStatus::Signaled(_, sig, _)) => {
+                    tracing::debug!("child killed by signal: {:?}", sig);
+                }
+                Ok(WaitStatus::StillAlive) => {
+                    // No child exited, continue
+                }
+                Err(e) => {
+                    tracing::error!("waitpid error: {}", e);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
 }
 ```
 
 ### 1.3 Process Pool Manager
 **Priority: HIGH** - Controls concurrent build count
+
+Based on Buildkite's "first available agent" model with priority queuing.
 
 ```rust
 // crates/gitforce-process/src/pool.rs
@@ -76,6 +101,13 @@ pub struct ProcessPool {
     pub max_concurrent: usize,
     running: HashMap<u32, Child>,
     pending: Vec<Box<dyn Future<Output = ()>>>,
+    semaphore: Arc<Semaphore>,
+}
+
+impl ProcessPool {
+    pub async fn acquire_slot(&self) -> Permit<'_> {
+        self.semaphore.acquire().await.unwrap()
+    }
 }
 ```
 
