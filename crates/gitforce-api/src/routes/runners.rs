@@ -369,4 +369,135 @@ mod tests {
         let result = extract_user(&auth, &headers);
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn test_runner_response_malformed_auth_header() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "NotBearer token123".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_runner_response_empty_bearer_token() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_runner_response_basic_auth_header() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_runner_response_all_capacities_values() {
+        for cap in &[0, 1, 2, 4, 8, 16, 32, 64] {
+            let response = RunnerResponse {
+                id: "runner-cap".to_string(),
+                name: "capacity-test".to_string(),
+                runner_type: "docker".to_string(),
+                status: "online".to_string(),
+                capacity: *cap,
+                last_heartbeat: None,
+            };
+            assert_eq!(response.capacity, *cap);
+        }
+    }
+
+    #[test]
+    fn test_runner_response_special_characters_in_name() {
+        let response = RunnerResponse {
+            id: "runner-special".to_string(),
+            name: "runner-with-dashes_and_underscores".to_string(),
+            runner_type: "docker".to_string(),
+            status: "online".to_string(),
+            capacity: 2,
+            last_heartbeat: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("runner-with-dashes_and_underscores"));
+    }
+
+    #[test]
+    fn test_runner_response_timestamp_formats() {
+        let timestamps = [
+            "2024-01-01T00:00:00Z",
+            "2024-12-31T23:59:59Z",
+            "2026-07-23T12:00:00Z",
+        ];
+        for ts in &timestamps {
+            let response = RunnerResponse {
+                id: "runner-ts".to_string(),
+                name: "timestamp-test".to_string(),
+                runner_type: "firecracker".to_string(),
+                status: "busy".to_string(),
+                capacity: 4,
+                last_heartbeat: Some(ts.to_string()),
+            };
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains(ts));
+        }
+    }
+
+    #[test]
+    fn test_runner_response_id_formats() {
+        // UUID format
+        let response = RunnerResponse {
+            id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            name: "uuid-runner".to_string(),
+            runner_type: "docker".to_string(),
+            status: "online".to_string(),
+            capacity: 2,
+            last_heartbeat: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("550e8400-e29b-41d4-a716-446655440000"));
+    }
+
+    #[test]
+    fn test_runner_response_statuses() {
+        let statuses = ["online", "offline", "busy", "draining", "unknown"];
+        for status in &statuses {
+            let response = RunnerResponse {
+                id: "runner-status".to_string(),
+                name: "status-test".to_string(),
+                runner_type: "docker".to_string(),
+                status: status.to_string(),
+                capacity: 1,
+                last_heartbeat: None,
+            };
+            assert_eq!(response.status, *status);
+        }
+    }
+
+    #[test]
+    fn test_runner_response_debug_format() {
+        let response = RunnerResponse {
+            id: "runner-debug".to_string(),
+            name: "debug-runner".to_string(),
+            runner_type: "docker".to_string(),
+            status: "online".to_string(),
+            capacity: 4,
+            last_heartbeat: None,
+        };
+        let debug_str = format!("{:?}", response);
+        assert!(debug_str.contains("runner-debug"));
+        assert!(debug_str.contains("debug-runner"));
+    }
 }
