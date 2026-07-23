@@ -10,8 +10,9 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use gitforce_common::PipelineId;
+use gitforce_common::{JobId, PipelineId, PipelineRunId, RepoId};
 use gitforce_db::{queries::PipelineQueries, Pool};
+use gitforce_scheduler::Scheduler;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -58,6 +59,7 @@ fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
 /// Trigger a pipeline via webhook
 async fn trigger_pipeline(
     Extension(pool): Extension<Arc<Pool>>,
+    Extension(scheduler): Extension<Option<Arc<Scheduler>>>,
     Extension(auth): Extension<Arc<ApiAuth>>,
     headers: HeaderMap,
     Path(pipeline_id): Path<String>,
@@ -93,14 +95,33 @@ async fn trigger_pipeline(
     // Verify pipeline exists
     match PipelineQueries::get(&pool, pipeline_uuid).await {
         Ok(Some(_pipeline)) => {
-            // Pipeline exists - in a full implementation, this would
-            // create a new pipeline run and return its ID
+            // Pipeline exists - enqueue jobs to scheduler
             tracing::info!(
                 "Triggering pipeline {} for repo {} at commit {}",
                 pipeline_id,
                 payload.repo_id,
                 payload.commit_hash
             );
+
+            // Create a job for this pipeline run
+            let repo_id = uuid::Uuid::parse_str(&payload.repo_id)
+                .map(RepoId::from)
+                .unwrap_or_else(|_| RepoId::new());
+            let run_id = PipelineRunId::new();
+            let job_id = JobId::new();
+
+            // Enqueue the job to the scheduler (if available)
+            if let Some(sched) = &scheduler {
+                sched.enqueue(job_id, run_id, repo_id).await;
+                tracing::info!(
+                    "Enqueued job {} for pipeline {} on branch {}",
+                    job_id,
+                    pipeline_id,
+                    payload.branch
+                );
+            } else {
+                tracing::warn!("No scheduler available, job not enqueued");
+            }
 
             (
                 StatusCode::OK,

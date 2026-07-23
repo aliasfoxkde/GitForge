@@ -10,6 +10,7 @@ gitforce-common = { path = "../gitforce-common" }
 gitforce-db = { path = "../gitforce-db" }
 gitforce-events = { path = "../gitforce-events" }
 gitforce-ci = { path = "../gitforce-ci" }
+gitforce-scheduler = { path = "../gitforce-scheduler" }
 gitforce-storage = { path = "../gitforce-storage" }
 uuid = { workspace = true }
 chrono = { workspace = true }

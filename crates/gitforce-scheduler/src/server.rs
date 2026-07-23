@@ -122,9 +122,22 @@ async fn get_pending_jobs(State(state): State<SchedulerServerState>) -> impl Int
     // Process queue to assign pending jobs
     state.scheduler.process_queue().await;
 
-    // Return empty array - actual job info would come from database
-    // In real implementation, this would query job details from DB
-    Json(serde_json::json!([]))
+    // Get jobs assigned to runners (these are pending execution)
+    let assigned_jobs = state.scheduler.get_assigned_jobs().await;
+
+    // Convert to response format
+    let job_infos: Vec<PendingJobInfo> = assigned_jobs
+        .into_iter()
+        .map(|(job_id, runner_id, pipeline_run_id)| PendingJobInfo {
+            job_id: job_id.to_string(),
+            name: format!("job-{}", job_id),
+            pipeline_run_id: pipeline_run_id.to_string(),
+            commands: vec!["echo 'job assigned'".to_string()], // Placeholder - real impl would query DB
+            working_dir: None,
+        })
+        .collect();
+
+    Json(serde_json::json!(job_infos))
 }
 
 /// Assign a job to a runner (runner claims a job)
@@ -184,7 +197,31 @@ async fn complete_job(
     };
 
     let success = request["success"].as_bool().unwrap_or(false);
-    tracing::info!("job {} completed via HTTP: success={}", job_id, success);
+    let exit_code = request["exit_code"].as_i64().unwrap_or(-1);
+    let error = request["error"].as_str();
+
+    tracing::info!(
+        "job {} completed via HTTP: success={}, exit_code={}",
+        job_id,
+        success,
+        exit_code
+    );
+
+    // Log step results if present
+    if let Some(step_results) = request["step_results"].as_array() {
+        tracing::debug!("job {} had {} steps", job_id, step_results.len());
+        for (i, step) in step_results.iter().enumerate() {
+            let step_exit = step["exit_code"].as_i64().unwrap_or(-1);
+            tracing::debug!("  step {}: exit_code={}", i, step_exit);
+        }
+    }
+
+    // Log error if present
+    if let Some(err) = error {
+        if !err.is_empty() {
+            tracing::error!("job {} error: {}", job_id, err);
+        }
+    }
 
     (
         StatusCode::OK,

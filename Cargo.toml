@@ -6,6 +6,7 @@ members = [
     "crates/gitforce-events",
     "crates/gitforce-core",
     "crates/gitforce-ci",
+    "crates/gitforce-process",
     "crates/gitforce-scheduler",
     "crates/gitforce-runner",
     "crates/gitforce-sandbox",

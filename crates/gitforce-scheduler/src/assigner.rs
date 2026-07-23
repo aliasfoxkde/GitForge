@@ -3,7 +3,8 @@
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
 use gitforce_common::{JobId, PipelineRunId, RepoId, RunnerId};
-use gitforce_db::models::Runner;
+use gitforce_db::models::{Job as DbJob, Runner};
+use gitforce_db::Pool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -86,15 +87,29 @@ pub struct Scheduler {
     state: Arc<RwLock<SchedulerState>>,
     policy: Arc<dyn SchedulingPolicy>,
     event_tx: broadcast::Sender<SchedulerEvent>,
+    db_pool: Option<Pool>,
 }
 
 impl Scheduler {
+    /// Create a new scheduler without database
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(100);
         Self {
             state: Arc::new(RwLock::new(SchedulerState::new())),
             policy: Arc::new(SimplePolicy::new()),
             event_tx,
+            db_pool: None,
+        }
+    }
+
+    /// Create a new scheduler with database pool
+    pub fn with_db(pool: Pool) -> Self {
+        let (event_tx, _) = broadcast::channel(100);
+        Self {
+            state: Arc::new(RwLock::new(SchedulerState::new())),
+            policy: Arc::new(SimplePolicy::new()),
+            event_tx,
+            db_pool: Some(pool),
         }
     }
 
@@ -104,7 +119,13 @@ impl Scheduler {
             policy: Arc::new(policy),
             state: self.state,
             event_tx: self.event_tx,
+            db_pool: self.db_pool,
         }
+    }
+
+    /// Get whether scheduler has database connection
+    pub fn has_db(&self) -> bool {
+        self.db_pool.is_some()
     }
 
     /// Subscribe to scheduler events
@@ -118,6 +139,17 @@ impl Scheduler {
         let mut state = self.state.write().await;
         state.queue.enqueue(job);
         tracing::debug!("job {} enqueued", job_id);
+
+        // Persist to database if available
+        if let Some(pool) = &self.db_pool {
+            let db_job = DbJob::new(pipeline_run_id, format!("job-{}", job_id));
+            if let Err(e) = gitforce_db::queries::JobQueries::create(pool, &db_job).await {
+                tracing::error!("failed to persist job to DB: {}", e);
+            }
+            if let Err(e) = gitforce_db::queries::JobQueries::update_status(pool, job_id, "queued").await {
+                tracing::error!("failed to update job status in DB: {}", e);
+            }
+        }
     }
 
     /// Enqueue a job with priority
@@ -203,7 +235,43 @@ impl Scheduler {
         if let Some((job_id, runner_id)) = assigned {
             let event = SchedulerEvent::JobAssigned { job_id, runner_id };
             let _ = self.event_tx.send(event);
+
+            // Persist assignment to database if available
+            if let Some(pool) = &self.db_pool {
+                if let Err(e) = gitforce_db::queries::JobQueries::assign(pool, job_id, runner_id).await {
+                    tracing::error!("failed to persist job assignment to DB: {}", e);
+                }
+                if let Err(e) = gitforce_db::queries::JobQueries::update_status(pool, job_id, "assigned").await {
+                    tracing::error!("failed to update job status in DB: {}", e);
+                }
+            }
         }
+    }
+
+    /// Load pending jobs from database
+    pub async fn load_pending_jobs(&self) -> anyhow::Result<usize> {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return Ok(0),
+        };
+
+        let pending_jobs = gitforce_db::queries::JobQueries::list_pending(pool).await?;
+        let mut state = self.state.write().await;
+
+        let mut loaded = 0;
+        for db_job in pending_jobs {
+            if !state.queue.contains(db_job.id) {
+                state.queue.enqueue(QueuedJob::new(
+                    db_job.id,
+                    db_job.pipeline_run_id,
+                    RepoId::new(), // RepoId not in job model, use default
+                ));
+                loaded += 1;
+            }
+        }
+
+        tracing::info!("loaded {} pending jobs from database", loaded);
+        Ok(loaded)
     }
 
     /// Get queue length
@@ -216,6 +284,24 @@ impl Scheduler {
     pub async fn is_assigned(&self, job_id: JobId) -> Option<RunnerId> {
         let state = self.state.read().await;
         state.job_assignments.get(&job_id).copied()
+    }
+
+    /// Get all assigned jobs (jobs assigned to runners, awaiting execution)
+    pub async fn get_assigned_jobs(&self) -> Vec<(JobId, RunnerId, PipelineRunId)> {
+        let state = self.state.read().await;
+        state
+            .job_assignments
+            .iter()
+            .filter_map(|(job_id, runner_id)| {
+                // Find the queued job to get pipeline_run_id
+                state
+                    .queue
+                    .all()
+                    .iter()
+                    .find(|j| j.job_id == *job_id)
+                    .map(|j| (j.job_id, *runner_id, j.pipeline_run_id))
+            })
+            .collect()
     }
 }
 
