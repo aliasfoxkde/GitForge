@@ -526,7 +526,12 @@ mod tests {
                 "def456".to_string(),
                 None,
             );
-            assert_eq!(payload.is_branch_push(), is_branch, "failed for {}", ref_name);
+            assert_eq!(
+                payload.is_branch_push(),
+                is_branch,
+                "failed for {}",
+                ref_name
+            );
             assert_eq!(payload.is_tag_push(), is_tag, "failed for {}", ref_name);
         }
     }
