@@ -12,6 +12,7 @@ use axum::{
     Json, Router,
 };
 use gitforce_db::Pool;
+use gitforce_scheduler::Scheduler;
 use gitforce_storage::FileStorage;
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -118,6 +119,15 @@ impl ApiServer {
     /// Add storage extension to the router
     pub fn with_storage_extension(self, storage: Arc<FileStorage>) -> Self {
         let app = self.router.layer(Extension(storage));
+        Self {
+            router: app,
+            ..self
+        }
+    }
+
+    /// Add scheduler extension for job queuing
+    pub fn with_scheduler_extension(self, scheduler: Arc<Scheduler>) -> Self {
+        let app = self.router.layer(Extension(scheduler));
         Self {
             router: app,
             ..self

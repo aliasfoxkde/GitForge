@@ -898,6 +898,7 @@ dependencies = [
  "gitforce-common",
  "gitforce-db",
  "gitforce-events",
+ "gitforce-scheduler",
  "gitforce-storage",
  "hyper",
  "jsonwebtoken",
