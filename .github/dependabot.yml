@@ -17,6 +17,22 @@ updates:
       - dependencies
       - go
 
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: UTC
+    groups:
+      cargo:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - rust
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -33,8 +49,3 @@ updates:
     labels:
       - dependencies
       - github-actions
-
-  # Add more package ecosystems as needed:
-  # - npm (for Node.js projects)
-  # - pip (for Python projects)
-  # - cargo (for Rust projects)

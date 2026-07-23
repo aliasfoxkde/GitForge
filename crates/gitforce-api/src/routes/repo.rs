@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use gitforce_common::{RepoId, UserId};
-use gitforce_db::{Pool, queries::RepoQueries};
+use gitforce_db::{queries::RepoQueries, Pool};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -41,10 +41,16 @@ fn validate_repo_name(name: &str) -> Result<(), String> {
     }
 
     // Check for special characters that could be problematic
-    let invalid_chars = ['\0', '\n', '\r', '\t', '\\', '"', '\'', '`', '>', '<', '|', '&', ';', '$', '!', '{', '}', '[', ']', '(', ')'];
+    let invalid_chars = [
+        '\0', '\n', '\r', '\t', '\\', '"', '\'', '`', '>', '<', '|', '&', ';', '$', '!', '{', '}',
+        '[', ']', '(', ')',
+    ];
     for c in invalid_chars {
         if name.contains(c) {
-            return Err(format!("Repository name contains invalid character: {:?}", c));
+            return Err(format!(
+                "Repository name contains invalid character: {:?}",
+                c
+            ));
         }
     }
 
@@ -88,15 +94,14 @@ pub fn repo_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 
 /// Helper to extract and validate user from headers
 fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<UserId, StatusCode> {
-    let auth_header = headers
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok());
+    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok());
 
     let token = auth_header
         .and_then(|h| ApiAuth::extract_token(h))
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let claims = auth.validate_token(token)
+    let claims = auth
+        .validate_token(token)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     Ok(claims.user_id)
@@ -111,10 +116,11 @@ async fn list_repos(
     // Check auth
     match extract_user(&auth, &headers) {
         Err(e) => e.into_response(),
-        Ok(_) => {
-            match RepoQueries::list(&pool).await {
-                Ok(repos) => {
-                    let response: Vec<RepoResponse> = repos.into_iter().map(|r| RepoResponse {
+        Ok(_) => match RepoQueries::list(&pool).await {
+            Ok(repos) => {
+                let response: Vec<RepoResponse> = repos
+                    .into_iter()
+                    .map(|r| RepoResponse {
                         id: r.id.to_string(),
                         name: r.name,
                         owner_id: r.owner_id.to_string(),
@@ -122,15 +128,15 @@ async fn list_repos(
                         git_path: r.git_path,
                         created_at: r.created_at.to_rfc3339(),
                         updated_at: r.updated_at.to_rfc3339(),
-                    }).collect();
-                    Json(response).into_response()
-                }
-                Err(e) => {
-                    tracing::error!("failed to list repos: {}", e);
-                    Json(serde_json::Value::Array(vec![])).into_response()
-                }
+                    })
+                    .collect();
+                Json(response).into_response()
             }
-        }
+            Err(e) => {
+                tracing::error!("failed to list repos: {}", e);
+                Json(serde_json::Value::Array(vec![])).into_response()
+            }
+        },
     }
 }
 
@@ -151,19 +157,19 @@ async fn create_repo(
 
     // Validate repository name to prevent path traversal and injection
     if let Err(e) = validate_repo_name(&req.name) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "invalid_name",
-            "message": e
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_name",
+                "message": e
+            })),
+        )
+            .into_response();
     }
 
     let git_path = format!("/git/repos/{}", req.name);
 
-    let repo = gitforce_db::models::Repository::new(
-        req.name,
-        owner_id,
-        git_path.clone(),
-    );
+    let repo = gitforce_db::models::Repository::new(req.name, owner_id, git_path.clone());
 
     match RepoQueries::create(&pool, &repo).await {
         Ok(_) => {
@@ -180,10 +186,14 @@ async fn create_repo(
         }
         Err(e) => {
             tracing::error!("failed to create repo: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "database_error",
-                "message": format!("failed to create repository: {}", e)
-            }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": format!("failed to create repository: {}", e)
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -217,27 +227,35 @@ async fn get_repo(
                             };
                             (StatusCode::OK, Json(response)).into_response()
                         }
-                        Ok(None) => {
-                            (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                        Ok(None) => (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({
                                 "error": "not_found",
                                 "message": "Repository not found"
-                            }))).into_response()
-                        }
+                            })),
+                        )
+                            .into_response(),
                         Err(e) => {
                             tracing::error!("failed to get repo: {}", e);
-                            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                                "error": "database_error",
-                                "message": format!("failed to get repository: {}", e)
-                            }))).into_response()
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "database_error",
+                                    "message": format!("failed to get repository: {}", e)
+                                })),
+                            )
+                                .into_response()
                         }
                     }
                 }
-                Err(_) => {
-                    (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                Err(_) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
                         "error": "invalid_id",
                         "message": "Invalid repository ID format"
-                    }))).into_response()
-                }
+                    })),
+                )
+                    .into_response(),
             }
         }
     }
@@ -263,19 +281,25 @@ async fn delete_repo(
                         Ok(_) => StatusCode::NO_CONTENT.into_response(),
                         Err(e) => {
                             tracing::error!("failed to delete repo: {}", e);
-                            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                                "error": "database_error",
-                                "message": format!("failed to delete repository: {}", e)
-                            }))).into_response()
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "database_error",
+                                    "message": format!("failed to delete repository: {}", e)
+                                })),
+                            )
+                                .into_response()
                         }
                     }
                 }
-                Err(_) => {
-                    (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                Err(_) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
                         "error": "invalid_id",
                         "message": "Invalid repository ID format"
-                    }))).into_response()
-                }
+                    })),
+                )
+                    .into_response(),
             }
         }
     }

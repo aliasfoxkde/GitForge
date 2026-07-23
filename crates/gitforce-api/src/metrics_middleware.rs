@@ -3,10 +3,7 @@
 //! Intercepts all HTTP requests and records metrics for Prometheus export.
 
 use crate::metrics::Metrics;
-use axum::{
-    extract::Request,
-    response::Response,
-};
+use axum::{extract::Request, response::Response};
 use std::{
     convert::Infallible,
     future::Future,
@@ -160,18 +157,12 @@ mod tests {
 
     #[test]
     fn test_normalize_path_with_numeric_id() {
-        assert_eq!(
-            normalize_path("/api/repos/12345"),
-            "/api/repos/{id}"
-        );
+        assert_eq!(normalize_path("/api/repos/12345"), "/api/repos/{id}");
     }
 
     #[test]
     fn test_normalize_path_preserves_static_segments() {
-        assert_eq!(
-            normalize_path("/api/repos"),
-            "/api/repos"
-        );
+        assert_eq!(normalize_path("/api/repos"), "/api/repos");
     }
 
     #[test]

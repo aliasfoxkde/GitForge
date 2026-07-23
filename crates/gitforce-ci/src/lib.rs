@@ -11,5 +11,7 @@ pub mod state;
 pub use dag::{DagBuilder, JobGraph, JobNode};
 pub use engine::CiEngine;
 pub use executor::PipelineExecutor;
-pub use pipeline::{PipelineDefinition, PipelineTriggerEvent, TriggerType, JobDefinition, StepDefinition};
+pub use pipeline::{
+    JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
+};
 pub use state::JobStateMachine;

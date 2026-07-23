@@ -5,11 +5,7 @@ use crate::metrics::Metrics;
 use crate::metrics_middleware::MetricsLayer;
 use crate::routes::{artifact_routes, ci_routes, repo_routes, runner_routes, webhook_routes};
 use axum::{
-    extract::Extension,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
+    extract::Extension, http::StatusCode, response::IntoResponse, routing::get, Json, Router,
 };
 use gitforce_db::Pool;
 use gitforce_storage::FileStorage;
@@ -31,16 +27,40 @@ impl ApiServer {
     }
 
     /// Create a new API server with custom storage path
-    pub fn with_storage(jwt_secret: &str, pool: Pool, _storage_path: Option<std::path::PathBuf>) -> Self {
+    pub fn with_storage(
+        jwt_secret: &str,
+        pool: Pool,
+        _storage_path: Option<std::path::PathBuf>,
+    ) -> Self {
         let auth = ApiAuth::new(jwt_secret);
         let metrics = Metrics::new();
         let metrics_arc = Arc::new(metrics);
 
         // Configure CORS - restrictive by default
-        let cors = CorsLayer::new()
-            .allow_origin(Any) // TODO: Configure allowed origins
-            .allow_methods(Any)
-            .allow_headers(Any);
+        // Use CORS_ALLOWED_ORIGINS env var to specify comma-separated allowed origins
+        // e.g., CORS_ALLOWED_ORIGINS=https://app.example.com,https://dashboard.example.com
+        // If not set, defaults to allowing only localhost for development
+        let allowed_origins = std::env::var("CORS_ALLOWED_ORIGINS")
+            .unwrap_or_else(|_| "http://localhost:3000,http://localhost:8080".to_string());
+
+        let origins: Vec<&str> = allowed_origins.split(',').map(|s| s.trim()).collect();
+
+        let cors = if origins.contains(&"*") {
+            // Wildcard only allowed in development (not production)
+            tracing::warn!("CORS wildcard '*' is insecure for production!");
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        } else {
+            let allow_list: Vec<axum::http::HeaderValue> =
+                origins.iter().filter_map(|s| s.parse().ok()).collect();
+
+            CorsLayer::new()
+                .allow_origin(allow_list)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        };
 
         // Public routes (no auth required)
         let health = Router::new().route("/health", get(health_check));
@@ -77,13 +97,19 @@ impl ApiServer {
             .layer(Extension(metrics_arc))
             .nest("/api", protected_routes);
 
-        Self { router: app, port: 8080 }
+        Self {
+            router: app,
+            port: 8080,
+        }
     }
 
     /// Add storage extension to the router
     pub fn with_storage_extension(self, storage: Arc<FileStorage>) -> Self {
         let app = self.router.layer(Extension(storage));
-        Self { router: app, ..self }
+        Self {
+            router: app,
+            ..self
+        }
     }
 
     /// Set the port
@@ -114,9 +140,7 @@ impl ApiServer {
 }
 
 /// Health check endpoint
-async fn health_check(
-    Extension(pool): Extension<Arc<Pool>>,
-) -> impl IntoResponse {
+async fn health_check(Extension(pool): Extension<Arc<Pool>>) -> impl IntoResponse {
     let db_status = match pool.health_check().await {
         Ok(_) => "connected",
         Err(e) => {
@@ -125,7 +149,11 @@ async fn health_check(
         }
     };
 
-    let overall_status = if db_status == "connected" { "healthy" } else { "unhealthy" };
+    let overall_status = if db_status == "connected" {
+        "healthy"
+    } else {
+        "unhealthy"
+    };
 
     Json(HealthResponse {
         status: overall_status.to_string(),
@@ -143,9 +171,7 @@ pub struct HealthResponse {
 }
 
 /// Metrics endpoint handler
-async fn metrics_handler(
-    Extension(metrics): Extension<Arc<Metrics>>,
-) -> impl IntoResponse {
+async fn metrics_handler(Extension(metrics): Extension<Arc<Metrics>>) -> impl IntoResponse {
     use prometheus::Encoder;
     let encoder = prometheus::TextEncoder::new();
     let metric_families = metrics.registry.gather();
@@ -165,10 +191,13 @@ pub struct ErrorResponse {
 
 /// Helper to create an error response
 pub fn error_response(status: StatusCode, error: &str, message: &str) -> impl IntoResponse {
-    (status, Json(ErrorResponse {
-        error: error.to_string(),
-        message: message.to_string(),
-    }))
+    (
+        status,
+        Json(ErrorResponse {
+            error: error.to_string(),
+            message: message.to_string(),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -186,7 +215,9 @@ mod tests {
     async fn test_health_check() {
         let pool = Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
-        let response = health_check(Extension(Arc::new(pool))).await.into_response();
+        let response = health_check(Extension(Arc::new(pool)))
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -194,9 +225,14 @@ mod tests {
     async fn test_health_check_no_migration() {
         let pool = Pool::memory().await.unwrap();
         // Don't migrate - health check should still work
-        let response = health_check(Extension(Arc::new(pool))).await.into_response();
+        let response = health_check(Extension(Arc::new(pool)))
+            .await
+            .into_response();
         // May return unhealthy but shouldn't panic
-        assert!(response.status() == StatusCode::OK || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            response.status() == StatusCode::OK
+                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]
@@ -250,7 +286,11 @@ mod tests {
     #[tokio::test]
     async fn test_server_with_storage() {
         let pool = Pool::memory().await.unwrap();
-        let server = ApiServer::with_storage("test-secret", pool, Some(std::path::PathBuf::from("/tmp/storage")));
+        let server = ApiServer::with_storage(
+            "test-secret",
+            pool,
+            Some(std::path::PathBuf::from("/tmp/storage")),
+        );
         assert_eq!(server.port, 8080);
     }
 

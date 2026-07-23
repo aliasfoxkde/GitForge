@@ -10,18 +10,10 @@ use std::future::Future;
 #[async_trait::async_trait]
 pub trait GitProtocolHandler: Send + Sync {
     /// Handle a git upload-pack request (git clone/fetch)
-    async fn upload_pack(
-        &self,
-        repo_id: RepoId,
-        input: Vec<u8>,
-    ) -> Result<Vec<u8>>;
+    async fn upload_pack(&self, repo_id: RepoId, input: Vec<u8>) -> Result<Vec<u8>>;
 
     /// Handle a git receive-pack request (git push)
-    async fn receive_pack(
-        &self,
-        repo_id: RepoId,
-        input: Vec<u8>,
-    ) -> Result<Vec<u8>>;
+    async fn receive_pack(&self, repo_id: RepoId, input: Vec<u8>) -> Result<Vec<u8>>;
 }
 
 /// Async function wrapper for GitProtocolHandler
@@ -56,9 +48,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fn_handler_upload_pack() {
-        let handler = FnHandler::new(|_repo_id: RepoId, input: Vec<u8>| async move {
-            Ok(input)
-        });
+        let handler = FnHandler::new(|_repo_id: RepoId, input: Vec<u8>| async move { Ok(input) });
 
         let repo_id = RepoId::new();
         let result = handler.upload_pack(repo_id, vec![1, 2, 3]).await;
@@ -68,9 +58,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fn_handler_receive_pack() {
-        let handler = FnHandler::new(|_repo_id: RepoId, input: Vec<u8>| async move {
-            Ok(input)
-        });
+        let handler = FnHandler::new(|_repo_id: RepoId, input: Vec<u8>| async move { Ok(input) });
 
         let repo_id = RepoId::new();
         let result = handler.receive_pack(repo_id, vec![4, 5, 6]).await;
@@ -80,9 +68,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fn_handler_empty_input() {
-        let handler = FnHandler::new(|_repo_id: RepoId, input: Vec<u8>| async move {
-            Ok(input)
-        });
+        let handler = FnHandler::new(|_repo_id: RepoId, input: Vec<u8>| async move { Ok(input) });
 
         let repo_id = RepoId::new();
         let result = handler.upload_pack(repo_id, vec![]).await;

@@ -47,10 +47,7 @@ impl EventEnvelope {
     }
 
     /// Create a new event with a correlation ID
-    pub fn with_correlation(
-        mut self,
-        correlation_id: Uuid,
-    ) -> Self {
+    pub fn with_correlation(mut self, correlation_id: Uuid) -> Self {
         self.correlation_id = Some(correlation_id);
         self
     }
@@ -525,7 +522,8 @@ mod tests {
             EventPayload::PushReceived(payload),
             None,
             None,
-        ).with_correlation(correlation_id);
+        )
+        .with_correlation(correlation_id);
 
         assert_eq!(event.correlation_id, Some(correlation_id));
     }
@@ -554,8 +552,14 @@ mod tests {
     #[test]
     fn test_event_type_display() {
         assert_eq!(format!("{}", EventType::PushReceived), "push.received");
-        assert_eq!(format!("{}", EventType::PipelineTriggered), "pipeline.triggered");
-        assert_eq!(format!("{}", EventType::RunnerHeartbeat), "runner.heartbeat");
+        assert_eq!(
+            format!("{}", EventType::PipelineTriggered),
+            "pipeline.triggered"
+        );
+        assert_eq!(
+            format!("{}", EventType::RunnerHeartbeat),
+            "runner.heartbeat"
+        );
     }
 
     #[test]

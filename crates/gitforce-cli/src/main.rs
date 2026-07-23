@@ -2,17 +2,17 @@
 //!
 //! Local-first Git platform client for GitForge.
 
+use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
-use anyhow::Result;
 use std::path::PathBuf;
 
-mod config;
 mod client;
+mod config;
 mod sync;
 
-pub use config::Config;
 pub use client::GitForgeClient;
+pub use config::Config;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -171,7 +171,12 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
     let token = cli.token.or_else(|| config.token.clone());
 
     match &cli.command {
-        Commands::Auth { login, logout, status, whoami } => {
+        Commands::Auth {
+            login,
+            logout,
+            status,
+            whoami,
+        } => {
             if let Some(username) = login {
                 println!("🔐 Authenticating as {} to {}", username, server);
                 println!("   (API not yet wired - use `gitforge auth status` to check)");
@@ -198,14 +203,21 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
 
-        Commands::Repo { list, create, info, delete, clone, init } => {
+        Commands::Repo {
+            list,
+            create,
+            info,
+            delete,
+            clone,
+            init,
+        } => {
             if *list {
                 println!("📦 Repositories on {}:", server);
-                println!("");
+                println!();
                 println!("  (API not yet wired - showing sample format)");
                 println!("  my-project     - My awesome project       [active]");
                 println!("  another-repo   - Another repository        [active]");
-                println!("");
+                println!();
                 println!("  Run `gitforge repo create <name>` to create a new repository.");
             } else if let Some(name) = create {
                 println!("📦 Creating repository '{}'...", name);
@@ -231,7 +243,17 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
 
-        Commands::Git { init, clone, status, push, pull, add, commit, log, remote } => {
+        Commands::Git {
+            init,
+            clone,
+            status,
+            push,
+            pull,
+            add,
+            commit,
+            log,
+            remote,
+        } => {
             if let Some(path) = init {
                 let dir = PathBuf::from(path);
                 println!("🔧 Initializing Git repository at {}...", dir.display());
@@ -241,18 +263,18 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("📥 Cloning from {}...", url);
                 println!("   This will clone the repository to the current directory.");
                 println!("   (Actual git clone would be performed here)");
-                println!("");
+                println!();
                 println!("   GitForge supports:");
                 println!("   - HTTPS cloning via GitForge API");
                 println!("   - SSH cloning via git-server service");
             } else if *status {
                 println!("📊 Git Status:");
-                println!("");
+                println!();
                 println!("  On branch: main");
                 println!("  Your branch is up to date with 'origin/main'.");
-                println!("");
+                println!();
                 println!("  nothing to commit, working tree clean");
-                println!("");
+                println!();
                 println!("  (This is a demo - actual git status would show real state)");
             } else if *push {
                 println!("⬆️  Pushing to remote...");
@@ -273,30 +295,37 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("   (Actual git commit would be performed here)");
             } else if *log {
                 println!("📜 Commit History:");
-                println!("");
+                println!();
                 println!("  commit abc123 (HEAD -> main)");
                 println!("  Author: User <user@example.com>");
                 println!("  Date:   2026-07-22");
-                println!("");
+                println!();
                 println!("      Initial commit");
-                println!("");
+                println!();
                 println!("  (This is a demo - actual git log would show real history)");
             } else if *remote {
                 println!("🔗 Git Remotes:");
-                println!("");
+                println!();
                 println!("  origin  {} (fetch)", server);
                 println!("  origin  {} (push)", server);
             }
         }
 
-        Commands::Pipeline { list, show, run, watch, create, delete } => {
+        Commands::Pipeline {
+            list,
+            show,
+            run,
+            watch,
+            create,
+            delete,
+        } => {
             if *list {
                 println!("⚙️  Pipelines on {}:", server);
-                println!("");
+                println!();
                 println!("  (API not yet wired - showing sample format)");
                 println!("  build-and-test  - Build and run tests     [active]");
                 println!("  deploy-prod      - Deploy to production     [active]");
-                println!("");
+                println!();
                 println!("  Run `gitforge pipeline create <name>` to create a pipeline.");
             } else if let Some(id) = show {
                 println!("⚙️  Pipeline: {}", id);
@@ -318,14 +347,20 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
 
-        Commands::Runner { list, info, register, capacity, deregister } => {
+        Commands::Runner {
+            list,
+            info,
+            register,
+            capacity,
+            deregister,
+        } => {
             if *list {
                 println!("🤖 Runners on {}:", server);
-                println!("");
+                println!();
                 println!("  (API not yet wired - showing sample format)");
                 println!("  runner-01    - Linux x86_64    [idle]    capacity: 2");
                 println!("  runner-02    - Linux ARM64     [busy]    capacity: 4");
-                println!("");
+                println!();
                 println!("  Run `gitforge runner register <name>` to register a runner.");
             } else if let Some(id) = info {
                 println!("🤖 Runner: {}", id);
@@ -347,7 +382,12 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
 
-        Commands::Sync { status, push, pull, init } => {
+        Commands::Sync {
+            status,
+            push,
+            pull,
+            init,
+        } => {
             let local_dir = config.local_data_dir.clone();
 
             if let Some(directory) = init {
@@ -364,14 +404,17 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
 
             if *status {
                 println!("☁️  GitForge Sync Status");
-                println!("");
+                println!();
                 println!("   Local storage: {}", local_dir.display());
                 let sync_client = sync::SyncClient::with_real_client(local_dir.clone());
                 let sync_status = sync_client.status().await;
                 println!("   Sync state: {:?}", sync_status);
-                println!("");
+                println!();
                 println!("   Server: {}", server);
-                println!("   (Authenticated: {})", if token.is_some() { "yes" } else { "no" });
+                println!(
+                    "   (Authenticated: {})",
+                    if token.is_some() { "yes" } else { "no" }
+                );
             } else if *push {
                 if let Some(ref t) = token {
                     println!("⬆️  Pushing to remote...");
@@ -425,8 +468,11 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(if cli.verbose { tracing::Level::DEBUG.into() } else { tracing::Level::INFO.into() })
+            tracing_subscriber::EnvFilter::from_default_env().add_directive(if cli.verbose {
+                tracing::Level::DEBUG.into()
+            } else {
+                tracing::Level::INFO.into()
+            }),
         )
         .init();
 
@@ -579,7 +625,11 @@ mod tests {
     #[tokio::test]
     async fn test_sync_init_creates_directory() {
         let temp_dir = std::env::temp_dir();
-        let test_dir = temp_dir.join("gitforge-test-init").to_str().unwrap().to_string();
+        let test_dir = temp_dir
+            .join("gitforge-test-init")
+            .to_str()
+            .unwrap()
+            .to_string();
         let _ = std::fs::remove_dir_all(&test_dir);
 
         let cli = test_cli(Commands::Sync {

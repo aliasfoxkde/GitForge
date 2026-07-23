@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use gitforce_common::PipelineId;
-use gitforce_db::{Pool, queries::PipelineQueries};
+use gitforce_db::{queries::PipelineQueries, Pool};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -38,15 +38,12 @@ pub struct WebhookTriggerResponse {
 
 /// Webhook routes
 pub fn webhook_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
-    Router::new()
-        .route("/webhook/trigger/:pipeline_id", post(trigger_pipeline))
+    Router::new().route("/webhook/trigger/:pipeline_id", post(trigger_pipeline))
 }
 
 /// Helper to extract and validate user from headers
 fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let auth_header = headers
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok());
+    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok());
 
     let token = auth_header
         .and_then(|h| ApiAuth::extract_token(h))
@@ -71,17 +68,25 @@ async fn trigger_pipeline(
         return e.into_response();
     }
 
-    tracing::info!("Webhook trigger for pipeline {} from repo {}", pipeline_id, payload.repo_id);
+    tracing::info!(
+        "Webhook trigger for pipeline {} from repo {}",
+        pipeline_id,
+        payload.repo_id
+    );
 
     // Parse pipeline ID
     let pipeline_uuid = match uuid::Uuid::parse_str(&pipeline_id) {
         Ok(uuid) => PipelineId::from(uuid),
         Err(_) => {
-            return (StatusCode::BAD_REQUEST, Json(WebhookTriggerResponse {
-                success: false,
-                message: "Invalid pipeline ID format".to_string(),
-                pipeline_id: None,
-            })).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(WebhookTriggerResponse {
+                    success: false,
+                    message: "Invalid pipeline ID format".to_string(),
+                    pipeline_id: None,
+                }),
+            )
+                .into_response();
         }
     };
 
@@ -90,29 +95,43 @@ async fn trigger_pipeline(
         Ok(Some(_pipeline)) => {
             // Pipeline exists - in a full implementation, this would
             // create a new pipeline run and return its ID
-            tracing::info!("Triggering pipeline {} for repo {} at commit {}",
-                pipeline_id, payload.repo_id, payload.commit_hash);
+            tracing::info!(
+                "Triggering pipeline {} for repo {} at commit {}",
+                pipeline_id,
+                payload.repo_id,
+                payload.commit_hash
+            );
 
-            (StatusCode::OK, Json(WebhookTriggerResponse {
-                success: true,
-                message: format!("Pipeline triggered for branch '{}'", payload.branch),
-                pipeline_id: Some(pipeline_id),
-            })).into_response()
+            (
+                StatusCode::OK,
+                Json(WebhookTriggerResponse {
+                    success: true,
+                    message: format!("Pipeline triggered for branch '{}'", payload.branch),
+                    pipeline_id: Some(pipeline_id),
+                }),
+            )
+                .into_response()
         }
-        Ok(None) => {
-            (StatusCode::NOT_FOUND, Json(WebhookTriggerResponse {
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(WebhookTriggerResponse {
                 success: false,
                 message: "Pipeline not found".to_string(),
                 pipeline_id: None,
-            })).into_response()
-        }
+            }),
+        )
+            .into_response(),
         Err(e) => {
             tracing::error!("Failed to get pipeline: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(WebhookTriggerResponse {
-                success: false,
-                message: "Database error".to_string(),
-                pipeline_id: None,
-            })).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(WebhookTriggerResponse {
+                    success: false,
+                    message: "Database error".to_string(),
+                    pipeline_id: None,
+                }),
+            )
+                .into_response()
         }
     }
 }

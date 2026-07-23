@@ -60,7 +60,7 @@ impl JsonEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{PushReceivedPayload, EventType, EventPayload, PipelineStartedPayload};
+    use crate::event::{EventPayload, EventType, PipelineStartedPayload, PushReceivedPayload};
 
     #[test]
     fn test_serialize_roundtrip() {
@@ -160,7 +160,8 @@ mod tests {
             }),
             None,
             None,
-        ).with_correlation(correlation_id);
+        )
+        .with_correlation(correlation_id);
 
         let json_event = JsonEvent::from_envelope(&event);
         assert!(json_event.correlation_id.is_some());
@@ -217,7 +218,8 @@ mod tests {
 
     #[test]
     fn test_serializer_deserialize_from_str_invalid() {
-        let result: Result<EventEnvelope, _> = EventSerializer::deserialize_from_str("invalid json");
+        let result: Result<EventEnvelope, _> =
+            EventSerializer::deserialize_from_str("invalid json");
         assert!(result.is_err());
     }
 

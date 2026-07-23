@@ -2,10 +2,15 @@
 //!
 //! These tests use in-memory SQLite databases for testing.
 
-use gitforce_db::Pool;
-use gitforce_db::queries::{RepoQueries, UserQueries, RunnerQueries, PipelineQueries, PipelineRunQueries, JobQueries, EventQueries};
-use gitforce_db::models::{Repository, User, Runner, RunnerType, Pipeline, PipelineRun, Job, Event};
 use gitforce_common::PipelineId;
+use gitforce_db::models::{
+    Event, Job, Pipeline, PipelineRun, Repository, Runner, RunnerType, User,
+};
+use gitforce_db::queries::{
+    EventQueries, JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries, RunnerQueries,
+    UserQueries,
+};
+use gitforce_db::Pool;
 
 #[tokio::test]
 async fn test_database_in_memory_pool() {
@@ -13,7 +18,11 @@ async fn test_database_in_memory_pool() {
     pool.migrate().await.unwrap();
 
     // Create user
-    let user = User::new("testuser".to_string(), "test@example.com".to_string(), "hash".to_string());
+    let user = User::new(
+        "testuser".to_string(),
+        "test@example.com".to_string(),
+        "hash".to_string(),
+    );
     UserQueries::create(&pool, &user).await.unwrap();
 
     // Verify user can be retrieved
@@ -28,11 +37,19 @@ async fn test_database_repository_crud() {
     pool.migrate().await.unwrap();
 
     // Create user first
-    let user = User::new("owner".to_string(), "owner@example.com".to_string(), "hash".to_string());
+    let user = User::new(
+        "owner".to_string(),
+        "owner@example.com".to_string(),
+        "hash".to_string(),
+    );
     UserQueries::create(&pool, &user).await.unwrap();
 
     // Create repository
-    let repo = Repository::new("test-repo".to_string(), user.id, "/git/test-repo".to_string());
+    let repo = Repository::new(
+        "test-repo".to_string(),
+        user.id,
+        "/git/test-repo".to_string(),
+    );
     RepoQueries::create(&pool, &repo).await.unwrap();
 
     // List repositories
@@ -60,7 +77,9 @@ async fn test_database_runner_operations() {
     assert_eq!(found.unwrap().name, "test-runner");
 
     // Update status
-    RunnerQueries::update_status(&pool, runner.id, "offline").await.unwrap();
+    RunnerQueries::update_status(&pool, runner.id, "offline")
+        .await
+        .unwrap();
     let found = RunnerQueries::get(&pool, runner.id).await.unwrap();
     assert_eq!(found.unwrap().status, "offline");
 }
@@ -71,10 +90,18 @@ async fn test_database_pipeline_with_dependencies() {
     pool.migrate().await.unwrap();
 
     // Create user and repo
-    let user = User::new("owner".to_string(), "owner@example.com".to_string(), "hash".to_string());
+    let user = User::new(
+        "owner".to_string(),
+        "owner@example.com".to_string(),
+        "hash".to_string(),
+    );
     UserQueries::create(&pool, &user).await.unwrap();
 
-    let repo = Repository::new("test-repo".to_string(), user.id, "/git/test-repo".to_string());
+    let repo = Repository::new(
+        "test-repo".to_string(),
+        user.id,
+        "/git/test-repo".to_string(),
+    );
     RepoQueries::create(&pool, &repo).await.unwrap();
 
     // Create pipeline
@@ -89,7 +116,12 @@ async fn test_database_pipeline_with_dependencies() {
     PipelineQueries::create(&pool, &pipeline).await.unwrap();
 
     // Create pipeline run
-    let run = PipelineRun::new(pipeline.id, repo.id, "alice".to_string(), "abc123".to_string());
+    let run = PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "alice".to_string(),
+        "abc123".to_string(),
+    );
     PipelineRunQueries::create(&pool, &run).await.unwrap();
 
     // Create job
@@ -119,7 +151,9 @@ async fn test_database_event_storage() {
     EventQueries::create(&pool, &event).await.unwrap();
 
     // List events by type
-    let events = EventQueries::list_by_type(&pool, "push.received", 10).await.unwrap();
+    let events = EventQueries::list_by_type(&pool, "push.received", 10)
+        .await
+        .unwrap();
     assert_eq!(events.len(), 1);
 
     // List recent events
@@ -153,10 +187,18 @@ async fn test_database_job_state_transitions() {
     pool.migrate().await.unwrap();
 
     // Setup: user, repo, pipeline, run, job
-    let user = User::new("owner".to_string(), "owner@example.com".to_string(), "hash".to_string());
+    let user = User::new(
+        "owner".to_string(),
+        "owner@example.com".to_string(),
+        "hash".to_string(),
+    );
     UserQueries::create(&pool, &user).await.unwrap();
 
-    let repo = Repository::new("test-repo".to_string(), user.id, "/git/test-repo".to_string());
+    let repo = Repository::new(
+        "test-repo".to_string(),
+        user.id,
+        "/git/test-repo".to_string(),
+    );
     RepoQueries::create(&pool, &repo).await.unwrap();
 
     let pipeline = Pipeline {
@@ -169,7 +211,12 @@ async fn test_database_job_state_transitions() {
     };
     PipelineQueries::create(&pool, &pipeline).await.unwrap();
 
-    let run = PipelineRun::new(pipeline.id, repo.id, "alice".to_string(), "abc123".to_string());
+    let run = PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "alice".to_string(),
+        "abc123".to_string(),
+    );
     PipelineRunQueries::create(&pool, &run).await.unwrap();
 
     let job = Job::new(run.id, "build".to_string());
@@ -180,7 +227,9 @@ async fn test_database_job_state_transitions() {
     RunnerQueries::create(&pool, &runner).await.unwrap();
 
     // Update job status to running
-    JobQueries::update_status(&pool, job.id, "running").await.unwrap();
+    JobQueries::update_status(&pool, job.id, "running")
+        .await
+        .unwrap();
     let found = JobQueries::get(&pool, job.id).await.unwrap();
     assert_eq!(found.unwrap().status, "running");
 
@@ -196,10 +245,18 @@ async fn test_database_pipeline_run_status_updates() {
     pool.migrate().await.unwrap();
 
     // Setup
-    let user = User::new("owner".to_string(), "owner@example.com".to_string(), "hash".to_string());
+    let user = User::new(
+        "owner".to_string(),
+        "owner@example.com".to_string(),
+        "hash".to_string(),
+    );
     UserQueries::create(&pool, &user).await.unwrap();
 
-    let repo = Repository::new("test-repo".to_string(), user.id, "/git/test-repo".to_string());
+    let repo = Repository::new(
+        "test-repo".to_string(),
+        user.id,
+        "/git/test-repo".to_string(),
+    );
     RepoQueries::create(&pool, &repo).await.unwrap();
 
     let pipeline = Pipeline {
@@ -212,12 +269,19 @@ async fn test_database_pipeline_run_status_updates() {
     };
     PipelineQueries::create(&pool, &pipeline).await.unwrap();
 
-    let run = PipelineRun::new(pipeline.id, repo.id, "alice".to_string(), "abc123".to_string());
+    let run = PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "alice".to_string(),
+        "abc123".to_string(),
+    );
     PipelineRunQueries::create(&pool, &run).await.unwrap();
 
     // Update status through various states
     for status in &["pending", "running", "succeeded"] {
-        PipelineRunQueries::update_status(&pool, run.id, status).await.unwrap();
+        PipelineRunQueries::update_status(&pool, run.id, status)
+            .await
+            .unwrap();
         let found = PipelineRunQueries::get(&pool, run.id).await.unwrap();
         assert_eq!(found.unwrap().status, *status);
     }

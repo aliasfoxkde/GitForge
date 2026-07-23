@@ -66,8 +66,8 @@ impl Config {
 
     /// Get config file path
     fn config_path() -> Result<PathBuf> {
-        let base = dirs::config_dir()
-            .ok_or_else(|| anyhow::anyhow!("could not find config directory"))?;
+        let base =
+            dirs::config_dir().ok_or_else(|| anyhow::anyhow!("could not find config directory"))?;
         Ok(base.join("gitforge").join("config.toml"))
     }
 }

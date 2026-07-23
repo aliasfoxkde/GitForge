@@ -81,14 +81,36 @@ pub struct ServerConfig {
 }
 
 /// Load server configuration from environment
+/// Fails if JWT_SECRET is not set (no dev fallback in production)
 pub fn load_config() -> ServerConfig {
-    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "dev-secret-change-in-prod".to_string());
+    let jwt_secret = std::env::var("JWT_SECRET")
+        .expect("JWT_SECRET environment variable must be set - no dev fallback in production");
+
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
         .parse::<u16>()
         .unwrap_or(8080);
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite:/gitforge.db".to_string());
+
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:/gitforge.db".to_string());
+
+    ServerConfig {
+        jwt_secret,
+        port,
+        database_url,
+    }
+}
+
+/// Load configuration for testing (allows env var defaults)
+#[cfg(test)]
+pub fn load_config_test() -> ServerConfig {
+    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "test-secret".to_string());
+    let port = std::env::var("PORT")
+        .unwrap_or_else(|_| "8080".to_string())
+        .parse::<u16>()
+        .unwrap_or(8080);
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:/gitforge.db".to_string());
 
     ServerConfig {
         jwt_secret,
@@ -149,31 +171,43 @@ mod tests {
     }
 
     #[test]
-    fn test_load_config_defaults() {
-        // Clear any set env vars first
+    fn test_load_config_requires_jwt_secret() {
         clear_env();
+        std::env::remove_var("JWT_SECRET");
 
-        let config = load_config();
-        assert_eq!(config.jwt_secret, "dev-secret-change-in-prod");
-        assert_eq!(config.port, 8080);
-        assert_eq!(config.database_url, "sqlite:/gitforge.db");
+        // Should panic because JWT_SECRET is not set
+        let result = std::panic::catch_unwind(|| {
+            load_config();
+        });
+        assert!(
+            result.is_err(),
+            "load_config should panic without JWT_SECRET"
+        );
     }
 
     #[test]
-    fn test_load_config_from_env() {
-        // Always set fresh values - clear first then set
+    fn test_load_config_with_env() {
         clear_env();
-        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("JWT_SECRET", "production-secret-32chars!!");
         std::env::set_var("PORT", "3000");
         std::env::set_var("DATABASE_URL", "postgres://localhost/test");
 
         let config = load_config();
-        assert_eq!(config.jwt_secret, "test-secret");
+        assert_eq!(config.jwt_secret, "production-secret-32chars!!");
         assert_eq!(config.port, 3000);
         assert_eq!(config.database_url, "postgres://localhost/test");
 
-        // Clean up
         clear_env();
+    }
+
+    #[test]
+    fn test_load_config_test_defaults() {
+        clear_env();
+        // load_config_test should use defaults when env vars not set
+        let config = load_config_test();
+        assert_eq!(config.jwt_secret, "test-secret");
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.database_url, "sqlite:/gitforge.db");
     }
 
     #[test]
