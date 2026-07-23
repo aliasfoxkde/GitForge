@@ -151,3 +151,77 @@ pub async fn auth_status(
         .into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn test_auth_status_no_token() {
+        let auth = ApiAuth::new("test-secret");
+        let response = auth_status(
+            Extension(Arc::new(auth)),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_status_invalid_token() {
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer invalid-token".parse().unwrap());
+
+        let response = auth_status(
+            Extension(Arc::new(auth)),
+            headers,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_status_valid_token() {
+        let auth = ApiAuth::new("test-secret");
+        let user_id = gitforce_common::UserId::new();
+        let token = auth.generate_token(user_id, "testuser", "user").unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {}", token).parse().unwrap());
+
+        let response = auth_status(
+            Extension(Arc::new(auth)),
+            headers,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_login_request_deserialize() {
+        let json = r#"{"username":"testuser","password":"testpass"}"#;
+        let req: LoginRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.username, "testuser");
+        assert_eq!(req.password, "testpass");
+    }
+
+    #[tokio::test]
+    async fn test_login_response_serialize() {
+        let response = LoginResponse {
+            token: "test-token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("test-token"));
+        assert!(json.contains("Bearer"));
+    }
+}

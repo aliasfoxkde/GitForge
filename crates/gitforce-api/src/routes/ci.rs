@@ -619,4 +619,77 @@ mod tests {
         assert!(json.contains("succeeded"));
         assert!(json.contains("runner-1"));
     }
+
+    #[test]
+    fn test_extract_user_without_auth_header() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let headers = HeaderMap::new();
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_extract_user_with_invalid_token() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer invalid-token".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_extract_user_with_valid_token() {
+        use crate::auth::ApiAuth;
+        use gitforce_common::UserId;
+
+        let auth = ApiAuth::new("test-secret");
+        let user_id = UserId::new();
+        let token = auth.generate_token(user_id, "testuser", "user").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {}", token).parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_pipeline_run_response_deserialize() {
+        let json = r#"{
+            "id": "run-123",
+            "pipeline_id": "pipe-456",
+            "status": "running",
+            "commit_hash": "abc123",
+            "triggered_by": "user1",
+            "started_at": "2024-01-01T00:00:00Z",
+            "finished_at": null
+        }"#;
+        let response: PipelineRunResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.id, "run-123");
+        assert_eq!(response.pipeline_id, "pipe-456");
+        assert_eq!(response.status, "running");
+        assert!(response.started_at.is_some());
+        assert!(response.finished_at.is_none());
+    }
+
+    #[test]
+    fn test_job_response_deserialize() {
+        let json = r#"{
+            "id": "job-123",
+            "name": "build",
+            "status": "pending",
+            "runner_id": null,
+            "started_at": null,
+            "finished_at": null
+        }"#;
+        let response: JobResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.id, "job-123");
+        assert_eq!(response.name, "build");
+        assert_eq!(response.status, "pending");
+        assert!(response.runner_id.is_none());
+    }
 }
