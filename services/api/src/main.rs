@@ -74,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Server configuration
+#[derive(Debug)]
 pub struct ServerConfig {
     pub jwt_secret: String,
     pub port: u16,
@@ -247,5 +248,33 @@ mod tests {
             .block_on(async {
                 graceful_shutdown_delay().await;
             });
+    }
+
+    #[tokio::test]
+    async fn test_spawn_shutdown_handler_does_not_panic() {
+        let flag = create_shutdown_flag();
+        // Just verify the function doesn't panic when called
+        spawn_shutdown_handler(flag);
+    }
+
+    #[test]
+    fn test_shutdown_flag_is_atomic() {
+        let flag = create_shutdown_flag();
+        // Verify atomic operations work
+        assert!(!flag.load(Ordering::SeqCst));
+        flag.store(true, Ordering::SeqCst);
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_server_config_debug() {
+        let config = ServerConfig {
+            jwt_secret: "test-secret".to_string(),
+            port: 8080,
+            database_url: "sqlite::memory:".to_string(),
+        };
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("jwt_secret"));
+        assert!(debug_str.contains("8080"));
     }
 }
