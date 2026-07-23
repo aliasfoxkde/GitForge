@@ -160,12 +160,9 @@ mod tests {
     #[tokio::test]
     async fn test_auth_status_no_token() {
         let auth = ApiAuth::new("test-secret");
-        let response = auth_status(
-            Extension(Arc::new(auth)),
-            HeaderMap::new(),
-        )
-        .await
-        .into_response();
+        let response = auth_status(Extension(Arc::new(auth)), HeaderMap::new())
+            .await
+            .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -176,12 +173,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", "Bearer invalid-token".parse().unwrap());
 
-        let response = auth_status(
-            Extension(Arc::new(auth)),
-            headers,
-        )
-        .await
-        .into_response();
+        let response = auth_status(Extension(Arc::new(auth)), headers)
+            .await
+            .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -193,14 +187,14 @@ mod tests {
         let token = auth.generate_token(user_id, "testuser", "user").unwrap();
 
         let mut headers = HeaderMap::new();
-        headers.insert("Authorization", format!("Bearer {}", token).parse().unwrap());
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
 
-        let response = auth_status(
-            Extension(Arc::new(auth)),
-            headers,
-        )
-        .await
-        .into_response();
+        let response = auth_status(Extension(Arc::new(auth)), headers)
+            .await
+            .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
     }

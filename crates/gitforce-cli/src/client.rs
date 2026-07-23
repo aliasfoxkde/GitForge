@@ -226,7 +226,11 @@ impl ApiClient {
     }
 
     /// Create a repository
-    pub async fn create_repo(&self, name: &str, visibility: Option<String>) -> Result<RepoResponse> {
+    pub async fn create_repo(
+        &self,
+        name: &str,
+        visibility: Option<String>,
+    ) -> Result<RepoResponse> {
         let url = format!("{}/api/repos", self.base_url);
         let body = CreateRepoRequest {
             name: name.to_string(),

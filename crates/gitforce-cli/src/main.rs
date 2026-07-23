@@ -281,7 +281,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             println!("  No repositories found.");
                         } else {
                             for repo in repos {
-                                println!("  {:20} - {} [{}]", repo.name, repo.git_path, repo.visibility);
+                                println!(
+                                    "  {:20} - {} [{}]",
+                                    repo.name, repo.git_path, repo.visibility
+                                );
                             }
                         }
                         println!();
@@ -293,7 +296,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 }
             } else if let Some(name) = create {
                 println!("📦 Creating repository '{}'...", name);
-                match api_client.create_repo(name, Some("private".to_string())).await {
+                match api_client
+                    .create_repo(name, Some("private".to_string()))
+                    .await
+                {
                     Ok(repo) => {
                         println!("✅ Repository created successfully!");
                         println!("   ID: {}", repo.id);
@@ -427,8 +433,15 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             println!("  No pipelines found.");
                         } else {
                             for pipeline in pipelines {
-                                let status = if pipeline.enabled { "active" } else { "disabled" };
-                                println!("  {:20} - {} [{}]", pipeline.name, pipeline.repo_id, status);
+                                let status = if pipeline.enabled {
+                                    "active"
+                                } else {
+                                    "disabled"
+                                };
+                                println!(
+                                    "  {:20} - {} [{}]",
+                                    pipeline.name, pipeline.repo_id, status
+                                );
                             }
                         }
                         println!();
@@ -483,8 +496,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             println!("  No runners registered.");
                         } else {
                             for runner in runners {
-                                println!("  {:15} - {} [{}] capacity: {}",
-                                    runner.name, runner.runner_type, runner.status, runner.capacity);
+                                println!(
+                                    "  {:15} - {} [{}] capacity: {}",
+                                    runner.name, runner.runner_type, runner.status, runner.capacity
+                                );
                             }
                         }
                         println!();

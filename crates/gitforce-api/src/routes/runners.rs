@@ -362,7 +362,10 @@ mod tests {
         let user_id = UserId::new();
         let token = auth.generate_token(user_id, "testuser", "user").unwrap();
         let mut headers = HeaderMap::new();
-        headers.insert("Authorization", format!("Bearer {}", token).parse().unwrap());
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         let result = extract_user(&auth, &headers);
         assert!(result.is_ok());
     }
