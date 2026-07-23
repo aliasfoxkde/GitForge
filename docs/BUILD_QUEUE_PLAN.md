@@ -252,8 +252,9 @@ POST /api/queue/jobs/{id}/complete {result}
 | 6 | 3 | Concurrency limits | High | ✅ DONE |
 | 7 | 3 | Memory/CPU limits | Medium | ⏳ PENDING |
 | 8 | 4 | Runner queue integration | Medium | ✅ DONE |
-| 9 | 4 | Webhook → job trigger | Medium | ⏳ PENDING |
-| 10 | 4 | Results reporting | Medium | ⏳ PENDING |
+| 9 | 4 | Webhook → job trigger | Medium | ✅ DONE |
+| 10 | 4 | GitForge-native CI workflow | Medium | ✅ DONE |
+| 11 | 4 | Results reporting | Medium | ⏳ PENDING |
 
 ## Files to Create
 
