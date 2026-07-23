@@ -125,7 +125,8 @@ pub fn create_shutdown_flag() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
-/// Spawn the shutdown signal handler
+/// Spawn the shutdown signal handler (Unix-only)
+#[cfg(unix)]
 pub fn spawn_shutdown_handler(shutdown_flag: Arc<AtomicBool>) {
     tokio::spawn(async move {
         let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
@@ -141,6 +142,13 @@ pub fn spawn_shutdown_handler(shutdown_flag: Arc<AtomicBool>) {
         }
         shutdown_flag.store(true, Ordering::SeqCst);
     });
+}
+
+/// Spawn the shutdown signal handler (Windows stub)
+#[cfg(windows)]
+pub fn spawn_shutdown_handler(_shutdown_flag: Arc<AtomicBool>) {
+    // Windows shutdown handling - for now just do nothing
+    // In production, use Windows-specific signal handling
 }
 
 /// Create the shutdown future that waits for shutdown signal
