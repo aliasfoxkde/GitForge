@@ -343,9 +343,7 @@ mod tests {
     async fn test_extract_client_id_no_headers() {
         use axum::http::Request;
 
-        let request = Request::builder()
-            .body(axum::body::Body::empty())
-            .unwrap();
+        let request = Request::builder().body(axum::body::Body::empty()).unwrap();
         let client_id = extract_client_id(&request);
         assert_eq!(client_id, "unknown");
     }

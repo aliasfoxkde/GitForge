@@ -1360,7 +1360,6 @@ async fn test_api_get_pipeline_with_invalid_id_format() {
 
     // Should get BAD_REQUEST for invalid UUID or NOT_FOUND
     assert!(
-        response.status() == StatusCode::BAD_REQUEST
-            || response.status() == StatusCode::NOT_FOUND
+        response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::NOT_FOUND
     );
 }
