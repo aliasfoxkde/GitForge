@@ -1,6 +1,7 @@
 //! Runner agent
 
-use gitforce_common::{Error, Result, RunnerId};
+use crate::executor::{ExecutableJob, JobExecutor, JobStep};
+use gitforce_common::{Error, JobId, Result, RunnerId};
 use gitforce_db::models::Runner;
 use gitforce_sandbox::DockerSandbox;
 use reqwest::Client;
@@ -62,6 +63,7 @@ pub struct RunnerAgent {
     runner: Option<Runner>,
     #[allow(dead_code)]
     sandbox: Arc<DockerSandbox>,
+    executor: Arc<JobExecutor>,
     is_running: Arc<RwLock<bool>>,
 }
 
@@ -74,12 +76,14 @@ impl RunnerAgent {
             .map_err(|e| Error::internal(format!("failed to create HTTP client: {}", e)))?;
 
         let sandbox = DockerSandbox::new().await?;
+        let executor = JobExecutor::new().await?;
 
         Ok(Self {
             config,
             client,
             runner: None,
             sandbox: Arc::new(sandbox),
+            executor: Arc::new(executor),
             is_running: Arc::new(RwLock::new(false)),
         })
     }
@@ -165,6 +169,7 @@ impl RunnerAgent {
         let fetch_client = self.client.clone();
         let fetch_url = self.config.scheduler_url.clone();
         let is_running = self.is_running.clone();
+        let executor = self.executor.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(fetch_interval));
             loop {
@@ -186,7 +191,8 @@ impl RunnerAgent {
                                         job.name,
                                         job.job_id
                                     );
-                                    // Job execution would happen here
+                                    // Execute the job
+                                    Self::execute_job(&executor, &job, &fetch_client, &fetch_url).await;
                                 }
                             }
                         }
@@ -220,6 +226,65 @@ impl RunnerAgent {
     /// Check if agent is running
     pub async fn is_running(&self) -> bool {
         *self.is_running.read().await
+    }
+
+    /// Execute a job assignment
+    async fn execute_job(
+        executor: &Arc<JobExecutor>,
+        assignment: &JobAssignment,
+        client: &Client,
+        scheduler_url: &str,
+    ) {
+        let job_id = match uuid::Uuid::parse_str(&assignment.job_id) {
+            Ok(id) => JobId::from(id),
+            Err(_) => {
+                tracing::error!("invalid job_id: {}", assignment.job_id);
+                return;
+            }
+        };
+
+        // Convert assignment to ExecutableJob
+        let executable = ExecutableJob {
+            job_id,
+            image: "rust:latest".to_string(), // Default image - would come from job config
+            steps: assignment
+                .commands
+                .iter()
+                .map(|cmd| JobStep {
+                    name: "run".to_string(),
+                    run: cmd.clone(),
+                    env: None,
+                    working_directory: assignment.working_dir.clone(),
+                })
+                .collect(),
+            env: std::collections::HashMap::new(),
+            working_dir: assignment.working_dir.clone(),
+            timeout_secs: 3600,
+        };
+
+        tracing::info!("executing job {} in container", assignment.job_id);
+
+        // Execute the job
+        let result = executor.execute(executable).await;
+
+        tracing::info!(
+            "job {} completed: success={}, exit_code={}",
+            assignment.job_id,
+            result.success,
+            result.exit_code
+        );
+
+        // Report completion to scheduler
+        let complete_url = format!("{}/jobs/{}/complete", scheduler_url, assignment.job_id);
+        let complete_request = serde_json::json!({
+            "success": result.success,
+            "exit_code": result.exit_code,
+            "error": result.error,
+        });
+
+        if let Err(e) = client.post(&complete_url).json(&complete_request).send().await {
+            tracing::error!("failed to report job completion: {}", e);
+        }
     }
 }
 
