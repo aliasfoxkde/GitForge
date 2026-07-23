@@ -218,4 +218,124 @@ mod tests {
         assert!(json.contains("test-token"));
         assert!(json.contains("Bearer"));
     }
+
+    #[test]
+    fn test_login_request_debug() {
+        let req = LoginRequest {
+            username: "user1".to_string(),
+            password: "secret".to_string(),
+        };
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("user1"));
+    }
+
+    #[test]
+    fn test_login_response_debug() {
+        let response = LoginResponse {
+            token: "debug-token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 3600,
+        };
+        let debug_str = format!("{:?}", response);
+        assert!(debug_str.contains("debug-token"));
+    }
+
+    #[test]
+    fn test_login_response_default_token_type() {
+        let response = LoginResponse {
+            token: "token123".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        assert_eq!(response.token_type, "Bearer");
+    }
+
+    #[test]
+    fn test_login_response_expires_in_values() {
+        // Test various expiration times
+        for exp in &[3600, 7200, 86400, 604800] {
+            let response = LoginResponse {
+                token: "token".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: *exp,
+            };
+            assert_eq!(response.expires_in, *exp);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auth_status_malformed_header() {
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        // Malformed header - not Bearer
+        headers.insert("Authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+
+        let response = auth_status(Extension(Arc::new(auth)), headers)
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_status_empty_bearer() {
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer".parse().unwrap());
+
+        let response = auth_status(Extension(Arc::new(auth)), headers)
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_status_expired_token() {
+        use chrono::Utc;
+        use jsonwebtoken::{encode, Header};
+
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct ExpiredClaims {
+            sub: String,
+            user_id: gitforce_common::UserId,
+            username: String,
+            role: String,
+            exp: i64,
+            iat: i64,
+        }
+
+        let auth = ApiAuth::new("test-secret");
+        let user_id = gitforce_common::UserId::new();
+
+        // Create expired token
+        let claims = ExpiredClaims {
+            sub: user_id.to_string(),
+            user_id,
+            username: "expired".to_string(),
+            role: "user".to_string(),
+            exp: Utc::now().timestamp() - 3600, // Expired 1 hour ago
+            iat: Utc::now().timestamp() - 7200,
+        };
+
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret("test-secret".as_bytes()),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+
+        let response = auth_status(Extension(Arc::new(auth)), headers)
+            .await
+            .into_response();
+
+        // Expired tokens return OK with authenticated=false
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

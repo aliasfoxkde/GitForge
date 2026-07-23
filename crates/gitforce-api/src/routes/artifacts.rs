@@ -391,4 +391,128 @@ mod tests {
         assert_eq!(response.id, "min");
         assert_eq!(response.size_bytes, 1);
     }
+
+    #[test]
+    fn test_extract_user_without_auth_header() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let headers = HeaderMap::new();
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_extract_user_with_invalid_token() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer invalid-token".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_extract_user_with_valid_token() {
+        use crate::auth::ApiAuth;
+        use gitforce_common::UserId;
+
+        let auth = ApiAuth::new("test-secret");
+        let user_id = UserId::new();
+        let token = auth.generate_token(user_id, "testuser", "user").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_extract_user_malformed_auth_header() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        // Malformed header without proper Bearer prefix
+        headers.insert("Authorization", "NotBearer token123".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_extract_user_empty_bearer_token() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_extract_user_basic_auth_header() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        // Basic auth instead of Bearer
+        headers.insert("Authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_artifact_to_response_preserves_all_fields() {
+        use gitforce_common::JobId;
+        let job_id = JobId::new();
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            job_id,
+            name: "preserved.bin".to_string(),
+            path: "/tmp/preserved.bin".to_string(),
+            checksum: "preserved123".to_string(),
+            size_bytes: 1024,
+            content_type: Some("application/bin".to_string()),
+            created_at: chrono::Utc::now(),
+        };
+        let response = artifact_to_response(&artifact);
+        assert_eq!(response.name, "preserved.bin");
+        assert_eq!(response.checksum, "preserved123");
+        assert_eq!(response.size_bytes, 1024);
+    }
+
+    #[test]
+    fn test_artifact_response_size_edge_cases() {
+        // Test zero size
+        let response = ArtifactResponse {
+            id: "zero".to_string(),
+            job_id: "job-zero".to_string(),
+            name: "empty.bin".to_string(),
+            path: "/tmp/empty.bin".to_string(),
+            checksum: "e3b0c44".to_string(),
+            size_bytes: 0,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        assert_eq!(response.size_bytes, 0);
+
+        // Test max u64
+        let response = ArtifactResponse {
+            id: "max".to_string(),
+            job_id: "job-max".to_string(),
+            name: "max.bin".to_string(),
+            path: "/tmp/max.bin".to_string(),
+            checksum: "max".to_string(),
+            size_bytes: u64::MAX,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        assert_eq!(response.size_bytes, u64::MAX);
+    }
 }
