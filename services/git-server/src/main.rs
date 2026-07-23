@@ -168,4 +168,20 @@ mod tests {
 
         create_shutdown_future(shutdown).await;
     }
+
+    #[tokio::test]
+    async fn test_spawn_shutdown_handler_does_not_panic() {
+        let flag = create_shutdown_flag();
+        // Just verify the function doesn't panic when called
+        spawn_shutdown_handler(flag);
+    }
+
+    #[test]
+    fn test_shutdown_flag_is_atomic() {
+        let flag = create_shutdown_flag();
+        // Verify atomic operations work
+        assert!(!flag.load(Ordering::SeqCst));
+        flag.store(true, Ordering::SeqCst);
+        assert!(flag.load(Ordering::SeqCst));
+    }
 }

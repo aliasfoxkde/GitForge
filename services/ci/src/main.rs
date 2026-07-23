@@ -411,4 +411,26 @@ mod tests {
                 graceful_shutdown_delay().await;
             });
     }
+
+    #[test]
+    fn test_create_shutdown_flag_cloneable() {
+        let flag = create_shutdown_flag();
+        let _cloned = flag.clone();
+        // Verify the flag can be cloned and used
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_pipeline_cache_type_alias() {
+        // Verify the PipelineCache type works correctly
+        let cache: PipelineCache = HashMap::new();
+        assert!(cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_shutdown_handler_does_not_panic() {
+        let flag = create_shutdown_flag();
+        // Just verify the function doesn't panic when called
+        spawn_shutdown_handler(flag);
+    }
 }
