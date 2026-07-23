@@ -573,7 +573,7 @@ mod tests {
         let mut set: HashSet<RepoId> = HashSet::new();
         set.insert(RepoId::new());
         set.insert(RepoId::new());
-        assert!(set.len() >= 1);
+        assert!(!set.is_empty());
     }
 
     #[test]

@@ -177,28 +177,87 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             status,
             whoami,
         } => {
+            let api_client = GitForgeClient::new(&config.api_url(), token.clone());
+
             if let Some(username) = login {
                 println!("🔐 Authenticating as {} to {}", username, server);
-                println!("   (API not yet wired - use `gitforge auth status` to check)");
-                println!("   Token would be stored in: ~/.gitforge/credentials");
+                println!("   Enter password: ");
+
+                // Read password from stdin
+                let password = rpassword::read_password().unwrap_or_default();
+
+                match api_client.login(username, &password).await {
+                    Ok(response) => {
+                        println!("✅ Login successful!");
+                        println!("   Token expires in {} seconds", response.expires_in);
+                        println!();
+                        println!(
+                            "   Token: {}...",
+                            &response.token[..response.token.len().min(20)]
+                        );
+
+                        // Save token to config
+                        let mut config = config.clone();
+                        config.token = Some(response.token);
+                        if let Err(e) = config.save() {
+                            tracing::warn!("Failed to save token: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        println!("❌ Login failed: {}", e);
+                        println!("   Please check your username and password.");
+                    }
+                }
             } else if *logout {
+                let mut config = config.clone();
+                config.token = None;
+                if let Err(e) = config.save() {
+                    println!("⚠️  Warning: Failed to clear credentials: {}", e);
+                }
                 println!("👋 Logged out. Credentials cleared.");
                 println!("   Run `gitforge auth login <username>` to authenticate again.");
             } else if *status {
-                if token.is_some() {
-                    println!("✅ Authenticated to {}", server);
-                    println!("   Server: {}", server);
-                    println!("   Use `gitforge auth whoami` for user details.");
-                } else {
-                    println!("❌ Not authenticated.");
-                    println!("   Run `gitforge auth login <username>` to authenticate.");
+                match api_client.auth_status().await {
+                    Ok(status) => {
+                        if status.authenticated {
+                            println!("✅ Authenticated to {}", server);
+                            println!("   Username: {}", status.username.unwrap_or_default());
+                            if let Some(role) = status.role {
+                                println!("   Role: {}", role);
+                            }
+                        } else {
+                            println!("❌ Not authenticated.");
+                            if let Some(msg) = status.message {
+                                println!("   Reason: {}", msg);
+                            }
+                            println!("   Run `gitforge auth login <username>` to authenticate.");
+                        }
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to check auth status: {}", e);
+                        if token.is_some() {
+                            println!("   You have a token but the server may be unreachable.");
+                        }
+                    }
                 }
             } else if *whoami {
-                if token.is_some() {
-                    println!("👤 Authenticated user");
-                    println!("   Server: {}", server);
-                } else {
-                    println!("❌ Not authenticated.");
+                match api_client.auth_status().await {
+                    Ok(status) => {
+                        if status.authenticated {
+                            println!("👤 Authenticated user");
+                            println!("   Server: {}", server);
+                            println!("   User ID: {}", status.user_id.unwrap_or_default());
+                            println!("   Username: {}", status.username.unwrap_or_default());
+                            if let Some(role) = status.role {
+                                println!("   Role: {}", role);
+                            }
+                        } else {
+                            println!("❌ Not authenticated.");
+                        }
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to get user info: {}", e);
+                    }
                 }
             }
         }

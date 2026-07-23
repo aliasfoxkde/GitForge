@@ -115,7 +115,6 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthenticatedUser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Request;
     use chrono::Utc;
     use gitforce_common::UserId;
 

@@ -2,7 +2,33 @@
 
 use anyhow::Result;
 use reqwest::Client;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+/// Login response from the API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginResponse {
+    pub token: String,
+    pub token_type: String,
+    pub expires_in: i64,
+}
+
+/// Auth status response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthStatusResponse {
+    pub authenticated: bool,
+    pub user_id: Option<String>,
+    pub username: Option<String>,
+    pub role: Option<String>,
+    pub message: Option<String>,
+}
+
+/// Login request body
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
 
 /// GitForge API client
 #[derive(Clone)]
@@ -66,6 +92,40 @@ impl ApiClient {
         req.send().await?;
         Ok(())
     }
+
+    /// Login with username and password
+    pub async fn login(&self, username: &str, password: &str) -> Result<LoginResponse> {
+        let url = format!("{}/auth/login", self.base_url);
+        let body = LoginRequest {
+            username: username.to_string(),
+            password: password.to_string(),
+        };
+
+        let resp = self.http.post(&url).json(&body).send().await?;
+        let status = resp.status();
+
+        if !status.is_success() {
+            let error_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Login failed: {} - {}", status, error_text);
+        }
+
+        let login_resp: LoginResponse = resp.json().await?;
+        Ok(login_resp)
+    }
+
+    /// Check authentication status
+    pub async fn auth_status(&self) -> Result<AuthStatusResponse> {
+        let url = format!("{}/auth/status", self.base_url);
+        let mut req = self.http.get(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        let auth_resp: AuthStatusResponse = resp.json().await?;
+        Ok(auth_resp)
+    }
 }
 
 pub use ApiClient as GitForgeClient;
@@ -73,7 +133,6 @@ pub use ApiClient as GitForgeClient;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::Client;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]

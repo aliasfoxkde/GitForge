@@ -318,8 +318,8 @@ mod tests {
         assert!(!instance.container_id.is_empty());
 
         let result = sandbox.execute(&instance, &["echo", "hello"]).await;
-        if result.is_ok() {
-            assert_eq!(result.unwrap().exit_code, 0);
+        if let Ok(exec_result) = result {
+            assert_eq!(exec_result.exit_code, 0);
         }
 
         let _ = sandbox.destroy(instance).await;
@@ -344,8 +344,8 @@ mod tests {
         let instance = instance.unwrap();
 
         let result = sandbox.execute(&instance, &["sh", "-c", "echo test"]).await;
-        if result.is_ok() {
-            assert_eq!(result.unwrap().exit_code, 0);
+        if let Ok(exec_result) = result {
+            assert_eq!(exec_result.exit_code, 0);
         }
 
         let _ = sandbox.destroy(instance).await;
@@ -372,8 +372,8 @@ mod tests {
         let result = sandbox
             .execute(&instance, &["sh", "-c", "echo line1"])
             .await;
-        if result.is_ok() {
-            assert_eq!(result.unwrap().exit_code, 0);
+        if let Ok(exec_result) = result {
+            assert_eq!(exec_result.exit_code, 0);
         }
 
         let _ = sandbox.destroy(instance).await;
@@ -669,8 +669,10 @@ mod tests {
 
     #[test]
     fn test_sandbox_limits_with_network_disabled() {
-        let mut limits = SandboxLimits::default();
-        limits.network = false;
+        let limits = SandboxLimits {
+            network: false,
+            ..Default::default()
+        };
         assert!(!limits.network);
     }
 

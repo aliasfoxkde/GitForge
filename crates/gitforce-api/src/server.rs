@@ -5,7 +5,11 @@ use crate::metrics::Metrics;
 use crate::metrics_middleware::MetricsLayer;
 use crate::routes::{artifact_routes, ci_routes, repo_routes, runner_routes, webhook_routes};
 use axum::{
-    extract::Extension, http::StatusCode, response::IntoResponse, routing::get, Json, Router,
+    extract::Extension,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
 };
 use gitforce_db::Pool;
 use gitforce_storage::FileStorage;
@@ -76,6 +80,13 @@ impl ApiServer {
         public_routes = public_routes.merge(dashboard);
         public_routes = public_routes.merge(swagger);
 
+        // Auth routes (public - no auth required for login)
+        let auth_routes = Router::new()
+            .route("/auth/login", post(crate::routes::login))
+            .route("/auth/status", get(crate::routes::auth_status))
+            .layer(Extension(Arc::new(auth.clone())))
+            .layer(Extension(Arc::new(pool.clone())));
+
         // Protected routes (auth required)
         let pool_arc = Arc::new(pool);
         let protected_routes = Router::new()
@@ -84,7 +95,7 @@ impl ApiServer {
             .merge(runner_routes())
             .merge(artifact_routes())
             .merge(webhook_routes())
-            .layer(Extension(Arc::new(auth)))
+            .layer(Extension(Arc::new(auth.clone())))
             .layer(Extension(pool_arc.clone()));
 
         // Metrics layer for automatic request recording
@@ -95,6 +106,7 @@ impl ApiServer {
             .layer(metrics_layer)
             .layer(Extension(pool_arc.clone()))
             .layer(Extension(metrics_arc))
+            .merge(auth_routes)
             .nest("/api", protected_routes);
 
         Self {

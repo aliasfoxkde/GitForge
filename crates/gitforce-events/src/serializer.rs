@@ -238,6 +238,7 @@ mod tests {
         ];
 
         for event_type in event_types {
+            #[allow(clippy::clone_on_copy)]
             let event = EventEnvelope::new(
                 event_type.clone(),
                 EventPayload::PushReceived(PushReceivedPayload {
