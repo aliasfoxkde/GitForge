@@ -451,4 +451,79 @@ mod tests {
         // Should be valid RFC3339 format
         assert!(chrono::DateTime::parse_from_rfc3339(&payload.timestamp).is_ok());
     }
+
+    #[test]
+    fn test_webhook_payload_debug() {
+        let payload = WebhookPayload::new(
+            WebhookEvent::PipelineCompleted,
+            serde_json::json!({"id": "123"}),
+        );
+        let debug_str = format!("{:?}", payload);
+        assert!(debug_str.contains("WebhookPayload"));
+    }
+
+    #[test]
+    fn test_webhook_event_debug() {
+        let event = WebhookEvent::PipelineCompleted;
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("PipelineCompleted"));
+    }
+
+    #[test]
+    fn test_webhook_config_debug() {
+        let config = WebhookConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("WebhookConfig"));
+    }
+
+    #[test]
+    fn test_webhook_error_debug() {
+        let error = WebhookError::Network("test".to_string());
+        let debug_str = format!("{:?}", error);
+        assert!(debug_str.contains("Network"));
+    }
+
+    #[test]
+    fn test_webhook_error_serialization() {
+        let error = WebhookError::Serialization("test error".to_string());
+        let error_str = error.to_string();
+        assert!(error_str.contains("test error") || error_str.contains("serialization"));
+    }
+
+    #[test]
+    fn test_http_webhook_sender_signature_different_payloads() {
+        let sender = HttpWebhookSender::new("http://example.com/webhook", Some("secret"));
+        let payload1 = b"hello world";
+        let payload2 = b"hello world!";
+
+        let sig1 = sender.generate_signature(payload1);
+        let sig2 = sender.generate_signature(payload2);
+
+        assert!(sig1.is_some());
+        assert!(sig2.is_some());
+        assert_ne!(sig1.unwrap(), sig2.unwrap());
+    }
+
+    #[test]
+    fn test_http_webhook_sender_same_payload_same_signature() {
+        let sender = HttpWebhookSender::new("http://example.com/webhook", Some("secret"));
+        let payload = b"consistent payload";
+
+        let sig1 = sender.generate_signature(payload);
+        let sig2 = sender.generate_signature(payload);
+
+        assert!(sig1.is_some());
+        assert!(sig2.is_some());
+        assert_eq!(sig1.unwrap(), sig2.unwrap());
+    }
+
+    #[test]
+    fn test_webhook_manager_should_send_filtered_event() {
+        let mut manager = WebhookManager::new();
+        manager.set_event_filter(WebhookEvent::PipelineCompleted, false);
+        assert!(!manager.should_send(&WebhookEvent::PipelineCompleted));
+        // Unset should default to true
+        manager.set_event_filter(WebhookEvent::PipelineCompleted, true);
+        assert!(manager.should_send(&WebhookEvent::PipelineCompleted));
+    }
 }
