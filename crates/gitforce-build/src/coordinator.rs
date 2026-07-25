@@ -1,0 +1,386 @@
+//! Build coordinator with semaphore-based concurrency control
+
+use crate::job::{BuildJob, BuildResult, JobStatus, MAX_CONCURRENT_JOBS};
+use crate::protocol::{JobInfo, Response};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{Mutex, Semaphore};
+use tokio::time::{timeout, Duration};
+use tracing::{error, info, warn};
+
+/// Build coordinator that limits concurrent cargo invocations
+pub struct BuildCoordinator {
+    /// Semaphore limiting concurrent jobs
+    semaphore: Arc<Semaphore>,
+    /// Active jobs
+    jobs: Arc<Mutex<HashMap<uuid::Uuid, BuildJob>>>,
+    /// Completed job count
+    completed_count: Arc<AtomicU64>,
+    /// Job results for waiters
+    results: Arc<Mutex<HashMap<uuid::Uuid, BuildResult>>>,
+}
+
+impl BuildCoordinator {
+    /// Create a new build coordinator
+    pub fn new() -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            completed_count: Arc::new(AtomicU64::new(0)),
+            results: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Get the maximum concurrent job count
+    pub fn max_concurrent() -> usize {
+        MAX_CONCURRENT_JOBS
+    }
+
+    /// Submit a new build job - BLOCKS until a permit is available
+    pub async fn submit(
+        self: &Arc<Self>,
+        cargo_args: Vec<String>,
+        working_dir: Option<String>,
+    ) -> uuid::Uuid {
+        let job = BuildJob::new(cargo_args, working_dir);
+        let job_id = job.id;
+        let coordinator = self.clone();
+
+        info!("submitting job {} with args: {:?}", job_id, job.cargo_args);
+
+        // Add to jobs map first
+        {
+            let mut jobs = self.jobs.lock().await;
+            jobs.insert(job_id, job.clone());
+        }
+
+        // BLOCKING: Acquire semaphore permit BEFORE returning
+        // This is the key fix - we await the acquire, blocking the caller
+        // when at capacity (max 2 concurrent)
+        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
+
+        // Update job status to running
+        {
+            let mut jobs = self.jobs.lock().await;
+            if let Some(j) = jobs.get_mut(&job_id) {
+                j.status = JobStatus::Running { pid: 0 };
+            }
+        }
+
+        // Spawn execution task - it will run but we already hold the permit
+        tokio::spawn(async move {
+            // Execute the job
+            let result = execute_cargo_job(&job).await;
+
+            // Update job status and record completion
+            {
+                let mut jobs = coordinator.jobs.lock().await;
+                if let Some(j) = jobs.get_mut(&job_id) {
+                    match &result {
+                        Ok(r) => {
+                            j.status = JobStatus::Completed {
+                                exit_code: r.exit_code,
+                                duration_ms: r.duration_ms,
+                            };
+                        }
+                        Err(e) => {
+                            j.status = JobStatus::Failed {
+                                exit_code: -1,
+                                duration_ms: j.wait_time().as_millis() as u64,
+                                error: e.to_string(),
+                            };
+                        }
+                    }
+                }
+                coordinator.completed_count.fetch_add(1, Ordering::SeqCst);
+            }
+
+            // Store result for waiters
+            {
+                let mut results = coordinator.results.lock().await;
+                if let Ok(r) = &result {
+                    results.insert(job_id, r.clone());
+                }
+            }
+
+            // Release permit (drop to signal completion)
+            drop(permit);
+        });
+
+        job_id
+    }
+
+    /// Get job status
+    pub async fn get_status(&self, job_id: &uuid::Uuid) -> Option<(String, u64)> {
+        let jobs = self.jobs.lock().await;
+        jobs.get(job_id).map(|j| {
+            let status = match &j.status {
+                JobStatus::Queued => "queued".to_string(),
+                JobStatus::Running { .. } => "running".to_string(),
+                JobStatus::Completed { exit_code, .. } => {
+                    format!("completed({})", exit_code)
+                }
+                JobStatus::Failed { exit_code, error, .. } => {
+                    format!("failed({}): {}", exit_code, error)
+                }
+                JobStatus::Cancelled => "cancelled".to_string(),
+            };
+            (status, j.wait_time().as_millis() as u64)
+        })
+    }
+
+    /// List all jobs
+    pub async fn list_jobs(&self) -> Vec<JobInfo> {
+        let jobs = self.jobs.lock().await;
+        jobs.values()
+            .map(|j| {
+                let status = match &j.status {
+                    JobStatus::Queued => "queued".to_string(),
+                    JobStatus::Running { .. } => "running".to_string(),
+                    JobStatus::Completed { exit_code, .. } => {
+                        format!("completed({})", exit_code)
+                    }
+                    JobStatus::Failed { error, .. } => format!("failed: {}", error),
+                    JobStatus::Cancelled => "cancelled".to_string(),
+                };
+                JobInfo {
+                    job_id: j.id.to_string(),
+                    status,
+                    cargo_args: j.cargo_args.clone(),
+                    wait_time_ms: j.wait_time().as_millis() as u64,
+                }
+            })
+            .collect()
+    }
+
+    /// Get coordinator stats
+    pub async fn stats(&self) -> Response {
+        let jobs = self.jobs.lock().await;
+        let running = jobs
+            .values()
+            .filter(|j| matches!(j.status, JobStatus::Running { .. }))
+            .count();
+        let queued = jobs
+            .values()
+            .filter(|j| matches!(j.status, JobStatus::Queued))
+            .count();
+        let completed = self.completed_count.load(std::sync::atomic::Ordering::SeqCst);
+
+        Response::Stats {
+            running_count: running,
+            queued_count: queued,
+            completed_count: completed,
+            max_concurrent: MAX_CONCURRENT_JOBS,
+        }
+    }
+
+    /// Wait for a job to complete and get its result
+    pub async fn wait_for_job(&self, job_id: uuid::Uuid) -> Option<BuildResult> {
+        let start = std::time::Instant::now();
+        let timeout_duration = Duration::from_secs(3600);
+
+        loop {
+            // Check if already completed
+            {
+                let results = self.results.lock().await;
+                if let Some(result) = results.get(&job_id) {
+                    return Some(result.clone());
+                }
+            }
+
+            // Check if job exists and is terminal
+            {
+                let jobs = self.jobs.lock().await;
+                if let Some(job) = jobs.get(&job_id) {
+                    if job.is_terminal() {
+                        // Build result from job status
+                        return Some(match &job.status {
+                            JobStatus::Completed { exit_code, duration_ms } => BuildResult {
+                                job_id: job.id,
+                                success: *exit_code == 0,
+                                exit_code: *exit_code,
+                                duration_ms: *duration_ms,
+                                output: crate::job::JobOutput {
+                                    stdout: String::new(),
+                                    stderr: String::new(),
+                                    exit_code: *exit_code,
+                                },
+                                error: None,
+                            },
+                            JobStatus::Failed { exit_code, duration_ms, error } => BuildResult {
+                                job_id: job.id,
+                                success: false,
+                                exit_code: *exit_code,
+                                duration_ms: *duration_ms,
+                                output: crate::job::JobOutput {
+                                    stdout: String::new(),
+                                    stderr: String::new(),
+                                    exit_code: *exit_code,
+                                },
+                                error: Some(error.clone()),
+                            },
+                            _ => BuildResult {
+                                job_id: job.id,
+                                success: false,
+                                exit_code: -1,
+                                duration_ms: job.wait_time().as_millis() as u64,
+                                output: crate::job::JobOutput {
+                                    stdout: String::new(),
+                                    stderr: String::new(),
+                                    exit_code: -1,
+                                },
+                                error: Some("job not complete".to_string()),
+                            },
+                        });
+                    }
+                }
+            }
+
+            // Check timeout
+            if start.elapsed() > timeout_duration {
+                return None;
+            }
+
+            // Brief sleep before retry
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+impl Default for BuildCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Execute a cargo job
+async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
+    use tokio::io::AsyncReadExt;
+    use std::process::Stdio;
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+
+    info!(
+        "executing cargo {} in {:?}",
+        job.cargo_args.join(" "),
+        job.working_dir
+    );
+
+    let mut cmd = tokio::process::Command::new(&cargo);
+    cmd.args(&job.cargo_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(ref dir) = job.working_dir {
+        cmd.current_dir(dir);
+    }
+
+    // Set up process group for proper cleanup
+    cmd.process_group(0);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            error!("failed to spawn cargo: {}", e);
+            return Ok(BuildResult::failed(job, -1, String::new(), format!("failed to spawn: {}", e)));
+        }
+    };
+
+    let timeout_duration = Duration::from_secs(3600); // 1 hour default timeout
+
+    let result = timeout(timeout_duration, async {
+        let start = std::time::Instant::now();
+
+        // Capture stdout
+        let mut stdout_buf = String::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            AsyncReadExt::read_to_string(&mut stdout, &mut stdout_buf).await.unwrap_or(0);
+        }
+        let stdout = stdout_buf;
+
+        // Capture stderr
+        let mut stderr_buf = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            AsyncReadExt::read_to_string(&mut stderr, &mut stderr_buf).await.unwrap_or(0);
+        }
+        let stderr = stderr_buf;
+
+        // Wait for process to finish
+        let status = child.wait().await?;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let exit_code = status.code().unwrap_or(-1);
+
+        Ok::<_, anyhow::Error>(BuildResult {
+            job_id: job.id,
+            success: exit_code == 0,
+            exit_code,
+            duration_ms,
+            output: crate::job::JobOutput {
+                stdout,
+                stderr,
+                exit_code,
+            },
+            error: None,
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(r)) => {
+            info!(
+                "job {} completed: success={}, exit_code={}, duration={}ms",
+                job.id, r.success, r.exit_code, r.duration_ms
+            );
+            Ok(r)
+        }
+        Ok(Err(e)) => {
+            warn!("job {} failed: {}", job.id, e);
+            Ok(BuildResult::failed(job, -1, String::new(), e.to_string()))
+        }
+        Err(_) => {
+            warn!("job {} timed out after {:?}", job.id, timeout_duration);
+            // Try to kill the process
+            let _ = child.kill().await;
+            Ok(BuildResult::failed(
+                job,
+                -1,
+                String::new(),
+                format!("timed out after {:?}", timeout_duration),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_coordinator_submit() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let job_id = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+        assert!(!job_id.is_nil());
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_stats() {
+        let coordinator = BuildCoordinator::new();
+        let stats = coordinator.stats().await;
+        assert!(matches!(stats, Response::Stats { .. }));
+
+        if let Response::Stats { max_concurrent, .. } = stats {
+            assert_eq!(max_concurrent, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_list_jobs() {
+        let coordinator = BuildCoordinator::new();
+        let jobs = coordinator.list_jobs().await;
+        assert!(jobs.is_empty());
+    }
+}
