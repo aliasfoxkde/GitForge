@@ -9,3 +9,4 @@ pub mod runner_integration_tests;
 pub mod ci_integration_tests;
 pub mod e2e_pipeline_tests;
 pub mod api_route_tests;
+pub mod cargo_wrapper_tests;

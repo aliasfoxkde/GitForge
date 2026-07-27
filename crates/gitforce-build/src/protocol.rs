@@ -102,7 +102,11 @@ pub fn decode_request(bytes: &[u8]) -> anyhow::Result<Request> {
     }
     let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     if bytes.len() < 4 + len {
-        anyhow::bail!("incomplete message: expected {} bytes, got {}", len, bytes.len() - 4);
+        anyhow::bail!(
+            "incomplete message: expected {} bytes, got {}",
+            len,
+            bytes.len() - 4
+        );
     }
     if bytes.len() > 4 + MAX_MESSAGE_SIZE {
         anyhow::bail!("message too large");
@@ -165,5 +169,131 @@ mod tests {
         let encoded = encode_response(&resp).unwrap();
         let decoded = decode_response(&encoded).unwrap();
         assert!(matches!(decoded, Response::Stats { .. }));
+    }
+
+    #[test]
+    fn test_request_names() {
+        assert_eq!(
+            Request::Submit {
+                cargo_args: vec![],
+                working_dir: None
+            }
+            .name(),
+            "submit"
+        );
+        assert_eq!(
+            Request::Status {
+                job_id: "123".to_string()
+            }
+            .name(),
+            "status"
+        );
+        assert_eq!(
+            Request::Cancel {
+                job_id: "123".to_string()
+            }
+            .name(),
+            "cancel"
+        );
+        assert_eq!(Request::List.name(), "list");
+        assert_eq!(Request::Stats.name(), "stats");
+        assert_eq!(Request::Shutdown.name(), "shutdown");
+    }
+
+    #[test]
+    fn test_encode_decode_all_request_types() {
+        let requests = vec![
+            Request::Submit {
+                cargo_args: vec!["build".to_string()],
+                working_dir: None,
+            },
+            Request::Status {
+                job_id: "test-123".to_string(),
+            },
+            Request::Cancel {
+                job_id: "test-456".to_string(),
+            },
+            Request::List,
+            Request::Stats,
+            Request::Shutdown,
+        ];
+
+        for req in requests {
+            let encoded = encode_request(&req).unwrap();
+            let decoded = decode_request(&encoded).unwrap();
+            // Check type matches
+            match (&req, &decoded) {
+                (Request::Submit { .. }, Request::Submit { .. }) => (),
+                (Request::Status { .. }, Request::Status { .. }) => (),
+                (Request::Cancel { .. }, Request::Cancel { .. }) => (),
+                (Request::List, Request::List) => (),
+                (Request::Stats, Request::Stats) => (),
+                (Request::Shutdown, Request::Shutdown) => (),
+                _ => panic!("type mismatch"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_all_response_types() {
+        let responses = vec![
+            Response::Submitted {
+                job_id: "test-123".to_string(),
+            },
+            Response::Completed {
+                job_id: "test-456".to_string(),
+                success: true,
+                exit_code: 0,
+                duration_ms: 100,
+                stdout: "OK".to_string(),
+                stderr: "".to_string(),
+            },
+            Response::Error {
+                message: "test error".to_string(),
+            },
+            Response::Status {
+                job_id: "test-789".to_string(),
+                status: "running".to_string(),
+                wait_time_ms: 50,
+            },
+            Response::JobList { jobs: vec![] },
+            Response::Stats {
+                running_count: 1,
+                queued_count: 2,
+                completed_count: 100,
+                max_concurrent: 2,
+            },
+            Response::Shutdown,
+        ];
+
+        for resp in responses {
+            let encoded = encode_response(&resp).unwrap();
+            let decoded = decode_response(&encoded).unwrap();
+            // Just verify decode succeeded
+            assert!(matches!(decoded, _));
+        }
+    }
+
+    #[test]
+    fn test_decode_request_too_short() {
+        let result = decode_request(&[0, 0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_response_too_short() {
+        let result = decode_response(&[0, 0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encode_request_empty_args() {
+        let req = Request::Submit {
+            cargo_args: vec![],
+            working_dir: None,
+        };
+        let encoded = encode_request(&req).unwrap();
+        let decoded = decode_request(&encoded).unwrap();
+        assert!(matches!(decoded, Request::Submit { cargo_args, .. } if cargo_args.is_empty()));
     }
 }

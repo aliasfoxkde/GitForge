@@ -4,12 +4,25 @@
 
 use anyhow::Result;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 
 use gitforce_build::{encode_response, BuildCoordinator, Request, Response, MAX_CONCURRENT_JOBS};
+
+/// Create a shutdown flag
+pub fn create_shutdown_flag() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+/// Create the shutdown future that waits for shutdown signal
+pub async fn create_shutdown_future(shutdown: Arc<AtomicBool>) {
+    while !shutdown.load(Ordering::SeqCst) {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
 
 /// Socket path for the daemon
 const SOCKET_PATH: &str = "/tmp/gitforge-build.sock";
@@ -145,11 +158,9 @@ async fn handle_connection(stream: UnixStream, coordinator: Arc<BuildCoordinator
                 }
             }
         }
-        Request::Cancel { job_id: _ } => {
-            Response::Error {
-                message: "cancel not implemented".to_string(),
-            }
-        }
+        Request::Cancel { job_id: _ } => Response::Error {
+            message: "cancel not implemented".to_string(),
+        },
         Request::List => {
             let jobs = coordinator.list_jobs().await;
             Response::JobList { jobs }
@@ -175,4 +186,45 @@ async fn handle_connection(stream: UnixStream, coordinator: Arc<BuildCoordinator
     }
     // Close write half to signal end of response
     drop(writer);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_shutdown_flag_initial_state() {
+        let flag = create_shutdown_flag();
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_create_shutdown_flag_clone() {
+        let flag1 = create_shutdown_flag();
+        let flag2 = flag1.clone();
+        flag1.store(true, Ordering::SeqCst);
+        assert!(flag2.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_create_shutdown_future() {
+        let shutdown = create_shutdown_flag();
+        let shutdown_flag = shutdown.clone();
+
+        // Set shutdown after a short delay
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            shutdown_flag.store(true, Ordering::SeqCst);
+        });
+
+        create_shutdown_future(shutdown).await;
+    }
+
+    #[test]
+    fn test_shutdown_flag_is_atomic() {
+        let flag = create_shutdown_flag();
+        assert!(!flag.load(Ordering::SeqCst));
+        flag.store(true, Ordering::SeqCst);
+        assert!(flag.load(Ordering::SeqCst));
+    }
 }

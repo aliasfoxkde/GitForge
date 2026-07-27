@@ -31,6 +31,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("starting GitForce CI Orchestrator");
 
+    // Initialize process supervision (subreaper + SIGCHLD) to prevent zombies
+    if let Err(e) = gitforce_process::init() {
+        tracing::warn!("failed to initialize process supervision: {}", e);
+    }
+
     // Initialize event bus
     let event_bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
 
@@ -221,13 +226,7 @@ async fn handle_push_event(
     };
 
     // Create trigger event
-    let trigger_event = PipelineTriggerEvent::new(
-        gitforce_common::PipelineId::new(),
-        repo_id,
-        payload.new_hash.clone(),
-        TriggerType::Push,
-    )
-    .with_ref(ref_name.clone());
+    let trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
 
     // Create and start the CI engine
     let engine = CiEngine::new(trigger_event, pipeline).await?;
@@ -252,6 +251,21 @@ async fn handle_push_event(
     }
 
     Ok(())
+}
+
+/// Create a trigger event from push payload (extracted for testability)
+pub fn create_trigger_event(
+    repo_id: gitforce_common::RepoId,
+    commit_hash: &str,
+    ref_name: &str,
+) -> gitforce_ci::PipelineTriggerEvent {
+    PipelineTriggerEvent::new(
+        gitforce_common::PipelineId::new(),
+        repo_id,
+        commit_hash.to_string(),
+        TriggerType::Push,
+    )
+    .with_ref(ref_name.to_string())
 }
 
 /// Create a default pipeline definition
@@ -379,6 +393,29 @@ mod tests {
     }
 
     #[test]
+    fn test_pipeline_cache_insert_and_retrieve() {
+        let mut cache: PipelineCache = HashMap::new();
+        let repo_id = gitforce_common::RepoId::new();
+        let pipeline = create_default_pipeline("test-repo");
+
+        cache.insert(repo_id, pipeline.clone());
+        assert!(cache.contains_key(&repo_id));
+        assert_eq!(cache.get(&repo_id).unwrap().name, "test-repo-pipeline");
+    }
+
+    #[test]
+    fn test_pipeline_cache_multiple_repos() {
+        let mut cache: PipelineCache = HashMap::new();
+        let repo1 = gitforce_common::RepoId::new();
+        let repo2 = gitforce_common::RepoId::new();
+
+        cache.insert(repo1, create_default_pipeline("repo1"));
+        cache.insert(repo2, create_default_pipeline("repo2"));
+
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
     fn test_create_shutdown_flag_initial_state() {
         let flag = create_shutdown_flag();
         assert!(!flag.load(Ordering::SeqCst));
@@ -437,5 +474,32 @@ mod tests {
         let flag = create_shutdown_flag();
         // Just verify the function doesn't panic when called
         spawn_shutdown_handler(flag);
+    }
+
+    #[test]
+    fn test_create_trigger_event_basic() {
+        let repo_id = gitforce_common::RepoId::new();
+        let event = create_trigger_event(repo_id, "abc123", "refs/heads/main");
+
+        // Verify event was created with correct commit hash
+        assert_eq!(event.commit_hash, "abc123");
+        assert_eq!(event.ref_name.as_deref(), Some("refs/heads/main"));
+    }
+
+    #[test]
+    fn test_create_trigger_event_with_branch() {
+        let repo_id = gitforce_common::RepoId::new();
+        let event = create_trigger_event(repo_id, "def456", "refs/heads/develop");
+
+        assert_eq!(event.commit_hash, "def456");
+        assert_eq!(event.ref_name.as_deref(), Some("refs/heads/develop"));
+    }
+
+    #[test]
+    fn test_create_trigger_event_preserves_repo_id() {
+        let repo_id = gitforce_common::RepoId::new();
+        let event = create_trigger_event(repo_id, "xyz789", "refs/heads/main");
+
+        assert_eq!(event.repo_id, repo_id);
     }
 }

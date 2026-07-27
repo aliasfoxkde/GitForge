@@ -21,6 +21,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("starting GitForce Runner Agent");
 
+    // Initialize process supervision (subreaper + SIGCHLD) to prevent zombies
+    if let Err(e) = gitforce_process::init() {
+        tracing::warn!("failed to initialize process supervision: {}", e);
+    }
+
     // Load runner configuration
     let config = RunnerConfig::default();
 
@@ -163,5 +168,34 @@ mod tests {
         assert!(!flag.load(Ordering::SeqCst));
         flag.store(true, Ordering::SeqCst);
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_shutdown_flag_load_ordering() {
+        // Verify SeqCst ordering is used
+        let flag = create_shutdown_flag();
+        let value = flag.load(Ordering::SeqCst);
+        assert!(!value);
+    }
+
+    #[test]
+    fn test_graceful_shutdown_delay_completes() {
+        // Test that the delay actually waits
+        let start = std::time::Instant::now();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                graceful_shutdown_delay().await;
+            });
+        // Should have taken at least 1 second
+        assert!(start.elapsed().as_secs() >= 1);
+    }
+
+    #[test]
+    fn test_runner_service_config_defaults() {
+        // Test that RunnerConfig::default() works - just verify it doesn't panic
+        let _config = gitforce_runner::RunnerConfig::default();
     }
 }

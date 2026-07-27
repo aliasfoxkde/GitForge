@@ -15,6 +15,7 @@ gitforce-db = { path = "../../crates/gitforce-db" }
 gitforce-runner = { path = "../../crates/gitforce-runner" }
 gitforce-sandbox = { path = "../../crates/gitforce-sandbox" }
 gitforce-storage = { path = "../../crates/gitforce-storage" }
+gitforce-process = { path = "../../crates/gitforce-process" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

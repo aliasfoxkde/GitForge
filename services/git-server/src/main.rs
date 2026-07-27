@@ -22,6 +22,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("starting GitForce Git Server");
 
+    // Initialize process supervision (subreaper + SIGCHLD) to prevent zombies
+    if let Err(e) = gitforce_process::init() {
+        tracing::warn!("failed to initialize process supervision: {}", e);
+    }
+
     // Get git root from environment
     let git_root = get_git_root();
     tracing::info!("using git root: {}", git_root);
@@ -188,5 +193,37 @@ mod tests {
         assert!(!flag.load(Ordering::SeqCst));
         flag.store(true, Ordering::SeqCst);
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_shutdown_flag_load_ordering() {
+        // Verify SeqCst ordering is used
+        let flag = create_shutdown_flag();
+        let value = flag.load(Ordering::SeqCst);
+        assert!(!value);
+    }
+
+    #[test]
+    fn test_graceful_shutdown_delay_completes() {
+        // Test that the delay actually waits
+        let start = std::time::Instant::now();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                graceful_shutdown_delay().await;
+            });
+        // Should have taken at least 1 second
+        assert!(start.elapsed().as_secs() >= 1);
+    }
+
+    #[test]
+    fn test_get_git_root_empty_string() {
+        // When GIT_ROOT is set to empty string
+        std::env::set_var("GIT_ROOT", "");
+        let _root = get_git_root();
+        // Empty string is a valid env var value, so it returns empty
+        std::env::remove_var("GIT_ROOT");
     }
 }

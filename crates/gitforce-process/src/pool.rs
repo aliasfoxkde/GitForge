@@ -167,5 +167,130 @@ mod tests {
     fn test_pool_config_default() {
         let config = PoolConfig::default();
         assert_eq!(config.max_concurrent, 4);
+        assert_eq!(config.default_timeout, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn test_pool_config_custom() {
+        let config = PoolConfig {
+            max_concurrent: 8,
+            default_timeout: Duration::from_secs(7200),
+        };
+        assert_eq!(config.max_concurrent, 8);
+        assert_eq!(config.default_timeout, Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn test_managed_process_debug() {
+        let process = ManagedProcess {
+            pid: 12345,
+            weight: JobWeight::Medium,
+        };
+        let debug_str = format!("{:?}", process);
+        assert!(debug_str.contains("12345"));
+        assert!(debug_str.contains("Medium"));
+    }
+
+    #[test]
+    fn test_job_weight_default() {
+        assert_eq!(JobWeight::default(), JobWeight::Light);
+    }
+
+    #[test]
+    fn test_job_weight_equality() {
+        assert_eq!(JobWeight::Light, JobWeight::Light);
+        assert_eq!(JobWeight::Medium, JobWeight::Medium);
+        assert_eq!(JobWeight::Heavy, JobWeight::Heavy);
+        assert_ne!(JobWeight::Light, JobWeight::Medium);
+    }
+
+    #[test]
+    fn test_pool_new() {
+        let config = PoolConfig {
+            max_concurrent: 2,
+            default_timeout: Duration::from_secs(1800),
+        };
+        let pool = ProcessPool::new(config);
+        assert_eq!(pool.running_count(), 0);
+        assert!(!pool.is_running(1));
+    }
+
+    #[tokio::test]
+    async fn test_pool_acquire() {
+        let pool = ProcessPool::with_default_config();
+        // Acquire a permit
+        let permit = pool.acquire(JobWeight::Light).await;
+        // Permit should be valid (will be dropped at end of scope)
+        drop(permit);
+        // After drop, we can acquire again
+        let permit2 = pool.acquire(JobWeight::Light).await;
+        drop(permit2);
+    }
+
+    #[tokio::test]
+    async fn test_pool_acquire_multiple() {
+        let config = PoolConfig {
+            max_concurrent: 2,
+            default_timeout: Duration::from_secs(3600),
+        };
+        let pool = ProcessPool::new(config);
+
+        // Acquire all permits
+        let permit1 = pool.acquire(JobWeight::Light).await;
+        let permit2 = pool.acquire(JobWeight::Light).await;
+
+        // Both should be acquired - running count is still 0 until spawn
+        assert_eq!(pool.running_count(), 0);
+
+        drop(permit1);
+        drop(permit2);
+    }
+
+    #[tokio::test]
+    async fn test_pool_acquire_all_weights() {
+        let pool = ProcessPool::with_default_config();
+
+        // Acquire with different weights
+        let light = pool.acquire(JobWeight::Light).await;
+        drop(light);
+
+        let medium = pool.acquire(JobWeight::Medium).await;
+        drop(medium);
+
+        let heavy = pool.acquire(JobWeight::Heavy).await;
+        drop(heavy);
+    }
+
+    #[test]
+    fn test_pool_config_clone() {
+        let config = PoolConfig::default();
+        let cloned = config.clone();
+        assert_eq!(cloned.max_concurrent, config.max_concurrent);
+        assert_eq!(cloned.default_timeout, config.default_timeout);
+    }
+
+    #[test]
+    fn test_pool_debug() {
+        let pool = ProcessPool::with_default_config();
+        let debug_str = format!("{:?}", pool);
+        assert!(debug_str.contains("ProcessPool"));
+    }
+
+    #[test]
+    fn test_pool_config_debug() {
+        let config = PoolConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("max_concurrent"));
+    }
+
+    #[test]
+    fn test_job_weight_sorting() {
+        // Test that weights can be sorted
+        let mut weights = vec![JobWeight::Heavy, JobWeight::Light, JobWeight::Medium];
+        weights.sort();
+        assert_eq!(
+            weights,
+            vec![JobWeight::Light, JobWeight::Medium, JobWeight::Heavy]
+        );
     }
 }

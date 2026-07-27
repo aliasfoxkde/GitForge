@@ -74,4 +74,13 @@ mod tests {
         install_sigchld_handler();
         assert!(is_handler_running());
     }
+
+    #[test]
+    fn test_install_handler_idempotent() {
+        // Calling twice should not panic
+        install_sigchld_handler();
+        install_sigchld_handler();
+        // Handler should still be running
+        assert!(is_handler_running());
+    }
 }

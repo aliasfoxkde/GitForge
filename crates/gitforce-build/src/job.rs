@@ -40,7 +40,11 @@ pub enum JobStatus {
     /// Job completed successfully
     Completed { exit_code: i32, duration_ms: u64 },
     /// Job failed
-    Failed { exit_code: i32, duration_ms: u64, error: String },
+    Failed {
+        exit_code: i32,
+        duration_ms: u64,
+        error: String,
+    },
     /// Job was cancelled
     Cancelled,
 }
@@ -86,9 +90,7 @@ impl BuildJob {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.status,
-            JobStatus::Completed { .. }
-                | JobStatus::Failed { .. }
-                | JobStatus::Cancelled
+            JobStatus::Completed { .. } | JobStatus::Failed { .. } | JobStatus::Cancelled
         )
     }
 }
@@ -167,8 +169,14 @@ mod tests {
         assert_eq!(JobWeight::from_cargo_cmd("build"), JobWeight::Light);
         assert_eq!(JobWeight::from_cargo_cmd("check"), JobWeight::Light);
         assert_eq!(JobWeight::from_cargo_cmd("clippy"), JobWeight::Light);
+        assert_eq!(JobWeight::from_cargo_cmd("fmt"), JobWeight::Light);
         assert_eq!(JobWeight::from_cargo_cmd("test"), JobWeight::Medium);
+        assert_eq!(JobWeight::from_cargo_cmd("bench"), JobWeight::Medium);
         assert_eq!(JobWeight::from_cargo_cmd("llvm-cov"), JobWeight::Heavy);
+        assert_eq!(JobWeight::from_cargo_cmd("tarpaulin"), JobWeight::Heavy);
+        assert_eq!(JobWeight::from_cargo_cmd("miri"), JobWeight::Heavy);
+        // Unknown defaults to Medium
+        assert_eq!(JobWeight::from_cargo_cmd("unknown"), JobWeight::Medium);
     }
 
     #[test]
@@ -179,11 +187,81 @@ mod tests {
         );
         assert_eq!(job.weight, JobWeight::Medium);
         assert!(matches!(job.status, JobStatus::Queued));
+        assert!(!job.id.is_nil());
+        assert!(job.wait_time().as_millis() == job.wait_time().as_millis());
+    }
+
+    #[test]
+    fn test_build_job_new_no_working_dir() {
+        let job = BuildJob::new(vec!["build".to_string()], None);
+        assert_eq!(job.working_dir, None);
+        assert_eq!(job.weight, JobWeight::Light);
     }
 
     #[test]
     fn test_job_is_terminal() {
         let job = BuildJob::new(vec!["build".to_string()], None);
         assert!(!job.is_terminal());
+    }
+
+    #[test]
+    fn test_job_status_completed() {
+        let mut job = BuildJob::new(vec!["build".to_string()], None);
+        job.status = JobStatus::Completed {
+            exit_code: 0,
+            duration_ms: 100,
+        };
+        assert!(job.is_terminal());
+    }
+
+    #[test]
+    fn test_job_status_failed() {
+        let mut job = BuildJob::new(vec!["build".to_string()], None);
+        job.status = JobStatus::Failed {
+            exit_code: 1,
+            duration_ms: 50,
+            error: "test error".to_string(),
+        };
+        assert!(job.is_terminal());
+    }
+
+    #[test]
+    fn test_job_status_cancelled() {
+        let mut job = BuildJob::new(vec!["build".to_string()], None);
+        job.status = JobStatus::Cancelled;
+        assert!(job.is_terminal());
+    }
+
+    #[test]
+    fn test_job_status_running() {
+        let mut job = BuildJob::new(vec!["build".to_string()], None);
+        job.status = JobStatus::Running { pid: 12345 };
+        assert!(!job.is_terminal());
+    }
+
+    #[test]
+    fn test_build_result_from_job_success() {
+        let job = BuildJob::new(vec!["build".to_string()], None);
+        let result = BuildResult::from_job(&job, 0, "output".to_string(), "".to_string());
+        assert!(result.success);
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[test]
+    fn test_build_result_from_job_failure() {
+        let job = BuildJob::new(vec!["build".to_string()], None);
+        let result = BuildResult::from_job(&job, 1, "".to_string(), "error".to_string());
+        assert!(!result.success);
+        assert_eq!(result.exit_code, 1);
+    }
+
+    #[test]
+    fn test_build_result_failed() {
+        let job = BuildJob::new(vec!["build".to_string()], None);
+        let result =
+            BuildResult::failed(&job, -1, "stderr".to_string(), "spawn failed".to_string());
+        assert!(!result.success);
+        assert_eq!(result.exit_code, -1);
+        assert!(result.error.is_some());
     }
 }

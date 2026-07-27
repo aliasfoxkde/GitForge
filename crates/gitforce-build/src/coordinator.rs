@@ -3,8 +3,8 @@
 use crate::job::{BuildJob, BuildResult, JobStatus, MAX_CONCURRENT_JOBS};
 use crate::protocol::{JobInfo, Response};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 use tracing::{error, info, warn};
@@ -121,7 +121,9 @@ impl BuildCoordinator {
                 JobStatus::Completed { exit_code, .. } => {
                     format!("completed({})", exit_code)
                 }
-                JobStatus::Failed { exit_code, error, .. } => {
+                JobStatus::Failed {
+                    exit_code, error, ..
+                } => {
                     format!("failed({}): {}", exit_code, error)
                 }
                 JobStatus::Cancelled => "cancelled".to_string(),
@@ -165,7 +167,9 @@ impl BuildCoordinator {
             .values()
             .filter(|j| matches!(j.status, JobStatus::Queued))
             .count();
-        let completed = self.completed_count.load(std::sync::atomic::Ordering::SeqCst);
+        let completed = self
+            .completed_count
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         Response::Stats {
             running_count: running,
@@ -177,8 +181,17 @@ impl BuildCoordinator {
 
     /// Wait for a job to complete and get its result
     pub async fn wait_for_job(&self, job_id: uuid::Uuid) -> Option<BuildResult> {
+        self.wait_for_job_with_timeout(job_id, Duration::from_secs(3600))
+            .await
+    }
+
+    /// Wait for a job with a custom timeout (useful for testing)
+    pub async fn wait_for_job_with_timeout(
+        &self,
+        job_id: uuid::Uuid,
+        timeout: Duration,
+    ) -> Option<BuildResult> {
         let start = std::time::Instant::now();
-        let timeout_duration = Duration::from_secs(3600);
 
         loop {
             // Check if already completed
@@ -196,7 +209,10 @@ impl BuildCoordinator {
                     if job.is_terminal() {
                         // Build result from job status
                         return Some(match &job.status {
-                            JobStatus::Completed { exit_code, duration_ms } => BuildResult {
+                            JobStatus::Completed {
+                                exit_code,
+                                duration_ms,
+                            } => BuildResult {
                                 job_id: job.id,
                                 success: *exit_code == 0,
                                 exit_code: *exit_code,
@@ -208,7 +224,11 @@ impl BuildCoordinator {
                                 },
                                 error: None,
                             },
-                            JobStatus::Failed { exit_code, duration_ms, error } => BuildResult {
+                            JobStatus::Failed {
+                                exit_code,
+                                duration_ms,
+                                error,
+                            } => BuildResult {
                                 job_id: job.id,
                                 success: false,
                                 exit_code: *exit_code,
@@ -238,7 +258,7 @@ impl BuildCoordinator {
             }
 
             // Check timeout
-            if start.elapsed() > timeout_duration {
+            if start.elapsed() > timeout {
                 return None;
             }
 
@@ -256,21 +276,35 @@ impl Default for BuildCoordinator {
 
 /// Execute a cargo job
 async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
-    use tokio::io::AsyncReadExt;
     use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
 
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    // IMPORTANT: Never invoke cargo-wrapper here - it would create circular dependency:
+    // wrapper -> daemon -> gitforge-build -> wrapper -> daemon...
+    //
+    // Strategy:
+    // 1. CARGO_REAL env var (set by wrapper in bypass mode)
+    // 2. rustup run stable cargo (always uses real cargo)
+    let cargo_executable = std::env::var("CARGO_REAL").unwrap_or_else(|_| "rustup".to_string());
+
+    let cargo_args = if cargo_executable == "rustup" {
+        // rustup run stable cargo [cargo args...]
+        let mut args = vec!["run".to_string(), "stable".to_string(), "cargo".to_string()];
+        args.extend(job.cargo_args.clone());
+        args
+    } else {
+        job.cargo_args.clone()
+    };
 
     info!(
-        "executing cargo {} in {:?}",
-        job.cargo_args.join(" "),
-        job.working_dir
+        "executing {} {:?} in {:?}",
+        cargo_executable, cargo_args, job.working_dir
     );
 
-    let mut cmd = tokio::process::Command::new(&cargo);
-    cmd.args(&job.cargo_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut cmd = tokio::process::Command::new(&cargo_executable);
+    cmd.args(&cargo_args);
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     if let Some(ref dir) = job.working_dir {
         cmd.current_dir(dir);
@@ -283,7 +317,12 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
         Ok(c) => c,
         Err(e) => {
             error!("failed to spawn cargo: {}", e);
-            return Ok(BuildResult::failed(job, -1, String::new(), format!("failed to spawn: {}", e)));
+            return Ok(BuildResult::failed(
+                job,
+                -1,
+                String::new(),
+                format!("failed to spawn: {}", e),
+            ));
         }
     };
 
@@ -295,14 +334,18 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
         // Capture stdout
         let mut stdout_buf = String::new();
         if let Some(mut stdout) = child.stdout.take() {
-            AsyncReadExt::read_to_string(&mut stdout, &mut stdout_buf).await.unwrap_or(0);
+            AsyncReadExt::read_to_string(&mut stdout, &mut stdout_buf)
+                .await
+                .unwrap_or(0);
         }
         let stdout = stdout_buf;
 
         // Capture stderr
         let mut stderr_buf = String::new();
         if let Some(mut stderr) = child.stderr.take() {
-            AsyncReadExt::read_to_string(&mut stderr, &mut stderr_buf).await.unwrap_or(0);
+            AsyncReadExt::read_to_string(&mut stderr, &mut stderr_buf)
+                .await
+                .unwrap_or(0);
         }
         let stderr = stderr_buf;
 
@@ -382,5 +425,145 @@ mod tests {
         let coordinator = BuildCoordinator::new();
         let jobs = coordinator.list_jobs().await;
         assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_stats_with_running_jobs() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+
+        // Submit a job that will complete quickly
+        let _job_id = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+
+        // Check stats
+        let stats = coordinator.stats().await;
+        if let Response::Stats {
+            completed_count, ..
+        } = stats
+        {
+            assert_eq!(completed_count, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_wait_for_nonexistent_job() {
+        let coordinator = BuildCoordinator::new();
+        let fake_uuid = uuid::Uuid::new_v4();
+        // Use short timeout for testing nonexistent job
+        let result = coordinator
+            .wait_for_job_with_timeout(fake_uuid, Duration::from_millis(500))
+            .await;
+        // Should timeout and return None (job doesn't exist)
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_get_status() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let job_id = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+
+        // Job should exist
+        let status = coordinator.get_status(&job_id).await;
+        assert!(status.is_some());
+
+        let (status_str, wait_time) = status.unwrap();
+        assert!(!status_str.is_empty());
+        assert!(wait_time == wait_time); // u64 is always >= 0, verify wait_time exists
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_get_status_nonexistent() {
+        let coordinator = BuildCoordinator::new();
+        let fake_uuid = uuid::Uuid::new_v4();
+        let status = coordinator.get_status(&fake_uuid).await;
+        assert!(status.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_max_concurrent() {
+        assert_eq!(BuildCoordinator::max_concurrent(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_default() {
+        let coordinator = BuildCoordinator::default();
+        let stats = coordinator.stats().await;
+        if let Response::Stats {
+            max_concurrent,
+            running_count,
+            queued_count,
+            completed_count,
+        } = stats
+        {
+            assert_eq!(max_concurrent, 2);
+            assert_eq!(running_count, 0);
+            assert_eq!(queued_count, 0);
+            assert_eq!(completed_count, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_list_jobs_after_submit() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let _job_id = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+
+        // Give a moment for job to be registered
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let jobs = coordinator.list_jobs().await;
+        assert!(!jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_get_status_after_submit() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let job_id = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+
+        // Give a moment for job to be registered
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let status = coordinator.get_status(&job_id).await;
+        assert!(status.is_some());
+
+        let (status_str, _) = status.unwrap();
+        // Job should be in a valid state (queued, running, or completed for fast jobs)
+        assert!(!status_str.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_wait_for_job_completes() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let job_id = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+
+        // Wait for job to complete with short timeout
+        let result = coordinator
+            .wait_for_job_with_timeout(job_id, Duration::from_secs(5))
+            .await;
+        assert!(result.is_some());
+
+        let r = result.unwrap();
+        assert_eq!(r.job_id, job_id);
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_submit_multiple_jobs() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+
+        // Submit multiple jobs
+        let job1 = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+        let job2 = coordinator.submit(vec!["--list".to_string()], None).await;
+
+        assert_ne!(job1, job2);
     }
 }

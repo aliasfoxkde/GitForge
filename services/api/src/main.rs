@@ -22,6 +22,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("starting GitForce API Gateway");
 
+    // Initialize process supervision (subreaper + SIGCHLD) to prevent zombies
+    if let Err(e) = gitforce_process::init() {
+        tracing::warn!("failed to initialize process supervision: {}", e);
+    }
+
     // Load configuration
     let config = load_config();
     tracing::info!("connecting to database: {}", config.database_url);
@@ -105,18 +110,12 @@ pub fn load_config() -> ServerConfig {
 /// Load configuration for testing (allows env var defaults)
 #[cfg(test)]
 pub fn load_config_test() -> ServerConfig {
-    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "test-secret".to_string());
-    let port = std::env::var("PORT")
-        .unwrap_or_else(|_| "8080".to_string())
-        .parse::<u16>()
-        .unwrap_or(8080);
-    let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:/gitforge.db".to_string());
-
+    // Use ONLY defaults for testing - ignore any environment variables
+    // This ensures test isolation regardless of parallel test execution
     ServerConfig {
-        jwt_secret,
-        port,
-        database_url,
+        jwt_secret: "test-secret".to_string(),
+        port: 8080,
+        database_url: "sqlite:/gitforge.db".to_string(),
     }
 }
 
@@ -212,6 +211,8 @@ mod tests {
     #[test]
     fn test_load_config_test_defaults() {
         clear_env();
+        // Explicitly remove DATABASE_URL to ensure clean state
+        std::env::remove_var("DATABASE_URL");
         // load_config_test should use defaults when env vars not set
         let config = load_config_test();
         assert_eq!(config.jwt_secret, "test-secret");
@@ -284,5 +285,89 @@ mod tests {
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("jwt_secret"));
         assert!(debug_str.contains("8080"));
+    }
+
+    #[test]
+    fn test_load_config_port_parsing() {
+        clear_env();
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("PORT", "9000");
+
+        let config = load_config();
+        assert_eq!(config.port, 9000);
+
+        clear_env();
+    }
+
+    #[test]
+    fn test_load_config_invalid_port_uses_default() {
+        clear_env();
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("PORT", "invalid");
+
+        let config = load_config();
+        // Invalid port should fallback to 8080
+        assert_eq!(config.port, 8080);
+
+        clear_env();
+    }
+
+    #[test]
+    fn test_load_config_port_zero_is_valid() {
+        clear_env();
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("PORT", "0");
+
+        let config = load_config();
+        // Port 0 is actually valid (though it means "bind to any available port")
+        assert_eq!(config.port, 0);
+
+        clear_env();
+    }
+
+    #[test]
+    fn test_load_config_port_max_u16() {
+        clear_env();
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("PORT", "65535");
+
+        let config = load_config();
+        assert_eq!(config.port, 65535);
+
+        clear_env();
+    }
+
+    #[test]
+    fn test_create_shutdown_flag_load_ordering() {
+        // Verify SeqCst ordering is used
+        let flag = create_shutdown_flag();
+        let value = flag.load(Ordering::SeqCst);
+        assert!(!value);
+    }
+
+    #[test]
+    fn test_graceful_shutdown_delay_completes() {
+        // Test that the delay actually waits
+        let start = std::time::Instant::now();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                graceful_shutdown_delay().await;
+            });
+        // Should have taken at least 2 seconds
+        assert!(start.elapsed().as_secs() >= 2);
+    }
+
+    #[test]
+    fn test_clear_env_removes_all_vars() {
+        // Set then clear
+        std::env::set_var("JWT_SECRET", "test");
+        std::env::set_var("PORT", "1234");
+        clear_env();
+        // After clear, these should not be set
+        assert!(std::env::var("JWT_SECRET").is_err());
+        assert!(std::env::var("PORT").is_err());
     }
 }

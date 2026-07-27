@@ -15,6 +15,7 @@ gitforce-db = { path = "../../crates/gitforce-db" }
 gitforce-events = { path = "../../crates/gitforce-events" }
 gitforce-ci = { path = "../../crates/gitforce-ci" }
 gitforce-scheduler = { path = "../../crates/gitforce-scheduler" }
+gitforce-process = { path = "../../crates/gitforce-process" }
 futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

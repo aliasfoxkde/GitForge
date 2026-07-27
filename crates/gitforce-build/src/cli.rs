@@ -69,7 +69,9 @@ async fn main() -> Result<()> {
     let working_dir = if let Some(ref dir) = cli.dir {
         Some(dir.clone())
     } else {
-        std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string())
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
     };
 
     // Build submit request
@@ -142,11 +144,7 @@ async fn list_jobs(socket_path: &str) -> Result<()> {
                 for job in jobs {
                     println!(
                         "{} {:15} {:8} (wait: {}ms) {:?}",
-                        job.job_id,
-                        job.status,
-                        "",
-                        job.wait_time_ms,
-                        job.cargo_args
+                        job.job_id, job.status, "", job.wait_time_ms, job.cargo_args
                     );
                 }
             }
