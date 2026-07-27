@@ -502,4 +502,58 @@ mod tests {
 
         assert_eq!(event.repo_id, repo_id);
     }
+
+    #[test]
+    fn test_create_trigger_event_with_tag_ref() {
+        let repo_id = gitforce_common::RepoId::new();
+        let event = create_trigger_event(repo_id, "v1.0.0", "refs/tags/v1.0.0");
+
+        assert_eq!(event.commit_hash, "v1.0.0");
+        assert_eq!(event.ref_name.as_deref(), Some("refs/tags/v1.0.0"));
+    }
+
+    #[test]
+    fn test_create_trigger_event_empty_commit() {
+        let repo_id = gitforce_common::RepoId::new();
+        let event = create_trigger_event(repo_id, "", "refs/heads/main");
+
+        assert_eq!(event.commit_hash, "");
+        assert_eq!(event.ref_name.as_deref(), Some("refs/heads/main"));
+    }
+
+    #[test]
+    fn test_pipeline_cache_multiple_different_repos() {
+        let mut cache: PipelineCache = HashMap::new();
+        let repos: Vec<_> = (0..5).map(|_| gitforce_common::RepoId::new()).collect();
+
+        for (i, repo_id) in repos.iter().enumerate() {
+            let pipeline = create_default_pipeline(&format!("repo{}", i));
+            cache.insert(*repo_id, pipeline);
+        }
+
+        assert_eq!(cache.len(), 5);
+    }
+
+    #[test]
+    fn test_create_shutdown_flag_default_is_false() {
+        let flag = create_shutdown_flag();
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_pipeline_cache_insert_same_repo_updates() {
+        let mut cache: PipelineCache = HashMap::new();
+        let repo_id = gitforce_common::RepoId::new();
+
+        let pipeline1 = create_default_pipeline("repo1");
+        let pipeline2 = create_default_pipeline("repo2");
+
+        cache.insert(repo_id, pipeline1);
+        cache.insert(repo_id, pipeline2);
+
+        // Should have only one entry (updated)
+        assert_eq!(cache.len(), 1);
+        // And it should be the second one
+        assert_eq!(cache.get(&repo_id).unwrap().name, "repo2-pipeline");
+    }
 }

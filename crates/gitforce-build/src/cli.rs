@@ -201,3 +201,67 @@ async fn show_stats(socket_path: &str) -> Result<()> {
         _ => anyhow::bail!("unexpected response"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_socket_path() {
+        assert_eq!(DEFAULT_SOCKET, "/tmp/gitforge-build.sock");
+    }
+
+    #[test]
+    fn test_cli_default_socket() {
+        let cli = Cli::try_parse_from(["gitforge-build", "--stats"]).unwrap();
+        assert!(cli.socket.is_none());
+        assert!(cli.stats);
+    }
+
+    #[test]
+    fn test_cli_with_socket() {
+        let cli = Cli::try_parse_from(["gitforge-build", "--socket", "/custom/socket", "--stats"]).unwrap();
+        assert_eq!(cli.socket, Some("/custom/socket".to_string()));
+    }
+
+    #[test]
+    fn test_cli_with_working_dir() {
+        let cli = Cli::try_parse_from(["gitforge-build", "-d", "/work/dir", "--", "build"]).unwrap();
+        assert_eq!(cli.dir, Some("/work/dir".to_string()));
+        assert_eq!(cli.cargo_args, vec!["build"]);
+    }
+
+    #[test]
+    fn test_cli_no_wait() {
+        let cli = Cli::try_parse_from(["gitforge-build", "-n", "--", "test"]).unwrap();
+        assert!(cli.no_wait);
+        assert_eq!(cli.cargo_args, vec!["test"]);
+    }
+
+    #[test]
+    fn test_cli_list() {
+        let cli = Cli::try_parse_from(["gitforge-build", "-l"]).unwrap();
+        assert!(cli.list);
+    }
+
+    #[test]
+    fn test_cli_cargo_args() {
+        let cli = Cli::try_parse_from(["gitforge-build", "--", "build", "--release", "-p", "foo"]).unwrap();
+        assert_eq!(cli.cargo_args, vec!["build", "--release", "-p", "foo"]);
+    }
+
+    #[test]
+    fn test_cli_empty_args_no_error() {
+        // Empty args is allowed by clap (cargo_args defaults to empty Vec)
+        let result = Cli::try_parse_from(["gitforge-build"]);
+        assert!(result.is_ok());
+        let cli = result.unwrap();
+        assert!(cli.cargo_args.is_empty());
+    }
+
+    #[test]
+    fn test_cli_cargo_args_multiple() {
+        let cli = Cli::try_parse_from(["gitforge-build", "--", "check", "-p", "foo", "--all-targets"]).unwrap();
+        assert_eq!(cli.cargo_args, vec!["check", "-p", "foo", "--all-targets"]);
+    }
+}
