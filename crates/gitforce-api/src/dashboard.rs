@@ -83,7 +83,7 @@ const DASHBOARD_HTML: &str = r#"
                 <h2>🔧 Services</h2>
                 <div class="metric">
                     <span class="metric-label">Git Server</span>
-                    <span class="badge badge-info">Port 2222/8082</span>
+                    <span class="badge badge-info">Port 42022/42782</span>
                 </div>
                 <div class="metric">
                     <span class="metric-label">CI Orchestrator</span>

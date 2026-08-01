@@ -30,7 +30,7 @@ pub struct RunnerConfig {
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
-            scheduler_url: "http://localhost:8081".to_string(),
+            scheduler_url: "http://localhost:42781".to_string(),
             name: "runner".to_string(),
             runner_type: "docker".to_string(),
             capacity: 2,
@@ -614,7 +614,7 @@ mod tests {
     fn test_runner_config_all_default_values() {
         let config = RunnerConfig::default();
         // Verify all default values
-        assert_eq!(config.scheduler_url, "http://localhost:8081");
+        assert_eq!(config.scheduler_url, "http://localhost:42781");
         assert_eq!(config.name, "runner");
         assert_eq!(config.runner_type, "docker");
         assert_eq!(config.capacity, 2);
@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn test_runner_config_with_zero_capacity() {
         let config = RunnerConfig {
-            scheduler_url: "http://localhost:8081".to_string(),
+            scheduler_url: "http://localhost:42781".to_string(),
             name: "zero-cap".to_string(),
             runner_type: "docker".to_string(),
             capacity: 0,

@@ -46,7 +46,7 @@ impl ApiServer {
         // e.g., CORS_ALLOWED_ORIGINS=https://app.example.com,https://dashboard.example.com
         // If not set, defaults to allowing only localhost for development
         let allowed_origins = std::env::var("CORS_ALLOWED_ORIGINS")
-            .unwrap_or_else(|_| "http://localhost:3000,http://localhost:8080".to_string());
+            .unwrap_or_else(|_| "http://localhost:3000,http://localhost:42780".to_string());
 
         let origins: Vec<&str> = allowed_origins.split(',').map(|s| s.trim()).collect();
 
@@ -113,7 +113,7 @@ impl ApiServer {
 
         Self {
             router: app,
-            port: 8080,
+            port: 42780,
         }
     }
 
@@ -231,7 +231,7 @@ mod tests {
     async fn test_server_creation() {
         let pool = Pool::memory().await.unwrap();
         let server = ApiServer::new("test-secret", pool);
-        assert_eq!(server.port, 8080);
+        assert_eq!(server.port, 42780);
     }
 
     #[tokio::test]
@@ -314,7 +314,7 @@ mod tests {
             pool,
             Some(std::path::PathBuf::from("/tmp/storage")),
         );
-        assert_eq!(server.port, 8080);
+        assert_eq!(server.port, 42780);
     }
 
     #[tokio::test]

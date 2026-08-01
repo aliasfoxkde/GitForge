@@ -35,12 +35,12 @@ docker-compose up -d
 
 5. Verify health:
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:42780/health
 ```
 
 ## Services
 
-### API Gateway (port 8080)
+### API Gateway (port 42780)
 REST API for GitForge. All client interaction goes through this service.
 
 ### CI Orchestrator
@@ -90,7 +90,7 @@ url = "postgres://gitforge:password@postgres:5432/gitforge"
 
 ## Monitoring
 
-Prometheus metrics available at `http://localhost:8080/metrics`.
+Prometheus metrics available at `http://localhost:42780/metrics`.
 
 Key metrics:
 - `gitforge_http_requests_total` - HTTP request counts

@@ -17,7 +17,7 @@ fn test_runner_config_default() {
     assert_eq!(config.capacity, 2);
     assert_eq!(config.heartbeat_interval_secs, 30);
     assert_eq!(config.fetch_interval_secs, 5);
-    assert_eq!(config.scheduler_url, "http://localhost:8081");
+    assert_eq!(config.scheduler_url, "http://localhost:42781");
 }
 
 /// Test runner configuration custom values

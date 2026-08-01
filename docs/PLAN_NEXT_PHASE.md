@@ -172,7 +172,7 @@ port = 8080
 url = "sqlite:/data/gitforge.db"
 
 [runner]
-scheduler_url = "http://ci:8081"
+scheduler_url = "http://ci:42781"
 ```
 
 ### Phase F: Test Coverage (Week 3)

@@ -16,7 +16,7 @@ use tower::ServiceExt;
 async fn test_api_server_creation() {
     let pool = Pool::memory().await.unwrap();
     let server = ApiServer::new("test-secret", pool);
-    assert_eq!(server.port, 8080);
+    assert_eq!(server.port, 42780);
 }
 
 #[tokio::test]

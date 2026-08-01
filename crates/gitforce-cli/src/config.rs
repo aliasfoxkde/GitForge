@@ -75,7 +75,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            server_url: "http://localhost:8080".to_string(),
+            server_url: "http://localhost:42780".to_string(),
             token: None,
             local_data_dir: dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        assert_eq!(config.server_url, "http://localhost:8080");
+        assert_eq!(config.server_url, "http://localhost:42780");
         assert!(config.token.is_none());
         assert_eq!(config.output_format, OutputFormat::Table);
     }
@@ -161,7 +161,7 @@ mod tests {
     fn test_config_serialize() {
         let config = Config::default();
         let serialized = serde_json::to_string(&config).unwrap();
-        assert!(serialized.contains("http://localhost:8080"));
+        assert!(serialized.contains("http://localhost:42780"));
     }
 
     #[test]

@@ -11,7 +11,7 @@ services:
       target: api-prod
     container_name: gitforge-api
     ports:
-      - "8080:8080"
+      - "42780:42780"
     volumes:
       - api-data:/data
       - ./config.toml.example:/config.toml:ro
@@ -20,7 +20,7 @@ services:
       - RUST_LOG=info
       - JWT_SECRET=${JWT_SECRET:-changeme-in-production}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:42780/health"]
       interval: 30s
       timeout: 3s
       retries: 3
@@ -43,7 +43,7 @@ services:
     environment:
       - DATABASE_URL=sqlite:/data/gitforge.db
       - RUST_LOG=info
-      - SCHEDULER_URL=http://scheduler:8081
+      - SCHEDULER_URL=http://scheduler:42781
     depends_on:
       - scheduler
       - git-server
@@ -59,7 +59,7 @@ services:
       target: ci-prod
     container_name: gitforge-scheduler
     ports:
-      - "8081:8081"
+      - "42781:42781"
     volumes:
       - scheduler-data:/data
     environment:
@@ -82,7 +82,7 @@ services:
       - runner-data:/data
     environment:
       - RUST_LOG=info
-      - SCHEDULER_URL=http://scheduler:8081
+      - SCHEDULER_URL=http://scheduler:42781
       - RUNNER_NAME=docker-runner-1
       - RUNNER_CAPACITY=4
     depends_on:
@@ -99,15 +99,15 @@ services:
       target: git-server-prod
     container_name: gitforge-git-server
     ports:
-      - "2222:2222"
-      - "8082:8082"  # Git HTTP
+      - "42022:2222"
+      - "42782:8082"  # Git HTTP
     volumes:
       - git-data:/git
       - ssh-data:/home/gitforge/.ssh
     environment:
       - RUST_LOG=info
-      - SSH_PORT=2222
-      - HTTP_PORT=8082
+      - SSH_PORT=42022
+      - HTTP_PORT=42782
     networks:
       - gitforge
 
@@ -125,7 +125,7 @@ services:
       - runner2-data:/data
     environment:
       - RUST_LOG=info
-      - SCHEDULER_URL=http://scheduler:8081
+      - SCHEDULER_URL=http://scheduler:42781
       - RUNNER_NAME=docker-runner-2
       - RUNNER_CAPACITY=2
     depends_on:

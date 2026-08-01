@@ -12,7 +12,7 @@ on:
       - '.github/workflows/**'
 
 env:
-  GITFORGE_API_URL: ${{ vars.GITFORGE_API_URL || 'http://localhost:8080' }}
+  GITFORGE_API_URL: ${{ vars.GITFORGE_API_URL || 'http://localhost:42780' }}
   GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
 
 # Route ALL builds through GitForge instead of running directly on GitHub Actions runners.

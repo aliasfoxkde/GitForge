@@ -812,7 +812,7 @@ mod tests {
         let client = SyncClient::new(temp_dir.path().to_path_buf(), mock_client);
         client.init().await.unwrap();
 
-        let result = client.push("http://localhost:8080", "test-token").await;
+        let result = client.push("http://localhost:42780", "test-token").await;
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.remote_rev, 42);
@@ -826,7 +826,7 @@ mod tests {
         let client = SyncClient::new(temp_dir.path().to_path_buf(), mock_client);
         client.init().await.unwrap();
 
-        let result = client.push("http://localhost:8080", "test-token").await;
+        let result = client.push("http://localhost:42780", "test-token").await;
         assert!(result.is_err());
     }
 
@@ -842,7 +842,7 @@ mod tests {
         let client = SyncClient::new(temp_dir.path().to_path_buf(), mock_client);
         client.init().await.unwrap();
 
-        let result = client.pull("http://localhost:8080", "test-token").await;
+        let result = client.pull("http://localhost:42780", "test-token").await;
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.remote_rev, 100);
@@ -856,7 +856,7 @@ mod tests {
         let client = SyncClient::new(temp_dir.path().to_path_buf(), mock_client);
         client.init().await.unwrap();
 
-        let result = client.pull("http://localhost:8080", "test-token").await;
+        let result = client.pull("http://localhost:42780", "test-token").await;
         assert!(result.is_err());
     }
 

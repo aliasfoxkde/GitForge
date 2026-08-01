@@ -141,7 +141,7 @@ DATABASE_URL="sqlite:/gitforge.db"
 GIT_ROOT="/var/lib/gitforge/repos"
 
 # Runner Agent
-RUNNER_API_URL="http://localhost:8080"
+RUNNER_API_URL="http://localhost:42780"
 RUNNER_TOKEN="runner-registration-token"
 
 # Logging
@@ -164,8 +164,8 @@ cargo llvm-cov report          # Should show 89.65%
 cargo clippy --all-targets --all-features -- -D warnings
 
 # Health check (when services running)
-curl http://localhost:8080/health
-curl http://localhost:8080/metrics
+curl http://localhost:42780/health
+curl http://localhost:42780/metrics
 ```
 
 ---

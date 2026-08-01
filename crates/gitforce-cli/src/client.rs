@@ -461,22 +461,22 @@ mod tests {
 
     #[test]
     fn test_api_client_new() {
-        let client = ApiClient::new("http://localhost:8080", None);
-        assert_eq!(client.base_url, "http://localhost:8080");
+        let client = ApiClient::new("http://localhost:42780", None);
+        assert_eq!(client.base_url, "http://localhost:42780");
     }
 
     #[test]
     fn test_api_client_with_token() {
         let client =
-            ApiClient::new("http://localhost:8080", None).with_token("test-token".to_string());
+            ApiClient::new("http://localhost:42780", None).with_token("test-token".to_string());
         // Token is set internally, verify client was created
-        let client2 = ApiClient::new("http://localhost:8080", Some("test-token".to_string()));
+        let client2 = ApiClient::new("http://localhost:42780", Some("test-token".to_string()));
         assert_eq!(client.token, client2.token);
     }
 
     #[test]
     fn test_api_client_clone() {
-        let client = ApiClient::new("http://localhost:8080", Some("token".to_string()));
+        let client = ApiClient::new("http://localhost:42780", Some("token".to_string()));
         let _cloned = client.clone();
     }
 
@@ -488,14 +488,14 @@ mod tests {
 
     #[test]
     fn test_api_client_token_none() {
-        let client = ApiClient::new("http://localhost:8080", None);
+        let client = ApiClient::new("http://localhost:42780", None);
         assert!(client.token.is_none());
     }
 
     #[test]
     fn test_api_client_with_token_method() {
         let client =
-            ApiClient::new("http://localhost:8080", None).with_token("my-token".to_string());
+            ApiClient::new("http://localhost:42780", None).with_token("my-token".to_string());
         assert_eq!(client.token, Some("my-token".to_string()));
     }
 
@@ -508,21 +508,21 @@ mod tests {
 
     #[test]
     fn test_api_client_clone_preserves_token() {
-        let client = ApiClient::new("http://localhost:8080", Some("secret-token".to_string()));
+        let client = ApiClient::new("http://localhost:42780", Some("secret-token".to_string()));
         let cloned = client.clone();
         assert_eq!(cloned.token, client.token);
     }
 
     #[test]
     fn test_api_client_different_tokens() {
-        let client1 = ApiClient::new("http://localhost:8080", Some("token1".to_string()));
-        let client2 = ApiClient::new("http://localhost:8080", Some("token2".to_string()));
+        let client1 = ApiClient::new("http://localhost:42780", Some("token1".to_string()));
+        let client2 = ApiClient::new("http://localhost:42780", Some("token2".to_string()));
         assert_ne!(client1.token, client2.token);
     }
 
     #[test]
     fn test_api_client_with_empty_token() {
-        let client = ApiClient::new("http://localhost:8080", Some("".to_string()));
+        let client = ApiClient::new("http://localhost:42780", Some("".to_string()));
         assert!(client.token.is_some());
         assert_eq!(client.token.unwrap(), "");
     }
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn test_gitforge_client_is_api_client() {
         // GitForgeClient is an alias for ApiClient
-        let client = GitForgeClient::new("http://localhost:8080", None);
-        assert_eq!(client.base_url, "http://localhost:8080");
+        let client = GitForgeClient::new("http://localhost:42780", None);
+        assert_eq!(client.base_url, "http://localhost:42780");
     }
 }

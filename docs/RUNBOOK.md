@@ -13,7 +13,7 @@ GitForge is a self-hosted Git platform with event-driven CI/CD capabilities. Thi
 │                    GitForge Services                      │
 ├─────────────┬─────────────┬─────────────┬───────────────┤
 │  git-server │     ci     │   runner    │      api      │
-│  (2222/8082)│  (Internal)│  (Internal) │   (Port 8080) │
+│ (42022/42782)│ (Internal)│  (Internal) │  (Port 42780) │
 └─────────────┴─────────────┴─────────────┴───────────────┘
 ```
 
@@ -45,7 +45,7 @@ The API gateway exposes the REST API for frontend integration.
 cargo run -p api
 
 # Production
-JWT_SECRET=your-secret ./target/release/api --host 0.0.0.0 --port 8080
+JWT_SECRET=your-secret ./target/release/api --host 0.0.0.0 --port 42780
 ```
 
 **Environment Variables:**
@@ -76,8 +76,8 @@ sudo ./target/release/git-server
 ```
 
 **Ports:**
-- SSH: 2222
-- HTTP: 8082
+- SSH: 42022
+- HTTP: 42782
 
 ### 3. CI Orchestrator
 
@@ -106,12 +106,12 @@ The runner agent executes jobs in Docker containers.
 cargo run -p runner
 
 # Production
-SCHEDULER_URL=http://localhost:8081 ./target/release/runner
+SCHEDULER_URL=http://localhost:42781 ./target/release/runner
 ```
 
 **Environment Variables:**
 - `RUNNER_NAME` - Runner name (default: runner)
-- `SCHEDULER_URL` - Scheduler URL (default: http://localhost:8081)
+- `SCHEDULER_URL` - Scheduler URL (default: http://localhost:42781)
 - `RUNNER_CAPACITY` - Concurrent job capacity (default: 2)
 - `HEARTBEAT_INTERVAL_SECS` - Heartbeat interval (default: 30)
 - `FETCH_INTERVAL_SECS` - Job fetch interval (default: 5)
@@ -123,7 +123,7 @@ SCHEDULER_URL=http://localhost:8081 ./target/release/runner
 docker-compose up -d
 
 # Check health
-curl http://localhost:8080/health
+curl http://localhost:42780/health
 
 # View logs
 docker-compose logs -f
@@ -133,7 +133,7 @@ docker-compose logs -f
 
 ```bash
 # Check API health
-curl http://localhost:8080/health
+curl http://localhost:42780/health
 
 # Expected response:
 # {"status":"healthy","timestamp":"2026-07-14T12:00:00Z","database":"connected"}
@@ -145,9 +145,9 @@ curl http://localhost:8080/health
 
 1. Check ports aren't already in use:
    ```bash
-   lsof -i :8080  # API
-   lsof -i :2222  # Git SSH
-   lsof -i :8082  # Git HTTP
+   lsof -i :42780  # API
+   lsof -i :42022  # Git SSH
+   lsof -i :42782  # Git HTTP
    ```
 
 2. Check logs for errors:
@@ -160,7 +160,7 @@ curl http://localhost:8080/health
 1. Verify CI orchestrator is running
 2. Check scheduler has runners registered:
    ```bash
-   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/runners
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:42780/api/runners
    ```
 3. Check CI logs for queue processing
 
@@ -168,7 +168,7 @@ curl http://localhost:8080/health
 
 1. Verify runner is registered:
    ```bash
-   curl http://localhost:8081/runners  # Scheduler API
+   curl http://localhost:42781/runners  # Scheduler API
    ```
 2. Check runner logs for heartbeat errors
 3. Verify runner can reach scheduler
@@ -215,7 +215,7 @@ cargo fmt
 ```toml
 [server]
 host = "0.0.0.0"
-port = 8080
+port = 42780
 
 [database]
 url = "sqlite:/data/gitforge.db"
@@ -224,7 +224,7 @@ url = "sqlite:/data/gitforge.db"
 jwt_secret = "your-secret-here"
 
 [runner]
-scheduler_url = "http://scheduler:8081"
+scheduler_url = "http://scheduler:42781"
 capacity = 4
 ```
 
@@ -235,10 +235,10 @@ capacity = 4
 | `JWT_SECRET` | api | - | JWT signing secret (required) |
 | `DATABASE_URL` | api | sqlite:/data/gitforge.db | Database URL |
 | `RUNNER_NAME` | runner | runner | Runner identifier |
-| `SCHEDULER_URL` | runner | http://localhost:8081 | Scheduler endpoint |
+| `SCHEDULER_URL` | runner | http://localhost:42781 | Scheduler endpoint |
 | `RUNNER_CAPACITY` | runner | 2 | Max concurrent jobs |
-| `SSH_PORT` | git-server | 2222 | SSH port |
-| `HTTP_PORT` | git-server | 8082 | HTTP port |
+| `SSH_PORT` | git-server | 42022 | SSH port |
+| `HTTP_PORT` | git-server | 42782 | HTTP port |
 
 ## Logging
 

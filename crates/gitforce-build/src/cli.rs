@@ -220,13 +220,15 @@ mod tests {
 
     #[test]
     fn test_cli_with_socket() {
-        let cli = Cli::try_parse_from(["gitforge-build", "--socket", "/custom/socket", "--stats"]).unwrap();
+        let cli = Cli::try_parse_from(["gitforge-build", "--socket", "/custom/socket", "--stats"])
+            .unwrap();
         assert_eq!(cli.socket, Some("/custom/socket".to_string()));
     }
 
     #[test]
     fn test_cli_with_working_dir() {
-        let cli = Cli::try_parse_from(["gitforge-build", "-d", "/work/dir", "--", "build"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["gitforge-build", "-d", "/work/dir", "--", "build"]).unwrap();
         assert_eq!(cli.dir, Some("/work/dir".to_string()));
         assert_eq!(cli.cargo_args, vec!["build"]);
     }
@@ -246,7 +248,8 @@ mod tests {
 
     #[test]
     fn test_cli_cargo_args() {
-        let cli = Cli::try_parse_from(["gitforge-build", "--", "build", "--release", "-p", "foo"]).unwrap();
+        let cli = Cli::try_parse_from(["gitforge-build", "--", "build", "--release", "-p", "foo"])
+            .unwrap();
         assert_eq!(cli.cargo_args, vec!["build", "--release", "-p", "foo"]);
     }
 
@@ -261,7 +264,15 @@ mod tests {
 
     #[test]
     fn test_cli_cargo_args_multiple() {
-        let cli = Cli::try_parse_from(["gitforge-build", "--", "check", "-p", "foo", "--all-targets"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "gitforge-build",
+            "--",
+            "check",
+            "-p",
+            "foo",
+            "--all-targets",
+        ])
+        .unwrap();
         assert_eq!(cli.cargo_args, vec!["check", "-p", "foo", "--all-targets"]);
     }
 }

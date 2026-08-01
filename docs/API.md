@@ -5,13 +5,13 @@ REST API for the GitForge self-hosted Git platform with CI/CD capabilities.
 ## Base URL
 
 ```
-http://localhost:8080
+http://localhost:42780
 ```
 
 ## Interactive Documentation
 
-- **Swagger UI**: http://localhost:8080/swagger-ui
-- **OpenAPI Spec**: http://localhost:8080/api-docs/openapi.json
+- **Swagger UI**: http://localhost:42780/swagger-ui
+- **OpenAPI Spec**: http://localhost:42780/api-docs/openapi.json
 
 ## Authentication
 
@@ -206,7 +206,7 @@ Prometheus-format metrics including:
 ### Create a Repository
 
 ```bash
-curl -X POST http://localhost:8080/repos \
+curl -X POST http://localhost:42780/repos \
   -H "Content-Type: application/json" \
   -d '{"name": "my-project", "visibility": "public"}'
 ```
@@ -214,13 +214,13 @@ curl -X POST http://localhost:8080/repos \
 ### Check Pipeline Status
 
 ```bash
-curl http://localhost:8080/pipeline-runs/your-run-id
+curl http://localhost:42780/pipeline-runs/your-run-id
 ```
 
 ### Register a Runner
 
 ```bash
-curl -X POST http://localhost:8080/runners \
+curl -X POST http://localhost:42780/runners \
   -H "Content-Type: application/json" \
   -d '{"name": "docker-runner-1", "type": "docker", "capacity": 4}'
 ```

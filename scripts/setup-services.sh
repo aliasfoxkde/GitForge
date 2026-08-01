@@ -48,7 +48,7 @@ echo "API started with PID $API_PID"
 sleep 3
 
 # Verify API is running
-if curl -s http://localhost:8080/health > /dev/null 2>&1; then
+if curl -s http://localhost:42780/health > /dev/null 2>&1; then
     echo "✅ API is healthy"
 else
     echo "❌ API failed to start - check $LOGS_DIR/api.log"
@@ -77,15 +77,15 @@ echo ""
 echo "✅ GitForge Services Started!"
 echo ""
 echo "Services:"
-echo "  API:        http://localhost:8080 (PID $API_PID)"
+echo "  API:        http://localhost:42780 (PID $API_PID)"
 echo "  CI:         PID $CI_PID"
 echo "  Git Server: PID $GIT_PID"
 echo ""
 echo "Endpoints:"
-echo "  Health:      http://localhost:8080/health"
-echo "  Swagger UI:  http://localhost:8080/swagger-ui"
-echo "  Metrics:     http://localhost:8080/metrics"
-echo "  OpenAPI:     http://localhost:8080/api-docs/openapi.json"
+echo "  Health:      http://localhost:42780/health"
+echo "  Swagger UI:  http://localhost:42780/swagger-ui"
+echo "  Metrics:     http://localhost:42780/metrics"
+echo "  OpenAPI:     http://localhost:42780/api-docs/openapi.json"
 echo ""
 echo "Logs:"
 echo "  $LOGS_DIR/api.log"

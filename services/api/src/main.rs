@@ -93,9 +93,9 @@ pub fn load_config() -> ServerConfig {
         .expect("JWT_SECRET environment variable must be set - no dev fallback in production");
 
     let port = std::env::var("PORT")
-        .unwrap_or_else(|_| "8080".to_string())
+        .unwrap_or_else(|_| "42780".to_string())
         .parse::<u16>()
-        .unwrap_or(8080);
+        .unwrap_or(42780);
 
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:/gitforge.db".to_string());
@@ -114,7 +114,7 @@ pub fn load_config_test() -> ServerConfig {
     // This ensures test isolation regardless of parallel test execution
     ServerConfig {
         jwt_secret: "test-secret".to_string(),
-        port: 8080,
+        port: 42780,
         database_url: "sqlite:/gitforge.db".to_string(),
     }
 }
@@ -216,7 +216,7 @@ mod tests {
         // load_config_test should use defaults when env vars not set
         let config = load_config_test();
         assert_eq!(config.jwt_secret, "test-secret");
-        assert_eq!(config.port, 8080);
+        assert_eq!(config.port, 42780);
         assert_eq!(config.database_url, "sqlite:/gitforge.db");
     }
 
@@ -279,12 +279,12 @@ mod tests {
     fn test_server_config_debug() {
         let config = ServerConfig {
             jwt_secret: "test-secret".to_string(),
-            port: 8080,
+            port: 42780,
             database_url: "sqlite::memory:".to_string(),
         };
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("jwt_secret"));
-        assert!(debug_str.contains("8080"));
+        assert!(debug_str.contains("42780"));
     }
 
     #[test]
@@ -306,8 +306,8 @@ mod tests {
         std::env::set_var("PORT", "invalid");
 
         let config = load_config();
-        // Invalid port should fallback to 8080
-        assert_eq!(config.port, 8080);
+        // Invalid port should fallback to 42780
+        assert_eq!(config.port, 42780);
 
         clear_env();
     }
