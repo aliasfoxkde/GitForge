@@ -113,13 +113,13 @@ jobs:
           path: dist/
 
       - name: Display artifacts
-        run: ls -la dist/
+        run: |
+          find dist -type f -name "*.tar.gz" -o -name "SHA256SUMS" | head -20
 
       - name: Create checksums
         run: |
-          cd dist
-          sha256sum * > SHA256SUMS
-          cat SHA256SUMS
+          find dist -name "*.tar.gz" -exec sha256sum {} \; > dist/SHA256SUMS
+          cat dist/SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
