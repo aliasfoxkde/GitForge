@@ -114,19 +114,26 @@ jobs:
 
       - name: Display artifacts
         run: |
-          find dist -type f -name "*.tar.gz" -o -name "SHA256SUMS" | head -20
+          find dist -type f \( -name "*.tar.gz" -o -name "SHA256SUMS" \) | head -20
 
       - name: Create checksums
         run: |
           find dist -name "*.tar.gz" -exec sha256sum {} \; > dist/SHA256SUMS
           cat dist/SHA256SUMS
 
+      - name: Flatten artifacts for release
+        run: |
+          mkdir -p dist/release
+          cp dist/*/*.tar.gz dist/release/ 2>/dev/null || true
+          cp dist/SHA256SUMS dist/release/ 2>/dev/null || true
+          ls -la dist/release/
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           draft: false
           prerelease: false
-          files: dist/*
+          files: dist/release/*
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
