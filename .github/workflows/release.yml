@@ -46,6 +46,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Add targets
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
       - name: Build x86_64
         run: cargo build --release --target x86_64-apple-darwin --bin api --bin ci --bin git-server --bin runner
 
