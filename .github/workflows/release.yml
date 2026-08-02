@@ -5,11 +5,6 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version tag (e.g. v1.0.0)'
-        required: false
-        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -21,40 +16,43 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   build-linux:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+    container: xenial
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Install cross
-        run: cargo install cross --locked
-
-      - name: Build
+      - name: Install Rust
         run: |
-          cross build --release --target ${{ matrix.target }} \
-            --bin api --bin ci --bin git-server --bin runner
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          . "$HOME/.cargo/env"
+
+      - name: Add targets
+        run: |
+          . "$HOME/.cargo/env"
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - name: Build x86_64
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release --target x86_64-unknown-linux-musl --bin api --bin ci --bin git-server --bin runner
+
+      - name: Build aarch64
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release --target aarch64-unknown-linux-musl --bin api --bin ci --bin git-server --bin runner
 
       - name: Package
         run: |
           mkdir -p dist
-          if [[ "${{ matrix.target }}" == "aarch64"* ]]; then
-            ARCH="arm64"
-          else
-            ARCH="amd64"
-          fi
-          tar -czf dist/gitforge-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release \
-            api ci git-server runner
-          ls -la dist/
+          tar -czf dist/gitforge-x86_64-unknown-linux-musl.tar.gz \
+            -C target/x86_64-unknown-linux-musl/release api ci git-server runner
+          tar -czf dist/gitforge-aarch64-unknown-linux-musl.tar.gz \
+            -C target/aarch64-unknown-linux-musl/release api ci git-server runner
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gitforge-linux-${{ matrix.target }}
+          name: gitforge-linux
           path: dist/*
 
   # ─────────────────────────────────────────────────────────────────────────────
@@ -62,31 +60,26 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   build-macos:
     runs-on: macos-latest
-    strategy:
-      matrix:
-        target:
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Build
-        run: |
-          cargo build --release --target ${{ matrix.target }} \
-            --bin api --bin ci --bin git-server --bin runner
+      - name: Build x86_64
+        run: cargo build --release --target x86_64-apple-darwin --bin api --bin ci --bin git-server --bin runner
+
+      - name: Build arm64
+        run: cargo build --release --target aarch64-apple-darwin --bin api --bin ci --bin git-server --bin runner
 
       - name: Package
         run: |
           mkdir -p dist
-          tar -czf dist/gitforge-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release \
-            api ci git-server runner
+          tar -czf dist/gitforge-x86_64-apple-darwin.tar.gz -C target/x86_64-apple-darwin/release api ci git-server runner
+          tar -czf dist/gitforge-aarch64-apple-darwin.tar.gz -C target/aarch64-apple-darwin/release api ci git-server runner
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gitforge-macos-${{ matrix.target }}
+          name: gitforge-macos
           path: dist/*
 
   # ─────────────────────────────────────────────────────────────────────────────
@@ -94,10 +87,6 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
-    strategy:
-      matrix:
-        target:
-          - x86_64-pc-windows-gnu
     steps:
       - uses: actions/checkout@v7
         with:
@@ -105,21 +94,18 @@ jobs:
 
       - name: Build
         shell: bash
-        run: |
-          cargo build --release --target ${{ matrix.target }} \
-            --bin api --bin ci --bin git-server --bin runner
+        run: cargo build --release --target x86_64-pc-windows-gnu --bin api --bin ci --bin git-server --bin runner
 
       - name: Package
         shell: bash
         run: |
           mkdir -p dist
-          tar -czf dist/gitforge-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release \
-            api.exe ci.exe git-server.exe runner.exe
+          tar -czf dist/gitforge-x86_64-pc-windows-gnu.tar.gz \
+            -C target/x86_64-pc-windows-gnu/release api.exe ci.exe git-server.exe runner.exe
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gitforge-windows-${{ matrix.target }}
+          name: gitforge-windows
           path: dist/*
 
   # ─────────────────────────────────────────────────────────────────────────────
@@ -139,7 +125,6 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: gitforge-
           path: dist/
 
       - name: Display artifacts
