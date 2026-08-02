@@ -873,11 +873,13 @@ dependencies = [
  "gitforce-db",
  "gitforce-events",
  "gitforce-process",
+ "sha2",
  "tokio",
  "tower",
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

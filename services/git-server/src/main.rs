@@ -12,21 +12,22 @@ use axum::{
 };
 use gitforce_common::RepoId;
 use gitforce_core::git_protocol::{http::HttpGitHandler, GitProtocolHandler};
-use gitforce_core::{FileStorageBackend, RepoService};
+use gitforce_core::{FileStorageBackend, RepoService, StorageBackend};
 use gitforce_events::{EventBus, InMemoryEventBus};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tokio::time::timeout;
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 
 /// Application state shared across handlers
 #[derive(Clone)]
 struct AppState {
     http_handler: Arc<HttpGitHandler<FileStorageBackend>>,
-    #[allow(dead_code)]
-    repo_service: Arc<RepoService<FileStorageBackend>>,
+    storage: Arc<FileStorageBackend>,
 }
 
 #[tokio::main]
@@ -65,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     storage.ensure_root().await?;
 
     // Initialize repository service
-    let repo_service = Arc::new(RepoService::new((*storage).clone()));
+    let _repo_service = Arc::new(RepoService::new((*storage).clone()));
 
     // Initialize event bus
     let _event_bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
@@ -78,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     // Create app state
     let state = AppState {
         http_handler,
-        repo_service,
+        storage: storage.clone(),
     };
 
     // Build router for Git HTTP protocol
@@ -147,16 +148,35 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
+/// Derive a deterministic RepoId from owner/repo path
+fn derive_repo_id(owner: &str, repo: &str) -> RepoId {
+    // Create a deterministic ID based on the path
+    let input = format!("{}/{}", owner, repo);
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let result = hasher.finalize();
+    // Use first 16 bytes to create a Uuid, then convert to RepoId
+    let bytes: [u8; 16] = result[..16].try_into().unwrap();
+    let uuid = Uuid::from_bytes(bytes);
+    RepoId::from(uuid)
+}
+
 /// Git upload-pack handler (GET) - returns ref advertisement
 async fn git_upload_pack(
     Path((owner, repo)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> Response {
     let repo_path = format!("{}/{}", owner, repo);
+    let repo_id = derive_repo_id(&owner, &repo);
 
-    // Try to look up repo by name - for now, just use the path as repo_id
-    // In a full implementation, this would query the database
-    let repo_id = RepoId::new(); // Placeholder - needs proper lookup
+    // Check if repository exists
+    if !state.storage.exists(repo_id).await {
+        tracing::warn!("repository not found: {}", repo_path);
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from(format!("Repository not found: {}", repo_path)))
+            .unwrap();
+    }
 
     match state.http_handler.upload_pack(repo_id, vec![]).await {
         Ok(response) => {
@@ -177,8 +197,8 @@ async fn git_upload_pack(
         Err(e) => {
             tracing::warn!("upload-pack failed for {}: {}", repo_path, e);
             Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from(format!("Repository not found: {}", repo_path)))
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("Error: {}", e)))
                 .unwrap()
         }
     }
@@ -199,7 +219,16 @@ async fn git_receive_pack(
     request: Request<Body>,
 ) -> Response {
     let repo_path = format!("{}/{}", owner, repo);
-    let repo_id = RepoId::new(); // Placeholder - needs proper lookup
+    let repo_id = derive_repo_id(&owner, &repo);
+
+    // Check if repository exists
+    if !state.storage.exists(repo_id).await {
+        tracing::warn!("repository not found: {}", repo_path);
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from(format!("Repository not found: {}", repo_path)))
+            .unwrap();
+    }
 
     // Read request body
     let body = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
