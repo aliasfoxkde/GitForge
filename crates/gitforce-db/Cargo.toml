@@ -17,4 +17,4 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 
 # SQLite for MVP - embedded, no server needed
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json"] }
