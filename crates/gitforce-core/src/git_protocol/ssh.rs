@@ -55,7 +55,7 @@ impl<S: StorageBackend> GitProtocolHandler for SshGitHandler<S> {
 
         // Get HEAD
         if let Ok(reference) = repo.head() {
-            if let (Some(name), Some(target)) = (reference.name(), reference.target()) {
+            if let (Some(name), Some(target)) = (reference.name().ok(), reference.target()) {
                 let line = format!("{} {}\n", target, name);
                 response.extend_from_slice(&Self::format_pkt_line(&line));
             }
@@ -64,7 +64,7 @@ impl<S: StorageBackend> GitProtocolHandler for SshGitHandler<S> {
         // Get all refs
         if let Ok(refs) = repo.references() {
             for reference in refs.flatten() {
-                if let (Some(name), Some(target)) = (reference.name(), reference.target()) {
+                if let (Some(name), Some(target)) = (reference.name().ok(), reference.target()) {
                     if name.starts_with("refs/") && !name.contains("^{}") {
                         let line = format!("{} {}\n", target, name);
                         response.extend_from_slice(&Self::format_pkt_line(&line));
@@ -131,7 +131,7 @@ impl<S: StorageBackend> GitProtocolHandler for SshGitHandler<S> {
         let mut updated_refs = Vec::new();
         if let Ok(references) = repo.references() {
             for reference in references.flatten() {
-                if let Some(name) = reference.name() {
+                if let Ok(name) = reference.name() {
                     if name.starts_with("refs/") && !name.contains("^{}") {
                         updated_refs.push(name.to_string());
                     }

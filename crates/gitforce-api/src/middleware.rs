@@ -92,7 +92,6 @@ pub struct AuthenticatedUser {
     pub claims: Claims,
 }
 
-#[axum::async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for AuthenticatedUser {
     type Rejection = Response;
 

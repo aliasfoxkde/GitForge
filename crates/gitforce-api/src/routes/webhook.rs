@@ -39,7 +39,7 @@ pub struct WebhookTriggerResponse {
 
 /// Webhook routes
 pub fn webhook_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
-    Router::new().route("/webhook/trigger/:pipeline_id", post(trigger_pipeline))
+    Router::new().route("/webhook/trigger/{pipeline_id}", post(trigger_pipeline))
 }
 
 /// Helper to extract and validate user from headers

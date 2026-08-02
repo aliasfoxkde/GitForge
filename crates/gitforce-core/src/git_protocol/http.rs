@@ -57,7 +57,7 @@ impl<S: StorageBackend> HttpGitHandler<S> {
         // Get references from packed-refs and loose refs
         if let Ok(refs) = repo.references() {
             for reference in refs.flatten() {
-                if let (Some(name), Some(target)) = (reference.name(), reference.target()) {
+                if let (Some(name), Some(target)) = (reference.name().ok(), reference.target()) {
                     // Skip symbolic refs and HEAD (already handled)
                     if name.starts_with("refs/") && !name.contains("^{}") {
                         let ref_line = format!("{} {}\n", target, name);
@@ -155,7 +155,7 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
         let mut updated_refs = Vec::new();
         if let Ok(references) = repo.references() {
             for reference in references.flatten() {
-                if let Some(name) = reference.name() {
+                if let Ok(name) = reference.name() {
                     if name.starts_with("refs/") && !name.contains("^{}") {
                         updated_refs.push(name.to_string());
                     }
