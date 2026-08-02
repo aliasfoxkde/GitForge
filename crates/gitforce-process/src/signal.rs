@@ -3,6 +3,7 @@
 //! This module provides proper SIGCHLD handling to prevent zombie processes
 //! by actively reaping terminated child processes.
 
+#[cfg(target_os = "linux")]
 use libc::{waitpid, WEXITSTATUS, WIFEXITED, WIFSIGNALED, WNOHANG, WTERMSIG};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -15,10 +16,13 @@ static SIGCHLD_HANDLER_STARTED: AtomicBool = AtomicBool::new(false);
 /// This spawns a background thread that waits for child processes,
 /// preventing them from becoming zombies.
 ///
+/// On non-Linux platforms, this is a no-op since waitpid is not available.
+///
 /// # Example
 /// ```
 /// gitforce_process::install_sigchld_handler();
 /// ```
+#[cfg(target_os = "linux")]
 pub fn install_sigchld_handler() {
     if SIGCHLD_HANDLER_STARTED.swap(true, Ordering::SeqCst) {
         tracing::warn!("SIGCHLD handler already installed");
@@ -58,6 +62,15 @@ pub fn install_sigchld_handler() {
             thread::sleep(Duration::from_millis(100));
         }
     });
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn install_sigchld_handler() {
+    if SIGCHLD_HANDLER_STARTED.swap(true, Ordering::SeqCst) {
+        tracing::warn!("SIGCHLD handler already installed");
+        return;
+    }
+    tracing::debug!("SIGCHLD handler not available on this platform");
 }
 
 /// Check if the SIGCHLD handler is running
