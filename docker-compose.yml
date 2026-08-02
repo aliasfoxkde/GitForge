@@ -30,41 +30,23 @@ services:
       - gitforge
 
   # =============================================================================
-  # CI Orchestrator
+  # CI Orchestrator (includes Scheduler)
   # =============================================================================
   ci:
     build:
       context: .
       target: ci-prod
     container_name: gitforge-ci
+    ports:
+      - "42781:42781"
     volumes:
       - ci-data:/data
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - DATABASE_URL=sqlite:/data/gitforge.db
       - RUST_LOG=info
-      - SCHEDULER_URL=http://scheduler:42781
     depends_on:
-      - scheduler
       - git-server
-    networks:
-      - gitforge
-
-  # =============================================================================
-  # Job Scheduler
-  # =============================================================================
-  scheduler:
-    build:
-      context: .
-      target: ci-prod
-    container_name: gitforge-scheduler
-    ports:
-      - "42781:42781"
-    volumes:
-      - scheduler-data:/data
-    environment:
-      - DATABASE_URL=sqlite:/data/gitforge.db
-      - RUST_LOG=info
     networks:
       - gitforge
 
@@ -82,11 +64,11 @@ services:
       - runner-data:/data
     environment:
       - RUST_LOG=info
-      - SCHEDULER_URL=http://scheduler:42781
+      - SCHEDULER_URL=http://ci:42781
       - RUNNER_NAME=docker-runner-1
       - RUNNER_CAPACITY=4
     depends_on:
-      - scheduler
+      - ci
     networks:
       - gitforge
 
@@ -125,11 +107,11 @@ services:
       - runner2-data:/data
     environment:
       - RUST_LOG=info
-      - SCHEDULER_URL=http://scheduler:42781
+      - SCHEDULER_URL=http://ci:42781
       - RUNNER_NAME=docker-runner-2
       - RUNNER_CAPACITY=2
     depends_on:
-      - scheduler
+      - ci
     networks:
       - gitforge
     deploy:
@@ -142,8 +124,6 @@ volumes:
   api-data:
     driver: local
   ci-data:
-    driver: local
-  scheduler-data:
     driver: local
   runner-data:
     driver: local
