@@ -13,7 +13,7 @@ GitForge is a self-hosted Git platform with event-driven CI/CD capabilities. Thi
 │                    GitForge Services                      │
 ├─────────────┬─────────────┬─────────────┬───────────────┤
 │  git-server │     ci     │   runner    │      api      │
-│ (42022/42782)│ (Internal)│  (Internal) │  (Port 42780) │
+│ (42022/42782)│ (42781)   │  (Dynamic)  │  (Port 42780) │
 └─────────────┴─────────────┴─────────────┴───────────────┘
 ```
 
@@ -79,9 +79,9 @@ sudo ./target/release/git-server
 - SSH: 42022
 - HTTP: 42782
 
-### 3. CI Orchestrator
+### 3. CI Orchestrator (includes Scheduler)
 
-The CI orchestrator manages pipeline execution and job scheduling.
+The CI orchestrator manages pipeline execution and job scheduling. The scheduler HTTP API runs within this service on port 42781.
 
 ```bash
 # Development
@@ -94,7 +94,7 @@ cargo run -p ci
 **Responsibilities:**
 - Subscribes to push events from event bus
 - Triggers pipeline execution
-- Manages job queue via scheduler
+- Hosts scheduler HTTP API on port 42781
 - Assigns jobs to runners
 
 ### 4. Runner Agent
@@ -111,7 +111,7 @@ SCHEDULER_URL=http://localhost:42781 ./target/release/runner
 
 **Environment Variables:**
 - `RUNNER_NAME` - Runner name (default: runner)
-- `SCHEDULER_URL` - Scheduler URL (default: http://localhost:42781)
+- `SCHEDULER_URL` - Scheduler URL (default: http://localhost:42781, in docker: http://ci:42781)
 - `RUNNER_CAPACITY` - Concurrent job capacity (default: 2)
 - `HEARTBEAT_INTERVAL_SECS` - Heartbeat interval (default: 30)
 - `FETCH_INTERVAL_SECS` - Job fetch interval (default: 5)
@@ -124,6 +124,7 @@ docker-compose up -d
 
 # Check health
 curl http://localhost:42780/health
+curl http://localhost:42781/health  # CI/Scheduler
 
 # View logs
 docker-compose logs -f
@@ -224,7 +225,7 @@ url = "sqlite:/data/gitforge.db"
 jwt_secret = "your-secret-here"
 
 [runner]
-scheduler_url = "http://scheduler:42781"
+scheduler_url = "http://ci:42781"
 capacity = 4
 ```
 

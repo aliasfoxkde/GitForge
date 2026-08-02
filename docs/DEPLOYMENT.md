@@ -43,17 +43,14 @@ curl http://localhost:42780/health
 ### API Gateway (port 42780)
 REST API for GitForge. All client interaction goes through this service.
 
-### CI Orchestrator
-Processes pipeline events and orchestrates job execution.
-
-### Scheduler
-Manages job queue and runner assignment.
+### CI Orchestrator (port 42781)
+Processes pipeline events and orchestrates job execution. The scheduler HTTP API runs within this service.
 
 ### Runner
-Executes CI jobs in Docker containers. Multiple runners can be deployed horizontally.
+Executes CI jobs in Docker containers. Multiple runners can be deployed horizontally. Connects to CI service at `http://ci:42781`.
 
-### Git Server
-Handles Git SSH and HTTP protocols.
+### Git Server (ports 42782 HTTP, 42022 SSH)
+Handles Git SSH and HTTP protocols. SSH support is pending implementation.
 
 ## Configuration
 

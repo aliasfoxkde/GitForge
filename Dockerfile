@@ -68,14 +68,13 @@ RUN chown -R gitforge:gitforge /app
 USER gitforge
 
 # Expose port
-EXPOSE 8080
+EXPOSE 42780
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD curl -f http://localhost:42780/health || exit 1
 
 ENTRYPOINT ["/app/api"]
-CMD ["--host", "0.0.0.0", "--port", "8080"]
 
 # =============================================================================
 # Production stage - CI service
@@ -100,6 +99,8 @@ COPY --from=builder /app/target/release/ci /app/ci
 RUN chown -R gitforge:gitforge /app
 
 USER gitforge
+
+EXPOSE 42781
 
 ENTRYPOINT ["/app/ci"]
 
@@ -160,6 +161,6 @@ RUN chown -R gitforge:gitforge /home/gitforge
 
 USER gitforge
 
-EXPOSE 2222
+EXPOSE 42022 42782
 
 ENTRYPOINT ["/app/git-server"]

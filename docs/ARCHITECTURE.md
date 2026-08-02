@@ -54,9 +54,9 @@ GitForge is a self-hosted Git platform with CI/CD capabilities, built in Rust. I
 | Service | Port | Purpose |
 |---------|------|---------|
 | `api` | 42780 | REST API gateway |
-| `ci` | - | CI orchestration |
-| `git-server` | 42022 (SSH), 42782 (HTTP) | Git hosting |
-| `runner` | - | Job execution |
+| `ci` | 42781 | CI orchestration + Scheduler HTTP API |
+| `git-server` | 42782 (HTTP), 42022 (SSH placeholder) | Git hosting |
+| `runner` | - | Job execution agent |
 
 ## Data Flow
 
