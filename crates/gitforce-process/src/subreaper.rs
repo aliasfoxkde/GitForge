@@ -4,7 +4,9 @@
 //! This prevents zombie processes from accumulating when child processes
 //! terminate but are not explicitly waited on.
 
+#[cfg(target_os = "linux")]
 use libc::prctl;
+#[cfg(target_os = "linux")]
 use libc::PR_SET_CHILD_SUBREAPER;
 use std::io::Result;
 
@@ -14,10 +16,13 @@ use std::io::Result;
 /// responsible for reaping them. Without this, orphaned children can become
 /// zombies that are never reaped.
 ///
+/// On non-Linux platforms, this is a no-op since prctl is not available.
+///
 /// # Example
 /// ```
 /// gitforce_process::become_subreaper().expect("failed to become subreaper");
 /// ```
+#[cfg(target_os = "linux")]
 pub fn become_subreaper() -> Result<()> {
     unsafe {
         if prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0 {
@@ -25,6 +30,12 @@ pub fn become_subreaper() -> Result<()> {
         }
     }
     tracing::info!("process configured as subreaper");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn become_subreaper() -> Result<()> {
+    tracing::debug!("subreaper not available on this platform");
     Ok(())
 }
 
