@@ -15,37 +15,149 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  GO_VERSION: '1.24'
-  GORELEASER_VERSION: 'v2.3.2'
-
 jobs:
-  release:
-    if: github.repository_owner == 'aliasfoxkde'  # Canonical repo only
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Linux build
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-linux:
     runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      contents: write
-      id-token: write
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
+      - name: Install cross
+        run: cargo install cross --locked
 
-      - name: Install GoReleaser
-        uses: goreleaser/goreleaser-action@v7
+      - name: Build
+        run: |
+          cross build --release --target ${{ matrix.target }} \
+            --bin api --bin ci --bin git-server --bin runner
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          if [[ "${{ matrix.target }}" == "aarch64"* ]]; then
+            ARCH="arm64"
+          else
+            ARCH="amd64"
+          fi
+          tar -czf dist/gitforge-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release \
+            api ci git-server runner
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
         with:
-          version: ${{ env.GORELEASER_VERSION }}
-          args: release --clean
+          name: gitforge-linux-${{ matrix.target }}
+          path: dist/*
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # macOS build
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            --bin api --bin ci --bin git-server --bin runner
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf dist/gitforge-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release \
+            api ci git-server runner
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitforge-macos-${{ matrix.target }}
+          path: dist/*
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Windows build
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            --bin api --bin ci --bin git-server --bin runner
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf dist/gitforge-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release \
+            api.exe ci.exe git-server.exe runner.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitforge-windows-${{ matrix.target }}
+          path: dist/*
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Create Release
+  # ─────────────────────────────────────────────────────────────────────────────
+  release:
+    needs: [build-linux, build-macos, build-windows]
+    if: github.repository_owner == 'aliasfoxkde'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+        pattern: gitforge-*
+        merge-multiple: true
+
+      - name: Display artifacts
+        run: ls -la dist/
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          draft: false
+          prerelease: false
+          files: dist/*
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create release artifacts (SNAPSHOT)
-        if: github.event.inputs.version == ''
-        run: |
-          goreleaser build --clean --snapshot --output dist/
