@@ -7,7 +7,7 @@ edition = "2021"
 tokio = { version = "1", features = ["rt", "sync", "time", "io-util", "process"] }
 tracing = "0.1"
 libc = "0.2"
-thiserror = "1"
+thiserror = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"
