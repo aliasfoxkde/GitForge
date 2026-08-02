@@ -355,6 +355,7 @@ name = "ci"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "futures",
  "gitforce-ci",
  "gitforce-common",
@@ -363,6 +364,8 @@ dependencies = [
  "gitforce-process",
  "gitforce-scheduler",
  "tokio",
+ "tower",
+ "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
 ]
@@ -863,12 +866,16 @@ name = "git-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "futures",
  "gitforce-common",
  "gitforce-core",
  "gitforce-db",
  "gitforce-events",
  "gitforce-process",
  "tokio",
+ "tower",
+ "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
 ]

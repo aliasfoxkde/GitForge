@@ -2,6 +2,7 @@
 //!
 //! Main entry point for the CI orchestration service.
 
+use axum::Router;
 use futures::StreamExt;
 use gitforce_ci::{
     CiEngine, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
@@ -9,13 +10,14 @@ use gitforce_ci::{
 use gitforce_events::{
     EventBus, EventEnvelope, EventFilter, EventPayload, EventType, InMemoryEventBus,
 };
-use gitforce_scheduler::Scheduler;
+use gitforce_scheduler::{create_state, scheduler_routes, Scheduler};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tokio::time::timeout;
+use tower_http::trace::TraceLayer;
 
 type PipelineCache = HashMap<gitforce_common::RepoId, PipelineDefinition>;
 
@@ -40,7 +42,34 @@ async fn main() -> anyhow::Result<()> {
     let event_bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
 
     // Initialize scheduler
-    let scheduler = Arc::new(Scheduler::new());
+    let scheduler = Scheduler::new();
+
+    // Start scheduler HTTP API server on port 42781
+    let scheduler_port: u16 = std::env::var("SCHEDULER_PORT")
+        .unwrap_or_else(|_| "42781".to_string())
+        .parse()
+        .unwrap_or(42781);
+
+    // Create scheduler state for HTTP server (consumes scheduler)
+    let scheduler_state = create_state(scheduler);
+    let scheduler_arc = scheduler_state.scheduler.clone();
+
+    let scheduler_app = Router::new()
+        .route("/health", axum::routing::get(health_check))
+        .merge(scheduler_routes(scheduler_state))
+        .layer(TraceLayer::new_for_http());
+
+    let scheduler_addr = format!("0.0.0.0:{}", scheduler_port);
+    tracing::info!("starting Scheduler HTTP API on {}", scheduler_addr);
+
+    let scheduler_listener = tokio::net::TcpListener::bind(&scheduler_addr).await?;
+    let scheduler_handle = tokio::spawn(async move {
+        axum::serve(scheduler_listener, scheduler_app)
+            .await
+            .unwrap();
+    });
+
+    tracing::info!("Scheduler HTTP API listening on {}", scheduler_addr);
 
     // Pipeline definitions cache
     let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
@@ -48,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Clone for event consumer
     let event_bus_clone = event_bus.clone();
-    let scheduler_clone = scheduler.clone();
+    let scheduler_clone = scheduler_arc.clone();
     let pipeline_cache_clone = pipeline_cache.clone();
 
     // Shared shutdown flag
@@ -74,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start scheduler loop
-    let scheduler_clone = scheduler.clone();
+    let scheduler_clone = scheduler_arc.clone();
     let shutdown_scheduler = shutdown.clone();
     let _scheduler_handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
@@ -98,6 +127,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("shutting down CI Orchestrator");
 
+    // Cancel scheduler HTTP server
+    scheduler_handle.abort();
+
     // Wait for in-flight work to complete (with timeout)
     graceful_shutdown_delay().await;
 
@@ -108,6 +140,11 @@ async fn main() -> anyhow::Result<()> {
 /// Create a shutdown flag
 pub fn create_shutdown_flag() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
+}
+
+/// Health check for scheduler HTTP API
+async fn health_check() -> &'static str {
+    "OK"
 }
 
 /// Spawn the shutdown signal handler (Unix-only)
