@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
-  # Linux build
+  # Linux build (x86_64 only - cross-compilation not available)
   # ─────────────────────────────────────────────────────────────────────────────
   build-linux:
     runs-on: ubuntu-latest
@@ -21,25 +21,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Add targets
+      - name: Build
         run: |
-          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
-
-      - name: Build x86_64
-        run: |
-          cargo build --release --target x86_64-unknown-linux-gnu --bin api --bin ci --bin git-server --bin runner
-
-      - name: Build aarch64
-        run: |
-          cargo build --release --target aarch64-unknown-linux-gnu --bin api --bin ci --bin git-server --bin runner
+          cargo build --release --bin api --bin ci --bin git-server --bin runner
 
       - name: Package
         run: |
           mkdir -p dist
           tar -czf dist/gitforge-x86_64-unknown-linux-gnu.tar.gz \
-            -C target/x86_64-unknown-linux-gnu/release api ci git-server runner
-          tar -czf dist/gitforge-aarch64-unknown-linux-gnu.tar.gz \
-            -C target/aarch64-unknown-linux-gnu/release api ci git-server runner
+            -C target/release api ci git-server runner
 
       - uses: actions/upload-artifact@v4
         with:
@@ -47,7 +37,7 @@ jobs:
           path: dist/*
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # macOS build
+  # macOS build (both x86_64 and arm64)
   # ─────────────────────────────────────────────────────────────────────────────
   build-macos:
     runs-on: macos-latest
