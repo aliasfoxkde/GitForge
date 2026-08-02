@@ -101,17 +101,19 @@ async fn main() -> anyhow::Result<()> {
     let http_addr = format!("0.0.0.0:{}", http_port);
     tracing::info!("starting Git HTTP server on {}", http_addr);
 
-    let listener = tokio::net::TcpListener::bind(&http_addr).await?;
+    let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
     tracing::info!("Git HTTP server listening on {}", http_addr);
 
     // Spawn HTTP server
     let http_handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(http_listener, app).await.unwrap();
     });
 
-    // SSH server placeholder
+    // SSH server
+    // Note: SSH Git protocol requires russh integration which has API compatibility issues
+    // with the current crate version. SSH Git support is planned for a future release.
     tracing::info!(
-        "Git SSH server on port {} (SSH daemon not yet implemented)",
+        "Git SSH server on port {} (SSH support pending russh API resolution)",
         ssh_port
     );
 
