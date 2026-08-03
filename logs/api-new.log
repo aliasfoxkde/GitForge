@@ -1,9 +1,0 @@
-[2m2026-07-21T02:11:13.715035Z[0m [32m INFO[0m [2mapi[0m[2m:[0m starting GitForce API Gateway
-[2m2026-07-21T02:11:13.715099Z[0m [32m INFO[0m [2mapi[0m[2m:[0m connecting to database: sqlite:///nas/Temp/repos/GitForge/data/gitforge.db?mode=rwc
-[2m2026-07-21T02:11:13.717258Z[0m [32m INFO[0m [2mgitforce_db::connection[0m[2m:[0m database migrations completed successfully
-[2m2026-07-21T02:11:13.717284Z[0m [32m INFO[0m [2mapi[0m[2m:[0m database connection established
-[2m2026-07-21T02:11:13.717623Z[0m [32m INFO[0m [2mapi[0m[2m:[0m API Gateway listening on port 8080
-[2m2026-07-21T02:11:13.717638Z[0m [32m INFO[0m [2mgitforce_api::server[0m[2m:[0m API server listening on 0.0.0.0:8080
-[2m2026-07-21T02:11:13.717649Z[0m [32m INFO[0m [2mgitforce_api::server[0m[2m:[0m Swagger UI available at /swagger-ui
-[2m2026-07-21T02:11:13.717660Z[0m [32m INFO[0m [2mgitforce_api::server[0m[2m:[0m OpenAPI spec at /api-docs/openapi.json
-[2m2026-07-21T02:11:13.717671Z[0m [32m INFO[0m [2mgitforce_api::server[0m[2m:[0m Metrics available at /metrics
