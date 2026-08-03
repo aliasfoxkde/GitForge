@@ -31,6 +31,12 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           queries: security-extended
+          # Exclude test files and template scaffolding from analysis
+          config: |
+            paths-ignore:
+              - '**/*_test.go'
+              - '**/*_test.rs'
+              - 'template-parts/**'
 
       - name: Autobuild
         uses: github/codeql-action/autobuild@v3
