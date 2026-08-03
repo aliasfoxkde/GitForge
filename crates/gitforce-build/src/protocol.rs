@@ -296,4 +296,92 @@ mod tests {
         let decoded = decode_request(&encoded).unwrap();
         assert!(matches!(decoded, Request::Submit { cargo_args, .. } if cargo_args.is_empty()));
     }
+
+    #[test]
+    fn test_decode_request_incomplete_message() {
+        // Create a message that claims to have 100 bytes but only has 4 + 10
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&100u32.to_le_bytes()); // claims 100 bytes
+        bytes.extend_from_slice(&[0u8; 10]); // only 10 bytes of payload
+        let result = decode_request(&bytes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("incomplete"));
+    }
+
+    #[test]
+    fn test_decode_response_incomplete_message() {
+        // Create a message that claims to have 100 bytes but only has 4 + 10
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 10]);
+        let result = decode_response(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_request_message_too_large() {
+        // Create a message that exceeds MAX_MESSAGE_SIZE
+        let large_len = (MAX_MESSAGE_SIZE + 1) as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&large_len.to_le_bytes());
+        bytes.extend_from_slice(&vec![0u8; MAX_MESSAGE_SIZE + 1]);
+        let result = decode_request(&bytes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too large"));
+    }
+
+    #[test]
+    fn test_decode_response_message_too_large() {
+        let large_len = (MAX_MESSAGE_SIZE + 1) as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&large_len.to_le_bytes());
+        bytes.extend_from_slice(&vec![0u8; MAX_MESSAGE_SIZE + 1]);
+        let result = decode_response(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_request_serde_roundtrip() {
+        // Test Submit with all fields
+        let req = Request::Submit {
+            cargo_args: vec!["build".to_string(), "--release".to_string()],
+            working_dir: Some("/test/dir".to_string()),
+        };
+        let encoded = encode_request(&req).unwrap();
+        let decoded: Request = serde_json::from_slice(&encoded[4..]).unwrap();
+        assert!(matches!(decoded, Request::Submit { .. }));
+    }
+
+    #[test]
+    fn test_response_serde_roundtrip() {
+        let resp = Response::Completed {
+            job_id: "job-abc".to_string(),
+            success: true,
+            exit_code: 0,
+            duration_ms: 5000,
+            stdout: "test output".to_string(),
+            stderr: "".to_string(),
+        };
+        let encoded = encode_response(&resp).unwrap();
+        let decoded: Response = serde_json::from_slice(&encoded[4..]).unwrap();
+        assert!(matches!(decoded, Response::Completed { .. }));
+    }
+
+    #[test]
+    fn test_job_info_serde() {
+        let job = JobInfo {
+            job_id: "job-123".to_string(),
+            status: "running".to_string(),
+            cargo_args: vec!["test".to_string()],
+            wait_time_ms: 100,
+        };
+        let json = serde_json::to_string(&job).unwrap();
+        let decoded: JobInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.job_id, "job-123");
+    }
+
+    #[test]
+    fn test_max_message_size_constant() {
+        assert_eq!(MAX_MESSAGE_SIZE, 64 * 1024);
+    }
 }

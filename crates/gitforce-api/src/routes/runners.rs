@@ -500,4 +500,75 @@ mod tests {
         assert!(debug_str.contains("runner-debug"));
         assert!(debug_str.contains("debug-runner"));
     }
+
+    #[test]
+    fn test_runner_response_id_various_formats() {
+        // Test various ID formats
+        let ids = vec![
+            "simple",
+            "with-dashes",
+            "with_underscores",
+            "with.dots",
+            "UPPERCASE",
+            "MixedCase123",
+        ];
+        for id in ids {
+            let response = RunnerResponse {
+                id: id.to_string(),
+                name: "test".to_string(),
+                runner_type: "docker".to_string(),
+                status: "online".to_string(),
+                capacity: 1,
+                last_heartbeat: None,
+            };
+            assert_eq!(response.id, id);
+        }
+    }
+
+    #[test]
+    fn test_runner_response_name_with_spaces() {
+        let response = RunnerResponse {
+            id: "runner-1".to_string(),
+            name: "My Docker Runner".to_string(),
+            runner_type: "docker".to_string(),
+            status: "online".to_string(),
+            capacity: 2,
+            last_heartbeat: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("My Docker Runner"));
+    }
+
+    #[test]
+    fn test_extract_user_with_bearer_prefix_only() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_user_with_empty_bearer_token() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer ".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_user_with_wrong_auth_scheme() {
+        use crate::auth::ApiAuth;
+
+        let auth = ApiAuth::new("test-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Digest username".parse().unwrap());
+        let result = extract_user(&auth, &headers);
+        assert!(result.is_err());
+    }
 }
