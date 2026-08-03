@@ -52,5 +52,9 @@ temp/data/
 *.log
 data/
 
+# ─── Environment ───────────────────────────────────────────────────────────────
+.env
+.cargo/
+
 # NOTE: Cargo.lock is committed to support security audits and reproducible builds
 # across multiple developers and CI environments for this multi-platform binary.
