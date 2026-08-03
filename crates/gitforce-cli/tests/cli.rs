@@ -200,7 +200,13 @@ fn test_cli_repo_delete() {
 
 #[test]
 fn test_cli_repo_clone() {
-    let cli = TestCli::try_parse_from(["gitforge", "repo", "--clone", "git@github.com:user/repo.git"]).unwrap();
+    let cli = TestCli::try_parse_from([
+        "gitforge",
+        "repo",
+        "--clone",
+        "git@github.com:user/repo.git",
+    ])
+    .unwrap();
     match cli.command {
         TestCommands::Repo { clone, .. } => {
             assert_eq!(clone, Some("git@github.com:user/repo.git".to_string()));
@@ -277,7 +283,8 @@ fn test_cli_pipeline_create() {
 
 #[test]
 fn test_cli_pipeline_delete() {
-    let cli = TestCli::try_parse_from(["gitforge", "pipeline", "--delete", "old-pipeline"]).unwrap();
+    let cli =
+        TestCli::try_parse_from(["gitforge", "pipeline", "--delete", "old-pipeline"]).unwrap();
     match cli.command {
         TestCommands::Pipeline { delete, .. } => {
             assert_eq!(delete, Some("old-pipeline".to_string()));
@@ -320,7 +327,9 @@ fn test_cli_runner_register_with_capacity() {
     ])
     .unwrap();
     match cli.command {
-        TestCommands::Runner { register, capacity, .. } => {
+        TestCommands::Runner {
+            register, capacity, ..
+        } => {
             assert_eq!(register, Some("big-runner".to_string()));
             assert_eq!(capacity, Some(8));
         }
@@ -341,7 +350,8 @@ fn test_cli_runner_info() {
 
 #[test]
 fn test_cli_runner_deregister() {
-    let cli = TestCli::try_parse_from(["gitforge", "runner", "--deregister", "runner-old"]).unwrap();
+    let cli =
+        TestCli::try_parse_from(["gitforge", "runner", "--deregister", "runner-old"]).unwrap();
     match cli.command {
         TestCommands::Runner { deregister, .. } => {
             assert_eq!(deregister, Some("runner-old".to_string()));
@@ -407,7 +417,9 @@ fn test_cli_git_init() {
 
 #[test]
 fn test_cli_git_clone() {
-    let cli = TestCli::try_parse_from(["gitforge", "git", "--clone", "git@github.com:user/repo.git"]).unwrap();
+    let cli =
+        TestCli::try_parse_from(["gitforge", "git", "--clone", "git@github.com:user/repo.git"])
+            .unwrap();
     match cli.command {
         TestCommands::Git { clone, .. } => {
             assert_eq!(clone, Some("git@github.com:user/repo.git".to_string()));
