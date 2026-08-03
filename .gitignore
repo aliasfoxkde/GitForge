@@ -38,5 +38,18 @@ template-parts/rust/target/
 
 # ─── Rust ─────────────────────────────────────────────────────────────────────
 target/
+
+# ─── Coverage & Profiling ───────────────────────────────────────────────────────────
+tarpaulin-report.*
+*.profraw
+
+# ─── Logs ───────────────────────────────────────────────────────────────────────
+temp/logs/
+*.log
+
+# ─── Runtime Data ──────────────────────────────────────────────────────────────
+data/
+temp/
+
 # NOTE: Cargo.lock is committed to support security audits and reproducible builds
 # across multiple developers and CI environments for this multi-platform binary.
