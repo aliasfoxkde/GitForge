@@ -1,0 +1,135 @@
+name: Release Rust
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 0.1.0)'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─── Build Linux x86_64 ──────────────────────────────────────────────────
+  build-linux:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --bin gitforge
+
+      - name: Package
+        run: |
+          tar -czf gitforge-linux-x86_64.tar.gz -C target/release gitforge
+          ls -la gitforge-linux-x86_64.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitforge-linux-x86_64
+          path: gitforge-linux-x86_64.tar.gz
+
+  # ─── Build Windows x86_64 ─────────────────────────────────────────────────
+  build-windows:
+    name: Build Windows x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build
+        run: cross build --release --target x86_64-pc-windows-gnu --bin gitforge
+
+      - name: Package
+        run: |
+          cd target/x86_64-pc-windows-gnu/release
+          zip gitforge-windows-x86_64.zip gitforge.exe
+          ls -la gitforge-windows-x86_64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitforge-windows-x86_64
+          path: target/x86_64-pc-windows-gnu/release/gitforge-windows-x86_64.zip
+
+  # ─── Build macOS x86_64 + ARM64 ──────────────────────────────────────────
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --bin gitforge
+
+      - name: Package
+        run: |
+          target_dir=target/${{ matrix.target }}/release
+          tar -czf gitforge-macos-${{ matrix.target }}.tar.gz -C ${target_dir} gitforge
+          ls -la gitforge-macos-${{ matrix.target }}.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitforge-macos-${{ matrix.target }}
+          path: gitforge-macos-${{ matrix.target }}.tar.gz
+
+  # ─── Create Release ────────────────────────────────────────────────────────
+  release:
+    name: Create Release
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: ls -laR artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

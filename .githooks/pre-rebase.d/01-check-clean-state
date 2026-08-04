@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# Dark Factory Clean State Pre-rebase Hook
+#
+# Blocks rebase if:
+#   - Uncommitted changes in working tree
+#   - Stashed changes exist
+#
+# Usage: Add to .githooks/pre-rebase
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+cd "$REPO_ROOT"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+ERROR() { echo -e "${RED}[clean-state]${NC} $*"; }
+WARN() { echo -e "${YELLOW}[clean-state]${NC} $*"; }
+INFO() { echo -e "${GREEN}[clean-state]${NC} $*"; }
+
+show_help() {
+    cat << 'EOF'
+Dark Factory Clean State Pre-rebase Hook
+
+Blocks rebase if:
+  - Uncommitted changes in working tree
+  - Stashed changes exist
+
+Before rebasing, you must either:
+  1. Commit your changes: git add -A && git commit -m "..."
+  2. Stash them: git stash
+
+Exit codes:
+  0 - Clean state, rebase may proceed
+  1 - Dirty state, rebase blocked
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) show_help; exit 0 ;;
+    esac
+done
+
+BLOCKED=0
+
+# ─── 1. Uncommitted changes check ─────────────────────────────────────────────
+if ! command -v git &>/dev/null; then
+    INFO "Git not available — skipping clean state check"
+    exit 0
+fi
+
+if ! git rev-parse --git-dir &>/dev/null 2>&1; then
+    INFO "Not in a git repo — skipping clean state check"
+    exit 0
+fi
+
+# Check for uncommitted changes (working tree + staged)
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    ERROR "UNCOMMITTED CHANGES: You have uncommitted changes in your working tree"
+    echo ""
+    git status --short 2>/dev/null | head -20
+    echo ""
+    ERROR "Cannot rebase with uncommitted changes."
+    echo ""
+    INFO "To proceed, either:"
+    echo "  1. Commit: git add -A && git commit -m 'WIP: ...'"
+    echo "  2. Stash:  git stash"
+    BLOCKED=1
+fi
+
+# ─── 2. Stashed changes check ─────────────────────────────────────────────────
+local stash_count
+stash_count=$(git stash list 2>/dev/null | wc -l || echo 0)
+if [ "$stash_count" -gt 0 ]; then
+    ERROR "STASHED CHANGES: You have $stash_count stash(es) saved"
+    echo ""
+    git stash list 2>/dev/null
+    echo ""
+    WARN "Rebasing will not lose your stashes, but it's better to be organized."
+    WARN "Consider creating a branch from your current work instead:"
+    echo "  git checkout -b backup/my-work && git rebase $1"
+    echo ""
+    WARN "Stashes are NOT automatically dropped by rebase, but they can become orphaned."
+    BLOCKED=1
+fi
+
+# ─── Result ───────────────────────────────────────────────────────────────────
+if [ "$BLOCKED" -eq 1 ]; then
+    echo ""
+    ERROR "Clean state check blocked rebase. Fix the above issues first."
+    exit 1
+fi
+
+INFO "Clean state verified — rebase may proceed"
+exit 0

@@ -1,0 +1,17 @@
+//! GitForce CI Orchestrator
+//!
+//! Pipeline parsing, DAG building, and job execution orchestration.
+
+pub mod dag;
+pub mod engine;
+pub mod executor;
+pub mod pipeline;
+pub mod state;
+
+pub use dag::{DagBuilder, JobGraph, JobNode};
+pub use engine::CiEngine;
+pub use executor::PipelineExecutor;
+pub use pipeline::{
+    JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
+};
+pub use state::JobStateMachine;

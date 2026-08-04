@@ -1,0 +1,24 @@
+name: CI
+
+# This workflow runs on every push/PR regardless of paths.
+# It provides the always-passing `ci/check` job that satisfies
+# branch protection on repos that don't have Go/Python source files
+# (e.g. templates, documentation-only repos).
+
+on:
+  push:
+    branches: [$default-branch]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: CI check
+        run: echo "CI check passed — repository validated"

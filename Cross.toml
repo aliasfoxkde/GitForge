@@ -1,0 +1,28 @@
+# Cross.toml - Cross-compilation configuration for GitForge
+# See: https://github.com/cross-rs/cross
+#
+# macOS cross-compilation options:
+# 1. Use GitHub Actions macOS runners (recommended for releases)
+# 2. Use Zig with cargo-zigbuild (fast, works from Linux)
+# 3. Use osxcross (requires manual Apple SDK setup)
+# 4. Build on macOS hardware directly
+
+[target.x86_64-unknown-linux-musl]
+image = "x86_64-unknown-linux-musl:cross"
+
+[target.aarch64-unknown-linux-musl]
+image = "aarch64-unknown-linux-musl:cross"
+
+# macOS targets using osxcross-based image
+# Requires Apple SDK which must be obtained legally from Apple
+[target.x86_64-apple-darwin]
+image = "ghcr.io/messense/cross:arm64-linux-android"
+
+[target.aarch64-apple-darwin]
+image = "ghcr.io/messense/cross:arm64-linux-android"
+
+[target.x86_64-pc-windows-gnu]
+image = "ghcr.io/cross-rs/x86_64-pc-windows-gnu:0.2.5"
+
+[target.aarch64-pc-windows-gnu]
+image = "ghcr.io/cross-rs/aarch64-pc-windows-gnu:0.2.5"

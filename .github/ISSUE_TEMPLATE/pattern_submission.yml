@@ -1,0 +1,90 @@
+name: Pattern Submission
+description: Submit a new detection pattern for review
+title: "pattern: "
+labels: ["pattern", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Pattern Submission
+
+        Thank you for contributing a pattern! Please fill out as much as possible.
+
+        Patterns are defined in YAML. See the [Pattern Format docs](https://github.com/aliasfoxkde/dark-factory/wiki/PATTERN_DEVELOPMENT) for the schema.
+
+  - type: input
+    id: pattern_name
+    attributes:
+      label: Pattern name
+      description: Unique name for this pattern (kebab-case)
+      placeholder: "my-secret-pattern"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - secrets
+        - quality
+        - best-practice
+        - configuration
+        - credentials
+        - api-key
+        - authentication
+        - infrastructure
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What does this pattern detect?
+      placeholder: Detects AWS access keys in the format AKIA...
+    validations:
+      required: true
+
+  - type: textarea
+    id: match_pattern
+    attributes:
+      label: Match pattern (regex)
+      description: RE2-compatible regex pattern
+      placeholder: |
+        match:
+          type: regex
+          pattern: "AKIA[0-9A-Z]{16}"
+    validations:
+      required: true
+
+  - type: textarea
+    id: true_positives
+    attributes:
+      label: True positives (examples that should match)
+      description: Example strings that should trigger this pattern
+      placeholder: |
+        - AKIAIOSFODNN7EXAMPLE
+        - AKIA1234567890ABCDEF
+    validations:
+      required: false
+
+  - type: textarea
+    id: false_positives
+    attributes:
+      label: Known false positives (examples that should NOT match)
+      description: Known strings that trigger this pattern but are not secrets
+      placeholder: |
+        - Test fixtures with AKIA prefix
+        - Example keys in documentation
+    validations:
+      required: false
+
+  - type: checkbox
+    id: enable_default
+    attributes:
+      label: Enable by default
+      description: Should this pattern be enabled by default in the bundle?
+      options:
+        - label: "Yes — enable in default bundle"
+          required: false

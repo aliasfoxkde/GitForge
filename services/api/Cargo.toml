@@ -1,0 +1,21 @@
+[package]
+name = "api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "api"
+path = "src/main.rs"
+
+[dependencies]
+gitforce-common = { path = "../../crates/gitforce-common" }
+gitforce-db = { path = "../../crates/gitforce-db" }
+gitforce-events = { path = "../../crates/gitforce-events" }
+gitforce-api = { path = "../../crates/gitforce-api" }
+gitforce-process = { path = "../../crates/gitforce-process" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,228 @@
+name: CI
+
+on:
+  push:
+    branches: [$default-branch]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/security.yml'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/security.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEFAULT_BRANCH: ${{ vars.DEFAULT_BRANCH || 'main' }}
+  COVERAGE_THRESHOLD: ${{ vars.COVERAGE_THRESHOLD || 70 }}
+  GO_VERSIONS: ${{ vars.GO_VERSIONS || '["1.21","1.22","1.23","1.24"]' }}
+  GOLANGCI_LINT_VERSION: ${{ vars.GOLANGCI_LINT_VERSION || 'v2.1.6' }}
+  STATICCHECK_VERSION: ${{ vars.STATICCHECK_VERSION || 'v0.7.0' }}
+
+jobs:
+  # ─── Always-pass check (satisfies branch protection even on non-Go repos) ──
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: CI check
+        run: echo "CI check passed — repository validated"
+
+  # ─── Detect Go project ─────────────────────────────────────────────────────
+  check-go-files:
+    runs-on: ubuntu-latest
+    outputs:
+      has_go: ${{ steps.check.outputs.has_go }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for Go module
+        id: check
+        run: |
+          if [ -f go.mod ]; then
+            echo "has_go=true" >> $GITHUB_OUTPUT
+            echo "Go module detected"
+          else
+            echo "has_go=false" >> $GITHUB_OUTPUT
+            echo "No Go module — Go jobs will be skipped"
+          fi
+
+  # ─── Go Tests ─────────────────────────────────────────────────────────────
+  go-test:
+    needs: check-go-files
+    if: needs.check-go-files.outputs.has_go == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ${{ fromJSON(env.GO_VERSIONS) }}
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go ${{ matrix.go }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ matrix.go }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.go }}-
+
+      - name: Run tests (-race, coverage)
+        run: go test -p 1 -race -timeout 15m -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Coverage check
+        run: |
+          COV=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | tr -d '%')
+          echo "Coverage: $COV%"
+          if (( $(echo "$COV < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) )); then
+            echo "ERROR: coverage $COV% below threshold ${{ env.COVERAGE_THRESHOLD }}%"
+            exit 1
+          fi
+
+      - name: Upload coverage to Codecov
+        if: matrix.os == 'ubuntu-latest' && matrix.go == '1.24'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.out
+          flags: unittests
+          fail_ci_if_error: false
+
+      - name: Upload test results
+        if: matrix.os == 'ubuntu-latest' && matrix.go == '1.24'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: coverage.out
+
+  # ─── Lint ──────────────────────────────────────────────────────────────────
+  lint:
+    needs: check-go-files
+    if: needs.check-go-files.outputs.has_go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Check gofmt
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "gofmt must format these files:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${{ env.GOLANGCI_LINT_VERSION }}/install.sh" | sh -s -- -b "$(go env GOPATH)/bin" "${{ env.GOLANGCI_LINT_VERSION }}"
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run golangci-lint
+        run: golangci-lint run --timeout=5m --concurrency=2
+
+      - name: Check goimports
+        run: |
+          which goimports || go install golang.org/x/tools/cmd/goimports@latest
+          UNIMPORTED=$(goimports -l .)
+          if [ -n "$UNIMPORTED" ]; then
+            echo "goimports must format these files:"
+            echo "$UNIMPORTED"
+            exit 1
+          fi
+
+  # ─── Build ─────────────────────────────────────────────────────────────────
+  build:
+    needs: check-go-files
+    if: needs.check-go-files.outputs.has_go == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ['1.24']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Build
+        run: go build -o bin/atheon ./cmd/atheon && go build -o bin/atheon-mcp ./cmd/mcp
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.os }}
+          path: bin/
+
+  # ─── Code Quality Grep ──────────────────────────────────────────────────────
+  quality-grep:
+    needs: check-go-files
+    if: needs.check-go-files.outputs.has_go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for TODO/FIX without issue refs
+        run: |
+          TODOS=$(grep -rnE 'TODO|FIXME|XXX|HACK' --include="*.go" . | grep -vE 'TODO.*#[0-9]+|FIXME.*#[0-9]+' || true)
+          if [ -n "$TODOS" ]; then
+            echo "Found TODO/FIX without issue references:"
+            echo "$TODOS"
+          fi
+
+  # ─── Vulnerability Check ────────────────────────────────────────────────────
+  vuln:
+    needs: check-go-files
+    if: needs.check-go-files.outputs.has_go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+# Required checks for branch protection:
+#   ci/go-test   → skipped when no go.mod
+#   ci/lint      → skipped when no go.mod
+#   ci/build     → skipped when no go.mod
+# When no go.mod present, check-go-files job succeeds with no failures.

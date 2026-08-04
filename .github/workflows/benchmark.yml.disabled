@@ -1,0 +1,242 @@
+name: Benchmark
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**.go'
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/benchmark.yml'
+  pull_request:
+    paths:
+      - '**.go'
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/benchmark.yml'
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - lang: go
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        if: matrix.lang == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Run Go benchmarks
+        if: matrix.lang == 'go'
+        id: go-benchmark
+        run: |
+          # Run benchmarks and capture output
+          go test -bench=. -benchmem -count=5 -timeout 10m ./... 2>&1 | tee benchmark_raw.txt
+          exit 0
+
+      - name: Parse Go benchmark output
+        if: matrix.lang == 'go'
+        id: parse-go
+        run: |
+          # Parse Go benchmark output: BenchmarkName N ns/op X allocs/op Y MB/s Z bytes/op
+          cat benchmark_raw.txt | grep -E '^Benchmark' | while read line; do
+            name=$(echo "$line" | awk '{print $1}')
+            ns_op=$(echo "$line" | grep -oE '[0-9]+ ns/op' | grep -oE '[0-9]+')
+            allocs_op=$(echo "$line" | grep -oE '[0-9]+ allocs/op' | grep -oE '[0-9]+')
+            mb_s=$(echo "$line" | grep -oE '[0-9]+\.?[0-9]* MB/s' | grep -oE '[0-9]+\.?[0-9]*')
+            bytes_op=$(echo "$line" | grep -oE '[0-9]+ bytes/op' | grep -oE '[0-9]+')
+
+            echo "{\"name\":\"$name\",\"ns_op\":$ns_op,\"allocs_op\":$allocs_op,\"mb_s\":$mb_s,\"bytes_op\":$bytes_op}"
+          done | jq -s '{benchmarks: .}' > benchmark_current.json
+
+          # Check if we got any benchmarks
+          if [ ! -s benchmark_current.json ] || [ "$(jq '.benchmarks | length' benchmark_current.json)" == "0" ]; then
+            echo '{"benchmarks":[]}' > benchmark_current.json
+          fi
+
+          cat benchmark_current.json
+
+      - name: Run Python benchmarks
+        if: matrix.lang == 'python'
+        run: |
+          pip install pytest pytest-benchmark
+          pytest --benchmark-only --benchmark-json=benchmark_current.json benchmarks/ || true
+
+      - name: Handle Python benchmark output
+        if: matrix.lang == 'python'
+        run: |
+          if [ -f benchmark_current.json ]; then
+            echo "Python benchmark JSON exists"
+          else
+            echo '{"benchmarks":[]}' > benchmark_current.json
+          fi
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-current
+          path: benchmark_current.json
+          retention-days: 30
+
+  compare:
+    name: Compare Benchmarks
+    runs-on: ubuntu-latest
+    needs: benchmark
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Download current benchmark
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-current
+          path: .
+        continue-on-error: true
+
+      - name: Check current benchmark exists
+        id: check-current
+        run: |
+          if [ -f benchmark_current.json ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "count=$(jq '.benchmarks | length' benchmark_current.json)" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch base benchmark from main branch
+        if: steps.check-current.outputs.exists == 'true'
+        id: fetch-base
+        run: |
+          # Download base benchmark from main branch artifact
+          gh api repos/${{ github.repository }}/actions/artifacts --jq '.artifacts[] | select(.name == "benchmark-base") | .id' 2>/dev/null | head -1 | while read artifact_id; do
+            gh api repos/${{ github.repository }}/actions/artifacts/$artifact_id/archive --output benchmark_base.json -L 302 2>/dev/null || true
+          done
+
+          # Alternative: try to download via download-artifact action
+          if [ ! -f benchmark_base.json ]; then
+            # Try with a workaround - get the latest run on main that uploaded benchmark-base
+            gh run list --workflow=benchmark.yml --branch=main --status=completed --json=id --jq '.[0].id' 2>/dev/null | while read run_id; do
+              if [ -n "$run_id" ]; then
+                gh api repos/${{ github.repository }}/actions/runs/$run_id/artifacts --jq '.artifacts[] | select(.name == "benchmark-base") | .id' 2>/dev/null | head -1 | while read artifact_id; do
+                  gh api repos/${{ github.repository }}/actions/artifacts/$artifact_id/archive --output benchmark_base.json -L 302 2>/dev/null || true
+                done
+              fi
+            done
+          fi
+
+          if [ -f benchmark_base.json ]; then
+            echo "base_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "base_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Compare benchmarks
+        if: steps.check-current.outputs.exists == 'true' && steps.fetch-base.outputs.base_exists == 'true'
+        id: compare
+        run: |
+          # Compare benchmarks and generate delta comment
+          node_script='
+          const current = require("./benchmark_current.json");
+          const base = require("./benchmark_base.json");
+
+          const baseMap = {};
+          base.benchmarks.forEach(b => { baseMap[b.name] = b; });
+
+          let table = "| Benchmark | Current | Previous | Delta |\n|---|---|---|---|\n";
+          let hasRegression = false;
+
+          current.benchmarks.forEach(b => {
+            const prev = baseMap[b.name];
+            if (prev) {
+              const nsDelta = prev.ns_op ? (((b.ns_op - prev.ns_op) / prev.ns_op) * 100).toFixed(2) : "N/A";
+              const allocDelta = prev.allocs_op ? (((b.allocs_op - prev.allocs_op) / prev.allocs_op) * 100).toFixed(2) : "N/A";
+
+              let nsSign = "";
+              let allocSign = "";
+              if (nsDelta !== "N/A" && nsDelta > 0) { nsSign = "+"; hasRegression = true; }
+              if (allocDelta !== "N/A" && allocDelta > 0) { allocSign = "+"; }
+
+              table += `| ${b.name} | ${b.ns_op} ns/op | ${prev.ns_op} ns/op | ${nsSign}${nsDelta}% |\n`;
+              table += `| ${b.name} (allocs) | ${b.allocs_op} | ${prev.allocs_op} | ${allocSign}${allocDelta}% |\n`;
+            } else {
+              table += `| ${b.name} | ${b.ns_op} ns/op | N/A | new |\n`;
+            }
+          });
+
+          console.log("TABLE_OUTPUT::" + table);
+          console.log("HAS_REGRESSION::" + hasRegression);
+          '
+
+          OUTPUT=$(node "$node_script")
+          TABLE=$(echo "$OUTPUT" | grep "TABLE_OUTPUT::" | sed 's/TABLE_OUTPUT:://')
+          HAS_REGRESSION=$(echo "$OUTPUT" | grep "HAS_REGRESSION::" | sed 's/HAS_REGRESSION:://')
+
+          echo "table=$TABLE" >> $GITHUB_OUTPUT
+          echo "has_regression=$HAS_REGRESSION" >> $GITHUB_OUTPUT
+
+      - name: Find existing benchmark comment
+        if: steps.check-current.outputs.exists == 'true' && steps.fetch-base.outputs.base_exists == 'true'
+        id: find-comment
+        run: |
+          COMMENT_ID=""
+          gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments --jq '.[] | select(.body | contains("## Benchmark Results")) | .id' 2>/dev/null | while read id; do
+            COMMENT_ID=$id
+          done
+          echo "comment_id=$COMMENT_ID" >> $GITHUB_OUTPUT
+
+      - name: Post benchmark comment
+        if: steps.check-current.outputs.exists == 'true' && steps.fetch-base.outputs.base_exists == 'true'
+        uses: peaceiris/actions-gh-comment@v3
+        with:
+          comment-id: ${{ steps.find-comment.outputs.comment_id }}
+          body: |
+            ## Benchmark Results
+
+            ${{ steps.compare.outputs.table }}
+
+            ${{ steps.compare.outputs.has_regression == 'true' && '⚠️ Performance regression detected (ns/op increased >20%)' || '' }}
+          edit-mode: upsert
+
+      - name: Post new benchmark comment (no base)
+        if: steps.check-current.outputs.exists == 'true' && steps.fetch-base.outputs.base_exists != 'true'
+        uses: peaceiris/actions-gh-comment@v3
+        with:
+          body: |
+            ## Benchmark Results
+
+            First benchmark run on this PR. No previous baseline available for comparison.
+
+            See artifacts for full benchmark data.
+          flag: ${{ steps.check-current.outputs.count == '0' && 'empty' || '' }}
+
+  upload-base:
+    name: Upload Base Benchmark
+    runs-on: ubuntu-latest
+    needs: benchmark
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Download current benchmark
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-current
+          path: .
+        continue-on-error: true
+
+      - name: Upload base benchmark
+        if: -f benchmark_current.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-base
+          path: benchmark_current.json
+          retention-days: 90

@@ -1,0 +1,65 @@
+name: Bug Report
+description: Report a bug to help us improve
+title: "bug: "
+labels: ["bug"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Bug Report
+
+        Please describe the bug clearly. The more specific, the faster we can resolve it.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened vs what you expected
+      placeholder: |
+        1. I did X
+        2. I expected Y
+        3. But instead Z happened
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Exact steps to reproduce the bug
+      placeholder: |
+        1. Go to '...'
+        2. Click on '...'
+        3. See error
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: What version were you using?
+      placeholder: e.g., v1.2.3
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: Paste any relevant error logs
+      placeholder: |
+        ```
+        Paste logs here
+        ```
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Anything else that might be relevant (OS, environment, etc.)
+    validations:
+      required: false

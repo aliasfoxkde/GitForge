@@ -1,0 +1,40 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: UTC
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - go
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: UTC
+    groups:
+      github-actions:
+        update-types:
+          - minor
+          - patch
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - github-actions
+
+  # Add more package ecosystems as needed:
+  # - npm (for Node.js projects)
+  # - pip (for Python projects)
+  # - cargo (for Rust projects)

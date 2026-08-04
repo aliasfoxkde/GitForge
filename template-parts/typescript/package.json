@@ -1,0 +1,63 @@
+{
+  "name": "project-name",
+  "version": "1.0.0",
+  "description": "A TypeScript project with structured API, models, services, and utilities",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./api": {
+      "import": "./dist/api/mod.js",
+      "types": "./dist/api/mod.d.ts"
+    },
+    "./models": {
+      "import": "./dist/models/mod.js",
+      "types": "./dist/models/mod.d.ts"
+    },
+    "./services": {
+      "import": "./dist/services/mod.js",
+      "types": "./dist/services/mod.d.ts"
+    },
+    "./utils": {
+      "import": "./dist/utils/mod.js",
+      "types": "./dist/utils/mod.d.ts"
+    }
+  },
+  "scripts": {
+    "test": "vitest",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:e2e": "playwright test",
+    "lint": "eslint src tests --ext .ts",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "coverage": "vitest run --coverage",
+    "clean": "rm -rf dist coverage",
+    "prepare": "npm run typecheck"
+  },
+  "peerDependencies": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.45.0",
+    "@types/node": "^20.14.0",
+    "@typescript-eslint/eslint-plugin": "^7.13.0",
+    "@typescript-eslint/parser": "^7.13.0",
+    "@vitest/coverage-v8": "^1.6.0",
+    "eslint": "^8.57.0",
+    "prettier": "^3.3.0",
+    "tsc": "^2.0.0",
+    "tsx": "^4.15.0",
+    "typescript": "^5.5.0",
+    "vitest": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

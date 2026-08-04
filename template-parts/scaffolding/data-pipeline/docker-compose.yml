@@ -1,0 +1,135 @@
+version: "3.8"
+
+services:
+  etl-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: etl-pipeline
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    environment:
+      - SOURCE_TYPE=${SOURCE_TYPE:-csv}
+      - SOURCE_PATH=${SOURCE_PATH:-/data/source.csv}
+      - SOURCE_URL=${SOURCE_URL:-http://api.example.com/data}
+      - SOURCE_INTERVAL=${SOURCE_INTERVAL:-1m}
+      - DEST_TYPE=${DEST_TYPE:-postgres}
+      - DEST_CONN=${DEST_CONN:-}
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REDIS_DB=${REDIS_DB:-0}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-etl}
+      - DB_PASSWORD=${DB_PASSWORD:-etlsecret}
+      - DB_NAME=${DB_NAME:-etl_db}
+      - DB_POOL_SIZE=${DB_POOL_SIZE:-10}
+      - BATCH_SIZE=${BATCH_SIZE:-100}
+      - WORKERS=${WORKERS:-4}
+      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30s}
+      - METRICS_PORT=9090
+    volumes:
+      - ./data:/data:ro
+      - etl-state:/state
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - etl-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  postgres:
+    image: docker.io/postgres:16-alpine
+    container_name: etl-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${DB_USER:-etl}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-etlsecret}
+      - POSTGRES_DB=${DB_NAME:-etl_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-etl} -d ${DB_NAME:-etl_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - etl-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  redis:
+    image: docker.io/redis:7-alpine
+    container_name: etl-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - etl-network
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  prometheus:
+    image: docker.io/prom/prometheus:v2.51.0
+    container_name: etl-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - etl-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  etl-state:
+    driver: local
+
+networks:
+  etl-network:
+    driver: bridge

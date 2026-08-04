@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Linux build (x86_64 only - cross-compilation not available)
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build
+        run: |
+          cargo build --release --bin api --bin ci --bin git-server --bin runner
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf dist/gitforge-x86_64-unknown-linux-gnu.tar.gz \
+            -C target/release api ci git-server runner
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitforge-linux
+          path: dist/*
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # macOS build (both x86_64 and arm64)
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Add targets
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Build x86_64
+        run: cargo build --release --target x86_64-apple-darwin --bin api --bin ci --bin git-server --bin runner
+
+      - name: Build arm64
+        run: cargo build --release --target aarch64-apple-darwin --bin api --bin ci --bin git-server --bin runner
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf dist/gitforge-x86_64-apple-darwin.tar.gz -C target/x86_64-apple-darwin/release api ci git-server runner
+          tar -czf dist/gitforge-aarch64-apple-darwin.tar.gz -C target/aarch64-apple-darwin/release api ci git-server runner
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitforge-macos
+          path: dist/*
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Windows build
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --target x86_64-pc-windows-gnu --bin api --bin ci --bin git-server --bin runner
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf dist/gitforge-x86_64-pc-windows-gnu.tar.gz \
+            -C target/x86_64-pc-windows-gnu/release api.exe ci.exe git-server.exe runner.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitforge-windows
+          path: dist/*
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Create Release
+  # ─────────────────────────────────────────────────────────────────────────────
+  release:
+    needs: [build-linux, build-macos, build-windows]
+    if: github.repository_owner == 'aliasfoxkde'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Display artifacts
+        run: |
+          find dist -type f \( -name "*.tar.gz" -o -name "SHA256SUMS" \) | head -20
+
+      - name: Create checksums
+        run: |
+          find dist -name "*.tar.gz" -exec sha256sum {} \; > dist/SHA256SUMS
+          cat dist/SHA256SUMS
+
+      - name: Flatten artifacts for release
+        run: |
+          mkdir -p dist/release
+          cp dist/*/*.tar.gz dist/release/ 2>/dev/null || true
+          cp dist/SHA256SUMS dist/release/ 2>/dev/null || true
+          ls -la dist/release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          draft: false
+          prerelease: false
+          files: dist/release/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

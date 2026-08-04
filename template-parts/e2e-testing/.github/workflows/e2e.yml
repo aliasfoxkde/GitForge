@@ -1,0 +1,223 @@
+name: E2E Tests
+
+on:
+  # Manual trigger for any branch
+  workflow_dispatch:
+    inputs:
+      browser:
+        description: 'Browser to test (chromium, firefox, webkit, all)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - chromium
+          - firefox
+          - webkit
+      parallel:
+        description: 'Number of parallel workers'
+        required: false
+        default: '2'
+        type: string
+
+  # Run on push to main when e2e files change
+  push:
+    branches: [$default-branch]
+    paths:
+      - 'template-parts/e2e-testing/**'
+      - 'tests/e2e/**'
+      - 'playwright.config.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/e2e.yml'
+
+  # Run on PR when e2e files change
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'template-parts/e2e-testing/**'
+      - 'tests/e2e/**'
+      - 'playwright.config.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/e2e.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEFAULT_BRANCH: ${{ vars.DEFAULT_BRANCH || 'main' }}
+  # Coverage threshold (percentage)
+  COVERAGE_THRESHOLD: ${{ vars.COVERAGE_THRESHOLD || 80 }}
+
+jobs:
+  # ─── Check for E2E test files ──────────────────────────────────────────────
+  check-e2e-files:
+    runs-on: ubuntu-latest
+    outputs:
+      has_e2e: ${{ steps.check.outputs.has_e2e }}
+      e2e_files: ${{ steps.check.outputs.e2e_files }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for E2E test files
+        id: check
+        run: |
+          E2E_FILES=$(find . -type f \( -name "*.test.ts" -o -name "*.spec.ts" \) -path "*/e2e/*" 2>/dev/null | tr '\n' ' ' || true)
+          if [ -n "$E2E_FILES" ]; then
+            echo "has_e2e=true" >> $GITHUB_OUTPUT
+            echo "e2e_files=$E2E_FILES" >> $GITHUB_OUTPUT
+            echo "Found E2E test files: $E2E_FILES"
+          else
+            echo "has_e2e=false" >> $GITHUB_OUTPUT
+            echo "No E2E test files found — E2E job will be skipped"
+          fi
+
+  # ─── E2E Tests (Ubuntu) ────────────────────────────────────────────────────
+  e2e-ubuntu:
+    needs: check-e2e-files
+    if: needs.check-e2e-files.outputs.has_e2e == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Run E2E tests (${{ matrix.browser }})
+        run: |
+          ./runner.sh \
+            --browser ${{ matrix.browser }} \
+            --parallel 2 \
+            --report html \
+            --timeout 60000
+        env:
+          E2E_BASE_URL: ${{ vars.E2E_BASE_URL || 'http://localhost:3000' }}
+          E2E_COVERAGE: ${{ github.event.inputs.coverage || 'false' }}
+
+      - name: Upload E2E report (HTML)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report-${{ matrix.browser }}-ubuntu
+          path: test-reports/html/
+          retention-days: 14
+
+      - name: Upload E2E results (JSON)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results-${{ matrix.browser }}-ubuntu
+          path: test-reports/results.json
+          retention-days: 14
+
+      - name: Upload Playwright Trace
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-trace-${{ matrix.browser }}-ubuntu
+          path: test-reports/trace.zip
+          retention-days: 30
+
+  # ─── E2E Tests (Windows) ──────────────────────────────────────────────────
+  e2e-windows:
+    needs: check-e2e-files
+    if: needs.check-e2e-files.outputs.has_e2e == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium]
+        os: [windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E tests (Windows)
+        run: |
+          ./runner.sh --browser chromium --parallel 2 --report html --timeout 60000
+        env:
+          E2E_BASE_URL: ${{ vars.E2E_BASE_URL || 'http://localhost:3000' }}
+
+      - name: Upload E2E report (HTML)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report-chromium-windows
+          path: test-reports/html/
+          retention-days: 14
+
+      - name: Upload E2E results (JSON)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results-chromium-windows
+          path: test-reports/results.json
+          retention-days: 14
+
+  # ─── Coverage Check ─────────────────────────────────────────────────────────
+  coverage:
+    needs: check-e2e-files
+    if: needs.check-e2e-files.outputs.has_e2e == 'true' && github.event.inputs.coverage == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E with coverage
+        run: ./runner.sh --browser chromium --coverage --report json --timeout 60000
+        env:
+          E2E_BASE_URL: ${{ vars.E2E_BASE_URL || 'http://localhost:3000' }}
+          E2E_COVERAGE: true
+
+      - name: Check coverage threshold
+        run: |
+          COV=$(npx coverage-report --input test-reports/coverage/coverage-final.json --threshold ${{ env.COVERAGE_THRESHOLD }} || echo "0")
+          echo "Coverage: $COV%"
+          if (( $(echo "$COV < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) )); then
+            echo "ERROR: coverage $COV% below threshold ${{ env.COVERAGE_THRESHOLD }}%"
+            exit 1
+          fi
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-coverage
+          path: test-reports/coverage/
+          retention-days: 30

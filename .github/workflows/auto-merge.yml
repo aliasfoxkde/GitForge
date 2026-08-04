@@ -1,0 +1,67 @@
+name: Auto Merge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  try-merge:
+    # Only act on PRs from the same owner (no forks auto-merging)
+    if: github.event.pull_request.user.login == github.event.repository.owner.login
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check CI status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+
+          # Wait up to 60 seconds for CI to report status
+          echo "Checking CI status for PR #$PR_NUMBER..."
+          for i in {1..12}; do
+            # Get the combined status
+            STATUS=$(gh pr view $PR_NUMBER --json statusCheckRollup --jq '.statusCheckRollup[] | select(.type == "CI") | .state' 2>/dev/null || echo "UNKNOWN")
+
+            if [ "$STATUS" = "SUCCESS" ] || [ "$STATUS" = "" ]; then
+              echo "CI status: $STATUS"
+              break
+            fi
+
+            echo "Waiting for CI... attempt $i/12 (status: $STATUS)"
+            sleep 5
+          done
+
+          # Get final combined status
+          FINAL_STATUS=$(gh pr view $PR_NUMBER --json statusCheckRollup --jq '[.statusCheckRollup[] | select(.type == "CI") | .state] | if map(select(. == "SUCCESS")) | length == length then "SUCCESS" else "PENDING" end' 2>/dev/null || echo "PENDING")
+
+          if [ "$FINAL_STATUS" != "SUCCESS" ]; then
+            echo "CI is not passing (status: $FINAL_STATUS). Will not merge."
+            exit 1
+          fi
+
+          echo "CI is passing. Proceeding with auto-merge..."
+
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+
+          # Enable auto-merge
+          gh pr merge $PR_NUMBER --squash --delete-branch --auto || {
+            echo "Auto-merge failed (可能是因为分支保护或冲突)"
+            exit 1
+          }
+          echo "Auto-merge enabled successfully!"

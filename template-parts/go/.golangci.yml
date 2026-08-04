@@ -1,0 +1,64 @@
+# golangci-lint configuration for Dark Factory Go projects
+# See https://golangci-lint.run/usage/configuration/
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    - errcheck      # Check for unchecked errors
+    - gosimple      # Simplify code
+    - govet         # Reports suspicious constructs
+    - ineffassign   # Detects unused variable assignments
+    - staticcheck   # Static analysis checks
+    - unused        # Checks for unused code
+    - gofmt         # Whether code was gofmt'd
+    - goimports     # Check import statements
+    - misspell      # Finds commonly misspelled English words
+    - unconvert     # Detects unnecessary type conversions
+    - unparam       # Reports unused function parameters
+    - whitespace    # Checks for unnecessary whitespace
+    - gocritic      # Provides diagnostics that check for bugs and style issues
+    - gocyclo       # Calculates cyclomatic complexities
+    - prealloc      # Finds slice declarations that could be preallocated
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+  govet:
+    enable-all: true
+  gocyclo:
+    min-complexity: 15
+  goconst:
+    min-len: 3
+    min-occurrences: 3
+  misspell:
+    locale: US
+  lll:
+    line-length: 120
+  goimports:
+    local-prefixes: {{MODULE_NAME}}
+  staticcheck:
+    checks:
+      - "all"
+      - "-ST1000"
+      - "-ST1003"
+      - "-ST1016"
+      - "-ST1020"
+      - "-ST1021"
+      - "-ST1022"
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 50
+  max-same-issues: 10
+
+output:
+  format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true

@@ -1,0 +1,60 @@
+# ─── Binaries ─────────────────────────────────────────────────────────────────
+atheon
+atheon.exe
+atheon-*-*
+bin/
+dist/
+!template-parts/atheon-enhanced/
+
+# ─── Generated ────────────────────────────────────────────────────────────────
+*.out
+coverage.out
+coverage.html
+*.html
+report.xml
+.aetheon-build/
+
+# ─── IDE ──────────────────────────────────────────────────────────────────────
+.vs/
+.idea/
+*.iml
+.pr-notes/
+
+# ─── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.#*
+
+# ─── Go ───────────────────────────────────────────────────────────────────────
+go.work
+go.work.sum
+
+# ─── Claude Code ─────────────────────────────────────────────────────────────
+.claude/
+CLAUDE.md
+template-parts/rust/target/
+
+# ─── Rust ─────────────────────────────────────────────────────────────────────
+target/
+
+# ─── Coverage & Profiling ───────────────────────────────────────────────────────────
+tarpaulin-report.*
+*.profraw
+cobertura.xml
+lcov.info
+temp/coverage/
+
+# ─── Logs & Runtime ───────────────────────────────────────────────────────────────
+temp/logs/
+temp/data/
+*.log
+data/
+
+# ─── Environment ───────────────────────────────────────────────────────────────
+.env
+.cargo/
+
+# NOTE: Cargo.lock is committed to support security audits and reproducible builds
+# across multiple developers and CI environments for this multi-platform binary.

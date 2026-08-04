@@ -1,0 +1,31 @@
+# Branch Protection Ruleset Configuration
+# Imported by setup-ruleset.sh
+
+name: "Safeguards - Branch Protection"
+target: branches
+enforcement: active
+
+conditions:
+  branches:
+    - main
+    - stable
+    - master
+
+rules:
+  # Prevent branch deletion
+  deletion: false
+
+  # Prevent non-fast-forward merges
+  non_fast_forward: false
+
+  # Require linear history
+  linear_history: true
+
+  # Require signed commits (optional)
+  # signed_commits: true
+
+  # Admin bypass
+  bypass: false
+
+  # Apply to repository admins too
+  enforce_admins: true

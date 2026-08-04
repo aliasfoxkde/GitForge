@@ -1,0 +1,19 @@
+name = "vite-react-pwa"
+compatibility_date = "2025-01-01"
+pages_build_output_dir = "dist"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+APP_NAME = "Vite React PWA"
+APP_URL = "https://vite-react-pwa.pages.dev"
+
+# D1 database (optional)
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "app-db"
+# database_id = "xxxx"
+
+# R2 bucket (optional)
+# [[r2_buckets]]
+# binding = "IMAGES"
+# bucket_name = "app-images"

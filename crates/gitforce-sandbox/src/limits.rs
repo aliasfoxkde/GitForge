@@ -1,0 +1,135 @@
+//! Sandbox resource limits
+
+use serde::{Deserialize, Serialize};
+
+/// Resource limits for sandbox execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxLimits {
+    /// CPU time limit in milliseconds
+    pub cpu_ms: u64,
+    /// Memory limit in megabytes
+    pub memory_mb: u64,
+    /// Disk limit in megabytes
+    pub disk_mb: u64,
+    /// Execution timeout in seconds
+    pub timeout_secs: u64,
+    /// Whether to allow network access
+    pub network: bool,
+}
+
+impl Default for SandboxLimits {
+    fn default() -> Self {
+        Self {
+            cpu_ms: 3600000,    // 1 hour
+            memory_mb: 4096,    // 4GB
+            disk_mb: 10240,     // 10GB
+            timeout_secs: 3600, // 1 hour
+            network: true,
+        }
+    }
+}
+
+impl SandboxLimits {
+    /// Create limits for a specific tier
+    pub fn small() -> Self {
+        Self {
+            cpu_ms: 300000, // 5 minutes
+            memory_mb: 512,
+            disk_mb: 1024,
+            timeout_secs: 300,
+            network: false,
+        }
+    }
+
+    pub fn medium() -> Self {
+        Self {
+            cpu_ms: 1800000, // 30 minutes
+            memory_mb: 2048,
+            disk_mb: 5120,
+            timeout_secs: 1800,
+            network: true,
+        }
+    }
+
+    pub fn large() -> Self {
+        Self {
+            cpu_ms: 3600000,
+            memory_mb: 8192,
+            disk_mb: 20480,
+            timeout_secs: 3600,
+            network: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sandbox_limits_default() {
+        let limits = SandboxLimits::default();
+        assert_eq!(limits.cpu_ms, 3600000);
+        assert_eq!(limits.memory_mb, 4096);
+        assert!(limits.network);
+    }
+
+    #[test]
+    fn test_sandbox_limits_small() {
+        let limits = SandboxLimits::small();
+        assert_eq!(limits.cpu_ms, 300000);
+        assert_eq!(limits.memory_mb, 512);
+        assert!(!limits.network);
+    }
+
+    #[test]
+    fn test_sandbox_limits_medium() {
+        let limits = SandboxLimits::medium();
+        assert_eq!(limits.cpu_ms, 1800000);
+        assert_eq!(limits.memory_mb, 2048);
+        assert!(limits.network);
+    }
+
+    #[test]
+    fn test_sandbox_limits_large() {
+        let limits = SandboxLimits::large();
+        assert_eq!(limits.cpu_ms, 3600000);
+        assert_eq!(limits.memory_mb, 8192);
+        assert!(limits.network);
+    }
+
+    #[test]
+    fn test_sandbox_limits_debug() {
+        let limits = SandboxLimits::default();
+        let debug_str = format!("{:?}", limits);
+        assert!(debug_str.contains("cpu_ms"));
+        assert!(debug_str.contains("memory_mb"));
+    }
+
+    #[test]
+    fn test_sandbox_limits_clone() {
+        let limits = SandboxLimits::large();
+        let cloned = limits.clone();
+        assert_eq!(cloned.cpu_ms, limits.cpu_ms);
+        assert_eq!(cloned.memory_mb, limits.memory_mb);
+    }
+
+    #[test]
+    fn test_sandbox_limits_all_tiers() {
+        let small = SandboxLimits::small();
+        let medium = SandboxLimits::medium();
+        let large = SandboxLimits::large();
+        let default = SandboxLimits::default();
+
+        // Verify tier ordering
+        assert!(small.memory_mb < medium.memory_mb);
+        assert!(medium.memory_mb < large.memory_mb);
+        assert!(default.memory_mb <= large.memory_mb);
+
+        // Verify network settings
+        assert!(!small.network); // Small has no network
+        assert!(medium.network);
+        assert!(large.network);
+        assert!(default.network);
+    }
+}
