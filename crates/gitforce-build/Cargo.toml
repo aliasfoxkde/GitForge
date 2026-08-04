@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 # Async runtime
 tokio = { workspace = true }
+async-trait = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

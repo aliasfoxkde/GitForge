@@ -23,10 +23,12 @@
 //!                         └──────────────────┘
 //! ```
 
+pub mod client;
 pub mod coordinator;
 pub mod job;
 pub mod protocol;
 
+pub use client::{JobSubmitter, MockClient, UnixSocketClient, DEFAULT_SOCKET};
 pub use coordinator::BuildCoordinator;
 pub use job::{BuildJob, BuildResult, JobOutput, JobStatus, MAX_CONCURRENT_JOBS};
 pub use protocol::*;
