@@ -4,36 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Type
 
-**Dark Factory** is an opinionated GitHub repository template for bootstrapping production-grade software projects. It enforces:
-- 90%+ automated test, code, and documentation coverage
-- Strict pre-commit/push hooks and CI/CD pipelines
-- Conventional commit conventions
-
-This is a **template repository** — actual project code lives in `template-parts/scaffolding/` for various project types (api-service, cli-tool, worker-service, data-pipeline).
+**GitForge** is a local-first Git platform client with AI-powered code review capabilities. It provides:
+- Git repository management with local-first architecture
+- AI-powered code review (Anthropic Claude, OpenAI GPT, Ollama local)
+- CI/CD pipeline integration
+- Security vulnerability scanning
 
 ## Build, Test, and Lint Commands
 
 ```bash
-# Setup (install git hooks)
-make setup
-
 # Build binaries
-make build
+cargo build --release
 
 # Run tests
-make test
+cargo test --workspace
 
 # Run tests with race detector
-make test-race
+cargo test --workspace -- --test-threads=1
 
-# Coverage check (70% threshold)
-make coverage
+# Lint
+cargo clippy --workspace --all-targets -- -D warnings
 
-# Lint (vet, fmt, golangci, goimports)
-make lint
-
-# Vulnerability check
-make vuln
+# Format
+cargo fmt --all
 ```
 
 ## Architecture
@@ -41,22 +34,30 @@ make vuln
 ### Directory Structure
 
 ```
-.github/           # GitHub configuration (workflows, templates)
-.githooks/         # Installed git hooks (pre-commit, pre-push)
-docs/              # Architecture, testing strategy, hooks docs
-scripts/           # Setup and installation scripts
-template-parts/    # Modular language-specific starter templates
+.github/           # GitHub configuration (workflows)
+.githooks/         # Installed git hooks
+crates/            # Core Rust libraries
+services/          # Microservices (api, git-server, ci, runner)
+docs/              # Documentation
 ```
+
+### Crates
+
+| Crate | Purpose |
+|-------|---------|
+| gitforce-ai | AI provider interface (Claude, GPT, Ollama) |
+| gitforce-review | Diff parsing, security scanning, fix suggestions |
+| gitforce-cli | CLI with `gitforge review` command |
+| gitforce-core | Core Git operations |
+| gitforce-api | API gateway |
 
 ### GitHub Actions Workflows
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `ci.yml` | push, PR | Test + lint + build pipeline |
-| `security.yml` | push, schedule | CodeQL, govulncheck, secrets scan |
-| `auto-merge.yml` | PR | Auto-merge Dependabot + same-repo PRs |
-| `release.yml` | tag push | GoReleaser cross-platform builds |
-| `wiki.yml` | push to wiki/ | Publish wiki from `.github/wiki/` |
+| `gitforge-ci.yml` | push, PR | Build queue via GitForge |
+| `ai-review.yml` | PR | AI code review |
+| `release.yml` | tag push | Cross-platform releases |
 
 ### Git Hooks
 
