@@ -79,7 +79,17 @@ impl DockerSandbox {
     /// Pull an image if not present
     async fn ensure_image(&self, image: &str) -> Result<()> {
         if let Some(ref docker) = self.docker {
-            tracing::info!("Pulling image: {}", image);
+            // Check if image already exists locally before pulling
+            match docker.inspect_image(image).await {
+                Ok(_) => {
+                    tracing::info!("Image already exists locally: {}", image);
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::info!("Image not found locally, pulling: {} (error: {})", image, e);
+                }
+            }
+
             // Pull the image - Docker is idempotent, so this works even if image exists
             let mut stream = docker.create_image(
                 Some(CreateImageOptions {

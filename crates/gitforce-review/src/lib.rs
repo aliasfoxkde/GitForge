@@ -69,12 +69,16 @@ pub struct ParsedDiff {
 impl ParsedDiff {
     /// Check if this diff has any additions
     pub fn has_additions(&self) -> bool {
-        self.hunks.iter().any(|h| h.lines.iter().any(|l| matches!(l, HunkLine::Addition(_))))
+        self.hunks
+            .iter()
+            .any(|h| h.lines.iter().any(|l| matches!(l, HunkLine::Addition(_))))
     }
 
     /// Check if this diff has any deletions
     pub fn has_deletions(&self) -> bool {
-        self.hunks.iter().any(|h| h.lines.iter().any(|l| matches!(l, HunkLine::Deletion(_))))
+        self.hunks
+            .iter()
+            .any(|h| h.lines.iter().any(|l| matches!(l, HunkLine::Deletion(_))))
     }
 }
 
@@ -175,10 +179,22 @@ pub fn parse_unified_diff(diff: &str) -> Result<Vec<ParsedDiff>, ReviewError> {
                     d.hunks.push(h);
                 }
 
-                let old_start: u32 = caps.get(1).map(|m| m.as_str().parse().unwrap_or(1)).unwrap_or(1);
-                let old_lines: u32 = caps.get(2).map(|m| m.as_str().parse().unwrap_or(1)).unwrap_or(1);
-                let new_start: u32 = caps.get(3).map(|m| m.as_str().parse().unwrap_or(1)).unwrap_or(1);
-                let new_lines: u32 = caps.get(4).map(|m| m.as_str().parse().unwrap_or(1)).unwrap_or(1);
+                let old_start: u32 = caps
+                    .get(1)
+                    .map(|m| m.as_str().parse().unwrap_or(1))
+                    .unwrap_or(1);
+                let old_lines: u32 = caps
+                    .get(2)
+                    .map(|m| m.as_str().parse().unwrap_or(1))
+                    .unwrap_or(1);
+                let new_start: u32 = caps
+                    .get(3)
+                    .map(|m| m.as_str().parse().unwrap_or(1))
+                    .unwrap_or(1);
+                let new_lines: u32 = caps
+                    .get(4)
+                    .map(|m| m.as_str().parse().unwrap_or(1))
+                    .unwrap_or(1);
 
                 current_hunk = Some(DiffHunk {
                     old_start,
@@ -318,7 +334,7 @@ impl DiffStats {
 #[derive(Debug)]
 pub struct ChangeComplexity {
     pub total_lines: usize,
-    pub churn: usize,  // Total changes (adds + deletes)
+    pub churn: usize, // Total changes (adds + deletes)
     pub files_touched: usize,
     pub has_test_changes: bool,
     pub has_docs_changes: bool,
@@ -350,7 +366,10 @@ impl ChangeComplexity {
 
             // Check for test files
             let path_lower = change.path.to_lowercase();
-            if path_lower.contains("test") || path_lower.contains("_test") || path_lower.ends_with("_tests.rs") {
+            if path_lower.contains("test")
+                || path_lower.contains("_test")
+                || path_lower.ends_with("_tests.rs")
+            {
                 complexity.has_test_changes = true;
             }
 
@@ -438,7 +457,10 @@ index abc123..def456 100644
         assert_eq!(detect_language("main.py"), Some("python".to_string()));
         assert_eq!(detect_language("main.go"), Some("go".to_string()));
         assert_eq!(detect_language("README.md"), Some("markdown".to_string()));
-        assert_eq!(detect_language("Dockerfile"), Some("dockerfile".to_string()));
+        assert_eq!(
+            detect_language("Dockerfile"),
+            Some("dockerfile".to_string())
+        );
         assert_eq!(detect_language("unknown.xyz"), None);
     }
 }

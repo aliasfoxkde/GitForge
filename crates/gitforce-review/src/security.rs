@@ -324,7 +324,9 @@ mod tests {
                 old_lines: 1,
                 new_start: 1,
                 new_lines: 1,
-                lines: vec![HunkLine::Addition("password = 'supersecret123'".to_string())],
+                lines: vec![HunkLine::Addition(
+                    "password = 'supersecret123'".to_string(),
+                )],
             }],
             language: Some("python".to_string()),
         };
@@ -348,7 +350,9 @@ mod tests {
                 old_lines: 1,
                 new_start: 1,
                 new_lines: 1,
-                lines: vec![HunkLine::Addition("cursor.execute('SELECT * FROM users WHERE id=' + user_id)".to_string())],
+                lines: vec![HunkLine::Addition(
+                    "cursor.execute('SELECT * FROM users WHERE id=' + user_id)".to_string(),
+                )],
             }],
             language: Some("python".to_string()),
         };
@@ -372,7 +376,9 @@ mod tests {
                 old_lines: 1,
                 new_start: 1,
                 new_lines: 1,
-                lines: vec![HunkLine::Addition("cursor.execute('SELECT * FROM users WHERE id = ?', [user_id])".to_string())],
+                lines: vec![HunkLine::Addition(
+                    "cursor.execute('SELECT * FROM users WHERE id = ?', [user_id])".to_string(),
+                )],
             }],
             language: Some("python".to_string()),
         };

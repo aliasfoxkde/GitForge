@@ -127,7 +127,11 @@ pub struct ReviewRequest {
 
 impl ReviewRequest {
     /// Create a new review request
-    pub fn new(repo_name: impl Into<String>, branch: impl Into<String>, files: Vec<FileChange>) -> Self {
+    pub fn new(
+        repo_name: impl Into<String>,
+        branch: impl Into<String>,
+        files: Vec<FileChange>,
+    ) -> Self {
         Self {
             repo_name: repo_name.into(),
             branch: branch.into(),
@@ -226,19 +230,25 @@ pub struct ReviewResponse {
 impl ReviewResponse {
     /// Check if any critical or high severity findings exist
     pub fn has_critical_findings(&self) -> bool {
-        self.findings.iter().any(|f| {
-            matches!(f.severity, Severity::Critical | Severity::High)
-        })
+        self.findings
+            .iter()
+            .any(|f| matches!(f.severity, Severity::Critical | Severity::High))
     }
 
     /// Get findings by severity
     pub fn findings_by_severity(&self, severity: Severity) -> Vec<&ReviewFinding> {
-        self.findings.iter().filter(|f| f.severity == severity).collect()
+        self.findings
+            .iter()
+            .filter(|f| f.severity == severity)
+            .collect()
     }
 
     /// Get findings by category
     pub fn findings_by_category(&self, category: FindingCategory) -> Vec<&ReviewFinding> {
-        self.findings.iter().filter(|f| f.category == category).collect()
+        self.findings
+            .iter()
+            .filter(|f| f.category == category)
+            .collect()
     }
 }
 
@@ -345,12 +355,12 @@ impl AiProviderFactory {
 
 // Re-export implementations
 mod anthropic;
-mod openai;
 mod ollama;
+mod openai;
 
 pub use anthropic::AnthropicProvider;
-pub use openai::OpenAiProvider;
 pub use ollama::OllamaProvider;
+pub use openai::OpenAiProvider;
 
 #[cfg(test)]
 mod tests {
@@ -419,7 +429,12 @@ mod tests {
 
         assert!(response.has_critical_findings());
         assert_eq!(response.findings_by_severity(Severity::Critical).len(), 1);
-        assert_eq!(response.findings_by_category(FindingCategory::Security).len(), 1);
+        assert_eq!(
+            response
+                .findings_by_category(FindingCategory::Security)
+                .len(),
+            1
+        );
     }
 
     #[test]

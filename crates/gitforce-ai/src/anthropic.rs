@@ -1,6 +1,9 @@
 //! Anthropic (Claude) AI provider implementation
 
-use super::{AiError, AiProvider, ProviderConfig, ProviderType, ReviewFinding, ReviewRequest, ReviewResponse, Severity, FindingCategory};
+use super::{
+    AiError, AiProvider, FindingCategory, ProviderConfig, ProviderType, ReviewFinding,
+    ReviewRequest, ReviewResponse, Severity,
+};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -20,15 +23,18 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     /// Create a new Anthropic provider
     pub fn new(config: ProviderConfig) -> Result<Self, AiError> {
-        let api_key = std::env::var(&config.api_key_env)
-            .map_err(|_| AiError::Config(format!(
+        let api_key = std::env::var(&config.api_key_env).map_err(|_| {
+            AiError::Config(format!(
                 "Environment variable {} not set",
                 config.api_key_env
-            )))?;
+            ))
+        })?;
 
         Ok(Self {
             api_key,
-            base_url: config.base_url.unwrap_or_else(|| ANTHROPIC_BASE_URL.to_string()),
+            base_url: config
+                .base_url
+                .unwrap_or_else(|| ANTHROPIC_BASE_URL.to_string()),
             client: Client::builder()
                 .timeout(Duration::from_secs(60))
                 .build()
@@ -64,7 +70,8 @@ impl AiProvider for AnthropicProvider {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
@@ -95,7 +102,8 @@ impl AiProvider for AnthropicProvider {
             }],
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
@@ -136,14 +144,20 @@ impl AnthropicProvider {
         );
 
         if let Some(base) = &request.base_branch {
-            prompt.push_str(&format!(r#"Compare against branch "{}".
-"#, base));
+            prompt.push_str(&format!(
+                r#"Compare against branch "{}".
+"#,
+                base
+            ));
         }
 
         if !request.context.is_empty() {
-            prompt.push_str(&format!(r#"Context: {}
+            prompt.push_str(&format!(
+                r#"Context: {}
 
-"#, request.context));
+"#,
+                request.context
+            ));
         }
 
         prompt.push_str(&format!(
@@ -173,7 +187,8 @@ Files changed ({} total):
             ));
         }
 
-        prompt.push_str(r#"
+        prompt.push_str(
+            r#"
 
 Provide your review in JSON format:
 {
@@ -195,7 +210,8 @@ Provide your review in JSON format:
 }
 
 JSON Response:
-"#);
+"#,
+        );
 
         prompt
     }
@@ -206,7 +222,8 @@ JSON Response:
         _request: &ReviewRequest,
     ) -> Result<ReviewResponse, AiError> {
         // Extract the text content from the response
-        let content = response.content
+        let content = response
+            .content
             .into_iter()
             .find_map(|block| {
                 if let ContentBlock::Text(text) = block {
@@ -218,11 +235,17 @@ JSON Response:
             .ok_or_else(|| AiError::Parse("No text content in response".to_string()))?;
 
         // Parse the JSON from the response
-        let parsed: ParsedReviewResponse = serde_json::from_str(&content)
-            .map_err(|e| AiError::Parse(format!("Failed to parse review JSON: {}\n\nContent:\n{}", e, content)))?;
+        let parsed: ParsedReviewResponse = serde_json::from_str(&content).map_err(|e| {
+            AiError::Parse(format!(
+                "Failed to parse review JSON: {}\n\nContent:\n{}",
+                e, content
+            ))
+        })?;
 
-        let findings = parsed.findings.into_iter().map(|f| {
-            ReviewFinding {
+        let findings = parsed
+            .findings
+            .into_iter()
+            .map(|f| ReviewFinding {
                 file: f.file,
                 line_start: f.line_start,
                 line_end: f.line_end,
@@ -246,8 +269,8 @@ JSON Response:
                 description: f.description,
                 suggestion: f.suggestion,
                 code_snippet: f.code_snippet,
-            }
-        }).collect();
+            })
+            .collect();
 
         // Estimate cost based on tokens (Anthropic pricing)
         let input_tokens = response.usage.input_tokens;

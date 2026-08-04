@@ -1,6 +1,9 @@
 //! OpenAI provider implementation
 
-use super::{AiError, AiProvider, ProviderConfig, ProviderType, ReviewFinding, ReviewRequest, ReviewResponse, Severity, FindingCategory};
+use super::{
+    AiError, AiProvider, FindingCategory, ProviderConfig, ProviderType, ReviewFinding,
+    ReviewRequest, ReviewResponse, Severity,
+};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -21,15 +24,18 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     /// Create a new OpenAI provider
     pub fn new(config: ProviderConfig) -> Result<Self, AiError> {
-        let api_key = std::env::var(&config.api_key_env)
-            .map_err(|_| AiError::Config(format!(
+        let api_key = std::env::var(&config.api_key_env).map_err(|_| {
+            AiError::Config(format!(
                 "Environment variable {} not set",
                 config.api_key_env
-            )))?;
+            ))
+        })?;
 
         Ok(Self {
             api_key,
-            base_url: config.base_url.unwrap_or_else(|| OPENAI_BASE_URL.to_string()),
+            base_url: config
+                .base_url
+                .unwrap_or_else(|| OPENAI_BASE_URL.to_string()),
             client: Client::builder()
                 .timeout(Duration::from_secs(60))
                 .build()
@@ -92,7 +98,8 @@ impl AiProvider for OpenAiProvider {
             max_tokens: request.config.max_tokens,
         };
 
-        let mut req_builder = self.client
+        let mut req_builder = self
+            .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
@@ -138,16 +145,20 @@ impl OpenAiProvider {
         );
 
         if let Some(base) = &request.base_branch {
-            prompt.push_str(&format!(r#"Compare against branch "{}".
+            prompt.push_str(&format!(
+                r#"Compare against branch "{}".
 "#,
-            base));
+                base
+            ));
         }
 
         if !request.context.is_empty() {
-            prompt.push_str(&format!(r#"Context: {}
+            prompt.push_str(&format!(
+                r#"Context: {}
 
 "#,
-            request.context));
+                request.context
+            ));
         }
 
         prompt.push_str(&format!(
@@ -178,7 +189,8 @@ Files changed ({} total):
             ));
         }
 
-        prompt.push_str(r#"
+        prompt.push_str(
+            r#"
 
 Provide your review in JSON format:
 {
@@ -200,7 +212,8 @@ Provide your review in JSON format:
 }
 
 JSON Response:
-"#);
+"#,
+        );
 
         prompt
     }
@@ -210,17 +223,24 @@ JSON Response:
         response: OpenAiResponse,
         _request: &ReviewRequest,
     ) -> Result<ReviewResponse, AiError> {
-        let content = response.choices
+        let content = response
+            .choices
             .into_iter()
             .next()
             .map(|c| c.message.content)
             .ok_or_else(|| AiError::Parse("No content in response".to_string()))?;
 
-        let parsed: ParsedReviewResponse = serde_json::from_str(&content)
-            .map_err(|e| AiError::Parse(format!("Failed to parse review JSON: {}\n\nContent:\n{}", e, content)))?;
+        let parsed: ParsedReviewResponse = serde_json::from_str(&content).map_err(|e| {
+            AiError::Parse(format!(
+                "Failed to parse review JSON: {}\n\nContent:\n{}",
+                e, content
+            ))
+        })?;
 
-        let findings = parsed.findings.into_iter().map(|f| {
-            ReviewFinding {
+        let findings = parsed
+            .findings
+            .into_iter()
+            .map(|f| ReviewFinding {
                 file: f.file,
                 line_start: f.line_start,
                 line_end: f.line_end,
@@ -244,11 +264,12 @@ JSON Response:
                 description: f.description,
                 suggestion: f.suggestion,
                 code_snippet: f.code_snippet,
-            }
-        }).collect();
+            })
+            .collect();
 
         let usage = response.usage.unwrap_or_default();
-        let cost_cents = calculate_openai_cost(&self.model, usage.prompt_tokens, usage.completion_tokens);
+        let cost_cents =
+            calculate_openai_cost(&self.model, usage.prompt_tokens, usage.completion_tokens);
 
         Ok(ReviewResponse {
             summary: parsed.summary,

@@ -1,6 +1,9 @@
 //! Ollama local provider implementation
 
-use super::{AiError, AiProvider, ProviderConfig, ProviderType, ReviewFinding, ReviewRequest, ReviewResponse, Severity, FindingCategory};
+use super::{
+    AiError, AiProvider, FindingCategory, ProviderConfig, ProviderType, ReviewFinding,
+    ReviewRequest, ReviewResponse, Severity,
+};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -20,7 +23,9 @@ impl OllamaProvider {
     /// Create a new Ollama provider
     pub fn new(config: ProviderConfig) -> Result<Self, AiError> {
         Ok(Self {
-            base_url: config.base_url.unwrap_or_else(|| OLLAMA_BASE_URL.to_string()),
+            base_url: config
+                .base_url
+                .unwrap_or_else(|| OLLAMA_BASE_URL.to_string()),
             client: Client::builder()
                 .timeout(Duration::from_secs(120)) // Longer timeout for local models
                 .build()
@@ -49,7 +54,8 @@ impl AiProvider for OllamaProvider {
     async fn health_check(&self) -> Result<(), AiError> {
         let url = format!("{}/api/tags", self.base_url);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
@@ -77,7 +83,8 @@ impl AiProvider for OllamaProvider {
             },
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&body)
@@ -108,16 +115,20 @@ impl OllamaProvider {
         );
 
         if let Some(base) = &request.base_branch {
-            prompt.push_str(&format!(r#"Compare against branch "{}".
+            prompt.push_str(&format!(
+                r#"Compare against branch "{}".
 "#,
-            base));
+                base
+            ));
         }
 
         if !request.context.is_empty() {
-            prompt.push_str(&format!(r#"Context: {}
+            prompt.push_str(&format!(
+                r#"Context: {}
 
 "#,
-            request.context));
+                request.context
+            ));
         }
 
         prompt.push_str(&format!(
@@ -148,7 +159,8 @@ Files changed ({} total):
             ));
         }
 
-        prompt.push_str(r#"
+        prompt.push_str(
+            r#"
 
 Provide your review in JSON format:
 {
@@ -170,7 +182,8 @@ Provide your review in JSON format:
 }
 
 JSON Response:
-"#);
+"#,
+        );
 
         prompt
     }
@@ -187,8 +200,10 @@ JSON Response:
 
         match parsed {
             Ok(parsed) => {
-                let findings = parsed.findings.into_iter().map(|f| {
-                    ReviewFinding {
+                let findings = parsed
+                    .findings
+                    .into_iter()
+                    .map(|f| ReviewFinding {
                         file: f.file,
                         line_start: f.line_start,
                         line_end: f.line_end,
@@ -212,8 +227,8 @@ JSON Response:
                         description: f.description,
                         suggestion: f.suggestion,
                         code_snippet: f.code_snippet,
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 // Ollama doesn't provide token counts, estimate based on response length
                 let tokens_used = (content.len() / 4) as u32; // Rough estimate

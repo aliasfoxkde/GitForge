@@ -208,11 +208,20 @@ impl Scheduler {
     pub async fn process_queue(&self) {
         let mut state = self.state.write().await;
         let runners = state.list_online_runners();
+        let available_runners = runners.len();
 
-        // Try to assign jobs while we have available runners
-        let mut assigned = None;
+        // Process multiple jobs if we have multiple runners
+        // Use a loop to batch process jobs
+        let mut processed = 0;
+        let max_jobs_per_batch = available_runners.max(1);
 
-        if let Some(job) = state.queue.peek() {
+        while processed < max_jobs_per_batch {
+            // Peek at next job
+            let job = match state.queue.peek() {
+                Some(j) => j,
+                None => break, // No more jobs
+            };
+
             let job_id = job.job_id;
 
             // Select runner using policy
@@ -220,37 +229,45 @@ impl Scheduler {
 
             match runner_id {
                 Some(r_id) => {
-                    // Dequeue and assign
+                    // Dequeue and assign (JobId and RunnerId are Copy types)
                     state.queue.dequeue();
                     state.job_assignments.insert(job_id, r_id);
                     tracing::info!("assigned job {} to runner {}", job_id, r_id);
-                    assigned = Some((job_id, r_id));
+                    processed += 1;
+
+                    // Emit event
+                    let event = SchedulerEvent::JobAssigned {
+                        job_id,
+                        runner_id: r_id,
+                    };
+                    let _ = self.event_tx.send(event);
+
+                    // Persist assignment to database if available
+                    if let Some(pool) = &self.db_pool {
+                        if let Err(e) =
+                            gitforce_db::queries::JobQueries::assign(pool, job_id, r_id).await
+                        {
+                            tracing::error!("failed to persist job assignment to DB: {}", e);
+                        }
+                        if let Err(e) = gitforce_db::queries::JobQueries::update_status(
+                            pool, job_id, "assigned",
+                        )
+                        .await
+                        {
+                            tracing::error!("failed to update job status in DB: {}", e);
+                        }
+                    }
                 }
                 None => {
-                    // No runner available
-                    tracing::debug!("no runner available for job {}", job_id);
+                    // No runner available for this job, skip remaining
+                    tracing::debug!("no runner available for job {}, stopping batch", job_id);
+                    break;
                 }
             }
         }
 
-        // Emit event if we assigned a job
-        if let Some((job_id, runner_id)) = assigned {
-            let event = SchedulerEvent::JobAssigned { job_id, runner_id };
-            let _ = self.event_tx.send(event);
-
-            // Persist assignment to database if available
-            if let Some(pool) = &self.db_pool {
-                if let Err(e) =
-                    gitforce_db::queries::JobQueries::assign(pool, job_id, runner_id).await
-                {
-                    tracing::error!("failed to persist job assignment to DB: {}", e);
-                }
-                if let Err(e) =
-                    gitforce_db::queries::JobQueries::update_status(pool, job_id, "assigned").await
-                {
-                    tracing::error!("failed to update job status in DB: {}", e);
-                }
-            }
+        if processed > 0 {
+            tracing::debug!("batch assigned {} jobs", processed);
         }
     }
 
