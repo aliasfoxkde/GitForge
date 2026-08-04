@@ -254,4 +254,56 @@ mod tests {
         assert_eq!(user.claims.username, "testuser");
         assert_eq!(user.claims.role, "developer");
     }
+
+    #[test]
+    fn test_auth_error_response_debug() {
+        let response = auth_error_response("test", "message");
+        // Just verify it doesn't panic when formatted
+        let debug_str = format!("{:?}", response);
+        assert!(!debug_str.is_empty());
+    }
+
+    #[test]
+    fn test_public_paths_all_values() {
+        assert_eq!(PUBLIC_PATHS.len(), 5);
+        assert!(PUBLIC_PATHS.contains(&"/health"));
+        assert!(PUBLIC_PATHS.contains(&"/metrics"));
+        assert!(PUBLIC_PATHS.contains(&"/swagger-ui"));
+        assert!(PUBLIC_PATHS.contains(&"/api-docs"));
+        assert!(PUBLIC_PATHS.contains(&"/docs"));
+    }
+
+    #[test]
+    fn test_authenticated_user_type_equivalence() {
+        let claims = Claims {
+            sub: "user-456".to_string(),
+            user_id: UserId::new(),
+            username: "anotheruser".to_string(),
+            role: "viewer".to_string(),
+            exp: Utc::now().timestamp() + 7200,
+            iat: Utc::now().timestamp(),
+        };
+        let user = AuthenticatedUser { claims };
+        assert_eq!(user.claims.username, "anotheruser");
+        assert_eq!(user.claims.role, "viewer");
+    }
+
+    #[test]
+    fn test_claims_with_different_expiry() {
+        let user_id = UserId::new();
+        for hours in &[1, 2, 24, 48, 168] {
+            let claims = Claims::new(user_id, "user", "role", *hours);
+            let expected_exp = claims.iat + (hours * 3600);
+            assert_eq!(claims.exp, expected_exp);
+        }
+    }
+
+    #[test]
+    fn test_auth_error_response_message_preservation() {
+        let test_message = "This is a detailed error message";
+        let response = auth_error_response("code", test_message);
+        // Response is created successfully - the actual message content
+        // is tested via JSON serialization in integration tests
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

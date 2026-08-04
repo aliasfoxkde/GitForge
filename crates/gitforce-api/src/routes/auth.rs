@@ -338,4 +338,50 @@ mod tests {
         // Expired tokens return OK with authenticated=false
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    #[test]
+    fn test_login_request_deserialization() {
+        let json = r#"{"username":"testuser","password":"testpass"}"#;
+        let req: LoginRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.username, "testuser");
+        assert_eq!(req.password, "testpass");
+    }
+
+    #[test]
+    fn test_login_request_deserialization_special_chars() {
+        let json = r#"{"username":"user@domain.com","password":"p@$$w0rd!"}"#;
+        let req: LoginRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.username, "user@domain.com");
+        assert_eq!(req.password, "p@$$w0rd!");
+    }
+
+    #[test]
+    fn test_login_response_serialization_all_fields() {
+        let response = LoginResponse {
+            token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("Bearer"));
+        assert!(json.contains("86400"));
+    }
+
+    #[test]
+    fn test_login_response_different_expires_in() {
+        for exp in &[1, 60, 3600, 86400, 604800] {
+            let response = LoginResponse {
+                token: "token".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: *exp,
+            };
+            assert_eq!(response.expires_in, *exp);
+        }
+    }
+
+    #[test]
+    fn test_auth_routes_creation() {
+        let _router: Router<()> = auth_routes();
+        // Just verify it compiles and creates a router
+    }
 }

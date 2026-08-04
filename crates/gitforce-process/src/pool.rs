@@ -22,7 +22,7 @@ pub enum JobWeight {
 }
 
 /// A managed process in the pool
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ManagedProcess {
     pub pid: u32,
     pub weight: JobWeight,
@@ -399,5 +399,66 @@ mod tests {
         assert!(JobWeight::Light < JobWeight::Medium);
         assert!(JobWeight::Medium < JobWeight::Heavy);
         assert!(JobWeight::Light < JobWeight::Heavy);
+    }
+
+    #[test]
+    fn test_pool_config_with_zero_concurrent() {
+        let config = PoolConfig {
+            max_concurrent: 0,
+            default_timeout: Duration::from_secs(60),
+        };
+        assert_eq!(config.max_concurrent, 0);
+    }
+
+    #[test]
+    fn test_pool_config_with_large_concurrent() {
+        let config = PoolConfig {
+            max_concurrent: 1000,
+            default_timeout: Duration::from_secs(3600),
+        };
+        assert_eq!(config.max_concurrent, 1000);
+    }
+
+    #[test]
+    fn test_managed_process_with_zero_pid() {
+        let process = ManagedProcess {
+            pid: 0,
+            weight: JobWeight::Light,
+        };
+        assert_eq!(process.pid, 0);
+        assert_eq!(process.weight, JobWeight::Light);
+    }
+
+    #[test]
+    fn test_job_weight_all_variants() {
+        assert!(matches!(JobWeight::default(), JobWeight::Light));
+        assert!(JobWeight::Light as i32 >= 0);
+        assert!(JobWeight::Medium as i32 >= 0);
+        assert!(JobWeight::Heavy as i32 >= 0);
+    }
+
+    #[test]
+    fn test_pool_config_default_presets() {
+        let config = PoolConfig::default();
+        assert!(config.max_concurrent > 0);
+        assert!(config.default_timeout > Duration::ZERO);
+    }
+
+    #[test]
+    fn test_managed_process_partialeq() {
+        let p1 = ManagedProcess {
+            pid: 1,
+            weight: JobWeight::Light,
+        };
+        let p2 = ManagedProcess {
+            pid: 1,
+            weight: JobWeight::Light,
+        };
+        let p3 = ManagedProcess {
+            pid: 2,
+            weight: JobWeight::Light,
+        };
+        assert_eq!(p1, p2);
+        assert_ne!(p1, p3);
     }
 }
