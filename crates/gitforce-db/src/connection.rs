@@ -196,6 +196,33 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create events table: {}", e)))?;
 
+        // Create indexes for performance
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::database(format!("failed to create idx_jobs_status: {}", e)))?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_pipeline_run_id ON jobs(pipeline_run_id)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                Error::database(format!("failed to create idx_jobs_pipeline_run_id: {}", e))
+            })?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pipeline_id ON pipeline_runs(pipeline_id)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::database(format!("failed to create idx_pipeline_runs_pipeline_id: {}", e)))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_repositories_owner_id ON repositories(owner_id)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!("failed to create idx_repositories_owner_id: {}", e))
+        })?;
+
         tracing::info!("database migrations completed successfully");
         Ok(())
     }

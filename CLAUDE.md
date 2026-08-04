@@ -4,12 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Type
 
-**Dark Factory** is an opinionated GitHub repository template for bootstrapping production-grade software projects. It enforces:
-- 90%+ automated test, code, and documentation coverage
-- Strict pre-commit/push hooks and CI/CD pipelines
-- Conventional commit conventions
-
-This is a **template repository** — actual project code lives in `template-parts/scaffolding/` for various project types (api-service, cli-tool, worker-service, data-pipeline).
+**GitForge** is a local-first Git platform client with AI-powered code review capabilities.
 
 ## Build, Test, and Lint Commands
 
@@ -41,11 +36,11 @@ make vuln
 ### Directory Structure
 
 ```
-.github/           # GitHub configuration (workflows, templates)
-.githooks/         # Installed git hooks (pre-commit, pre-push)
-docs/              # Architecture, testing strategy, hooks docs
-scripts/           # Setup and installation scripts
-template-parts/    # Modular language-specific starter templates
+.github/           # GitHub configuration (workflows)
+.githooks/         # Installed git hooks
+crates/            # Core Rust libraries
+services/          # Microservices (api, git-server, ci, runner)
+docs/              # Documentation
 ```
 
 ### GitHub Actions Workflows

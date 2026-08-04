@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Maximum concurrent build jobs
-pub const MAX_CONCURRENT_JOBS: usize = 2;
+pub const MAX_CONCURRENT_JOBS: usize = 8;
 
 /// Job weight for resource accounting
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -23,7 +23,7 @@ impl JobWeight {
     pub fn from_cargo_cmd(cmd: &str) -> Self {
         match cmd {
             "build" | "check" | "clippy" | "fmt" => JobWeight::Light,
-            "test" | " bench" => JobWeight::Medium,
+            "test" | "bench" => JobWeight::Medium,
             "llvm-cov" | "tarpaulin" | "miri" => JobWeight::Heavy,
             _ => JobWeight::Medium,
         }

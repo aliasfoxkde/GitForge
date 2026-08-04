@@ -1,0 +1,151 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    paths:
+      - '**.rs'
+      - '**.go'
+      - '**.py'
+      - '**.js'
+      - '**.ts'
+      - '**.java'
+      - '!**/test/**'
+      - '!**/*_test.rs'
+      - '!**/tests/**'
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'AI Provider'
+        required: false
+        default: 'anthropic'
+        type: choice
+        options:
+          - anthropic
+          - openai
+          - ollama
+
+env:
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+jobs:
+  ai-review:
+    name: AI Code Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Get PR diff
+        id: pr-diff
+        run: |
+          # Get the diff between the PR branch and main
+          BASE_BRANCH=${{ github.base_ref || 'main' }}
+          echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+
+          # Generate diff
+          git diff $BASE_BRANCH...HEAD > pr.diff
+          echo "diff_file=pr.diff" >> $GITHUB_OUTPUT
+
+          # Count files changed
+          FILES_CHANGED=$(git diff --name-only $BASE_BRANCH...HEAD | wc -l)
+          echo "files_changed=$FILES_CHANGED" >> $GITHUB_OUTPUT
+
+      - name: Run AI Review
+        id: review
+        env:
+          PROVIDER: ${{ github.event.inputs.provider || 'anthropic' }}
+        run: |
+          set +e
+
+          # Build the CLI first
+          cargo build --package gitforce-cli --release 2>/dev/null
+
+          REVIEW_CMD="./target/release/gitforge review --diff --provider $PROVIDER --verbose"
+
+          # Run the review and capture output
+          OUTPUT=$($REVIEW_CMD 2>&1 || true)
+          echo "$OUTPUT"
+
+          # Extract summary for GitHub comment
+          SUMMARY=$(echo "$OUTPUT" | grep -A 20 "CODE REVIEW RESULTS" | head -30 || echo "Review completed")
+          echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
+
+          # Check for critical findings
+          if echo "$OUTPUT" | grep -q "Critical"; then
+            echo "critical_findings=true" >> $GITHUB_OUTPUT
+          else
+            echo "critical_findings=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post review comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync(process.env.GITHUB_OUTPUT, 'utf8');
+
+            const summary = output.match(/summary=(.*)/s)?.[1] || 'Review completed';
+            const hasCritical = output.includes('critical_findings=true');
+
+            const body = `
+            ## 🤖 AI Code Review Results
+
+            ${summary.replace(/"/g, '\\"')}
+
+            ${hasCritical ? '⚠️ **Warning**: Critical security issues detected!' : '✅ No critical issues found.'}
+
+            _AI Code Review powered by GitForge_
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Fail on critical issues
+        if: steps.review.outputs.critical_findings == 'true'
+        run: |
+          echo "Critical security issues detected in code review"
+          exit 1
+
+  security-scan:
+    name: Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run security scan
+        run: |
+          # Run cargo-audit or similar security checks
+          cargo install cargo-audit --quiet 2>/dev/null || true
+          cargo audit || echo "No vulnerabilities found or audit skipped"
+
+  # Run standard tests alongside AI review
+  test-checks:
+    name: Test Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

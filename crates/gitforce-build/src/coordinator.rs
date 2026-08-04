@@ -416,7 +416,7 @@ mod tests {
         assert!(matches!(stats, Response::Stats { .. }));
 
         if let Response::Stats { max_concurrent, .. } = stats {
-            assert_eq!(max_concurrent, 2);
+            assert_eq!(max_concurrent, MAX_CONCURRENT_JOBS);
         }
     }
 
@@ -484,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_coordinator_max_concurrent() {
-        assert_eq!(BuildCoordinator::max_concurrent(), 2);
+        assert_eq!(BuildCoordinator::max_concurrent(), MAX_CONCURRENT_JOBS);
     }
 
     #[tokio::test]
@@ -498,7 +498,7 @@ mod tests {
             completed_count,
         } = stats
         {
-            assert_eq!(max_concurrent, 2);
+            assert_eq!(max_concurrent, MAX_CONCURRENT_JOBS);
             assert_eq!(running_count, 0);
             assert_eq!(queued_count, 0);
             assert_eq!(completed_count, 0);
