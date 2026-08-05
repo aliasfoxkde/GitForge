@@ -14,7 +14,9 @@ pub use limits::{
     apply_limits, get_cgroup_path, is_in_cgroup_v2, CpuLimit, MemoryLimit, ResourceLimits,
 };
 pub use pool::{JobWeight, PoolConfig, ProcessPool};
-pub use signal::install_sigchld_handler;
+pub use signal::{
+    create_shutdown_flag, install_sigchld_handler, spawn_shutdown_handler, wait_for_shutdown,
+};
 pub use subreaper::become_subreaper;
 
 /// Initialize process supervision
