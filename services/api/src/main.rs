@@ -2,8 +2,8 @@
 //!
 //! Main entry point for the REST API gateway.
 
-use gitforce_api::ApiServer;
-use gitforce_db::Pool;
+use gitforge_api::ApiServer;
+use gitforge_db::Pool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("starting GitForce API Gateway");
 
     // Initialize process supervision (subreaper + SIGCHLD) to prevent zombies
-    if let Err(e) = gitforce_process::init() {
+    if let Err(e) = gitforge_process::init() {
         tracing::warn!("failed to initialize process supervision: {}", e);
     }
 

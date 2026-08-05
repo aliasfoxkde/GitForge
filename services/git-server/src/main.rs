@@ -10,10 +10,10 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use gitforce_common::RepoId;
-use gitforce_core::git_protocol::{http::HttpGitHandler, GitProtocolHandler};
-use gitforce_core::{FileStorageBackend, RepoService, StorageBackend};
-use gitforce_events::{EventBus, InMemoryEventBus};
+use gitforge_common::RepoId;
+use gitforge_core::git_protocol::{http::HttpGitHandler, GitProtocolHandler};
+use gitforge_core::{FileStorageBackend, RepoService, StorageBackend};
+use gitforge_events::{EventBus, InMemoryEventBus};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("starting GitForce Git Server");
 
     // Initialize process supervision (subreaper + SIGCHLD) to prevent zombies
-    if let Err(e) = gitforce_process::init() {
+    if let Err(e) = gitforge_process::init() {
         tracing::warn!("failed to initialize process supervision: {}", e);
     }
 

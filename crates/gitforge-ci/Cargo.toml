@@ -1,0 +1,23 @@
+[package]
+name = "gitforge-ci"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+gitforge-common = { path = "../gitforge-common" }
+gitforge-db = { path = "../gitforge-db" }
+gitforge-events = { path = "../gitforge-events" }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+lazy_static = { workspace = true }

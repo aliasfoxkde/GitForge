@@ -1,0 +1,27 @@
+[package]
+name = "gitforge-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[dependencies]
+gitforge-common = { path = "../gitforge-common" }
+gitforge-db = { path = "../gitforge-db" }
+gitforge-events = { path = "../gitforge-events" }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+async-trait = { workspace = true }
+git2 = { workspace = true }

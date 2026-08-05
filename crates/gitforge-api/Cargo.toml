@@ -1,0 +1,36 @@
+[package]
+name = "gitforge-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+gitforge-common = { path = "../gitforge-common" }
+gitforge-db = { path = "../gitforge-db" }
+gitforge-events = { path = "../gitforge-events" }
+gitforge-ci = { path = "../gitforge-ci" }
+gitforge-scheduler = { path = "../gitforge-scheduler" }
+gitforge-storage = { path = "../gitforge-storage" }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+async-trait = { workspace = true }
+jsonwebtoken = { workspace = true }
+bcrypt = { workspace = true }
+reqwest = { workspace = true }
+
+# Prometheus metrics
+prometheus = "0.14"
+
+[dev-dependencies]
+hyper = "1.5"
+tempfile = "3"

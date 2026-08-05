@@ -1,0 +1,36 @@
+[package]
+name = "gitforge-cli"
+version = "0.1.0"
+edition = "2021"
+description = "GitForge CLI - Local-first Git platform client"
+authors = ["GitForge Team"]
+
+[dependencies]
+gitforge-common = { path = "../gitforge-common" }
+
+# CLI framework
+clap = { version = "4.6", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+# UI
+rpassword = "7"
+dirs = "6"
+toml = "1.1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+mockito = "1"
+
+[[bin]]
+name = "gitforge"
+path = "src/main.rs"

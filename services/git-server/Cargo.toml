@@ -10,11 +10,11 @@ name = "git-server"
 path = "src/main.rs"
 
 [dependencies]
-gitforce-common = { path = "../../crates/gitforce-common" }
-gitforce-db = { path = "../../crates/gitforce-db" }
-gitforce-events = { path = "../../crates/gitforce-events" }
-gitforce-core = { path = "../../crates/gitforce-core" }
-gitforce-process = { path = "../../crates/gitforce-process" }
+gitforge-common = { path = "../../crates/gitforge-common" }
+gitforge-db = { path = "../../crates/gitforge-db" }
+gitforge-events = { path = "../../crates/gitforge-events" }
+gitforge-core = { path = "../../crates/gitforge-core" }
+gitforge-process = { path = "../../crates/gitforge-process" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
