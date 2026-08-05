@@ -4,13 +4,13 @@
 
 use axum::Router;
 use futures::StreamExt;
-use gitforce_ci::{
+use gitforge_ci::{
     CiEngine, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
 };
-use gitforce_events::{
+use gitforge_events::{
     EventBus, EventEnvelope, EventFilter, EventPayload, EventType, InMemoryEventBus,
 };
-use gitforce_scheduler::{create_state, scheduler_routes, Scheduler};
+use gitforge_scheduler::{create_state, scheduler_routes, Scheduler};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use tokio::signal;
 use tokio::time::timeout;
 use tower_http::trace::TraceLayer;
 
-type PipelineCache = HashMap<gitforce_common::RepoId, PipelineDefinition>;
+type PipelineCache = HashMap<gitforge_common::RepoId, PipelineDefinition>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("starting GitForce CI Orchestrator");
 
     // Initialize process supervision (subreaper + SIGCHLD) to prevent zombies
-    if let Err(e) = gitforce_process::init() {
+    if let Err(e) = gitforge_process::init() {
         tracing::warn!("failed to initialize process supervision: {}", e);
     }
 
@@ -292,12 +292,12 @@ async fn handle_push_event(
 
 /// Create a trigger event from push payload (extracted for testability)
 pub fn create_trigger_event(
-    repo_id: gitforce_common::RepoId,
+    repo_id: gitforge_common::RepoId,
     commit_hash: &str,
     ref_name: &str,
-) -> gitforce_ci::PipelineTriggerEvent {
+) -> gitforge_ci::PipelineTriggerEvent {
     PipelineTriggerEvent::new(
-        gitforce_common::PipelineId::new(),
+        gitforge_common::PipelineId::new(),
         repo_id,
         commit_hash.to_string(),
         TriggerType::Push,
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn test_pipeline_cache_insert_and_retrieve() {
         let mut cache: PipelineCache = HashMap::new();
-        let repo_id = gitforce_common::RepoId::new();
+        let repo_id = gitforge_common::RepoId::new();
         let pipeline = create_default_pipeline("test-repo");
 
         cache.insert(repo_id, pipeline.clone());
@@ -443,8 +443,8 @@ mod tests {
     #[test]
     fn test_pipeline_cache_multiple_repos() {
         let mut cache: PipelineCache = HashMap::new();
-        let repo1 = gitforce_common::RepoId::new();
-        let repo2 = gitforce_common::RepoId::new();
+        let repo1 = gitforge_common::RepoId::new();
+        let repo2 = gitforge_common::RepoId::new();
 
         cache.insert(repo1, create_default_pipeline("repo1"));
         cache.insert(repo2, create_default_pipeline("repo2"));
@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_create_trigger_event_basic() {
-        let repo_id = gitforce_common::RepoId::new();
+        let repo_id = gitforge_common::RepoId::new();
         let event = create_trigger_event(repo_id, "abc123", "refs/heads/main");
 
         // Verify event was created with correct commit hash
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn test_create_trigger_event_with_branch() {
-        let repo_id = gitforce_common::RepoId::new();
+        let repo_id = gitforge_common::RepoId::new();
         let event = create_trigger_event(repo_id, "def456", "refs/heads/develop");
 
         assert_eq!(event.commit_hash, "def456");
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_create_trigger_event_preserves_repo_id() {
-        let repo_id = gitforce_common::RepoId::new();
+        let repo_id = gitforge_common::RepoId::new();
         let event = create_trigger_event(repo_id, "xyz789", "refs/heads/main");
 
         assert_eq!(event.repo_id, repo_id);
@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_create_trigger_event_with_tag_ref() {
-        let repo_id = gitforce_common::RepoId::new();
+        let repo_id = gitforge_common::RepoId::new();
         let event = create_trigger_event(repo_id, "v1.0.0", "refs/tags/v1.0.0");
 
         assert_eq!(event.commit_hash, "v1.0.0");
@@ -551,7 +551,7 @@ mod tests {
 
     #[test]
     fn test_create_trigger_event_empty_commit() {
-        let repo_id = gitforce_common::RepoId::new();
+        let repo_id = gitforge_common::RepoId::new();
         let event = create_trigger_event(repo_id, "", "refs/heads/main");
 
         assert_eq!(event.commit_hash, "");
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn test_pipeline_cache_multiple_different_repos() {
         let mut cache: PipelineCache = HashMap::new();
-        let repos: Vec<_> = (0..5).map(|_| gitforce_common::RepoId::new()).collect();
+        let repos: Vec<_> = (0..5).map(|_| gitforge_common::RepoId::new()).collect();
 
         for (i, repo_id) in repos.iter().enumerate() {
             let pipeline = create_default_pipeline(&format!("repo{}", i));
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn test_pipeline_cache_insert_same_repo_updates() {
         let mut cache: PipelineCache = HashMap::new();
-        let repo_id = gitforce_common::RepoId::new();
+        let repo_id = gitforge_common::RepoId::new();
 
         let pipeline1 = create_default_pipeline("repo1");
         let pipeline2 = create_default_pipeline("repo2");

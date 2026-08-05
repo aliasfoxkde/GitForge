@@ -87,11 +87,11 @@ name = "api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "gitforce-api",
- "gitforce-common",
- "gitforce-db",
- "gitforce-events",
- "gitforce-process",
+ "gitforge-api",
+ "gitforge-common",
+ "gitforge-db",
+ "gitforge-events",
+ "gitforge-process",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -415,12 +415,12 @@ dependencies = [
  "anyhow",
  "axum",
  "futures",
- "gitforce-ci",
- "gitforce-common",
- "gitforce-db",
- "gitforce-events",
- "gitforce-process",
- "gitforce-scheduler",
+ "gitforge-ci",
+ "gitforge-common",
+ "gitforge-db",
+ "gitforge-events",
+ "gitforge-process",
+ "gitforge-scheduler",
  "tokio",
  "tower",
  "tower-http",
@@ -1125,11 +1125,11 @@ dependencies = [
  "anyhow",
  "axum",
  "futures",
- "gitforce-common",
- "gitforce-core",
- "gitforce-db",
- "gitforce-events",
- "gitforce-process",
+ "gitforge-common",
+ "gitforge-core",
+ "gitforge-db",
+ "gitforge-events",
+ "gitforge-process",
  "sha2 0.11.0",
  "tokio",
  "tower",
@@ -1152,7 +1152,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-ai"
+name = "gitforge-ai"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1166,7 +1166,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-api"
+name = "gitforge-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1174,12 +1174,12 @@ dependencies = [
  "axum",
  "bcrypt",
  "chrono",
- "gitforce-ci",
- "gitforce-common",
- "gitforce-db",
- "gitforce-events",
- "gitforce-scheduler",
- "gitforce-storage",
+ "gitforge-ci",
+ "gitforge-common",
+ "gitforge-db",
+ "gitforge-events",
+ "gitforge-scheduler",
+ "gitforge-storage",
  "hyper",
  "jsonwebtoken",
  "prometheus",
@@ -1196,7 +1196,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-build"
+name = "gitforge-build"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1204,7 +1204,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "gitforce-process",
+ "gitforge-process",
  "serde",
  "serde_json",
  "tempfile",
@@ -1215,16 +1215,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-ci"
+name = "gitforge-ci"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "futures",
- "gitforce-common",
- "gitforce-db",
- "gitforce-events",
+ "gitforge-common",
+ "gitforge-db",
+ "gitforge-events",
  "lazy_static",
  "serde",
  "serde_json",
@@ -1236,7 +1236,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-cli"
+name = "gitforge-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1244,7 +1244,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
- "gitforce-common",
+ "gitforge-common",
  "mockito",
  "reqwest 0.13.4",
  "rpassword",
@@ -1258,7 +1258,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-common"
+name = "gitforge-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1272,7 +1272,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-core"
+name = "gitforge-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1281,9 +1281,9 @@ dependencies = [
  "chrono",
  "futures",
  "git2",
- "gitforce-common",
- "gitforce-db",
- "gitforce-events",
+ "gitforge-common",
+ "gitforge-db",
+ "gitforge-events",
  "hex",
  "serde",
  "sha2 0.11.0",
@@ -1295,12 +1295,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-db"
+name = "gitforge-db"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "gitforce-common",
+ "gitforge-common",
  "serde",
  "serde_json",
  "sqlx",
@@ -1311,14 +1311,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-events"
+name = "gitforge-events"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "futures",
- "gitforce-common",
+ "gitforge-common",
  "hex",
  "reqwest 0.13.4",
  "serde",
@@ -1331,7 +1331,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-process"
+name = "gitforge-process"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -1342,11 +1342,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-review"
+name = "gitforge-review"
 version = "0.1.0"
 dependencies = [
  "git2",
- "gitforce-ai",
+ "gitforge-ai",
  "once_cell",
  "regex",
  "thiserror 2.0.19",
@@ -1354,17 +1354,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-runner"
+name = "gitforge-runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "futures",
- "gitforce-common",
- "gitforce-db",
- "gitforce-sandbox",
- "gitforce-storage",
+ "gitforge-common",
+ "gitforge-db",
+ "gitforge-sandbox",
+ "gitforge-storage",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -1375,7 +1375,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-sandbox"
+name = "gitforge-sandbox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1384,7 +1384,7 @@ dependencies = [
  "chrono",
  "futures",
  "futures-util",
- "gitforce-common",
+ "gitforge-common",
  "serde",
  "thiserror 2.0.19",
  "tokio",
@@ -1393,7 +1393,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-scheduler"
+name = "gitforge-scheduler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1401,8 +1401,8 @@ dependencies = [
  "axum",
  "chrono",
  "futures",
- "gitforce-common",
- "gitforce-db",
+ "gitforge-common",
+ "gitforge-db",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -1413,7 +1413,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforce-storage"
+name = "gitforge-storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1421,7 +1421,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
- "gitforce-common",
+ "gitforge-common",
  "hex",
  "serde",
  "serde_json",
@@ -2864,12 +2864,12 @@ name = "runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "gitforce-common",
- "gitforce-db",
- "gitforce-process",
- "gitforce-runner",
- "gitforce-sandbox",
- "gitforce-storage",
+ "gitforge-common",
+ "gitforge-db",
+ "gitforge-process",
+ "gitforge-runner",
+ "gitforge-sandbox",
+ "gitforge-storage",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -10,12 +10,12 @@ name = "runner"
 path = "src/main.rs"
 
 [dependencies]
-gitforce-common = { path = "../../crates/gitforce-common" }
-gitforce-db = { path = "../../crates/gitforce-db" }
-gitforce-runner = { path = "../../crates/gitforce-runner" }
-gitforce-sandbox = { path = "../../crates/gitforce-sandbox" }
-gitforce-storage = { path = "../../crates/gitforce-storage" }
-gitforce-process = { path = "../../crates/gitforce-process" }
+gitforge-common = { path = "../../crates/gitforge-common" }
+gitforge-db = { path = "../../crates/gitforge-db" }
+gitforge-runner = { path = "../../crates/gitforge-runner" }
+gitforge-sandbox = { path = "../../crates/gitforge-sandbox" }
+gitforge-storage = { path = "../../crates/gitforge-storage" }
+gitforge-process = { path = "../../crates/gitforge-process" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

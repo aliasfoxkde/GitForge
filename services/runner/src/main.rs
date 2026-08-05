@@ -2,7 +2,7 @@
 //!
 //! Main entry point for the runner agent service.
 
-use gitforce_runner::{JobExecutor, RunnerAgent, RunnerConfig};
+use gitforge_runner::{JobExecutor, RunnerAgent, RunnerConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("starting GitForce Runner Agent");
 
     // Initialize process supervision (subreaper + SIGCHLD) to prevent zombies
-    if let Err(e) = gitforce_process::init() {
+    if let Err(e) = gitforge_process::init() {
         tracing::warn!("failed to initialize process supervision: {}", e);
     }
 
@@ -196,6 +196,6 @@ mod tests {
     #[test]
     fn test_runner_service_config_defaults() {
         // Test that RunnerConfig::default() works - just verify it doesn't panic
-        let _config = gitforce_runner::RunnerConfig::default();
+        let _config = gitforge_runner::RunnerConfig::default();
     }
 }
