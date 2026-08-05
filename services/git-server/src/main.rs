@@ -14,11 +14,12 @@ use gitforge_common::RepoId;
 use gitforge_core::git_protocol::{http::HttpGitHandler, GitProtocolHandler};
 use gitforge_core::{FileStorageBackend, RepoService, StorageBackend};
 use gitforge_events::{EventBus, InMemoryEventBus};
+use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
 use sha2::{Digest, Sha256};
+#[allow(unused_imports)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::signal;
 use tokio::time::timeout;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -269,39 +270,9 @@ pub fn get_git_root() -> String {
     std::env::var("GIT_ROOT").unwrap_or_else(|_| "/var/lib/gitforge/repos".to_string())
 }
 
-/// Create a shutdown flag
-pub fn create_shutdown_flag() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(false))
-}
-
-/// Spawn the shutdown signal handler (Unix-only)
-#[cfg(unix)]
-pub fn spawn_shutdown_handler(shutdown_flag: Arc<AtomicBool>) {
-    tokio::spawn(async move {
-        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
-        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt()).unwrap();
-
-        tokio::select! {
-            _ = sigterm.recv() => {
-                tracing::info!("received SIGTERM, initiating graceful shutdown...");
-            }
-            _ = sigint.recv() => {
-                tracing::info!("received SIGINT, initiating graceful shutdown...");
-            }
-        }
-        shutdown_flag.store(true, Ordering::SeqCst);
-    });
-}
-
-/// Spawn the shutdown signal handler (Windows stub)
-#[cfg(windows)]
-pub fn spawn_shutdown_handler(_shutdown_flag: Arc<AtomicBool>) {}
-
 /// Create the shutdown future that waits for shutdown signal
 pub async fn create_shutdown_future(shutdown: Arc<AtomicBool>) {
-    while !shutdown.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    wait_for_shutdown(shutdown).await;
 }
 
 /// Perform graceful shutdown delay
