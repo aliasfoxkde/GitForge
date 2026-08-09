@@ -3,9 +3,9 @@
 //! These tests verify the scheduler's internal logic.
 //! Note: HTTP route tests are limited due to issues with state passing in the router setup.
 
-use gitforce_scheduler::{Scheduler, Priority};
-use gitforce_common::{JobId, PipelineRunId, RepoId, RunnerId};
-use gitforce_db::models::Runner;
+use gitforge_scheduler::{Scheduler, Priority};
+use gitforge_common::{JobId, PipelineRunId, RepoId, RunnerId};
+use gitforge_db::models::Runner;
 use crate::integration_test_helpers::*;
 
 /// Test scheduler job enqueuing
@@ -55,7 +55,7 @@ async fn test_scheduler_cancel() {
 async fn test_scheduler_register_runner() {
     let scheduler = Scheduler::new();
 
-    let runner = Runner::new("test-runner".to_string(), gitforce_db::models::RunnerType::Docker, 2);
+    let runner = Runner::new("test-runner".to_string(), gitforge_db::models::RunnerType::Docker, 2);
     let runner_id = runner.id;
 
     scheduler.register_runner(runner).await;
@@ -77,7 +77,7 @@ async fn test_scheduler_register_runner() {
 async fn test_scheduler_heartbeat() {
     let scheduler = Scheduler::new();
 
-    let runner = Runner::new("test-runner".to_string(), gitforce_db::models::RunnerType::Docker, 2);
+    let runner = Runner::new("test-runner".to_string(), gitforge_db::models::RunnerType::Docker, 2);
     let runner_id = runner.id;
 
     scheduler.register_runner(runner).await;
@@ -90,7 +90,7 @@ async fn test_scheduler_heartbeat() {
 async fn test_scheduler_runner_offline() {
     let scheduler = Scheduler::new();
 
-    let runner = Runner::new("test-runner".to_string(), gitforce_db::models::RunnerType::Docker, 2);
+    let runner = Runner::new("test-runner".to_string(), gitforge_db::models::RunnerType::Docker, 2);
     let runner_id = runner.id;
 
     scheduler.register_runner(runner).await;
@@ -125,8 +125,8 @@ async fn test_scheduler_cancel_nonexistent() {
 async fn test_scheduler_multiple_runners() {
     let scheduler = Scheduler::new();
 
-    let runner1 = Runner::new("runner-1".to_string(), gitforce_db::models::RunnerType::Docker, 4);
-    let runner2 = Runner::new("runner-2".to_string(), gitforce_db::models::RunnerType::Firecracker, 2);
+    let runner1 = Runner::new("runner-1".to_string(), gitforge_db::models::RunnerType::Docker, 4);
+    let runner2 = Runner::new("runner-2".to_string(), gitforge_db::models::RunnerType::Firecracker, 2);
 
     scheduler.register_runner(runner1.clone()).await;
     scheduler.register_runner(runner2.clone()).await;

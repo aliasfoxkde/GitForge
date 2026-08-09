@@ -3,10 +3,10 @@
 //! These tests verify the CI engine's pipeline orchestration,
 //! DAG building, job state management, and pipeline lifecycle.
 
-use gitforce_common::{
+use gitforge_common::{
     JobId, JobStatus, PipelineId, PipelineRunId, PipelineStatus, RepoId, RunnerId,
 };
-use gitforce_ci::{
+use gitforge_ci::{
     CiEngine, DagBuilder, JobGraph, JobNode, JobStateMachine, PipelineDefinition,
     PipelineExecutor, PipelineTriggerEvent, TriggerType, JobDefinition, StepDefinition,
 };

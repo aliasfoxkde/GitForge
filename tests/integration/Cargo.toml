@@ -7,15 +7,15 @@ edition = "2021"
 
 [dependencies]
 # Workspace crates
-gitforce-common = { path = "../../crates/gitforce-common" }
-gitforce-db = { path = "../../crates/gitforce-db" }
-gitforce-ci = { path = "../../crates/gitforce-ci" }
-gitforce-scheduler = { path = "../../crates/gitforce-scheduler" }
-gitforce-runner = { path = "../../crates/gitforce-runner" }
-gitforce-api = { path = "../../crates/gitforce-api" }
+gitforge-common = { path = "../../crates/gitforge-common" }
+gitforge-db = { path = "../../crates/gitforge-db" }
+gitforge-ci = { path = "../../crates/gitforge-ci" }
+gitforge-scheduler = { path = "../../crates/gitforge-scheduler" }
+gitforge-runner = { path = "../../crates/gitforge-runner" }
+gitforge-api = { path = "../../crates/gitforge-api" }
 
 # External dependencies
-axum = "0.7"
+axum = "0.8"
 tower = "0.5"
 tokio = { version = "1.40", features = ["full"] }
 serde_json = "1.0"

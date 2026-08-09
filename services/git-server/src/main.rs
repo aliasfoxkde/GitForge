@@ -1,4 +1,4 @@
-//! GitForce Git Server
+//! GitForge Git Server
 //!
 //! Main entry point for the Git SSH/HTTP server.
 
@@ -11,7 +11,7 @@ use axum::{
     Router,
 };
 use gitforge_common::RepoId;
-use gitforge_core::git_protocol::{http::HttpGitHandler, GitProtocolHandler};
+use gitforge_core::git_protocol::{http::HttpGitHandler, ssh::SshGitHandler, GitProtocolHandler};
 use gitforge_core::{FileStorageBackend, RepoService, StorageBackend};
 use gitforge_events::{EventBus, InMemoryEventBus};
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
@@ -28,6 +28,12 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     http_handler: Arc<HttpGitHandler<FileStorageBackend>>,
+    storage: Arc<FileStorageBackend>,
+}
+
+/// SSH server configuration
+struct SshServerConfig {
+    port: u16,
     storage: Arc<FileStorageBackend>,
 }
 
@@ -86,14 +92,14 @@ async fn main() -> anyhow::Result<()> {
     // Build router for Git HTTP protocol
     let app = Router::new()
         .route("/health", get(health_check))
-        .route("/git-upload-pack/:owner/:repo", get(git_upload_pack))
+        .route("/git-upload-pack/{owner}/{repo}", get(git_upload_pack))
         .route(
-            "/git-upload-pack/:owner/:repo/*path",
+            "/git-upload-pack/{owner}/{repo}/{*path}",
             get(git_upload_pack_path),
         )
-        .route("/git-receive-pack/:owner/:repo", post(git_receive_pack))
+        .route("/git-receive-pack/{owner}/{repo}", post(git_receive_pack))
         .route(
-            "/git-receive-pack/:owner/:repo/*path",
+            "/git-receive-pack/{owner}/{repo}/{*path}",
             post(git_receive_pack_path),
         )
         .layer(TraceLayer::new_for_http())
@@ -111,13 +117,19 @@ async fn main() -> anyhow::Result<()> {
         axum::serve(http_listener, app).await.unwrap();
     });
 
-    // SSH server
-    // Note: SSH Git protocol requires russh integration which has API compatibility issues
-    // with the current crate version. SSH Git support is planned for a future release.
-    tracing::info!(
-        "Git SSH server on port {} (SSH support pending russh API resolution)",
-        ssh_port
-    );
+    // Start SSH server for Git operations
+    let ssh_config = SshServerConfig {
+        port: ssh_port,
+        storage: storage.clone(),
+    };
+    let shutdown = create_shutdown_flag();
+    let shutdown_flag = shutdown.clone();
+
+    let ssh_handle = tokio::spawn(async move {
+        if let Err(e) = run_ssh_server(ssh_config, shutdown_flag).await {
+            tracing::error!("SSH server error: {}", e);
+        }
+    });
 
     // Set up shutdown handling
     let shutdown = create_shutdown_flag();
@@ -134,8 +146,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("shutting down Git Server");
 
-    // Cancel HTTP server
+    // Cancel HTTP and SSH servers
     http_handle.abort();
+    ssh_handle.abort();
 
     // Graceful shutdown delay
     graceful_shutdown_delay().await;
@@ -282,6 +295,204 @@ pub async fn graceful_shutdown_delay() {
     })
     .await
     .ok();
+}
+
+/// Run the SSH server for Git operations
+async fn run_ssh_server(config: SshServerConfig, shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
+    use std::net::SocketAddr;
+
+    tracing::info!("starting Git SSH server on port {}", config.port);
+
+    // Create TCP listener
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("Git SSH server listening on {}", addr);
+
+    // Create SSH handler wrapped in Arc for sharing across connections
+    let ssh_handler = Arc::new(SshGitHandler::new((*config.storage).clone()));
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            tracing::info!("SSH server shutting down");
+            break;
+        }
+
+        // Accept connection with timeout to allow checking shutdown flag
+        let accept_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            listener.accept(),
+        )
+        .await;
+
+        match accept_result {
+            Ok(Ok((stream, peer_addr))) => {
+                tracing::debug!("SSH connection from {}", peer_addr);
+
+                // Clone handler and storage for this connection
+                let handler = ssh_handler.clone();
+                let storage = config.storage.clone();
+
+                // Handle connection in blocking task since ssh2 is sync
+                tokio::task::spawn_blocking(move || {
+                    handle_ssh_connection(stream, handler, storage);
+                });
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("SSH accept error: {}", e);
+            }
+            Err(_) => {
+                // Timeout - continue loop to check shutdown flag
+                continue;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle a single SSH connection
+#[allow(clippy::too_many_lines)]
+fn handle_ssh_connection(
+    stream: tokio::net::TcpStream,
+    handler: Arc<SshGitHandler<FileStorageBackend>>,
+    _storage: Arc<FileStorageBackend>,
+) {
+    use std::io::{Read, Write};
+
+    // Convert tokio TcpStream to blocking TcpStream
+    let mut stream = match stream.into_std() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("failed to convert TcpStream: {}", e);
+            return;
+        }
+    };
+
+    // Create ssh2 session
+    let mut session = match ssh2::Session::new() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("failed to create SSH session: {}", e);
+            return;
+        }
+    };
+
+    // Set blocking mode for ssh2
+    session.set_blocking(true);
+
+    // Handshake
+    if let Err(e) = session.handshake() {
+        tracing::error!("SSH handshake failed: {}", e);
+        return;
+    }
+
+    // Check if peer is authenticated - Git over SSH typically uses public-key auth
+    // For MVP, we'll accept None auth and skip detailed auth verification
+    let authenticated = session.authenticated();
+    if !authenticated {
+        tracing::warn!("SSH session not authenticated - Git operations may fail");
+    }
+
+    // Accept a single channel for git command
+    match session.channel_session() {
+        Ok(mut channel) => {
+            // Request exec to run the git command
+            // Read the command that was passed
+            let mut cmd_buf = [0u8; 4096];
+            let cmd_len = match channel.read(&mut cmd_buf) {
+                Ok(len) => len,
+                Err(e) => {
+                    tracing::error!("failed to read from channel: {}", e);
+                    return;
+                }
+            };
+
+            if cmd_len == 0 {
+                return;
+            }
+
+            let cmd = String::from_utf8_lossy(&cmd_buf[..cmd_len]).to_string();
+            tracing::debug!("received SSH command: {}", cmd);
+
+            // Parse the git command (e.g., "git-upload-pack /owner/repo.git" or just "git-upload-pack")
+            let parts: Vec<&str> = cmd.split_whitespace().collect();
+            if parts.is_empty() {
+                tracing::warn!("empty SSH command");
+                let _ = channel.write_all(b"empty command\n");
+                channel.wait_close().ok();
+                return;
+            }
+
+            let git_cmd = parts[0];
+            let repo_path = if parts.len() > 1 {
+                parts[1].trim_start_matches('/')
+            } else {
+                ""
+            };
+
+            // Parse owner/repo from path
+            let path_parts: Vec<&str> = repo_path.split('/').collect();
+            if path_parts.len() < 2 {
+                tracing::warn!("invalid repo path: {}", repo_path);
+                let _ = channel.write_all(b"invalid repository path\n");
+                channel.wait_close().ok();
+                return;
+            }
+
+            let owner = path_parts[0];
+            let repo = path_parts[1].trim_end_matches(".git").trim_end_matches("/");
+
+            // Derive repo ID
+            let input = format!("{}/{}", owner, repo);
+            let mut hasher = Sha256::new();
+            hasher.update(input.as_bytes());
+            let result = hasher.finalize();
+            let bytes: [u8; 16] = result[..16].try_into().unwrap();
+            let uuid = Uuid::from_bytes(bytes);
+            let repo_id = RepoId::from(uuid);
+
+            // Process based on command
+            let response = match git_cmd {
+                "git-upload-pack" => {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(handler.upload_pack(repo_id, vec![]))
+                }
+                "git-receive-pack" => {
+                    // For receive-pack, we need to read the request body
+                    let mut input = Vec::new();
+                    std::io::Read::read_to_end(&mut stream, &mut input).ok();
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(handler.receive_pack(repo_id, input))
+                }
+                _ => {
+                    Err(gitforge_common::Error::git(format!("unsupported command: {}", git_cmd)))
+                }
+            };
+
+            match response {
+                Ok(data) => {
+                    let _ = channel.write_all(&data);
+                }
+                Err(e) => {
+                    tracing::error!("git command failed: {}", e);
+                    let _ = channel.write_all(format!("error: {}\n", e).as_bytes());
+                }
+            }
+
+            channel.wait_close().ok();
+        }
+        Err(e) => {
+            tracing::error!("failed to open channel: {}", e);
+        }
+    }
+
+    let _ = session.disconnect(None, "closing", None);
 }
 
 #[cfg(test)]
