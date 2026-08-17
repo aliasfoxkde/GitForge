@@ -327,6 +327,20 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     }
                 }
             },
+            "/artifacts/{id}/content": {
+                "get": {
+                    "tags": ["artifacts"],
+                    "summary": "Download artifact bytes",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "200": {"description": "Artifact bytes"},
+                        "401": {"description": "Authentication required"},
+                        "404": {"description": "Artifact not found"}
+                    }
+                }
+            },
             "/jobs/{job_id}/artifacts": {
                 "get": {
                     "tags": ["artifacts"],

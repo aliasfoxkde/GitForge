@@ -3,7 +3,7 @@
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
 use gitforge_common::{JobId, PipelineRunId, RepoId, RunnerId};
-use gitforge_db::models::{Job as DbJob, Runner};
+use gitforge_db::models::{Job as DbJob, PipelineRun as DbPipelineRun, Runner};
 use gitforge_db::Pool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,6 +36,13 @@ pub enum SchedulerEvent {
     JobAssigned { job_id: JobId, runner_id: RunnerId },
     /// No runner available for job
     NoRunnerAvailable { job_id: JobId },
+    /// Runner submitted a terminal job receipt.
+    JobCompleted {
+        job_id: JobId,
+        pipeline_run_id: PipelineRunId,
+        runner_id: RunnerId,
+        success: bool,
+    },
 }
 
 /// Scheduler state
@@ -44,6 +51,18 @@ pub struct SchedulerState {
     pub queue: JobQueue,
     pub runners: HashMap<RunnerId, Runner>,
     pub job_assignments: HashMap<JobId, RunnerId>,
+    pub assigned_jobs: HashMap<JobId, (RunnerId, PipelineRunId)>,
+    pub job_definitions: HashMap<JobId, JobExecutionDefinition>,
+    pub completed_receipts: HashMap<JobId, String>,
+}
+
+/// The scheduler-facing portion of a CI job definition. It is deliberately
+/// transport-neutral so the runner receives exactly the commands selected by
+/// the CI engine rather than reconstructing or guessing them.
+#[derive(Debug, Clone)]
+pub struct JobExecutionDefinition {
+    pub commands: Vec<String>,
+    pub working_dir: Option<String>,
 }
 
 impl Default for SchedulerState {
@@ -58,6 +77,9 @@ impl SchedulerState {
             queue: JobQueue::new(),
             runners: HashMap::new(),
             job_assignments: HashMap::new(),
+            assigned_jobs: HashMap::new(),
+            job_definitions: HashMap::new(),
+            completed_receipts: HashMap::new(),
         }
     }
 
@@ -128,6 +150,32 @@ impl Scheduler {
         self.db_pool.is_some()
     }
 
+    /// Read a durable pipeline run for the CI status adapter.
+    pub async fn get_pipeline_run(
+        &self,
+        run_id: PipelineRunId,
+    ) -> anyhow::Result<Option<DbPipelineRun>> {
+        let Some(pool) = &self.db_pool else {
+            return Ok(None);
+        };
+        gitforge_db::queries::PipelineRunQueries::get(pool, run_id)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    }
+
+    /// Read durable jobs and their bounded terminal receipts for a pipeline.
+    pub async fn get_pipeline_run_jobs(
+        &self,
+        run_id: PipelineRunId,
+    ) -> anyhow::Result<Vec<gitforge_db::models::Job>> {
+        let Some(pool) = &self.db_pool else {
+            return Ok(Vec::new());
+        };
+        gitforge_db::queries::JobQueries::list_by_run(pool, run_id)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    }
+
     /// Subscribe to scheduler events
     pub fn subscribe(&self) -> broadcast::Receiver<SchedulerEvent> {
         self.event_tx.subscribe()
@@ -135,14 +183,35 @@ impl Scheduler {
 
     /// Enqueue a job
     pub async fn enqueue(&self, job_id: JobId, pipeline_run_id: PipelineRunId, repo_id: RepoId) {
+        self.enqueue_with_definition(job_id, pipeline_run_id, repo_id, Vec::new(), None)
+            .await;
+    }
+
+    /// Enqueue a job together with its executable definition.
+    pub async fn enqueue_with_definition(
+        &self,
+        job_id: JobId,
+        pipeline_run_id: PipelineRunId,
+        repo_id: RepoId,
+        commands: Vec<String>,
+        working_dir: Option<String>,
+    ) {
         let job = QueuedJob::new(job_id, pipeline_run_id, repo_id);
         let mut state = self.state.write().await;
         state.queue.enqueue(job);
+        state.job_definitions.insert(
+            job_id,
+            JobExecutionDefinition {
+                commands: commands.clone(),
+                working_dir: working_dir.clone(),
+            },
+        );
         tracing::debug!("job {} enqueued", job_id);
 
         // Persist to database if available
         if let Some(pool) = &self.db_pool {
-            let db_job = DbJob::new(pipeline_run_id, format!("job-{}", job_id));
+            let mut db_job = DbJob::new(pipeline_run_id, format!("job-{}", job_id));
+            db_job.id = job_id;
             if let Err(e) = gitforge_db::queries::JobQueries::create(pool, &db_job).await {
                 tracing::error!("failed to persist job to DB: {}", e);
             }
@@ -150,6 +219,16 @@ impl Scheduler {
                 gitforge_db::queries::JobQueries::update_status(pool, job_id, "queued").await
             {
                 tracing::error!("failed to update job status in DB: {}", e);
+            }
+            if let Err(e) = gitforge_db::queries::JobQueries::set_definition(
+                pool,
+                job_id,
+                &commands,
+                working_dir.as_deref(),
+            )
+            .await
+            {
+                tracing::error!("failed to persist job definition: {}", e);
             }
         }
     }
@@ -176,6 +255,7 @@ impl Scheduler {
         }
         // Also remove assignment if exists
         state.job_assignments.remove(&job_id);
+        state.assigned_jobs.remove(&job_id);
     }
 
     /// Register a runner
@@ -183,6 +263,14 @@ impl Scheduler {
         let mut state = self.state.write().await;
         let runner_id = runner.id;
         state.add_runner(runner);
+        if let Some(pool) = &self.db_pool {
+            if let Some(runner) = state.runners.get(&runner_id) {
+                if let Err(error) = gitforge_db::queries::RunnerQueries::create(pool, runner).await
+                {
+                    tracing::error!("failed to persist runner {}: {}", runner_id, error);
+                }
+            }
+        }
         tracing::info!("runner {} registered", runner_id);
     }
 
@@ -204,6 +292,94 @@ impl Scheduler {
         }
     }
 
+    /// Mark runners as offline if they have not sent a heartbeat within the threshold.
+    /// Returns the number of runners marked offline.
+    pub async fn mark_stale_runners_offline(&self, heartbeat_timeout_secs: i64) -> usize {
+        let stale_threshold =
+            chrono::Utc::now() - chrono::Duration::seconds(heartbeat_timeout_secs);
+        let mut marked_offline = 0;
+
+        let db_pool = self.db_pool.clone();
+        let mut state = self.state.write().await;
+        for runner in state.runners.values_mut() {
+            if runner.status == "online" {
+                if let Some(last_heartbeat) = runner.last_heartbeat {
+                    if last_heartbeat < stale_threshold {
+                        runner.status = "offline".to_string();
+                        tracing::warn!(
+                            "runner {} marked offline: last heartbeat {} seconds ago",
+                            runner.id,
+                            heartbeat_timeout_secs
+                        );
+                        marked_offline += 1;
+
+                        // Persist to DB if available
+                        if let Some(pool) = &db_pool {
+                            let _ = gitforge_db::queries::RunnerQueries::update_status(
+                                pool,
+                                runner.id.clone(),
+                                "offline",
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+
+        marked_offline
+    }
+
+    /// Re-enqueue jobs that were assigned to an offline runner so they can be
+    /// picked up by another runner. Returns the number of jobs re-enqueued.
+    pub async fn requeue_jobs_for_offline_runner(&self, runner_id: RunnerId) -> usize {
+        let jobs_to_requeue = {
+            let state = self.state.read().await;
+            state
+                .assigned_jobs
+                .iter()
+                .filter(|(_, (rid, _))| *rid == runner_id)
+                .map(|(job_id, (_, pipeline_run_id))| (*job_id, *pipeline_run_id))
+                .collect::<Vec<_>>()
+        };
+
+        if jobs_to_requeue.is_empty() {
+            return 0;
+        }
+
+        let mut requeued = 0;
+        let db_pool = self.db_pool.clone();
+        let mut state = self.state.write().await;
+
+        for (job_id, pipeline_run_id) in &jobs_to_requeue {
+            // Remove from assignments
+            state.job_assignments.remove(job_id);
+            state.assigned_jobs.remove(job_id);
+
+            // Re-enqueue the job with the original pipeline run ID
+            // Use a dummy repo_id since we don't store it per-job
+            state.queue.enqueue(crate::queue::QueuedJob::new(
+                *job_id,
+                *pipeline_run_id,
+                gitforge_common::RepoId::new(),
+            ));
+            tracing::info!(
+                "re-enqueued job {} after runner {} went offline",
+                job_id,
+                runner_id
+            );
+            requeued += 1;
+
+            // Persist status change to DB
+            if let Some(pool) = &db_pool {
+                let _ =
+                    gitforge_db::queries::JobQueries::update_status(pool, *job_id, "queued").await;
+            }
+        }
+
+        requeued
+    }
+
     /// Try to assign jobs to available runners
     pub async fn process_queue(&self) {
         let mut state = self.state.write().await;
@@ -223,6 +399,7 @@ impl Scheduler {
             };
 
             let job_id = job.job_id;
+            let pipeline_run_id = job.pipeline_run_id;
 
             // Select runner using policy
             let runner_id = self.policy.select_runner(job_id, &runners).await;
@@ -232,6 +409,7 @@ impl Scheduler {
                     // Dequeue and assign (JobId and RunnerId are Copy types)
                     state.queue.dequeue();
                     state.job_assignments.insert(job_id, r_id);
+                    state.assigned_jobs.insert(job_id, (r_id, pipeline_run_id));
                     tracing::info!("assigned job {} to runner {}", job_id, r_id);
                     processed += 1;
 
@@ -313,18 +491,65 @@ impl Scheduler {
     pub async fn get_assigned_jobs(&self) -> Vec<(JobId, RunnerId, PipelineRunId)> {
         let state = self.state.read().await;
         state
-            .job_assignments
+            .assigned_jobs
             .iter()
-            .filter_map(|(job_id, runner_id)| {
-                // Find the queued job to get pipeline_run_id
+            .map(|(job_id, (runner_id, run_id))| (*job_id, *runner_id, *run_id))
+            .collect()
+    }
+
+    /// Get assigned jobs with their executable definition.
+    pub async fn get_assigned_job_details(
+        &self,
+    ) -> Vec<(JobId, RunnerId, PipelineRunId, JobExecutionDefinition)> {
+        let state = self.state.read().await;
+        state
+            .assigned_jobs
+            .iter()
+            .filter_map(|(job_id, (runner_id, run_id))| {
                 state
-                    .queue
-                    .all()
-                    .iter()
-                    .find(|j| j.job_id == *job_id)
-                    .map(|j| (j.job_id, *runner_id, j.pipeline_run_id))
+                    .job_definitions
+                    .get(job_id)
+                    .map(|definition| (*job_id, *runner_id, *run_id, definition.clone()))
             })
             .collect()
+    }
+
+    /// Record a terminal receipt and persist it when a scheduler DB exists.
+    pub async fn complete_job(
+        &self,
+        job_id: JobId,
+        success: bool,
+        result_json: String,
+    ) -> anyhow::Result<()> {
+        let status = if success { "succeeded" } else { "failed" };
+        let assignment = {
+            let state = self.state.read().await;
+            state.assigned_jobs.get(&job_id).copied()
+        };
+        if let Some(pool) = &self.db_pool {
+            gitforge_db::queries::JobQueries::complete(pool, job_id, status, &result_json)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+        let mut state = self.state.write().await;
+        if let Some(existing) = state.completed_receipts.get(&job_id) {
+            if existing == &result_json {
+                return Ok(());
+            }
+            anyhow::bail!("job {} already has a conflicting receipt", job_id);
+        }
+        state.completed_receipts.insert(job_id, result_json);
+        state.job_assignments.remove(&job_id);
+        state.assigned_jobs.remove(&job_id);
+        if let Some((runner_id, pipeline_run_id)) = assignment {
+            let _ = self.event_tx.send(SchedulerEvent::JobCompleted {
+                job_id,
+                pipeline_run_id,
+                runner_id,
+                success,
+            });
+        }
+        Ok(())
     }
 }
 

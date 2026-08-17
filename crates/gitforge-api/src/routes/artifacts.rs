@@ -3,9 +3,10 @@
 use crate::auth::ApiAuth;
 use crate::server::ErrorResponse;
 use axum::{
+    body::Body,
     extract::{Extension, Path},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -31,6 +32,7 @@ pub fn artifact_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/artifacts", get(list_artifacts))
         .route("/artifacts/{id}", get(get_artifact).delete(delete_artifact))
+        .route("/artifacts/{id}/content", get(get_artifact_content))
         .route("/jobs/{job_id}/artifacts", get(get_job_artifacts))
 }
 
@@ -137,6 +139,47 @@ async fn get_artifact(
                 }
             }
         }
+    }
+}
+
+/// Download artifact bytes after authentication.
+async fn get_artifact_content(
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    Extension(storage): Extension<Arc<FileStorage>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(error) = extract_user(&auth, &headers) {
+        return error.into_response();
+    }
+    let artifact_id = match Uuid::parse_str(&id) {
+        Ok(uuid) => ArtifactId::from(uuid),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "invalid_id".to_string(),
+                    message: "Invalid artifact ID format".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
+    match storage.get(artifact_id).await {
+        Ok(data) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/octet-stream")
+            .header("content-length", data.len())
+            .body(Body::from(data))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "not_found".to_string(),
+                message: "Artifact not found".to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 

@@ -1,10 +1,18 @@
 //! Job executor with container pooling
 
-use gitforge_common::{JobId, Result};
+use gitforge_common::{JobId, PipelineRunId, RepoId, Result};
 use gitforge_sandbox::{DockerSandbox, Sandbox, SandboxInstance, SandboxLimits, StepResult};
+use gitforge_storage::{
+    Artifact, ArtifactReceipt, ArtifactStore, FileJobLogStore, FileStorage, JobReceipt,
+    LogReceipt, ReceiptStatus, MAX_LOG_BYTES, RECEIPT_VERSION,
+};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::fs;
 use tokio::sync::RwLock;
+use tokio::time::{timeout, Duration};
 
 /// Default number of pre-warmed containers per image
 const POOL_SIZE: usize = 2;
@@ -18,7 +26,7 @@ pub struct ContainerPool {
 impl ContainerPool {
     /// Create a new container pool
     pub async fn new() -> Result<Self> {
-        let sandbox = DockerSandbox::new().await?;
+        let sandbox = DockerSandbox::connect_required().await?;
         Ok(Self {
             pools: Arc::new(RwLock::new(HashMap::new())),
             sandbox: Arc::new(sandbox),
@@ -51,7 +59,18 @@ impl ContainerPool {
     }
 
     /// Get a container from the pool, creating one if needed
-    pub async fn acquire(&self, job_id: &JobId, image: &str) -> Result<SandboxInstance> {
+    pub async fn acquire(
+        &self,
+        job_id: &JobId,
+        image: &str,
+        workspace_path: Option<&str>,
+    ) -> Result<SandboxInstance> {
+        if workspace_path.is_some() {
+            return self
+                .sandbox
+                .create_with_workspace(*job_id, image, SandboxLimits::default(), workspace_path)
+                .await;
+        }
         let mut pools = self.pools.write().await;
 
         // Try to get from pool
@@ -70,7 +89,18 @@ impl ContainerPool {
     }
 
     /// Return a container to the pool
-    pub async fn release(&self, image: &str, instance: SandboxInstance) {
+    pub async fn release(
+        &self,
+        image: &str,
+        instance: SandboxInstance,
+        workspace_path: Option<&str>,
+    ) {
+        if workspace_path.is_some() {
+            if let Err(error) = self.sandbox.destroy(instance).await {
+                tracing::warn!("failed to destroy workspace container: {}", error);
+            }
+            return;
+        }
         let mut pools = self.pools.write().await;
         let instances = pools.entry(image.to_string()).or_insert_with(Vec::new);
 
@@ -104,19 +134,109 @@ impl ContainerPool {
 }
 
 /// Job executor
+#[allow(clippy::type_complexity)]
 pub struct JobExecutor {
     pool: ContainerPool,
-    active_instances: Arc<RwLock<HashMap<JobId, (String, SandboxInstance)>>>, // job_id -> (image, instance)
+    active_instances:
+        Arc<RwLock<HashMap<JobId, (String, Option<String>, SandboxInstance)>>>, // job_id -> (image, workspace, instance)
+    artifact_storage: Arc<FileStorage>,
+    log_store: Arc<FileJobLogStore>,
 }
 
 impl JobExecutor {
     /// Create a new job executor
     pub async fn new() -> Result<Self> {
         let pool = ContainerPool::new().await?;
+        let storage_root = std::env::var("GITFORGE_ARTIFACT_ROOT")
+            .unwrap_or_else(|_| "/tmp/gitforge-artifacts".to_string());
+        let artifact_storage = FileStorage::new(storage_root.clone()).await?;
+        let log_store = FileJobLogStore::new(&storage_root).await?;
         Ok(Self {
             pool,
             active_instances: Arc::new(RwLock::new(HashMap::new())),
+            artifact_storage: Arc::new(artifact_storage),
+            log_store: Arc::new(log_store),
         })
+    }
+
+    async fn collect_artifacts(
+        &self,
+        job_id: JobId,
+        workspace_path: Option<&str>,
+    ) -> Vec<ArtifactReceipt> {
+        let Some(workspace_path) = workspace_path else {
+            return Vec::new();
+        };
+        let artifact_dir = Path::new(workspace_path).join("artifacts");
+        let mut entries = match fs::read_dir(&artifact_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(error) => {
+                tracing::warn!(%error, path = %artifact_dir.display(), "failed to read artifact directory");
+                return Vec::new();
+            }
+        };
+        let mut receipts = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path: PathBuf = entry.path();
+            let Ok(metadata) = entry.metadata().await else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.len() > gitforge_storage::receipt::MAX_ARTIFACT_BYTES {
+                tracing::warn!(path = %path.display(), "skipping invalid or oversized artifact");
+                continue;
+            }
+            let name = path
+                .strip_prefix(&artifact_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            let Ok(mut artifact) = Artifact::from_file(job_id, name.clone(), &path).await else {
+                continue;
+            };
+            let Ok(data) = fs::read(&path).await else {
+                continue;
+            };
+            artifact.path = path.to_string_lossy().to_string();
+            if let Err(error) = self.artifact_storage.put(&artifact, &data).await {
+                tracing::warn!(%error, path = %path.display(), "failed to persist artifact");
+                continue;
+            }
+            receipts.push(ArtifactReceipt {
+                name,
+                uri: format!("gitforge://artifact/{}", artifact.id),
+                sha256: artifact.checksum,
+                bytes: artifact.size_bytes,
+                media_type: artifact.content_type,
+            });
+        }
+        receipts
+    }
+
+    /// Collect stdout/stderr from step results, bound to max_size, and store as LogReceipt.
+    async fn collect_logs(&self, job_id: JobId, step_results: &[StepResult]) -> Option<LogReceipt> {
+        // Concatenate all stdout and stderr
+        let mut combined = String::new();
+        for (i, sr) in step_results.iter().enumerate() {
+            if !sr.stdout.is_empty() {
+                combined.push_str(&format!("[step {} stdout]\n{}\n", i, sr.stdout));
+            }
+            if !sr.stderr.is_empty() {
+                combined.push_str(&format!("[step {} stderr]\n{}\n", i, sr.stderr));
+            }
+        }
+
+        let data = combined.into_bytes();
+        match self.log_store.bounded_put(job_id, data, MAX_LOG_BYTES).await {
+            Ok(receipt) => {
+                tracing::debug!("stored {} byte log for job {}", receipt.bytes, job_id);
+                Some(receipt)
+            }
+            Err(e) => {
+                tracing::warn!("failed to store job log: {}", e);
+                None
+            }
+        }
     }
 
     /// Pre-warm containers for an image
@@ -127,26 +247,61 @@ impl JobExecutor {
     /// Execute a job
     pub async fn execute(&self, job: ExecutableJob) -> JobResult {
         let job_id = job.job_id; // Copy type
+        let started_at = chrono::Utc::now();
         tracing::info!("executing job {}", job_id);
 
         // Acquire container from pool
-        let instance = match self.pool.acquire(&job_id, &job.image).await {
-            Ok(i) => i,
-            Err(e) => {
+        let acquire_timeout = Duration::from_secs(job.timeout_secs.clamp(5, 60));
+        let instance = match timeout(
+            acquire_timeout,
+            self.pool
+                .acquire(&job_id, &job.image, job.working_dir.as_deref()),
+        )
+        .await
+        {
+            Err(_) => {
+                let completed_at = chrono::Utc::now();
                 return JobResult {
                     job_id,
                     success: false,
                     exit_code: -1,
                     step_results: Vec::new(),
-                    error: Some(format!("failed to create sandbox: {}", e)),
+                    artifacts: Vec::new(),
+                    logs: None,
+                    started_at,
+                    completed_at,
+                    error: Some(format!(
+                        "failed to create sandbox: acquisition timed out after {} seconds",
+                        acquire_timeout.as_secs()
+                    )),
+                    workspace_path: job.working_dir.clone(),
                 };
             }
+            Ok(Err(e)) => {
+                let completed_at = chrono::Utc::now();
+                return JobResult {
+                    job_id,
+                    success: false,
+                    exit_code: -1,
+                    step_results: Vec::new(),
+                    artifacts: Vec::new(),
+                    logs: None,
+                    started_at,
+                    completed_at,
+                    error: Some(format!("failed to create sandbox: {}", e)),
+                    workspace_path: job.working_dir.clone(),
+                };
+            }
+            Ok(Ok(instance)) => instance,
         };
 
         // Store active instance
         {
             let mut instances = self.active_instances.write().await;
-            instances.insert(job_id, (job.image.clone(), instance.clone()));
+            instances.insert(
+                job_id,
+                (job.image.clone(), job.working_dir.clone(), instance.clone()),
+            );
         }
 
         // Execute steps
@@ -158,7 +313,13 @@ impl JobExecutor {
             tracing::debug!("executing step: {}", step.name);
             let cmd = vec!["sh", "-c", &step.run];
 
-            let result = self.pool.sandbox.execute(&instance, &cmd).await;
+            let result = timeout(
+                Duration::from_secs(job.timeout_secs),
+                self.pool.sandbox.execute(&instance, &cmd),
+            )
+            .await
+            .map_err(|_| gitforge_common::Error::timeout("job step timed out"))
+            .and_then(|result| result);
 
             match result {
                 Ok(step_result) => {
@@ -187,14 +348,32 @@ impl JobExecutor {
             }
         }
 
+        // Collect artifacts
+        let artifacts = self
+            .collect_artifacts(job_id, job.working_dir.as_deref())
+            .await;
+
+        // Collect logs
+        let logs = self.collect_logs(job_id, &step_results).await;
+
         // Return container to pool
-        {
+        let released = {
             let mut instances = self.active_instances.write().await;
-            if let Some((image, inst)) = instances.remove(&job_id) {
-                self.pool.release(&image, inst).await;
+            instances.remove(&job_id)
+        };
+        if let Some((image, workspace, inst)) = released {
+            if timeout(
+                Duration::from_secs(30),
+                self.pool.release(&image, inst, workspace.as_deref()),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("timed out cleaning up sandbox for job {}", job_id);
             }
         }
 
+        let completed_at = chrono::Utc::now();
         tracing::info!("job {} completed: success={}", job_id, success);
 
         JobResult {
@@ -202,18 +381,23 @@ impl JobExecutor {
             success,
             exit_code: final_exit_code,
             step_results,
+            artifacts,
+            logs,
+            started_at,
+            completed_at,
             error: if success {
                 None
             } else {
                 Some("job failed".to_string())
             },
+            workspace_path: job.working_dir.clone(),
         }
     }
 
     /// Cancel a running job
     pub async fn cancel(&self, job_id: &JobId) -> Result<()> {
         let instances = self.active_instances.read().await;
-        if let Some((_image, instance)) = instances.get(job_id) {
+        if let Some((_image, _workspace, instance)) = instances.get(job_id) {
             self.pool.sandbox.destroy(instance.clone()).await?;
         }
         Ok(())
@@ -224,6 +408,9 @@ impl JobExecutor {
 #[derive(Debug, Clone)]
 pub struct ExecutableJob {
     pub job_id: JobId,
+    pub pipeline_run_id: PipelineRunId,
+    pub repository_id: Option<RepoId>,
+    pub base_sha: Option<String>,
     pub image: String,
     pub steps: Vec<JobStep>,
     pub env: HashMap<String, String>,
@@ -233,14 +420,17 @@ pub struct ExecutableJob {
 
 impl ExecutableJob {
     /// Create a new executable job
-    pub fn new(job_id: JobId, image: String) -> Self {
+    pub fn new(job_id: JobId, pipeline_run_id: PipelineRunId, image: String) -> Self {
         Self {
             job_id,
+            pipeline_run_id,
+            repository_id: None,
+            base_sha: None,
             image,
             steps: Vec::new(),
             env: HashMap::new(),
             working_dir: None,
-            timeout_secs: 3600,
+            timeout_secs: 300,
         }
     }
 
@@ -287,5 +477,90 @@ pub struct JobResult {
     pub success: bool,
     pub exit_code: i32,
     pub step_results: Vec<StepResult>,
+    pub artifacts: Vec<ArtifactReceipt>,
+    pub logs: Option<LogReceipt>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: chrono::DateTime<chrono::Utc>,
     pub error: Option<String>,
+    /// Workspace path where the job executed
+    pub workspace_path: Option<String>,
+}
+
+impl JobResult {
+    /// Determine receipt status from job result
+    fn status(&self) -> ReceiptStatus {
+        if self.success {
+            ReceiptStatus::Succeeded
+        } else if self.error.as_ref().map(|e| e.contains("timeout")).unwrap_or(false) {
+            ReceiptStatus::TimedOut
+        } else {
+            ReceiptStatus::Failed
+        }
+    }
+}
+
+impl JobResult {
+    /// Build a `JobReceipt` from this result, using metadata from `job`.
+    ///
+    /// Returns `None` if the receipt fails validation.
+    pub fn receipt(&self, job: &ExecutableJob) -> Option<JobReceipt> {
+        let status = self.status();
+
+        let commands: Vec<String> = job.steps.iter().map(|s| s.run.clone()).collect();
+        let working_directory = job.working_dir.clone();
+        let (output_sha, output_bytes) = Self::compute_output_sha(&self.artifacts);
+
+        // Build log and artifact URI lists from receipts
+        let log_uri: Vec<String> = self.logs.iter().map(|l| l.uri.clone()).collect();
+        let artifact_uri: Vec<String> = self.artifacts.iter().map(|a| a.uri.clone()).collect();
+
+        let mut receipt = JobReceipt {
+            receipt_version: RECEIPT_VERSION,
+            work_request_id: None,
+            pipeline_run_id: job.pipeline_run_id,
+            job_id: self.job_id,
+            repository_id: job.repository_id,
+            base_sha: job.base_sha.clone(),
+            head_sha: job.base_sha.clone(), // Head SHA same as base for single-commit jobs
+            workspace_path: self.workspace_path.clone(),
+            run_id: Some(format!("run-{}", self.job_id)), // Generate run ID from job ID
+            status,
+            commands,
+            working_directory,
+            exit_code: Some(self.exit_code),
+            changed_paths: Vec::new(),
+            started_at: self.started_at,
+            completed_at: self.completed_at,
+            output_sha,
+            output_bytes,
+            stable_uri: format!("gitforge://job/{}", self.job_id),
+            log_uri,
+            artifact_uri,
+            logs: self.logs.clone(),
+            artifacts: self.artifacts.clone(),
+            error: self.error.clone(),
+            receipt_signature: None,
+        };
+
+        // Sign the receipt for integrity verification
+        receipt.receipt_signature = Some(receipt.compute_signature());
+
+        // Validate before returning
+        receipt.validate().ok()?;
+        Some(receipt)
+    }
+
+    /// Compute the aggregate output SHA from a list of artifact receipts.
+    fn compute_output_sha(artifacts: &[ArtifactReceipt]) -> (String, u64) {
+        if artifacts.is_empty() {
+            return (String::new(), 0);
+        }
+        let mut hasher = Sha256::new();
+        let mut total_bytes = 0u64;
+        for ar in artifacts {
+            hasher.update(ar.sha256.as_bytes());
+            total_bytes += ar.bytes;
+        }
+        (hex::encode(hasher.finalize()), total_bytes)
+    }
 }

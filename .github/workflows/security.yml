@@ -1,0 +1,106 @@
+name: Security
+
+on:
+  push:
+    branches: [$default-branch]
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/security.yml'
+  pull_request:
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/security.yml'
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 6am UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEFAULT_BRANCH: ${{ vars.DEFAULT_BRANCH || 'main' }}
+
+jobs:
+  # ─── Security Audit (Rust) ─────────────────────────────────────────────────
+  cargo-audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Run security audit
+        run: cargo audit
+
+  # ─── Secrets scan (all repos — always runs) ─────────────────────────────────
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for committed secrets
+        run: |
+          echo "Checking for leaked secrets in commits..."
+          # Exclude issue templates (contain example patterns, not real secrets)
+          # Look for common secret patterns
+          FOUND=$(grep -rnE "ghp_[0-9a-zA-Z]{36}|gho_[0-9a-zA-Z]{36}|AKIA[0-9A-Z]{16}|xox[baprs]-[0-9a-zA-Z]{48,}" \
+            --include="*.rs" --include="*.toml" --include="*.yaml" --include="*.yml" \
+            --include="*.sh" --include="*.json" --include="*.md" \
+            --exclude-dir=target --exclude-dir=.git . 2>/dev/null || true)
+          if [ -n "$FOUND" ]; then
+            echo "WARNING: Potential secrets found in repository:"
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "No obvious secrets detected."
+
+  # ─── Dependency Review ─────────────────────────────────────────────────────
+  dependency-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for vulnerable dependencies
+        uses: actions/dependency-review-action@v4
+        continue-on-error: true
+
+  # ─── Rust-specific Security Checks ─────────────────────────────────────────
+  rust-security:
+    name: Rust Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run clippy with security-focused lints
+        run: |
+          # Check for common security issues in Rust code
+          cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check for unsafe code
+        run: |
+          # Report any unsafe code blocks (requires review)
+          UNSAFE_COUNT=$(grep -r "unsafe" --include="*.rs" crates/ services/ 2>/dev/null | grep -v "unsafe_impl" | grep -v "// safe" | wc -l || true)
+          echo "Found $UNSAFE_COUNT unsafe code blocks"
+          if [ "$UNSAFE_COUNT" -gt 0 ]; then
+            echo "Note: Unsafe code blocks require security review"
+            grep -rn "unsafe" --include="*.rs" crates/ services/ 2>/dev/null | grep -v "unsafe_impl" | grep -v "// safe" | head -20
+          fi

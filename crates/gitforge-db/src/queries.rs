@@ -2,6 +2,7 @@
 //!
 //! This module provides real SQLite query implementations for all database operations.
 
+use crate::models::JobStatus;
 use crate::Pool;
 use chrono::{DateTime, Utc};
 use gitforge_common::{Error, JobId, PipelineId, PipelineRunId, RepoId, Result, RunnerId, UserId};
@@ -128,6 +129,43 @@ impl RepoQueries {
             .collect();
 
         Ok(repos)
+    }
+
+    /// Get a repository by owner username and repository name
+    pub async fn get_by_owner_and_name(
+        pool: &Pool,
+        owner_username: &str,
+        repo_name: &str,
+    ) -> Result<Option<crate::models::Repository>> {
+        let row = sqlx::query(
+            r#"
+            SELECT r.* FROM repositories r
+            JOIN users u ON r.owner_id = u.id
+            WHERE u.username = ? AND r.name = ?
+            "#,
+        )
+        .bind(owner_username)
+        .bind(repo_name)
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to get repository by owner and name: {}", e)))?;
+
+        match row {
+            Some(row) => Ok(Some(crate::models::Repository {
+                id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
+                name: row.get("name"),
+                owner_id: UserId::from(Uuid::parse_str(&row.get::<String, _>("owner_id")).unwrap()),
+                visibility: row.get("visibility"),
+                git_path: row.get("git_path"),
+                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
+                    .unwrap()
+                    .with_timezone(&Utc),
+                updated_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))
+                    .unwrap()
+                    .with_timezone(&Utc),
+            })),
+            None => Ok(None),
+        }
     }
 }
 
@@ -398,8 +436,16 @@ impl PipelineRunQueries {
 
     /// Update pipeline run status
     pub async fn update_status(pool: &Pool, id: PipelineRunId, status: &str) -> Result<()> {
-        sqlx::query("UPDATE pipeline_runs SET status = ? WHERE id = ?")
+        let finished_at = matches!(
+            status,
+            "succeeded" | "failed" | "cancelled" | "timed_out" | "timeout" | "timed-out"
+        )
+        .then(|| Utc::now().to_rfc3339());
+        sqlx::query(
+            "UPDATE pipeline_runs SET status = ?, finished_at = COALESCE(?, finished_at) WHERE id = ?",
+        )
             .bind(status)
+            .bind(finished_at)
             .bind(id.to_string())
             .execute(pool.pool())
             .await
@@ -495,8 +541,8 @@ impl JobQueries {
     pub async fn create(pool: &Pool, job: &crate::models::Job) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, working_dir, result_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(job.id.to_string())
@@ -508,6 +554,9 @@ impl JobQueries {
         .bind(job.finished_at.map(|dt| dt.to_rfc3339()))
         .bind(job.retry_count)
         .bind(job.created_at.to_rfc3339())
+        .bind(serde_json::to_string(&job.commands).unwrap_or_else(|_| "[]".to_string()))
+        .bind(&job.working_dir)
+        .bind(&job.result_json)
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to create job: {}", e)))?;
@@ -545,6 +594,13 @@ impl JobQueries {
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
                     .unwrap()
                     .with_timezone(&Utc),
+                commands: serde_json::from_str(
+                    &row.get::<Option<String>, _>("commands")
+                        .unwrap_or_else(|| "[]".to_string()),
+                )
+                .unwrap_or_default(),
+                working_dir: row.get("working_dir"),
+                result_json: row.get("result_json"),
             })),
             None => Ok(None),
         }
@@ -558,6 +614,56 @@ impl JobQueries {
             .execute(pool.pool())
             .await
             .map_err(|e| Error::database(format!("failed to update job status: {}", e)))?;
+        Ok(())
+    }
+
+    /// Persist the executable definition for a job. This is intentionally
+    /// separate from status transitions so queueing remains idempotent.
+    pub async fn set_definition(
+        pool: &Pool,
+        id: JobId,
+        commands: &[String],
+        working_dir: Option<&str>,
+    ) -> Result<()> {
+        let commands_json = serde_json::to_string(commands)
+            .map_err(|e| Error::database(format!("failed to encode job commands: {}", e)))?;
+        sqlx::query("UPDATE jobs SET commands = ?, working_dir = ? WHERE id = ?")
+            .bind(commands_json)
+            .bind(working_dir)
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to persist job definition: {}", e)))?;
+        Ok(())
+    }
+
+    /// Persist a terminal execution receipt. A repeated identical completion
+    /// is idempotent; a conflicting completion is rejected.
+    pub async fn complete(pool: &Pool, id: JobId, status: &str, result_json: &str) -> Result<()> {
+        let existing = Self::get(pool, id).await?;
+        if let Some(job) = existing {
+            if let Some(current) = JobStatus::from_str(&job.status) {
+                if current.is_terminal() {
+                    if job.result_json.as_deref() == Some(result_json) {
+                        return Ok(());
+                    }
+                    return Err(Error::invalid_input(
+                        "job already has a different terminal receipt",
+                    ));
+                }
+            }
+        } else {
+            return Err(Error::not_found("job", id));
+        }
+
+        sqlx::query("UPDATE jobs SET status = ?, finished_at = ?, result_json = ? WHERE id = ?")
+            .bind(status)
+            .bind(Utc::now().to_rfc3339())
+            .bind(result_json)
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to persist job receipt: {}", e)))?;
         Ok(())
     }
 
@@ -608,6 +714,13 @@ impl JobQueries {
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
                     .unwrap()
                     .with_timezone(&Utc),
+                commands: serde_json::from_str(
+                    &row.get::<Option<String>, _>("commands")
+                        .unwrap_or_else(|| "[]".to_string()),
+                )
+                .unwrap_or_default(),
+                working_dir: row.get("working_dir"),
+                result_json: row.get("result_json"),
             })
             .collect();
 
@@ -646,6 +759,13 @@ impl JobQueries {
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
                     .unwrap()
                     .with_timezone(&Utc),
+                commands: serde_json::from_str(
+                    &row.get::<Option<String>, _>("commands")
+                        .unwrap_or_else(|| "[]".to_string()),
+                )
+                .unwrap_or_default(),
+                working_dir: row.get("working_dir"),
+                result_json: row.get("result_json"),
             })
             .collect();
 
@@ -1086,6 +1206,13 @@ mod tests {
             .unwrap();
         let found = PipelineRunQueries::get(&pool, run.id).await.unwrap();
         assert_eq!(found.unwrap().status, "running");
+
+        PipelineRunQueries::update_status(&pool, run.id, "succeeded")
+            .await
+            .unwrap();
+        let found = PipelineRunQueries::get(&pool, run.id).await.unwrap().unwrap();
+        assert_eq!(found.status, "succeeded");
+        assert!(found.finished_at.is_some());
 
         // List by pipeline
         let runs = PipelineRunQueries::list_by_pipeline(&pool, pipeline.id)

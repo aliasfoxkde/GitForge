@@ -13,28 +13,29 @@ use axum::{
 use gitforge_common::RepoId;
 use gitforge_core::git_protocol::{http::HttpGitHandler, ssh::SshGitHandler, GitProtocolHandler};
 use gitforge_core::{FileStorageBackend, RepoService, StorageBackend};
+use gitforge_db::Pool;
 use gitforge_events::{EventBus, InMemoryEventBus};
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
-use sha2::{Digest, Sha256};
 #[allow(unused_imports)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 use tower_http::trace::TraceLayer;
-use uuid::Uuid;
 
 /// Application state shared across handlers
 #[derive(Clone)]
 struct AppState {
     http_handler: Arc<HttpGitHandler<FileStorageBackend>>,
     storage: Arc<FileStorageBackend>,
+    db_pool: Option<Arc<Pool>>,
 }
 
 /// SSH server configuration
 struct SshServerConfig {
     port: u16,
     storage: Arc<FileStorageBackend>,
+    db_pool: Option<Arc<Pool>>,
 }
 
 #[tokio::main]
@@ -68,6 +69,26 @@ async fn main() -> anyhow::Result<()> {
     let git_root = get_git_root();
     tracing::info!("using git root: {}", git_root);
 
+    // Initialize database pool (optional - git operations can work without it for local repos)
+    let db_pool = match std::env::var("DATABASE_URL") {
+        Ok(url) => match Pool::new(&url).await {
+            Ok(pool) => {
+                if let Err(e) = pool.migrate().await {
+                    tracing::warn!("database migration failed: {}", e);
+                }
+                Some(Arc::new(pool))
+            }
+            Err(e) => {
+                tracing::warn!("failed to create database pool: {}", e);
+                None
+            }
+        },
+        Err(_) => {
+            tracing::info!("DATABASE_URL not set, running without database lookup");
+            None
+        }
+    };
+
     // Initialize storage
     let storage = Arc::new(FileStorageBackend::new(&git_root));
     storage.ensure_root().await?;
@@ -83,10 +104,14 @@ async fn main() -> anyhow::Result<()> {
     // Create HTTP handler
     let http_handler = Arc::new(HttpGitHandler::new((*storage).clone()));
 
+    // Save db_pool before moving state into router
+    let saved_db_pool = db_pool.clone();
+
     // Create app state
     let state = AppState {
         http_handler,
         storage: storage.clone(),
+        db_pool: saved_db_pool.clone(),
     };
 
     // Build router for Git HTTP protocol
@@ -121,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
     let ssh_config = SshServerConfig {
         port: ssh_port,
         storage: storage.clone(),
+        db_pool: saved_db_pool.clone(),
     };
     let shutdown = create_shutdown_flag();
     let shutdown_flag = shutdown.clone();
@@ -162,17 +188,28 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-/// Derive a deterministic RepoId from owner/repo path
-fn derive_repo_id(owner: &str, repo: &str) -> RepoId {
-    // Create a deterministic ID based on the path
-    let input = format!("{}/{}", owner, repo);
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let result = hasher.finalize();
-    // Use first 16 bytes to create a Uuid, then convert to RepoId
-    let bytes: [u8; 16] = result[..16].try_into().unwrap();
-    let uuid = Uuid::from_bytes(bytes);
-    RepoId::from(uuid)
+/// Look up RepoId from database using owner username and repo name
+async fn lookup_repo_id(
+    db_pool: &Option<Arc<Pool>>,
+    owner: &str,
+    repo_name: &str,
+) -> Option<RepoId> {
+    let pool = db_pool.as_ref()?;
+
+    match gitforge_db::queries::RepoQueries::get_by_owner_and_name(pool, owner, repo_name).await {
+        Ok(Some(repo)) => {
+            tracing::debug!("looked up repo {:?} for {}/{}", repo.id, owner, repo_name);
+            Some(repo.id)
+        }
+        Ok(None) => {
+            tracing::debug!("repo not found in DB for {}/{}", owner, repo_name);
+            None
+        }
+        Err(e) => {
+            tracing::warn!("DB lookup failed for {}/{}: {}", owner, repo_name, e);
+            None
+        }
+    }
 }
 
 /// Git upload-pack handler (GET) - returns ref advertisement
@@ -181,11 +218,30 @@ async fn git_upload_pack(
     State(state): State<AppState>,
 ) -> Response {
     let repo_path = format!("{}/{}", owner, repo);
-    let repo_id = derive_repo_id(&owner, &repo);
 
-    // Check if repository exists
+    // Try to look up repo ID from database first
+    let repo_id = if let Some(_pool) = &state.db_pool {
+        match lookup_repo_id(&state.db_pool, &owner, &repo).await {
+            Some(id) => id,
+            None => {
+                tracing::warn!("repository not found in DB: {}", repo_path);
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from(format!("Repository not found: {}", repo_path)))
+                    .unwrap();
+            }
+        }
+    } else {
+        tracing::warn!("database not available, cannot look up repository: {}", repo_path);
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from("Database not available"))
+            .unwrap();
+    };
+
+    // Check if repository exists in storage
     if !state.storage.exists(repo_id).await {
-        tracing::warn!("repository not found: {}", repo_path);
+        tracing::warn!("repository not found in storage: {}", repo_path);
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from(format!("Repository not found: {}", repo_path)))
@@ -233,11 +289,30 @@ async fn git_receive_pack(
     request: Request<Body>,
 ) -> Response {
     let repo_path = format!("{}/{}", owner, repo);
-    let repo_id = derive_repo_id(&owner, &repo);
 
-    // Check if repository exists
+    // Try to look up repo ID from database first
+    let repo_id = if let Some(_pool) = &state.db_pool {
+        match lookup_repo_id(&state.db_pool, &owner, &repo).await {
+            Some(id) => id,
+            None => {
+                tracing::warn!("repository not found in DB: {}", repo_path);
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from(format!("Repository not found: {}", repo_path)))
+                    .unwrap();
+            }
+        }
+    } else {
+        tracing::warn!("database not available, cannot look up repository: {}", repo_path);
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from("Database not available"))
+            .unwrap();
+    };
+
+    // Check if repository exists in storage
     if !state.storage.exists(repo_id).await {
-        tracing::warn!("repository not found: {}", repo_path);
+        tracing::warn!("repository not found in storage: {}", repo_path);
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from(format!("Repository not found: {}", repo_path)))
@@ -331,10 +406,11 @@ async fn run_ssh_server(config: SshServerConfig, shutdown: Arc<AtomicBool>) -> a
                 // Clone handler and storage for this connection
                 let handler = ssh_handler.clone();
                 let storage = config.storage.clone();
+                let db_pool = config.db_pool.clone();
 
                 // Handle connection in blocking task since ssh2 is sync
                 tokio::task::spawn_blocking(move || {
-                    handle_ssh_connection(stream, handler, storage);
+                    handle_ssh_connection(stream, handler, storage, db_pool);
                 });
             }
             Ok(Err(e)) => {
@@ -355,7 +431,8 @@ async fn run_ssh_server(config: SshServerConfig, shutdown: Arc<AtomicBool>) -> a
 fn handle_ssh_connection(
     stream: tokio::net::TcpStream,
     handler: Arc<SshGitHandler<FileStorageBackend>>,
-    _storage: Arc<FileStorageBackend>,
+    storage: Arc<FileStorageBackend>,
+    db_pool: Option<Arc<Pool>>,
 ) {
     use std::io::{Read, Write};
 
@@ -442,14 +519,49 @@ fn handle_ssh_connection(
             let owner = path_parts[0];
             let repo = path_parts[1].trim_end_matches(".git").trim_end_matches("/");
 
-            // Derive repo ID
-            let input = format!("{}/{}", owner, repo);
-            let mut hasher = Sha256::new();
-            hasher.update(input.as_bytes());
-            let result = hasher.finalize();
-            let bytes: [u8; 16] = result[..16].try_into().unwrap();
-            let uuid = Uuid::from_bytes(bytes);
-            let repo_id = RepoId::from(uuid);
+            // Look up repo ID from database if available
+            let repo_id = if let Some(ref pool) = db_pool {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(gitforge_db::queries::RepoQueries::get_by_owner_and_name(
+                        pool, owner, repo,
+                    )) {
+                    Ok(Some(repo)) => repo.id,
+                    Ok(None) => {
+                        tracing::warn!("repository not found in DB: {}/{}", owner, repo);
+                        let _ = channel.write_all(b"repository not found\n");
+                        channel.wait_close().ok();
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("DB lookup failed: {}", e);
+                        let _ = channel.write_all(b"database error\n");
+                        channel.wait_close().ok();
+                        return;
+                    }
+                }
+            } else {
+                tracing::warn!("database not available for SSH connection");
+                let _ = channel.write_all(b"database not available\n");
+                channel.wait_close().ok();
+                return;
+            };
+
+            // Check if repository exists in storage
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            if rt.block_on(storage.exists(repo_id)) {
+                tracing::debug!("repository found in storage: {:?}", repo_id);
+            } else {
+                tracing::warn!("repository not found in storage: {}/{}", owner, repo);
+                let _ = channel.write_all(b"repository not found\n");
+                channel.wait_close().ok();
+                return;
+            }
 
             // Process based on command
             let response = match git_cmd {

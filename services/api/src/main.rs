@@ -5,6 +5,7 @@
 use gitforge_api::ApiServer;
 use gitforge_db::Pool;
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
+use gitforge_storage::FileStorage;
 #[allow(unused_imports)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,8 +38,14 @@ async fn main() -> anyhow::Result<()> {
     pool.migrate().await?;
     tracing::info!("database connection established");
 
-    // Create and start API server
-    let server = ApiServer::new(&config.jwt_secret, pool).with_port(config.port);
+    // Create and start API server. Runner and API share this LAN-local
+    // filesystem root for bounded artifact metadata and content.
+    let artifact_root = std::env::var("GITFORGE_ARTIFACT_ROOT")
+        .unwrap_or_else(|_| "/tmp/gitforge-artifacts".to_string());
+    let storage = FileStorage::new(artifact_root).await?;
+    let server = ApiServer::new(&config.jwt_secret, pool)
+        .with_storage_extension(Arc::new(storage))
+        .with_port(config.port);
 
     tracing::info!("API Gateway listening on port {}", config.port);
 

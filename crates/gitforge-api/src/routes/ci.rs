@@ -282,7 +282,8 @@ async fn get_pipeline_run_jobs(
                                         "status": j.status,
                                         "runner_id": j.runner_id.map(|id| id.to_string()),
                                         "started_at": j.started_at.map(|dt| dt.to_rfc3339()),
-                                        "finished_at": j.finished_at.map(|dt| dt.to_rfc3339())
+                                        "finished_at": j.finished_at.map(|dt| dt.to_rfc3339()),
+                                        "receipt": j.result_json.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
                                     })
                                 })
                                 .collect();
@@ -338,7 +339,8 @@ async fn get_job(
                                 "status": job.status,
                                 "runner_id": job.runner_id.map(|id| id.to_string()),
                                 "started_at": job.started_at.map(|dt| dt.to_rfc3339()),
-                                "finished_at": job.finished_at.map(|dt| dt.to_rfc3339())
+                                "finished_at": job.finished_at.map(|dt| dt.to_rfc3339()),
+                                "receipt": job.result_json.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
                             })),
                         )
                             .into_response(),
@@ -376,8 +378,9 @@ async fn get_job(
     }
 }
 
-/// Get job logs (placeholder - logs would come from storage)
+/// Get the persisted bounded completion receipt for a job.
 async fn get_job_logs(
+    Extension(pool): Extension<Arc<Pool>>,
     Extension(auth): Extension<Arc<ApiAuth>>,
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -385,15 +388,47 @@ async fn get_job_logs(
     match extract_user(&auth, &headers) {
         Err(e) => e.into_response(),
         Ok(_) => {
-            tracing::debug!("get job logs: {}", id);
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "job_id": id,
-                    "logs": "Logs not yet implemented - coming soon"
-                })),
-            )
-                .into_response()
+            let uuid = match Uuid::parse_str(&id) {
+                Ok(uuid) => uuid,
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "invalid_id",
+                            "message": "Invalid job ID format"
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+            match JobQueries::get(&pool, JobId::from(uuid)).await {
+                Ok(Some(job)) => {
+                    let receipt = job
+                        .result_json
+                        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"job_id": id, "receipt": receipt})),
+                    )
+                        .into_response()
+                }
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "not_found",
+                        "message": "Job not found"
+                    })),
+                )
+                    .into_response(),
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "database_error",
+                        "message": format!("failed to get job receipt: {}", error)
+                    })),
+                )
+                    .into_response(),
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Runner agent
 
 use crate::executor::{ExecutableJob, JobExecutor, JobStep};
-use gitforge_common::{Error, JobId, Result, RunnerId};
+use gitforge_common::{Error, JobId, PipelineRunId, Result, RunnerId};
 use gitforge_db::models::Runner;
 use gitforge_sandbox::DockerSandbox;
 use reqwest::Client;
@@ -75,7 +75,7 @@ impl RunnerAgent {
             .build()
             .map_err(|e| Error::internal(format!("failed to create HTTP client: {}", e)))?;
 
-        let sandbox = DockerSandbox::new().await?;
+        let sandbox = DockerSandbox::connect_required().await?;
         let executor = JobExecutor::new().await?;
 
         Ok(Self {
@@ -90,7 +90,7 @@ impl RunnerAgent {
 
     /// Register with the scheduler via HTTP
     pub async fn register(&mut self) -> Result<RunnerId> {
-        let runner = Runner::new(
+        let mut runner = Runner::new(
             self.config.name.clone(),
             gitforge_db::models::RunnerType::Docker,
             self.config.capacity,
@@ -107,6 +107,14 @@ impl RunnerAgent {
         match self.client.post(&register_url).json(&request).send().await {
             Ok(response) => {
                 if response.status().is_success() {
+                    if let Ok(payload) = response.json::<serde_json::Value>().await {
+                        if let Some(id) = payload["id"]
+                            .as_str()
+                            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                        {
+                            runner.id = RunnerId::from(id);
+                        }
+                    }
                     tracing::info!("registered runner {} with scheduler", runner.id);
                 } else {
                     tracing::warn!(
@@ -168,6 +176,7 @@ impl RunnerAgent {
         let fetch_interval = self.config.fetch_interval_secs;
         let fetch_client = self.client.clone();
         let fetch_url = self.config.scheduler_url.clone();
+        let fetch_runner_id = runner_id;
         let is_running = self.is_running.clone();
         let executor = self.executor.clone();
         tokio::spawn(async move {
@@ -180,7 +189,10 @@ impl RunnerAgent {
                 }
                 tracing::debug!("runner checking for jobs...");
 
-                let jobs_url = format!("{}/jobs/pending", fetch_url);
+                let jobs_url = format!(
+                    "{}/jobs/pending?runner_id={}",
+                    fetch_url, fetch_runner_id
+                );
                 match fetch_client.get(&jobs_url).send().await {
                     Ok(response) => {
                         if response.status().is_success() {
@@ -245,8 +257,15 @@ impl RunnerAgent {
         };
 
         // Convert assignment to ExecutableJob
+        let pipeline_run_id = uuid::Uuid::parse_str(&assignment.pipeline_run_id)
+            .map(PipelineRunId::from)
+            .unwrap_or_else(|_| PipelineRunId::new());
+
         let executable = ExecutableJob {
             job_id,
+            pipeline_run_id,
+            repository_id: None,
+            base_sha: None,
             image: "rust:latest".to_string(), // Default image - would come from job config
             steps: assignment
                 .commands
@@ -260,7 +279,7 @@ impl RunnerAgent {
                 .collect(),
             env: std::collections::HashMap::new(),
             working_dir: assignment.working_dir.clone(),
-            timeout_secs: 3600,
+            timeout_secs: 300,
         };
 
         tracing::info!("executing job {} in container", assignment.job_id);
@@ -296,6 +315,7 @@ impl RunnerAgent {
             "exit_code": result.exit_code,
             "error": result.error,
             "step_results": step_results_json,
+            "artifacts": result.artifacts,
         });
 
         if let Err(e) = client

@@ -9,6 +9,7 @@ use axum::{
 use gitforge_api::{ApiAuth, ApiServer};
 use gitforge_db::Pool;
 use gitforge_storage::FileStorage;
+use gitforge_storage::{Artifact, ArtifactStore};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -444,6 +445,65 @@ async fn test_api_artifacts_endpoint() {
         response.status() == StatusCode::OK
             || response.status() == StatusCode::INTERNAL_SERVER_ERROR
     );
+}
+
+#[tokio::test]
+async fn test_api_artifact_content_requires_auth_and_returns_bytes() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let user = gitforge_db::models::User::new(
+        "artifact-user".to_string(),
+        "artifact@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(temp_dir.path()).await.unwrap();
+    let source = temp_dir.path().join("build.txt");
+    tokio::fs::write(&source, b"artifact-data").await.unwrap();
+    let job_id = gitforge_common::JobId::new();
+    let artifact = Artifact::from_file(job_id, "build.txt".to_string(), &source)
+        .await
+        .unwrap();
+    let artifact_id = artifact.id.to_string();
+    let data = tokio::fs::read(&source).await.unwrap();
+    storage.put(&artifact, &data).await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool).with_storage_extension(Arc::new(storage));
+    let app = server.into_router();
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user.id, "artifact-user", "admin").unwrap();
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/artifacts/{artifact_id}/content"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/artifacts/{artifact_id}/content"))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"artifact-data");
 }
 
 #[tokio::test]

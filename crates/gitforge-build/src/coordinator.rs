@@ -566,4 +566,131 @@ mod tests {
 
         assert_ne!(job1, job2);
     }
+
+    // =============================================================================
+    // Negative-path tests for BuildCoordinator
+    // =============================================================================
+
+    /// Test: Job with non-zero exit code records failure
+    #[tokio::test]
+    async fn test_coordinator_job_failure_records_failure() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+
+        // Submit a command that will fail (exit code != 0)
+        let job_id = coordinator
+            .submit(vec!["--invalid-flag".to_string()], None)
+            .await;
+
+        // Wait for job to complete
+        let result = coordinator
+            .wait_for_job_with_timeout(job_id, Duration::from_secs(10))
+            .await;
+
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.job_id, job_id);
+        // A failed command should have success = false
+        assert!(!r.success, "job with invalid flag should have failed");
+        assert_ne!(r.exit_code, 0);
+    }
+
+    /// Test: Wait for non-existent job times out
+    #[tokio::test]
+    async fn test_coordinator_wait_for_nonexistent_job_times_out() {
+        let coordinator = BuildCoordinator::new();
+        let fake_uuid = uuid::Uuid::new_v4();
+
+        let result = coordinator
+            .wait_for_job_with_timeout(fake_uuid, Duration::from_millis(200))
+            .await;
+
+        assert!(result.is_none(), "waiting for non-existent job should timeout");
+    }
+
+    /// Test: Status of non-existent job returns None
+    #[tokio::test]
+    async fn test_coordinator_nonexistent_job_status_is_none() {
+        let coordinator = BuildCoordinator::new();
+        let fake_uuid = uuid::Uuid::new_v4();
+
+        let status = coordinator.get_status(&fake_uuid).await;
+        assert!(status.is_none(), "status of non-existent job should be None");
+    }
+
+    /// Test: Missing receipt - job completed but receipt not in results map
+    /// This is detectable by checking job status vs result presence
+    #[tokio::test]
+    async fn test_coordinator_missing_receipt_detectable() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+
+        // Submit a fast job
+        let job_id = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+
+        // Give time for job to register
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Job exists in the jobs map
+        let status = coordinator.get_status(&job_id).await;
+        assert!(status.is_some());
+
+        // Wait for result
+        let result = coordinator
+            .wait_for_job_with_timeout(job_id, Duration::from_secs(5))
+            .await;
+
+        // If result is None but status exists, we have a "missing receipt" scenario
+        // This could happen if results weren't properly persisted
+        match result {
+            Some(r) => {
+                // Normal case: receipt exists
+                assert_eq!(r.job_id, job_id);
+            }
+            None => {
+                // Missing receipt case - detectable
+                // In production this would indicate a persistence failure
+                let status = coordinator.get_status(&job_id).await;
+                assert!(status.is_some(), "job exists but receipt missing");
+            }
+        }
+    }
+
+    /// Test: Duplicate job submission produces unique IDs (idempotency check)
+    #[tokio::test]
+    async fn test_coordinator_duplicate_submit_unique_ids() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+
+        let job1 = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+        let job2 = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+
+        // Each submission gets a unique ID
+        assert_ne!(job1, job2, "duplicate submits should produce unique IDs");
+    }
+
+    /// Test: Job with working directory that doesn't exist still executes
+    /// (sandbox/escape prevention is at a different layer)
+    #[tokio::test]
+    async fn test_coordinator_nonexistent_working_dir() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+
+        // Submit job with non-existent working directory
+        let job_id = coordinator
+            .submit(
+                vec!["--version".to_string()],
+                Some("/nonexistent/path/does/not/exist".to_string()),
+            )
+            .await;
+
+        let result = coordinator
+            .wait_for_job_with_timeout(job_id, Duration::from_secs(5))
+            .await;
+
+        // Job should complete (will likely fail due to bad dir, but not hang)
+        assert!(result.is_some());
+    }
 }

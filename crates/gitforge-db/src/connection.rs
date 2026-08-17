@@ -153,6 +153,9 @@ impl Pool {
                 finished_at TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
+                commands TEXT NOT NULL DEFAULT '[]',
+                working_dir TEXT,
+                result_json TEXT,
                 FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id),
                 FOREIGN KEY (runner_id) REFERENCES runners(id)
             )
@@ -161,6 +164,25 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create jobs table: {}", e)))?;
+
+        // Additive migration for databases created before job definitions and
+        // receipts were persisted. SQLite has no portable IF NOT EXISTS form
+        // for ADD COLUMN, so tolerate only the known duplicate-column case.
+        for statement in [
+            "ALTER TABLE jobs ADD COLUMN commands TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE jobs ADD COLUMN working_dir TEXT",
+            "ALTER TABLE jobs ADD COLUMN result_json TEXT",
+        ] {
+            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
+                let message = error.to_string();
+                if !message.contains("duplicate column name") {
+                    return Err(Error::database(format!(
+                        "failed to migrate jobs table: {}",
+                        error
+                    )));
+                }
+            }
+        }
 
         // Create artifacts table
         sqlx::query(
