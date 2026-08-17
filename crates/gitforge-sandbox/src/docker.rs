@@ -4,6 +4,7 @@ use crate::limits::SandboxLimits;
 use async_trait::async_trait;
 use bollard::container::{
     Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StartContainerOptions,
+    StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
@@ -381,14 +382,31 @@ impl Sandbox for DockerSandbox {
 
     async fn destroy(&self, instance: SandboxInstance) -> Result<()> {
         if let Some(ref docker) = self.docker {
-            // Stop and remove container
-            let options = RemoveContainerOptions {
-                force: true,
+            // Send SIGTERM for graceful shutdown first
+            // Wait up to 10 seconds for container to stop gracefully
+            let stop_options = StopContainerOptions {
+                t: 10,
+            };
+
+            if let Err(e) = docker
+                .stop_container(&instance.container_id, Some(stop_options))
+                .await
+            {
+                // Container might already be stopped or not exist - that's OK
+                tracing::debug!(
+                    "stop_container returned error (container may already be stopped): {}",
+                    e
+                );
+            }
+
+            // Now remove the stopped container
+            let remove_options = RemoveContainerOptions {
+                force: false,
                 ..Default::default()
             };
 
             docker
-                .remove_container(&instance.container_id, Some(options))
+                .remove_container(&instance.container_id, Some(remove_options))
                 .await
                 .map_err(|e| Error::sandbox(format!("failed to remove container: {}", e)))?;
 
