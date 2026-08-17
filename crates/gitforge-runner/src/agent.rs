@@ -226,14 +226,27 @@ impl RunnerAgent {
     }
 
     /// Stop the runner agent
-    pub async fn stop(&self) {
+    /// If force is true, cancel all running jobs immediately.
+    /// Otherwise, wait for jobs to complete gracefully.
+    pub async fn stop(&self, force: bool) {
         *self.is_running.write().await = false;
+        
+        if force {
+            tracing::info!("force stopping - cancelling all active jobs");
+            self.executor.cancel_all_jobs().await;
+        }
+        
         let runner_id = self
             .runner
             .as_ref()
             .map(|r| r.id.to_string())
             .unwrap_or_default();
         tracing::info!("runner {} stopped", runner_id);
+    }
+
+    /// Wait for all active jobs to complete within the given timeout
+    pub async fn wait_for_jobs_complete(&self, timeout_duration: tokio::time::Duration) -> bool {
+        self.executor.wait_for_jobs_complete(timeout_duration).await
     }
 
     /// Check if agent is running
@@ -366,7 +379,7 @@ mod tests {
     async fn test_runner_agent_stop() {
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
-        agent.stop().await;
+        agent.stop(false).await;
         // No panic means success
     }
 
@@ -615,7 +628,7 @@ mod tests {
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         // Stop without running should not panic
-        agent.stop().await;
+        agent.stop(false).await;
     }
 
     #[tokio::test]
@@ -627,7 +640,7 @@ mod tests {
         let mut agent = RunnerAgent::new(config).await.unwrap();
         agent.register().await.unwrap();
         // Stop after registration should not panic
-        agent.stop().await;
+        agent.stop(false).await;
     }
 
     #[test]
@@ -802,7 +815,7 @@ mod tests {
         assert!(agent.is_running().await);
 
         // Stop it
-        agent.stop().await;
+        agent.stop(false).await;
 
         // Give it time to shutdown
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

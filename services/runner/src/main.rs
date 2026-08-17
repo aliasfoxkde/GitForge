@@ -61,8 +61,15 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("shutting down Runner Agent");
 
-    // Stop the agent gracefully
-    agent.stop().await;
+    // Stop the agent gracefully (force=false to wait for jobs)
+    agent.stop(false).await;
+
+    // Wait for active jobs to complete with a timeout
+    const JOB_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+    if !agent.wait_for_jobs_complete(JOB_SHUTDOWN_TIMEOUT).await {
+        tracing::warn!("jobs did not complete in time, force cancelling");
+        agent.stop(true).await;
+    }
 
     runner_task
         .await

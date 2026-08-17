@@ -137,8 +137,9 @@ impl ContainerPool {
 #[allow(clippy::type_complexity)]
 pub struct JobExecutor {
     pool: ContainerPool,
+    active_job_count: Arc<RwLock<usize>>, // number of jobs currently executing
     active_instances:
-        Arc<RwLock<HashMap<JobId, (String, Option<String>, SandboxInstance)>>>, // job_id -> (image, workspace, instance)
+                Arc<RwLock<HashMap<JobId, (String, Option<String>, SandboxInstance)>>>, // job_id -> (image, workspace, instance)
     artifact_storage: Arc<FileStorage>,
     log_store: Arc<FileJobLogStore>,
 }
@@ -154,6 +155,7 @@ impl JobExecutor {
         Ok(Self {
             pool,
             active_instances: Arc::new(RwLock::new(HashMap::new())),
+            active_job_count: Arc::new(RwLock::new(0)),
             artifact_storage: Arc::new(artifact_storage),
             log_store: Arc::new(log_store),
         })
@@ -295,6 +297,12 @@ impl JobExecutor {
             Ok(Ok(instance)) => instance,
         };
 
+        // Increment active job count
+        {
+            let mut count = self.active_job_count.write().await;
+            *count += 1;
+        }
+
         // Store active instance
         {
             let mut instances = self.active_instances.write().await;
@@ -373,6 +381,12 @@ impl JobExecutor {
             }
         }
 
+        // Decrement active job count
+        {
+            let mut count = self.active_job_count.write().await;
+            *count = count.saturating_sub(1);
+        }
+
         let completed_at = chrono::Utc::now();
         tracing::info!("job {} completed: success={}", job_id, success);
 
@@ -396,11 +410,50 @@ impl JobExecutor {
 
     /// Cancel a running job
     pub async fn cancel(&self, job_id: &JobId) -> Result<()> {
-        let instances = self.active_instances.read().await;
-        if let Some((_image, _workspace, instance)) = instances.get(job_id) {
-            self.pool.sandbox.destroy(instance.clone()).await?;
+        let instance = {
+            let mut instances = self.active_instances.write().await;
+            instances.remove(job_id)
+        };
+        if let Some((_image, _workspace, inst)) = instance {
+            self.pool.sandbox.destroy(inst).await?;
         }
         Ok(())
+    }
+
+    /// Get the number of active jobs
+    pub async fn active_job_count(&self) -> usize {
+        *self.active_job_count.read().await
+    }
+
+    /// Wait for all active jobs to complete
+    pub async fn wait_for_jobs_complete(&self, timeout_duration: Duration) -> bool {
+        let start = tokio::time::Instant::now();
+        while *self.active_job_count.read().await > 0 {
+            if start.elapsed() >= timeout_duration {
+                tracing::warn!("timeout waiting for {} active jobs to complete", 
+                    *self.active_job_count.read().await);
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        true
+    }
+
+    /// Cancel all active jobs and drain active_instances
+    pub async fn cancel_all_jobs(&self) {
+        let instances = {
+            let mut instances = self.active_instances.write().await;
+            std::mem::take(&mut *instances)
+        };
+        
+        for (_job_id, (_image, _workspace, instance)) in instances {
+            if let Err(e) = self.pool.sandbox.destroy(instance).await {
+                tracing::warn!("failed to destroy sandbox during cancel_all_jobs: {}", e);
+            }
+        }
+        
+        let mut count = self.active_job_count.write().await;
+        *count = 0;
     }
 }
 
