@@ -8,6 +8,8 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 use tracing::{error, info, warn};
+use nix::sys::signal::{killpg, Signal, SIGTERM};
+use nix::unistd::Pid;
 
 /// Build coordinator that limits concurrent cargo invocations
 pub struct BuildCoordinator {
@@ -384,8 +386,16 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
         }
         Err(_) => {
             warn!("job {} timed out after {:?}", job.id, timeout_duration);
-            // Try to kill the process
-            let _ = child.kill().await;
+            // Kill the process group with SIGTERM first
+            if let Some(pid) = child.id() {
+                let pgid = Pid::from_raw(pid as i32);
+                let _ = killpg(pgid, SIGTERM);
+                // Give it a moment then SIGKILL if still alive
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let _ = killpg(pgid, Signal::SIGKILL);
+            } else {
+                let _ = child.kill().await;
+            }
             Ok(BuildResult::failed(
                 job,
                 -1,

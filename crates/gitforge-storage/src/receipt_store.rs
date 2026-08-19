@@ -63,6 +63,7 @@ pub struct ReceiptVerification {
 pub struct InMemoryReceiptStore {
     receipts: std::sync::Mutex<std::collections::HashMap<JobId, JobReceipt>>,
     by_workspace: std::sync::Mutex<std::collections::HashMap<String, Vec<JobId>>>,
+    #[allow(dead_code)]
     by_owner: std::sync::Mutex<std::collections::HashMap<String, Vec<JobId>>>,
     by_run: std::sync::Mutex<std::collections::HashMap<String, Vec<JobId>>>,
 }
@@ -88,7 +89,7 @@ impl InMemoryReceiptStore {
         receipt
             .workspace_path
             .as_ref()
-            .and_then(|p| p.split('/').last())
+            .and_then(|p| p.split('/').next_back())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
     }
@@ -231,7 +232,7 @@ impl FileReceiptStore {
         receipt
             .workspace_path
             .as_ref()
-            .and_then(|p| p.split('/').last())
+            .and_then(|p| p.split('/').next_back())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
     }

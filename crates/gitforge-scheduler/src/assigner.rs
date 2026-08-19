@@ -317,7 +317,7 @@ impl Scheduler {
                         if let Some(pool) = &db_pool {
                             let _ = gitforge_db::queries::RunnerQueries::update_status(
                                 pool,
-                                runner.id.clone(),
+                                runner.id,
                                 "offline",
                             )
                             .await;
