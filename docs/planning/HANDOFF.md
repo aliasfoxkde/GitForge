@@ -1,10 +1,10 @@
 # GitForge Handoff
 
-**Last Updated:** 2026-08-13
-**Evidence boundary (central audit):** branch `main`, HEAD `b413aee190b2d0d411d55729bb70855c386823b5`, 17 dirty status entries. Refresh this boundary before relying on any test or rating below; numeric ratings are historical context, not release gates.
-**Status:** 🔄 Active — tests present, production runner lifecycle unproven
+**Last Updated:** 2026-08-21
+**Evidence boundary (central audit):** branch `chore/GIT-W2-06-A-promotion-runner-sigterm`, HEAD `2647671da6315315507223807ec37d8f0b022acd`, 4 dirty status entries. Refresh this boundary before relying on any test or rating below; numeric ratings are historical context, not release gates.
+**Status:** 🔄 Active — runner loop source-fixed; service-auth, durable-compose wiring, and live runner lifecycle remain unproven
 **Location:** `/nas/Temp/repos/GitForge`
-**Rating:** 7.5/10
+**Rating:** 7.5/10 (historical context only)
 
 > **Current execution authority:** Use `/nas/Temp/repos/Platform-Architecture/docs/planning/HANDOFF_AUDIT_2026-08-13.md` for verified cross-repository findings and `/nas/Temp/repos/Platform-Architecture/docs/planning/CODEX_CLI_EXECUTION_PACKETS_2026-08-13.md` for bounded implementation sessions. The runner lifecycle remains a blocker until the registered agent actually enters its run loop and executes a disposable job.
 
@@ -117,20 +117,22 @@ Aegis scans should run as a **pre-pipeline gate** before job execution:
 
 ## Known Issues
 
-1. **Runner not executing jobs** — `Runner::run()` not being called
-2. **Docker sandbox** — needs verification it works for job isolation
-3. **Python template missing** — dark-factory needs Python support
-4. **JS/TS template missing** — web app template not yet created
+1. **Runner registration fail-open** — scheduler registration failure still falls back to standalone mode
+2. **Runner service authentication** — registration, heartbeat, job fetch, assignment, and completion need a service credential and ownership proof
+3. **Docker sandbox** — needs verification it works for job isolation
+4. **Python template missing** — dark-factory needs Python support
+5. **JS/TS template missing** — web app template not yet created
 
 ---
 
 ## Next Steps
 
-1. **P0:** Fix `Runner::run()` — jobs must execute
+1. **P0:** Make production runner registration fail closed and add service authentication
 2. **P0:** Verify Docker sandbox works for isolation
-3. **P1:** Define VPS exposure policy (Tailscale/private network)
-4. **P1:** Add Aegis as pre-pipeline security gate
-5. **P1:** Document runner deployment runbook (`PLATFORM_SERVICE.md`)
+3. **P0:** Run a disposable queued-job smoke with durable completion and restart recovery
+4. **P1:** Define VPS exposure policy (Tailscale/private network)
+5. **P1:** Add Aegis as pre-pipeline security gate
+6. **P1:** Document runner deployment runbook (`PLATFORM_SERVICE.md`)
 
 ---
 
@@ -165,6 +167,72 @@ receipts, large-payload external storage, negative-path coverage, and the
 Control Center owner-scoped artifact retrieval contract remain open. Update
 this section when those gates receive reproducible evidence; do not erase the
 older audit conclusions without a replacement receipt.
+
+## Current audit reconciliation (2026-08-21)
+
+The historical runner-entrypoint finding is superseded on the current branch:
+`services/runner/src/main.rs` now starts `RunnerAgent::run()` in a task,
+performs graceful stop, and awaits the task result. Package and integration
+tests pass for the API (212 unit, 39 integration), runner (38), and scheduler
+(74).
+
+The following production gaps remain confirmed:
+
+1. `RunnerAgent::register()` logs scheduler failure and continues in standalone
+   mode. Production registration failure must be fail-closed or explicitly
+   policy-controlled; otherwise a runner can appear healthy while it cannot
+   receive scheduler jobs.
+2. Runner heartbeat, pending-job fetch, assignment, and completion requests
+   have no service credential or replay/ownership proof. The scheduler routes
+   are assembled directly by `services/ci/src/main.rs`; the API
+   `auth_middleware` has no inbound caller in the current graph and does not
+   protect this CI listener.
+3. Compose previously supplied `DATABASE_URL` to CI while
+   `services/ci/src/main.rs` reads `GITFORGE_DATABASE_URL`. The CI compose entry
+   is now corrected to `GITFORGE_DATABASE_URL=sqlite:/data/gitforge.db`; this
+   still requires compose parsing and a disposable restart/persistence probe.
+4. `services/ci/src/main.rs` binds the scheduler listener to `0.0.0.0`;
+   deployment must keep it on the private GitForge network or add an explicit
+   service boundary before external exposure.
+
+Required next packet: add an explicit runner/service credential contract,
+enforce it on registration/heartbeat/job fetch/assign/complete, reject runner
+identity mismatches, make production registration failure fail closed, and run
+one disposable queued-job smoke with durable completion and restart recovery.
+Do not mark GitForge operational based on unit tests alone.
+
+## Current audit reconciliation (2026-08-21)
+
+The historical runner-entrypoint finding is superseded on the current branch:
+`services/runner/src/main.rs` now starts `RunnerAgent::run()` in a task,
+performs graceful stop, and awaits the task result. Package and integration
+tests pass for the API (212 unit, 39 integration), runner (38), and scheduler
+(74).
+
+The following production gaps remain confirmed:
+
+1. `RunnerAgent::register()` logs scheduler failure and continues in standalone
+   mode. Production registration failure must be fail-closed or explicitly
+   policy-controlled; otherwise a runner can appear healthy while it cannot
+   receive scheduler jobs.
+2. Runner heartbeat, pending-job fetch, assignment, and completion requests
+   have no service credential or replay/ownership proof. The scheduler routes
+   are assembled directly by `services/ci/src/main.rs`; the API
+   `auth_middleware` has no inbound caller in the current graph and does not
+   protect this CI listener.
+3. Compose previously supplied `DATABASE_URL` to CI while
+   `services/ci/src/main.rs` reads `GITFORGE_DATABASE_URL`. The CI compose entry
+   is now corrected to `GITFORGE_DATABASE_URL=sqlite:/data/gitforge.db`; this
+   still requires compose parsing and a disposable restart/persistence probe.
+4. `services/ci/src/main.rs` binds the scheduler listener to `0.0.0.0`;
+   deployment must keep it on the private GitForge network or add an explicit
+   service boundary before external exposure.
+
+Required next packet: add an explicit runner/service credential contract,
+enforce it on registration/heartbeat/job fetch/assign/complete, reject runner
+identity mismatches, make production registration failure fail closed, and run
+one disposable queued-job smoke with durable completion and restart recovery.
+Do not mark GitForge operational based on unit tests alone.
 
 ---
 
