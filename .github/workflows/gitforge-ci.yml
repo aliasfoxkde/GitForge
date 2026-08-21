@@ -30,6 +30,19 @@ jobs:
       job_id: ${{ steps.enqueue.outputs.job_id }}
       build_status: ${{ steps.enqueue.outputs.status }}
     steps:
+      - name: Validate GitForge configuration
+        run: |
+          set -euo pipefail
+          : "${GITFORGE_API_URL:?GITFORGE_API_URL is required}"
+          : "${GITFORGE_API_TOKEN:?GITFORGE_API_TOKEN is required}"
+          [[ "$GITFORGE_POLL_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+            echo "GITFORGE_POLL_TIMEOUT_SECONDS must be a positive integer" >&2
+            exit 1
+          }
+          [[ "$GITFORGE_POLL_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+            echo "GITFORGE_POLL_INTERVAL_SECONDS must be a positive integer" >&2
+            exit 1
+          }
       - name: Enqueue build job
         id: enqueue
         run: |
