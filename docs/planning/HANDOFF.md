@@ -1,7 +1,7 @@
 # GitForge Handoff
 
 **Last Updated:** 2026-08-21
-**Evidence boundary (central audit):** branch `chore/GIT-W2-06-A-promotion-runner-sigterm`, HEAD `2647671da6315315507223807ec37d8f0b022acd`, 4 dirty status entries. Refresh this boundary before relying on any test or rating below; numeric ratings are historical context, not release gates.
+**Evidence boundary (central audit):** branch `chore/GIT-W2-06-A-promotion-runner-sigterm`, HEAD `945f5bd`, 2 dirty status entries. Refresh this boundary before relying on any test or rating below; numeric ratings are historical context, not release gates.
 **Status:** 🔄 Active — runner loop source-fixed; service-auth, durable-compose wiring, and live runner lifecycle remain unproven
 **Location:** `/nas/Temp/repos/GitForge`
 **Rating:** 7.5/10 (historical context only)
