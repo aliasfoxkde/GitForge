@@ -43,6 +43,10 @@ jobs:
             echo "GITFORGE_POLL_INTERVAL_SECONDS must be a positive integer" >&2
             exit 1
           }
+          [ "$GITFORGE_POLL_INTERVAL_SECONDS" -lt "$GITFORGE_POLL_TIMEOUT_SECONDS" ] || {
+            echo "GITFORGE_POLL_INTERVAL_SECONDS ($GITFORGE_POLL_INTERVAL_SECONDS) must be strictly less than GITFORGE_POLL_TIMEOUT_SECONDS ($GITFORGE_POLL_TIMEOUT_SECONDS)" >&2
+            exit 1
+          }
       - name: Enqueue build job
         id: enqueue
         run: |
