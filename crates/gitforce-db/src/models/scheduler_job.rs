@@ -68,6 +68,7 @@ pub struct SchedulerJob {
     pub exit_code: Option<i64>,
     pub error: Option<String>,
     pub completed_at: Option<DateTime<Utc>>,
+    pub receipt_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -95,6 +96,7 @@ impl SchedulerJob {
             exit_code: None,
             error: None,
             completed_at: None,
+            receipt_id: None,
             created_at: now,
             updated_at: now,
         }
@@ -194,6 +196,7 @@ mod tests {
         assert!(job.exit_code.is_none());
         assert!(job.error.is_none());
         assert!(job.completed_at.is_none());
+        assert!(job.receipt_id.is_none());
         assert_eq!(job.created_at, job.updated_at);
     }
 

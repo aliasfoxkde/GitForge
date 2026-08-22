@@ -2,6 +2,7 @@
 
 use gitforce_common::{Error, Result};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::Row;
 use std::path::Path;
 
 /// SQLite connection pool wrapper
@@ -213,6 +214,7 @@ impl Pool {
                 exit_code INTEGER,
                 error TEXT,
                 completed_at TEXT,
+                receipt_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -221,6 +223,26 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create scheduler_jobs table: {}", e)))?;
+
+        // Guarded additive migration: inspect the schema before altering it.
+        // This avoids relying on SQLite/driver-specific duplicate-column error text.
+        let columns = sqlx::query("PRAGMA table_info(scheduler_jobs)")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                Error::database(format!("failed to inspect scheduler_jobs schema: {}", e))
+            })?;
+        let has_receipt_id = columns.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == "receipt_id")
+                .unwrap_or(false)
+        });
+        if !has_receipt_id {
+            sqlx::query("ALTER TABLE scheduler_jobs ADD COLUMN receipt_id TEXT")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| Error::database(format!("failed to add receipt_id column: {}", e)))?;
+        }
 
         // Index for listing jobs that still need scheduler attention
         sqlx::query(

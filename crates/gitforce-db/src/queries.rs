@@ -670,9 +670,9 @@ impl SchedulerJobQueries {
             INSERT OR IGNORE INTO scheduler_jobs (
                 id, pipeline_run_id, repo_id, name, status, commands, working_dir,
                 runner_id, claimed_at, success, exit_code, error, completed_at,
-                created_at, updated_at
+                receipt_id, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(job.id.to_string())
@@ -688,6 +688,7 @@ impl SchedulerJobQueries {
         .bind(job.exit_code)
         .bind(&job.error)
         .bind(job.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(&job.receipt_id)
         .bind(job.created_at.to_rfc3339())
         .bind(job.updated_at.to_rfc3339())
         .execute(pool.pool())
@@ -752,8 +753,10 @@ impl SchedulerJobQueries {
     /// Record the terminal outcome of a scheduler job.
     ///
     /// First terminal writer wins: the update only applies while the job is
-    /// non-terminal. Returns the stored terminal job — either written by this
-    /// call or by an earlier writer — or `None` when the job does not exist.
+    /// non-terminal. A new immutable receipt_id is minted for each winning
+    /// terminal transition. Returns the stored terminal job — either written
+    /// by this call or by an earlier writer — or `None` when the job does not
+    /// exist.
     pub async fn complete(
         pool: &Pool,
         id: JobId,
@@ -762,11 +765,12 @@ impl SchedulerJobQueries {
         error: Option<String>,
     ) -> Result<Option<crate::models::SchedulerJob>> {
         let now = Utc::now();
+        let receipt_id = Uuid::new_v4().to_string();
         let result = sqlx::query(
             r#"
             UPDATE scheduler_jobs
             SET status = ?, success = ?, exit_code = ?, error = ?,
-                completed_at = ?, updated_at = ?
+                completed_at = ?, updated_at = ?, receipt_id = ?
             WHERE id = ? AND status IN ('pending', 'claimed')
             "#,
         )
@@ -776,6 +780,7 @@ impl SchedulerJobQueries {
         .bind(&error)
         .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
+        .bind(&receipt_id)
         .bind(id.to_string())
         .execute(pool.pool())
         .await
@@ -792,18 +797,21 @@ impl SchedulerJobQueries {
     }
 
     /// Cancel a pending or claimed job. The first terminal writer wins.
+    /// A new immutable receipt_id is minted for each winning transition.
     pub async fn cancel(pool: &Pool, id: JobId) -> Result<Option<crate::models::SchedulerJob>> {
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let receipt_id = Uuid::new_v4().to_string();
         let result = sqlx::query(
             r#"
             UPDATE scheduler_jobs
             SET status = 'cancelled', success = 0, exit_code = -1,
-                completed_at = ?, updated_at = ?
+                completed_at = ?, updated_at = ?, receipt_id = ?
             WHERE id = ? AND status IN ('pending', 'claimed')
             "#,
         )
-        .bind(&now)
-        .bind(&now)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(&receipt_id)
         .bind(id.to_string())
         .execute(pool.pool())
         .await
@@ -865,6 +873,7 @@ fn scheduler_job_from_row(row: &sqlx::sqlite::SqliteRow) -> crate::models::Sched
             .get::<Option<String>, _>("completed_at")
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|dt| dt.with_timezone(&Utc)),
+        receipt_id: row.get("receipt_id"),
         created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
             .unwrap()
             .with_timezone(&Utc),
@@ -1625,6 +1634,7 @@ mod tests {
         assert!(found.exit_code.is_none());
         assert!(found.error.is_none());
         assert!(found.completed_at.is_none());
+        assert!(found.receipt_id.is_none());
         assert_eq!(found.created_at, job.created_at);
         assert_eq!(found.updated_at, job.updated_at);
         assert!(found.is_active());
@@ -1746,6 +1756,7 @@ mod tests {
         assert!(first.completed_at.is_some());
         assert!(first.is_terminal());
         assert!(!first.is_active());
+        assert!(first.receipt_id.is_some());
 
         // Terminal jobs drop out of the active list
         let active = SchedulerJobQueries::list_active(&pool).await.unwrap();
@@ -1761,6 +1772,8 @@ mod tests {
         assert_eq!(second.exit_code, Some(2));
         assert_eq!(second.error.as_deref(), Some("build failed"));
         assert_eq!(second.completed_at, first.completed_at);
+        // Receipt_id is immutable — the replay returns the first writer's receipt.
+        assert_eq!(second.receipt_id, first.receipt_id);
     }
 
     #[tokio::test]
@@ -1791,6 +1804,7 @@ mod tests {
         assert_eq!(cancelled.success, Some(false));
         assert_eq!(cancelled.exit_code, Some(-1));
         assert!(cancelled.is_terminal());
+        assert!(cancelled.receipt_id.is_some());
         assert!(SchedulerJobQueries::list_active(&pool)
             .await
             .unwrap()
@@ -1802,6 +1816,8 @@ mod tests {
             .expect("cancelled job should remain observable");
         assert_eq!(second.status, "cancelled");
         assert_eq!(second.completed_at, cancelled.completed_at);
+        // Receipt_id is immutable on replay.
+        assert_eq!(second.receipt_id, cancelled.receipt_id);
         assert!(SchedulerJobQueries::cancel(&pool, JobId::new())
             .await
             .unwrap()
@@ -1852,5 +1868,184 @@ mod tests {
             .await
             .unwrap();
         assert!(!unknown);
+    }
+
+    // ------------------------------------------------------------------------
+    // Receipt_id tests
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_scheduler_job_success_completion_mints_receipt_id() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("build");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+
+        let completed = SchedulerJobQueries::complete(&pool, job.id, true, 0, None)
+            .await
+            .unwrap()
+            .expect("job should exist");
+
+        assert_eq!(completed.status, "succeeded");
+        assert!(completed.receipt_id.is_some());
+        let receipt = completed.receipt_id.clone();
+
+        // Replay must return the same receipt_id.
+        let replay = SchedulerJobQueries::complete(&pool, job.id, false, 1, Some("oops".into()))
+            .await
+            .unwrap()
+            .expect("job still exists");
+        assert_eq!(replay.receipt_id, receipt);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_failure_completion_mints_receipt_id() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("build");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+
+        let completed =
+            SchedulerJobQueries::complete(&pool, job.id, false, 42, Some("segfault".to_string()))
+                .await
+                .unwrap()
+                .expect("job should exist");
+
+        assert_eq!(completed.status, "failed");
+        assert!(completed.receipt_id.is_some());
+        let receipt = completed.receipt_id.clone();
+
+        // Replay must not overwrite.
+        let replay = SchedulerJobQueries::complete(&pool, job.id, true, 0, None)
+            .await
+            .unwrap()
+            .expect("job still exists");
+        assert_eq!(replay.receipt_id, receipt);
+        assert_eq!(replay.status, "failed");
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_cancel_mints_receipt_id() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("build");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+
+        let cancelled = SchedulerJobQueries::cancel(&pool, job.id)
+            .await
+            .unwrap()
+            .expect("job should exist");
+
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(cancelled.receipt_id.is_some());
+        let receipt = cancelled.receipt_id.clone();
+
+        // Replay must return the same receipt_id.
+        let replay = SchedulerJobQueries::cancel(&pool, job.id)
+            .await
+            .unwrap()
+            .expect("job still exists");
+        assert_eq!(replay.receipt_id, receipt);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_conflicting_terminal_writers() {
+        // Two callers race to terminal-write the same job; the first writer's
+        // receipt must be stable and the second must not overwrite it.
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("race");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job.id, RunnerId::new())
+            .await
+            .unwrap();
+
+        // Caller A wins with "succeeded".
+        let winner_a = SchedulerJobQueries::complete(&pool, job.id, true, 0, None)
+            .await
+            .unwrap()
+            .expect("job exists");
+
+        // Caller B loses with "failed"; must observe winner A's outcome.
+        let loser_b =
+            SchedulerJobQueries::complete(&pool, job.id, false, 1, Some("i lost".to_string()))
+                .await
+                .unwrap()
+                .expect("job still exists");
+
+        assert_eq!(loser_b.status, "succeeded");
+        assert_eq!(loser_b.receipt_id, winner_a.receipt_id);
+        assert!(loser_b.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_receipt_id_persists_across_restart() {
+        // Simulate a scheduler restart: a job is completed, then a new pool
+        // reads the same row from disk and must observe the same receipt_id.
+        let db_path = std::env::var("HOME")
+            .map(|home| {
+                format!(
+                    "{home}/.cache/gitforge-receipt-test-{}-{}.db",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                )
+            })
+            .expect("HOME must be set for restart test");
+        let pool = Pool::new(&db_path).await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("build");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+
+        let before = SchedulerJobQueries::complete(&pool, job.id, true, 0, None)
+            .await
+            .unwrap()
+            .expect("job exists");
+        let receipt_before = before.receipt_id.clone().expect("receipt_id set");
+
+        // Simulate restart: a new pool opens the same durable file.
+        let pool2 = Pool::new(&db_path).await.unwrap();
+        pool2.migrate().await.unwrap();
+
+        let after = SchedulerJobQueries::get(&pool2, job.id)
+            .await
+            .unwrap()
+            .expect("job row still exists");
+        assert_eq!(after.receipt_id, Some(receipt_before));
+        drop(pool2);
+        drop(pool);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_pending_job_has_no_receipt_id() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("build");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+
+        let found = SchedulerJobQueries::get(&pool, job.id)
+            .await
+            .unwrap()
+            .expect("job exists");
+        assert!(found.receipt_id.is_none());
+        assert!(found.completed_at.is_none());
     }
 }

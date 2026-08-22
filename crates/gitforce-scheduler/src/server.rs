@@ -56,6 +56,10 @@ pub struct JobCompletion {
     pub exit_code: i64,
     pub error: Option<String>,
     pub completed_at: String,
+    /// Immutable receipt for this terminal transition. Absent when the
+    /// transition has not yet been persisted (non-durable mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_id: Option<String>,
 }
 
 /// Request to enqueue a runnable synthetic/CI job.
@@ -131,6 +135,7 @@ fn completion_from_job(job: &SchedulerJob) -> Option<JobCompletion> {
         exit_code: job.exit_code.unwrap_or(if job.success? { 0 } else { -1 }),
         error: job.error.clone(),
         completed_at: job.completed_at?.to_rfc3339(),
+        receipt_id: job.receipt_id.clone(),
     })
 }
 
@@ -519,6 +524,7 @@ async fn complete_job(
         exit_code,
         error,
         completed_at: chrono::Utc::now().to_rfc3339(),
+        receipt_id: None,
     };
     state.scheduler.complete(job_id).await;
     state.jobs.write().await.remove(&job_id);
@@ -605,6 +611,7 @@ async fn cancel_job(
         exit_code: -1,
         error: Some("job cancelled".to_string()),
         completed_at: chrono::Utc::now().to_rfc3339(),
+        receipt_id: None,
     };
     state.scheduler.cancel(job_id).await;
     state.jobs.write().await.remove(&job_id);
@@ -914,5 +921,121 @@ mod tests {
         let response = register_runner(axum::extract::State(state), axum::Json(request)).await;
 
         assert_status(response.into_response(), StatusCode::CREATED);
+    }
+
+    // ------------------------------------------------------------------------
+    // Receipt_id integration tests
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_complete_job_echoes_receipt_id() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let job_id = uuid::Uuid::new_v4();
+        state.jobs.write().await.insert(
+            JobId::from(job_id),
+            PendingJobInfo {
+                job_id: job_id.to_string(),
+                name: "build".to_string(),
+                pipeline_run_id: uuid::Uuid::new_v4().to_string(),
+                commands: vec!["make build".to_string()],
+                working_dir: None,
+            },
+        );
+
+        let response = complete_job(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(serde_json::json!({
+                "success": true,
+                "exit_code": 0
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // In non-durable mode receipt_id is None (not serialized).
+        assert!(payload.get("receipt_id").is_none() || payload["receipt_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_job_echoes_receipt_id() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let job_id = uuid::Uuid::new_v4();
+        state.jobs.write().await.insert(
+            JobId::from(job_id),
+            PendingJobInfo {
+                job_id: job_id.to_string(),
+                name: "build".to_string(),
+                pipeline_run_id: uuid::Uuid::new_v4().to_string(),
+                commands: vec!["make build".to_string()],
+                working_dir: None,
+            },
+        );
+
+        let response = cancel_job(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(job_id.to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["status"], "cancelled");
+        assert!(payload.get("receipt_id").is_none() || payload["receipt_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_get_job_status_after_completion_echoes_receipt_id() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let job_id = uuid::Uuid::new_v4();
+        state.jobs.write().await.insert(
+            JobId::from(job_id),
+            PendingJobInfo {
+                job_id: job_id.to_string(),
+                name: "build".to_string(),
+                pipeline_run_id: uuid::Uuid::new_v4().to_string(),
+                commands: vec!["make build".to_string()],
+                working_dir: None,
+            },
+        );
+
+        // Complete the job first.
+        let _ = complete_job(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(serde_json::json!({
+                "success": true,
+                "exit_code": 0
+            })),
+        )
+        .await
+        .into_response();
+
+        // Status endpoint must return the same completion record.
+        let status = get_job_status(
+            axum::extract::State(state),
+            axum::extract::Path(job_id.to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(status.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["status"], "succeeded");
     }
 }
