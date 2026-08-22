@@ -245,7 +245,7 @@ http://localhost:8081
 
 ```
 POST /runners
-GET /runners/:id/heartbeat
+POST /runners/:id/heartbeat
 ```
 
 **Register Runner Request:**

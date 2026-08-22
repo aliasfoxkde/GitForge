@@ -10,7 +10,6 @@ dist/
 *.out
 coverage.out
 coverage.html
-*.html
 report.xml
 .aetheon-build/
 
