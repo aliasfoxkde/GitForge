@@ -196,6 +196,48 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create events table: {}", e)))?;
 
+        // Create scheduler_jobs table (scheduler persistence)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS scheduler_jobs (
+                id TEXT PRIMARY KEY,
+                pipeline_run_id TEXT NOT NULL,
+                repo_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                commands TEXT NOT NULL DEFAULT '[]',
+                working_dir TEXT,
+                runner_id TEXT,
+                claimed_at TEXT,
+                success INTEGER,
+                exit_code INTEGER,
+                error TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create scheduler_jobs table: {}", e)))?;
+
+        // Index for listing jobs that still need scheduler attention
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_scheduler_jobs_status
+            ON scheduler_jobs (status)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!(
+                "failed to create scheduler_jobs status index: {}",
+                e
+            ))
+        })?;
+
         tracing::info!("database migrations completed successfully");
         Ok(())
     }

@@ -654,6 +654,203 @@ impl JobQueries {
 }
 
 // ============================================================================
+// Scheduler Job Queries
+// ============================================================================
+
+pub struct SchedulerJobQueries;
+
+impl SchedulerJobQueries {
+    /// Insert a scheduler job unless a row with the same ID already exists.
+    ///
+    /// Returns `true` when the row was inserted, `false` when a job with the
+    /// same ID was already present (idempotent enqueue).
+    pub async fn insert_if_absent(pool: &Pool, job: &crate::models::SchedulerJob) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO scheduler_jobs (
+                id, pipeline_run_id, repo_id, name, status, commands, working_dir,
+                runner_id, claimed_at, success, exit_code, error, completed_at,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(job.id.to_string())
+        .bind(job.pipeline_run_id.to_string())
+        .bind(job.repo_id.to_string())
+        .bind(&job.name)
+        .bind(&job.status)
+        .bind(serde_json::to_string(&job.commands).unwrap_or_else(|_| "[]".to_string()))
+        .bind(&job.working_dir)
+        .bind(job.runner_id.map(|id| id.to_string()))
+        .bind(job.claimed_at.map(|dt| dt.to_rfc3339()))
+        .bind(job.success)
+        .bind(job.exit_code)
+        .bind(&job.error)
+        .bind(job.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(job.created_at.to_rfc3339())
+        .bind(job.updated_at.to_rfc3339())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to insert scheduler job: {}", e)))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Get a scheduler job by ID
+    pub async fn get(pool: &Pool, id: JobId) -> Result<Option<crate::models::SchedulerJob>> {
+        let row = sqlx::query("SELECT * FROM scheduler_jobs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get scheduler job: {}", e)))?;
+
+        Ok(row.map(|row| scheduler_job_from_row(&row)))
+    }
+
+    /// List scheduler jobs that still need attention (pending or claimed),
+    /// oldest first.
+    pub async fn list_active(pool: &Pool) -> Result<Vec<crate::models::SchedulerJob>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM scheduler_jobs
+            WHERE status IN ('pending', 'claimed')
+            ORDER BY created_at ASC
+            "#,
+        )
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list active scheduler jobs: {}", e)))?;
+
+        Ok(rows.iter().map(scheduler_job_from_row).collect())
+    }
+
+    /// Atomically move a pending scheduler job to claimed for a runner.
+    ///
+    /// Returns `true` when this call claimed the job, `false` when the job was
+    /// missing or not pending (another writer got it first).
+    pub async fn mark_claimed(pool: &Pool, id: JobId, runner_id: RunnerId) -> Result<bool> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            r#"
+            UPDATE scheduler_jobs
+            SET status = 'claimed', runner_id = ?, claimed_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending'
+            "#,
+        )
+        .bind(runner_id.to_string())
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to claim scheduler job: {}", e)))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Record the terminal outcome of a scheduler job.
+    ///
+    /// First terminal writer wins: the update only applies while the job is
+    /// non-terminal. Returns the stored terminal job — either written by this
+    /// call or by an earlier writer — or `None` when the job does not exist.
+    pub async fn complete(
+        pool: &Pool,
+        id: JobId,
+        success: bool,
+        exit_code: i64,
+        error: Option<String>,
+    ) -> Result<Option<crate::models::SchedulerJob>> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            r#"
+            UPDATE scheduler_jobs
+            SET status = ?, success = ?, exit_code = ?, error = ?,
+                completed_at = ?, updated_at = ?
+            WHERE id = ? AND status IN ('pending', 'claimed')
+            "#,
+        )
+        .bind(if success { "succeeded" } else { "failed" })
+        .bind(success)
+        .bind(exit_code)
+        .bind(&error)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to complete scheduler job: {}", e)))?;
+
+        if result.rows_affected() == 0 {
+            // Either unknown job or already terminal: fetch what is stored.
+            // An unknown ID yields None; a terminal job yields the first
+            // writer's record so the caller observes a stable outcome.
+            return Self::get(pool, id).await;
+        }
+
+        Self::get(pool, id).await
+    }
+
+    /// Return a claimed scheduler job to the pending pool (e.g. the runner
+    /// disappeared before reporting a result).
+    ///
+    /// Returns `true` when the job was requeued, `false` when it was not in
+    /// the claimed state.
+    pub async fn requeue_claimed(pool: &Pool, id: JobId) -> Result<bool> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            r#"
+            UPDATE scheduler_jobs
+            SET status = 'pending', runner_id = NULL, claimed_at = NULL, updated_at = ?
+            WHERE id = ? AND status = 'claimed'
+            "#,
+        )
+        .bind(now.to_rfc3339())
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to requeue scheduler job: {}", e)))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+/// Map a scheduler_jobs row to the model
+fn scheduler_job_from_row(row: &sqlx::sqlite::SqliteRow) -> crate::models::SchedulerJob {
+    crate::models::SchedulerJob {
+        id: JobId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
+        pipeline_run_id: PipelineRunId::from(
+            Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap(),
+        ),
+        repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
+        name: row.get("name"),
+        status: row.get("status"),
+        commands: serde_json::from_str(&row.get::<String, _>("commands")).unwrap_or_default(),
+        working_dir: row.get("working_dir"),
+        runner_id: row
+            .get::<Option<String>, _>("runner_id")
+            .and_then(|s| Uuid::parse_str(&s).ok().map(RunnerId::from)),
+        claimed_at: row
+            .get::<Option<String>, _>("claimed_at")
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc)),
+        success: row.get("success"),
+        exit_code: row.get("exit_code"),
+        error: row.get("error"),
+        completed_at: row
+            .get::<Option<String>, _>("completed_at")
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc)),
+        created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
+            .unwrap()
+            .with_timezone(&Utc),
+        updated_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))
+            .unwrap()
+            .with_timezone(&Utc),
+    }
+}
+
+// ============================================================================
 // Runner Queries
 // ============================================================================
 
@@ -1355,5 +1552,247 @@ mod tests {
         // List recent
         let recent = EventQueries::list_recent(&pool, 10).await.unwrap();
         assert_eq!(recent.len(), 1);
+    }
+
+    // ------------------------------------------------------------------------
+    // Scheduler job queries
+    // ------------------------------------------------------------------------
+
+    fn sample_scheduler_job(name: &str) -> crate::models::SchedulerJob {
+        crate::models::SchedulerJob::new(
+            PipelineRunId::new(),
+            RepoId::new(),
+            name.to_string(),
+            vec!["make build".to_string(), "make test".to_string()],
+        )
+        .with_working_dir(Some("/workspace/repo".to_string()))
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_round_trip() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("build");
+
+        // Insert
+        let inserted = SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+        assert!(inserted);
+
+        // Round-trip: every field survives the write/read cycle
+        let found = SchedulerJobQueries::get(&pool, job.id).await.unwrap();
+        assert!(found.is_some());
+        let found = found.unwrap();
+        assert_eq!(found.id, job.id);
+        assert_eq!(found.pipeline_run_id, job.pipeline_run_id);
+        assert_eq!(found.repo_id, job.repo_id);
+        assert_eq!(found.name, "build");
+        assert_eq!(found.status, "pending");
+        assert_eq!(
+            found.commands,
+            vec!["make build".to_string(), "make test".to_string()]
+        );
+        assert_eq!(found.working_dir.as_deref(), Some("/workspace/repo"));
+        assert!(found.runner_id.is_none());
+        assert!(found.claimed_at.is_none());
+        assert!(found.success.is_none());
+        assert!(found.exit_code.is_none());
+        assert!(found.error.is_none());
+        assert!(found.completed_at.is_none());
+        assert_eq!(found.created_at, job.created_at);
+        assert_eq!(found.updated_at, job.updated_at);
+        assert!(found.is_active());
+
+        // Not found for a random ID
+        let missing = SchedulerJobQueries::get(&pool, JobId::new()).await.unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_duplicate_insert_is_ignored() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("build");
+        assert!(SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap());
+
+        // Same ID inserted again is a no-op, not an error
+        let mut duplicate = sample_scheduler_job("changed");
+        duplicate.id = job.id;
+        duplicate.name = "changed".to_string();
+        let inserted = SchedulerJobQueries::insert_if_absent(&pool, &duplicate)
+            .await
+            .unwrap();
+        assert!(!inserted);
+
+        // The original row is untouched
+        let found = SchedulerJobQueries::get(&pool, job.id).await.unwrap();
+        assert_eq!(found.unwrap().name, "build");
+
+        // list_active still sees exactly one row
+        let active = SchedulerJobQueries::list_active(&pool).await.unwrap();
+        assert_eq!(active.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_list_active_and_claim() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job1 = sample_scheduler_job("build");
+        let job2 = sample_scheduler_job("test");
+        SchedulerJobQueries::insert_if_absent(&pool, &job1)
+            .await
+            .unwrap();
+        SchedulerJobQueries::insert_if_absent(&pool, &job2)
+            .await
+            .unwrap();
+
+        // Both pending jobs are listed as active
+        let active = SchedulerJobQueries::list_active(&pool).await.unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|job| job.id == job1.id));
+        assert!(active.iter().any(|job| job.id == job2.id));
+
+        // Claim job1 for a runner
+        let runner_id = RunnerId::new();
+        let claimed = SchedulerJobQueries::mark_claimed(&pool, job1.id, runner_id)
+            .await
+            .unwrap();
+        assert!(claimed);
+
+        let found = SchedulerJobQueries::get(&pool, job1.id).await.unwrap();
+        let found = found.unwrap();
+        assert_eq!(found.status, "claimed");
+        assert_eq!(found.runner_id, Some(runner_id));
+        assert!(found.claimed_at.is_some());
+        assert!(found.is_active());
+
+        // A claimed job is still active
+        let active = SchedulerJobQueries::list_active(&pool).await.unwrap();
+        assert_eq!(active.len(), 2);
+
+        // Double-claim is rejected: the job is no longer pending
+        let second_claim = SchedulerJobQueries::mark_claimed(&pool, job1.id, RunnerId::new())
+            .await
+            .unwrap();
+        assert!(!second_claim);
+        let found = SchedulerJobQueries::get(&pool, job1.id).await.unwrap();
+        assert_eq!(found.unwrap().runner_id, Some(runner_id));
+
+        // Claiming an unknown job is a no-op
+        let unknown_claim = SchedulerJobQueries::mark_claimed(&pool, JobId::new(), RunnerId::new())
+            .await
+            .unwrap();
+        assert!(!unknown_claim);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_completion_is_idempotent() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("build");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job.id, RunnerId::new())
+            .await
+            .unwrap();
+
+        // First writer completes the job
+        let first = SchedulerJobQueries::complete(
+            &pool,
+            job.id,
+            false,
+            2,
+            Some("build failed".to_string()),
+        )
+        .await
+        .unwrap()
+        .expect("job should exist");
+        assert_eq!(first.status, "failed");
+        assert_eq!(first.success, Some(false));
+        assert_eq!(first.exit_code, Some(2));
+        assert_eq!(first.error.as_deref(), Some("build failed"));
+        assert!(first.completed_at.is_some());
+        assert!(first.is_terminal());
+        assert!(!first.is_active());
+
+        // Terminal jobs drop out of the active list
+        let active = SchedulerJobQueries::list_active(&pool).await.unwrap();
+        assert!(active.is_empty());
+
+        // Second writer with a different outcome must not overwrite
+        let second = SchedulerJobQueries::complete(&pool, job.id, true, 0, None)
+            .await
+            .unwrap()
+            .expect("job should exist");
+        assert_eq!(second.status, "failed");
+        assert_eq!(second.success, Some(false));
+        assert_eq!(second.exit_code, Some(2));
+        assert_eq!(second.error.as_deref(), Some("build failed"));
+        assert_eq!(second.completed_at, first.completed_at);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_unknown_completion_returns_none() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let unknown = SchedulerJobQueries::complete(&pool, JobId::new(), true, 0, None)
+            .await
+            .unwrap();
+        assert!(unknown.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_requeue_claimed() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("build");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+
+        // Requeueing a pending (not claimed) job is a no-op
+        let requeued = SchedulerJobQueries::requeue_claimed(&pool, job.id)
+            .await
+            .unwrap();
+        assert!(!requeued);
+
+        // Claim, then requeue
+        let runner_id = RunnerId::new();
+        SchedulerJobQueries::mark_claimed(&pool, job.id, runner_id)
+            .await
+            .unwrap();
+        let requeued = SchedulerJobQueries::requeue_claimed(&pool, job.id)
+            .await
+            .unwrap();
+        assert!(requeued);
+
+        let found = SchedulerJobQueries::get(&pool, job.id).await.unwrap();
+        let found = found.unwrap();
+        assert_eq!(found.status, "pending");
+        assert!(found.runner_id.is_none());
+        assert!(found.claimed_at.is_none());
+        assert!(found.is_active());
+
+        // Requeued job can be claimed again
+        let claimed = SchedulerJobQueries::mark_claimed(&pool, job.id, RunnerId::new())
+            .await
+            .unwrap();
+        assert!(claimed);
+
+        // Requeueing an unknown job is a no-op
+        let unknown = SchedulerJobQueries::requeue_claimed(&pool, JobId::new())
+            .await
+            .unwrap();
+        assert!(!unknown);
     }
 }
