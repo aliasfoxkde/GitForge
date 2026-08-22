@@ -670,9 +670,9 @@ impl SchedulerJobQueries {
             INSERT OR IGNORE INTO scheduler_jobs (
                 id, pipeline_run_id, repo_id, name, status, commands, working_dir,
                 runner_id, claimed_at, success, exit_code, error, completed_at,
-                receipt_id, created_at, updated_at
+                receipt_id, requeue_count, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(job.id.to_string())
@@ -689,6 +689,7 @@ impl SchedulerJobQueries {
         .bind(&job.error)
         .bind(job.completed_at.map(|dt| dt.to_rfc3339()))
         .bind(&job.receipt_id)
+        .bind(job.requeue_count)
         .bind(job.created_at.to_rfc3339())
         .bind(job.updated_at.to_rfc3339())
         .execute(pool.pool())
@@ -845,6 +846,111 @@ impl SchedulerJobQueries {
 
         Ok(result.rows_affected() > 0)
     }
+
+    /// Reap stale claimed jobs whose lease has expired.
+    ///
+    /// For each stale claimed job (claimed_at older than `lease_secs`):
+    ///   - If requeue_count < max_retries: atomically requeue (status='pending',
+    ///     clear runner_id/claimed_at, increment requeue_count, update updated_at).
+    ///     The job will be handed out again on restart because it is pending.
+    ///   - If requeue_count >= max_retries: atomically transition to 'failed'
+    ///     with a durable receipt_id and clear claim state.
+    ///
+    /// Returns the count of jobs that were transitioned (requeued + failed).
+    /// Jobs with a terminal status at the time of the UPDATE are skipped
+    /// (first-terminal-writer-wins semantics).
+    pub async fn reap_stale_claimed(pool: &Pool, lease_secs: i64, max_retries: i32) -> Result<i32> {
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::seconds(lease_secs);
+
+        // Select stale claimed jobs ordered by creation time (oldest first).
+        let rows = sqlx::query(
+            r#"
+            SELECT id FROM scheduler_jobs
+            WHERE status = 'claimed'
+              AND claimed_at IS NOT NULL
+              AND claimed_at < ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(cutoff.to_rfc3339())
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to select stale claimed jobs: {}", e)))?;
+
+        let mut transitioned = 0;
+        for row in rows {
+            let id: String = row.get("id");
+            let job_id = JobId::from(Uuid::parse_str(&id).unwrap());
+
+            // Fetch current state to decide whether to requeue or fail.
+            let current = Self::get(pool, job_id).await?;
+            let current = match current {
+                Some(j) => j,
+                None => continue,
+            };
+
+            // Skip if already terminal.
+            if current.is_terminal() {
+                continue;
+            }
+
+            // Determine the requeue count from the row we just read.
+            let requeue_count = current.requeue_count;
+
+            if requeue_count >= max_retries {
+                // Transition to failed: first-terminal-writer wins via WHERE
+                // status IN ('pending','claimed'), mint fresh receipt_id.
+                let fail_receipt = Uuid::new_v4().to_string();
+                let result = sqlx::query(
+                    r#"
+                    UPDATE scheduler_jobs
+                    SET status = 'failed', success = 0, exit_code = -2,
+                        error = 'reaped: lease expired and retry cap exceeded',
+                        completed_at = ?, updated_at = ?, receipt_id = ?,
+                        runner_id = NULL, claimed_at = NULL
+                    WHERE id = ? AND status IN ('pending', 'claimed')
+                    "#,
+                )
+                .bind(now.to_rfc3339())
+                .bind(now.to_rfc3339())
+                .bind(&fail_receipt)
+                .bind(&id)
+                .execute(pool.pool())
+                .await
+                .map_err(|e| {
+                    Error::database(format!("failed to reap scheduler job to failed: {}", e))
+                })?;
+
+                if result.rows_affected() > 0 {
+                    transitioned += 1;
+                }
+            } else {
+                // Requeue: clear claim state, bump requeue_count.
+                let result = sqlx::query(
+                    r#"
+                    UPDATE scheduler_jobs
+                    SET status = 'pending', runner_id = NULL, claimed_at = NULL,
+                        requeue_count = requeue_count + 1, updated_at = ?
+                    WHERE id = ? AND status = 'claimed'
+                    "#,
+                )
+                .bind(now.to_rfc3339())
+                .bind(&id)
+                .execute(pool.pool())
+                .await
+                .map_err(|e| {
+                    Error::database(format!("failed to reap scheduler job to pending: {}", e))
+                })?;
+
+                if result.rows_affected() > 0 {
+                    transitioned += 1;
+                }
+            }
+        }
+
+        Ok(transitioned)
+    }
 }
 
 /// Map a scheduler_jobs row to the model
@@ -874,6 +980,7 @@ fn scheduler_job_from_row(row: &sqlx::sqlite::SqliteRow) -> crate::models::Sched
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|dt| dt.with_timezone(&Utc)),
         receipt_id: row.get("receipt_id"),
+        requeue_count: row.get::<i32, _>("requeue_count"),
         created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
             .unwrap()
             .with_timezone(&Utc),
@@ -2047,5 +2154,421 @@ mod tests {
             .expect("job exists");
         assert!(found.receipt_id.is_none());
         assert!(found.completed_at.is_none());
+    }
+
+    // ------------------------------------------------------------------------
+    // Reaper tests
+    // ------------------------------------------------------------------------
+
+    /// Helper: advance the claimed_at timestamp of a job directly in the DB
+    /// so it appears older than the lease threshold.
+    async fn make_claimed_job_stale(pool: &Pool, job_id: JobId, lease_secs: i64) {
+        let stale_time = Utc::now() - chrono::Duration::seconds(lease_secs + 10);
+        sqlx::query("UPDATE scheduler_jobs SET claimed_at = ? WHERE id = ?")
+            .bind(stale_time.to_rfc3339())
+            .bind(job_id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reaper_fresh_claim_not_requeued() {
+        // A recently-claimed job (within lease) must not be touched.
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("fresh");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job.id, RunnerId::new())
+            .await
+            .unwrap();
+
+        // lease=60, job was just claimed — nothing to reap.
+        let n = SchedulerJobQueries::reap_stale_claimed(&pool, 60, 3)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+
+        // Job is still claimed.
+        let found = SchedulerJobQueries::get(&pool, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "claimed");
+        assert_eq!(found.requeue_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reaper_stale_claim_requeued_once() {
+        // A stale claimed job below the retry cap is requeued.
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("stale-requeue");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job.id, RunnerId::new())
+            .await
+            .unwrap();
+        make_claimed_job_stale(&pool, job.id, 60).await;
+
+        let n = SchedulerJobQueries::reap_stale_claimed(&pool, 60, 3)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        let found = SchedulerJobQueries::get(&pool, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "pending");
+        assert!(found.runner_id.is_none());
+        assert!(found.claimed_at.is_none());
+        assert_eq!(found.requeue_count, 1);
+        assert!(found.is_active()); // pending is active
+    }
+
+    #[tokio::test]
+    async fn test_reaper_cap_becomes_explicit_failure() {
+        // A stale claimed job at or above the retry cap transitions to failed.
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("cap-fail");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+
+        // Manually set requeue_count to max_retries (3) to be at/above cap.
+        sqlx::query("UPDATE scheduler_jobs SET requeue_count = 3 WHERE id = ?")
+            .bind(job.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        SchedulerJobQueries::mark_claimed(&pool, job.id, RunnerId::new())
+            .await
+            .unwrap();
+
+        make_claimed_job_stale(&pool, job.id, 60).await;
+
+        // max_retries=3, current requeue_count=3 → >= cap → fails.
+        let n = SchedulerJobQueries::reap_stale_claimed(&pool, 60, 3)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        let found = SchedulerJobQueries::get(&pool, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "failed");
+        assert!(found.is_terminal());
+        assert!(found.receipt_id.is_some());
+        assert!(found.runner_id.is_none()); // claim state cleared
+        assert!(found.claimed_at.is_none());
+        assert_eq!(found.exit_code, Some(-2));
+        assert!(found.error.as_ref().is_some_and(|e| e.contains("reaped")));
+    }
+
+    #[tokio::test]
+    async fn test_reaper_restart_does_not_strand_stale_claims() {
+        // After requeue, a scheduler restart must see the job as pending
+        // (not stuck in claimed), so it can be handed out again.
+        let db_path = std::env::var("HOME")
+            .map(|home| {
+                format!(
+                    "{home}/.cache/gitforge-reaper-restart-{}-{}.db",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                )
+            })
+            .unwrap();
+        let pool = Pool::new(&db_path).await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("restart-strand");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job.id, RunnerId::new())
+            .await
+            .unwrap();
+        make_claimed_job_stale(&pool, job.id, 60).await;
+
+        // Reaper requeues the stale job.
+        let n = SchedulerJobQueries::reap_stale_claimed(&pool, 60, 3)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // Simulate restart: new pool opens the same file.
+        drop(pool);
+        let pool2 = Pool::new(&db_path).await.unwrap();
+        pool2.migrate().await.unwrap();
+
+        // After restart the job must appear as pending (not claimed).
+        let found = SchedulerJobQueries::get(&pool2, job.id)
+            .await
+            .unwrap()
+            .expect("job row still exists");
+        assert_eq!(found.status, "pending");
+        assert_eq!(found.requeue_count, 1);
+        assert!(found.is_active()); // pending is active
+
+        // The requeued job can be claimed again after restart.
+        let re_claimed = SchedulerJobQueries::mark_claimed(&pool2, job.id, RunnerId::new())
+            .await
+            .unwrap();
+        assert!(re_claimed);
+
+        drop(pool2);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn test_reaper_concurrent_calls_do_not_duplicate() {
+        // Two concurrent reaper calls must not double-transition the same job.
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("concurrent-reap");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job.id, RunnerId::new())
+            .await
+            .unwrap();
+        make_claimed_job_stale(&pool, job.id, 60).await;
+
+        // Fire two reaper calls concurrently.
+        let (r1, r2) = tokio::join!(
+            SchedulerJobQueries::reap_stale_claimed(&pool, 60, 3),
+            SchedulerJobQueries::reap_stale_claimed(&pool, 60, 3),
+        );
+
+        let n1 = r1.unwrap();
+        let n2 = r2.unwrap();
+
+        // One of them must have transitioned the job, the other zero.
+        assert_eq!(n1 + n2, 1, "exactly one reaper call should transition");
+
+        // Job is pending and requeue_count is exactly 1.
+        let found = SchedulerJobQueries::get(&pool, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "pending");
+        assert_eq!(found.requeue_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_reaper_unknown_job_is_noop() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let n = SchedulerJobQueries::reap_stale_claimed(&pool, 60, 3)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reaper_already_terminal_skipped() {
+        // A claimed job that becomes terminal before the reaper runs must be skipped.
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("terminal-before-reap");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job.id, RunnerId::new())
+            .await
+            .unwrap();
+
+        // Manually expire it so it looks stale.
+        make_claimed_job_stale(&pool, job.id, 60).await;
+
+        // Complete it externally before the reaper runs (simulating a runner
+        // that reported success just before the reaper window).
+        SchedulerJobQueries::complete(&pool, job.id, true, 0, None)
+            .await
+            .unwrap();
+
+        // Reaper must not overwrite the terminal state.
+        let n = SchedulerJobQueries::reap_stale_claimed(&pool, 60, 3)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+
+        let found = SchedulerJobQueries::get(&pool, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "succeeded");
+        assert!(found.receipt_id.is_some()); // original receipt preserved
+    }
+
+    #[tokio::test]
+    async fn test_reaper_multiple_stale_jobs_mixed_outcomes() {
+        // Five stale jobs: two below cap (→ requeued), two at cap (→ failed), one fresh (→ untouched).
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job_fresh = sample_scheduler_job("fresh");
+        let job_reap1 = sample_scheduler_job("reap1");
+        let job_reap2 = sample_scheduler_job("reap2");
+        let job_fail1 = sample_scheduler_job("fail1");
+        let job_fail2 = sample_scheduler_job("fail2");
+
+        for job in [&job_fresh, &job_reap1, &job_reap2, &job_fail1, &job_fail2] {
+            SchedulerJobQueries::insert_if_absent(&pool, job)
+                .await
+                .unwrap();
+        }
+
+        // Claim all.
+        SchedulerJobQueries::mark_claimed(&pool, job_fresh.id, RunnerId::new())
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job_reap1.id, RunnerId::new())
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job_reap2.id, RunnerId::new())
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job_fail1.id, RunnerId::new())
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job_fail2.id, RunnerId::new())
+            .await
+            .unwrap();
+
+        // Expire the four non-fresh ones.
+        make_claimed_job_stale(&pool, job_reap1.id, 60).await;
+        make_claimed_job_stale(&pool, job_reap2.id, 60).await;
+        make_claimed_job_stale(&pool, job_fail1.id, 60).await;
+        make_claimed_job_stale(&pool, job_fail2.id, 60).await;
+
+        // Set fail jobs to be at/above cap (>= max_retries=3).
+        sqlx::query("UPDATE scheduler_jobs SET requeue_count = 3 WHERE id = ? OR id = ?")
+            .bind(job_fail1.id.to_string())
+            .bind(job_fail2.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        let n = SchedulerJobQueries::reap_stale_claimed(&pool, 60, 3)
+            .await
+            .unwrap();
+        // 2 requeued + 2 failed = 4 transitioned (fresh is within lease).
+        assert_eq!(n, 4);
+
+        let fresh = SchedulerJobQueries::get(&pool, job_fresh.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.status, "claimed"); // untouched
+
+        for (job, expected_status) in [
+            (job_reap1, "pending"),
+            (job_reap2, "pending"),
+            (job_fail1, "failed"),
+            (job_fail2, "failed"),
+        ] {
+            let found = SchedulerJobQueries::get(&pool, job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.status, expected_status);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reaper_receipt_id_first_terminal_writer_wins() {
+        // A stale job that completes before reaper runs: reaper must not overwrite
+        // the terminal receipt_id.
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("receipt-reap");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job.id, RunnerId::new())
+            .await
+            .unwrap();
+        make_claimed_job_stale(&pool, job.id, 60).await;
+
+        // Complete it externally first.
+        let completed = SchedulerJobQueries::complete(&pool, job.id, true, 0, None)
+            .await
+            .unwrap()
+            .expect("job exists");
+        let original_receipt = completed.receipt_id.clone().expect("receipt set");
+
+        // Reaper must not transition it.
+        let n = SchedulerJobQueries::reap_stale_claimed(&pool, 60, 3)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+
+        let found = SchedulerJobQueries::get(&pool, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "succeeded");
+        assert_eq!(found.receipt_id, Some(original_receipt)); // immutable
+    }
+
+    // ------------------------------------------------------------------------
+    // requeue_count field tests
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_scheduler_job_requeue_count_defaults_to_zero() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("build");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+
+        let found = SchedulerJobQueries::get(&pool, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.requeue_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_requeue_count_increments_on_reap() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("build");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+        SchedulerJobQueries::mark_claimed(&pool, job.id, RunnerId::new())
+            .await
+            .unwrap();
+        make_claimed_job_stale(&pool, job.id, 60).await;
+
+        SchedulerJobQueries::reap_stale_claimed(&pool, 60, 3)
+            .await
+            .unwrap();
+
+        let found = SchedulerJobQueries::get(&pool, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.requeue_count, 1);
     }
 }

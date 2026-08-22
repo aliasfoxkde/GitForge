@@ -244,6 +244,21 @@ impl Pool {
                 .map_err(|e| Error::database(format!("failed to add receipt_id column: {}", e)))?;
         }
 
+        // Guarded additive migration for requeue_count column.
+        let has_requeue_count = columns.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == "requeue_count")
+                .unwrap_or(false)
+        });
+        if !has_requeue_count {
+            sqlx::query(
+                "ALTER TABLE scheduler_jobs ADD COLUMN requeue_count INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::database(format!("failed to add requeue_count column: {}", e)))?;
+        }
+
         // Index for listing jobs that still need scheduler attention
         sqlx::query(
             r#"

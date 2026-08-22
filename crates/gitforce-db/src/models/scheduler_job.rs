@@ -69,6 +69,7 @@ pub struct SchedulerJob {
     pub error: Option<String>,
     pub completed_at: Option<DateTime<Utc>>,
     pub receipt_id: Option<String>,
+    pub requeue_count: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -97,6 +98,7 @@ impl SchedulerJob {
             error: None,
             completed_at: None,
             receipt_id: None,
+            requeue_count: 0,
             created_at: now,
             updated_at: now,
         }
@@ -105,6 +107,12 @@ impl SchedulerJob {
     /// Set an optional working directory
     pub fn with_working_dir(mut self, working_dir: Option<String>) -> Self {
         self.working_dir = working_dir;
+        self
+    }
+
+    /// Set the requeue count
+    pub fn with_requeue_count(mut self, requeue_count: i32) -> Self {
+        self.requeue_count = requeue_count;
         self
     }
 
@@ -197,6 +205,7 @@ mod tests {
         assert!(job.error.is_none());
         assert!(job.completed_at.is_none());
         assert!(job.receipt_id.is_none());
+        assert_eq!(job.requeue_count, 0);
         assert_eq!(job.created_at, job.updated_at);
     }
 
