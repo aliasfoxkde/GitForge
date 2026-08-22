@@ -110,7 +110,7 @@ impl HttpWebhookSender {
 
     /// Generate signature for payload
     fn generate_signature(&self, payload: &[u8]) -> Option<String> {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let secret = self.secret.as_ref()?;
         let mut hasher = Sha256::new();
@@ -124,8 +124,8 @@ impl HttpWebhookSender {
 #[async_trait]
 impl WebhookSender for HttpWebhookSender {
     async fn send(&self, payload: &WebhookPayload) -> Result<(), WebhookError> {
-        let json = serde_json::to_vec(payload)
-            .map_err(|e| WebhookError::Serialization(e.to_string()))?;
+        let json =
+            serde_json::to_vec(payload).map_err(|e| WebhookError::Serialization(e.to_string()))?;
 
         let mut request = self.client.post(&self.url);
 
@@ -136,7 +136,10 @@ impl WebhookSender for HttpWebhookSender {
 
         request
             .header("Content-Type", "application/json")
-            .header("X-GitForge-Event", serde_json::to_string(&payload.event).unwrap_or_default())
+            .header(
+                "X-GitForge-Event",
+                serde_json::to_string(&payload.event).unwrap_or_default(),
+            )
             .body(json)
             .send()
             .await
@@ -396,10 +399,7 @@ mod tests {
 
     #[test]
     fn test_webhook_payload_new_with_empty_data() {
-        let payload = WebhookPayload::new(
-            WebhookEvent::RunnerRegistered,
-            serde_json::json!({}),
-        );
+        let payload = WebhookPayload::new(WebhookEvent::RunnerRegistered, serde_json::json!({}));
 
         assert_eq!(payload.event, WebhookEvent::RunnerRegistered);
         assert!(payload.data.is_object());

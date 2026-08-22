@@ -5,13 +5,7 @@
 //!   GET  /  — Server-Sent Events stream for server-initiated messages
 
 use anyhow::Result;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-    routing::post,
-    Router,
-};
+use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
@@ -28,7 +22,9 @@ struct HttpState {
 
 impl HttpState {
     fn new() -> Self {
-        Self { handler: McPHandler }
+        Self {
+            handler: McPHandler,
+        }
     }
 
     fn handle_rpc(&self, req: JsonRpcRequest) -> Result<serde_json::Value, String> {
@@ -45,11 +41,21 @@ impl HttpState {
             }),
 
             "tools/call" => {
-                let tool_name = req.params.get("name")
-                    .and_then(|v| v.as_str()).unwrap_or("");
-                let arguments = req.params.get("arguments")
-                    .and_then(|v| v.as_object()).cloned().unwrap_or_default();
-                let call = ToolCall { name: tool_name.to_string(), arguments };
+                let tool_name = req
+                    .params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let arguments = req
+                    .params
+                    .get("arguments")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                let call = ToolCall {
+                    name: tool_name.to_string(),
+                    arguments,
+                };
                 let result = self.handler.handle(call);
                 return Ok(serde_json::json!({
                     "jsonrpc": "2.0",
@@ -198,9 +204,7 @@ async fn handle_rpc(
 /// Start the HTTP MCP server
 pub async fn run_http(port: u16) -> Result<()> {
     let state = Arc::new(HttpState::new());
-    let app = Router::new()
-        .route("/", post(handle_rpc))
-        .with_state(state);
+    let app = Router::new().route("/", post(handle_rpc)).with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
     info!("Starting HTTP MCP server on http://{}", addr);

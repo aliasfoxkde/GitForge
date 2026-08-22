@@ -8,8 +8,8 @@ pub mod serializer;
 pub mod types;
 pub mod webhook;
 
-pub use bus::{EventBus, EventStream, InMemoryEventBus, EventFilter};
+pub use bus::{EventBus, EventFilter, EventStream, InMemoryEventBus};
 pub use event::EventEnvelope;
 pub use serializer::EventSerializer;
 pub use types::*;
-pub use webhook::{WebhookManager, WebhookPayload, WebhookEvent, WebhookSender, WebhookError};
+pub use webhook::{WebhookError, WebhookEvent, WebhookManager, WebhookPayload, WebhookSender};

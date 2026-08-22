@@ -98,7 +98,11 @@ impl JobExecutor {
         tracing::info!("executing job {}", job_id);
 
         // Create sandbox instance
-        let instance = match self.sandbox.create(job_id, &job.image, SandboxLimits::default()).await {
+        let instance = match self
+            .sandbox
+            .create(job_id, &job.image, SandboxLimits::default())
+            .await
+        {
             Ok(i) => i,
             Err(e) => {
                 return JobResult {
@@ -137,7 +141,11 @@ impl JobExecutor {
                     if step_result.exit_code != 0 {
                         success = false;
                         final_exit_code = step_result.exit_code;
-                        tracing::error!("step {} failed with exit code {}", step.name, step_result.exit_code);
+                        tracing::error!(
+                            "step {} failed with exit code {}",
+                            step.name,
+                            step_result.exit_code
+                        );
                         break;
                     }
                 }
@@ -172,7 +180,11 @@ impl JobExecutor {
             success,
             exit_code: final_exit_code,
             step_results,
-            error: if success { None } else { Some("job failed".to_string()) },
+            error: if success {
+                None
+            } else {
+                Some("job failed".to_string())
+            },
         }
     }
 
@@ -210,8 +222,8 @@ mod tests {
             JobStep::new("build", "cargo build"),
             JobStep::new("test", "cargo test"),
         ];
-        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
-            .with_steps(steps.clone());
+        let job =
+            ExecutableJob::new(JobId::new(), "rust:latest".to_string()).with_steps(steps.clone());
         assert_eq!(job.steps.len(), 2);
         assert_eq!(job.steps[0].name, "build");
     }
@@ -220,15 +232,13 @@ mod tests {
     fn test_executable_job_with_env() {
         let mut env = HashMap::new();
         env.insert("RUST_BACKTRACE".to_string(), "1".to_string());
-        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
-            .with_env(env);
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string()).with_env(env);
         assert_eq!(job.env.get("RUST_BACKTRACE"), Some(&"1".to_string()));
     }
 
     #[test]
     fn test_executable_job_with_timeout() {
-        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
-            .with_timeout(7200);
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string()).with_timeout(7200);
         assert_eq!(job.timeout_secs, 7200);
     }
 
@@ -298,7 +308,10 @@ mod tests {
             env: Some(env),
             working_directory: Some("/tmp".to_string()),
         };
-        assert_eq!(step.env.as_ref().unwrap().get("KEY"), Some(&"value".to_string()));
+        assert_eq!(
+            step.env.as_ref().unwrap().get("KEY"),
+            Some(&"value".to_string())
+        );
         assert_eq!(step.working_directory, Some("/tmp".to_string()));
     }
 
@@ -384,8 +397,7 @@ mod tests {
             JobStep::new("step2", "echo 2"),
             JobStep::new("step3", "echo 3"),
         ];
-        let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string())
-            .with_steps(steps);
+        let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string()).with_steps(steps);
         assert_eq!(job.steps.len(), 3);
     }
 
@@ -534,8 +546,7 @@ mod tests {
 
     #[test]
     fn test_executable_job_with_empty_steps() {
-        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
-            .with_steps(vec![]);
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string()).with_steps(vec![]);
         assert!(job.steps.is_empty());
     }
 
@@ -560,8 +571,7 @@ mod tests {
     fn test_executable_job_clone_and_modify() {
         let mut env = HashMap::new();
         env.insert("FOO".to_string(), "bar".to_string());
-        let job1 = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
-            .with_env(env);
+        let job1 = ExecutableJob::new(JobId::new(), "rust:latest".to_string()).with_env(env);
         let job2 = job1.clone();
         // Verify both have same values
         assert_eq!(job1.image, job2.image);
@@ -579,22 +589,20 @@ mod tests {
 
     #[test]
     fn test_executable_job_with_empty_env() {
-        let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string())
-            .with_env(HashMap::new());
+        let job =
+            ExecutableJob::new(JobId::new(), "alpine:latest".to_string()).with_env(HashMap::new());
         assert!(job.env.is_empty());
     }
 
     #[test]
     fn test_executable_job_very_long_timeout() {
-        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
-            .with_timeout(86400); // 24 hours
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string()).with_timeout(86400); // 24 hours
         assert_eq!(job.timeout_secs, 86400);
     }
 
     #[test]
     fn test_executable_job_zero_timeout() {
-        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
-            .with_timeout(0);
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string()).with_timeout(0);
         assert_eq!(job.timeout_secs, 0);
     }
 
@@ -617,8 +625,7 @@ mod tests {
     fn test_executable_job_with_unicode_in_env() {
         let mut env = HashMap::new();
         env.insert("中文".to_string(), "value".to_string());
-        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
-            .with_env(env);
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string()).with_env(env);
         assert_eq!(job.env.get("中文"), Some(&"value".to_string()));
     }
 
@@ -633,8 +640,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("MY_VAR_123".to_string(), "value".to_string());
         env.insert("ANOTHER_VAR".to_string(), "another".to_string());
-        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
-            .with_env(env);
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string()).with_env(env);
         assert_eq!(job.env.len(), 2);
     }
 
@@ -662,8 +668,7 @@ mod tests {
 
     #[test]
     fn test_executable_job_preserves_timeout() {
-        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
-            .with_timeout(7200);
+        let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string()).with_timeout(7200);
         assert_eq!(job.timeout_secs, 7200);
     }
 
@@ -692,9 +697,7 @@ mod tests {
         }
 
         let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string())
-            .with_steps(vec![
-                JobStep::new("test", "echo hello"),
-            ]);
+            .with_steps(vec![JobStep::new("test", "echo hello")]);
 
         let result = executor.execute(job).await;
         // Job completed - success or failure depends on Docker availability
@@ -715,9 +718,7 @@ mod tests {
         env.insert("TEST_VAR".to_string(), "test_value".to_string());
 
         let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string())
-            .with_steps(vec![
-                JobStep::new("env", "echo $TEST_VAR"),
-            ])
+            .with_steps(vec![JobStep::new("env", "echo $TEST_VAR")])
             .with_env(env);
 
         let result = executor.execute(job).await;
@@ -796,9 +797,21 @@ mod tests {
     fn test_job_result_multiple_step_results() {
         use gitforce_sandbox::StepResult;
         let step_results = vec![
-            StepResult { exit_code: 0, stdout: "build success".to_string(), stderr: String::new() },
-            StepResult { exit_code: 0, stdout: "test success".to_string(), stderr: String::new() },
-            StepResult { exit_code: 0, stdout: "deploy success".to_string(), stderr: String::new() },
+            StepResult {
+                exit_code: 0,
+                stdout: "build success".to_string(),
+                stderr: String::new(),
+            },
+            StepResult {
+                exit_code: 0,
+                stdout: "test success".to_string(),
+                stderr: String::new(),
+            },
+            StepResult {
+                exit_code: 0,
+                stdout: "deploy success".to_string(),
+                stderr: String::new(),
+            },
         ];
         let result = JobResult {
             job_id: JobId::new(),
@@ -846,7 +859,10 @@ mod tests {
             working_directory: Some("/dir".to_string()),
         };
         assert_eq!(step.name, "full-step");
-        assert_eq!(step.env.as_ref().unwrap().get("VAR"), Some(&"val".to_string()));
+        assert_eq!(
+            step.env.as_ref().unwrap().get("VAR"),
+            Some(&"val".to_string())
+        );
         assert_eq!(step.working_directory, Some("/dir".to_string()));
     }
 

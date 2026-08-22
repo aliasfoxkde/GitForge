@@ -44,7 +44,9 @@ impl CiEngineState {
 
     /// Check if all jobs succeeded
     pub fn all_jobs_succeeded(&self) -> bool {
-        self.jobs.values().all(|j| j.status() == JobStatus::Succeeded)
+        self.jobs
+            .values()
+            .all(|j| j.status() == JobStatus::Succeeded)
     }
 
     /// Get failed jobs
@@ -144,14 +146,12 @@ impl CiEngine {
             }
 
             // Check if all dependencies are satisfied
-            let deps_satisfied = node
-                .dependencies
-                .iter()
-                .all(|dep_id| {
-                    state.jobs.get(dep_id).is_some_and(|s| {
-                        s.status() == JobStatus::Succeeded
-                    })
-                });
+            let deps_satisfied = node.dependencies.iter().all(|dep_id| {
+                state
+                    .jobs
+                    .get(dep_id)
+                    .is_some_and(|s| s.status() == JobStatus::Succeeded)
+            });
 
             if deps_satisfied {
                 ready.push(node.id);
@@ -162,7 +162,11 @@ impl CiEngine {
     }
 
     /// Assign a job to a runner
-    pub async fn assign_job(&self, job_id: JobId, runner_id: gitforce_common::RunnerId) -> Result<()> {
+    pub async fn assign_job(
+        &self,
+        job_id: JobId,
+        runner_id: gitforce_common::RunnerId,
+    ) -> Result<()> {
         let mut state = self.state.write().await;
         if let Some(job_state) = state.jobs.get_mut(&job_id) {
             job_state.assign(runner_id)?;
@@ -322,7 +326,14 @@ mod tests {
         // After build succeeds, test job is now ready (still needs to be picked up by scheduler)
         // Note: In real system, scheduler would dequeue it. For test, we verify pipeline completion.
         let state = engine.state().await;
-        assert!(!state.failed_jobs().is_empty() || state.status == PipelineStatus::Succeeded || state.jobs.values().any(|j| j.status() == JobStatus::Succeeded));
+        assert!(
+            !state.failed_jobs().is_empty()
+                || state.status == PipelineStatus::Succeeded
+                || state
+                    .jobs
+                    .values()
+                    .any(|j| j.status() == JobStatus::Succeeded)
+        );
     }
 
     #[tokio::test]
@@ -343,7 +354,10 @@ mod tests {
 
         engine.assign_job(build_job, runner_id).await.unwrap();
         engine.start_job(build_job).await.unwrap();
-        engine.fail_job(build_job, 1, "build failed".to_string()).await.unwrap();
+        engine
+            .fail_job(build_job, 1, "build failed".to_string())
+            .await
+            .unwrap();
 
         let state = engine.state().await;
         assert_eq!(state.status, PipelineStatus::Failed);
@@ -459,7 +473,10 @@ mod tests {
 
         engine.assign_job(build_job, runner_id).await.unwrap();
         engine.start_job(build_job).await.unwrap();
-        engine.fail_job(build_job, 1, "test failure".to_string()).await.unwrap();
+        engine
+            .fail_job(build_job, 1, "test failure".to_string())
+            .await
+            .unwrap();
 
         let state = engine.state().await;
         assert!(!state.failed_jobs().is_empty());
