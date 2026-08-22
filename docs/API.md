@@ -438,6 +438,17 @@ The receipt is not a guarantee of success — both `succeeded` and `failed` outc
 
 The claim reaper is a background task that automatically recovers stale claimed jobs whose runners have disappeared.
 
+The scheduler service starts it automatically using these environment variables:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `SCHEDULER_CLAIM_LEASE_SECS` | `300` | Age after which a claimed job is stale |
+| `SCHEDULER_CLAIM_MAX_RETRIES` | `3` | Requeues before stale claims fail explicitly |
+| `SCHEDULER_CLAIM_REAPER_INTERVAL_SECS` | `30` | Poll interval |
+
+All values must be positive integers. The service performs an immediate reap
+on startup and aborts the reaper during graceful shutdown.
+
 **Function:** `start_claim_reaper(state, lease_secs, max_retries, poll_interval)`
 
 **Parameters:**
