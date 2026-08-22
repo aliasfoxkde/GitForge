@@ -144,6 +144,12 @@ impl Scheduler {
         state.job_assignments.remove(&job_id);
     }
 
+    /// Mark a job complete and release its assignment.
+    pub async fn complete(&self, job_id: JobId) {
+        let mut state = self.state.write().await;
+        state.job_assignments.remove(&job_id);
+    }
+
     /// Register a runner
     pub async fn register_runner(&self, runner: Runner) {
         let mut state = self.state.write().await;

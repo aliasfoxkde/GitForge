@@ -2,7 +2,7 @@
 //!
 //! Main entry point for the runner agent service.
 
-use gitforce_runner::{JobExecutor, RunnerAgent, RunnerConfig};
+use gitforce_runner::{RunnerAgent, RunnerConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,8 +31,13 @@ async fn main() -> anyhow::Result<()> {
     let runner_id = agent.register().await?;
     tracing::info!("runner registered with ID: {}", runner_id);
 
-    // Create job executor
-    let _executor = Arc::new(JobExecutor::new().await?);
+    // Start the scheduler heartbeat and job execution loops.
+    let running_agent = agent.clone();
+    tokio::spawn(async move {
+        if let Err(error) = running_agent.run().await {
+            tracing::error!("runner loop stopped: {}", error);
+        }
+    });
 
     tracing::info!("Runner Agent initialized successfully");
 

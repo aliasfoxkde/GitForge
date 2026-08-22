@@ -1,6 +1,7 @@
 //! Runner agent
 
-use gitforce_common::{Error, Result, RunnerId};
+use crate::executor::{ExecutableJob, JobExecutor, JobStep};
+use gitforce_common::{Error, JobId, Result, RunnerId};
 use gitforce_db::models::Runner;
 use gitforce_sandbox::DockerSandbox;
 use reqwest::Client;
@@ -78,6 +79,11 @@ pub struct JobAssignment {
     pub working_dir: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RegisterRunnerResponse {
+    id: String,
+}
+
 /// Runner agent that fetches and executes jobs
 #[derive(Clone)]
 pub struct RunnerAgent {
@@ -110,7 +116,7 @@ impl RunnerAgent {
 
     /// Register with the scheduler via HTTP
     pub async fn register(&mut self) -> Result<RunnerId> {
-        let runner = Runner::new(
+        let mut runner = Runner::new(
             self.config.name.clone(),
             gitforce_db::models::RunnerType::Docker,
             self.config.capacity,
@@ -127,6 +133,11 @@ impl RunnerAgent {
         match self.client.post(&register_url).json(&request).send().await {
             Ok(response) => {
                 if response.status().is_success() {
+                    if let Ok(payload) = response.json::<RegisterRunnerResponse>().await {
+                        if let Ok(uuid) = uuid::Uuid::parse_str(&payload.id) {
+                            runner.id = RunnerId::from(uuid);
+                        }
+                    }
                     tracing::info!("registered runner {} with scheduler", runner.id);
                 } else {
                     tracing::warn!(
@@ -158,6 +169,7 @@ impl RunnerAgent {
 
         let runner_id = runner.id;
         tracing::info!("runner {} starting", runner_id);
+        let executor = Arc::new(JobExecutor::new().await?);
 
         // Start heartbeat loop
         let heartbeat_runner_id = runner_id;
@@ -188,6 +200,8 @@ impl RunnerAgent {
         let fetch_interval = self.config.fetch_interval_secs;
         let fetch_client = self.client.clone();
         let fetch_url = self.config.scheduler_url.clone();
+        let fetch_runner_id = runner_id;
+        let executor = executor.clone();
         let is_running = self.is_running.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(fetch_interval));
@@ -199,7 +213,7 @@ impl RunnerAgent {
                 }
                 tracing::debug!("runner checking for jobs...");
 
-                let jobs_url = format!("{}/jobs/pending", fetch_url);
+                let jobs_url = format!("{}/jobs/pending?runner_id={}", fetch_url, fetch_runner_id);
                 match fetch_client.get(&jobs_url).send().await {
                     Ok(response) => {
                         if response.status().is_success() {
@@ -210,7 +224,61 @@ impl RunnerAgent {
                                         job.name,
                                         job.job_id
                                     );
-                                    // Job execution would happen here
+                                    let Ok(uuid) = uuid::Uuid::parse_str(&job.job_id) else {
+                                        tracing::error!(
+                                            "scheduler returned invalid job ID: {}",
+                                            job.job_id
+                                        );
+                                        continue;
+                                    };
+                                    let executable = ExecutableJob::new(
+                                        JobId::from(uuid),
+                                        "alpine:latest".to_string(),
+                                    )
+                                    .with_steps(
+                                        job.commands
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(index, command)| {
+                                                JobStep::new(&format!("step-{index}"), command)
+                                            })
+                                            .collect(),
+                                    );
+                                    let result = executor.execute(executable).await;
+                                    let complete_url =
+                                        format!("{}/jobs/{}/complete", fetch_url, job.job_id);
+                                    match fetch_client
+                                        .post(&complete_url)
+                                        .json(&serde_json::json!({
+                                            "success": result.success,
+                                            "exit_code": result.exit_code,
+                                            "error": result.error,
+                                        }))
+                                        .send()
+                                        .await
+                                    {
+                                        Ok(response) if response.status().is_success() => {
+                                            tracing::info!(
+                                                "reported job {} completion: HTTP {}",
+                                                job.job_id,
+                                                response.status()
+                                            );
+                                        }
+                                        Ok(response) => {
+                                            tracing::error!(
+                                                "scheduler rejected job {} completion: HTTP {}",
+                                                job.job_id,
+                                                response.status()
+                                            );
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                "failed to report job {} completion: {}",
+                                                job.job_id,
+                                                error
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }

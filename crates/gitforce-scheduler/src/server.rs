@@ -2,22 +2,26 @@
 
 use crate::Scheduler;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use gitforce_common::{JobId, RunnerId};
+use gitforce_common::{JobId, PipelineRunId, RepoId, RunnerId};
 use gitforce_db::models::{Runner, RunnerType};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 /// Application state for scheduler server
 #[derive(Clone)]
 pub struct SchedulerServerState {
     pub scheduler: Arc<Scheduler>,
+    jobs: Arc<RwLock<HashMap<JobId, PendingJobInfo>>>,
+    claimed: Arc<RwLock<HashSet<JobId>>>,
 }
 
 /// Runner registration request
@@ -30,7 +34,7 @@ pub struct RegisterRunnerRequest {
 }
 
 /// Job info for pending jobs response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PendingJobInfo {
     pub job_id: String,
     pub name: String,
@@ -39,10 +43,28 @@ pub struct PendingJobInfo {
     pub working_dir: Option<String>,
 }
 
+/// Request to enqueue a runnable synthetic/CI job.
+#[derive(Debug, Deserialize)]
+pub struct CreateJobRequest {
+    pub job_id: Option<String>,
+    pub pipeline_run_id: Option<String>,
+    pub repo_id: Option<String>,
+    pub name: String,
+    pub commands: Vec<String>,
+    pub working_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingJobsQuery {
+    runner_id: Option<String>,
+}
+
 /// Create scheduler server state
 pub fn create_state(scheduler: Scheduler) -> SchedulerServerState {
     SchedulerServerState {
         scheduler: Arc::new(scheduler),
+        jobs: Arc::new(RwLock::new(HashMap::new())),
+        claimed: Arc::new(RwLock::new(HashSet::new())),
     }
 }
 
@@ -52,11 +74,49 @@ pub fn scheduler_routes<S: Clone + Send + Sync + 'static>(
 ) -> Router<S> {
     Router::new()
         .route("/runners", post(register_runner))
-        .route("/runners/{id}/heartbeat", post(runner_heartbeat))
+        .route("/runners/:id/heartbeat", post(runner_heartbeat))
+        .route("/jobs", post(create_job))
         .route("/jobs/pending", get(get_pending_jobs))
-        .route("/jobs/{id}/assign", post(assign_job))
-        .route("/jobs/{id}/complete", post(complete_job))
+        .route("/jobs/:id/assign", post(assign_job))
+        .route("/jobs/:id/complete", post(complete_job))
         .with_state(state)
+}
+
+/// Enqueue a runnable job for a registered runner.
+async fn create_job(
+    State(state): State<SchedulerServerState>,
+    Json(request): Json<CreateJobRequest>,
+) -> impl IntoResponse {
+    let job_id = request
+        .job_id
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok().map(JobId::from))
+        .unwrap_or_else(JobId::new);
+    let pipeline_run_id = request
+        .pipeline_run_id
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok().map(PipelineRunId::from))
+        .unwrap_or_else(PipelineRunId::new);
+    let repo_id = request
+        .repo_id
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok().map(RepoId::from))
+        .unwrap_or_else(RepoId::new);
+    let info = PendingJobInfo {
+        job_id: job_id.to_string(),
+        name: request.name,
+        pipeline_run_id: pipeline_run_id.to_string(),
+        commands: request.commands,
+        working_dir: request.working_dir,
+    };
+
+    state
+        .scheduler
+        .enqueue(job_id, pipeline_run_id, repo_id)
+        .await;
+    state.jobs.write().await.insert(job_id, info.clone());
+
+    (StatusCode::CREATED, Json(info))
 }
 
 /// Register a new runner
@@ -118,13 +178,32 @@ async fn runner_heartbeat(
 }
 
 /// Get pending jobs for a runner
-async fn get_pending_jobs(State(state): State<SchedulerServerState>) -> impl IntoResponse {
-    // Process queue to assign pending jobs
+async fn get_pending_jobs(
+    State(state): State<SchedulerServerState>,
+    Query(query): Query<PendingJobsQuery>,
+) -> impl IntoResponse {
     state.scheduler.process_queue().await;
-
-    // Return empty array - actual job info would come from database
-    // In real implementation, this would query job details from DB
-    Json(serde_json::json!([]))
+    let requested_runner = query
+        .runner_id
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok().map(RunnerId::from));
+    let jobs = state.jobs.read().await;
+    let mut claimed = state.claimed.write().await;
+    let mut pending = Vec::new();
+    for (job_id, info) in jobs.iter() {
+        if claimed.contains(job_id) {
+            continue;
+        }
+        let Some(assigned_runner) = state.scheduler.is_assigned(*job_id).await else {
+            continue;
+        };
+        if requested_runner.is_some_and(|runner| runner != assigned_runner) {
+            continue;
+        }
+        claimed.insert(*job_id);
+        pending.push(info.clone());
+    }
+    Json(pending)
 }
 
 /// Assign a job to a runner (runner claims a job)
@@ -166,7 +245,7 @@ async fn assign_job(
 
 /// Complete a job
 async fn complete_job(
-    State(_state): State<SchedulerServerState>,
+    State(state): State<SchedulerServerState>,
     Path(job_id): Path<String>,
     Json(request): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -184,6 +263,9 @@ async fn complete_job(
     };
 
     let success = request["success"].as_bool().unwrap_or(false);
+    state.scheduler.complete(job_id).await;
+    state.jobs.write().await.remove(&job_id);
+    state.claimed.write().await.remove(&job_id);
     tracing::info!("job {} completed via HTTP: success={}", job_id, success);
 
     (
@@ -275,7 +357,11 @@ mod tests {
         let scheduler = crate::Scheduler::new();
         let state = create_state(scheduler);
 
-        let response = get_pending_jobs(axum::extract::State(state)).await;
+        let response = get_pending_jobs(
+            axum::extract::State(state),
+            axum::extract::Query(PendingJobsQuery { runner_id: None }),
+        )
+        .await;
 
         let resp = response.into_response();
         assert_status(resp, StatusCode::OK);
