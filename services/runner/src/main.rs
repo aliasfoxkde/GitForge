@@ -3,7 +3,7 @@
 //! Main entry point for the runner agent service.
 
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
-use gitforge_runner::{JobExecutor, RunnerAgent, RunnerConfig};
+use gitforge_runner::{RunnerAgent, RunnerConfig};
 #[allow(unused_imports)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -40,9 +40,6 @@ async fn main() -> anyhow::Result<()> {
     let runner_id = agent.register().await?;
     tracing::info!("runner registered with ID: {}", runner_id);
 
-    // Create job executor
-    let _executor = Arc::new(JobExecutor::new().await?);
-
     tracing::info!("Runner Agent initialized successfully");
 
     // Set up shutdown handling
@@ -52,17 +49,20 @@ async fn main() -> anyhow::Result<()> {
     // Spawn graceful shutdown handler
     spawn_shutdown_handler(shutdown_flag);
 
-    // Wait for shutdown signal
-    let shutdown_future = create_shutdown_future(shutdown.clone());
     tracing::info!("Runner Agent running, press Ctrl+C to stop");
 
-    // Wait for shutdown signal
-    timeout(Duration::MAX, shutdown_future).await.ok();
+    // Run the fetch/heartbeat loops while also accepting graceful shutdown.
+    tokio::select! {
+        result = agent.run() => {
+            result?;
+        }
+        _ = create_shutdown_future(shutdown.clone()) => {
+            tracing::info!("shutdown signal received");
+            agent.stop().await;
+        }
+    }
 
     tracing::info!("shutting down Runner Agent");
-
-    // Stop the agent gracefully
-    agent.stop().await;
 
     // Graceful shutdown delay
     graceful_shutdown_delay().await;
