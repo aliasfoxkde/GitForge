@@ -176,10 +176,9 @@ impl CompletionOutbox {
             writer.into_inner()?.sync_all()?;
         }
         let final_path = self.entry_path(job_id);
-        fs::rename(&tmp_path, &final_path).map_err(|e| {
+        fs::rename(&tmp_path, &final_path).inspect_err(|_| {
             // Clean up temp file on failure.
             let _ = fs::remove_file(&tmp_path);
-            e
         })?;
 
         // Write .done marker to detect torn writes on restart.
@@ -574,7 +573,7 @@ mod tests {
         let mut outbox = CompletionOutbox::open(&path).unwrap();
         for i in 0..3 {
             outbox
-                .enqueue(&format!("reload-{:02}", i), payload(true, i as i32))
+                .enqueue(&format!("reload-{:02}", i), payload(true, i))
                 .unwrap();
         }
         drop(outbox);
