@@ -39,3 +39,25 @@ template-parts/rust/target/
 # ─── Rust ─────────────────────────────────────────────────────────────────────
 target/
 Cargo.lock
+
+# ─── Coverage & Profiling ─────────────────────────────────────────────────────
+*.profraw
+*.prof
+*.gcda
+*.gcno
+lcov.info
+cobertura.xml
+tarpaulin-report.json
+coverage/
+coverage.out
+coverage.html
+*.html
+report.xml
+
+# ─── Runtime Data ──────────────────────────────────────────────────────────────
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+logs/
+*.log
