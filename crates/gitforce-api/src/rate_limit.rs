@@ -292,8 +292,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_extract_client_id() {
-        use axum::body::Body;
-
         let limiter = RateLimiter::new(RateLimitConfig::default());
         let _ = limiter;
         // Note: This is a simplified test placeholder

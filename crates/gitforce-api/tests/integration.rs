@@ -1038,10 +1038,10 @@ async fn test_api_webhook_trigger_not_found() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(&format!("/api/webhook/trigger/{}", valid_uuid))
+                .uri(format!("/api/webhook/trigger/{}", valid_uuid))
                 .header("Authorization", format!("Bearer {}", token))
                 .header("Content-Type", "application/json")
-                .body(Body::from(format!(r#"{{"repo_id":"550e8400-e29b-41d4-a716-446655440000","commit_hash":"abc123","branch":"main"}}"#)))
+                .body(Body::from(r#"{"repo_id":"550e8400-e29b-41d4-a716-446655440000","commit_hash":"abc123","branch":"main"}"#.to_string()))
                 .unwrap(),
         )
         .await
@@ -1066,7 +1066,7 @@ async fn test_api_webhook_trigger_unauthorized() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(&format!("/api/webhook/trigger/{}", valid_uuid))
+                .uri(format!("/api/webhook/trigger/{}", valid_uuid))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"repo_id":"550e8400-e29b-41d4-a716-446655440000","commit_hash":"abc123","branch":"main"}"#))
                 .unwrap(),
@@ -1131,7 +1131,7 @@ async fn test_api_webhook_trigger_success() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(&format!("/api/webhook/trigger/{}", pipeline.id))
+                .uri(format!("/api/webhook/trigger/{}", pipeline.id))
                 .header("Authorization", format!("Bearer {}", token))
                 .header("Content-Type", "application/json")
                 .body(Body::from(format!(r#"{{"repo_id":"{}","commit_hash":"abc123","branch":"main","pipeline_name":"ci-pipeline"}}"#, repo_id)))

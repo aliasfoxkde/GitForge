@@ -430,7 +430,7 @@ mod tests {
         scheduler.register_runner(runner2.clone()).await;
 
         // Add multiple jobs
-        for i in 0..5 {
+        for _i in 0..5 {
             let job_id = JobId::new();
             let run_id = PipelineRunId::new();
             let repo_id = RepoId::new();
@@ -565,7 +565,7 @@ mod tests {
         let scheduler = Scheduler::new();
 
         // Subscribe to scheduler events
-        let mut rx = scheduler.subscribe();
+        let _rx = scheduler.subscribe();
 
         let job_id = JobId::new();
         let run_id = PipelineRunId::new();
@@ -589,7 +589,7 @@ mod tests {
         scheduler.register_runner(runner.clone()).await;
 
         // Subscribe before enqueueing
-        let mut rx = scheduler.subscribe();
+        let _rx = scheduler.subscribe();
 
         let job_id = JobId::new();
         let run_id = PipelineRunId::new();

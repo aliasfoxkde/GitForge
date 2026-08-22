@@ -6,9 +6,7 @@
 
 use anyhow::Result;
 use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use tokio::sync::broadcast;
+use std::sync::Arc;
 use tracing::info;
 
 use crate::handlers::{McPHandler, ToolCall};

@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_sync_status_all_variants() {
-        let variants = vec![
+        let variants = [
             SyncStatus::InSync,
             SyncStatus::PendingPush,
             SyncStatus::PendingPull,
@@ -717,7 +717,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         client.init().await.unwrap();
-        let before = client.state.read().await.updated_at.clone();
+        let _before = client.state.read().await.updated_at.clone();
         client
             .add_repo("test-repo".to_string(), "repo-123".to_string())
             .await

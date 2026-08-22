@@ -239,7 +239,7 @@ mod tests {
 
         for event_type in event_types {
             let event = EventEnvelope::new(
-                event_type.clone(),
+                event_type,
                 EventPayload::PushReceived(PushReceivedPayload {
                     repo_id: gitforce_common::RepoId::new(),
                     ref_name: "refs/heads/main".to_string(),
