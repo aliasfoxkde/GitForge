@@ -15,7 +15,9 @@ use gitforce_db::Pool;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// Application state for scheduler server
@@ -115,6 +117,47 @@ pub async fn create_state_with_pool(
         state.jobs.write().await.insert(job.id, info);
     }
     Ok(state)
+}
+
+/// Spawn a cancellable background task that periodically reaps stale claimed
+/// jobs whose leases have expired.
+///
+/// Returns `None` when the state has no durable pool (in-memory mode) so callers
+/// can distinguish "durable recovery not active" from a task handle they must
+/// drop.
+///
+/// Parameters:
+/// - `lease_secs`: threshold in seconds after which a claimed job is considered stale
+/// - `max_retries`: maximum requeue count before a stale job is transitioned to failed
+/// - `poll_interval`: how often the reaper checks for stale claims
+///
+/// The task runs an immediate bounded reap on start, then continues with interval ticks.
+/// Failures are logged without crashing the scheduler.
+pub fn start_claim_reaper(
+    state: &SchedulerServerState,
+    lease_secs: i64,
+    max_retries: i32,
+    poll_interval: Duration,
+) -> Option<JoinHandle<()>> {
+    let pool = state.pool.clone()?;
+    Some(tokio::spawn(async move {
+        // Immediate first reap.
+        if let Err(e) =
+            SchedulerJobQueries::reap_stale_claimed(&pool, lease_secs, max_retries).await
+        {
+            tracing::error!(%e, "claim reaper initial reap failed");
+        }
+
+        let mut interval = tokio::time::interval(poll_interval);
+        loop {
+            interval.tick().await;
+            if let Err(e) =
+                SchedulerJobQueries::reap_stale_claimed(&pool, lease_secs, max_retries).await
+            {
+                tracing::error!(%e, "claim reaper tick failed");
+            }
+        }
+    }))
 }
 
 fn pending_info_from_job(job: &SchedulerJob) -> PendingJobInfo {
@@ -1037,5 +1080,97 @@ mod tests {
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["status"], "succeeded");
+    }
+
+    // ------------------------------------------------------------------------
+    // Claim reaper lifecycle tests
+    // ------------------------------------------------------------------------
+
+    fn sample_scheduler_job(name: &str) -> gitforce_db::models::SchedulerJob {
+        gitforce_db::models::SchedulerJob::new(
+            gitforce_common::PipelineRunId::new(),
+            gitforce_common::RepoId::new(),
+            name.to_string(),
+            vec!["make build".to_string(), "make test".to_string()],
+        )
+        .with_working_dir(Some("/workspace/repo".to_string()))
+    }
+
+    #[tokio::test]
+    async fn test_claim_reaper_returns_none_when_no_pool() {
+        // In-memory state has no durable pool — reaper must not be started.
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let handle = start_claim_reaper(&state, 60, 3, Duration::from_secs(30));
+        assert!(handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_claim_reaper_one_bounded_reap_preserves_terminal_receipt() {
+        // Durable path: a job that was claimed then completed (terminal) is skipped
+        // by the bounded reaper — its receipt is immutable.
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("build");
+        gitforce_db::queries::SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+
+        // Claim it, then complete it — this mints a durable receipt.
+        let runner_id = gitforce_common::RunnerId::new();
+        gitforce_db::queries::SchedulerJobQueries::mark_claimed(&pool, job.id, runner_id)
+            .await
+            .unwrap();
+        let completed =
+            gitforce_db::queries::SchedulerJobQueries::complete(&pool, job.id, true, 0, None)
+                .await
+                .unwrap()
+                .expect("job should exist");
+        let original_receipt = completed.receipt_id.clone().expect("receipt set");
+        assert!(completed.is_terminal());
+        assert_eq!(completed.status, "succeeded");
+
+        // The reaper skips a terminal job even if it were somehow still 'claimed'.
+        // (complete() sets status='succeeded', so is_terminal() returns true).
+        let n = gitforce_db::queries::SchedulerJobQueries::reap_stale_claimed(&pool, 60, 3)
+            .await
+            .unwrap();
+        assert_eq!(n, 0); // nothing transitioned
+
+        let found = gitforce_db::queries::SchedulerJobQueries::get(&pool, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "succeeded");
+        assert_eq!(found.receipt_id, Some(original_receipt)); // immutable
+    }
+
+    #[tokio::test]
+    async fn test_claim_reaper_inmemory_state_no_silent_durable_recovery() {
+        // Prove that create_state (no pool) does not pretend to do durable recovery.
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        // The state has no pool — start_claim_reaper must return None.
+        let handle = start_claim_reaper(&state, 60, 3, Duration::from_secs(30));
+        assert!(handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_claim_reaper_durable_state_returns_some_handle() {
+        // With a real pool, start_claim_reaper must return Some(handle).
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let scheduler = crate::Scheduler::new();
+        let state = create_state_with_pool(scheduler, pool.clone())
+            .await
+            .unwrap();
+
+        let handle = start_claim_reaper(&state, 60, 3, Duration::from_secs(30));
+        assert!(handle.is_some());
+
+        // Abort the background task to clean up.
+        handle.unwrap().abort();
     }
 }

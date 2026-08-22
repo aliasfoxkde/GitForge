@@ -20,3 +20,6 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
+
+[dev-dependencies]
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json"] }

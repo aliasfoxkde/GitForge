@@ -10,4 +10,7 @@ pub mod server;
 pub use assigner::Scheduler;
 pub use policy::{SchedulingPolicy, SimplePolicy};
 pub use queue::{JobQueue, Priority};
-pub use server::{create_state, create_state_with_pool, scheduler_routes, SchedulerServerState};
+pub use server::{
+    create_state, create_state_with_pool, scheduler_routes, start_claim_reaper,
+    SchedulerServerState,
+};
