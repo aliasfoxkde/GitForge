@@ -44,6 +44,8 @@ pub struct SchedulerState {
     pub queue: JobQueue,
     pub runners: HashMap<RunnerId, Runner>,
     pub job_assignments: HashMap<JobId, RunnerId>,
+    /// Pipeline run IDs for assigned jobs; assignments are removed from the queue.
+    pub assigned_pipeline_runs: HashMap<JobId, PipelineRunId>,
 }
 
 impl Default for SchedulerState {
@@ -58,6 +60,7 @@ impl SchedulerState {
             queue: JobQueue::new(),
             runners: HashMap::new(),
             job_assignments: HashMap::new(),
+            assigned_pipeline_runs: HashMap::new(),
         }
     }
 
@@ -207,6 +210,7 @@ impl Scheduler {
         }
         // Also remove assignment if exists
         state.job_assignments.remove(&job_id);
+        state.assigned_pipeline_runs.remove(&job_id);
     }
 
     /// Register a runner
@@ -265,6 +269,7 @@ impl Scheduler {
             };
 
             let job_id = job.job_id;
+            let pipeline_run_id = job.pipeline_run_id;
 
             // Select runner using policy
             let runner_id = self.policy.select_runner(job_id, &runners).await;
@@ -274,6 +279,7 @@ impl Scheduler {
                     // Dequeue and assign (JobId and RunnerId are Copy types)
                     state.queue.dequeue();
                     state.job_assignments.insert(job_id, r_id);
+                    state.assigned_pipeline_runs.insert(job_id, pipeline_run_id);
                     tracing::info!("assigned job {} to runner {}", job_id, r_id);
                     processed += 1;
 
@@ -358,13 +364,10 @@ impl Scheduler {
             .job_assignments
             .iter()
             .filter_map(|(job_id, runner_id)| {
-                // Find the queued job to get pipeline_run_id
                 state
-                    .queue
-                    .all()
-                    .iter()
-                    .find(|j| j.job_id == *job_id)
-                    .map(|j| (j.job_id, *runner_id, j.pipeline_run_id))
+                    .assigned_pipeline_runs
+                    .get(job_id)
+                    .map(|pipeline_run_id| (*job_id, *runner_id, *pipeline_run_id))
             })
             .collect()
     }
@@ -793,6 +796,9 @@ mod tests {
         // Job should be assigned
         let assigned = scheduler.is_assigned(job_id).await;
         assert_eq!(assigned, Some(runner.id));
+
+        let assigned_jobs = scheduler.get_assigned_jobs().await;
+        assert_eq!(assigned_jobs, vec![(job_id, runner.id, run_id)]);
     }
 
     #[tokio::test]
