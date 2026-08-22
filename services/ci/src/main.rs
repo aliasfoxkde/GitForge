@@ -12,7 +12,11 @@ use futures::StreamExt;
 use gitforge_ci::{
     CiEngine, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
 };
-use gitforge_db::Pool;
+use gitforge_db::{
+    models::{Pipeline, PipelineRun},
+    queries::{PipelineQueries, PipelineRunQueries, RepoQueries},
+    Pool,
+};
 use gitforge_events::{
     EventBus, EventEnvelope, EventFilter, EventPayload, EventType, InMemoryEventBus,
     PushReceivedPayload,
@@ -54,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:./gitforge.db".to_string());
     let db_pool = Pool::new(&database_url).await?;
     db_pool.migrate().await?;
-    let scheduler = Scheduler::with_db(db_pool);
+    let scheduler = Scheduler::with_db(db_pool.clone());
 
     // Start scheduler HTTP API server on port 42781
     let scheduler_port: u16 = std::env::var("SCHEDULER_PORT")
@@ -71,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/pipelines/trigger", axum::routing::post(trigger_pipeline))
         .merge(scheduler_routes(scheduler_state))
         .layer(Extension(event_bus.clone()))
+        .layer(Extension(db_pool.clone()))
         .layer(TraceLayer::new_for_http());
 
     let scheduler_addr = format!("0.0.0.0:{}", scheduler_port);
@@ -93,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
     let event_bus_clone = event_bus.clone();
     let scheduler_clone = scheduler_arc.clone();
     let pipeline_cache_clone = pipeline_cache.clone();
+    let db_pool_clone = db_pool.clone();
 
     // Shared shutdown flag
     let shutdown = create_shutdown_flag();
@@ -108,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
             event_bus_clone,
             scheduler_clone,
             pipeline_cache_clone,
+            db_pool_clone,
             shutdown_consumer,
         )
         .await
@@ -172,6 +179,7 @@ struct PipelineTriggerRequest {
 /// this endpoint does not duplicate pipeline creation or scheduler behavior.
 async fn trigger_pipeline(
     Extension(event_bus): Extension<Arc<dyn EventBus>>,
+    Extension(db_pool): Extension<Pool>,
     headers: HeaderMap,
     Json(request): Json<PipelineTriggerRequest>,
 ) -> impl IntoResponse {
@@ -233,6 +241,62 @@ async fn trigger_pipeline(
     }
 
     let repo_id = gitforge_common::RepoId::from(repo_uuid);
+    if !matches!(RepoQueries::get(&db_pool, repo_id).await, Ok(Some(_))) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "accepted": false,
+                "error": "repository not found"
+            })),
+        )
+            .into_response();
+    }
+    let pipeline = match PipelineQueries::list_by_repo(&db_pool, repo_id).await {
+        Ok(mut pipelines) => match pipelines.pop() {
+            Some(pipeline) => pipeline,
+            None => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "accepted": false,
+                        "error": "repository has no configured pipeline"
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "accepted": false,
+                    "error": "failed to load pipeline"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let run_id = gitforge_common::PipelineRunId::new();
+    let mut persisted_run = PipelineRun::new(
+        pipeline.id,
+        repo_id,
+        "control-center".to_string(),
+        request.new_hash.clone(),
+    );
+    persisted_run.id = run_id;
+    if PipelineRunQueries::create(&db_pool, &persisted_run)
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "accepted": false,
+                "error": "failed to persist CI trigger run"
+            })),
+        )
+            .into_response();
+    }
     let event = EventEnvelope::new(
         EventType::PushReceived,
         EventPayload::PushReceived(PushReceivedPayload {
@@ -246,6 +310,7 @@ async fn trigger_pipeline(
         None,
     );
     let event_id = event.event_id;
+    let event = event.with_correlation(run_id.into());
 
     if let Err(error) = event_bus.publish(event).await {
         tracing::error!(%error, %event_id, "failed to publish CI trigger event");
@@ -264,7 +329,9 @@ async fn trigger_pipeline(
         Json(serde_json::json!({
             "accepted": true,
             "event_id": event_id,
-            "repo_id": repo_id
+            "repo_id": repo_id,
+            "pipeline_run_id": run_id,
+            "pipeline_id": pipeline.id
         })),
     )
         .into_response()
@@ -293,6 +360,7 @@ async fn run_event_consumer(
     event_bus: Arc<dyn EventBus>,
     scheduler: Arc<Scheduler>,
     pipeline_cache: Arc<std::sync::Mutex<PipelineCache>>,
+    db_pool: Pool,
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     tracing::info!("starting event consumer loop");
@@ -317,7 +385,7 @@ async fn run_event_consumer(
                 match event {
                     Some(event) => {
                         tracing::debug!("received event: {:?}", event.event_type);
-                        if let Err(e) = handle_push_event(&event, &scheduler, &pipeline_cache).await {
+                        if let Err(e) = handle_push_event(&event, &scheduler, &pipeline_cache, &db_pool).await {
                             tracing::error!("failed to handle push event: {}", e);
                         }
                     }
@@ -338,6 +406,7 @@ async fn handle_push_event(
     event: &EventEnvelope,
     scheduler: &Arc<Scheduler>,
     pipeline_cache: &Arc<std::sync::Mutex<PipelineCache>>,
+    db_pool: &Pool,
 ) -> anyhow::Result<()> {
     // Only handle PushReceived events
     let EventPayload::PushReceived(payload) = &event.payload else {
@@ -364,12 +433,39 @@ async fn handle_push_event(
             .clone()
     };
 
-    // Create trigger event
-    let trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
+    // Control-plane events persist their run before publication. Native push
+    // events retain the generated pipeline/run path below.
+    let persisted_run = if let Some(run_uuid) = event.correlation_id {
+        let run_id = gitforge_common::PipelineRunId::from(run_uuid);
+        let run = PipelineRunQueries::get(db_pool, run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("persisted CI trigger run {} was not found", run_id))?;
+        Some((run_id, run.pipeline_id))
+    } else {
+        None
+    };
+    let trigger_event = match persisted_run {
+        Some((_, pipeline_id)) => PipelineTriggerEvent::new(
+            pipeline_id,
+            repo_id,
+            payload.new_hash.clone(),
+            TriggerType::Push,
+        )
+        .with_ref(ref_name.to_string()),
+        None => create_trigger_event(repo_id, &payload.new_hash, ref_name),
+    };
 
     // Create and start the CI engine
-    let engine = CiEngine::new(trigger_event, pipeline).await?;
+    let engine = match persisted_run {
+        Some((run_id, _)) => {
+            CiEngine::new_with_run_id(trigger_event, pipeline.clone(), run_id).await?
+        }
+        None => CiEngine::new(trigger_event, pipeline.clone()).await?,
+    };
     engine.start().await?;
+    if let Some((run_id, _)) = persisted_run {
+        PipelineRunQueries::update_status(db_pool, run_id, "running").await?;
+    }
 
     tracing::info!(
         "pipeline triggered for repo {} on ref {}",
@@ -382,6 +478,27 @@ async fn handle_push_event(
     tracing::info!("enqueueing {} ready jobs", ready_jobs.len());
 
     let state = engine.state().await;
+    if persisted_run.is_none() {
+        let persisted_pipeline = Pipeline {
+            id: state.pipeline_id,
+            repo_id,
+            name: format!("{}-pipeline", repo_id),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(db_pool, &persisted_pipeline).await?;
+        let mut native_run = PipelineRun::new(
+            state.pipeline_id,
+            repo_id,
+            "ci-trigger".to_string(),
+            payload.new_hash.clone(),
+        );
+        native_run.id = state.run_id;
+        native_run.start();
+        PipelineRunQueries::create(db_pool, &native_run).await?;
+    }
+
     for job_id in ready_jobs {
         if let Some(_job_state) = state.jobs.get(&job_id) {
             scheduler.enqueue(job_id, state.run_id, repo_id).await;
