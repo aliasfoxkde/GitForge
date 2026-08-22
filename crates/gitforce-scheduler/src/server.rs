@@ -192,7 +192,6 @@ pub fn scheduler_routes<S: Clone + Send + Sync + 'static>(
         .route("/jobs", post(create_job))
         .route("/jobs/pending", get(get_pending_jobs))
         .route("/jobs/:id", get(get_job_status))
-        .route("/jobs/:id/assign", post(assign_job))
         .route("/jobs/:id/complete", post(complete_job))
         .route("/jobs/:id/cancel", post(cancel_job))
         .with_state(state)
@@ -451,43 +450,6 @@ async fn get_pending_jobs(
         }
     }
     Json(pending)
-}
-
-/// Assign a job to a runner (runner claims a job)
-async fn assign_job(
-    State(_state): State<SchedulerServerState>,
-    Path(job_id): Path<String>,
-    Json(request): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let job_id: JobId = match Uuid::parse_str(&job_id) {
-        Ok(id) => JobId::from(id),
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid_job_id",
-                    "message": "Invalid job ID format"
-                })),
-            )
-        }
-    };
-
-    let runner_id: Option<RunnerId> = request["runner_id"]
-        .as_str()
-        .and_then(|s| Uuid::parse_str(s).ok().map(RunnerId::from));
-
-    if let Some(r_id) = runner_id {
-        // In real impl, mark job as assigned to this runner
-        tracing::info!("job {} assigned to runner {} via HTTP", job_id, r_id);
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "assigned",
-            "job_id": job_id.to_string()
-        })),
-    )
 }
 
 /// Complete a job
@@ -755,42 +717,6 @@ mod tests {
 
         let resp = response.into_response();
         assert_status(resp, StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_assign_job_valid_uuid() {
-        let scheduler = crate::Scheduler::new();
-        let state = create_state(scheduler);
-        let job_id = uuid::Uuid::new_v4();
-        let runner_id = uuid::Uuid::new_v4();
-
-        let response = assign_job(
-            axum::extract::State(state),
-            axum::extract::Path(job_id.to_string()),
-            axum::Json(serde_json::json!({
-                "runner_id": runner_id.to_string()
-            })),
-        )
-        .await;
-
-        assert_status(response.into_response(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_assign_job_invalid_uuid() {
-        let scheduler = crate::Scheduler::new();
-        let state = create_state(scheduler);
-
-        let response = assign_job(
-            axum::extract::State(state),
-            axum::extract::Path("not-a-uuid".to_string()),
-            axum::Json(serde_json::json!({
-                "runner_id": "something"
-            })),
-        )
-        .await;
-
-        assert_status(response.into_response(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
