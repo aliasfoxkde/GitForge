@@ -58,13 +58,12 @@ services:
       context: .
       target: ci-prod
     container_name: gitforge-scheduler
-    ports:
-      - "8081:8081"
     volumes:
       - scheduler-data:/data
     environment:
       - DATABASE_URL=sqlite:/data/gitforge.db
       - RUST_LOG=info
+      - SCHEDULER_BIND=0.0.0.0  # Bind to all interfaces inside private network
     networks:
       - gitforge
 

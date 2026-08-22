@@ -227,16 +227,15 @@ curl -X POST http://localhost:8080/runners \
 
 ## Scheduler (Job Queue)
 
-```
-http://localhost:8081
-```
-
 The scheduler manages the lifecycle of CI/run-time jobs: enqueue, runner claim, completion, cancellation, and automatic reaping of stale claimed jobs.
+
+**⚠️ Security note:** The scheduler is intentionally unauthenticated in Phase 1. It must only be exposed on trusted network segments. See [§Security](#security) before changing `SCHEDULER_BIND`.
 
 ### Base URL
 
 ```
-http://localhost:8081
+http://127.0.0.1:8081   (systemd/local — default bind 127.0.0.1)
+http://scheduler:8081    (Docker Compose — bind 0.0.0.0, private network only)
 ```
 
 ### Endpoints
@@ -442,6 +441,7 @@ The scheduler service starts it automatically using these environment variables:
 
 | Variable | Default | Meaning |
 |---|---:|---|
+| `SCHEDULER_BIND` | `127.0.0.1` | IPv4 bind address (see §Security) |
 | `SCHEDULER_CLAIM_LEASE_SECS` | `300` | Age after which a claimed job is stale |
 | `SCHEDULER_CLAIM_MAX_RETRIES` | `3` | Requeues before stale claims fail explicitly |
 | `SCHEDULER_CLAIM_REAPER_INTERVAL_SECS` | `30` | Poll interval |
@@ -477,3 +477,27 @@ if let Some(handle) = start_claim_reaper(&state, 60, 3, Duration::from_secs(30))
 ## Rate Limits
 
 No rate limits currently enforced in MVP.
+
+## Security
+
+### Scheduler Bind Address
+
+The scheduler HTTP service binds to `SCHEDULER_BIND` (default: `127.0.0.1`). This is the **only** network-facing API in a default deployment and is **intentionally unauthenticated** in Phase 1.
+
+**Valid `SCHEDULER_BIND` values:**
+
+| Value | Use case | Safe for LAN exposure |
+|---|---|---|
+| `127.0.0.1` | Local systemd/service deployment | ✅ Yes — loopback only |
+| `0.0.0.0` | Docker Compose private network | ✅ Yes — container-to-container only |
+| `10.x.x.x`, `172.16-31.x.x`, `192.168.x.x` | Private LAN | ⚠️ Requires Phase 2 shared-secret |
+| `0.0.0.0` with host port mapping | **Not recommended** | ❌ Exposes unauthenticated scheduler publicly |
+
+**Security boundary:**
+
+- The scheduler has **no authentication** (Phase 2 will add shared-secret runner tokens).
+- The runner and CI services communicate with the scheduler over a private network segment (systemd loopback or Docker Compose bridge). They are trusted actors.
+- **Do not expose port 8081 to the public internet.** There is no auth, no rate limiting, and no mTLS in Phase 1.
+- Phase 2 (planned) adds runner-to-scheduler shared-secret authentication before any LAN exposure beyond the Docker Compose private network.
+
+**Deterministic parsing:** `SCHEDULER_BIND` is parsed as a strict IPv4 address. IPv6 is rejected. Invalid values cause the service to exit with a descriptive error rather than falling back silently.

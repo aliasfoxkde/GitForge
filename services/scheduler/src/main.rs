@@ -4,8 +4,23 @@ use axum::{routing::get, Json};
 use gitforce_db::Pool;
 use gitforce_scheduler::{create_state_with_pool, scheduler_routes, start_claim_reaper, Scheduler};
 use serde_json::json;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::str::FromStr;
 use std::time::Duration;
+
+/// Parse a valid IPv4 address from an environment variable, or return a default.
+///
+/// Rejects invalid IP strings. This enforces that the scheduler bind address is
+/// a valid, contained IP — never 0.0.0.0 when exposed outside a trusted network.
+fn parse_scheduler_bind(name: &str, default: Ipv4Addr) -> anyhow::Result<Ipv4Addr> {
+    let var = std::env::var(name).unwrap_or_else(|_| default.to_string());
+    let ip = IpAddr::from_str(&var)
+        .map_err(|_| anyhow::anyhow!("{name} must be a valid IPv4 address (got: {var})"))?;
+    match ip {
+        IpAddr::V4(v4) => Ok(v4),
+        IpAddr::V6(_) => anyhow::bail!("{name} must be IPv4 (IPv6 not supported: {var})"),
+    }
+}
 
 /// Parse a strictly positive i64 environment variable, or return a default.
 ///
@@ -81,7 +96,8 @@ async fn main() -> anyhow::Result<()> {
         "/health",
         get(|| async { Json(json!({ "status": "healthy" })) }),
     );
-    let address = SocketAddr::from(([0, 0, 0, 0], port));
+    let bind_ip = parse_scheduler_bind("SCHEDULER_BIND", Ipv4Addr::new(127, 0, 0, 1))?;
+    let address = SocketAddr::from((bind_ip, port));
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address, "GitForce scheduler listening");
 
@@ -95,4 +111,75 @@ async fn main() -> anyhow::Result<()> {
     reaper_handle.abort();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_scheduler_bind_valid_ipv4() {
+        // Valid localhost
+        std::env::set_var("SCHEDULER_BIND", "127.0.0.1");
+        let result = parse_scheduler_bind("SCHEDULER_BIND", Ipv4Addr::new(127, 0, 0, 1));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Ipv4Addr::new(127, 0, 0, 1));
+        std::env::remove_var("SCHEDULER_BIND");
+
+        // Valid private IP
+        std::env::set_var("SCHEDULER_BIND", "10.0.0.1");
+        let result = parse_scheduler_bind("SCHEDULER_BIND", Ipv4Addr::new(127, 0, 0, 1));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Ipv4Addr::new(10, 0, 0, 1));
+        std::env::remove_var("SCHEDULER_BIND");
+
+        // Valid 0.0.0.0 (explicit)
+        std::env::set_var("SCHEDULER_BIND", "0.0.0.0");
+        let result = parse_scheduler_bind("SCHEDULER_BIND", Ipv4Addr::new(127, 0, 0, 1));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Ipv4Addr::new(0, 0, 0, 0));
+        std::env::remove_var("SCHEDULER_BIND");
+    }
+
+    #[test]
+    fn test_parse_scheduler_bind_default_on_missing() {
+        std::env::remove_var("SCHEDULER_BIND");
+        let result = parse_scheduler_bind("SCHEDULER_BIND", Ipv4Addr::new(127, 0, 0, 1));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Ipv4Addr::new(127, 0, 0, 1));
+    }
+
+    #[test]
+    fn test_parse_scheduler_bind_rejects_invalid() {
+        // Invalid: not an IP address
+        std::env::set_var("SCHEDULER_BIND", "not-an-ip");
+        let result = parse_scheduler_bind("SCHEDULER_BIND", Ipv4Addr::new(127, 0, 0, 1));
+        assert!(result.is_err());
+        std::env::remove_var("SCHEDULER_BIND");
+
+        // Invalid: out of range
+        std::env::set_var("SCHEDULER_BIND", "256.0.0.1");
+        let result = parse_scheduler_bind("SCHEDULER_BIND", Ipv4Addr::new(127, 0, 0, 1));
+        assert!(result.is_err());
+        std::env::remove_var("SCHEDULER_BIND");
+
+        // Invalid: empty
+        std::env::set_var("SCHEDULER_BIND", "");
+        let result = parse_scheduler_bind("SCHEDULER_BIND", Ipv4Addr::new(127, 0, 0, 1));
+        assert!(result.is_err());
+        std::env::remove_var("SCHEDULER_BIND");
+    }
+
+    #[test]
+    fn test_parse_scheduler_bind_rejects_ipv6() {
+        std::env::set_var("SCHEDULER_BIND", "::1");
+        let result = parse_scheduler_bind("SCHEDULER_BIND", Ipv4Addr::new(127, 0, 0, 1));
+        assert!(result.is_err());
+        std::env::remove_var("SCHEDULER_BIND");
+
+        std::env::set_var("SCHEDULER_BIND", "fe80::1");
+        let result = parse_scheduler_bind("SCHEDULER_BIND", Ipv4Addr::new(127, 0, 0, 1));
+        assert!(result.is_err());
+        std::env::remove_var("SCHEDULER_BIND");
+    }
 }
