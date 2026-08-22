@@ -169,6 +169,8 @@ async fn health_check() -> &'static str {
 #[derive(Debug, serde::Deserialize)]
 struct PipelineTriggerRequest {
     repo_id: String,
+    #[serde(default)]
+    pipeline_id: Option<String>,
     ref_name: String,
     old_hash: String,
     new_hash: String,
@@ -251,29 +253,78 @@ async fn trigger_pipeline(
         )
             .into_response();
     }
-    let pipeline = match PipelineQueries::list_by_repo(&db_pool, repo_id).await {
-        Ok(mut pipelines) => match pipelines.pop() {
-            Some(pipeline) => pipeline,
-            None => {
+    let pipeline = if let Some(pipeline_id) = request.pipeline_id.as_deref() {
+        let pipeline_uuid = match uuid::Uuid::parse_str(pipeline_id) {
+            Ok(value) => gitforge_common::PipelineId::from(value),
+            Err(_) => {
                 return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
+                    StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({
                         "accepted": false,
-                        "error": "repository has no configured pipeline"
+                        "error": "pipeline_id must be a UUID"
                     })),
                 )
                     .into_response();
             }
-        },
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "accepted": false,
-                    "error": "failed to load pipeline"
-                })),
-            )
-                .into_response();
+        };
+        match PipelineQueries::get(&db_pool, pipeline_uuid).await {
+            Ok(Some(pipeline)) if pipeline.repo_id == repo_id => pipeline,
+            Ok(Some(_)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "accepted": false,
+                        "error": "pipeline does not belong to repository"
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "accepted": false,
+                        "error": "pipeline not found"
+                    })),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "accepted": false,
+                        "error": "failed to load pipeline"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match PipelineQueries::list_by_repo(&db_pool, repo_id).await {
+            Ok(mut pipelines) => match pipelines.pop() {
+                Some(pipeline) => pipeline,
+                None => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(serde_json::json!({
+                            "accepted": false,
+                            "error": "repository has no configured pipeline"
+                        })),
+                    )
+                        .into_response();
+                }
+            },
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "accepted": false,
+                        "error": "failed to load pipeline"
+                    })),
+                )
+                    .into_response();
+            }
         }
     };
     let run_id = gitforge_common::PipelineRunId::new();

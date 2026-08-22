@@ -1138,14 +1138,15 @@ async fn test_api_webhook_trigger_success() {
                 .uri(format!("/api/webhook/trigger/{}", pipeline.id))
                 .header("Authorization", format!("Bearer {}", token))
                 .header("Content-Type", "application/json")
-                .body(Body::from(format!(r#"{{"repo_id":"{}","commit_hash":"abc123","branch":"main","pipeline_name":"ci-pipeline"}}"#, repo_id)))
+                .body(Body::from(format!(r#"{{"repo_id":"{}","commit_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branch":"main","pipeline_name":"ci-pipeline"}}"#, repo_id)))
                 .unwrap(),
         )
         .await
         .unwrap();
 
-    // Pipeline found, trigger accepted
-    assert_eq!(response.status(), StatusCode::OK);
+    // The API refuses to claim success when the separately supervised CI
+    // bridge is not configured in this in-process test.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
