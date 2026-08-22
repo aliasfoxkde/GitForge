@@ -35,8 +35,29 @@ pub struct DockerSandbox {
 }
 
 impl DockerSandbox {
+    /// Connect to Docker and fail closed when the daemon is unavailable.
+    ///
+    /// Production runners must use this constructor. `new()` remains a
+    /// compatibility path for legacy tests and may create a stub.
+    pub async fn connect_required() -> Result<Self> {
+        let docker = Docker::connect_with_local_defaults()
+            .map_err(|e| Error::sandbox(format!("failed to connect to Docker: {}", e)))?;
+        docker
+            .ping()
+            .await
+            .map_err(|e| Error::sandbox(format!("Docker daemon not available: {}", e)))?;
+        tracing::info!("Connected to Docker daemon");
+        Ok(Self {
+            docker: Some(docker),
+            default_limits: SandboxLimits::default(),
+        })
+    }
+
     /// Create a new Docker sandbox (connects to Docker daemon)
     pub async fn new() -> Result<Self> {
+        if std::env::var("GITFORGE_SANDBOX_MODE").as_deref() == Ok("required") {
+            return Self::connect_required().await;
+        }
         let docker = match Docker::connect_with_local_defaults() {
             Ok(d) => {
                 // Verify connection by pinging Docker

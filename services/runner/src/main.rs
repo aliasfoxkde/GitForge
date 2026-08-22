@@ -12,6 +12,9 @@ use tokio::time::timeout;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Production runner startup must fail closed when Docker is unavailable.
+    // Library tests intentionally retain the explicit stub-compatible default.
+    std::env::set_var("GITFORGE_SANDBOX_MODE", "required");
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
