@@ -22,6 +22,7 @@ pub struct SchedulerServerState {
     pub scheduler: Arc<Scheduler>,
     jobs: Arc<RwLock<HashMap<JobId, PendingJobInfo>>>,
     claimed: Arc<RwLock<HashSet<JobId>>>,
+    completed: Arc<RwLock<HashMap<JobId, JobCompletion>>>,
 }
 
 /// Runner registration request
@@ -41,6 +42,17 @@ pub struct PendingJobInfo {
     pub pipeline_run_id: String,
     pub commands: Vec<String>,
     pub working_dir: Option<String>,
+}
+
+/// Semantically observable result of a runner execution.
+#[derive(Debug, Clone, Serialize)]
+pub struct JobCompletion {
+    pub job_id: String,
+    pub status: String,
+    pub success: bool,
+    pub exit_code: i64,
+    pub error: Option<String>,
+    pub completed_at: String,
 }
 
 /// Request to enqueue a runnable synthetic/CI job.
@@ -65,6 +77,7 @@ pub fn create_state(scheduler: Scheduler) -> SchedulerServerState {
         scheduler: Arc::new(scheduler),
         jobs: Arc::new(RwLock::new(HashMap::new())),
         claimed: Arc::new(RwLock::new(HashSet::new())),
+        completed: Arc::new(RwLock::new(HashMap::new())),
     }
 }
 
@@ -77,9 +90,51 @@ pub fn scheduler_routes<S: Clone + Send + Sync + 'static>(
         .route("/runners/:id/heartbeat", post(runner_heartbeat))
         .route("/jobs", post(create_job))
         .route("/jobs/pending", get(get_pending_jobs))
+        .route("/jobs/:id", get(get_job_status))
         .route("/jobs/:id/assign", post(assign_job))
         .route("/jobs/:id/complete", post(complete_job))
         .with_state(state)
+}
+
+/// Return the current status and, after completion, the runner result.
+async fn get_job_status(
+    State(state): State<SchedulerServerState>,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    let job_id: JobId = match Uuid::parse_str(&job_id) {
+        Ok(id) => JobId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_job_id",
+                    "message": "Invalid job ID format"
+                })),
+            )
+        }
+    };
+
+    if let Some(completion) = state.completed.read().await.get(&job_id).cloned() {
+        return (StatusCode::OK, Json(serde_json::json!(completion)));
+    }
+
+    if state.jobs.read().await.contains_key(&job_id) {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "job_id": job_id.to_string(),
+                "status": "queued"
+            })),
+        );
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "job_not_found",
+            "job_id": job_id.to_string()
+        })),
+    )
 }
 
 /// Enqueue a runnable job for a registered runner.
@@ -263,18 +318,43 @@ async fn complete_job(
     };
 
     let success = request["success"].as_bool().unwrap_or(false);
+    let exit_code = request["exit_code"]
+        .as_i64()
+        .unwrap_or(if success { 0 } else { -1 });
+    let error = request["error"].as_str().map(str::to_string);
+
+    if let Some(completion) = state.completed.read().await.get(&job_id).cloned() {
+        return (StatusCode::OK, Json(serde_json::json!(completion)));
+    }
+    if !state.jobs.read().await.contains_key(&job_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "job_not_found",
+                "job_id": job_id.to_string()
+            })),
+        );
+    }
+
+    let completion = JobCompletion {
+        job_id: job_id.to_string(),
+        status: if success { "succeeded" } else { "failed" }.to_string(),
+        success,
+        exit_code,
+        error,
+        completed_at: chrono::Utc::now().to_rfc3339(),
+    };
     state.scheduler.complete(job_id).await;
     state.jobs.write().await.remove(&job_id);
     state.claimed.write().await.remove(&job_id);
+    state
+        .completed
+        .write()
+        .await
+        .insert(job_id, completion.clone());
     tracing::info!("job {} completed via HTTP: success={}", job_id, success);
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "completed",
-            "job_id": job_id.to_string()
-        })),
-    )
+    (StatusCode::OK, Json(serde_json::json!(completion)))
 }
 
 #[cfg(test)]
@@ -408,6 +488,16 @@ mod tests {
         let scheduler = crate::Scheduler::new();
         let state = create_state(scheduler);
         let job_id = uuid::Uuid::new_v4();
+        state.jobs.write().await.insert(
+            JobId::from(job_id),
+            PendingJobInfo {
+                job_id: job_id.to_string(),
+                name: "success".to_string(),
+                pipeline_run_id: uuid::Uuid::new_v4().to_string(),
+                commands: vec!["true".to_string()],
+                working_dir: None,
+            },
+        );
 
         let response = complete_job(
             axum::extract::State(state),
@@ -426,6 +516,16 @@ mod tests {
         let scheduler = crate::Scheduler::new();
         let state = create_state(scheduler);
         let job_id = uuid::Uuid::new_v4();
+        state.jobs.write().await.insert(
+            JobId::from(job_id),
+            PendingJobInfo {
+                job_id: job_id.to_string(),
+                name: "failure".to_string(),
+                pipeline_run_id: uuid::Uuid::new_v4().to_string(),
+                commands: vec!["false".to_string()],
+                working_dir: None,
+            },
+        );
 
         let response = complete_job(
             axum::extract::State(state),
@@ -455,6 +555,52 @@ mod tests {
         .await;
 
         assert_status(response.into_response(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_completion_is_observable_through_status_endpoint() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let job_id = uuid::Uuid::new_v4();
+        state.jobs.write().await.insert(
+            JobId::from(job_id),
+            PendingJobInfo {
+                job_id: job_id.to_string(),
+                name: "semantic-canary".to_string(),
+                pipeline_run_id: uuid::Uuid::new_v4().to_string(),
+                commands: vec!["exit 7".to_string()],
+                working_dir: None,
+            },
+        );
+
+        let completion = complete_job(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(serde_json::json!({
+                "success": false,
+                "exit_code": 7,
+                "error": "intentional canary failure"
+            })),
+        )
+        .await
+        .into_response();
+        assert_status(completion, StatusCode::OK);
+
+        let status = get_job_status(
+            axum::extract::State(state),
+            axum::extract::Path(job_id.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(status.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["exit_code"], 7);
+        assert_eq!(payload["error"], "intentional canary failure");
     }
 
     #[test]
