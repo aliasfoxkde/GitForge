@@ -221,18 +221,46 @@ impl Scheduler {
             state.assigned_pipeline_runs.remove(&job_id)
         };
 
-        if let Some(pool) = &self.db_pool {
+        if let (Some(pool), Some(run_id)) = (&self.db_pool, pipeline_run_id) {
             let status = if success { "completed" } else { "failed" };
             if let Err(error) =
                 gitforge_db::queries::JobQueries::update_status(pool, job_id, status).await
             {
                 tracing::error!("failed to persist job {} completion: {}", job_id, error);
             }
+
+            match gitforge_db::queries::JobQueries::list_by_run(pool, run_id).await {
+                Ok(jobs)
+                    if !jobs.is_empty()
+                        && jobs
+                            .iter()
+                            .all(|job| job.status == "completed" || job.status == "failed") =>
+                {
+                    let run_status = if jobs.iter().any(|job| job.status == "failed") {
+                        "failed"
+                    } else {
+                        "completed"
+                    };
+                    if let Err(error) = gitforge_db::queries::PipelineRunQueries::update_status(
+                        pool, run_id, run_status,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            "failed to persist pipeline run {} completion: {}",
+                            run_id,
+                            error
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!("failed to inspect pipeline run {} jobs: {}", run_id, error);
+                }
+            }
         }
 
-        if pipeline_run_id.is_some() {
-            tracing::info!("job {} completion recorded (success={})", job_id, success);
-        }
+        tracing::info!("job {} completion recorded (success={})", job_id, success);
     }
 
     /// Register a runner
