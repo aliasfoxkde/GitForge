@@ -5,6 +5,7 @@ use gitforce_sandbox::{DockerSandbox, Sandbox, SandboxInstance, SandboxLimits, S
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::time::{timeout, Duration};
 
 /// Job to execute
 #[derive(Debug, Clone)]
@@ -125,6 +126,7 @@ impl JobExecutor {
         let mut step_results = Vec::new();
         let mut success = true;
         let mut final_exit_code = 0;
+        let mut error_message = None;
 
         for step in &job.steps {
             tracing::debug!("executing step: {}", step.name);
@@ -133,10 +135,14 @@ impl JobExecutor {
             let cmd = vec!["sh", "-c", &step.run];
 
             // Execute step
-            let result = self.sandbox.execute(&instance, &cmd).await;
+            let result = timeout(
+                Duration::from_secs(job.timeout_secs),
+                self.sandbox.execute(&instance, &cmd),
+            )
+            .await;
 
             match result {
-                Ok(step_result) => {
+                Ok(Ok(step_result)) => {
                     step_results.push(step_result.clone());
                     if step_result.exit_code != 0 {
                         success = false;
@@ -149,14 +155,27 @@ impl JobExecutor {
                         break;
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     success = false;
                     final_exit_code = -1;
+                    error_message = Some(format!("execution error: {}", e));
                     step_results.push(StepResult {
                         exit_code: -1,
                         stdout: String::new(),
                         stderr: format!("execution error: {}", e),
                     });
+                    break;
+                }
+                Err(_) => {
+                    success = false;
+                    final_exit_code = -1;
+                    error_message = Some(format!("step {} timed out", step.name));
+                    step_results.push(StepResult {
+                        exit_code: -1,
+                        stdout: String::new(),
+                        stderr: error_message.clone().unwrap_or_default(),
+                    });
+                    tracing::error!("step {} timed out", step.name);
                     break;
                 }
             }
@@ -183,7 +202,7 @@ impl JobExecutor {
             error: if success {
                 None
             } else {
-                Some("job failed".to_string())
+                error_message.or_else(|| Some("job failed".to_string()))
             },
         }
     }
@@ -268,6 +287,22 @@ mod tests {
     #[tokio::test]
     async fn test_active_count_empty() {
         let executor = JobExecutor::new().await.unwrap();
+        assert_eq!(executor.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a reachable Docker-compatible Podman socket"]
+    async fn test_executor_timeout_cleans_up_container() {
+        let executor = JobExecutor::new().await.unwrap();
+        let job = ExecutableJob::new(JobId::new(), "alpine:latest".to_string())
+            .with_steps(vec![JobStep::new("sleep", "sleep 5")])
+            .with_timeout(1);
+
+        let result = executor.execute(job).await;
+
+        assert!(!result.success);
+        assert_eq!(result.exit_code, -1);
+        assert!(result.error.unwrap().contains("timed out"));
         assert_eq!(executor.active_count().await, 0);
     }
 
