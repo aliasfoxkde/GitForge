@@ -1,0 +1,21 @@
+[Unit]
+Description=GitForge Scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Work/gitforge-delta-doctest
+EnvironmentFile=-%h/.config/gitforge/gitforge.env
+ExecStart=%h/Work/gitforge-delta-doctest/target/release/gitforge-scheduler-service
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/gitforge
+
+[Install]
+WantedBy=default.target
