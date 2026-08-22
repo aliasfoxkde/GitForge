@@ -213,6 +213,28 @@ impl Scheduler {
         state.assigned_pipeline_runs.remove(&job_id);
     }
 
+    /// Record job completion and remove it from the assigned set.
+    pub async fn complete_job(&self, job_id: JobId, success: bool) {
+        let pipeline_run_id = {
+            let mut state = self.state.write().await;
+            state.job_assignments.remove(&job_id);
+            state.assigned_pipeline_runs.remove(&job_id)
+        };
+
+        if let Some(pool) = &self.db_pool {
+            let status = if success { "completed" } else { "failed" };
+            if let Err(error) =
+                gitforge_db::queries::JobQueries::update_status(pool, job_id, status).await
+            {
+                tracing::error!("failed to persist job {} completion: {}", job_id, error);
+            }
+        }
+
+        if pipeline_run_id.is_some() {
+            tracing::info!("job {} completion recorded (success={})", job_id, success);
+        }
+    }
+
     /// Register a runner
     pub async fn register_runner(&self, runner: Runner) {
         let runner_id = runner.id;
@@ -799,6 +821,10 @@ mod tests {
 
         let assigned_jobs = scheduler.get_assigned_jobs().await;
         assert_eq!(assigned_jobs, vec![(job_id, runner.id, run_id)]);
+
+        scheduler.complete_job(job_id, true).await;
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        assert!(scheduler.get_assigned_jobs().await.is_empty());
     }
 
     #[tokio::test]
