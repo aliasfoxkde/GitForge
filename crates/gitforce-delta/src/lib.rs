@@ -13,11 +13,16 @@
 //!
 //! # Example
 //!
-//! ```rust
-//! let analyzer = DeltaAnalyzer::new(".", "HEAD~1").await?;
+//! ```rust,no_run
+//! use gitforce_delta::DeltaAnalyzer;
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! let analyzer = DeltaAnalyzer::new(".", "HEAD~1");
 //! let plan = analyzer.analyze().await?;
 //! println!("Affected packages: {:?}", plan.affected_packages);
-//! println!("Run: {:?}", plan.execution_scope());
+//! println!("Run: {:?}", plan.execution_scope);
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod analyzer;
