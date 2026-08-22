@@ -246,8 +246,10 @@ mod tests {
     #[tokio::test]
     async fn test_runner_register_no_scheduler() {
         // Test that register doesn't panic when scheduler is unavailable
-        let mut config = RunnerConfig::default();
-        config.scheduler_url = "http://localhost:99999".to_string(); // Invalid URL
+        let config = RunnerConfig {
+            scheduler_url: "http://localhost:99999".to_string(), // Invalid URL
+            ..RunnerConfig::default()
+        };
         let mut agent = RunnerAgent::new(config).await.unwrap();
         let result = agent.register().await;
         assert!(result.is_ok());
@@ -406,8 +408,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_register_sets_runner() {
-        let mut config = RunnerConfig::default();
-        config.scheduler_url = "http://localhost:99999".to_string();
+        let config = RunnerConfig {
+            scheduler_url: "http://localhost:99999".to_string(),
+            ..RunnerConfig::default()
+        };
         let mut agent = RunnerAgent::new(config).await.unwrap();
 
         let result = agent.register().await;
@@ -510,8 +514,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_stop_after_registration() {
-        let mut config = RunnerConfig::default();
-        config.scheduler_url = "http://localhost:99999".to_string();
+        let config = RunnerConfig {
+            scheduler_url: "http://localhost:99999".to_string(),
+            ..RunnerConfig::default()
+        };
         let mut agent = RunnerAgent::new(config).await.unwrap();
         agent.register().await.unwrap();
         // Stop after registration should not panic
@@ -668,8 +674,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_run_and_stop() {
-        let mut config = RunnerConfig::default();
-        config.scheduler_url = "http://localhost:99999".to_string();
+        let config = RunnerConfig {
+            scheduler_url: "http://localhost:99999".to_string(),
+            ..RunnerConfig::default()
+        };
 
         // Create and register agent
         let mut agent = RunnerAgent::new(config.clone()).await.unwrap();

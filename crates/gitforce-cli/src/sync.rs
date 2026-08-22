@@ -783,8 +783,10 @@ mod tests {
 
     #[test]
     fn test_local_state_with_data() {
-        let mut state = LocalState::default();
-        state.updated_at = "2024-06-15T12:00:00Z".to_string();
+        let mut state = LocalState {
+            updated_at: "2024-06-15T12:00:00Z".to_string(),
+            ..LocalState::default()
+        };
         state.repos.insert(
             "test".to_string(),
             RepoState {
