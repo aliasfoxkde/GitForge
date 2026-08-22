@@ -1,8 +1,11 @@
 //! GitForce scheduler HTTP service.
 
-use axum::{routing::get, Json};
+use axum::{routing::get, Json, Router};
 use gitforce_db::Pool;
-use gitforce_scheduler::{create_state_with_pool, scheduler_routes, start_claim_reaper, Scheduler};
+use gitforce_scheduler::{
+    create_state_with_pool, scheduler_routes, start_claim_reaper, with_auth, Scheduler,
+    SchedulerAuthState,
+};
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
@@ -73,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
     pool.migrate()
         .await
         .map_err(|error| anyhow::anyhow!("failed to migrate scheduler database: {error}"))?;
-    let state = create_state_with_pool(Scheduler::new(), pool)
+    let state = create_state_with_pool(Scheduler::new(), pool, SchedulerAuthState::from_env())
         .await
         .map_err(|error| anyhow::anyhow!("failed to initialize scheduler state: {error}"))?;
 
@@ -92,7 +95,10 @@ async fn main() -> anyhow::Result<()> {
     )
     .ok_or_else(|| anyhow::anyhow!("claim reaper requires durable scheduler state (no pool)"))?;
 
-    let app = scheduler_routes::<()>(state).route(
+    // Build the scheduler router and apply auth middleware when a secret is configured.
+    // Routes added AFTER with_auth (e.g. /health) remain unauthenticated.
+    let scheduler_router = scheduler_routes::<()>(state.clone());
+    let app: Router = with_auth(state.auth, scheduler_router).route(
         "/health",
         get(|| async { Json(json!({ "status": "healthy" })) }),
     );

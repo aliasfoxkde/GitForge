@@ -69,6 +69,7 @@ hex = "0.4"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json"] }
+http = "1"
 
 # Docker client
 bollard = "0.17"

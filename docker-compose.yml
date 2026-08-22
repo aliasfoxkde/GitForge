@@ -64,6 +64,7 @@ services:
       - DATABASE_URL=sqlite:/data/gitforge.db
       - RUST_LOG=info
       - SCHEDULER_BIND=0.0.0.0  # Bind to all interfaces inside private network
+      - SCHEDULER_SHARED_SECRET=${SCHEDULER_SHARED_SECRET:-}  # Optional: enable auth
     networks:
       - gitforge
 
@@ -82,6 +83,7 @@ services:
     environment:
       - RUST_LOG=info
       - SCHEDULER_URL=http://scheduler:8081
+      - SCHEDULER_SHARED_SECRET=${SCHEDULER_SHARED_SECRET:-}
       - RUNNER_NAME=docker-runner-1
       - RUNNER_CAPACITY=4
     depends_on:
@@ -125,6 +127,7 @@ services:
     environment:
       - RUST_LOG=info
       - SCHEDULER_URL=http://scheduler:8081
+      - SCHEDULER_SHARED_SECRET=${SCHEDULER_SHARED_SECRET:-}
       - RUNNER_NAME=docker-runner-2
       - RUNNER_CAPACITY=2
     depends_on:

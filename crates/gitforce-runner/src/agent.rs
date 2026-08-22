@@ -6,6 +6,7 @@ use futures::future::BoxFuture;
 use gitforce_common::{Error, JobId, Result, RunnerId};
 use gitforce_db::models::Runner;
 use gitforce_sandbox::DockerSandbox;
+use http::header::AUTHORIZATION;
 use reqwest::Client;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -169,22 +170,25 @@ async fn report_completion_with_retry(
     url: &str,
     job_id: &str,
     payload: &serde_json::Value,
+    auth: Option<&str>,
 ) -> ReportOutcome {
+    let auth = auth.map(str::to_owned);
     retry_completion_report(
         job_id,
         || {
-            let fut: BoxFuture<'_, AttemptResult> = Box::pin(async {
-                match client.post(url).json(payload).send().await {
+            let auth = auth.clone();
+            Box::pin(async move {
+                let mut req = client.post(url).json(payload);
+                if let Some(ref token) = auth {
+                    req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+                }
+                match req.send().await {
                     Ok(response) => AttemptResult::Status(response.status()),
                     Err(error) => AttemptResult::Transport(error.to_string()),
                 }
-            });
-            fut
+            })
         },
-        |delay| {
-            let fut: BoxFuture<'_, ()> = Box::pin(tokio::time::sleep(delay));
-            fut
-        },
+        |delay| Box::pin(async move { tokio::time::sleep(delay).await }),
     )
     .await
 }
@@ -207,6 +211,9 @@ pub struct RunnerConfig {
     /// Path to the completion outbox directory.
     /// Empty string uses the safe per-user default (XDG_STATE_HOME or ~/.local).
     pub outbox_path: String,
+    /// Optional bearer token for scheduler authentication.
+    /// Populated from `SCHEDULER_SHARED_SECRET`. Never logged or embedded in URLs.
+    auth: Option<String>,
 }
 
 impl Default for RunnerConfig {
@@ -219,12 +226,16 @@ impl Default for RunnerConfig {
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
             outbox_path: String::new(),
+            auth: None,
         }
     }
 }
 
 impl RunnerConfig {
     /// Load runner settings from environment, retaining safe defaults.
+    ///
+    /// Reads `SCHEDULER_SHARED_SECRET` (if set and non-empty) for bearer-token
+    /// authentication. The secret is stored in memory only and never logged.
     pub fn from_env() -> Self {
         let defaults = Self::default();
         Self {
@@ -244,7 +255,25 @@ impl RunnerConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(defaults.fetch_interval_secs),
             outbox_path: std::env::var("RUNNER_OUTBOX_PATH").unwrap_or(defaults.outbox_path),
+            auth: std::env::var("SCHEDULER_SHARED_SECRET")
+                .ok()
+                .filter(|v| !v.is_empty()),
         }
+    }
+
+    /// Returns `true` when a non-empty auth secret is configured.
+    pub fn has_auth(&self) -> bool {
+        self.auth.is_some()
+    }
+
+    /// Add the `Authorization: Bearer <token>` header to `request` when a secret
+    /// is configured.  Does nothing when auth is absent so existing behaviour is
+    /// preserved when no secret is set.
+    pub fn apply_auth(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(ref token) = self.auth {
+            request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        request
     }
 }
 
@@ -322,7 +351,11 @@ impl RunnerAgent {
             "capacity": runner.capacity,
         });
 
-        match self.client.post(&register_url).json(&request).send().await {
+        let mut req = self.client.post(&register_url).json(&request);
+        if let Some(ref token) = self.config.auth {
+            req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        match req.send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     if let Ok(payload) = response.json::<RegisterRunnerResponse>().await {
@@ -374,6 +407,7 @@ impl RunnerAgent {
         let heartbeat_client = self.client.clone();
         let heartbeat_url = self.config.scheduler_url.clone();
         let is_running = self.is_running.clone();
+        let heartbeat_auth = self.config.auth.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(heartbeat_interval));
             loop {
@@ -387,7 +421,11 @@ impl RunnerAgent {
                     "{}/runners/{}/heartbeat",
                     heartbeat_url, heartbeat_runner_id
                 );
-                if let Err(e) = heartbeat_client.post(&url).send().await {
+                let mut req = heartbeat_client.post(&url);
+                if let Some(ref token) = heartbeat_auth {
+                    req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+                }
+                if let Err(e) = req.send().await {
                     tracing::trace!("heartbeat failed: {}", e);
                 }
             }
@@ -402,6 +440,7 @@ impl RunnerAgent {
         let is_running = self.is_running.clone();
         let outbox = self.outbox.clone();
         let outbox_client = self.client.clone();
+        let fetch_auth = self.config.auth.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(fetch_interval));
             loop {
@@ -413,7 +452,11 @@ impl RunnerAgent {
                 tracing::debug!("runner checking for jobs...");
 
                 let jobs_url = format!("{}/jobs/pending?runner_id={}", fetch_url, fetch_runner_id);
-                match fetch_client.get(&jobs_url).send().await {
+                let mut req = fetch_client.get(&jobs_url);
+                if let Some(ref token) = fetch_auth {
+                    req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+                }
+                match req.send().await {
                     Ok(response) => {
                         if response.status().is_success() {
                             if let Ok(jobs) = response.json::<Vec<JobAssignment>>().await {
@@ -471,6 +514,7 @@ impl RunnerAgent {
                                         &complete_url,
                                         &job.job_id,
                                         &payload,
+                                        fetch_auth.as_deref(),
                                     )
                                     .await;
 
@@ -489,6 +533,7 @@ impl RunnerAgent {
                                             &outbox_client,
                                             &fetch_url,
                                             &job.job_id,
+                                            fetch_auth.as_deref(),
                                         )
                                         .await;
                                         if terminal {
@@ -559,6 +604,7 @@ impl RunnerAgent {
                 &complete_url,
                 &entry.job_id,
                 &entry.payload,
+                self.config.auth.as_deref(),
             )
             .await;
 
@@ -581,6 +627,7 @@ impl RunnerAgent {
                         &self.client,
                         &self.config.scheduler_url,
                         &entry.job_id,
+                        self.config.auth.as_deref(),
                     )
                     .await;
                     if terminal {
@@ -613,9 +660,14 @@ impl RunnerAgent {
         client: &Client,
         scheduler_url: &str,
         job_id: &str,
+        auth: Option<&str>,
     ) -> bool {
         let url = format!("{}/jobs/{}", scheduler_url, job_id);
-        match client.get(&url).send().await {
+        let mut req = client.get(&url);
+        if let Some(token) = auth {
+            req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        match req.send().await {
             Ok(response) => {
                 if !response.status().is_success() {
                     tracing::trace!(
@@ -719,11 +771,14 @@ mod tests {
             heartbeat_interval_secs: 60,
             fetch_interval_secs: 10,
             outbox_path: String::new(),
+            auth: Some("secret-token".to_string()),
         };
         assert_eq!(config.name, "custom-runner");
         assert_eq!(config.capacity, 5);
         assert_eq!(config.heartbeat_interval_secs, 60);
         assert_eq!(config.fetch_interval_secs, 10);
+        assert!(config.has_auth());
+        assert_eq!(config.auth.as_deref(), Some("secret-token"));
     }
 
     #[test]
@@ -880,6 +935,7 @@ mod tests {
             heartbeat_interval_secs: 15,
             fetch_interval_secs: 3,
             outbox_path: String::new(),
+            auth: None,
         };
 
         assert_eq!(config.scheduler_url, "http://example.com:8081");
@@ -993,6 +1049,7 @@ mod tests {
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
             outbox_path: String::new(),
+            auth: None,
         };
         assert_eq!(config.capacity, 0);
     }
@@ -1062,6 +1119,7 @@ mod tests {
             heartbeat_interval_secs: 45,
             fetch_interval_secs: 10,
             outbox_path: String::new(),
+            auth: None,
         };
         assert!(config.scheduler_url.contains("user:pass"));
     }
@@ -1090,6 +1148,7 @@ mod tests {
             heartbeat_interval_secs: 60,
             fetch_interval_secs: 15,
             outbox_path: String::new(),
+            auth: None,
         };
         let agent = RunnerAgent::new(config).await.unwrap();
         assert!(agent.runner.is_none());
