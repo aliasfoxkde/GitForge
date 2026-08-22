@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("starting GitForce Runner Agent");
 
     // Load runner configuration
-    let config = RunnerConfig::default();
+    let config = RunnerConfig::from_env();
 
     // Create runner agent
     let mut agent = RunnerAgent::new(config).await?;

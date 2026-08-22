@@ -39,6 +39,30 @@ impl Default for RunnerConfig {
     }
 }
 
+impl RunnerConfig {
+    /// Load runner settings from environment, retaining safe defaults.
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            scheduler_url: std::env::var("SCHEDULER_URL").unwrap_or(defaults.scheduler_url),
+            name: std::env::var("RUNNER_NAME").unwrap_or(defaults.name),
+            runner_type: std::env::var("RUNNER_TYPE").unwrap_or(defaults.runner_type),
+            capacity: std::env::var("RUNNER_CAPACITY")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(defaults.capacity),
+            heartbeat_interval_secs: std::env::var("RUNNER_HEARTBEAT_INTERVAL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(defaults.heartbeat_interval_secs),
+            fetch_interval_secs: std::env::var("RUNNER_FETCH_INTERVAL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(defaults.fetch_interval_secs),
+        }
+    }
+}
+
 /// Job assignment from scheduler
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobAssignment {
