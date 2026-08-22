@@ -5,17 +5,47 @@ use axum::{
     extract::{Extension, Path},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use gitforge_common::{JobId, PipelineId, PipelineRunId};
 use gitforge_db::{
+    models::{Job, PipelineRun},
     queries::{JobQueries, PipelineQueries, PipelineRunQueries},
     Pool,
 };
+use gitforge_scheduler::Scheduler;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Request to trigger a manual pipeline run
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TriggerPipelineRequest {
+    /// Commit hash to build (optional, defaults to repo HEAD)
+    pub commit_hash: Option<String>,
+    /// Branch or ref to build from (optional)
+    pub branch: Option<String>,
+}
+
+/// Response for pipeline trigger
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TriggerPipelineResponse {
+    pub pipeline_run_id: String,
+    pub pipeline_id: String,
+    pub status: String,
+    pub triggered_by: String,
+    pub commit_hash: String,
+    pub jobs: Vec<TriggeredJobInfo>,
+}
+
+/// Information about a created job
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TriggeredJobInfo {
+    pub job_id: String,
+    pub name: String,
+    pub status: String,
+}
 
 /// Pipeline run response
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,6 +75,7 @@ pub fn ci_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/pipelines", get(list_pipelines))
         .route("/pipelines/{id}", get(get_pipeline))
+        .route("/pipelines/{id}/trigger", post(trigger_pipeline))
         .route("/pipeline-runs", get(list_pipeline_runs))
         .route("/pipeline-runs/{id}", get(get_pipeline_run))
         .route("/pipeline-runs/{id}/jobs", get(get_pipeline_run_jobs))
@@ -396,6 +427,197 @@ async fn get_job_logs(
                 .into_response()
         }
     }
+}
+
+/// Trigger a pipeline manually
+async fn trigger_pipeline(
+    Extension(pool): Extension<Arc<Pool>>,
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    Extension(scheduler): Extension<Option<Arc<Scheduler>>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<TriggerPipelineRequest>,
+) -> impl IntoResponse {
+    // Validate auth and get user info
+    let auth_header = match headers.get("Authorization").and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    let token = match ApiAuth::extract_token(auth_header) {
+        Some(t) => t,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    let claims = match auth.validate_token(token) {
+        Ok(c) => c,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    let username = claims.username.clone();
+
+    tracing::debug!("trigger pipeline: {} by {}", id, username);
+
+    // Parse pipeline UUID
+    let pipeline_id = match Uuid::parse_str(&id) {
+        Ok(uuid) => gitforge_common::PipelineId::from(uuid),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_id",
+                    "message": "Invalid pipeline ID format"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Get pipeline from database
+    let pipeline = match PipelineQueries::get(&pool, pipeline_id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "not_found",
+                    "message": "Pipeline not found"
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!("failed to get pipeline: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": format!("failed to get pipeline: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Determine commit hash
+    let commit_hash = request.commit_hash.unwrap_or_else(|| "HEAD".to_string());
+
+    // Parse and validate jobs from pipeline config BEFORE creating PipelineRun
+    // This ensures invalid config cannot orphan a pipeline run
+    let job_names = match parse_jobs_from_config(&pipeline.config) {
+        Ok(names) => names,
+        Err(e) => {
+            tracing::error!("failed to parse pipeline config: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_config",
+                    "message": format!("failed to parse pipeline config: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Create pipeline run
+    let pipeline_run = PipelineRun::new(
+        pipeline.id,
+        pipeline.repo_id,
+        username.clone(),
+        commit_hash.clone(),
+    );
+
+    // Persist pipeline run
+    if let Err(e) = PipelineRunQueries::create(&pool, &pipeline_run).await {
+        tracing::error!("failed to create pipeline run: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "database_error",
+                "message": format!("failed to create pipeline run: {}", e)
+            })),
+        )
+            .into_response();
+    }
+
+    // Create jobs in database
+    let mut triggered_jobs = Vec::new();
+    for job_name in &job_names {
+        let job = Job::new(pipeline_run.id, job_name.clone());
+
+        if let Err(e) = JobQueries::create(&pool, &job).await {
+            tracing::error!("failed to create job {}: {}", job_name, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": format!("failed to create job {}: {}", job_name, e)
+                })),
+            )
+                .into_response();
+        }
+
+        triggered_jobs.push(TriggeredJobInfo {
+            job_id: job.id.to_string(),
+            name: job.name.clone(),
+            status: job.status.clone(),
+        });
+    }
+
+    // Enqueue persisted jobs with scheduler if available
+    // Uses enqueue_persisted_job to avoid creating duplicate DB rows
+    if let Some(sched) = scheduler.as_ref() {
+        for job in &triggered_jobs {
+            let job_id = gitforge_common::JobId::from(Uuid::parse_str(&job.job_id).unwrap());
+            sched
+                .enqueue_persisted_job(job_id, pipeline_run.id, pipeline.repo_id)
+                .await;
+            tracing::debug!(
+                "job {} enqueued for pipeline run {}",
+                job.job_id,
+                pipeline_run.id
+            );
+        }
+    }
+
+    tracing::info!(
+        "pipeline {} triggered by {} with {} jobs",
+        pipeline.id,
+        username,
+        triggered_jobs.len()
+    );
+
+    let response = TriggerPipelineResponse {
+        pipeline_run_id: pipeline_run.id.to_string(),
+        pipeline_id: pipeline.id.to_string(),
+        status: pipeline_run.status.clone(),
+        triggered_by: username,
+        commit_hash,
+        jobs: triggered_jobs,
+    };
+
+    (StatusCode::CREATED, Json(response)).into_response()
+}
+
+/// Parse job names from pipeline config
+fn parse_jobs_from_config(config: &serde_json::Value) -> Result<Vec<String>, String> {
+    let jobs = config
+        .get("jobs")
+        .ok_or_else(|| "missing 'jobs' field in pipeline config")?;
+
+    let jobs_array = jobs.as_array().ok_or_else(|| "'jobs' must be an array")?;
+
+    let mut names = Vec::new();
+    for job in jobs_array {
+        let name = job
+            .get("name")
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| "job missing 'name' field")?
+            .to_string();
+        names.push(name);
+    }
+
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -910,5 +1132,191 @@ mod tests {
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("2026-12-01"));
+    }
+
+    // =========================================================================
+    // trigger_pipeline handler tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_jobs_from_config_valid() {
+        let config = serde_json::json!({
+            "jobs": [
+                {"name": "build", "image": "rust:latest"},
+                {"name": "test", "image": "rust:latest"},
+                {"name": "deploy", "image": "docker:latest"}
+            ]
+        });
+
+        let result = parse_jobs_from_config(&config).unwrap();
+        assert_eq!(result, vec!["build", "test", "deploy"]);
+    }
+
+    #[test]
+    fn test_parse_jobs_from_config_single_job() {
+        let config = serde_json::json!({
+            "jobs": [
+                {"name": "build"}
+            ]
+        });
+
+        let result = parse_jobs_from_config(&config).unwrap();
+        assert_eq!(result, vec!["build"]);
+    }
+
+    #[test]
+    fn test_parse_jobs_from_config_empty_jobs() {
+        let config = serde_json::json!({
+            "jobs": []
+        });
+
+        let result = parse_jobs_from_config(&config).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_jobs_from_config_missing_jobs_field() {
+        let config = serde_json::json!({
+            "stages": ["build"]
+        });
+
+        let result = parse_jobs_from_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing 'jobs' field"));
+    }
+
+    #[test]
+    fn test_parse_jobs_from_config_jobs_not_array() {
+        let config = serde_json::json!({
+            "jobs": "not an array"
+        });
+
+        let result = parse_jobs_from_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must be an array"));
+    }
+
+    #[test]
+    fn test_parse_jobs_from_config_job_missing_name() {
+        let config = serde_json::json!({
+            "jobs": [
+                {"name": "build"},
+                {"image": "rust:latest"}
+            ]
+        });
+
+        let result = parse_jobs_from_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("job missing 'name' field"));
+    }
+
+    #[test]
+    fn test_parse_jobs_from_config_empty_config() {
+        let config = serde_json::Value::Null;
+
+        let result = parse_jobs_from_config(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_trigger_pipeline_request_serialization() {
+        let request = TriggerPipelineRequest {
+            commit_hash: Some("abc123".to_string()),
+            branch: Some("main".to_string()),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("abc123"));
+        assert!(json.contains("main"));
+    }
+
+    #[test]
+    fn test_trigger_pipeline_request_minimal() {
+        let request = TriggerPipelineRequest {
+            commit_hash: None,
+            branch: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        // Verify minimal request serializes without errors
+        assert!(json.contains("commit_hash"));
+        assert!(json.contains("branch"));
+    }
+
+    #[test]
+    fn test_trigger_pipeline_response_serialization() {
+        let response = TriggerPipelineResponse {
+            pipeline_run_id: "run-123".to_string(),
+            pipeline_id: "pipe-456".to_string(),
+            status: "pending".to_string(),
+            triggered_by: "alice".to_string(),
+            commit_hash: "abc123".to_string(),
+            jobs: vec![
+                TriggeredJobInfo {
+                    job_id: "job-1".to_string(),
+                    name: "build".to_string(),
+                    status: "pending".to_string(),
+                },
+                TriggeredJobInfo {
+                    job_id: "job-2".to_string(),
+                    name: "test".to_string(),
+                    status: "pending".to_string(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("run-123"));
+        assert!(json.contains("pipe-456"));
+        assert!(json.contains("pending"));
+        assert!(json.contains("alice"));
+        assert!(json.contains("abc123"));
+        assert!(json.contains("build"));
+        assert!(json.contains("test"));
+    }
+
+    #[test]
+    fn test_triggered_job_info_serialization() {
+        let info = TriggeredJobInfo {
+            job_id: "job-xyz".to_string(),
+            name: "deploy".to_string(),
+            status: "queued".to_string(),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("job-xyz"));
+        assert!(json.contains("deploy"));
+        assert!(json.contains("queued"));
+    }
+
+    #[test]
+    fn test_trigger_pipeline_response_deserialization() {
+        let json = r#"{
+            "pipeline_run_id": "run-789",
+            "pipeline_id": "pipe-001",
+            "status": "pending",
+            "triggered_by": "bob",
+            "commit_hash": "def456",
+            "jobs": [
+                {"job_id": "job-a", "name": "lint", "status": "pending"}
+            ]
+        }"#;
+        let response: TriggerPipelineResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.pipeline_run_id, "run-789");
+        assert_eq!(response.pipeline_id, "pipe-001");
+        assert_eq!(response.triggered_by, "bob");
+        assert_eq!(response.commit_hash, "def456");
+        assert_eq!(response.jobs.len(), 1);
+        assert_eq!(response.jobs[0].name, "lint");
+    }
+
+    #[test]
+    fn test_trigger_pipeline_response_empty_jobs() {
+        let response = TriggerPipelineResponse {
+            pipeline_run_id: "run-empty".to_string(),
+            pipeline_id: "pipe-empty".to_string(),
+            status: "pending".to_string(),
+            triggered_by: "alice".to_string(),
+            commit_hash: "abc123".to_string(),
+            jobs: vec![],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"jobs\":[]"));
     }
 }
