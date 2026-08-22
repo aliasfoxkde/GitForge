@@ -1,7 +1,8 @@
 //! GitForce scheduler HTTP service.
 
 use axum::{routing::get, Json};
-use gitforce_scheduler::{create_state, scheduler_routes, Scheduler};
+use gitforce_db::Pool;
+use gitforce_scheduler::{create_state_with_pool, scheduler_routes, Scheduler};
 use serde_json::json;
 use std::net::SocketAddr;
 
@@ -20,7 +21,19 @@ async fn main() -> anyhow::Result<()> {
         .parse::<u16>()
         .map_err(|error| anyhow::anyhow!("invalid scheduler port: {error}"))?;
 
-    let state = create_state(Scheduler::new());
+    let database_url = std::env::var("SCHEDULER_DATABASE_URL").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("sqlite:{home}/.local/share/gitforge/scheduler.db?mode=rwc")
+    });
+    let pool = Pool::new(&database_url)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to open scheduler database: {error}"))?;
+    pool.migrate()
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to migrate scheduler database: {error}"))?;
+    let state = create_state_with_pool(Scheduler::new(), pool)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to initialize scheduler state: {error}"))?;
     let app = scheduler_routes::<()>(state).route(
         "/health",
         get(|| async { Json(json!({ "status": "healthy" })) }),

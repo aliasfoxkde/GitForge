@@ -9,7 +9,9 @@ use axum::{
     Json, Router,
 };
 use gitforce_common::{JobId, PipelineRunId, RepoId, RunnerId};
-use gitforce_db::models::{Runner, RunnerType};
+use gitforce_db::models::{Runner, RunnerType, SchedulerJob};
+use gitforce_db::queries::SchedulerJobQueries;
+use gitforce_db::Pool;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -20,6 +22,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct SchedulerServerState {
     pub scheduler: Arc<Scheduler>,
+    pool: Option<Pool>,
     jobs: Arc<RwLock<HashMap<JobId, PendingJobInfo>>>,
     claimed: Arc<RwLock<HashSet<JobId>>>,
     completed: Arc<RwLock<HashMap<JobId, JobCompletion>>>,
@@ -75,10 +78,60 @@ struct PendingJobsQuery {
 pub fn create_state(scheduler: Scheduler) -> SchedulerServerState {
     SchedulerServerState {
         scheduler: Arc::new(scheduler),
+        pool: None,
         jobs: Arc::new(RwLock::new(HashMap::new())),
         claimed: Arc::new(RwLock::new(HashSet::new())),
         completed: Arc::new(RwLock::new(HashMap::new())),
     }
+}
+
+/// Build a production scheduler state from a migrated durable store.
+pub async fn create_state_with_pool(
+    scheduler: Scheduler,
+    pool: Pool,
+) -> gitforce_common::Result<SchedulerServerState> {
+    let active = SchedulerJobQueries::list_active(&pool).await?;
+    let state = SchedulerServerState {
+        scheduler: Arc::new(scheduler),
+        pool: Some(pool),
+        jobs: Arc::new(RwLock::new(HashMap::new())),
+        claimed: Arc::new(RwLock::new(HashSet::new())),
+        completed: Arc::new(RwLock::new(HashMap::new())),
+    };
+    for job in active {
+        let info = pending_info_from_job(&job);
+        if job.status == "pending" {
+            state
+                .scheduler
+                .enqueue(job.id, job.pipeline_run_id, job.repo_id)
+                .await;
+        } else if job.status == "claimed" {
+            state.claimed.write().await.insert(job.id);
+        }
+        state.jobs.write().await.insert(job.id, info);
+    }
+    Ok(state)
+}
+
+fn pending_info_from_job(job: &SchedulerJob) -> PendingJobInfo {
+    PendingJobInfo {
+        job_id: job.id.to_string(),
+        name: job.name.clone(),
+        pipeline_run_id: job.pipeline_run_id.to_string(),
+        commands: job.commands.clone(),
+        working_dir: job.working_dir.clone(),
+    }
+}
+
+fn completion_from_job(job: &SchedulerJob) -> Option<JobCompletion> {
+    Some(JobCompletion {
+        job_id: job.id.to_string(),
+        status: job.status.clone(),
+        success: job.success?,
+        exit_code: job.exit_code.unwrap_or(if job.success? { 0 } else { -1 }),
+        error: job.error.clone(),
+        completed_at: job.completed_at?.to_rfc3339(),
+    })
 }
 
 /// Create scheduler routes
@@ -116,6 +169,33 @@ async fn get_job_status(
 
     if let Some(completion) = state.completed.read().await.get(&job_id).cloned() {
         return (StatusCode::OK, Json(serde_json::json!(completion)));
+    }
+
+    if let Some(pool) = &state.pool {
+        match SchedulerJobQueries::get(pool, job_id).await {
+            Ok(Some(job)) if job.is_terminal() => {
+                if let Some(completion) = completion_from_job(&job) {
+                    return (StatusCode::OK, Json(serde_json::json!(completion)));
+                }
+            }
+            Ok(Some(job)) => {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "job_id": job.id.to_string(),
+                        "status": job.status
+                    })),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, "failed to read durable scheduler job");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "scheduler_storage_failure"})),
+                );
+            }
+        }
     }
 
     if state.jobs.read().await.contains_key(&job_id) {
@@ -165,13 +245,60 @@ async fn create_job(
         working_dir: request.working_dir,
     };
 
-    state
-        .scheduler
-        .enqueue(job_id, pipeline_run_id, repo_id)
-        .await;
+    if let Some(pool) = &state.pool {
+        let mut durable = SchedulerJob::new(
+            pipeline_run_id,
+            repo_id,
+            info.name.clone(),
+            info.commands.clone(),
+        )
+        .with_working_dir(info.working_dir.clone());
+        durable.id = job_id;
+        match SchedulerJobQueries::insert_if_absent(pool, &durable).await {
+            Ok(true) => {
+                state
+                    .scheduler
+                    .enqueue(job_id, pipeline_run_id, repo_id)
+                    .await
+            }
+            Ok(false) => {
+                if let Ok(Some(existing)) = SchedulerJobQueries::get(pool, job_id).await {
+                    let existing_info = pending_info_from_job(&existing);
+                    state
+                        .jobs
+                        .write()
+                        .await
+                        .insert(job_id, existing_info.clone());
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::to_value(existing_info).unwrap_or_default()),
+                    );
+                }
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error":"scheduler_storage_failure"})),
+                );
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to persist scheduler job");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error":"scheduler_storage_failure"})),
+                );
+            }
+        }
+    } else {
+        state
+            .scheduler
+            .enqueue(job_id, pipeline_run_id, repo_id)
+            .await;
+    }
     state.jobs.write().await.insert(job_id, info.clone());
 
-    (StatusCode::CREATED, Json(info))
+    (
+        StatusCode::CREATED,
+        Json(serde_json::to_value(info).unwrap_or_default()),
+    )
 }
 
 /// Register a new runner
@@ -256,7 +383,23 @@ async fn get_pending_jobs(
             continue;
         }
         claimed.insert(*job_id);
-        pending.push(info.clone());
+        if let Some(pool) = &state.pool {
+            let Some(runner_id) = requested_runner.or(Some(assigned_runner)) else {
+                continue;
+            };
+            match SchedulerJobQueries::mark_claimed(pool, *job_id, runner_id).await {
+                Ok(true) => pending.push(info.clone()),
+                Ok(false) => {
+                    claimed.remove(job_id);
+                }
+                Err(error) => {
+                    claimed.remove(job_id);
+                    tracing::error!(%error, "failed to persist scheduler claim");
+                }
+            }
+        } else {
+            pending.push(info.clone());
+        }
     }
     Json(pending)
 }
@@ -334,6 +477,38 @@ async fn complete_job(
                 "job_id": job_id.to_string()
             })),
         );
+    }
+
+    if let Some(pool) = &state.pool {
+        match SchedulerJobQueries::complete(pool, job_id, success, exit_code, error.clone()).await {
+            Ok(Some(job)) if job.is_terminal() => {
+                if let Some(completion) = completion_from_job(&job) {
+                    state
+                        .completed
+                        .write()
+                        .await
+                        .insert(job_id, completion.clone());
+                    state.jobs.write().await.remove(&job_id);
+                    state.claimed.write().await.remove(&job_id);
+                    state.scheduler.complete(job_id).await;
+                    return (StatusCode::OK, Json(serde_json::json!(completion)));
+                }
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error":"job_not_found","job_id":job_id.to_string()})),
+                )
+            }
+            Ok(Some(_)) => {}
+            Err(error) => {
+                tracing::error!(%error, "failed to persist scheduler completion");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error":"scheduler_storage_failure"})),
+                );
+            }
+        }
     }
 
     let completion = JobCompletion {

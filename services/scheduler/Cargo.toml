@@ -9,6 +9,7 @@ license.workspace = true
 anyhow = { workspace = true }
 axum = { workspace = true }
 gitforce-scheduler = { path = "../../crates/gitforce-scheduler" }
+gitforce-db = { path = "../../crates/gitforce-db" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
