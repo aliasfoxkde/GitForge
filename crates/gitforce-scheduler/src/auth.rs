@@ -16,6 +16,7 @@ use axum::{
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tower::{Layer, Service};
 
 /// Application state that carries an optional shared secret.
@@ -58,8 +59,14 @@ impl SchedulerAuthState {
             return false;
         };
 
-        // Strip the "Bearer " prefix if present.
-        let token = token.strip_prefix("Bearer ").unwrap_or(token);
+        // Require the standard scheme; bare tokens and non-standard casing are
+        // rejected so callers cannot accidentally bypass the protocol contract.
+        let Some(token) = token.strip_prefix("Bearer ") else {
+            return false;
+        };
+        if token.is_empty() {
+            return false;
+        }
 
         constant_time_eq(secret.as_bytes(), token.as_bytes())
     }
@@ -67,14 +74,7 @@ impl SchedulerAuthState {
 
 /// Constant-time byte-slice equality check.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    bool::from(a.ct_eq(b))
 }
 
 /// JSON 401 error body for all auth failures (identical for missing/wrong/malformed).
@@ -243,8 +243,9 @@ mod tests {
         std::env::set_var("SCHEDULER_SHARED_SECRET", "hunter2");
         let state = SchedulerAuthState::from_env();
 
-        assert!(state.validate_token(Some("hunter2")));
         assert!(state.validate_token(Some("Bearer hunter2")));
+        assert!(!state.validate_token(Some("hunter2")));
+        assert!(!state.validate_token(Some("bearer hunter2")));
 
         std::env::remove_var("SCHEDULER_SHARED_SECRET");
     }

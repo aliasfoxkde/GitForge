@@ -80,6 +80,9 @@ jsonwebtoken = "9"
 # Password hashing
 bcrypt = "0.15"
 
+# Constant-time comparisons
+subtle = "2.6"
+
 # Git
 git2 = "0.19"
 
