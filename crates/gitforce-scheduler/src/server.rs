@@ -469,7 +469,7 @@ async fn complete_job(
     if let Some(completion) = state.completed.read().await.get(&job_id).cloned() {
         return (StatusCode::OK, Json(serde_json::json!(completion)));
     }
-    if !state.jobs.read().await.contains_key(&job_id) {
+    if state.pool.is_none() && !state.jobs.read().await.contains_key(&job_id) {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
