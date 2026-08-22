@@ -421,11 +421,14 @@ dependencies = [
  "gitforge-events",
  "gitforge-process",
  "gitforge-scheduler",
+ "serde",
+ "serde_json",
  "tokio",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

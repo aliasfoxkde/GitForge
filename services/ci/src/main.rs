@@ -2,7 +2,12 @@
 //!
 //! Main entry point for the CI orchestration service.
 
-use axum::Router;
+use axum::{
+    extract::Extension,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    Json, Router,
+};
 use futures::StreamExt;
 use gitforge_ci::{
     CiEngine, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
@@ -10,6 +15,7 @@ use gitforge_ci::{
 use gitforge_db::Pool;
 use gitforge_events::{
     EventBus, EventEnvelope, EventFilter, EventPayload, EventType, InMemoryEventBus,
+    PushReceivedPayload,
 };
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
 use gitforge_scheduler::{create_state, scheduler_routes, Scheduler};
@@ -62,7 +68,9 @@ async fn main() -> anyhow::Result<()> {
 
     let scheduler_app = Router::new()
         .route("/health", axum::routing::get(health_check))
+        .route("/pipelines/trigger", axum::routing::post(trigger_pipeline))
         .merge(scheduler_routes(scheduler_state))
+        .layer(Extension(event_bus.clone()))
         .layer(TraceLayer::new_for_http());
 
     let scheduler_addr = format!("0.0.0.0:{}", scheduler_port);
@@ -149,6 +157,121 @@ async fn main() -> anyhow::Result<()> {
 /// Health check for scheduler HTTP API
 async fn health_check() -> &'static str {
     "OK"
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PipelineTriggerRequest {
+    repo_id: String,
+    ref_name: String,
+    old_hash: String,
+    new_hash: String,
+}
+
+/// Accept a typed push event from the authenticated local Control Center bridge.
+/// The event is sent through the same bus consumed by native Git webhooks, so
+/// this endpoint does not duplicate pipeline creation or scheduler behavior.
+async fn trigger_pipeline(
+    Extension(event_bus): Extension<Arc<dyn EventBus>>,
+    headers: HeaderMap,
+    Json(request): Json<PipelineTriggerRequest>,
+) -> impl IntoResponse {
+    let configured_token = match std::env::var("GITFORGE_CI_TRIGGER_TOKEN") {
+        Ok(token) if !token.is_empty() => token,
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "accepted": false,
+                    "error": "CI trigger token is not configured"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let supplied_token = headers
+        .get("x-gitforge-trigger-token")
+        .and_then(|value| value.to_str().ok());
+    if supplied_token != Some(configured_token.as_str()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "accepted": false,
+                "error": "invalid CI trigger token"
+            })),
+        )
+            .into_response();
+    }
+
+    let repo_uuid = match uuid::Uuid::parse_str(&request.repo_id) {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "accepted": false,
+                    "error": "repo_id must be a UUID"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if !request.ref_name.starts_with("refs/")
+        || request.ref_name.len() > 256
+        || !is_git_hash(&request.old_hash)
+        || !is_git_hash(&request.new_hash)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "accepted": false,
+                "error": "ref_name or commit hash is invalid"
+            })),
+        )
+            .into_response();
+    }
+
+    let repo_id = gitforge_common::RepoId::from(repo_uuid);
+    let event = EventEnvelope::new(
+        EventType::PushReceived,
+        EventPayload::PushReceived(PushReceivedPayload {
+            repo_id,
+            ref_name: request.ref_name,
+            old_hash: request.old_hash,
+            new_hash: request.new_hash,
+            pusher_id: None,
+        }),
+        Some(repo_id),
+        None,
+    );
+    let event_id = event.event_id;
+
+    if let Err(error) = event_bus.publish(event).await {
+        tracing::error!(%error, %event_id, "failed to publish CI trigger event");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "accepted": false,
+                "error": "failed to publish CI trigger event"
+            })),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "accepted": true,
+            "event_id": event_id,
+            "repo_id": repo_id
+        })),
+    )
+        .into_response()
+}
+
+fn is_git_hash(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Create the shutdown future that waits for shutdown signal
