@@ -146,6 +146,7 @@ pub fn scheduler_routes<S: Clone + Send + Sync + 'static>(
         .route("/jobs/:id", get(get_job_status))
         .route("/jobs/:id/assign", post(assign_job))
         .route("/jobs/:id/complete", post(complete_job))
+        .route("/jobs/:id/cancel", post(cancel_job))
         .with_state(state)
 }
 
@@ -529,6 +530,90 @@ async fn complete_job(
         .insert(job_id, completion.clone());
     tracing::info!("job {} completed via HTTP: success={}", job_id, success);
 
+    (StatusCode::OK, Json(serde_json::json!(completion)))
+}
+
+/// Cancel a queued or claimed job. Cancellation is durable and idempotent.
+async fn cancel_job(
+    State(state): State<SchedulerServerState>,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    let job_id: JobId = match Uuid::parse_str(&job_id) {
+        Ok(id) => JobId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_job_id",
+                    "message": "Invalid job ID format"
+                })),
+            )
+        }
+    };
+
+    if let Some(completion) = state.completed.read().await.get(&job_id).cloned() {
+        return (StatusCode::OK, Json(serde_json::json!(completion)));
+    }
+
+    if let Some(pool) = &state.pool {
+        match SchedulerJobQueries::cancel(pool, job_id).await {
+            Ok(Some(job)) if job.is_terminal() => {
+                if let Some(completion) = completion_from_job(&job) {
+                    state.scheduler.cancel(job_id).await;
+                    state.jobs.write().await.remove(&job_id);
+                    state.claimed.write().await.remove(&job_id);
+                    state
+                        .completed
+                        .write()
+                        .await
+                        .insert(job_id, completion.clone());
+                    return (StatusCode::OK, Json(serde_json::json!(completion)));
+                }
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "job_not_found",
+                        "job_id": job_id.to_string()
+                    })),
+                )
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to persist scheduler cancellation");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "scheduler_storage_failure"})),
+                );
+            }
+            Ok(Some(_)) => {}
+        }
+    } else if !state.jobs.read().await.contains_key(&job_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "job_not_found",
+                "job_id": job_id.to_string()
+            })),
+        );
+    }
+
+    let completion = JobCompletion {
+        job_id: job_id.to_string(),
+        status: "cancelled".to_string(),
+        success: false,
+        exit_code: -1,
+        error: Some("job cancelled".to_string()),
+        completed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state.scheduler.cancel(job_id).await;
+    state.jobs.write().await.remove(&job_id);
+    state.claimed.write().await.remove(&job_id);
+    state
+        .completed
+        .write()
+        .await
+        .insert(job_id, completion.clone());
     (StatusCode::OK, Json(serde_json::json!(completion)))
 }
 

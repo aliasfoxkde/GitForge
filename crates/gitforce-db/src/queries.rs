@@ -791,6 +791,30 @@ impl SchedulerJobQueries {
         Self::get(pool, id).await
     }
 
+    /// Cancel a pending or claimed job. The first terminal writer wins.
+    pub async fn cancel(pool: &Pool, id: JobId) -> Result<Option<crate::models::SchedulerJob>> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            r#"
+            UPDATE scheduler_jobs
+            SET status = 'cancelled', success = 0, exit_code = -1,
+                completed_at = ?, updated_at = ?
+            WHERE id = ? AND status IN ('pending', 'claimed')
+            "#,
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to cancel scheduler job: {}", e)))?;
+
+        if result.rows_affected() == 0 {
+            return Self::get(pool, id).await;
+        }
+        Self::get(pool, id).await
+    }
+
     /// Return a claimed scheduler job to the pending pool (e.g. the runner
     /// disappeared before reporting a result).
     ///
@@ -1748,6 +1772,40 @@ mod tests {
             .await
             .unwrap();
         assert!(unknown.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_job_cancel_is_terminal_and_idempotent() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let job = sample_scheduler_job("cancel-me");
+        SchedulerJobQueries::insert_if_absent(&pool, &job)
+            .await
+            .unwrap();
+        let cancelled = SchedulerJobQueries::cancel(&pool, job.id)
+            .await
+            .unwrap()
+            .expect("job should exist");
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(cancelled.success, Some(false));
+        assert_eq!(cancelled.exit_code, Some(-1));
+        assert!(cancelled.is_terminal());
+        assert!(SchedulerJobQueries::list_active(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let second = SchedulerJobQueries::cancel(&pool, job.id)
+            .await
+            .unwrap()
+            .expect("cancelled job should remain observable");
+        assert_eq!(second.status, "cancelled");
+        assert_eq!(second.completed_at, cancelled.completed_at);
+        assert!(SchedulerJobQueries::cancel(&pool, JobId::new())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
