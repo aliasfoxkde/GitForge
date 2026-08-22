@@ -211,9 +211,20 @@ impl Scheduler {
 
     /// Register a runner
     pub async fn register_runner(&self, runner: Runner) {
-        let mut state = self.state.write().await;
         let runner_id = runner.id;
-        state.add_runner(runner);
+        {
+            let mut state = self.state.write().await;
+            state.add_runner(runner.clone());
+        }
+
+        // A DB-backed scheduler must persist runners before assigning jobs so
+        // the jobs.runner_id foreign key remains valid across processes.
+        if let Some(pool) = &self.db_pool {
+            if let Err(error) = gitforge_db::queries::RunnerQueries::create(pool, &runner).await {
+                tracing::error!("failed to persist runner {}: {}", runner_id, error);
+            }
+        }
+
         tracing::info!("runner {} registered", runner_id);
     }
 
