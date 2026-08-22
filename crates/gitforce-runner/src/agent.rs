@@ -1,14 +1,192 @@
 //! Runner agent
 
 use crate::executor::{ExecutableJob, JobExecutor, JobStep};
+use futures::future::BoxFuture;
 use gitforce_common::{Error, JobId, Result, RunnerId};
 use gitforce_db::models::Runner;
 use gitforce_sandbox::DockerSandbox;
 use reqwest::Client;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
+
+/// Maximum total attempts for reporting a job completion, including the first.
+pub(crate) const COMPLETION_MAX_ATTEMPTS: usize = 4;
+
+/// Base delay for the bounded exponential completion-report backoff.
+pub(crate) const COMPLETION_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+
+/// Outcome of a single completion-report HTTP attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompletionOutcome {
+    /// Any successful response (2xx), including a stored cancelled terminal
+    /// response, is a terminal acknowledgement.
+    Acknowledged(StatusCode),
+    /// HTTP 429/5xx (and transport errors, classified by the caller) may be
+    /// retried.
+    Retryable,
+    /// HTTP 4xx (other than 429) must not be retried.
+    Fatal(StatusCode),
+}
+
+/// Classify a completion-report HTTP response.
+///
+/// Retry is permitted only for transport errors (classified by the caller)
+/// and HTTP 429/5xx. Any other 4xx is fatal, and any 2xx — including a
+/// stored cancelled terminal response, which the scheduler replays with
+/// HTTP 200 — is a terminal acknowledgement.
+pub(crate) fn classify_completion_status(status: StatusCode) -> CompletionOutcome {
+    if status.is_success() {
+        CompletionOutcome::Acknowledged(status)
+    } else if status.as_u16() == 429 || status.is_server_error() {
+        CompletionOutcome::Retryable
+    } else {
+        CompletionOutcome::Fatal(status)
+    }
+}
+
+/// Bounded exponential delay before the next completion-report attempt.
+///
+/// After attempt `n` fails, the runner waits `base * 2^(n - 1)` (i.e. 1s,
+/// 2s, 4s for base = 1s) before attempt `n + 1`. Returns `None` once the
+/// attempt budget is exhausted, so the schedule is strictly bounded.
+pub(crate) fn completion_retry_delay(attempt: usize) -> Option<Duration> {
+    if attempt == 0 || attempt >= COMPLETION_MAX_ATTEMPTS {
+        None
+    } else {
+        // Delays precede attempts 2, 3, 4: shifts 0, 1, 2.
+        Some(COMPLETION_RETRY_BASE_DELAY * (1u32 << (attempt - 1)))
+    }
+}
+
+/// Transport-level result of one completion-report POST attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AttemptResult {
+    /// The scheduler responded with an HTTP status.
+    Status(StatusCode),
+    /// The request failed before a response was received.
+    Transport(String),
+}
+
+/// Terminal result of the bounded completion-report retry loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReportOutcome {
+    /// The scheduler acknowledged the completion (2xx, terminal).
+    Acknowledged,
+    /// Attempts were exhausted; the failure has been logged with the job ID.
+    Exhausted,
+    /// A non-retryable HTTP status was received; logged with the job ID.
+    Fatal(StatusCode),
+}
+
+/// Bounded retry core for completion reporting.
+///
+/// Runs `attempt_fn` at most [`COMPLETION_MAX_ATTEMPTS`] times, retrying only
+/// transport errors and HTTP 429/5xx, sleeping between attempts with bounded
+/// exponential backoff via `sleep_fn`. HTTP 4xx aborts immediately, any 2xx
+/// is a terminal acknowledgement, and after exhaustion the failure is logged
+/// with the job ID. The loop only re-sends the completion payload; it never
+/// re-executes the job.
+async fn retry_completion_report<'a, F, G>(
+    job_id: &str,
+    mut attempt_fn: F,
+    sleep_fn: G,
+) -> ReportOutcome
+where
+    F: FnMut() -> BoxFuture<'a, AttemptResult>,
+    G: Fn(Duration) -> BoxFuture<'a, ()>,
+{
+    let mut attempt = 1;
+    loop {
+        match attempt_fn().await {
+            AttemptResult::Status(status) => match classify_completion_status(status) {
+                CompletionOutcome::Acknowledged(status) => {
+                    tracing::info!(
+                        "reported job {} completion: HTTP {} (attempt {}/{})",
+                        job_id,
+                        status,
+                        attempt,
+                        COMPLETION_MAX_ATTEMPTS
+                    );
+                    return ReportOutcome::Acknowledged;
+                }
+                CompletionOutcome::Retryable => {
+                    tracing::warn!(
+                        "retryable status reporting job {} completion: HTTP {} (attempt {}/{})",
+                        job_id,
+                        status,
+                        attempt,
+                        COMPLETION_MAX_ATTEMPTS
+                    );
+                }
+                CompletionOutcome::Fatal(status) => {
+                    tracing::error!(
+                        "scheduler rejected job {} completion: HTTP {} (attempt {}/{})",
+                        job_id,
+                        status,
+                        attempt,
+                        COMPLETION_MAX_ATTEMPTS
+                    );
+                    return ReportOutcome::Fatal(status);
+                }
+            },
+            AttemptResult::Transport(error) => {
+                tracing::warn!(
+                    "transport error reporting job {} completion: {} (attempt {}/{})",
+                    job_id,
+                    error,
+                    attempt,
+                    COMPLETION_MAX_ATTEMPTS
+                );
+            }
+        }
+
+        let Some(delay) = completion_retry_delay(attempt) else {
+            tracing::error!(
+                "failed to report job {} completion after {} attempts",
+                job_id,
+                COMPLETION_MAX_ATTEMPTS
+            );
+            return ReportOutcome::Exhausted;
+        };
+        sleep_fn(delay).await;
+        attempt += 1;
+    }
+}
+
+/// POST a job completion to the scheduler with bounded retries.
+///
+/// Wraps [`retry_completion_report`] with the real HTTP transport: transport
+/// errors and HTTP 429/5xx are retried at most [`COMPLETION_MAX_ATTEMPTS`]
+/// total attempts with 1s/2s/4s backoff; HTTP 4xx is never retried, the job
+/// is never re-executed, and any 2xx response — including a stored cancelled
+/// terminal response — is treated as terminal acknowledgement.
+async fn report_completion_with_retry(
+    client: &Client,
+    url: &str,
+    job_id: &str,
+    payload: &serde_json::Value,
+) -> ReportOutcome {
+    retry_completion_report(
+        job_id,
+        || {
+            let fut: BoxFuture<'_, AttemptResult> = Box::pin(async {
+                match client.post(url).json(payload).send().await {
+                    Ok(response) => AttemptResult::Status(response.status()),
+                    Err(error) => AttemptResult::Transport(error.to_string()),
+                }
+            });
+            fut
+        },
+        |delay| {
+            let fut: BoxFuture<'_, ()> = Box::pin(tokio::time::sleep(delay));
+            fut
+        },
+    )
+    .await
+}
 
 /// Runner configuration
 #[derive(Debug, Clone)]
@@ -247,38 +425,24 @@ impl RunnerAgent {
                                     let result = executor.execute(executable).await;
                                     let complete_url =
                                         format!("{}/jobs/{}/complete", fetch_url, job.job_id);
-                                    match fetch_client
-                                        .post(&complete_url)
-                                        .json(&serde_json::json!({
-                                            "success": result.success,
-                                            "exit_code": result.exit_code,
-                                            "error": result.error,
-                                        }))
-                                        .send()
-                                        .await
-                                    {
-                                        Ok(response) if response.status().is_success() => {
-                                            tracing::info!(
-                                                "reported job {} completion: HTTP {}",
-                                                job.job_id,
-                                                response.status()
-                                            );
-                                        }
-                                        Ok(response) => {
-                                            tracing::error!(
-                                                "scheduler rejected job {} completion: HTTP {}",
-                                                job.job_id,
-                                                response.status()
-                                            );
-                                        }
-                                        Err(error) => {
-                                            tracing::error!(
-                                                "failed to report job {} completion: {}",
-                                                job.job_id,
-                                                error
-                                            );
-                                        }
-                                    }
+                                    // Build the payload once: bounded retries only
+                                    // re-send this report, they never re-execute the job.
+                                    let payload = serde_json::json!({
+                                        "success": result.success,
+                                        "exit_code": result.exit_code,
+                                        "error": result.error,
+                                    });
+                                    // Any 2xx — including a stored cancelled terminal
+                                    // response — is a terminal acknowledgement;
+                                    // exhaustion and 4xx are logged inside with the
+                                    // job ID, leaving execution semantics unchanged.
+                                    report_completion_with_retry(
+                                        &fetch_client,
+                                        &complete_url,
+                                        &job.job_id,
+                                        &payload,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -806,5 +970,233 @@ mod tests {
         // Agent is not registered, run should fail
         let result = agent.run().await;
         assert!(result.is_err());
+    }
+
+    // ── Completion-report retry: classification ────────────────────────────
+
+    #[test]
+    fn test_classify_completion_status_table() {
+        // 2xx is always a terminal acknowledgement — including HTTP 200 with
+        // a stored cancelled terminal response, which the scheduler replays
+        // for already-terminal jobs.
+        for status in [200, 201, 204] {
+            assert_eq!(
+                classify_completion_status(StatusCode::from_u16(status).unwrap()),
+                CompletionOutcome::Acknowledged(StatusCode::from_u16(status).unwrap()),
+                "expected {status} to be acknowledged"
+            );
+        }
+
+        // 429 and 5xx are retryable.
+        for status in [429, 500, 502, 503, 504] {
+            assert_eq!(
+                classify_completion_status(StatusCode::from_u16(status).unwrap()),
+                CompletionOutcome::Retryable,
+                "expected {status} to be retryable"
+            );
+        }
+
+        // Other 4xx statuses are never retried.
+        for status in [400, 401, 403, 404, 409, 422] {
+            assert_eq!(
+                classify_completion_status(StatusCode::from_u16(status).unwrap()),
+                CompletionOutcome::Fatal(StatusCode::from_u16(status).unwrap()),
+                "expected {status} to be fatal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_completion_stored_cancelled_is_acknowledged() {
+        // The scheduler responds 200 OK with the stored (possibly cancelled)
+        // terminal completion for an already-terminal job; the runner must
+        // treat that as terminal acknowledgement, not retry it.
+        assert_eq!(
+            classify_completion_status(StatusCode::OK),
+            CompletionOutcome::Acknowledged(StatusCode::OK)
+        );
+    }
+
+    // ── Completion-report retry: backoff schedule ──────────────────────────
+
+    #[test]
+    fn test_completion_retry_delay_schedule() {
+        // Bounded exponential delays 1s, 2s, 4s precede attempts 2, 3, 4.
+        assert_eq!(
+            completion_retry_delay(1),
+            Some(Duration::from_secs(1)),
+            "delay after attempt 1 must be 1s"
+        );
+        assert_eq!(
+            completion_retry_delay(2),
+            Some(Duration::from_secs(2)),
+            "delay after attempt 2 must be 2s"
+        );
+        assert_eq!(
+            completion_retry_delay(3),
+            Some(Duration::from_secs(4)),
+            "delay after attempt 3 must be 4s"
+        );
+        // The budget is strictly bounded at 4 total attempts.
+        assert_eq!(
+            completion_retry_delay(4),
+            None,
+            "no delay after the final attempt"
+        );
+        assert_eq!(completion_retry_delay(0), None);
+        assert_eq!(completion_retry_delay(5), None);
+    }
+
+    #[test]
+    fn test_completion_max_attempts_is_four() {
+        assert_eq!(COMPLETION_MAX_ATTEMPTS, 4);
+        assert_eq!(COMPLETION_RETRY_BASE_DELAY, Duration::from_secs(1));
+    }
+
+    // ── Completion-report retry: bounded loop (no network) ─────────────────
+
+    /// Harness for driving the retry core with scripted attempt results and a
+    /// recording sleeper; makes no real network calls.
+    async fn drive_retry_core(
+        scripted: Vec<AttemptResult>,
+    ) -> (ReportOutcome, usize, Vec<Duration>) {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        let scripted = Arc::new(Mutex::new(VecDeque::from(scripted)));
+        let attempts = Arc::new(Mutex::new(0usize));
+        let sleeps = Arc::new(Mutex::new(Vec::<Duration>::new()));
+
+        let script_for_attempts = scripted.clone();
+        let attempt_counter = attempts.clone();
+        let sleep_recorder = sleeps.clone();
+
+        let outcome = retry_completion_report(
+            "job-retry-test",
+            move || {
+                let script = script_for_attempts.clone();
+                let counter = attempt_counter.clone();
+                let fut: BoxFuture<'_, AttemptResult> = Box::pin(async move {
+                    *counter.lock().unwrap() += 1;
+                    script
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("scripted attempts exhausted")
+                });
+                fut
+            },
+            move |delay| {
+                let recorder = sleep_recorder.clone();
+                let fut: BoxFuture<'_, ()> = Box::pin(async move {
+                    recorder.lock().unwrap().push(delay);
+                });
+                fut
+            },
+        )
+        .await;
+
+        let attempt_count = *attempts.lock().unwrap();
+        let recorded_sleeps = sleeps.lock().unwrap().clone();
+        (outcome, attempt_count, recorded_sleeps)
+    }
+
+    #[tokio::test]
+    async fn test_retry_core_acknowledges_first_success() {
+        let (outcome, attempts, sleeps) =
+            drive_retry_core(vec![AttemptResult::Status(StatusCode::OK)]).await;
+        assert_eq!(outcome, ReportOutcome::Acknowledged);
+        assert_eq!(attempts, 1);
+        assert!(sleeps.is_empty(), "no backoff after acknowledgement");
+    }
+
+    #[tokio::test]
+    async fn test_retry_core_retries_5xx_and_429_then_acknowledges() {
+        let (outcome, attempts, sleeps) = drive_retry_core(vec![
+            AttemptResult::Status(StatusCode::INTERNAL_SERVER_ERROR),
+            AttemptResult::Status(StatusCode::TOO_MANY_REQUESTS),
+            AttemptResult::Status(StatusCode::SERVICE_UNAVAILABLE),
+            AttemptResult::Status(StatusCode::OK),
+        ])
+        .await;
+        assert_eq!(outcome, ReportOutcome::Acknowledged);
+        assert_eq!(attempts, 4, "must use at most the full attempt budget");
+        assert_eq!(
+            sleeps,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4)
+            ],
+            "backoff must follow the bounded 1s/2s/4s schedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_core_retries_transport_errors_then_acknowledges() {
+        let (outcome, attempts, sleeps) = drive_retry_core(vec![
+            AttemptResult::Transport("connection refused".to_string()),
+            AttemptResult::Transport("dns failure".to_string()),
+            AttemptResult::Status(StatusCode::OK),
+        ])
+        .await;
+        assert_eq!(outcome, ReportOutcome::Acknowledged);
+        assert_eq!(attempts, 3);
+        assert_eq!(sleeps, vec![Duration::from_secs(1), Duration::from_secs(2)]);
+    }
+
+    #[tokio::test]
+    async fn test_retry_core_never_retries_4xx() {
+        let (outcome, attempts, sleeps) = drive_retry_core(vec![
+            AttemptResult::Status(StatusCode::NOT_FOUND),
+            AttemptResult::Status(StatusCode::OK), // must never be reached
+        ])
+        .await;
+        assert_eq!(outcome, ReportOutcome::Fatal(StatusCode::NOT_FOUND));
+        assert_eq!(attempts, 1, "HTTP 4xx must abort immediately");
+        assert!(sleeps.is_empty(), "no backoff after fatal status");
+    }
+
+    #[tokio::test]
+    async fn test_retry_core_exhausts_after_four_transport_errors() {
+        let (outcome, attempts, sleeps) = drive_retry_core(vec![
+            AttemptResult::Transport("timeout".to_string()),
+            AttemptResult::Transport("timeout".to_string()),
+            AttemptResult::Transport("timeout".to_string()),
+            AttemptResult::Transport("timeout".to_string()),
+            AttemptResult::Status(StatusCode::OK), // must never be reached
+        ])
+        .await;
+        assert_eq!(outcome, ReportOutcome::Exhausted);
+        assert_eq!(attempts, 4, "attempt budget must be capped at 4");
+        assert_eq!(
+            sleeps,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_core_exhausts_after_four_5xx() {
+        let (outcome, attempts, sleeps) = drive_retry_core(vec![
+            AttemptResult::Status(StatusCode::BAD_GATEWAY),
+            AttemptResult::Status(StatusCode::BAD_GATEWAY),
+            AttemptResult::Status(StatusCode::BAD_GATEWAY),
+            AttemptResult::Status(StatusCode::BAD_GATEWAY),
+        ])
+        .await;
+        assert_eq!(outcome, ReportOutcome::Exhausted);
+        assert_eq!(attempts, 4);
+        assert_eq!(
+            sleeps,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4)
+            ]
+        );
     }
 }
