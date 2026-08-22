@@ -7,6 +7,7 @@ use futures::StreamExt;
 use gitforge_ci::{
     CiEngine, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
 };
+use gitforge_db::Pool;
 use gitforge_events::{
     EventBus, EventEnvelope, EventFilter, EventPayload, EventType, InMemoryEventBus,
 };
@@ -41,8 +42,13 @@ async fn main() -> anyhow::Result<()> {
     // Initialize event bus
     let event_bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
 
-    // Initialize scheduler
-    let scheduler = Scheduler::new();
+    // Initialize the scheduler with the shared database so jobs created by the
+    // API process are durable inputs to this separate CI process.
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:./gitforge.db".to_string());
+    let db_pool = Pool::new(&database_url).await?;
+    db_pool.migrate().await?;
+    let scheduler = Scheduler::with_db(db_pool);
 
     // Start scheduler HTTP API server on port 42781
     let scheduler_port: u16 = std::env::var("SCHEDULER_PORT")
@@ -113,6 +119,9 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             ticker.tick().await;
+            if let Err(error) = scheduler_clone.load_pending_jobs().await {
+                tracing::error!("failed to load persisted pending jobs: {}", error);
+            }
             scheduler_clone.process_queue().await;
         }
     });
