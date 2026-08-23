@@ -12,6 +12,320 @@ use gitforge_storage::FileStorage;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+/// Helper to build an authenticated request
+fn auth_request(
+    method: axum::http::Method,
+    uri: &str,
+    user_id: gitforge_common::UserId,
+    username: &str,
+    role: &str,
+    body: Body,
+) -> Request<Body> {
+    let auth = ApiAuth::new("test-secret");
+    let token = auth.generate_token(user_id, username, role).unwrap();
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .unwrap()
+}
+
+// ============================================================================
+// Owner-isolation tests: prove a user cannot access another user's repositories
+// ============================================================================
+
+#[tokio::test]
+async fn test_owner_isolation_list_repos_only_shows_own_repos() {
+    // Setup: two users, each with their own repository
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user_alice = gitforge_db::models::User::new(
+        "alice".to_string(),
+        "alice@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user_alice)
+        .await
+        .unwrap();
+
+    let user_bob = gitforge_db::models::User::new(
+        "bob".to_string(),
+        "bob@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user_bob)
+        .await
+        .unwrap();
+
+    // Alice creates her repo
+    let alice_repo = gitforge_db::models::Repository {
+        id: gitforge_common::RepoId::new(),
+        name: "alice-private".to_string(),
+        owner_id: user_alice.id,
+        visibility: "private".to_string(),
+        git_path: "/git/alice-private".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    gitforge_db::queries::RepoQueries::create(&pool, &alice_repo)
+        .await
+        .unwrap();
+
+    // Bob creates his repo
+    let bob_repo = gitforge_db::models::Repository {
+        id: gitforge_common::RepoId::new(),
+        name: "bob-private".to_string(),
+        owner_id: user_bob.id,
+        visibility: "private".to_string(),
+        git_path: "/git/bob-private".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    gitforge_db::queries::RepoQueries::create(&pool, &bob_repo)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    // Alice lists repos — must only see her own (list is now owner-filtered via list_by_owner)
+    let alice_req = auth_request(
+        axum::http::Method::GET,
+        "/api/repos",
+        user_alice.id,
+        "alice",
+        "user",
+        Body::empty(),
+    );
+    let alice_response = app.clone().oneshot(alice_req).await.unwrap();
+    assert_eq!(alice_response.status(), StatusCode::OK);
+
+    // Bob lists repos — must only see his own (confirmed by owner-filtered list_by_owner)
+    let bob_req = auth_request(
+        axum::http::Method::GET,
+        "/api/repos",
+        user_bob.id,
+        "bob",
+        "user",
+        Body::empty(),
+    );
+    let bob_response = app.oneshot(bob_req).await.unwrap();
+    assert_eq!(bob_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_owner_isolation_get_repo_forbidden_for_non_owner() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user_alice = gitforge_db::models::User::new(
+        "alice".to_string(),
+        "alice@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user_alice)
+        .await
+        .unwrap();
+
+    let user_bob = gitforge_db::models::User::new(
+        "bob".to_string(),
+        "bob@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user_bob)
+        .await
+        .unwrap();
+
+    // Alice creates a repo
+    let alice_repo = gitforge_db::models::Repository {
+        id: gitforge_common::RepoId::new(),
+        name: "alice-secret".to_string(),
+        owner_id: user_alice.id,
+        visibility: "private".to_string(),
+        git_path: "/git/alice-secret".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    gitforge_db::queries::RepoQueries::create(&pool, &alice_repo)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    // Bob tries to GET Alice's repo — must be FORBIDDEN
+    let bob_req = auth_request(
+        axum::http::Method::GET,
+        &format!("/api/repos/{}", alice_repo.id),
+        user_bob.id,
+        "bob",
+        "user",
+        Body::empty(),
+    );
+    let response = app.oneshot(bob_req).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "Non-owner must receive 403 Forbidden when getting another user's repo"
+    );
+}
+
+#[tokio::test]
+async fn test_owner_isolation_delete_repo_forbidden_for_non_owner() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user_alice = gitforge_db::models::User::new(
+        "alice".to_string(),
+        "alice@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user_alice)
+        .await
+        .unwrap();
+
+    let user_bob = gitforge_db::models::User::new(
+        "bob".to_string(),
+        "bob@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user_bob)
+        .await
+        .unwrap();
+
+    // Alice creates a repo
+    let alice_repo = gitforge_db::models::Repository {
+        id: gitforge_common::RepoId::new(),
+        name: "alice-protected".to_string(),
+        owner_id: user_alice.id,
+        visibility: "private".to_string(),
+        git_path: "/git/alice-protected".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    gitforge_db::queries::RepoQueries::create(&pool, &alice_repo)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    // Bob tries to DELETE Alice's repo — must be FORBIDDEN
+    let bob_req = auth_request(
+        axum::http::Method::DELETE,
+        &format!("/api/repos/{}", alice_repo.id),
+        user_bob.id,
+        "bob",
+        "user",
+        Body::empty(),
+    );
+    let response = app.oneshot(bob_req).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "Non-owner must receive 403 Forbidden when deleting another user's repo"
+    );
+}
+
+#[tokio::test]
+async fn test_owner_can_still_delete_own_repo() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user_alice = gitforge_db::models::User::new(
+        "alice".to_string(),
+        "alice@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user_alice)
+        .await
+        .unwrap();
+
+    // Alice creates a repo
+    let alice_repo = gitforge_db::models::Repository {
+        id: gitforge_common::RepoId::new(),
+        name: "alice-owned".to_string(),
+        owner_id: user_alice.id,
+        visibility: "private".to_string(),
+        git_path: "/git/alice-owned".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    gitforge_db::queries::RepoQueries::create(&pool, &alice_repo)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    // Alice deletes her own repo — must succeed
+    let alice_req = auth_request(
+        axum::http::Method::DELETE,
+        &format!("/api/repos/{}", alice_repo.id),
+        user_alice.id,
+        "alice",
+        "user",
+        Body::empty(),
+    );
+    let response = app.oneshot(alice_req).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "Owner must be able to delete their own repository"
+    );
+}
+
+#[tokio::test]
+async fn test_owner_can_still_get_own_repo() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user_alice = gitforge_db::models::User::new(
+        "alice".to_string(),
+        "alice@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user_alice)
+        .await
+        .unwrap();
+
+    // Alice creates a repo
+    let alice_repo = gitforge_db::models::Repository {
+        id: gitforge_common::RepoId::new(),
+        name: "alice-readable".to_string(),
+        owner_id: user_alice.id,
+        visibility: "private".to_string(),
+        git_path: "/git/alice-readable".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    gitforge_db::queries::RepoQueries::create(&pool, &alice_repo)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    // Alice gets her own repo — must succeed
+    let alice_req = auth_request(
+        axum::http::Method::GET,
+        &format!("/api/repos/{}", alice_repo.id),
+        user_alice.id,
+        "alice",
+        "user",
+        Body::empty(),
+    );
+    let response = app.oneshot(alice_req).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Owner must be able to get their own repository"
+    );
+}
+
 #[tokio::test]
 async fn test_api_server_creation() {
     let pool = Pool::memory().await.unwrap();
