@@ -1339,9 +1339,12 @@ dependencies = [
 name = "gitforge-mcp"
 version = "0.1.0"
 dependencies = [
+ "mockito",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

@@ -6,8 +6,12 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod api;
+mod api_dispatcher;
 mod dispatcher;
 
+pub use api::{ApiClient, ApiClientError};
+pub use api_dispatcher::ApiDispatcher;
 pub use dispatcher::{dispatch, run_stdio, DispatchError};
 
 /// JSON-RPC 2.0 request envelope.
