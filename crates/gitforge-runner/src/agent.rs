@@ -6,9 +6,47 @@ use gitforge_db::models::Runner;
 use gitforge_sandbox::DockerSandbox;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::sync::Arc;
+use std::time::Duration;
+use thiserror::Error as ThisError;
 use tokio::sync::RwLock;
-use tokio::time::{interval, Duration};
+use tokio::time::interval;
+
+/// Configuration seam errors with actionable messages
+#[derive(ThisError, Debug)]
+pub enum ConfigError {
+    #[error("GITFORGE_SCHEDULER_URL is empty. Set a valid URL (e.g., http://localhost:42781)")]
+    EmptySchedulerUrl,
+
+    #[error("GITFORGE_RUNNER_NAME is empty. Set a non-empty runner name via GITFORGE_RUNNER_NAME")]
+    EmptyRunnerName,
+
+    #[error("GITFORGE_CAPACITY must be a positive integer. Got '{value}'. Set GITFORGE_CAPACITY to a value between 1 and 100")]
+    InvalidCapacity { value: String },
+
+    #[error("GITFORGE_HEARTBEAT_INTERVAL must be a positive integer (seconds). Got '{value}'. Set GITFORGE_HEARTBEAT_INTERVAL to a value between 1 and 3600")]
+    InvalidHeartbeatInterval { value: String },
+
+    #[error("GITFORGE_FETCH_INTERVAL must be a positive integer (seconds). Got '{value}'. Set GITFORGE_FETCH_INTERVAL to a value between 1 and 3600")]
+    InvalidFetchInterval { value: String },
+}
+
+/// Environment variable names for runner configuration
+mod env_vars {
+    /// Scheduler URL environment variable
+    pub const SCHEDULER_URL: &str = "GITFORGE_SCHEDULER_URL";
+    /// Runner name environment variable
+    pub const RUNNER_NAME: &str = "GITFORGE_RUNNER_NAME";
+    /// Runner type environment variable
+    pub const RUNNER_TYPE: &str = "GITFORGE_RUNNER_TYPE";
+    /// Runner capacity environment variable
+    pub const CAPACITY: &str = "GITFORGE_CAPACITY";
+    /// Heartbeat interval environment variable (seconds)
+    pub const HEARTBEAT_INTERVAL: &str = "GITFORGE_HEARTBEAT_INTERVAL";
+    /// Fetch interval environment variable (seconds)
+    pub const FETCH_INTERVAL: &str = "GITFORGE_FETCH_INTERVAL";
+}
 
 /// Runner configuration
 #[derive(Debug, Clone)]
@@ -37,6 +75,144 @@ impl Default for RunnerConfig {
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
         }
+    }
+}
+
+impl RunnerConfig {
+    /// Build RunnerConfig from environment variables with validation.
+    ///
+    /// Environment variables (all optional, with sensible defaults):
+    /// - GITFORGE_SCHEDULER_URL: Scheduler URL (default: http://localhost:42781)
+    /// - GITFORGE_RUNNER_NAME: Runner name (default: runner)
+    /// - GITFORGE_RUNNER_TYPE: Runner type (default: docker)
+    /// - GITFORGE_CAPACITY: Concurrent job capacity (default: 2, range: 1-100)
+    /// - GITFORGE_HEARTBEAT_INTERVAL: Heartbeat interval in seconds (default: 30, range: 1-3600)
+    /// - GITFORGE_FETCH_INTERVAL: Job fetch interval in seconds (default: 5, range: 1-3600)
+    ///
+    /// # Errors
+    ///
+    /// Returns an actionable ConfigError if:
+    /// - GITFORGE_SCHEDULER_URL is set but empty
+    /// - GITFORGE_RUNNER_NAME is set but empty
+    /// - GITFORGE_CAPACITY is set but not a valid positive integer (1-100)
+    /// - GITFORGE_HEARTBEAT_INTERVAL is set but not a valid positive integer (1-3600)
+    /// - GITFORGE_FETCH_INTERVAL is set but not a valid positive integer (1-3600)
+    pub fn from_env() -> std::result::Result<Self, ConfigError> {
+        // Parse string values
+        let scheduler_url = match env::var(env_vars::SCHEDULER_URL) {
+            Ok(v) if v.trim().is_empty() => return Err(ConfigError::EmptySchedulerUrl),
+            Ok(v) => v,
+            Err(_) => "http://localhost:42781".to_string(),
+        };
+
+        let name = match env::var(env_vars::RUNNER_NAME) {
+            Ok(v) if v.trim().is_empty() => return Err(ConfigError::EmptyRunnerName),
+            Ok(v) => v,
+            Err(_) => "runner".to_string(),
+        };
+
+        let runner_type = env::var(env_vars::RUNNER_TYPE).unwrap_or_else(|_| "docker".to_string());
+
+        // Parse numeric values with validation
+        let capacity = Self::parse_i32_env(env_vars::CAPACITY, 1, 100, || 2)?;
+
+        let heartbeat_interval_secs =
+            Self::parse_u64_env(env_vars::HEARTBEAT_INTERVAL, 1, 3600, || 30)?;
+
+        let fetch_interval_secs = Self::parse_u64_env(env_vars::FETCH_INTERVAL, 1, 3600, || 5)?;
+
+        Ok(Self {
+            scheduler_url,
+            name,
+            runner_type,
+            capacity,
+            heartbeat_interval_secs,
+            fetch_interval_secs,
+        })
+    }
+
+    /// Parse an optional i32 environment variable with range validation.
+    fn parse_i32_env(
+        name: &str,
+        min: i32,
+        max: i32,
+        default: impl FnOnce() -> i32,
+    ) -> std::result::Result<i32, ConfigError> {
+        match env::var(name) {
+            Ok(v) => {
+                let parsed = v
+                    .parse::<i32>()
+                    .map_err(|_| ConfigError::InvalidCapacity { value: v.clone() })?;
+                if !(min..=max).contains(&parsed) {
+                    return Err(ConfigError::InvalidCapacity { value: v });
+                }
+                Ok(parsed)
+            }
+            Err(_) => Ok(default()),
+        }
+    }
+
+    /// Parse an optional u64 environment variable with range validation.
+    fn parse_u64_env(
+        name: &str,
+        min: u64,
+        max: u64,
+        default: impl FnOnce() -> u64,
+    ) -> std::result::Result<u64, ConfigError> {
+        match env::var(name) {
+            Ok(v) => {
+                let parsed = v.parse::<u64>().map_err(|_| match name {
+                    env_vars::HEARTBEAT_INTERVAL => {
+                        ConfigError::InvalidHeartbeatInterval { value: v.clone() }
+                    }
+                    env_vars::FETCH_INTERVAL => {
+                        ConfigError::InvalidFetchInterval { value: v.clone() }
+                    }
+                    _ => ConfigError::InvalidCapacity { value: v.clone() },
+                })?;
+                if !(min..=max).contains(&parsed) {
+                    return Err(match name {
+                        env_vars::HEARTBEAT_INTERVAL => {
+                            ConfigError::InvalidHeartbeatInterval { value: v }
+                        }
+                        env_vars::FETCH_INTERVAL => ConfigError::InvalidFetchInterval { value: v },
+                        _ => ConfigError::InvalidCapacity { value: v },
+                    });
+                }
+                Ok(parsed)
+            }
+            Err(_) => Ok(default()),
+        }
+    }
+
+    /// Get scheduler URL, checking environment first.
+    pub fn scheduler_url(&self) -> &str {
+        &self.scheduler_url
+    }
+
+    /// Get runner name, checking environment first.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get runner type, checking environment first.
+    pub fn runner_type(&self) -> &str {
+        &self.runner_type
+    }
+
+    /// Get capacity, checking environment first.
+    pub fn capacity(&self) -> i32 {
+        self.capacity
+    }
+
+    /// Get heartbeat interval in seconds, checking environment first.
+    pub fn heartbeat_interval_secs(&self) -> u64 {
+        self.heartbeat_interval_secs
+    }
+
+    /// Get fetch interval in seconds, checking environment first.
+    pub fn fetch_interval_secs(&self) -> u64 {
+        self.fetch_interval_secs
     }
 }
 
@@ -333,6 +509,7 @@ impl RunnerAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[tokio::test]
     async fn test_runner_creation() {
@@ -821,5 +998,320 @@ mod tests {
         // Agent is not registered, run should fail
         let result = agent.run().await;
         assert!(result.is_err());
+    }
+
+    // ========================================
+    // Configuration Seam Tests
+    // ========================================
+
+    #[test]
+    fn test_config_error_display() {
+        let err = ConfigError::EmptySchedulerUrl;
+        assert!(err.to_string().contains("GITFORGE_SCHEDULER_URL"));
+
+        let err = ConfigError::EmptyRunnerName;
+        assert!(err.to_string().contains("GITFORGE_RUNNER_NAME"));
+
+        let err = ConfigError::InvalidCapacity {
+            value: "bad".to_string(),
+        };
+        assert!(err.to_string().contains("GITFORGE_CAPACITY"));
+        assert!(err.to_string().contains("bad"));
+
+        let err = ConfigError::InvalidHeartbeatInterval {
+            value: "0".to_string(),
+        };
+        assert!(err.to_string().contains("GITFORGE_HEARTBEAT_INTERVAL"));
+
+        let err = ConfigError::InvalidFetchInterval {
+            value: "-1".to_string(),
+        };
+        assert!(err.to_string().contains("GITFORGE_FETCH_INTERVAL"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_from_env_no_vars() {
+        // Clear any existing env vars
+        env::remove_var(env_vars::SCHEDULER_URL);
+        env::remove_var(env_vars::RUNNER_NAME);
+        env::remove_var(env_vars::RUNNER_TYPE);
+        env::remove_var(env_vars::CAPACITY);
+        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
+        env::remove_var(env_vars::FETCH_INTERVAL);
+
+        let config = RunnerConfig::from_env().unwrap();
+        assert_eq!(config.scheduler_url, "http://localhost:42781");
+        assert_eq!(config.name, "runner");
+        assert_eq!(config.runner_type, "docker");
+        assert_eq!(config.capacity, 2);
+        assert_eq!(config.heartbeat_interval_secs, 30);
+        assert_eq!(config.fetch_interval_secs, 5);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_from_env_with_all_vars() {
+        env::set_var(env_vars::SCHEDULER_URL, "http://custom:8081");
+        env::set_var(env_vars::RUNNER_NAME, "test-runner");
+        env::set_var(env_vars::RUNNER_TYPE, "kubernetes");
+        env::set_var(env_vars::CAPACITY, "5");
+        env::set_var(env_vars::HEARTBEAT_INTERVAL, "60");
+        env::set_var(env_vars::FETCH_INTERVAL, "10");
+
+        let config = RunnerConfig::from_env().unwrap();
+        assert_eq!(config.scheduler_url, "http://custom:8081");
+        assert_eq!(config.name, "test-runner");
+        assert_eq!(config.runner_type, "kubernetes");
+        assert_eq!(config.capacity, 5);
+        assert_eq!(config.heartbeat_interval_secs, 60);
+        assert_eq!(config.fetch_interval_secs, 10);
+
+        // Cleanup
+        env::remove_var(env_vars::SCHEDULER_URL);
+        env::remove_var(env_vars::RUNNER_NAME);
+        env::remove_var(env_vars::RUNNER_TYPE);
+        env::remove_var(env_vars::CAPACITY);
+        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
+        env::remove_var(env_vars::FETCH_INTERVAL);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_from_env_partial_vars() {
+        // Only set some vars
+        env::set_var(env_vars::RUNNER_NAME, "partial-runner");
+        env::set_var(env_vars::CAPACITY, "8");
+
+        let config = RunnerConfig::from_env().unwrap();
+        assert_eq!(config.name, "partial-runner");
+        assert_eq!(config.capacity, 8);
+        // Others should be defaults
+        assert_eq!(config.scheduler_url, "http://localhost:42781");
+        assert_eq!(config.runner_type, "docker");
+        assert_eq!(config.heartbeat_interval_secs, 30);
+        assert_eq!(config.fetch_interval_secs, 5);
+
+        // Cleanup
+        env::remove_var(env_vars::RUNNER_NAME);
+        env::remove_var(env_vars::CAPACITY);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_capacity_boundaries() {
+        // Test minimum valid
+        env::set_var(env_vars::CAPACITY, "1");
+        let config = RunnerConfig::from_env().unwrap();
+        assert_eq!(config.capacity, 1);
+        env::remove_var(env_vars::CAPACITY);
+
+        // Test maximum valid
+        env::set_var(env_vars::CAPACITY, "100");
+        let config = RunnerConfig::from_env().unwrap();
+        assert_eq!(config.capacity, 100);
+        env::remove_var(env_vars::CAPACITY);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_heartbeat_boundaries() {
+        // Test minimum valid
+        env::set_var(env_vars::HEARTBEAT_INTERVAL, "1");
+        let config = RunnerConfig::from_env().unwrap();
+        assert_eq!(config.heartbeat_interval_secs, 1);
+        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
+
+        // Test maximum valid
+        env::set_var(env_vars::HEARTBEAT_INTERVAL, "3600");
+        let config = RunnerConfig::from_env().unwrap();
+        assert_eq!(config.heartbeat_interval_secs, 3600);
+        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_fetch_boundaries() {
+        // Test minimum valid
+        env::set_var(env_vars::FETCH_INTERVAL, "1");
+        let config = RunnerConfig::from_env().unwrap();
+        assert_eq!(config.fetch_interval_secs, 1);
+        env::remove_var(env_vars::FETCH_INTERVAL);
+
+        // Test maximum valid
+        env::set_var(env_vars::FETCH_INTERVAL, "3600");
+        let config = RunnerConfig::from_env().unwrap();
+        assert_eq!(config.fetch_interval_secs, 3600);
+        env::remove_var(env_vars::FETCH_INTERVAL);
+    }
+
+    #[test]
+    fn test_config_getter_methods() {
+        let config = RunnerConfig {
+            scheduler_url: "http://getter:9090".to_string(),
+            name: "getter-test".to_string(),
+            runner_type: "firecracker".to_string(),
+            capacity: 7,
+            heartbeat_interval_secs: 45,
+            fetch_interval_secs: 15,
+        };
+
+        assert_eq!(config.scheduler_url(), "http://getter:9090");
+        assert_eq!(config.name(), "getter-test");
+        assert_eq!(config.runner_type(), "firecracker");
+        assert_eq!(config.capacity(), 7);
+        assert_eq!(config.heartbeat_interval_secs(), 45);
+        assert_eq!(config.fetch_interval_secs(), 15);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_default_preserves_values() {
+        // Verify default() produces expected values
+        let config = RunnerConfig::default();
+        assert_eq!(config.scheduler_url, "http://localhost:42781");
+        assert_eq!(config.name, "runner");
+        assert_eq!(config.runner_type, "docker");
+        assert_eq!(config.capacity, 2);
+        assert_eq!(config.heartbeat_interval_secs, 30);
+        assert_eq!(config.fetch_interval_secs, 5);
+
+        // Verify from_env() without vars matches default
+        env::remove_var(env_vars::SCHEDULER_URL);
+        env::remove_var(env_vars::RUNNER_NAME);
+        env::remove_var(env_vars::RUNNER_TYPE);
+        env::remove_var(env_vars::CAPACITY);
+        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
+        env::remove_var(env_vars::FETCH_INTERVAL);
+
+        let from_env = RunnerConfig::from_env().unwrap();
+        assert_eq!(config.scheduler_url, from_env.scheduler_url);
+        assert_eq!(config.name, from_env.name);
+        assert_eq!(config.runner_type, from_env.runner_type);
+        assert_eq!(config.capacity, from_env.capacity);
+        assert_eq!(
+            config.heartbeat_interval_secs,
+            from_env.heartbeat_interval_secs
+        );
+        assert_eq!(config.fetch_interval_secs, from_env.fetch_interval_secs);
+    }
+
+    #[test]
+    fn test_config_env_var_names() {
+        assert_eq!(env_vars::SCHEDULER_URL, "GITFORGE_SCHEDULER_URL");
+        assert_eq!(env_vars::RUNNER_NAME, "GITFORGE_RUNNER_NAME");
+        assert_eq!(env_vars::RUNNER_TYPE, "GITFORGE_RUNNER_TYPE");
+        assert_eq!(env_vars::CAPACITY, "GITFORGE_CAPACITY");
+        assert_eq!(env_vars::HEARTBEAT_INTERVAL, "GITFORGE_HEARTBEAT_INTERVAL");
+        assert_eq!(env_vars::FETCH_INTERVAL, "GITFORGE_FETCH_INTERVAL");
+    }
+
+    // ========================================
+    // Invalid Value Tests
+    // ========================================
+
+    #[test]
+    #[serial]
+    fn test_config_empty_scheduler_url() {
+        env::set_var(env_vars::SCHEDULER_URL, "");
+        let result = RunnerConfig::from_env();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigError::EmptySchedulerUrl
+        ));
+        env::remove_var(env_vars::SCHEDULER_URL);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_empty_runner_name() {
+        env::set_var(env_vars::RUNNER_NAME, "   ");
+        let result = RunnerConfig::from_env();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ConfigError::EmptyRunnerName));
+        env::remove_var(env_vars::RUNNER_NAME);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_invalid_capacity_non_numeric() {
+        env::set_var(env_vars::CAPACITY, "abc");
+        let result = RunnerConfig::from_env();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidCapacity { .. }));
+        assert!(err.to_string().contains("abc"));
+        env::remove_var(env_vars::CAPACITY);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_invalid_capacity_zero() {
+        env::set_var(env_vars::CAPACITY, "0");
+        let result = RunnerConfig::from_env();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidCapacity { .. }));
+        assert!(err.to_string().contains("0"));
+        env::remove_var(env_vars::CAPACITY);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_invalid_capacity_out_of_range() {
+        env::set_var(env_vars::CAPACITY, "101");
+        let result = RunnerConfig::from_env();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidCapacity { .. }));
+        assert!(err.to_string().contains("101"));
+        env::remove_var(env_vars::CAPACITY);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_invalid_heartbeat_non_numeric() {
+        env::set_var(env_vars::HEARTBEAT_INTERVAL, "xyz");
+        let result = RunnerConfig::from_env();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidHeartbeatInterval { .. }));
+        assert!(err.to_string().contains("xyz"));
+        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_invalid_heartbeat_out_of_range() {
+        env::set_var(env_vars::HEARTBEAT_INTERVAL, "0");
+        let result = RunnerConfig::from_env();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidHeartbeatInterval { .. }));
+        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_invalid_fetch_non_numeric() {
+        env::set_var(env_vars::FETCH_INTERVAL, "nan");
+        let result = RunnerConfig::from_env();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidFetchInterval { .. }));
+        assert!(err.to_string().contains("nan"));
+        env::remove_var(env_vars::FETCH_INTERVAL);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_invalid_fetch_out_of_range() {
+        env::set_var(env_vars::FETCH_INTERVAL, "99999");
+        let result = RunnerConfig::from_env();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidFetchInterval { .. }));
+        env::remove_var(env_vars::FETCH_INTERVAL);
     }
 }
