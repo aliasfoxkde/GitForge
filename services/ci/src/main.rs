@@ -56,13 +56,15 @@ async fn main() -> anyhow::Result<()> {
     // Initialize scheduler. Production deployments provide a database URL so
     // job definitions and completion receipts survive service restarts;
     // development keeps the in-memory fallback explicit and usable.
-    let (scheduler, scheduler_db) = if let Ok(database_url) = std::env::var("GITFORGE_DATABASE_URL") {
+    let database_url = std::env::var("GITFORGE_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"));
+    let (scheduler, scheduler_db) = if let Ok(database_url) = database_url {
         let pool = gitforge_db::Pool::new(&database_url).await?;
         pool.migrate().await?;
         tracing::info!(database_url = %database_url, "using durable GitForge scheduler database");
         (Scheduler::with_db(pool.clone()), Some(pool))
     } else {
-        tracing::warn!("GITFORGE_DATABASE_URL is unset; scheduler state is in-memory only");
+        tracing::warn!("GITFORGE_DATABASE_URL and DATABASE_URL are unset; scheduler state is in-memory only");
         (Scheduler::new(), None)
     };
 
@@ -176,7 +178,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Start runner-loss detection loop: check for stale runners and re-enqueue their jobs
     let runner_loss_scheduler = scheduler_arc.clone();
-    let runner_loss_registry = pipeline_registry.clone();
     let runner_loss_shutdown = shutdown.clone();
     let _runner_loss_handle = tokio::spawn(async move {
         // Runner is considered stale if no heartbeat for 90 seconds (3x the 30s interval)
@@ -200,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
                     // Get list of offline runners and re-enqueue their jobs
                     // We need to check which runners are now offline and requeue
                     let assigned_jobs = runner_loss_scheduler.get_assigned_jobs().await;
-                    for (job_id, runner_id, pipeline_run_id) in assigned_jobs {
+                    for (_job_id, runner_id, _pipeline_run_id) in assigned_jobs {
                         // Check if the runner for this job assignment is now offline
                         // by looking at the runner's current status
                         let runner_offline = {
@@ -231,8 +232,6 @@ async fn main() -> anyhow::Result<()> {
     let _timeout_handle = tokio::spawn(async move {
         // Check for stale running jobs every 60 seconds
         let check_interval = Duration::from_secs(60);
-        let job_timeout_secs: i64 = 3600; // 1 hour default max
-
         let mut ticker = tokio::time::interval(check_interval);
         loop {
             tokio::select! {
@@ -242,8 +241,6 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     let registry = timeout_registry.read().await;
-                    let now = chrono::Utc::now();
-
                     for (run_id, engine) in registry.iter() {
                         let state = engine.state().await;
                         for (job_id, job_state) in state.jobs.iter() {
@@ -430,6 +427,7 @@ pub async fn graceful_shutdown_delay() {
 }
 
 /// Run the event consumer loop
+#[allow(clippy::too_many_arguments)]
 async fn run_event_consumer(
     event_bus: Arc<dyn EventBus>,
     scheduler: Arc<Scheduler>,
