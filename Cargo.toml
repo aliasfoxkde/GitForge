@@ -36,7 +36,7 @@ tokio-util = { version = "0.7", features = ["codec", "io"] }
 # Web framework
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -64,7 +64,7 @@ async-trait = "0.1"
 # Utilities
 futures = "0.3"
 bytes = "1.6"
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.11"
 hex = "0.4"
 
@@ -72,7 +72,7 @@ hex = "0.4"
 reqwest = { version = "0.13", features = ["json"] }
 
 # Docker client
-bollard = "0.16"
+bollard = "0.21"
 
 # JWT
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
