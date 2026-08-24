@@ -30,8 +30,16 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("failed to initialize process supervision: {}", e);
     }
 
-    // Load runner configuration
-    let config = RunnerConfig::default();
+    // Load runner configuration from environment variables or defaults.
+    // Environment variables (all optional):
+    //   GITFORGE_SCHEDULER_URL      - Scheduler URL (default: http://localhost:42781)
+    //   GITFORGE_RUNNER_NAME        - Runner name (default: runner)
+    //   GITFORGE_RUNNER_TYPE        - Runner type (default: docker)
+    //   GITFORGE_CAPACITY           - Concurrent job capacity (default: 2, range: 1-100)
+    //   GITFORGE_HEARTBEAT_INTERVAL - Heartbeat interval seconds (default: 30, range: 1-3600)
+    //   GITFORGE_FETCH_INTERVAL     - Job fetch interval seconds (default: 5, range: 1-3600)
+    let config = RunnerConfig::from_env()
+        .map_err(|error| anyhow::anyhow!("failed to load runner configuration: {error}"))?;
 
     // Create runner agent
     let mut agent = RunnerAgent::new(config).await?;
