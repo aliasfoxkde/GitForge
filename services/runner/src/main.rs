@@ -38,7 +38,8 @@ async fn main() -> anyhow::Result<()> {
     //   GITFORGE_CAPACITY           - Concurrent job capacity (default: 2, range: 1-100)
     //   GITFORGE_HEARTBEAT_INTERVAL - Heartbeat interval seconds (default: 30, range: 1-3600)
     //   GITFORGE_FETCH_INTERVAL     - Job fetch interval seconds (default: 5, range: 1-3600)
-    let config = RunnerConfig::from_env().expect("Failed to load runner configuration");
+    let config = RunnerConfig::from_env()
+        .map_err(|error| anyhow::anyhow!("failed to load runner configuration: {error}"))?;
 
     // Create runner agent
     let mut agent = RunnerAgent::new(config).await?;
