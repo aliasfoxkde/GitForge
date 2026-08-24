@@ -28,6 +28,11 @@ env:
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 jobs:
   ai-review:
     name: AI Code Review
@@ -48,12 +53,17 @@ jobs:
           BASE_BRANCH=${{ github.base_ref || 'main' }}
           echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
 
+          # actions/checkout leaves the PR in a detached worktree and may not
+          # create a local base branch. Fetch the exact remote base explicitly.
+          git fetch --no-tags origin "$BASE_BRANCH" --depth=1
+          BASE_REF="origin/$BASE_BRANCH"
+
           # Generate diff
-          git diff $BASE_BRANCH...HEAD > pr.diff
+          git diff "$BASE_REF"...HEAD > pr.diff
           echo "diff_file=pr.diff" >> $GITHUB_OUTPUT
 
           # Count files changed
-          FILES_CHANGED=$(git diff --name-only $BASE_BRANCH...HEAD | wc -l)
+          FILES_CHANGED=$(git diff --name-only "$BASE_REF"...HEAD | wc -l)
           echo "files_changed=$FILES_CHANGED" >> $GITHUB_OUTPUT
 
       - name: Run AI Review
@@ -64,7 +74,7 @@ jobs:
           set +e
 
           # Build the CLI first
-          cargo build --package gitforce-cli --release 2>/dev/null
+          cargo build --package gitforge-cli --release 2>/dev/null
 
           REVIEW_CMD="./target/release/gitforge review --diff --provider $PROVIDER --verbose"
 

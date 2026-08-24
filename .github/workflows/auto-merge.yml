@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
   statuses: write
 
@@ -61,7 +61,8 @@ jobs:
 
           # Enable auto-merge
           gh pr merge $PR_NUMBER --squash --delete-branch --auto || {
-            echo "Auto-merge failed (可能是因为分支保护或冲突)"
-            exit 1
+            echo "::warning::Auto-merge could not be enabled; leaving the PR open for manual review."
+            echo "This is non-blocking because repository policy or the token may deny enablePullRequestAutoMerge."
+            exit 0
           }
           echo "Auto-merge enabled successfully!"
