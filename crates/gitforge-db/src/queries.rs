@@ -835,6 +835,108 @@ impl RunnerQueries {
 }
 
 // ============================================================================
+// Durable receipt queries
+// ============================================================================
+
+pub struct JobLogQueries;
+
+impl JobLogQueries {
+    pub async fn upsert(pool: &Pool, log: &crate::models::JobLog) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO job_logs (id, job_id, pipeline_run_id, stdout, stderr, stdout_truncated, stderr_truncated, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id) DO UPDATE SET pipeline_run_id=excluded.pipeline_run_id, stdout=excluded.stdout, stderr=excluded.stderr, stdout_truncated=excluded.stdout_truncated, stderr_truncated=excluded.stderr_truncated",
+        )
+        .bind(log.id.to_string())
+        .bind(log.job_id.to_string())
+        .bind(log.pipeline_run_id.to_string())
+        .bind(&log.stdout)
+        .bind(&log.stderr)
+        .bind(i32::from(log.stdout_truncated))
+        .bind(i32::from(log.stderr_truncated))
+        .bind(log.created_at.to_rfc3339())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to upsert job log: {}", e)))?;
+        Ok(())
+    }
+
+    pub async fn get_by_job(pool: &Pool, job_id: JobId) -> Result<Option<crate::models::JobLog>> {
+        let row = sqlx::query("SELECT * FROM job_logs WHERE job_id = ?")
+            .bind(job_id.to_string())
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get job log: {}", e)))?;
+        Ok(row.map(|row| crate::models::JobLog {
+            id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
+            job_id: JobId::from(Uuid::parse_str(&row.get::<String, _>("job_id")).unwrap()),
+            pipeline_run_id: PipelineRunId::from(
+                Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap(),
+            ),
+            stdout: row.get("stdout"),
+            stderr: row.get("stderr"),
+            stdout_truncated: row.get::<i32, _>("stdout_truncated") != 0,
+            stderr_truncated: row.get::<i32, _>("stderr_truncated") != 0,
+            created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
+                .unwrap()
+                .with_timezone(&Utc),
+        }))
+    }
+}
+
+pub struct EventReceiptQueries;
+
+impl EventReceiptQueries {
+    pub async fn upsert(pool: &Pool, event: &crate::models::EventReceipt) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO event_receipts (id, event_type, job_id, pipeline_run_id, correlation_id, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(correlation_id) DO NOTHING",
+        )
+        .bind(event.id.to_string())
+        .bind(&event.event_type)
+        .bind(event.job_id.map(|id| id.to_string()))
+        .bind(event.pipeline_run_id.map(|id| id.to_string()))
+        .bind(&event.correlation_id)
+        .bind(event.payload.to_string())
+        .bind(event.created_at.to_rfc3339())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to upsert event receipt: {}", e)))?;
+        Ok(())
+    }
+
+    pub async fn list_by_run(
+        pool: &Pool,
+        run_id: PipelineRunId,
+    ) -> Result<Vec<crate::models::EventReceipt>> {
+        let rows = sqlx::query(
+            "SELECT * FROM event_receipts WHERE pipeline_run_id = ? ORDER BY created_at ASC",
+        )
+        .bind(run_id.to_string())
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list event receipts: {}", e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::models::EventReceipt {
+                id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
+                event_type: row.get("event_type"),
+                job_id: row
+                    .get::<Option<String>, _>("job_id")
+                    .and_then(|v| Uuid::parse_str(&v).ok())
+                    .map(JobId::from),
+                pipeline_run_id: row
+                    .get::<Option<String>, _>("pipeline_run_id")
+                    .and_then(|v| Uuid::parse_str(&v).ok())
+                    .map(PipelineRunId::from),
+                correlation_id: row.get("correlation_id"),
+                payload: serde_json::from_str(&row.get::<String, _>("payload")).unwrap_or_default(),
+                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
+                    .unwrap()
+                    .with_timezone(&Utc),
+            })
+            .collect())
+    }
+}
+
+// ============================================================================
 // Event Queries
 // ============================================================================
 
@@ -1799,5 +1901,37 @@ mod tests {
             found.started_at, first_started_at,
             "started_at must not change through completed"
         );
+    }
+
+    #[tokio::test]
+    async fn test_durable_job_log_and_event_receipt_are_idempotent_and_queryable() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (job, run_id) = create_test_job(&pool).await;
+
+        let log =
+            crate::models::JobLog::new(job.id, run_id, "build output".to_string(), "".to_string());
+        JobLogQueries::upsert(&pool, &log).await.unwrap();
+        let found = JobLogQueries::get_by_job(&pool, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.stdout, "build output");
+        assert!(!found.stdout_truncated);
+
+        let event = crate::models::EventReceipt::new(
+            "job.finished",
+            Some(job.id),
+            Some(run_id),
+            format!("job.finished:{}", job.id),
+            serde_json::json!({"status": "completed"}),
+        );
+        EventReceiptQueries::upsert(&pool, &event).await.unwrap();
+        EventReceiptQueries::upsert(&pool, &event).await.unwrap();
+        let events = EventReceiptQueries::list_by_run(&pool, run_id)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "job.finished");
     }
 }

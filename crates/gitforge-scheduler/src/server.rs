@@ -197,13 +197,23 @@ async fn complete_job(
     };
 
     let success = request["success"].as_bool().unwrap_or(false);
-    let exit_code = request["exit_code"].as_i64().unwrap_or(-1);
-    let error = request["error"].as_str();
+    let exit_code = request["exit_code"].as_i64().map(|value| value as i32);
+    let error = request["error"].as_str().map(str::to_owned);
+    let step_results = request["step_results"].as_array();
 
-    state.scheduler.complete_job(job_id, success).await;
+    state
+        .scheduler
+        .complete_job_with_receipt(
+            job_id,
+            success,
+            exit_code,
+            error.clone(),
+            step_results.map(Vec::as_slice),
+        )
+        .await;
 
     tracing::info!(
-        "job {} completed via HTTP: success={}, exit_code={}",
+        "job {} completed via HTTP: success={}, exit_code={:?}",
         job_id,
         success,
         exit_code
@@ -219,7 +229,7 @@ async fn complete_job(
     }
 
     // Log error if present
-    if let Some(err) = error {
+    if let Some(err) = error.as_deref() {
         if !err.is_empty() {
             tracing::error!("job {} error: {}", job_id, err);
         }
