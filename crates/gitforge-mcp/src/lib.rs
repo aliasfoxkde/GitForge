@@ -6,6 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
+mod dispatcher;
+
+pub use dispatcher::{dispatch, run_stdio, DispatchError};
+
 /// JSON-RPC 2.0 request envelope.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct JsonRpcRequest {

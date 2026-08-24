@@ -9,3 +9,4 @@ description = "Transport-agnostic MCP protocol types for GitForge"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
