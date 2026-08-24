@@ -20,5 +20,5 @@ pub mod server;
 
 pub use auth::{ApiAuth, Claims};
 pub use metrics::Metrics;
-pub use rate_limit::{RateLimiter, RateLimitConfig};
+pub use rate_limit::{RateLimitConfig, RateLimiter};
 pub use server::ApiServer;

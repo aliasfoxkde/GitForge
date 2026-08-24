@@ -375,7 +375,7 @@ mod tests {
         let mut sorted = ids;
         sorted.sort();
         for i in 1..sorted.len() {
-            assert_ne!(sorted[i], sorted[i-1], "IDs should be unique");
+            assert_ne!(sorted[i], sorted[i - 1], "IDs should be unique");
         }
     }
 
@@ -573,7 +573,7 @@ mod tests {
         let mut set: HashSet<RepoId> = HashSet::new();
         set.insert(RepoId::new());
         set.insert(RepoId::new());
-        assert!(set.len() >= 1);
+        assert!(!set.is_empty());
     }
 
     #[test]

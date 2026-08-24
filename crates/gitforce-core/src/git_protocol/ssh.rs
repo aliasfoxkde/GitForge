@@ -32,11 +32,7 @@ impl<S: StorageBackend> SshGitHandler<S> {
 
 #[async_trait]
 impl<S: StorageBackend> GitProtocolHandler for SshGitHandler<S> {
-    async fn upload_pack(
-        &self,
-        repo_id: RepoId,
-        input: Vec<u8>,
-    ) -> Result<Vec<u8>> {
+    async fn upload_pack(&self, repo_id: RepoId, input: Vec<u8>) -> Result<Vec<u8>> {
         tracing::debug!(
             "ssh upload_pack for repo {} ({} bytes input)",
             repo_id,
@@ -83,11 +79,7 @@ impl<S: StorageBackend> GitProtocolHandler for SshGitHandler<S> {
         Ok(response)
     }
 
-    async fn receive_pack(
-        &self,
-        repo_id: RepoId,
-        input: Vec<u8>,
-    ) -> Result<Vec<u8>> {
+    async fn receive_pack(&self, repo_id: RepoId, input: Vec<u8>) -> Result<Vec<u8>> {
         tracing::debug!(
             "ssh receive_pack for repo {} ({} bytes input)",
             repo_id,
@@ -174,19 +166,18 @@ impl<S: StorageBackend> GitProtocolHandler for SshGitHandler<S> {
 /// Write pack data to repository's object database
 fn write_pack_to_odb(repo: &git2::Repository, pack_data: &[u8]) -> gitforce_common::Result<()> {
     // Write pack data to repository's odb
-    let odb = repo.odb().map_err(|e| {
-        gitforce_common::Error::git(format!("Failed to get odb: {}", e))
-    })?;
+    let odb = repo
+        .odb()
+        .map_err(|e| gitforce_common::Error::git(format!("Failed to get odb: {}", e)))?;
 
     // Create a packwriter to write the pack
-    let mut packwriter = odb.packwriter().map_err(|e| {
-        gitforce_common::Error::git(format!("Failed to create packwriter: {}", e))
-    })?;
+    let mut packwriter = odb
+        .packwriter()
+        .map_err(|e| gitforce_common::Error::git(format!("Failed to create packwriter: {}", e)))?;
 
     // Write the pack data
-    std::io::Write::write_all(&mut packwriter, pack_data).map_err(|e| {
-        gitforce_common::Error::git(format!("Failed to write pack: {}", e))
-    })?;
+    std::io::Write::write_all(&mut packwriter, pack_data)
+        .map_err(|e| gitforce_common::Error::git(format!("Failed to write pack: {}", e)))?;
 
     // The pack is finalized when packwriter is dropped
     drop(packwriter);

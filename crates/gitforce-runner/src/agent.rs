@@ -2,7 +2,7 @@
 
 use gitforce_common::{Error, Result, RunnerId};
 use gitforce_db::models::Runner;
-use gitforce_sandbox::{DockerSandbox};
+use gitforce_sandbox::DockerSandbox;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -127,7 +127,8 @@ impl RunnerAgent {
     pub async fn run(&self) -> Result<()> {
         *self.is_running.write().await = true;
 
-        let runner = self.runner
+        let runner = self
+            .runner
             .as_ref()
             .ok_or_else(|| Error::internal("runner not registered"))?;
 
@@ -149,7 +150,10 @@ impl RunnerAgent {
                     break;
                 }
                 tracing::debug!("runner {} sending heartbeat", heartbeat_runner_id);
-                let url = format!("{}/runners/{}/heartbeat", heartbeat_url, heartbeat_runner_id);
+                let url = format!(
+                    "{}/runners/{}/heartbeat",
+                    heartbeat_url, heartbeat_runner_id
+                );
                 if let Err(e) = heartbeat_client.post(&url).send().await {
                     tracing::trace!("heartbeat failed: {}", e);
                 }
@@ -179,7 +183,8 @@ impl RunnerAgent {
                                 for job in jobs {
                                     tracing::info!(
                                         "received job assignment: {} ({})",
-                                        job.name, job.job_id
+                                        job.name,
+                                        job.job_id
                                     );
                                     // Job execution would happen here
                                 }
@@ -204,7 +209,11 @@ impl RunnerAgent {
     /// Stop the runner agent
     pub async fn stop(&self) {
         *self.is_running.write().await = false;
-        let runner_id = self.runner.as_ref().map(|r| r.id.to_string()).unwrap_or_default();
+        let runner_id = self
+            .runner
+            .as_ref()
+            .map(|r| r.id.to_string())
+            .unwrap_or_default();
         tracing::info!("runner {} stopped", runner_id);
     }
 
@@ -237,8 +246,10 @@ mod tests {
     #[tokio::test]
     async fn test_runner_register_no_scheduler() {
         // Test that register doesn't panic when scheduler is unavailable
-        let mut config = RunnerConfig::default();
-        config.scheduler_url = "http://localhost:99999".to_string(); // Invalid URL
+        let config = RunnerConfig {
+            scheduler_url: "http://localhost:99999".to_string(),
+            ..Default::default()
+        };
         let mut agent = RunnerAgent::new(config).await.unwrap();
         let result = agent.register().await;
         assert!(result.is_ok());
@@ -397,8 +408,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_register_sets_runner() {
-        let mut config = RunnerConfig::default();
-        config.scheduler_url = "http://localhost:99999".to_string();
+        let config = RunnerConfig {
+            scheduler_url: "http://localhost:99999".to_string(),
+            ..Default::default()
+        };
         let mut agent = RunnerAgent::new(config).await.unwrap();
 
         let result = agent.register().await;
@@ -501,8 +514,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_stop_after_registration() {
-        let mut config = RunnerConfig::default();
-        config.scheduler_url = "http://localhost:99999".to_string();
+        let config = RunnerConfig {
+            scheduler_url: "http://localhost:99999".to_string(),
+            ..Default::default()
+        };
         let mut agent = RunnerAgent::new(config).await.unwrap();
         agent.register().await.unwrap();
         // Stop after registration should not panic
@@ -659,8 +674,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_run_and_stop() {
-        let mut config = RunnerConfig::default();
-        config.scheduler_url = "http://localhost:99999".to_string();
+        let config = RunnerConfig {
+            scheduler_url: "http://localhost:99999".to_string(),
+            ..Default::default()
+        };
 
         // Create and register agent
         let mut agent = RunnerAgent::new(config.clone()).await.unwrap();
@@ -670,9 +687,7 @@ mod tests {
         let agent_clone = agent.clone();
 
         // Start run in background
-        let run_handle = tokio::spawn(async move {
-            agent_clone.run().await
-        });
+        let run_handle = tokio::spawn(async move { agent_clone.run().await });
 
         // Wait for start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

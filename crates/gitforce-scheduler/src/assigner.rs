@@ -32,10 +32,7 @@ pub enum SchedulerCommand {
 #[derive(Debug, Clone)]
 pub enum SchedulerEvent {
     /// Job assigned to runner
-    JobAssigned {
-        job_id: JobId,
-        runner_id: RunnerId,
-    },
+    JobAssigned { job_id: JobId, runner_id: RunnerId },
     /// No runner available for job
     NoRunnerAvailable { job_id: JobId },
 }
@@ -116,12 +113,7 @@ impl Scheduler {
     }
 
     /// Enqueue a job
-    pub async fn enqueue(
-        &self,
-        job_id: JobId,
-        pipeline_run_id: PipelineRunId,
-        repo_id: RepoId,
-    ) {
+    pub async fn enqueue(&self, job_id: JobId, pipeline_run_id: PipelineRunId, repo_id: RepoId) {
         let job = QueuedJob::new(job_id, pipeline_run_id, repo_id);
         let mut state = self.state.write().await;
         state.queue.enqueue(job);
@@ -289,7 +281,9 @@ mod tests {
         let run_id = PipelineRunId::new();
         let job_id = JobId::new();
 
-        scheduler.enqueue_with_priority(job_id, run_id, repo_id, Priority::High).await;
+        scheduler
+            .enqueue_with_priority(job_id, run_id, repo_id, Priority::High)
+            .await;
         assert_eq!(scheduler.queue_len().await, 1);
     }
 
@@ -366,7 +360,9 @@ mod tests {
 
     #[test]
     fn test_scheduler_event_debug() {
-        let evt = SchedulerEvent::NoRunnerAvailable { job_id: JobId::new() };
+        let evt = SchedulerEvent::NoRunnerAvailable {
+            job_id: JobId::new(),
+        };
         assert!(format!("{:?}", evt).contains("NoRunnerAvailable"));
     }
 
@@ -434,7 +430,7 @@ mod tests {
         scheduler.register_runner(runner2.clone()).await;
 
         // Add multiple jobs
-        for i in 0..5 {
+        for _i in 0..5 {
             let job_id = JobId::new();
             let run_id = PipelineRunId::new();
             let repo_id = RepoId::new();
@@ -542,7 +538,9 @@ mod tests {
         let repo_id = RepoId::new();
         let run_id = PipelineRunId::new();
 
-        scheduler.enqueue_with_priority(JobId::new(), run_id, repo_id, Priority::High).await;
+        scheduler
+            .enqueue_with_priority(JobId::new(), run_id, repo_id, Priority::High)
+            .await;
         assert_eq!(scheduler.queue_len().await, 1);
     }
 
@@ -567,7 +565,7 @@ mod tests {
         let scheduler = Scheduler::new();
 
         // Subscribe to scheduler events
-        let mut rx = scheduler.subscribe();
+        let _rx = scheduler.subscribe();
 
         let job_id = JobId::new();
         let run_id = PipelineRunId::new();
@@ -591,7 +589,7 @@ mod tests {
         scheduler.register_runner(runner.clone()).await;
 
         // Subscribe before enqueueing
-        let mut rx = scheduler.subscribe();
+        let _rx = scheduler.subscribe();
 
         let job_id = JobId::new();
         let run_id = PipelineRunId::new();

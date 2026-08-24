@@ -125,7 +125,10 @@ mod tests {
     #[test]
     fn test_is_older_than_edge_cases() {
         let now = Utc::now();
-        assert!(is_older_than(now - chrono::Duration::seconds(1), chrono::Duration::seconds(0)));
+        assert!(is_older_than(
+            now - chrono::Duration::seconds(1),
+            chrono::Duration::seconds(0)
+        ));
         assert!(!is_older_than(now, chrono::Duration::days(1)));
     }
 }

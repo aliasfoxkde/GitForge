@@ -2,11 +2,11 @@
 //!
 //! This module provides real SQLite query implementations for all database operations.
 
-use gitforce_common::{Error, RepoId, Result, RunnerId, UserId, PipelineId, PipelineRunId, JobId};
+use crate::Pool;
+use chrono::{DateTime, Utc};
+use gitforce_common::{Error, JobId, PipelineId, PipelineRunId, RepoId, Result, RunnerId, UserId};
 use sqlx::Row;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
-use crate::Pool;
 
 // ============================================================================
 // Repository Queries
@@ -63,7 +63,10 @@ impl RepoQueries {
     }
 
     /// List repositories by owner
-    pub async fn list_by_owner(pool: &Pool, owner_id: UserId) -> Result<Vec<crate::models::Repository>> {
+    pub async fn list_by_owner(
+        pool: &Pool,
+        owner_id: UserId,
+    ) -> Result<Vec<crate::models::Repository>> {
         let rows = sqlx::query("SELECT * FROM repositories WHERE owner_id = ?")
             .bind(owner_id.to_string())
             .fetch_all(pool.pool())
@@ -177,7 +180,10 @@ impl UserQueries {
     }
 
     /// Get a user by username
-    pub async fn get_by_username(pool: &Pool, username: &str) -> Result<Option<crate::models::User>> {
+    pub async fn get_by_username(
+        pool: &Pool,
+        username: &str,
+    ) -> Result<Option<crate::models::User>> {
         let row = sqlx::query("SELECT * FROM users WHERE username = ?")
             .bind(username)
             .fetch_optional(pool.pool())
@@ -263,8 +269,7 @@ impl PipelineQueries {
                 repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
                 name: row.get("name"),
                 trigger_type: row.get("trigger_type"),
-                config: serde_json::from_str(&row.get::<String, _>("config"))
-                    .unwrap_or_default(),
+                config: serde_json::from_str(&row.get::<String, _>("config")).unwrap_or_default(),
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
                     .unwrap()
                     .with_timezone(&Utc),
@@ -274,12 +279,16 @@ impl PipelineQueries {
     }
 
     /// List pipelines by repository
-    pub async fn list_by_repo(pool: &Pool, repo_id: RepoId) -> Result<Vec<crate::models::Pipeline>> {
-        let rows = sqlx::query("SELECT * FROM pipelines WHERE repo_id = ? ORDER BY created_at DESC")
-            .bind(repo_id.to_string())
-            .fetch_all(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to list pipelines: {}", e)))?;
+    pub async fn list_by_repo(
+        pool: &Pool,
+        repo_id: RepoId,
+    ) -> Result<Vec<crate::models::Pipeline>> {
+        let rows =
+            sqlx::query("SELECT * FROM pipelines WHERE repo_id = ? ORDER BY created_at DESC")
+                .bind(repo_id.to_string())
+                .fetch_all(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to list pipelines: {}", e)))?;
 
         let pipelines = rows
             .into_iter()
@@ -288,8 +297,7 @@ impl PipelineQueries {
                 repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
                 name: row.get("name"),
                 trigger_type: row.get("trigger_type"),
-                config: serde_json::from_str(&row.get::<String, _>("config"))
-                    .unwrap_or_default(),
+                config: serde_json::from_str(&row.get::<String, _>("config")).unwrap_or_default(),
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
                     .unwrap()
                     .with_timezone(&Utc),
@@ -313,8 +321,7 @@ impl PipelineQueries {
                 repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
                 name: row.get("name"),
                 trigger_type: row.get("trigger_type"),
-                config: serde_json::from_str(&row.get::<String, _>("config"))
-                    .unwrap_or_default(),
+                config: serde_json::from_str(&row.get::<String, _>("config")).unwrap_or_default(),
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
                     .unwrap()
                     .with_timezone(&Utc),
@@ -366,15 +373,19 @@ impl PipelineRunQueries {
         match row {
             Some(row) => Ok(Some(crate::models::PipelineRun {
                 id: PipelineRunId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_id: PipelineId::from(Uuid::parse_str(&row.get::<String, _>("pipeline_id")).unwrap()),
+                pipeline_id: PipelineId::from(
+                    Uuid::parse_str(&row.get::<String, _>("pipeline_id")).unwrap(),
+                ),
                 repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
                 status: row.get("status"),
                 triggered_by: row.get("triggered_by"),
                 commit_hash: row.get("commit_hash"),
-                started_at: row.get::<Option<String>, _>("started_at")
+                started_at: row
+                    .get::<Option<String>, _>("started_at")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row.get::<Option<String>, _>("finished_at")
+                finished_at: row
+                    .get::<Option<String>, _>("finished_at")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
@@ -397,26 +408,35 @@ impl PipelineRunQueries {
     }
 
     /// List pipeline runs by pipeline
-    pub async fn list_by_pipeline(pool: &Pool, pipeline_id: PipelineId) -> Result<Vec<crate::models::PipelineRun>> {
-        let rows = sqlx::query("SELECT * FROM pipeline_runs WHERE pipeline_id = ? ORDER BY created_at DESC")
-            .bind(pipeline_id.to_string())
-            .fetch_all(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to list pipeline runs: {}", e)))?;
+    pub async fn list_by_pipeline(
+        pool: &Pool,
+        pipeline_id: PipelineId,
+    ) -> Result<Vec<crate::models::PipelineRun>> {
+        let rows = sqlx::query(
+            "SELECT * FROM pipeline_runs WHERE pipeline_id = ? ORDER BY created_at DESC",
+        )
+        .bind(pipeline_id.to_string())
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list pipeline runs: {}", e)))?;
 
         let runs = rows
             .into_iter()
             .map(|row| crate::models::PipelineRun {
                 id: PipelineRunId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_id: PipelineId::from(Uuid::parse_str(&row.get::<String, _>("pipeline_id")).unwrap()),
+                pipeline_id: PipelineId::from(
+                    Uuid::parse_str(&row.get::<String, _>("pipeline_id")).unwrap(),
+                ),
                 repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
                 status: row.get("status"),
                 triggered_by: row.get("triggered_by"),
                 commit_hash: row.get("commit_hash"),
-                started_at: row.get::<Option<String>, _>("started_at")
+                started_at: row
+                    .get::<Option<String>, _>("started_at")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row.get::<Option<String>, _>("finished_at")
+                finished_at: row
+                    .get::<Option<String>, _>("finished_at")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
@@ -439,15 +459,19 @@ impl PipelineRunQueries {
             .into_iter()
             .map(|row| crate::models::PipelineRun {
                 id: PipelineRunId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_id: PipelineId::from(Uuid::parse_str(&row.get::<String, _>("pipeline_id")).unwrap()),
+                pipeline_id: PipelineId::from(
+                    Uuid::parse_str(&row.get::<String, _>("pipeline_id")).unwrap(),
+                ),
                 repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
                 status: row.get("status"),
                 triggered_by: row.get("triggered_by"),
                 commit_hash: row.get("commit_hash"),
-                started_at: row.get::<Option<String>, _>("started_at")
+                started_at: row
+                    .get::<Option<String>, _>("started_at")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row.get::<Option<String>, _>("finished_at")
+                finished_at: row
+                    .get::<Option<String>, _>("finished_at")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
@@ -501,15 +525,20 @@ impl JobQueries {
         match row {
             Some(row) => Ok(Some(crate::models::Job {
                 id: JobId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_run_id: PipelineRunId::from(Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap()),
+                pipeline_run_id: PipelineRunId::from(
+                    Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap(),
+                ),
                 name: row.get("name"),
                 status: row.get("status"),
-                runner_id: row.get::<Option<String>, _>("runner_id")
+                runner_id: row
+                    .get::<Option<String>, _>("runner_id")
                     .and_then(|s| Uuid::parse_str(&s).ok().map(RunnerId::from)),
-                started_at: row.get::<Option<String>, _>("started_at")
+                started_at: row
+                    .get::<Option<String>, _>("started_at")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row.get::<Option<String>, _>("finished_at")
+                finished_at: row
+                    .get::<Option<String>, _>("finished_at")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
                 retry_count: row.get("retry_count"),
@@ -544,26 +573,35 @@ impl JobQueries {
     }
 
     /// List jobs by pipeline run
-    pub async fn list_by_run(pool: &Pool, run_id: PipelineRunId) -> Result<Vec<crate::models::Job>> {
-        let rows = sqlx::query("SELECT * FROM jobs WHERE pipeline_run_id = ? ORDER BY created_at ASC")
-            .bind(run_id.to_string())
-            .fetch_all(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to list jobs: {}", e)))?;
+    pub async fn list_by_run(
+        pool: &Pool,
+        run_id: PipelineRunId,
+    ) -> Result<Vec<crate::models::Job>> {
+        let rows =
+            sqlx::query("SELECT * FROM jobs WHERE pipeline_run_id = ? ORDER BY created_at ASC")
+                .bind(run_id.to_string())
+                .fetch_all(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to list jobs: {}", e)))?;
 
         let jobs = rows
             .into_iter()
             .map(|row| crate::models::Job {
                 id: JobId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_run_id: PipelineRunId::from(Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap()),
+                pipeline_run_id: PipelineRunId::from(
+                    Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap(),
+                ),
                 name: row.get("name"),
                 status: row.get("status"),
-                runner_id: row.get::<Option<String>, _>("runner_id")
+                runner_id: row
+                    .get::<Option<String>, _>("runner_id")
                     .and_then(|s| Uuid::parse_str(&s).ok().map(RunnerId::from)),
-                started_at: row.get::<Option<String>, _>("started_at")
+                started_at: row
+                    .get::<Option<String>, _>("started_at")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row.get::<Option<String>, _>("finished_at")
+                finished_at: row
+                    .get::<Option<String>, _>("finished_at")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
                 retry_count: row.get("retry_count"),
@@ -578,24 +616,30 @@ impl JobQueries {
 
     /// List all pending jobs
     pub async fn list_pending(pool: &Pool) -> Result<Vec<crate::models::Job>> {
-        let rows = sqlx::query("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC")
-            .fetch_all(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to list pending jobs: {}", e)))?;
+        let rows =
+            sqlx::query("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC")
+                .fetch_all(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to list pending jobs: {}", e)))?;
 
         let jobs = rows
             .into_iter()
             .map(|row| crate::models::Job {
                 id: JobId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_run_id: PipelineRunId::from(Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap()),
+                pipeline_run_id: PipelineRunId::from(
+                    Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap(),
+                ),
                 name: row.get("name"),
                 status: row.get("status"),
-                runner_id: row.get::<Option<String>, _>("runner_id")
+                runner_id: row
+                    .get::<Option<String>, _>("runner_id")
                     .and_then(|s| Uuid::parse_str(&s).ok().map(RunnerId::from)),
-                started_at: row.get::<Option<String>, _>("started_at")
+                started_at: row
+                    .get::<Option<String>, _>("started_at")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row.get::<Option<String>, _>("finished_at")
+                finished_at: row
+                    .get::<Option<String>, _>("finished_at")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
                 retry_count: row.get("retry_count"),
@@ -654,7 +698,8 @@ impl RunnerQueries {
                 runner_type: row.get("runner_type"),
                 status: row.get("status"),
                 capacity: row.get("capacity"),
-                last_heartbeat: row.get::<Option<String>, _>("last_heartbeat")
+                last_heartbeat: row
+                    .get::<Option<String>, _>("last_heartbeat")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
@@ -702,7 +747,8 @@ impl RunnerQueries {
                 runner_type: row.get("runner_type"),
                 status: row.get("status"),
                 capacity: row.get("capacity"),
-                last_heartbeat: row.get::<Option<String>, _>("last_heartbeat")
+                last_heartbeat: row
+                    .get::<Option<String>, _>("last_heartbeat")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
@@ -716,10 +762,11 @@ impl RunnerQueries {
 
     /// List online runners
     pub async fn list_online(pool: &Pool) -> Result<Vec<crate::models::Runner>> {
-        let rows = sqlx::query("SELECT * FROM runners WHERE status = 'online' ORDER BY created_at DESC")
-            .fetch_all(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to list online runners: {}", e)))?;
+        let rows =
+            sqlx::query("SELECT * FROM runners WHERE status = 'online' ORDER BY created_at DESC")
+                .fetch_all(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to list online runners: {}", e)))?;
 
         let runners = rows
             .into_iter()
@@ -729,7 +776,8 @@ impl RunnerQueries {
                 runner_type: row.get("runner_type"),
                 status: row.get("status"),
                 capacity: row.get("capacity"),
-                last_heartbeat: row.get::<Option<String>, _>("last_heartbeat")
+                last_heartbeat: row
+                    .get::<Option<String>, _>("last_heartbeat")
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
@@ -768,9 +816,13 @@ impl EventQueries {
     }
 
     /// List events by type
-    pub async fn list_by_type(pool: &Pool, event_type: &str, limit: i64) -> Result<Vec<crate::models::Event>> {
+    pub async fn list_by_type(
+        pool: &Pool,
+        event_type: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::models::Event>> {
         let rows = sqlx::query(
-            "SELECT * FROM events WHERE event_type = ? ORDER BY created_at DESC LIMIT ?"
+            "SELECT * FROM events WHERE event_type = ? ORDER BY created_at DESC LIMIT ?",
         )
         .bind(event_type)
         .bind(limit)
@@ -783,8 +835,7 @@ impl EventQueries {
             .map(|row| crate::models::Event {
                 id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
                 event_type: row.get("event_type"),
-                payload: serde_json::from_str(&row.get::<String, _>("payload"))
-                    .unwrap_or_default(),
+                payload: serde_json::from_str(&row.get::<String, _>("payload")).unwrap_or_default(),
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
                     .unwrap()
                     .with_timezone(&Utc),
@@ -796,21 +847,18 @@ impl EventQueries {
 
     /// List recent events
     pub async fn list_recent(pool: &Pool, limit: i64) -> Result<Vec<crate::models::Event>> {
-        let rows = sqlx::query(
-            "SELECT * FROM events ORDER BY created_at DESC LIMIT ?"
-        )
-        .bind(limit)
-        .fetch_all(pool.pool())
-        .await
-        .map_err(|e| Error::database(format!("failed to list events: {}", e)))?;
+        let rows = sqlx::query("SELECT * FROM events ORDER BY created_at DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to list events: {}", e)))?;
 
         let events = rows
             .into_iter()
             .map(|row| crate::models::Event {
                 id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
                 event_type: row.get("event_type"),
-                payload: serde_json::from_str(&row.get::<String, _>("payload"))
-                    .unwrap_or_default(),
+                payload: serde_json::from_str(&row.get::<String, _>("payload")).unwrap_or_default(),
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
                     .unwrap()
                     .with_timezone(&Utc),
@@ -890,12 +938,16 @@ mod tests {
         assert_eq!(found.unwrap().username, "testuser");
 
         // Get by username
-        let found = UserQueries::get_by_username(&pool, "testuser").await.unwrap();
+        let found = UserQueries::get_by_username(&pool, "testuser")
+            .await
+            .unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().email, "test@example.com");
 
         // Not found
-        let found = UserQueries::get_by_username(&pool, "nonexistent").await.unwrap();
+        let found = UserQueries::get_by_username(&pool, "nonexistent")
+            .await
+            .unwrap();
         assert!(found.is_none());
 
         // List all
@@ -930,7 +982,9 @@ mod tests {
         RunnerQueries::heartbeat(&pool, runner.id).await.unwrap();
 
         // Update status
-        RunnerQueries::update_status(&pool, runner.id, "offline").await.unwrap();
+        RunnerQueries::update_status(&pool, runner.id, "offline")
+            .await
+            .unwrap();
         let found = RunnerQueries::get(&pool, runner.id).await.unwrap();
         assert_eq!(found.unwrap().status, "offline");
     }
@@ -1027,12 +1081,16 @@ mod tests {
         assert_eq!(found.unwrap().commit_hash, "abc123");
 
         // Update status
-        PipelineRunQueries::update_status(&pool, run.id, "running").await.unwrap();
+        PipelineRunQueries::update_status(&pool, run.id, "running")
+            .await
+            .unwrap();
         let found = PipelineRunQueries::get(&pool, run.id).await.unwrap();
         assert_eq!(found.unwrap().status, "running");
 
         // List by pipeline
-        let runs = PipelineRunQueries::list_by_pipeline(&pool, pipeline.id).await.unwrap();
+        let runs = PipelineRunQueries::list_by_pipeline(&pool, pipeline.id)
+            .await
+            .unwrap();
         assert_eq!(runs.len(), 1);
 
         // List all
@@ -1078,10 +1136,7 @@ mod tests {
         );
         PipelineRunQueries::create(&pool, &run).await.unwrap();
 
-        let job = crate::models::Job::new(
-            run.id,
-            "build".to_string(),
-        );
+        let job = crate::models::Job::new(run.id, "build".to_string());
 
         // Create
         JobQueries::create(&pool, &job).await.unwrap();
@@ -1092,7 +1147,9 @@ mod tests {
         assert_eq!(found.unwrap().name, "build");
 
         // Update status
-        JobQueries::update_status(&pool, job.id, "running").await.unwrap();
+        JobQueries::update_status(&pool, job.id, "running")
+            .await
+            .unwrap();
         let found = JobQueries::get(&pool, job.id).await.unwrap();
         assert_eq!(found.unwrap().status, "running");
 
@@ -1186,7 +1243,9 @@ mod tests {
         EventQueries::create(&pool, &event).await.unwrap();
 
         // List non-existent type
-        let events = EventQueries::list_by_type(&pool, "nonexistent.type", 10).await.unwrap();
+        let events = EventQueries::list_by_type(&pool, "nonexistent.type", 10)
+            .await
+            .unwrap();
         assert!(events.is_empty());
     }
 
@@ -1215,7 +1274,9 @@ mod tests {
         pool.migrate().await.unwrap();
 
         // List when no events
-        let events = EventQueries::list_by_type(&pool, "push.received", 10).await.unwrap();
+        let events = EventQueries::list_by_type(&pool, "push.received", 10)
+            .await
+            .unwrap();
         assert!(events.is_empty());
 
         let recent = EventQueries::list_recent(&pool, 10).await.unwrap();
@@ -1236,7 +1297,9 @@ mod tests {
         let pool = Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
 
-        let found = PipelineQueries::get(&pool, PipelineId::new()).await.unwrap();
+        let found = PipelineQueries::get(&pool, PipelineId::new())
+            .await
+            .unwrap();
         assert!(found.is_none());
     }
 
@@ -1245,7 +1308,9 @@ mod tests {
         let pool = Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
 
-        let found = PipelineRunQueries::get(&pool, PipelineRunId::new()).await.unwrap();
+        let found = PipelineRunQueries::get(&pool, PipelineRunId::new())
+            .await
+            .unwrap();
         assert!(found.is_none());
     }
 
@@ -1281,7 +1346,9 @@ mod tests {
         EventQueries::create(&pool, &event).await.unwrap();
 
         // List by type
-        let events = EventQueries::list_by_type(&pool, "push.received", 10).await.unwrap();
+        let events = EventQueries::list_by_type(&pool, "push.received", 10)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "push.received");
 

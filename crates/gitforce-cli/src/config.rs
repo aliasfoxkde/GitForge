@@ -66,8 +66,8 @@ impl Config {
 
     /// Get config file path
     fn config_path() -> Result<PathBuf> {
-        let base = dirs::config_dir()
-            .ok_or_else(|| anyhow::anyhow!("could not find config directory"))?;
+        let base =
+            dirs::config_dir().ok_or_else(|| anyhow::anyhow!("could not find config directory"))?;
         Ok(base.join("gitforge").join("config.toml"))
     }
 }
@@ -123,8 +123,10 @@ mod tests {
 
     #[test]
     fn test_config_with_token() {
-        let mut config = Config::default();
-        config.token = Some("test-token".to_string());
+        let config = Config {
+            token: Some("test-token".to_string()),
+            ..Default::default()
+        };
         assert_eq!(config.token.as_ref().unwrap(), "test-token");
     }
 
@@ -193,15 +195,19 @@ mod tests {
 
     #[test]
     fn test_config_organization() {
-        let mut config = Config::default();
-        config.organization = Some("my-org".to_string());
+        let config = Config {
+            organization: Some("my-org".to_string()),
+            ..Default::default()
+        };
         assert_eq!(config.organization.unwrap(), "my-org");
     }
 
     #[test]
     fn test_config_editor() {
-        let mut config = Config::default();
-        config.editor = Some("vim".to_string());
+        let config = Config {
+            editor: Some("vim".to_string()),
+            ..Default::default()
+        };
         assert_eq!(config.editor.unwrap(), "vim");
     }
 }

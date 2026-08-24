@@ -325,12 +325,8 @@ impl<C: HttpClient> SyncClient<C> {
 
     /// Push local state to cloud
     pub async fn push(&self, api_url: &str, token: &str) -> Result<PushResponse> {
-        let state = {
-            self.state.read().await.clone()
-        };
-        let metadata = {
-            self.metadata.read().await.clone()
-        };
+        let state = { self.state.read().await.clone() };
+        let metadata = { self.metadata.read().await.clone() };
 
         // Prepare push payload
         let payload = PushPayload {
@@ -342,7 +338,8 @@ impl<C: HttpClient> SyncClient<C> {
 
         // POST to cloud sync endpoint
         let url = format!("{}/sync/push", api_url);
-        let push_response: PushResponse = self.http_client
+        let push_response: PushResponse = self
+            .http_client
             .post_json(&url, token, &payload)
             .await
             .context("failed to push to cloud")?;
@@ -362,7 +359,8 @@ impl<C: HttpClient> SyncClient<C> {
     pub async fn pull(&self, api_url: &str, token: &str) -> Result<PullResponse> {
         // GET from cloud sync endpoint
         let url = format!("{}/sync/pull", api_url);
-        let pull_response: PullResponse = self.http_client
+        let pull_response: PullResponse = self
+            .http_client
             .get_json(&url, token)
             .await
             .context("failed to pull from cloud")?;
@@ -413,7 +411,13 @@ impl<C: HttpClient> SyncClient<C> {
 
     /// Add pipeline to local state
     #[allow(dead_code)]
-    pub async fn add_pipeline(&self, id: String, repo_id: String, name: String, definition: String) -> Result<()> {
+    pub async fn add_pipeline(
+        &self,
+        id: String,
+        repo_id: String,
+        name: String,
+        definition: String,
+    ) -> Result<()> {
         let mut state = self.state.write().await;
         state.pipelines.insert(
             id.clone(),
@@ -493,7 +497,10 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         client.init().await.unwrap();
-        client.add_repo("test-repo".to_string(), "repo-123".to_string()).await.unwrap();
+        client
+            .add_repo("test-repo".to_string(), "repo-123".to_string())
+            .await
+            .unwrap();
         let state = client.state.read().await;
         assert!(state.repos.contains_key("test-repo"));
     }
@@ -663,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_sync_status_all_variants() {
-        let variants = vec![
+        let variants = [
             SyncStatus::InSync,
             SyncStatus::PendingPush,
             SyncStatus::PendingPull,
@@ -684,12 +691,15 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         client.init().await.unwrap();
-        client.add_pipeline(
-            "pipe-1".to_string(),
-            "repo-1".to_string(),
-            "build".to_string(),
-            "steps: [build]".to_string(),
-        ).await.unwrap();
+        client
+            .add_pipeline(
+                "pipe-1".to_string(),
+                "repo-1".to_string(),
+                "build".to_string(),
+                "steps: [build]".to_string(),
+            )
+            .await
+            .unwrap();
         let state = client.state.read().await;
         assert!(state.pipelines.contains_key("pipe-1"));
     }
@@ -707,8 +717,11 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         client.init().await.unwrap();
-        let before = client.state.read().await.updated_at.clone();
-        client.add_repo("test-repo".to_string(), "repo-123".to_string()).await.unwrap();
+        let _before = client.state.read().await.updated_at.clone();
+        client
+            .add_repo("test-repo".to_string(), "repo-123".to_string())
+            .await
+            .unwrap();
         let after = client.state.read().await.updated_at.clone();
         assert!(!after.is_empty());
     }
@@ -718,12 +731,15 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let client = SyncClient::with_real_client(temp_dir.path().to_path_buf());
         client.init().await.unwrap();
-        client.add_pipeline(
-            "pipe-1".to_string(),
-            "repo-1".to_string(),
-            "build".to_string(),
-            "steps: [build]".to_string(),
-        ).await.unwrap();
+        client
+            .add_pipeline(
+                "pipe-1".to_string(),
+                "repo-1".to_string(),
+                "build".to_string(),
+                "steps: [build]".to_string(),
+            )
+            .await
+            .unwrap();
         let state = client.state.read().await;
         assert!(!state.updated_at.is_empty());
     }
@@ -767,15 +783,20 @@ mod tests {
 
     #[test]
     fn test_local_state_with_data() {
-        let mut state = LocalState::default();
-        state.updated_at = "2024-06-15T12:00:00Z".to_string();
-        state.repos.insert("test".to_string(), RepoState {
-            id: "id-1".to_string(),
-            name: "test".to_string(),
-            local_path: Some(PathBuf::from("/tmp/test")),
-            synced_at: None,
-            local_rev: 1,
-        });
+        let state = LocalState {
+            updated_at: "2024-06-15T12:00:00Z".to_string(),
+            repos: HashMap::from([(
+                "test".to_string(),
+                RepoState {
+                    id: "id-1".to_string(),
+                    name: "test".to_string(),
+                    local_path: Some(PathBuf::from("/tmp/test")),
+                    synced_at: None,
+                    local_rev: 1,
+                },
+            )]),
+            ..Default::default()
+        };
         assert_eq!(state.repos.len(), 1);
         assert_eq!(state.updated_at, "2024-06-15T12:00:00Z");
     }
@@ -783,12 +804,11 @@ mod tests {
     #[tokio::test]
     async fn test_sync_client_push_with_mock() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mock_client = MockHttpClient::new()
-            .with_push_response(PushResponse {
-                success: true,
-                remote_rev: 42,
-                conflicts: vec![],
-            });
+        let mock_client = MockHttpClient::new().with_push_response(PushResponse {
+            success: true,
+            remote_rev: 42,
+            conflicts: vec![],
+        });
         let client = SyncClient::new(temp_dir.path().to_path_buf(), mock_client);
         client.init().await.unwrap();
 
@@ -802,8 +822,7 @@ mod tests {
     #[tokio::test]
     async fn test_sync_client_push_with_mock_error() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mock_client = MockHttpClient::new()
-            .with_push_error(anyhow::anyhow!("server error"));
+        let mock_client = MockHttpClient::new().with_push_error(anyhow::anyhow!("server error"));
         let client = SyncClient::new(temp_dir.path().to_path_buf(), mock_client);
         client.init().await.unwrap();
 
@@ -814,13 +833,12 @@ mod tests {
     #[tokio::test]
     async fn test_sync_client_pull_with_mock() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mock_client = MockHttpClient::new()
-            .with_pull_response(PullResponse {
-                repos: HashMap::new(),
-                pipelines: HashMap::new(),
-                remote_rev: 100,
-                has_more: false,
-            });
+        let mock_client = MockHttpClient::new().with_pull_response(PullResponse {
+            repos: HashMap::new(),
+            pipelines: HashMap::new(),
+            remote_rev: 100,
+            has_more: false,
+        });
         let client = SyncClient::new(temp_dir.path().to_path_buf(), mock_client);
         client.init().await.unwrap();
 
@@ -834,8 +852,7 @@ mod tests {
     #[tokio::test]
     async fn test_sync_client_pull_with_mock_error() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mock_client = MockHttpClient::new()
-            .with_push_error(anyhow::anyhow!("server error"));
+        let mock_client = MockHttpClient::new().with_push_error(anyhow::anyhow!("server error"));
         let client = SyncClient::new(temp_dir.path().to_path_buf(), mock_client);
         client.init().await.unwrap();
 
@@ -845,25 +862,23 @@ mod tests {
 
     #[test]
     fn test_mock_http_client_push_response() {
-        let mock = MockHttpClient::new()
-            .with_push_response(PushResponse {
-                success: true,
-                remote_rev: 5,
-                conflicts: vec!["a".to_string()],
-            });
+        let mock = MockHttpClient::new().with_push_response(PushResponse {
+            success: true,
+            remote_rev: 5,
+            conflicts: vec!["a".to_string()],
+        });
         assert!(mock.push_response.is_some());
         assert!(mock.pull_response.is_none());
     }
 
     #[test]
     fn test_mock_http_client_pull_response() {
-        let mock = MockHttpClient::new()
-            .with_pull_response(PullResponse {
-                repos: HashMap::new(),
-                pipelines: HashMap::new(),
-                remote_rev: 10,
-                has_more: true,
-            });
+        let mock = MockHttpClient::new().with_pull_response(PullResponse {
+            repos: HashMap::new(),
+            pipelines: HashMap::new(),
+            remote_rev: 10,
+            has_more: true,
+        });
         assert!(mock.pull_response.is_some());
         assert!(mock.push_response.is_none());
     }

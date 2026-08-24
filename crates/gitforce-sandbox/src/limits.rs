@@ -20,9 +20,9 @@ pub struct SandboxLimits {
 impl Default for SandboxLimits {
     fn default() -> Self {
         Self {
-            cpu_ms: 3600000, // 1 hour
-            memory_mb: 4096, // 4GB
-            disk_mb: 10240,  // 10GB
+            cpu_ms: 3600000,    // 1 hour
+            memory_mb: 4096,    // 4GB
+            disk_mb: 10240,     // 10GB
             timeout_secs: 3600, // 1 hour
             network: true,
         }
@@ -33,7 +33,7 @@ impl SandboxLimits {
     /// Create limits for a specific tier
     pub fn small() -> Self {
         Self {
-            cpu_ms: 300000,  // 5 minutes
+            cpu_ms: 300000, // 5 minutes
             memory_mb: 512,
             disk_mb: 1024,
             timeout_secs: 300,
@@ -127,7 +127,7 @@ mod tests {
         assert!(default.memory_mb <= large.memory_mb);
 
         // Verify network settings
-        assert!(!small.network);  // Small has no network
+        assert!(!small.network); // Small has no network
         assert!(medium.network);
         assert!(large.network);
         assert!(default.network);

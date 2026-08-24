@@ -14,10 +14,14 @@
 //! # Example
 //!
 //! ```rust
-//! let analyzer = DeltaAnalyzer::new(".", "HEAD~1").await?;
-//! let plan = analyzer.analyze().await?;
-//! println!("Affected packages: {:?}", plan.affected_packages);
-//! println!("Run: {:?}", plan.execution_scope());
+//! use gitforce_delta::DeltaAnalyzer;
+//!
+//! async {
+//!     let analyzer = DeltaAnalyzer::new(".", "HEAD~1");
+//!     let plan = analyzer.analyze().await.unwrap();
+//!     println!("Affected packages: {:?}", plan.affected_packages);
+//!     println!("Run: {:?}", plan.execution_scope);
+//! };
 //! ```
 
 pub mod analyzer;

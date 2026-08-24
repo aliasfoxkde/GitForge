@@ -1,8 +1,8 @@
 //! Job queue implementation
 
 use gitforce_common::{JobId, PipelineRunId, RepoId};
-use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
 /// Job priority
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

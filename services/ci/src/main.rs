@@ -3,9 +3,11 @@
 //! Main entry point for the CI orchestration service.
 
 use futures::StreamExt;
-use gitforce_ci::{CiEngine, PipelineDefinition, PipelineTriggerEvent, TriggerType, JobDefinition, StepDefinition};
+use gitforce_ci::{
+    CiEngine, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
+};
 use gitforce_events::{
-    EventBus, EventEnvelope, EventFilter, EventType, EventPayload, InMemoryEventBus,
+    EventBus, EventEnvelope, EventFilter, EventPayload, EventType, InMemoryEventBus,
 };
 use gitforce_scheduler::Scheduler;
 use std::collections::HashMap;
@@ -53,8 +55,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Start event consumer loop
     let shutdown_consumer = shutdown.clone();
-    let consumer_handle = tokio::spawn(async move {
-        if let Err(e) = run_event_consumer(event_bus_clone, scheduler_clone, pipeline_cache_clone, shutdown_consumer).await {
+    let _consumer_handle = tokio::spawn(async move {
+        if let Err(e) = run_event_consumer(
+            event_bus_clone,
+            scheduler_clone,
+            pipeline_cache_clone,
+            shutdown_consumer,
+        )
+        .await
+        {
             tracing::error!("event consumer error: {}", e);
         }
     });
@@ -62,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     // Start scheduler loop
     let scheduler_clone = scheduler.clone();
     let shutdown_scheduler = shutdown.clone();
-    let scheduler_handle = tokio::spawn(async move {
+    let _scheduler_handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         loop {
             if shutdown_scheduler.load(Ordering::SeqCst) {
@@ -200,9 +209,10 @@ async fn handle_push_event(
     // Get or create pipeline definition for this repo
     let pipeline = {
         let mut cache = pipeline_cache.lock().unwrap();
-        cache.entry(repo_id).or_insert_with(|| {
-            create_default_pipeline(&repo_id.to_string())
-        }).clone()
+        cache
+            .entry(repo_id)
+            .or_insert_with(|| create_default_pipeline(&repo_id.to_string()))
+            .clone()
     };
 
     // Create trigger event
@@ -211,13 +221,18 @@ async fn handle_push_event(
         repo_id,
         payload.new_hash.clone(),
         TriggerType::Push,
-    ).with_ref(ref_name.clone());
+    )
+    .with_ref(ref_name.clone());
 
     // Create and start the CI engine
     let engine = CiEngine::new(trigger_event, pipeline).await?;
     engine.start().await?;
 
-    tracing::info!("pipeline triggered for repo {} on ref {}", repo_id, ref_name);
+    tracing::info!(
+        "pipeline triggered for repo {} on ref {}",
+        repo_id,
+        ref_name
+    );
 
     // Enqueue ready jobs to scheduler
     let ready_jobs = engine.ready_jobs().await;
@@ -271,15 +286,13 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 image: "rust:latest".to_string(),
                 needs: vec!["build".to_string()],
                 env: HashMap::new(),
-                steps: vec![
-                    StepDefinition {
-                        name: "test".to_string(),
-                        run: "cargo test".to_string(),
-                        env: None,
-                        working_directory: None,
-                        condition: None,
-                    },
-                ],
+                steps: vec![StepDefinition {
+                    name: "test".to_string(),
+                    run: "cargo test".to_string(),
+                    env: None,
+                    working_directory: None,
+                    condition: None,
+                }],
                 timeout: Some("30m".to_string()),
                 retry: Some(1),
             },

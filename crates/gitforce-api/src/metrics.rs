@@ -59,7 +59,9 @@ impl Metrics {
                 "http_request_duration_seconds",
                 "HTTP request duration in seconds",
             )
-            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ]),
             &["method", "endpoint"],
         )
         .expect("failed to create http_request_duration_seconds histogram");
@@ -75,7 +77,10 @@ impl Metrics {
             .expect("failed to register repos_total");
 
         let repo_operations_total = IntCounterVec::new(
-            Opts::new("gitforge_repo_operations_total", "Total repository operations"),
+            Opts::new(
+                "gitforge_repo_operations_total",
+                "Total repository operations",
+            ),
             &["operation"],
         )
         .expect("failed to create repo_operations_total counter");
@@ -84,8 +89,9 @@ impl Metrics {
             .expect("failed to register repo_operations_total");
 
         // CI/CD metrics
-        let pipelines_total = IntGauge::new("gitforge_pipelines_total", "Total number of pipelines")
-            .expect("failed to create pipelines_total gauge");
+        let pipelines_total =
+            IntGauge::new("gitforge_pipelines_total", "Total number of pipelines")
+                .expect("failed to create pipelines_total gauge");
         registry
             .register(Box::new(pipelines_total.clone()))
             .expect("failed to register pipelines_total");
@@ -106,8 +112,9 @@ impl Metrics {
             .expect("failed to register jobs_total");
 
         let job_duration_seconds = Histogram::with_opts(
-            HistogramOpts::new("gitforge_job_duration_seconds", "Job duration in seconds")
-                .buckets(vec![1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0]),
+            HistogramOpts::new("gitforge_job_duration_seconds", "Job duration in seconds").buckets(
+                vec![1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0],
+            ),
         )
         .expect("failed to create job_duration_seconds histogram");
         registry
@@ -127,8 +134,9 @@ impl Metrics {
             .register(Box::new(runners_busy.clone()))
             .expect("failed to register runners_busy");
 
-        let runners_offline = IntGauge::new("gitforge_runners_offline", "Number of offline runners")
-            .expect("failed to create runners_offline gauge");
+        let runners_offline =
+            IntGauge::new("gitforge_runners_offline", "Number of offline runners")
+                .expect("failed to create runners_offline gauge");
         registry
             .register(Box::new(runners_offline.clone()))
             .expect("failed to register runners_offline");
@@ -160,15 +168,24 @@ impl Metrics {
             .expect("failed to register events_consumed_total");
 
         // Storage metrics
-        let artifacts_total = IntGauge::new("gitforge_artifacts_total", "Total number of artifacts")
-            .expect("failed to create artifacts_total gauge");
+        let artifacts_total =
+            IntGauge::new("gitforge_artifacts_total", "Total number of artifacts")
+                .expect("failed to create artifacts_total gauge");
         registry
             .register(Box::new(artifacts_total.clone()))
             .expect("failed to register artifacts_total");
 
         let artifact_size_bytes = Histogram::with_opts(
-            HistogramOpts::new("gitforge_artifact_size_bytes", "Artifact size in bytes")
-                .buckets(vec![1024.0, 10240.0, 102400.0, 1048576.0, 10485760.0, 104857600.0]),
+            HistogramOpts::new("gitforge_artifact_size_bytes", "Artifact size in bytes").buckets(
+                vec![
+                    1024.0,
+                    10240.0,
+                    102400.0,
+                    1048576.0,
+                    10485760.0,
+                    104857600.0,
+                ],
+            ),
         )
         .expect("failed to create artifact_size_bytes histogram");
         registry
@@ -219,9 +236,7 @@ impl Metrics {
 
     /// Increment pipeline run counter
     pub fn record_pipeline_run(&self, status: &str) {
-        self.pipeline_runs_total
-            .with_label_values(&[status])
-            .inc();
+        self.pipeline_runs_total.with_label_values(&[status]).inc();
     }
 
     /// Record job duration

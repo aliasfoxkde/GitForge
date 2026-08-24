@@ -11,13 +11,7 @@ use axum::{
 use std::sync::Arc;
 
 /// Paths that don't require authentication
-const PUBLIC_PATHS: &[&str] = &[
-    "/health",
-    "/metrics",
-    "/swagger-ui",
-    "/api-docs",
-    "/docs",
-];
+const PUBLIC_PATHS: &[&str] = &["/health", "/metrics", "/swagger-ui", "/api-docs", "/docs"];
 
 /// Error response for auth failures
 #[derive(Debug, serde::Serialize)]
@@ -51,7 +45,10 @@ pub async fn auth_middleware(
         Some(header) => match crate::auth::ApiAuth::extract_token(header) {
             Some(token) => token,
             None => {
-                return auth_error_response("missing_token", "Missing or invalid Authorization header");
+                return auth_error_response(
+                    "missing_token",
+                    "Missing or invalid Authorization header",
+                );
             }
         },
         None => {
@@ -76,10 +73,14 @@ pub async fn auth_middleware(
 
 /// Create an authentication error response
 fn auth_error_response(error: &str, message: &str) -> Response {
-    (StatusCode::UNAUTHORIZED, Json(AuthErrorResponse {
-        error: error.to_string(),
-        message: message.to_string(),
-    })).into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(AuthErrorResponse {
+            error: error.to_string(),
+            message: message.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 /// Extractor for authenticated user claims
@@ -96,16 +97,16 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthenticatedUser {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let claims = parts
-            .extensions
-            .get::<Claims>()
-            .cloned()
-            .ok_or_else(|| {
-                (StatusCode::UNAUTHORIZED, Json(AuthErrorResponse {
+        let claims = parts.extensions.get::<Claims>().cloned().ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(AuthErrorResponse {
                     error: "unauthenticated".to_string(),
                     message: "No authentication context".to_string(),
-                })).into_response()
-            })?;
+                }),
+            )
+                .into_response()
+        })?;
 
         Ok(AuthenticatedUser { claims })
     }
@@ -114,7 +115,6 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthenticatedUser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Request;
     use chrono::Utc;
     use gitforce_common::UserId;
 
@@ -226,8 +226,12 @@ mod tests {
     #[test]
     fn test_public_paths_exact_match() {
         // Test that paths that are exactly the public path work
-        assert!(PUBLIC_PATHS.iter().any(|p| "/health" == *p || "/health".starts_with(p)));
-        assert!(PUBLIC_PATHS.iter().any(|p| "/metrics" == *p || "/metrics".starts_with(p)));
+        assert!(PUBLIC_PATHS
+            .iter()
+            .any(|p| "/health" == *p || "/health".starts_with(p)));
+        assert!(PUBLIC_PATHS
+            .iter()
+            .any(|p| "/metrics" == *p || "/metrics".starts_with(p)));
     }
 
     #[test]

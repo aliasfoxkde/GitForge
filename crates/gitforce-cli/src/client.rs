@@ -73,7 +73,6 @@ pub use ApiClient as GitForgeClient;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::Client;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -90,7 +89,8 @@ mod tests {
     #[tokio::test]
     async fn test_api_client_get_success() {
         let mut mock_server = mockito::Server::new_async().await;
-        let m = mock_server.mock("GET", "/api/test")
+        let m = mock_server
+            .mock("GET", "/api/test")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"id":"123","name":"test"}"#)
@@ -107,7 +107,8 @@ mod tests {
     #[tokio::test]
     async fn test_api_client_post_success() {
         let mut mock_server = mockito::Server::new_async().await;
-        let m = mock_server.mock("POST", "/api/test")
+        let m = mock_server
+            .mock("POST", "/api/test")
             .with_status(201)
             .with_header("content-type", "application/json")
             .with_body(r#"{"id":"456","name":"created"}"#)
@@ -115,7 +116,9 @@ mod tests {
 
         let url = mock_server.url();
         let client = ApiClient::new(&url, Some("token".to_string()));
-        let request = TestRequest { value: "test".to_string() };
+        let request = TestRequest {
+            value: "test".to_string(),
+        };
         let result: TestResponse = client.post("/api/test", &request).await.unwrap();
         assert_eq!(result.id, "456");
         m.assert();
@@ -124,7 +127,8 @@ mod tests {
     #[tokio::test]
     async fn test_api_client_delete_success() {
         let mut mock_server = mockito::Server::new_async().await;
-        let m = mock_server.mock("DELETE", "/api/test/123")
+        let m = mock_server
+            .mock("DELETE", "/api/test/123")
             .with_status(204)
             .create();
 
@@ -137,7 +141,8 @@ mod tests {
     #[tokio::test]
     async fn test_api_client_get_with_auth_header() {
         let mut mock_server = mockito::Server::new_async().await;
-        let m = mock_server.mock("GET", "/api/protected")
+        let m = mock_server
+            .mock("GET", "/api/protected")
             .match_header("Authorization", "Bearer my-secret-token")
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -154,7 +159,8 @@ mod tests {
     #[tokio::test]
     async fn test_api_client_get_without_token() {
         let mut mock_server = mockito::Server::new_async().await;
-        let m = mock_server.mock("GET", "/api/public")
+        let m = mock_server
+            .mock("GET", "/api/public")
             .match_header("Authorization", mockito::Matcher::Missing)
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -176,8 +182,8 @@ mod tests {
 
     #[test]
     fn test_api_client_with_token() {
-        let client = ApiClient::new("http://localhost:8080", None)
-            .with_token("test-token".to_string());
+        let client =
+            ApiClient::new("http://localhost:8080", None).with_token("test-token".to_string());
         // Token is set internally, verify client was created
         let client2 = ApiClient::new("http://localhost:8080", Some("test-token".to_string()));
         assert_eq!(client.token, client2.token);
@@ -203,7 +209,8 @@ mod tests {
 
     #[test]
     fn test_api_client_with_token_method() {
-        let client = ApiClient::new("http://localhost:8080", None).with_token("my-token".to_string());
+        let client =
+            ApiClient::new("http://localhost:8080", None).with_token("my-token".to_string());
         assert_eq!(client.token, Some("my-token".to_string()));
     }
 

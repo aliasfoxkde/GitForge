@@ -175,8 +175,7 @@ pub async fn dashboard() -> impl IntoResponse {
 
 /// Create dashboard routes
 pub fn dashboard_routes() -> Router {
-    Router::new()
-        .route("/dashboard", get(dashboard))
+    Router::new().route("/dashboard", get(dashboard))
 }
 
 #[cfg(test)]

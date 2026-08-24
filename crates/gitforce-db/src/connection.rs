@@ -14,14 +14,15 @@ impl Pool {
     /// Create a new connection pool from a database URL or file path
     pub async fn new(database_url: &str) -> Result<Self> {
         // Handle file paths - SQLite uses file: prefix or bare paths
-        let connect_url = if database_url.starts_with("sqlite:") || database_url.starts_with("file:") {
-            database_url.to_string()
-        } else if Path::new(database_url).exists() || database_url.contains('/') {
-            format!("sqlite:{}?mode=rwc", database_url)
-        } else {
-            // Memory database
-            "sqlite::memory:".to_string()
-        };
+        let connect_url =
+            if database_url.starts_with("sqlite:") || database_url.starts_with("file:") {
+                database_url.to_string()
+            } else if Path::new(database_url).exists() || database_url.contains('/') {
+                format!("sqlite:{}?mode=rwc", database_url)
+            } else {
+                // Memory database
+                "sqlite::memory:".to_string()
+            };
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)

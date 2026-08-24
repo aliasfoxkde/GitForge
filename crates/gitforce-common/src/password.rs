@@ -10,8 +10,7 @@ pub fn hash_password(password: &str) -> Result<String, PasswordError> {
 
 /// Verify a password against a hash
 pub fn verify_password(password: &str, hash: &str) -> Result<bool, PasswordError> {
-    bcrypt::verify(password, hash)
-        .map_err(|e| PasswordError::VerifyError(e.to_string()))
+    bcrypt::verify(password, hash).map_err(|e| PasswordError::VerifyError(e.to_string()))
 }
 
 /// Password error types

@@ -8,11 +8,7 @@ use gitforce_db::models::Runner;
 #[async_trait]
 pub trait SchedulingPolicy: Send + Sync {
     /// Select the best runner for a job
-    async fn select_runner(
-        &self,
-        job_id: JobId,
-        runners: &[Runner],
-    ) -> Option<RunnerId>;
+    async fn select_runner(&self, job_id: JobId, runners: &[Runner]) -> Option<RunnerId>;
 }
 
 /// Simple round-robin / least-loaded policy
@@ -32,11 +28,7 @@ impl Default for SimplePolicy {
 
 #[async_trait]
 impl SchedulingPolicy for SimplePolicy {
-    async fn select_runner(
-        &self,
-        _job_id: JobId,
-        runners: &[Runner],
-    ) -> Option<RunnerId> {
+    async fn select_runner(&self, _job_id: JobId, runners: &[Runner]) -> Option<RunnerId> {
         // Filter to only online runners with capacity
         let available: Vec<_> = runners
             .iter()
@@ -49,9 +41,7 @@ impl SchedulingPolicy for SimplePolicy {
 
         // Select the runner with most available capacity
         // In a real implementation, we'd track actual load
-        let best = available
-            .iter()
-            .max_by_key(|r| r.capacity)?;
+        let best = available.iter().max_by_key(|r| r.capacity)?;
 
         Some(best.id)
     }
@@ -74,11 +64,7 @@ impl Default for PriorityPolicy {
 
 #[async_trait]
 impl SchedulingPolicy for PriorityPolicy {
-    async fn select_runner(
-        &self,
-        job_id: JobId,
-        runners: &[Runner],
-    ) -> Option<RunnerId> {
+    async fn select_runner(&self, job_id: JobId, runners: &[Runner]) -> Option<RunnerId> {
         // Use simple policy for now
         SimplePolicy::new().select_runner(job_id, runners).await
     }
@@ -184,9 +170,7 @@ mod tests {
     #[tokio::test]
     async fn test_priority_policy_uses_simple_policy() {
         let policy = PriorityPolicy::new();
-        let runners = vec![
-            make_runner(RunnerId::new(), "runner-1", "online", 4),
-        ];
+        let runners = vec![make_runner(RunnerId::new(), "runner-1", "online", 4)];
         let job_id = JobId::new();
 
         let selected = policy.select_runner(job_id, &runners).await;
@@ -209,9 +193,7 @@ mod tests {
     async fn test_simple_policy_with_single_runner() {
         let policy = SimplePolicy::new();
         let runner_id = RunnerId::new();
-        let runners = vec![
-            make_runner(runner_id, "solo-runner", "online", 1),
-        ];
+        let runners = vec![make_runner(runner_id, "solo-runner", "online", 1)];
         let job_id = JobId::new();
 
         let selected = policy.select_runner(job_id, &runners).await;
