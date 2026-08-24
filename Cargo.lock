@@ -1336,6 +1336,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitforge-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "gitforge-process"
 version = "0.1.0"
 dependencies = [

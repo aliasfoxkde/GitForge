@@ -1,0 +1,11 @@
+[package]
+name = "gitforge-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Transport-agnostic MCP protocol types for GitForge"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
