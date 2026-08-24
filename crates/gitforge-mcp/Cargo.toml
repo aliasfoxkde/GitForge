@@ -12,6 +12,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 mockito = "1"

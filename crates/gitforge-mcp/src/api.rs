@@ -1,8 +1,11 @@
 //! Restricted read-only client for the GitForge API.
 
+use futures::StreamExt;
 use reqwest::Url;
 use serde_json::Value;
 use std::time::Duration;
+
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Errors returned by the restricted API client.
 #[derive(Debug, thiserror::Error)]
@@ -15,6 +18,8 @@ pub enum ApiClientError {
     Request(#[source] reqwest::Error),
     #[error("API returned HTTP status {0}")]
     HttpStatus(u16),
+    #[error("API response exceeds the {MAX_RESPONSE_BYTES} byte limit")]
+    ResponseTooLarge,
     #[error("API returned invalid JSON")]
     InvalidJson(#[source] serde_json::Error),
 }
@@ -65,6 +70,7 @@ impl ApiClient {
 
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(ApiClientError::Request)?;
 
@@ -104,10 +110,24 @@ impl ApiClient {
         if !status.is_success() {
             return Err(ApiClientError::HttpStatus(status.as_u16()));
         }
-        response
-            .json::<Value>()
-            .await
-            .map_err(ApiClientError::Request)
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(ApiClientError::ResponseTooLarge);
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(ApiClientError::Request)?;
+            if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                return Err(ApiClientError::ResponseTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        serde_json::from_slice(&body).map_err(ApiClientError::InvalidJson)
     }
 
     /// Fetch the public API health document.
@@ -249,6 +269,54 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("503"));
         assert!(!message.contains("secret"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn does_not_follow_redirects() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/health")
+            .with_status(302)
+            .with_header("location", "https://example.com/health")
+            .create_async()
+            .await;
+        let client = ApiClient::new(
+            &server.url(),
+            Some("secret-token".to_string()),
+            &["127.0.0.1".to_string()],
+            Duration::from_secs(1),
+        )
+        .expect("valid client");
+
+        assert!(matches!(
+            client.health().await,
+            Err(ApiClientError::HttpStatus(302))
+        ));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_response_body() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .with_body(vec![b'a'; MAX_RESPONSE_BYTES + 1])
+            .create_async()
+            .await;
+        let client = ApiClient::new(
+            &server.url(),
+            None,
+            &["127.0.0.1".to_string()],
+            Duration::from_secs(1),
+        )
+        .expect("valid client");
+
+        assert!(matches!(
+            client.health().await,
+            Err(ApiClientError::ResponseTooLarge)
+        ));
         mock.assert_async().await;
     }
 }
