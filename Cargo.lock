@@ -414,6 +414,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "futures",
  "gitforge-ci",
  "gitforge-common",
@@ -421,11 +422,14 @@ dependencies = [
  "gitforge-events",
  "gitforge-process",
  "gitforge-scheduler",
+ "serde",
+ "serde_json",
  "tokio",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1205,6 +1209,7 @@ dependencies = [
  "clap",
  "futures",
  "gitforge-process",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

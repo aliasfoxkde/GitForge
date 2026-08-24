@@ -396,14 +396,36 @@ impl PipelineRunQueries {
         }
     }
 
-    /// Update pipeline run status
+    /// Update pipeline run status.
+    ///
+    /// Sets `started_at` exactly once when transitioning to "running".
+    /// Sets `finished_at` exactly once when transitioning to terminal states.
+    /// Repeated calls preserve existing timestamps (idempotent).
     pub async fn update_status(pool: &Pool, id: PipelineRunId, status: &str) -> Result<()> {
-        sqlx::query("UPDATE pipeline_runs SET status = ? WHERE id = ?")
-            .bind(status)
-            .bind(id.to_string())
-            .execute(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to update pipeline run status: {}", e)))?;
+        sqlx::query(
+            r#"
+            UPDATE pipeline_runs
+            SET status = ?,
+                started_at = CASE
+                    WHEN started_at IS NULL AND ? = 'running'
+                    THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ELSE started_at
+                END,
+                finished_at = CASE
+                    WHEN finished_at IS NULL AND ? IN ('completed', 'failed', 'cancelled')
+                    THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ELSE finished_at
+                END
+            WHERE id = ?
+            "#,
+        )
+        .bind(status)
+        .bind(status)
+        .bind(status)
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to update pipeline run status: {}", e)))?;
         Ok(())
     }
 
@@ -550,14 +572,36 @@ impl JobQueries {
         }
     }
 
-    /// Update job status
+    /// Update job status.
+    ///
+    /// Sets `started_at` exactly once when transitioning to "assigned" or "running".
+    /// Sets `finished_at` exactly once when transitioning to terminal states.
+    /// Repeated calls preserve existing timestamps (idempotent).
     pub async fn update_status(pool: &Pool, id: JobId, status: &str) -> Result<()> {
-        sqlx::query("UPDATE jobs SET status = ? WHERE id = ?")
-            .bind(status)
-            .bind(id.to_string())
-            .execute(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to update job status: {}", e)))?;
+        sqlx::query(
+            r#"
+            UPDATE jobs
+            SET status = ?,
+                started_at = CASE
+                    WHEN started_at IS NULL AND ? IN ('assigned', 'running')
+                    THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ELSE started_at
+                END,
+                finished_at = CASE
+                    WHEN finished_at IS NULL AND ? IN ('completed', 'failed', 'cancelled', 'timed_out')
+                    THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ELSE finished_at
+                END
+            WHERE id = ?
+            "#,
+        )
+        .bind(status)
+        .bind(status)
+        .bind(status)
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to update job status: {}", e)))?;
         Ok(())
     }
 
@@ -1355,5 +1399,405 @@ mod tests {
         // List recent
         let recent = EventQueries::list_recent(&pool, 10).await.unwrap();
         assert_eq!(recent.len(), 1);
+    }
+
+    // ========================================================================
+    // Timestamp persistence tests
+    // ========================================================================
+
+    async fn create_test_pipeline_run(pool: &Pool) -> crate::models::PipelineRun {
+        let user = crate::models::User::new(
+            "owner".to_string(),
+            "owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(pool, &user).await.unwrap();
+
+        let repo = crate::models::Repository::new(
+            "test-repo".to_string(),
+            user.id,
+            "/git/test".to_string(),
+        );
+        RepoQueries::create(pool, &repo).await.unwrap();
+
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "Test Pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(pool, &pipeline).await.unwrap();
+
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(pool, &run).await.unwrap();
+        run
+    }
+
+    async fn create_test_job(pool: &Pool) -> (crate::models::Job, PipelineRunId) {
+        let user = crate::models::User::new(
+            "owner".to_string(),
+            "owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(pool, &user).await.unwrap();
+
+        let repo = crate::models::Repository::new(
+            "test-repo".to_string(),
+            user.id,
+            "/git/test".to_string(),
+        );
+        RepoQueries::create(pool, &repo).await.unwrap();
+
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "Test Pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(pool, &pipeline).await.unwrap();
+
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(pool, &run).await.unwrap();
+
+        let job = crate::models::Job::new(run.id, "build".to_string());
+        JobQueries::create(pool, &job).await.unwrap();
+        (job, run.id)
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_run_update_status_sets_started_at_once() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let run = create_test_pipeline_run(&pool).await;
+
+        // Transition to running — started_at should be set
+        PipelineRunQueries::update_status(&pool, run.id, "running")
+            .await
+            .unwrap();
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "running");
+        assert!(
+            found.started_at.is_some(),
+            "started_at must be set on first running transition"
+        );
+        let first_started_at = found.started_at;
+
+        // Transition to completed — started_at must NOT change
+        PipelineRunQueries::update_status(&pool, run.id, "completed")
+            .await
+            .unwrap();
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "completed");
+        assert_eq!(
+            found.started_at, first_started_at,
+            "started_at must not change on subsequent transitions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_run_update_status_sets_finished_at_once() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let run = create_test_pipeline_run(&pool).await;
+
+        // Go running then completed
+        PipelineRunQueries::update_status(&pool, run.id, "running")
+            .await
+            .unwrap();
+        PipelineRunQueries::update_status(&pool, run.id, "completed")
+            .await
+            .unwrap();
+
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            found.finished_at.is_some(),
+            "finished_at must be set on completed"
+        );
+        let first_finished_at = found.finished_at;
+
+        // Transition to failed — finished_at must NOT change
+        PipelineRunQueries::update_status(&pool, run.id, "failed")
+            .await
+            .unwrap();
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found.finished_at, first_finished_at,
+            "finished_at must not change once set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_run_update_status_idempotent() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let run = create_test_pipeline_run(&pool).await;
+
+        // Run full lifecycle
+        PipelineRunQueries::update_status(&pool, run.id, "running")
+            .await
+            .unwrap();
+        PipelineRunQueries::update_status(&pool, run.id, "completed")
+            .await
+            .unwrap();
+
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let started_at = found.started_at;
+        let finished_at = found.finished_at;
+
+        // Repeated updates preserve timestamps
+        PipelineRunQueries::update_status(&pool, run.id, "completed")
+            .await
+            .unwrap();
+        PipelineRunQueries::update_status(&pool, run.id, "running")
+            .await
+            .unwrap();
+
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.started_at, started_at);
+        assert_eq!(found.finished_at, finished_at);
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_run_update_status_cancelled_sets_finished_at() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let run = create_test_pipeline_run(&pool).await;
+
+        PipelineRunQueries::update_status(&pool, run.id, "cancelled")
+            .await
+            .unwrap();
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "cancelled");
+        assert!(
+            found.finished_at.is_some(),
+            "finished_at must be set on cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_run_update_status_completed_sets_finished_at() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let run = create_test_pipeline_run(&pool).await;
+
+        // Scheduler writes "completed" as terminal success state
+        PipelineRunQueries::update_status(&pool, run.id, "running")
+            .await
+            .unwrap();
+        PipelineRunQueries::update_status(&pool, run.id, "completed")
+            .await
+            .unwrap();
+
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "completed");
+        assert!(
+            found.finished_at.is_some(),
+            "finished_at must be set on completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_job_update_status_sets_started_at_once() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let (job, _run_id) = create_test_job(&pool).await;
+
+        // Transition to running — started_at should be set
+        JobQueries::update_status(&pool, job.id, "running")
+            .await
+            .unwrap();
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(found.status, "running");
+        assert!(
+            found.started_at.is_some(),
+            "started_at must be set on first running transition"
+        );
+        let first_started_at = found.started_at;
+
+        // Transition to completed — started_at must NOT change
+        JobQueries::update_status(&pool, job.id, "completed")
+            .await
+            .unwrap();
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(found.status, "completed");
+        assert_eq!(
+            found.started_at, first_started_at,
+            "started_at must not change on subsequent transitions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_job_update_status_sets_finished_at_once() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let (job, _run_id) = create_test_job(&pool).await;
+
+        // Go running then completed
+        JobQueries::update_status(&pool, job.id, "running")
+            .await
+            .unwrap();
+        JobQueries::update_status(&pool, job.id, "completed")
+            .await
+            .unwrap();
+
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert!(
+            found.finished_at.is_some(),
+            "finished_at must be set on completed"
+        );
+        let first_finished_at = found.finished_at;
+
+        // Transition to failed — finished_at must NOT change
+        JobQueries::update_status(&pool, job.id, "failed")
+            .await
+            .unwrap();
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(
+            found.finished_at, first_finished_at,
+            "finished_at must not change once set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_job_update_status_idempotent() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let (job, _run_id) = create_test_job(&pool).await;
+
+        // Run full lifecycle
+        JobQueries::update_status(&pool, job.id, "running")
+            .await
+            .unwrap();
+        JobQueries::update_status(&pool, job.id, "completed")
+            .await
+            .unwrap();
+
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        let started_at = found.started_at;
+        let finished_at = found.finished_at;
+
+        // Repeated updates preserve timestamps
+        JobQueries::update_status(&pool, job.id, "completed")
+            .await
+            .unwrap();
+        JobQueries::update_status(&pool, job.id, "running")
+            .await
+            .unwrap();
+
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(found.started_at, started_at);
+        assert_eq!(found.finished_at, finished_at);
+    }
+
+    #[tokio::test]
+    async fn test_job_update_status_timed_out_sets_finished_at() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let (job, _run_id) = create_test_job(&pool).await;
+
+        JobQueries::update_status(&pool, job.id, "running")
+            .await
+            .unwrap();
+        JobQueries::update_status(&pool, job.id, "timed_out")
+            .await
+            .unwrap();
+
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(found.status, "timed_out");
+        assert!(
+            found.finished_at.is_some(),
+            "finished_at must be set on timed_out"
+        );
+    }
+
+    /// Verifies that `assigned` sets `started_at` (simulating scheduler handoff)
+    /// and that it is preserved through the completed transition.
+    #[tokio::test]
+    async fn test_job_update_status_assigned_sets_started_at_once() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let (job, _run_id) = create_test_job(&pool).await;
+
+        // Transition to assigned (scheduler hands job to runner) — started_at must be set
+        JobQueries::update_status(&pool, job.id, "assigned")
+            .await
+            .unwrap();
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(found.status, "assigned");
+        assert!(
+            found.started_at.is_some(),
+            "started_at must be set when transitioning to assigned"
+        );
+        let first_started_at = found.started_at;
+
+        // Transition to running — started_at must NOT change
+        JobQueries::update_status(&pool, job.id, "running")
+            .await
+            .unwrap();
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(found.status, "running");
+        assert_eq!(
+            found.started_at, first_started_at,
+            "started_at must not change when transitioning from assigned to running"
+        );
+
+        // Transition to completed — started_at must STILL not change
+        JobQueries::update_status(&pool, job.id, "completed")
+            .await
+            .unwrap();
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(found.status, "completed");
+        assert_eq!(
+            found.started_at, first_started_at,
+            "started_at must not change through completed"
+        );
     }
 }

@@ -51,6 +51,10 @@ temp/logs/
 temp/data/
 *.log
 data/
+# Candidate service runtime state is shared by the API and CI units; retain it
+# on the host but never commit it to the source branch.
+audit.db
+runtime-logs/
 
 # ─── Environment ───────────────────────────────────────────────────────────────
 .env

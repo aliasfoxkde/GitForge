@@ -179,7 +179,7 @@ async fn assign_job(
 
 /// Complete a job
 async fn complete_job(
-    State(_state): State<SchedulerServerState>,
+    State(state): State<SchedulerServerState>,
     Path(job_id): Path<String>,
     Json(request): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -199,6 +199,8 @@ async fn complete_job(
     let success = request["success"].as_bool().unwrap_or(false);
     let exit_code = request["exit_code"].as_i64().unwrap_or(-1);
     let error = request["error"].as_str();
+
+    state.scheduler.complete_job(job_id, success).await;
 
     tracing::info!(
         "job {} completed via HTTP: success={}, exit_code={}",

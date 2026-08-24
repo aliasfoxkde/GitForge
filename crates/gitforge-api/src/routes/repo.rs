@@ -107,36 +107,38 @@ fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<UserId, StatusCod
     Ok(claims.user_id)
 }
 
-/// List repositories
+/// List repositories (owner-isolated: only returns repos owned by the authenticated user)
 async fn list_repos(
     Extension(pool): Extension<Arc<Pool>>,
     Extension(auth): Extension<Arc<ApiAuth>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     // Check auth
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(_) => match RepoQueries::list(&pool).await {
-            Ok(repos) => {
-                let response: Vec<RepoResponse> = repos
-                    .into_iter()
-                    .map(|r| RepoResponse {
-                        id: r.id.to_string(),
-                        name: r.name,
-                        owner_id: r.owner_id.to_string(),
-                        visibility: r.visibility,
-                        git_path: r.git_path,
-                        created_at: r.created_at.to_rfc3339(),
-                        updated_at: r.updated_at.to_rfc3339(),
-                    })
-                    .collect();
-                Json(response).into_response()
-            }
-            Err(e) => {
-                tracing::error!("failed to list repos: {}", e);
-                Json(serde_json::Value::Array(vec![])).into_response()
-            }
-        },
+    let user_id = match extract_user(&auth, &headers) {
+        Err(e) => return e.into_response(),
+        Ok(id) => id,
+    };
+
+    match RepoQueries::list_by_owner(&pool, user_id).await {
+        Ok(repos) => {
+            let response: Vec<RepoResponse> = repos
+                .into_iter()
+                .map(|r| RepoResponse {
+                    id: r.id.to_string(),
+                    name: r.name,
+                    owner_id: r.owner_id.to_string(),
+                    visibility: r.visibility,
+                    git_path: r.git_path,
+                    created_at: r.created_at.to_rfc3339(),
+                    updated_at: r.updated_at.to_rfc3339(),
+                })
+                .collect();
+            Json(response).into_response()
+        }
+        Err(e) => {
+            tracing::error!("failed to list repos: {}", e);
+            Json(serde_json::Value::Array(vec![])).into_response()
+        }
     }
 }
 
@@ -198,85 +200,126 @@ async fn create_repo(
     }
 }
 
-/// Get a repository
+/// Get a repository (owner-isolated: returns 403 if the authenticated user does not own the repo)
 async fn get_repo(
     Extension(pool): Extension<Arc<Pool>>,
     Extension(auth): Extension<Arc<ApiAuth>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // Check auth
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(_) => {
-            tracing::debug!("get repo request: {}", id);
+    // Check auth and get requesting user
+    let user_id = match extract_user(&auth, &headers) {
+        Err(e) => return e.into_response(),
+        Ok(id) => id,
+    };
 
-            match Uuid::parse_str(&id) {
-                Ok(uuid) => {
-                    let repo_id = RepoId::from(uuid);
-                    match RepoQueries::get(&pool, repo_id).await {
-                        Ok(Some(repo)) => {
-                            let response = RepoResponse {
-                                id: repo.id.to_string(),
-                                name: repo.name,
-                                owner_id: repo.owner_id.to_string(),
-                                visibility: repo.visibility,
-                                git_path: repo.git_path,
-                                created_at: repo.created_at.to_rfc3339(),
-                                updated_at: repo.updated_at.to_rfc3339(),
-                            };
-                            (StatusCode::OK, Json(response)).into_response()
-                        }
-                        Ok(None) => (
-                            StatusCode::NOT_FOUND,
+    tracing::debug!("get repo request: {} by user {}", id, user_id);
+
+    match Uuid::parse_str(&id) {
+        Ok(uuid) => {
+            let repo_id = RepoId::from(uuid);
+            match RepoQueries::get(&pool, repo_id).await {
+                Ok(Some(repo)) => {
+                    // Owner isolation: fail closed if user does not own this repository
+                    if repo.owner_id != user_id {
+                        tracing::warn!(
+                            "user {} attempted to get repo {} owned by {}",
+                            user_id,
+                            repo_id,
+                            repo.owner_id
+                        );
+                        return (
+                            StatusCode::FORBIDDEN,
                             Json(serde_json::json!({
-                                "error": "not_found",
-                                "message": "Repository not found"
+                                "error": "forbidden",
+                                "message": "You do not have access to this repository"
                             })),
                         )
-                            .into_response(),
-                        Err(e) => {
-                            tracing::error!("failed to get repo: {}", e);
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(serde_json::json!({
-                                    "error": "database_error",
-                                    "message": format!("failed to get repository: {}", e)
-                                })),
-                            )
-                                .into_response()
-                        }
+                            .into_response();
                     }
+                    let response = RepoResponse {
+                        id: repo.id.to_string(),
+                        name: repo.name,
+                        owner_id: repo.owner_id.to_string(),
+                        visibility: repo.visibility,
+                        git_path: repo.git_path,
+                        created_at: repo.created_at.to_rfc3339(),
+                        updated_at: repo.updated_at.to_rfc3339(),
+                    };
+                    (StatusCode::OK, Json(response)).into_response()
                 }
-                Err(_) => (
-                    StatusCode::BAD_REQUEST,
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
                     Json(serde_json::json!({
-                        "error": "invalid_id",
-                        "message": "Invalid repository ID format"
+                        "error": "not_found",
+                        "message": "Repository not found"
                     })),
                 )
                     .into_response(),
+                Err(e) => {
+                    tracing::error!("failed to get repo: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "database_error",
+                            "message": format!("failed to get repository: {}", e)
+                        })),
+                    )
+                        .into_response()
+                }
             }
         }
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_id",
+                "message": "Invalid repository ID format"
+            })),
+        )
+            .into_response(),
     }
 }
 
-/// Delete a repository
+/// Delete a repository (owner-isolated: returns 403 if the authenticated user does not own the repo)
 async fn delete_repo(
     Extension(pool): Extension<Arc<Pool>>,
     Extension(auth): Extension<Arc<ApiAuth>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // Check auth
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(_) => {
-            tracing::debug!("delete repo request: {}", id);
+    // Check auth and get requesting user
+    let user_id = match extract_user(&auth, &headers) {
+        Err(e) => return e.into_response(),
+        Ok(id) => id,
+    };
 
-            match Uuid::parse_str(&id) {
-                Ok(uuid) => {
-                    let repo_id = RepoId::from(uuid);
+    tracing::debug!("delete repo request: {} by user {}", id, user_id);
+
+    match Uuid::parse_str(&id) {
+        Ok(uuid) => {
+            let repo_id = RepoId::from(uuid);
+
+            // First fetch to check ownership before deleting
+            match RepoQueries::get(&pool, repo_id).await {
+                Ok(Some(repo)) => {
+                    // Owner isolation: fail closed if user does not own this repository
+                    if repo.owner_id != user_id {
+                        tracing::warn!(
+                            "user {} attempted to delete repo {} owned by {}",
+                            user_id,
+                            repo_id,
+                            repo.owner_id
+                        );
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "forbidden",
+                                "message": "You do not have access to this repository"
+                            })),
+                        )
+                            .into_response();
+                    }
+                    // User owns the repo — proceed with deletion
                     match RepoQueries::delete(&pool, repo_id).await {
                         Ok(_) => StatusCode::NO_CONTENT.into_response(),
                         Err(e) => {
@@ -292,16 +335,35 @@ async fn delete_repo(
                         }
                     }
                 }
-                Err(_) => (
-                    StatusCode::BAD_REQUEST,
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
                     Json(serde_json::json!({
-                        "error": "invalid_id",
-                        "message": "Invalid repository ID format"
+                        "error": "not_found",
+                        "message": "Repository not found"
                     })),
                 )
                     .into_response(),
+                Err(e) => {
+                    tracing::error!("failed to get repo for ownership check: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "database_error",
+                            "message": format!("failed to delete repository: {}", e)
+                        })),
+                    )
+                        .into_response()
+                }
             }
         }
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_id",
+                "message": "Invalid repository ID format"
+            })),
+        )
+            .into_response(),
     }
 }
 

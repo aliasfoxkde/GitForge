@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "sync", "time", "io-util", "process"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "io-util", "process", "macros", "signal"] }
 tracing = "0.1"
 libc = "0.2"
 thiserror = "2"

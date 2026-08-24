@@ -82,8 +82,19 @@ pub struct CiEngine {
 impl CiEngine {
     /// Create a new CI engine from a trigger event and pipeline definition
     pub async fn new(event: PipelineTriggerEvent, pipeline: PipelineDefinition) -> Result<Self> {
-        let run_id = PipelineRunId::new();
+        Self::new_with_run_id(event, pipeline, PipelineRunId::new()).await
+    }
 
+    /// Create a CI engine with a caller-supplied run ID.
+    ///
+    /// Control-plane adapters use this to return a durable identifier before
+    /// publishing an asynchronous trigger event. Native webhook callers use
+    /// `new`, which allocates an ID locally.
+    pub async fn new_with_run_id(
+        event: PipelineTriggerEvent,
+        pipeline: PipelineDefinition,
+        run_id: PipelineRunId,
+    ) -> Result<Self> {
         // Build DAG from pipeline
         let graph = DagBuilder::build(&pipeline, run_id)?;
 

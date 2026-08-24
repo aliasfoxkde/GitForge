@@ -44,6 +44,8 @@ pub struct SchedulerState {
     pub queue: JobQueue,
     pub runners: HashMap<RunnerId, Runner>,
     pub job_assignments: HashMap<JobId, RunnerId>,
+    /// Pipeline run IDs for assigned jobs; assignments are removed from the queue.
+    pub assigned_pipeline_runs: HashMap<JobId, PipelineRunId>,
 }
 
 impl Default for SchedulerState {
@@ -58,6 +60,7 @@ impl SchedulerState {
             queue: JobQueue::new(),
             runners: HashMap::new(),
             job_assignments: HashMap::new(),
+            assigned_pipeline_runs: HashMap::new(),
         }
     }
 
@@ -133,14 +136,17 @@ impl Scheduler {
         self.event_tx.subscribe()
     }
 
-    /// Enqueue a job
+    /// Enqueue a job (creates a new job in DB if pool exists)
+    ///
+    /// WARNING: When the job has already been persisted to the database,
+    /// use `enqueue_persisted_job()` instead to avoid creating duplicate rows.
     pub async fn enqueue(&self, job_id: JobId, pipeline_run_id: PipelineRunId, repo_id: RepoId) {
         let job = QueuedJob::new(job_id, pipeline_run_id, repo_id);
         let mut state = self.state.write().await;
         state.queue.enqueue(job);
         tracing::debug!("job {} enqueued", job_id);
 
-        // Persist to database if available
+        // Persist to database if available - creates a new job row
         if let Some(pool) = &self.db_pool {
             let db_job = DbJob::new(pipeline_run_id, format!("job-{}", job_id));
             if let Err(e) = gitforge_db::queries::JobQueries::create(pool, &db_job).await {
@@ -150,6 +156,34 @@ impl Scheduler {
                 gitforge_db::queries::JobQueries::update_status(pool, job_id, "queued").await
             {
                 tracing::error!("failed to update job status in DB: {}", e);
+            }
+        }
+    }
+
+    /// Enqueue a job that has already been persisted to the database.
+    ///
+    /// This method queues the job in memory and updates the existing DB row's status
+    /// to "queued" without creating a duplicate row.
+    ///
+    /// Use this when the job was already created via `JobQueries::create()` and
+    /// you just need to queue it for scheduling.
+    pub async fn enqueue_persisted_job(
+        &self,
+        job_id: JobId,
+        pipeline_run_id: PipelineRunId,
+        repo_id: RepoId,
+    ) {
+        let job = QueuedJob::new(job_id, pipeline_run_id, repo_id);
+        let mut state = self.state.write().await;
+        state.queue.enqueue(job);
+        tracing::debug!("persisted job {} enqueued", job_id);
+
+        // Update existing job status in database if pool available
+        if let Some(pool) = &self.db_pool {
+            if let Err(e) =
+                gitforge_db::queries::JobQueries::update_status(pool, job_id, "queued").await
+            {
+                tracing::error!("failed to update persisted job status in DB: {}", e);
             }
         }
     }
@@ -176,13 +210,75 @@ impl Scheduler {
         }
         // Also remove assignment if exists
         state.job_assignments.remove(&job_id);
+        state.assigned_pipeline_runs.remove(&job_id);
+    }
+
+    /// Record job completion and remove it from the assigned set.
+    pub async fn complete_job(&self, job_id: JobId, success: bool) {
+        let pipeline_run_id = {
+            let mut state = self.state.write().await;
+            state.job_assignments.remove(&job_id);
+            state.assigned_pipeline_runs.remove(&job_id)
+        };
+
+        if let (Some(pool), Some(run_id)) = (&self.db_pool, pipeline_run_id) {
+            let status = if success { "completed" } else { "failed" };
+            if let Err(error) =
+                gitforge_db::queries::JobQueries::update_status(pool, job_id, status).await
+            {
+                tracing::error!("failed to persist job {} completion: {}", job_id, error);
+            }
+
+            match gitforge_db::queries::JobQueries::list_by_run(pool, run_id).await {
+                Ok(jobs)
+                    if !jobs.is_empty()
+                        && jobs
+                            .iter()
+                            .all(|job| job.status == "completed" || job.status == "failed") =>
+                {
+                    let run_status = if jobs.iter().any(|job| job.status == "failed") {
+                        "failed"
+                    } else {
+                        "completed"
+                    };
+                    if let Err(error) = gitforge_db::queries::PipelineRunQueries::update_status(
+                        pool, run_id, run_status,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            "failed to persist pipeline run {} completion: {}",
+                            run_id,
+                            error
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!("failed to inspect pipeline run {} jobs: {}", run_id, error);
+                }
+            }
+        }
+
+        tracing::info!("job {} completion recorded (success={})", job_id, success);
     }
 
     /// Register a runner
     pub async fn register_runner(&self, runner: Runner) {
-        let mut state = self.state.write().await;
         let runner_id = runner.id;
-        state.add_runner(runner);
+        {
+            let mut state = self.state.write().await;
+            state.add_runner(runner.clone());
+        }
+
+        // A DB-backed scheduler must persist runners before assigning jobs so
+        // the jobs.runner_id foreign key remains valid across processes.
+        if let Some(pool) = &self.db_pool {
+            if let Err(error) = gitforge_db::queries::RunnerQueries::create(pool, &runner).await {
+                tracing::error!("failed to persist runner {}: {}", runner_id, error);
+            }
+        }
+
         tracing::info!("runner {} registered", runner_id);
     }
 
@@ -223,6 +319,7 @@ impl Scheduler {
             };
 
             let job_id = job.job_id;
+            let pipeline_run_id = job.pipeline_run_id;
 
             // Select runner using policy
             let runner_id = self.policy.select_runner(job_id, &runners).await;
@@ -232,6 +329,7 @@ impl Scheduler {
                     // Dequeue and assign (JobId and RunnerId are Copy types)
                     state.queue.dequeue();
                     state.job_assignments.insert(job_id, r_id);
+                    state.assigned_pipeline_runs.insert(job_id, pipeline_run_id);
                     tracing::info!("assigned job {} to runner {}", job_id, r_id);
                     processed += 1;
 
@@ -316,13 +414,10 @@ impl Scheduler {
             .job_assignments
             .iter()
             .filter_map(|(job_id, runner_id)| {
-                // Find the queued job to get pipeline_run_id
                 state
-                    .queue
-                    .all()
-                    .iter()
-                    .find(|j| j.job_id == *job_id)
-                    .map(|j| (j.job_id, *runner_id, j.pipeline_run_id))
+                    .assigned_pipeline_runs
+                    .get(job_id)
+                    .map(|pipeline_run_id| (*job_id, *runner_id, *pipeline_run_id))
             })
             .collect()
     }
@@ -711,5 +806,117 @@ mod tests {
         // Verify job is assigned
         let assigned = scheduler.is_assigned(job_id).await;
         assert!(assigned.is_some());
+    }
+
+    // =============================================================================
+    // enqueue_persisted_job tests
+    // =============================================================================
+
+    #[tokio::test]
+    async fn test_enqueue_persisted_job_adds_to_queue() {
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+        let job_id = JobId::new();
+
+        // Use enqueue_persisted_job for a job already in DB
+        scheduler
+            .enqueue_persisted_job(job_id, run_id, repo_id)
+            .await;
+        assert_eq!(scheduler.queue_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_persisted_job_queue_and_assign() {
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+        let job_id = JobId::new();
+
+        // Register a runner
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
+        scheduler.register_runner(runner.clone()).await;
+
+        // Enqueue persisted job and process
+        scheduler
+            .enqueue_persisted_job(job_id, run_id, repo_id)
+            .await;
+        scheduler.process_queue().await;
+
+        // Job should be assigned
+        let assigned = scheduler.is_assigned(job_id).await;
+        assert_eq!(assigned, Some(runner.id));
+
+        let assigned_jobs = scheduler.get_assigned_jobs().await;
+        assert_eq!(assigned_jobs, vec![(job_id, runner.id, run_id)]);
+
+        scheduler.complete_job(job_id, true).await;
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        assert!(scheduler.get_assigned_jobs().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_persisted_job_cancel() {
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+        let job_id = JobId::new();
+
+        scheduler
+            .enqueue_persisted_job(job_id, run_id, repo_id)
+            .await;
+        assert_eq!(scheduler.queue_len().await, 1);
+
+        // Cancel should work
+        scheduler.cancel(job_id).await;
+        assert_eq!(scheduler.queue_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_persisted_job_multiple() {
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+
+        // Enqueue multiple persisted jobs
+        for _ in 0..5 {
+            scheduler
+                .enqueue_persisted_job(JobId::new(), run_id, repo_id)
+                .await;
+        }
+        assert_eq!(scheduler.queue_len().await, 5);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_vs_enqueue_persisted_job_distinct() {
+        // Test that both methods can be used independently on different jobs
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+
+        let job1 = JobId::new();
+        let job2 = JobId::new();
+
+        // job1 uses regular enqueue (scheduler creates DB entry)
+        scheduler.enqueue(job1, run_id, repo_id).await;
+
+        // job2 uses enqueue_persisted_job (caller already created DB entry)
+        scheduler.enqueue_persisted_job(job2, run_id, repo_id).await;
+
+        // Both should be in queue
+        assert_eq!(scheduler.queue_len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_persisted_job_empty_repo_id() {
+        // Test with default RepoId (zero value)
+        let scheduler = Scheduler::new();
+        let run_id = PipelineRunId::new();
+        let job_id = JobId::new();
+
+        scheduler
+            .enqueue_persisted_job(job_id, run_id, RepoId::new())
+            .await;
+        assert_eq!(scheduler.queue_len().await, 1);
     }
 }

@@ -384,8 +384,13 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
         }
         Err(_) => {
             warn!("job {} timed out after {:?}", job.id, timeout_duration);
-            // Try to kill the process
-            let _ = child.kill().await;
+            // Kill the entire process group (negative pid), not just the direct
+            // child, so that any grandchildren spawned by the cargo subprocess
+            // are also terminated.
+            let pid = child.id().unwrap_or(0) as libc::pid_t;
+            if pid > 0 {
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
             Ok(BuildResult::failed(
                 job,
                 -1,

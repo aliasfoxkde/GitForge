@@ -86,14 +86,14 @@ async fn main() -> anyhow::Result<()> {
     // Build router for Git HTTP protocol
     let app = Router::new()
         .route("/health", get(health_check))
-        .route("/git-upload-pack/:owner/:repo", get(git_upload_pack))
+        .route("/git-upload-pack/{owner}/{repo}", get(git_upload_pack))
         .route(
-            "/git-upload-pack/:owner/:repo/*path",
+            "/git-upload-pack/{owner}/{repo}/{*path}",
             get(git_upload_pack_path),
         )
-        .route("/git-receive-pack/:owner/:repo", post(git_receive_pack))
+        .route("/git-receive-pack/{owner}/{repo}", post(git_receive_pack))
         .route(
-            "/git-receive-pack/:owner/:repo/*path",
+            "/git-receive-pack/{owner}/{repo}/{*path}",
             post(git_receive_pack_path),
         )
         .layer(TraceLayer::new_for_http())

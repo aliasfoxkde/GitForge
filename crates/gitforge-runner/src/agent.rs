@@ -90,7 +90,7 @@ impl RunnerAgent {
 
     /// Register with the scheduler via HTTP
     pub async fn register(&mut self) -> Result<RunnerId> {
-        let runner = Runner::new(
+        let mut runner = Runner::new(
             self.config.name.clone(),
             gitforge_db::models::RunnerType::Docker,
             self.config.capacity,
@@ -107,6 +107,27 @@ impl RunnerAgent {
         match self.client.post(&register_url).json(&request).send().await {
             Ok(response) => {
                 if response.status().is_success() {
+                    match response.json::<serde_json::Value>().await {
+                        Ok(body) => {
+                            if let Some(server_id) = body
+                                .get("id")
+                                .and_then(|value| value.as_str())
+                                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                            {
+                                runner.id = RunnerId::from(server_id);
+                            } else {
+                                tracing::warn!(
+                                    "scheduler registration response did not contain a valid runner ID"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "failed to decode scheduler registration response: {}",
+                                error
+                            );
+                        }
+                    }
                     tracing::info!("registered runner {} with scheduler", runner.id);
                 } else {
                     tracing::warn!(
