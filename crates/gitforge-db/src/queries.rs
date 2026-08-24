@@ -574,7 +574,7 @@ impl JobQueries {
 
     /// Update job status.
     ///
-    /// Sets `started_at` exactly once when transitioning to "running".
+    /// Sets `started_at` exactly once when transitioning to "assigned" or "running".
     /// Sets `finished_at` exactly once when transitioning to terminal states.
     /// Repeated calls preserve existing timestamps (idempotent).
     pub async fn update_status(pool: &Pool, id: JobId, status: &str) -> Result<()> {
@@ -583,7 +583,7 @@ impl JobQueries {
             UPDATE jobs
             SET status = ?,
                 started_at = CASE
-                    WHEN started_at IS NULL AND ? = 'running'
+                    WHEN started_at IS NULL AND ? IN ('assigned', 'running')
                     THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     ELSE started_at
                 END,
@@ -1754,6 +1754,50 @@ mod tests {
         assert!(
             found.finished_at.is_some(),
             "finished_at must be set on timed_out"
+        );
+    }
+
+    /// Verifies that `assigned` sets `started_at` (simulating scheduler handoff)
+    /// and that it is preserved through the completed transition.
+    #[tokio::test]
+    async fn test_job_update_status_assigned_sets_started_at_once() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let (job, _run_id) = create_test_job(&pool).await;
+
+        // Transition to assigned (scheduler hands job to runner) — started_at must be set
+        JobQueries::update_status(&pool, job.id, "assigned")
+            .await
+            .unwrap();
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(found.status, "assigned");
+        assert!(
+            found.started_at.is_some(),
+            "started_at must be set when transitioning to assigned"
+        );
+        let first_started_at = found.started_at;
+
+        // Transition to running — started_at must NOT change
+        JobQueries::update_status(&pool, job.id, "running")
+            .await
+            .unwrap();
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(found.status, "running");
+        assert_eq!(
+            found.started_at, first_started_at,
+            "started_at must not change when transitioning from assigned to running"
+        );
+
+        // Transition to completed — started_at must STILL not change
+        JobQueries::update_status(&pool, job.id, "completed")
+            .await
+            .unwrap();
+        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(found.status, "completed");
+        assert_eq!(
+            found.started_at, first_started_at,
+            "started_at must not change through completed"
         );
     }
 }

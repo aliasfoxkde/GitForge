@@ -603,16 +603,16 @@ async fn trigger_pipeline(
 fn parse_jobs_from_config(config: &serde_json::Value) -> Result<Vec<String>, String> {
     let jobs = config
         .get("jobs")
-        .ok_or_else(|| "missing 'jobs' field in pipeline config")?;
+        .ok_or("missing 'jobs' field in pipeline config")?;
 
-    let jobs_array = jobs.as_array().ok_or_else(|| "'jobs' must be an array")?;
+    let jobs_array = jobs.as_array().ok_or("'jobs' must be an array")?;
 
     let mut names = Vec::new();
     for job in jobs_array {
         let name = job
             .get("name")
             .and_then(|n| n.as_str())
-            .ok_or_else(|| "job missing 'name' field")?
+            .ok_or("job missing 'name' field")?
             .to_string();
         names.push(name);
     }
