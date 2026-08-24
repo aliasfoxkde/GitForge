@@ -40,6 +40,82 @@ impl Default for RunnerConfig {
     }
 }
 
+impl RunnerConfig {
+    /// Load runner settings from the process environment.
+    ///
+    /// Defaults remain suitable for local development, while deployed runners
+    /// can select their scheduler, identity, capacity, and polling intervals
+    /// without rebuilding the binary.
+    pub fn from_env() -> Result<Self> {
+        let defaults = Self::default();
+        Ok(Self {
+            scheduler_url: env_string("SCHEDULER_URL", defaults.scheduler_url),
+            name: env_string("RUNNER_NAME", defaults.name),
+            runner_type: env_string("RUNNER_TYPE", defaults.runner_type),
+            capacity: env_positive_i32("RUNNER_CAPACITY", defaults.capacity)?,
+            heartbeat_interval_secs: env_positive_u64(
+                "RUNNER_HEARTBEAT_INTERVAL_SECS",
+                defaults.heartbeat_interval_secs,
+            )?,
+            fetch_interval_secs: env_positive_u64(
+                "RUNNER_FETCH_INTERVAL_SECS",
+                defaults.fetch_interval_secs,
+            )?,
+        })
+    }
+}
+
+fn env_string(name: &str, default: String) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(default)
+}
+
+fn env_positive_i32(name: &str, default: i32) -> Result<i32> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<i32>()
+            .map_err(|error| {
+                Error::invalid_input(format!("{} must be a positive integer: {}", name, error))
+            })
+            .and_then(|value| {
+                if value > 0 {
+                    Ok(value)
+                } else {
+                    Err(Error::invalid_input(format!("{} must be positive", name)))
+                }
+            }),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(Error::invalid_input(format!(
+            "{} is unreadable: {}",
+            name, error
+        ))),
+    }
+}
+
+fn env_positive_u64(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|error| {
+                Error::invalid_input(format!("{} must be a positive integer: {}", name, error))
+            })
+            .and_then(|value| {
+                if value > 0 {
+                    Ok(value)
+                } else {
+                    Err(Error::invalid_input(format!("{} must be positive", name)))
+                }
+            }),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(Error::invalid_input(format!(
+            "{} is unreadable: {}",
+            name, error
+        ))),
+    }
+}
+
 /// Job assignment from scheduler
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobAssignment {
@@ -189,10 +265,7 @@ impl RunnerAgent {
                 }
                 tracing::debug!("runner checking for jobs...");
 
-                let jobs_url = format!(
-                    "{}/jobs/pending?runner_id={}",
-                    fetch_url, fetch_runner_id
-                );
+                let jobs_url = format!("{}/jobs/pending?runner_id={}", fetch_url, fetch_runner_id);
                 match fetch_client.get(&jobs_url).send().await {
                     Ok(response) => {
                         if response.status().is_success() {
@@ -230,12 +303,12 @@ impl RunnerAgent {
     /// Otherwise, wait for jobs to complete gracefully.
     pub async fn stop(&self, force: bool) {
         *self.is_running.write().await = false;
-        
+
         if force {
             tracing::info!("force stopping - cancelling all active jobs");
             self.executor.cancel_all_jobs().await;
         }
-        
+
         let runner_id = self
             .runner
             .as_ref()

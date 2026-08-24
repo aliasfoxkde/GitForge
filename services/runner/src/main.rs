@@ -27,8 +27,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("failed to initialize process supervision: {}", e);
     }
 
-    // Load runner configuration
-    let config = RunnerConfig::default();
+    // Load runner configuration from the environment, retaining development
+    // defaults but failing closed on malformed deployment values.
+    let config = RunnerConfig::from_env()?;
 
     // Create runner agent
     let mut agent = RunnerAgent::new(config).await?;
