@@ -28,6 +28,11 @@ env:
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 jobs:
   ai-review:
     name: AI Code Review
