@@ -215,10 +215,26 @@ impl Scheduler {
 
     /// Record job completion and remove it from the assigned set.
     pub async fn complete_job(&self, job_id: JobId, success: bool) {
-        let pipeline_run_id = {
+        self.complete_job_with_receipt(job_id, success, None, None, None)
+            .await;
+    }
+
+    /// Record completion and persist bounded output plus correlated events.
+    pub async fn complete_job_with_receipt(
+        &self,
+        job_id: JobId,
+        success: bool,
+        exit_code: Option<i32>,
+        error_message: Option<String>,
+        step_results: Option<&[serde_json::Value]>,
+    ) {
+        let (pipeline_run_id, runner_id) = {
             let mut state = self.state.write().await;
+            let runner_id = state.job_assignments.get(&job_id).copied();
+            let pipeline_run_id = state.assigned_pipeline_runs.get(&job_id).copied();
             state.job_assignments.remove(&job_id);
-            state.assigned_pipeline_runs.remove(&job_id)
+            state.assigned_pipeline_runs.remove(&job_id);
+            (pipeline_run_id, runner_id)
         };
 
         if let (Some(pool), Some(run_id)) = (&self.db_pool, pipeline_run_id) {
@@ -227,6 +243,46 @@ impl Scheduler {
                 gitforge_db::queries::JobQueries::update_status(pool, job_id, status).await
             {
                 tracing::error!("failed to persist job {} completion: {}", job_id, error);
+            }
+
+            if let Ok(Some(_job)) = gitforge_db::queries::JobQueries::get(pool, job_id).await {
+                let (stdout, stderr) = step_results
+                    .map(|steps| {
+                        steps
+                            .iter()
+                            .fold((String::new(), String::new()), |mut acc, step| {
+                                if let Some(value) = step.get("stdout").and_then(|v| v.as_str()) {
+                                    acc.0.push_str(value);
+                                }
+                                if let Some(value) = step.get("stderr").and_then(|v| v.as_str()) {
+                                    acc.1.push_str(value);
+                                }
+                                acc
+                            })
+                    })
+                    .unwrap_or_default();
+                let log = gitforge_db::models::JobLog::new(job_id, run_id, stdout, stderr);
+                if let Err(error) = gitforge_db::queries::JobLogQueries::upsert(pool, &log).await {
+                    tracing::error!("failed to persist job {} log: {}", job_id, error);
+                }
+                let event = gitforge_db::models::EventReceipt::new(
+                    "job.finished",
+                    Some(job_id),
+                    Some(run_id),
+                    format!("job.finished:{}", job_id),
+                    serde_json::json!({
+                        "status": status,
+                        "success": success,
+                        "exit_code": exit_code,
+                        "error": error_message,
+                        "runner_id": runner_id.map(|id| id.to_string()),
+                    }),
+                );
+                if let Err(error) =
+                    gitforge_db::queries::EventReceiptQueries::upsert(pool, &event).await
+                {
+                    tracing::error!("failed to persist job {} event: {}", job_id, error);
+                }
             }
 
             match gitforge_db::queries::JobQueries::list_by_run(pool, run_id).await {
@@ -251,6 +307,18 @@ impl Scheduler {
                             run_id,
                             error
                         );
+                    }
+                    let event = gitforge_db::models::EventReceipt::new(
+                        "pipeline.finished",
+                        None,
+                        Some(run_id),
+                        format!("pipeline.finished:{}", run_id),
+                        serde_json::json!({"status": run_status}),
+                    );
+                    if let Err(error) =
+                        gitforge_db::queries::EventReceiptQueries::upsert(pool, &event).await
+                    {
+                        tracing::error!("failed to persist pipeline {} event: {}", run_id, error);
                     }
                 }
                 Ok(_) => {}
@@ -353,6 +421,27 @@ impl Scheduler {
                         .await
                         {
                             tracing::error!("failed to update job status in DB: {}", e);
+                        } else {
+                            let event = gitforge_db::models::EventReceipt::new(
+                                "job.started",
+                                Some(job_id),
+                                Some(pipeline_run_id),
+                                format!("job.started:{}", job_id),
+                                serde_json::json!({
+                                    "status": "assigned",
+                                    "runner_id": r_id.to_string(),
+                                }),
+                            );
+                            if let Err(e) =
+                                gitforge_db::queries::EventReceiptQueries::upsert(pool, &event)
+                                    .await
+                            {
+                                tracing::error!(
+                                    "failed to persist job {} start event: {}",
+                                    job_id,
+                                    e
+                                );
+                            }
                         }
                     }
                 }
