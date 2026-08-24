@@ -50,9 +50,13 @@ impl ApiClient {
                 "scheme must be http or https".to_string(),
             ));
         }
-        if url.username() != "" || url.password().is_some() || url.query().is_some() {
+        if url.username() != ""
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
             return Err(ApiClientError::InvalidBaseUrl(
-                "credentials and query parameters are not allowed".to_string(),
+                "credentials, query parameters, and fragments are not allowed".to_string(),
             ));
         }
         if !allowed_hosts.iter().any(|allowed| allowed == host) {
@@ -157,6 +161,22 @@ mod tests {
         assert!(matches!(
             result,
             Err(ApiClientError::HostNotAllowed(host)) if host == "localhost"
+        ));
+    }
+
+    #[test]
+    fn rejects_url_fragments() {
+        let result = ApiClient::new(
+            "http://127.0.0.1:8080/base#fragment",
+            None,
+            &allowed(),
+            Duration::from_secs(1),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ApiClientError::InvalidBaseUrl(message))
+                if message.contains("fragments")
         ));
     }
 
