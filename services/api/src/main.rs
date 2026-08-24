@@ -141,6 +141,9 @@ pub async fn graceful_shutdown_delay() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn clear_env() {
         std::env::remove_var("JWT_SECRET");
@@ -150,6 +153,7 @@ mod tests {
 
     #[test]
     fn test_load_config_defaults() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         // Clear any set env vars first
         clear_env();
 
@@ -161,6 +165,7 @@ mod tests {
 
     #[test]
     fn test_load_config_from_env() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         // Always set fresh values - clear first then set
         clear_env();
         std::env::set_var("JWT_SECRET", "test-secret");
