@@ -248,8 +248,9 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   `cargo test` from blocking on a full stderr pipe.
 - Implemented the daemon `Cancel` request. Queued jobs are marked cancelled;
   running jobs are terminated through their process group, which also avoids
-  orphaned descendants. Timeout cleanup now uses async sleep and reaps the
-  child instead of blocking a runtime worker thread.
+  orphaned descendants. The CLI now exposes `gitforge-build --cancel JOB_ID`.
+  Timeout cleanup now uses async sleep and reaps the child instead of blocking
+  a runtime worker thread.
 - Validation: `cargo test -p gitforge-build` (53 library, 16 CLI, 4 daemon
   tests) and `cargo clippy -p gitforge-build --all-targets -- -D warnings`
   pass. Full workspace managed validation remains required after this change.

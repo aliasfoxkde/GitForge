@@ -2,7 +2,7 @@
 
 ## Overview
 
-GitForge Build Queue (`gitforge-buildd`) is a centralized build coordination system that prevents system overload from concurrent cargo builds. It enforces a maximum of **2 concurrent jobs** via semaphore-based admission control.
+GitForge Build Queue (`gitforge-buildd`) is a centralized build coordination system that prevents system overload from concurrent cargo builds. It enforces a maximum of **8 concurrent jobs** via semaphore-based admission control while keeping submissions queued and responsive.
 
 ## Architecture
 
@@ -233,6 +233,7 @@ cat /proc/$(pgrep gitforge-buildd)/status | grep -i sig
 | Install wrapper | `./scripts/install-cargo-wrapper.sh` |
 | Check status | `cargo-wrapper --wrapper-status` |
 | View queue | `gitforge-build --stats` |
+| Cancel a job | `gitforge-build --cancel <job-id>` |
 | Build (wait) | `cargo build` or `gitforge-build -- cargo build` |
 | Build (no wait) | `gitforge-build --no-wait -- cargo build` |
 | Bypass wrapper | `cargo-wrapper --wrapper-fallback -- cargo build` |

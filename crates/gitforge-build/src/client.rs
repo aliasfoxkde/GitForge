@@ -27,6 +27,9 @@ pub trait JobSubmitter: Send + Sync {
 
     /// Get daemon stats
     async fn get_stats(&self, socket_path: &str) -> DaemonResult;
+
+    /// Cancel a queued or running job.
+    async fn cancel_job(&self, socket_path: &str, job_id: String) -> DaemonResult;
 }
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -92,6 +95,14 @@ impl JobSubmitter for UnixSocketClient {
         let response = read_response(&mut stream).await?;
         Ok(response)
     }
+
+    async fn cancel_job(&self, socket_path: &str, job_id: String) -> DaemonResult {
+        let mut stream = UnixStream::connect(socket_path).await?;
+        let request = Request::Cancel { job_id };
+        stream.write_all(&encode_request(&request)?).await?;
+        stream.shutdown().await?;
+        Ok(read_response(&mut stream).await?)
+    }
 }
 
 /// Read a response from the stream
@@ -156,6 +167,12 @@ impl JobSubmitter for MockClient {
 
     async fn get_stats(&self, _socket_path: &str) -> DaemonResult {
         Ok(self.stats_response.clone())
+    }
+
+    async fn cancel_job(&self, _socket_path: &str, _job_id: String) -> DaemonResult {
+        Ok(Response::Error {
+            message: "cancel unavailable in mock client".to_string(),
+        })
     }
 }
 
