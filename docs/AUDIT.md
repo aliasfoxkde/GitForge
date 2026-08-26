@@ -309,3 +309,8 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   read permissions where workflows do not need write access. All 14 workflow
   and reusable-template YAML files parse successfully; no unpinned `uses:`
   references remain in those files.
+- Release jobs now publish a pinned CycloneDX JSON SBOM alongside archives;
+  CI coverage uses LLVM source instrumentation and enforces a 79.9% line gate,
+  matching the 79.98% workspace baseline measured on 2026-08-25. The gate is
+  intentionally a ratchet: it will rise with verified coverage improvements;
+  the 99% objective is not yet met.

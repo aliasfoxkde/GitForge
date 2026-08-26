@@ -92,14 +92,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libudev-dev pkg-config libssl-dev
-      - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@27435a8406f71837eac3dfecde57b1004cdf3514 # cargo-tarpaulin
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@562f912bf8a1174eb1007c4afe216a9187a8d722 # cargo-llvm-cov
       - name: Generate coverage report
-        run: cargo tarpaulin --workspace --all-features --out xml --ignore-tests --fail-under-line 70
+        run: cargo llvm-cov --workspace --all-features --no-fail-fast --cobertura --output-path cobertura.xml --fail-under-lines 79.9
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
-          files: ./tarpaulin-report.xml
+          files: ./cobertura.xml
           fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
