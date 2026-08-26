@@ -2,7 +2,7 @@ name: Security
 
 on:
   push:
-    branches: [$default-branch]
+    branches: [main]
     paths:
       - '**.rs'
       - '**/Cargo.toml'
@@ -21,6 +21,9 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   DEFAULT_BRANCH: ${{ vars.DEFAULT_BRANCH || 'main' }}
