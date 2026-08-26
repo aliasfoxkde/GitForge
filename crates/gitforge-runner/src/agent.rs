@@ -6,12 +6,13 @@ use gitforge_db::models::Runner;
 use gitforge_sandbox::DockerSandbox;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 
 /// Runner configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunnerConfig {
     /// Scheduler URL for job fetching
     pub scheduler_url: String,
@@ -27,6 +28,24 @@ pub struct RunnerConfig {
     pub fetch_interval_secs: u64,
     /// Bearer token used for scheduler service authentication.
     pub scheduler_token: Option<String>,
+}
+
+impl fmt::Debug for RunnerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RunnerConfig")
+            .field("scheduler_url", &self.scheduler_url)
+            .field("name", &self.name)
+            .field("runner_type", &self.runner_type)
+            .field("capacity", &self.capacity)
+            .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field("fetch_interval_secs", &self.fetch_interval_secs)
+            .field(
+                "scheduler_token",
+                &self.scheduler_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for RunnerConfig {
