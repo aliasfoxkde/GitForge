@@ -164,6 +164,22 @@ impl Scheduler {
         self.db_pool.is_some()
     }
 
+    /// Check whether a job is known to durable or in-memory scheduler state.
+    pub async fn job_exists(&self, job_id: JobId) -> bool {
+        if let Some(pool) = &self.db_pool {
+            return gitforge_db::queries::JobQueries::get(pool, job_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+        }
+        let state = self.state.read().await;
+        state.job_definitions.contains_key(&job_id)
+            || state.job_assignments.contains_key(&job_id)
+            || state.assigned_jobs.contains_key(&job_id)
+            || state.queue.contains(job_id)
+    }
+
     /// Read a durable pipeline run for the CI status adapter.
     pub async fn get_pipeline_run(
         &self,

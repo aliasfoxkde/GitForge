@@ -285,6 +285,12 @@ async fn cancel_job(
             )
         }
     };
+    if !state.scheduler.job_exists(job_id).await {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "job_not_found", "job_id": job_id.to_string()})),
+        );
+    }
     state.scheduler.cancel(job_id).await;
     (
         StatusCode::OK,
@@ -1009,6 +1015,37 @@ mod tests {
 
     #[tokio::test]
     async fn test_operator_token_can_cancel_job() {
+        let state = authenticated_test_state();
+        let job_id = JobId::new();
+        state
+            .scheduler
+            .enqueue(
+                job_id,
+                gitforge_common::PipelineRunId::new(),
+                gitforge_common::RepoId::new(),
+            )
+            .await;
+        let app: Router = scheduler_routes_with_tokens(
+            state,
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/jobs/{job_id}/cancel"))
+                    .header("authorization", "Bearer operator-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_operator_cancel_unknown_job_is_not_found() {
         let app: Router = scheduler_routes_with_tokens(
             authenticated_test_state(),
             Some(Arc::from("runner-secret")),
@@ -1025,7 +1062,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
