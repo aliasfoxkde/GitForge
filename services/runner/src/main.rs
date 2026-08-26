@@ -22,8 +22,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("starting GitForce Runner Agent");
 
-    // Initialize process supervision (subreaper + SIGCHLD) to prevent zombies
-    if let Err(e) = gitforge_process::init() {
+    // Initialize subreaper support without a global waitpid loop. Child
+    // ownership must remain with the runtime that spawned it.
+    if let Err(e) = gitforge_process::init_without_sigchld_reaper() {
         tracing::warn!("failed to initialize process supervision: {}", e);
     }
 

@@ -277,3 +277,19 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   remain explicitly open. The rebuilt manager also passed full workspace
   tests (`813e789e-807b-4d30-b1c5-0a9dbcda6905`) and Clippy
   (`bc4c1426-8b90-40ed-b7d1-58da3a56a5e2`), both exit 0.
+
+## Verified continuation findings — 2026-08-25 process ownership tranche
+
+- Audited all service entry points and found the process-wide
+  `waitpid(-1, WNOHANG)` reaper was enabled even where Tokio owns child
+  processes. That can consume an exit status before `Child::wait`, causing
+  false failures or hangs.
+- API, CI, runner, Git-server, and build-daemon entry points now use
+  `init_without_sigchld_reaper`; child owners are responsible for waiting on
+  children. The legacy reaper remains explicit-only until a registry-backed
+  orphan supervisor replaces it.
+- Added `gitforge-build --shutdown`, which is acknowledged over the private
+  socket and verified to terminate the daemon and remove the socket.
+- Validation: scoped service `cargo check` and strict Clippy passed; the full
+  workspace test passed through the manager as job
+  `353c5c30-dfbe-42f4-b286-52c23f6af36c` with exit 0.
