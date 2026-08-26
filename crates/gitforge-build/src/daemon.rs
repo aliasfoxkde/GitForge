@@ -158,8 +158,18 @@ async fn handle_connection(stream: UnixStream, coordinator: Arc<BuildCoordinator
                 }
             }
         }
-        Request::Cancel { job_id: _ } => Response::Error {
-            message: "cancel not implemented".to_string(),
+        Request::Cancel { job_id } => match uuid::Uuid::parse_str(&job_id) {
+            Ok(job_id) if coordinator.cancel(job_id).await => Response::Status {
+                job_id: job_id.to_string(),
+                status: "cancelled".to_string(),
+                wait_time_ms: 0,
+            },
+            Ok(_) => Response::Error {
+                message: "job not found or already terminal".to_string(),
+            },
+            Err(_) => Response::Error {
+                message: "invalid job id".to_string(),
+            },
         },
         Request::List => {
             let jobs = coordinator.list_jobs().await;

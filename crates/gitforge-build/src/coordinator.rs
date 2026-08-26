@@ -2,14 +2,14 @@
 
 use crate::job::{BuildJob, BuildResult, JobStatus, MAX_CONCURRENT_JOBS};
 use crate::protocol::{JobInfo, Response};
+use nix::sys::signal::{killpg, Signal, SIGTERM};
+use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 use tracing::{error, info, warn};
-use nix::sys::signal::{killpg, Signal, SIGTERM};
-use nix::unistd::Pid;
 
 /// Build coordinator that limits concurrent cargo invocations
 pub struct BuildCoordinator {
@@ -21,6 +21,9 @@ pub struct BuildCoordinator {
     completed_count: Arc<AtomicU64>,
     /// Job results for waiters
     results: Arc<Mutex<HashMap<uuid::Uuid, BuildResult>>>,
+    /// Process groups for running jobs, used by the control socket to cancel
+    /// a build without requiring access to the worker task.
+    active_pids: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
 }
 
 impl BuildCoordinator {
@@ -31,6 +34,7 @@ impl BuildCoordinator {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             completed_count: Arc::new(AtomicU64::new(0)),
             results: Arc::new(Mutex::new(HashMap::new())),
+            active_pids: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -39,7 +43,10 @@ impl BuildCoordinator {
         MAX_CONCURRENT_JOBS
     }
 
-    /// Submit a new build job - BLOCKS until a permit is available
+    /// Submit a build job without blocking the caller on capacity.
+    ///
+    /// The job remains queued until the worker task acquires a permit. This
+    /// keeps the daemon responsive when all build slots are busy.
     pub async fn submit(
         self: &Arc<Self>,
         cargo_args: Vec<String>,
@@ -57,28 +64,37 @@ impl BuildCoordinator {
             jobs.insert(job_id, job.clone());
         }
 
-        // BLOCKING: Acquire semaphore permit BEFORE returning
-        // This is the key fix - we await the acquire, blocking the caller
-        // when at capacity (max 2 concurrent)
-        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
-
-        // Update job status to running
-        {
-            let mut jobs = self.jobs.lock().await;
-            if let Some(j) = jobs.get_mut(&job_id) {
-                j.status = JobStatus::Running { pid: 0 };
-            }
-        }
-
-        // Spawn execution task - it will run but we already hold the permit
+        // Spawn a worker that waits for capacity independently of the client
+        // request. The permit lives for the complete process lifetime.
         tokio::spawn(async move {
+            let permit = match coordinator.semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            {
+                let mut jobs = coordinator.jobs.lock().await;
+                if matches!(
+                    jobs.get(&job_id).map(|j| &j.status),
+                    Some(JobStatus::Cancelled)
+                ) {
+                    return;
+                }
+                if let Some(j) = jobs.get_mut(&job_id) {
+                    j.status = JobStatus::Running { pid: 0 };
+                }
+            }
+
             // Execute the job
-            let result = execute_cargo_job(&job).await;
+            let result = execute_cargo_job(&job, coordinator.active_pids.clone()).await;
 
             // Update job status and record completion
             {
                 let mut jobs = coordinator.jobs.lock().await;
                 if let Some(j) = jobs.get_mut(&job_id) {
+                    if matches!(j.status, JobStatus::Cancelled) {
+                        drop(permit);
+                        return;
+                    }
                     match &result {
                         Ok(r) => {
                             j.status = JobStatus::Completed {
@@ -111,6 +127,26 @@ impl BuildCoordinator {
         });
 
         job_id
+    }
+
+    /// Cancel a queued or running build. Running jobs are terminated through
+    /// their process group so child processes cannot survive the request.
+    pub async fn cancel(&self, job_id: uuid::Uuid) -> bool {
+        let mut jobs = self.jobs.lock().await;
+        let Some(job) = jobs.get_mut(&job_id) else {
+            return false;
+        };
+        if job.is_terminal() {
+            return false;
+        }
+        job.status = JobStatus::Cancelled;
+        drop(jobs);
+
+        if let Some(pid) = self.active_pids.lock().await.get(&job_id).copied() {
+            let pgid = Pid::from_raw(pid as i32);
+            let _ = killpg(pgid, SIGTERM);
+        }
+        true
     }
 
     /// Get job status
@@ -277,7 +313,10 @@ impl Default for BuildCoordinator {
 }
 
 /// Execute a cargo job
-async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
+async fn execute_cargo_job(
+    job: &BuildJob,
+    active_pids: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
+) -> anyhow::Result<BuildResult> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
 
@@ -327,31 +366,36 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
             ));
         }
     };
+    if let Some(pid) = child.id() {
+        active_pids.lock().await.insert(job.id, pid);
+    }
 
     let timeout_duration = Duration::from_secs(3600); // 1 hour default timeout
 
+    // Drain both pipes concurrently. Reading stdout to completion before
+    // stderr can deadlock a noisy build once the stderr pipe buffer fills.
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let mut stdout_task = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut stream) = stdout.take() {
+            let _ = AsyncReadExt::read_to_string(&mut stream, &mut output).await;
+        }
+        output
+    });
+    let mut stderr_task = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut stream) = stderr.take() {
+            let _ = AsyncReadExt::read_to_string(&mut stream, &mut output).await;
+        }
+        output
+    });
+
     let result = timeout(timeout_duration, async {
         let start = std::time::Instant::now();
-
-        // Capture stdout
-        let mut stdout_buf = String::new();
-        if let Some(mut stdout) = child.stdout.take() {
-            AsyncReadExt::read_to_string(&mut stdout, &mut stdout_buf)
-                .await
-                .unwrap_or(0);
-        }
-        let stdout = stdout_buf;
-
-        // Capture stderr
-        let mut stderr_buf = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            AsyncReadExt::read_to_string(&mut stderr, &mut stderr_buf)
-                .await
-                .unwrap_or(0);
-        }
-        let stderr = stderr_buf;
-
-        // Wait for process to finish
+        let (stdout, stderr) = tokio::join!(&mut stdout_task, &mut stderr_task);
+        let stdout = stdout.unwrap_or_default();
+        let stderr = stderr.unwrap_or_default();
         let status = child.wait().await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -372,7 +416,7 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
     })
     .await;
 
-    match result {
+    let final_result = match result {
         Ok(Ok(r)) => {
             info!(
                 "job {} completed: success={}, exit_code={}, duration={}ms",
@@ -386,16 +430,20 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
         }
         Err(_) => {
             warn!("job {} timed out after {:?}", job.id, timeout_duration);
-            // Kill the process group with SIGTERM first
+            // Kill the process group with SIGTERM first and reap the child.
+            // Abort pipe readers after the process is gone so a stuck command
+            // cannot leave background tasks holding resources indefinitely.
             if let Some(pid) = child.id() {
                 let pgid = Pid::from_raw(pid as i32);
                 let _ = killpg(pgid, SIGTERM);
-                // Give it a moment then SIGKILL if still alive
-                std::thread::sleep(std::time::Duration::from_secs(5));
+                tokio::time::sleep(Duration::from_secs(5)).await;
                 let _ = killpg(pgid, Signal::SIGKILL);
             } else {
                 let _ = child.kill().await;
             }
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
             Ok(BuildResult::failed(
                 job,
                 -1,
@@ -403,7 +451,9 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
                 format!("timed out after {:?}", timeout_duration),
             ))
         }
-    }
+    };
+    active_pids.lock().await.remove(&job.id);
+    final_result
 }
 
 #[cfg(test)]
@@ -614,7 +664,10 @@ mod tests {
             .wait_for_job_with_timeout(fake_uuid, Duration::from_millis(200))
             .await;
 
-        assert!(result.is_none(), "waiting for non-existent job should timeout");
+        assert!(
+            result.is_none(),
+            "waiting for non-existent job should timeout"
+        );
     }
 
     /// Test: Status of non-existent job returns None
@@ -624,7 +677,10 @@ mod tests {
         let fake_uuid = uuid::Uuid::new_v4();
 
         let status = coordinator.get_status(&fake_uuid).await;
-        assert!(status.is_none(), "status of non-existent job should be None");
+        assert!(
+            status.is_none(),
+            "status of non-existent job should be None"
+        );
     }
 
     /// Test: Missing receipt - job completed but receipt not in results map

@@ -237,3 +237,19 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
 - Existing service edits in `services/api/src/main.rs` and
   `services/ci/src/main.rs` were pre-existing and remain intentionally
   preserved; they are not part of this queue fix.
+
+## Verified continuation findings — 2026-08-27 build-manager tranche
+
+- Fixed a control-plane deadlock in `gitforge-build`: submissions no longer
+  wait for a semaphore slot before returning, so the Unix control socket stays
+  responsive when all build capacity is occupied.
+- Fixed the high-risk child-process deadlock where stdout was drained before
+  stderr. Both pipes are now drained concurrently, preventing a noisy
+  `cargo test` from blocking on a full stderr pipe.
+- Implemented the daemon `Cancel` request. Queued jobs are marked cancelled;
+  running jobs are terminated through their process group, which also avoids
+  orphaned descendants. Timeout cleanup now uses async sleep and reaps the
+  child instead of blocking a runtime worker thread.
+- Validation: `cargo test -p gitforge-build` (53 library, 16 CLI, 4 daemon
+  tests) and `cargo clippy -p gitforge-build --all-targets -- -D warnings`
+  pass. Full workspace managed validation remains required after this change.
