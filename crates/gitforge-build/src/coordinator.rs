@@ -2,13 +2,13 @@
 
 use crate::job::{BuildJob, BuildResult, JobStatus, MAX_CONCURRENT_JOBS};
 use crate::protocol::{JobInfo, Response};
-use nix::sys::signal::{killpg, Signal, SIGTERM};
+use nix::sys::signal::{SIGTERM, Signal, killpg};
 use nix::unistd::Pid;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Semaphore};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use tracing::{error, info, warn};
 
 /// Build coordinator that limits concurrent cargo invocations
@@ -150,6 +150,42 @@ impl BuildCoordinator {
             let _ = killpg(pgid, SIGTERM);
         }
         true
+    }
+
+    /// Stop all queued and running jobs, then wait for their worker tasks to
+    /// reap their children. The forceful pass is deliberately bounded so a
+    /// child that ignores SIGTERM cannot keep the daemon shutdown hanging.
+    pub async fn shutdown(&self, grace: Duration) {
+        let job_ids: Vec<_> = {
+            let jobs = self.jobs.lock().await;
+            jobs.values()
+                .filter(|job| !job.is_terminal())
+                .map(|job| job.id)
+                .collect()
+        };
+        for job_id in job_ids {
+            let _ = self.cancel(job_id).await;
+        }
+
+        let deadline = tokio::time::Instant::now() + grace;
+        while tokio::time::Instant::now() < deadline {
+            if self.active_pids.lock().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // SIGKILL is the final containment boundary. The worker still owns
+        // and awaits the child, so normal task cleanup reaps it afterward.
+        let pids: Vec<_> = self.active_pids.lock().await.values().copied().collect();
+        for pid in pids {
+            let pgid = Pid::from_raw(pid as i32);
+            let _ = killpg(pgid, Signal::SIGCONT);
+            let _ = killpg(pgid, Signal::SIGKILL);
+        }
+        while !self.active_pids.lock().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Get job status

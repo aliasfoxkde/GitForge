@@ -5,8 +5,8 @@
 use anyhow::Result;
 use clap::Parser;
 
-use gitforge_build::client::{JobSubmitter, UnixSocketClient, DEFAULT_SOCKET};
 use gitforge_build::Response;
+use gitforge_build::client::{DEFAULT_SOCKET, JobSubmitter, UnixSocketClient};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -43,7 +43,9 @@ struct Cli {
     #[arg(long)]
     shutdown: bool,
 
-    /// cargo command and arguments (e.g., "test --workspace")
+    /// cargo command and arguments (e.g., "test --workspace"); options after
+    /// the cargo command are forwarded without requiring a second `--`.
+    #[arg(trailing_var_arg = true)]
     cargo_args: Vec<String>,
 }
 
@@ -464,6 +466,12 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.cargo_args, vec!["check", "-p", "foo", "--all-targets"]);
+    }
+
+    #[test]
+    fn test_cli_forwards_cargo_options_without_separator() {
+        let cli = Cli::try_parse_from(["gitforge-build", "test", "--workspace"]).unwrap();
+        assert_eq!(cli.cargo_args, vec!["test", "--workspace"]);
     }
 
     #[test]

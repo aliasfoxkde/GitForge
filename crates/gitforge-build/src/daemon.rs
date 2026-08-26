@@ -4,13 +4,15 @@
 
 use anyhow::Result;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 
-use gitforge_build::{encode_response, BuildCoordinator, Request, Response, MAX_CONCURRENT_JOBS};
+use gitforge_build::{
+    BuildCoordinator, MAX_CONCURRENT_JOBS, MAX_MESSAGE_SIZE, Request, Response, encode_response,
+};
 
 /// Create a shutdown flag
 pub fn create_shutdown_flag() -> Arc<AtomicBool> {
@@ -106,6 +108,13 @@ async fn main() -> Result<()> {
     drop(listener);
     let _ = std::fs::remove_file(SOCKET_PATH);
 
+    // Do not leave cargo, rustc, or test descendants orphaned when the
+    // control daemon is stopped. Give cooperative cancellation a short
+    // window, then let the coordinator force-kill and reap survivors.
+    coordinator
+        .shutdown(tokio::time::Duration::from_secs(5))
+        .await;
+
     info!("gitforge-buildd stopped");
     Ok(())
 }
@@ -125,6 +134,10 @@ async fn handle_connection(
         return;
     }
     let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_MESSAGE_SIZE {
+        error!("request exceeds maximum size: {} bytes", len);
+        return;
+    }
     let mut bytes = vec![0u8; len];
     if let Err(e) = reader.read_exact(&mut bytes).await {
         error!("read error: {}", e);

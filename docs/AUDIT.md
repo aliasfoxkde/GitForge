@@ -314,3 +314,10 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   matching the 79.98% workspace baseline measured on 2026-08-25. The gate is
   intentionally a ratchet: it will rise with verified coverage improvements;
   the 99% objective is not yet met.
+- The build manager now performs bounded coordinated shutdown: queued jobs are
+  cancelled, running process groups receive SIGCONT/SIGTERM, survivors receive
+  SIGKILL after the grace period, and the daemon waits for child reaping before
+  removing its socket. The CLI also forwards cargo flags such as
+  `gitforge-build test --workspace` without requiring a separator. A real
+  daemon smoke test confirmed socket cleanup and no surviving rustup/cargo/rustc
+  processes; cross-restart durable job recovery remains open.
