@@ -39,6 +39,10 @@ struct Cli {
     #[arg(long, value_name = "JOB_ID")]
     cancel: Option<String>,
 
+    /// Gracefully stop the build daemon
+    #[arg(long)]
+    shutdown: bool,
+
     /// cargo command and arguments (e.g., "test --workspace")
     cargo_args: Vec<String>,
 }
@@ -65,6 +69,10 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
 
     if let Some(job_id) = cli.cancel {
         return cancel_cmd(client, &socket_path, job_id).await;
+    }
+
+    if cli.shutdown {
+        return shutdown_cmd(client, &socket_path).await;
     }
 
     // Need at least one cargo arg
@@ -129,6 +137,17 @@ async fn cancel_cmd<C: JobSubmitter>(client: &C, socket_path: &str, job_id: Stri
     match client.cancel_job(socket_path, job_id).await? {
         Response::Status { status, .. } => {
             println!("{}", status);
+            Ok(())
+        }
+        Response::Error { message } => anyhow::bail!("error: {}", message),
+        response => anyhow::bail!("unexpected response: {:?}", response),
+    }
+}
+
+async fn shutdown_cmd<C: JobSubmitter>(client: &C, socket_path: &str) -> Result<()> {
+    match client.shutdown(socket_path).await? {
+        Response::Shutdown => {
+            println!("shutdown requested");
             Ok(())
         }
         Response::Error { message } => anyhow::bail!("error: {}", message),

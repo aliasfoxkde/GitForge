@@ -59,7 +59,10 @@ pub fn become_subreaper() -> Result<(), std::io::Error> {
 ### 1.2 SIGCHLD Handler
 **Priority: CRITICAL** - Ensures proper child reaping
 
-Using SIG_DFL (default handler) is sufficient - kernel will reap children automatically when they exit. Using waitpid() in a loop is more robust.
+The owner of a child must call `wait()`/`waitpid()` and consume its exit status.
+The build daemon deliberately does not install a process-wide `waitpid(-1,
+WNOHANG)` loop because that can steal statuses from Tokio-owned children.
+Orphan reaping belongs in a supervisor with an explicit child registry.
 
 ```rust
 // crates/gitforce-process/src/signal.rs

@@ -200,13 +200,14 @@ gitforge-buildd &
 
 ### Zombie processes appearing
 
-The daemon should reap zombies via subreaper. If zombies appear:
+The daemon owns and waits for every child it starts; it does not run a global
+SIGCHLD reaper because that races with Tokio. If zombies appear:
 
 ```bash
 # Check daemon is functioning
 ps aux | grep gitforge-buildd
 
-# Check for SIGCHLD handler
+# Check daemon and child states
 cat /proc/$(pgrep gitforge-buildd)/status | grep -i sig
 ```
 

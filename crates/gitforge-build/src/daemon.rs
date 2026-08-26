@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     info!("max concurrent jobs: {}", MAX_CONCURRENT_JOBS);
 
     // Initialize process supervision (subreaper + SIGCHLD)
-    if let Err(e) = gitforge_process::init() {
+    if let Err(e) = gitforge_process::init_without_sigchld_reaper() {
         warn!("failed to initialize process supervision: {}", e);
     }
 
@@ -65,13 +65,18 @@ async fn main() -> Result<()> {
 
     info!("listening on {}", SOCKET_PATH);
 
-    // Handle connections
-    let shutdown = async {
+    // Handle connections. The socket shutdown request and OS signal share the
+    // same flag so operators can use the manager to stop the daemon without
+    // needing a second process-control channel.
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let signal_shutdown = shutdown_flag.clone();
+    let shutdown_signal = async {
         tokio::signal::ctrl_c().await.ok();
+        signal_shutdown.store(true, Ordering::SeqCst);
         info!("ctrl-c received, shutting down");
     };
 
-    tokio::pin!(shutdown);
+    tokio::pin!(shutdown_signal);
 
     loop {
         tokio::select! {
@@ -79,7 +84,8 @@ async fn main() -> Result<()> {
                 match result {
                     Ok((stream, _)) => {
                         let coordinator = coordinator.clone();
-                        tokio::spawn(handle_connection(stream, coordinator));
+                        let shutdown = shutdown_flag.clone();
+                        tokio::spawn(handle_connection(stream, coordinator, shutdown));
                     }
                     Err(e) => {
                         error!("accept error: {}", e);
@@ -87,7 +93,10 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            _ = &mut shutdown => {
+            _ = &mut shutdown_signal => {
+                break;
+            }
+            _ = create_shutdown_future(shutdown_flag.clone()) => {
                 break;
             }
         }
@@ -102,7 +111,11 @@ async fn main() -> Result<()> {
 }
 
 /// Handle a single connection
-async fn handle_connection(stream: UnixStream, coordinator: Arc<BuildCoordinator>) {
+async fn handle_connection(
+    stream: UnixStream,
+    coordinator: Arc<BuildCoordinator>,
+    shutdown: Arc<AtomicBool>,
+) {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Read request - first 4 bytes are length prefix
@@ -178,6 +191,7 @@ async fn handle_connection(stream: UnixStream, coordinator: Arc<BuildCoordinator
         Request::Stats => coordinator.stats().await,
         Request::Shutdown => {
             info!("shutdown requested via socket");
+            shutdown.store(true, Ordering::SeqCst);
             Response::Shutdown
         }
     };
