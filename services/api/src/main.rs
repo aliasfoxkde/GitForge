@@ -145,6 +145,9 @@ pub async fn graceful_shutdown_delay() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn clear_env() {
         std::env::remove_var("JWT_SECRET");
@@ -154,6 +157,7 @@ mod tests {
 
     #[test]
     fn test_load_config_requires_jwt_secret() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         std::env::remove_var("JWT_SECRET");
 
@@ -169,6 +173,7 @@ mod tests {
 
     #[test]
     fn test_load_config_with_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         std::env::set_var("JWT_SECRET", "production-secret-32chars!!");
         std::env::set_var("PORT", "3000");
@@ -184,6 +189,7 @@ mod tests {
 
     #[test]
     fn test_load_config_test_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         // Explicitly remove DATABASE_URL to ensure clean state
         std::env::remove_var("DATABASE_URL");
@@ -263,6 +269,7 @@ mod tests {
 
     #[test]
     fn test_load_config_port_parsing() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         std::env::set_var("JWT_SECRET", "test-secret");
         std::env::set_var("PORT", "9000");
@@ -275,6 +282,7 @@ mod tests {
 
     #[test]
     fn test_load_config_invalid_port_uses_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         std::env::set_var("JWT_SECRET", "test-secret");
         std::env::set_var("PORT", "invalid");
@@ -288,6 +296,7 @@ mod tests {
 
     #[test]
     fn test_load_config_port_zero_is_valid() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         std::env::set_var("JWT_SECRET", "test-secret");
         std::env::set_var("PORT", "0");
@@ -301,6 +310,7 @@ mod tests {
 
     #[test]
     fn test_load_config_port_max_u16() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         std::env::set_var("JWT_SECRET", "test-secret");
         std::env::set_var("PORT", "65535");
@@ -336,6 +346,7 @@ mod tests {
 
     #[test]
     fn test_clear_env_removes_all_vars() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Set then clear
         std::env::set_var("JWT_SECRET", "test");
         std::env::set_var("PORT", "1234");
