@@ -32,6 +32,7 @@ pub fn get_openapi_spec() -> serde_json::Value {
             {"name": "health", "description": "Health check endpoints"},
             {"name": "repos", "description": "Repository management"},
             {"name": "ci", "description": "CI/CD pipelines"},
+            {"name": "users", "description": "Administrative user management"},
             {"name": "runners", "description": "Runner management"},
             {"name": "artifacts", "description": "Artifact management"}
         ],
@@ -137,6 +138,30 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     "responses": {
                         "204": {"description": "Repository deleted"},
                         "404": {"description": "Repository not found"}
+                    }
+                }
+            },
+            "/users/{id}/role": {
+                "patch": {
+                    "tags": ["users"],
+                    "summary": "Update a user's role",
+                    "description": "Administrator-only role update; the last administrator cannot be demoted.",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/UpdateRoleRequest"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {"description": "Role updated"},
+                        "400": {"description": "Invalid role or user ID"},
+                        "403": {"description": "Administrator access required"},
+                        "409": {"description": "The last administrator cannot be demoted"}
                     }
                 }
             },
@@ -427,6 +452,16 @@ pub fn get_openapi_spec() -> serde_json::Value {
                         "visibility": {"type": "string", "nullable": true}
                     }
                 },
+                "UpdateRoleRequest": {
+                    "type": "object",
+                    "required": ["role"],
+                    "properties": {
+                        "role": {
+                            "type": "string",
+                            "enum": ["admin", "maintainer", "developer", "read_only"]
+                        }
+                    }
+                },
                 "PipelineRunResponse": {
                     "type": "object",
                     "properties": {
@@ -556,6 +591,7 @@ mod tests {
         let paths = spec.get("paths").unwrap().as_object().unwrap();
         assert!(paths.contains_key("/health"));
         assert!(paths.contains_key("/repos"));
+        assert!(paths.contains_key("/users/{id}/role"));
         assert!(paths.contains_key("/pipelines"));
         assert!(paths.contains_key("/runners"));
         assert!(paths.contains_key("/artifacts"));

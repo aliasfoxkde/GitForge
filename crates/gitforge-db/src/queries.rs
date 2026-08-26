@@ -190,6 +190,27 @@ impl UserQueries {
         Ok(row.map(|row| row.get::<String, _>("role")))
     }
 
+    /// Set a user's persisted least-privilege role.
+    pub async fn set_role(pool: &Pool, id: UserId, role: &str) -> Result<bool> {
+        let result = sqlx::query("UPDATE users SET role = ? WHERE id = ?")
+            .bind(role)
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to set user role: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Count users currently holding a persisted role.
+    pub async fn count_role(pool: &Pool, role: &str) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM users WHERE role = ?")
+            .bind(role)
+            .fetch_one(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to count user roles: {}", e)))?;
+        Ok(row.get::<i64, _>("count"))
+    }
+
     /// Create a new user
     pub async fn create(pool: &Pool, user: &crate::models::User) -> Result<()> {
         sqlx::query(

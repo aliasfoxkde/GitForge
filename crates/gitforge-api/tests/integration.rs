@@ -351,6 +351,151 @@ async fn test_repository_access_is_owner_scoped() {
 }
 
 #[tokio::test]
+async fn test_admin_role_management_is_authorized_and_persisted() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let admin = gitforge_db::models::User::new(
+        "role-admin".to_string(),
+        "role-admin@example.com".to_string(),
+        "hash".to_string(),
+    );
+    let second_admin = gitforge_db::models::User::new(
+        "role-admin-2".to_string(),
+        "role-admin-2@example.com".to_string(),
+        "hash".to_string(),
+    );
+    let developer = gitforge_db::models::User::new(
+        "role-developer".to_string(),
+        "role-developer@example.com".to_string(),
+        "hash".to_string(),
+    );
+    for user in [&admin, &second_admin, &developer] {
+        gitforge_db::queries::UserQueries::create(&pool, user)
+            .await
+            .unwrap();
+    }
+    assert!(
+        gitforge_db::queries::UserQueries::set_role(&pool, admin.id, "admin")
+            .await
+            .unwrap()
+    );
+    assert!(
+        gitforge_db::queries::UserQueries::set_role(&pool, second_admin.id, "admin")
+            .await
+            .unwrap()
+    );
+
+    let auth = ApiAuth::new("test-secret");
+    let admin_token = auth
+        .generate_token(admin.id, "role-admin", "admin")
+        .unwrap();
+    let developer_token = auth
+        .generate_token(developer.id, "role-developer", "developer")
+        .unwrap();
+    let app = ApiServer::new("test-secret", pool.clone()).into_router();
+
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/users/{}/role", developer.id))
+                .header("Authorization", format!("Bearer {developer_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"maintainer"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let invalid = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/users/{}/role", developer.id))
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"root"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let promoted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/users/{}/role", developer.id))
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"maintainer"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(promoted.status(), StatusCode::OK);
+    assert_eq!(
+        gitforge_db::queries::UserQueries::get_role(&pool, developer.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("maintainer")
+    );
+
+    let demoted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/users/{}/role", admin.id))
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"developer"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(demoted.status(), StatusCode::OK);
+
+    let second_admin_token = auth
+        .generate_token(second_admin.id, "role-admin-2", "admin")
+        .unwrap();
+
+    let last_admin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/users/{}/role", second_admin.id))
+                .header("Authorization", format!("Bearer {second_admin_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"developer"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(last_admin.status(), StatusCode::CONFLICT);
+
+    let stale_admin = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/users/{}/role", second_admin.id))
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"developer"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_admin.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn test_get_nonexistent_repo() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();
@@ -361,6 +506,9 @@ async fn test_get_nonexistent_repo() {
         "hash".to_string(),
     );
     gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+    gitforge_db::queries::UserQueries::set_role(&pool, user.id, "admin")
         .await
         .unwrap();
 
@@ -502,6 +650,9 @@ async fn test_api_artifacts_endpoint() {
     gitforge_db::queries::UserQueries::create(&pool, &user)
         .await
         .unwrap();
+    gitforge_db::queries::UserQueries::set_role(&pool, user.id, "admin")
+        .await
+        .unwrap();
 
     let temp_dir = tempfile::tempdir().unwrap();
     let storage = FileStorage::new(temp_dir.path()).await.unwrap();
@@ -540,6 +691,9 @@ async fn test_api_artifact_content_requires_auth_and_returns_bytes() {
         "hash".to_string(),
     );
     gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+    gitforge_db::queries::UserQueries::set_role(&pool, user.id, "admin")
         .await
         .unwrap();
 

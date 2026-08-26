@@ -1072,8 +1072,37 @@ mod tests {
         let runner = make_runner(runner_id, "test-runner", "online", 2);
 
         scheduler.register_runner(runner).await;
-        scheduler.heartbeat(runner_id).await;
-        // No panic means success
+        assert!(scheduler.heartbeat(runner_id).await);
+        assert!(!scheduler.heartbeat(RunnerId::new()).await);
+    }
+
+    #[tokio::test]
+    async fn test_stale_runner_is_offlined_and_assigned_job_is_requeued() {
+        let scheduler = Scheduler::new();
+        let runner_id = RunnerId::new();
+        let mut runner = make_runner(runner_id, "stale-runner", "online", 1);
+        runner.last_heartbeat = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        scheduler.register_runner(runner).await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                PipelineRunId::new(),
+                RepoId::new(),
+                vec!["cargo test".to_string()],
+                None,
+            )
+            .await;
+        scheduler.process_queue().await;
+        assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
+
+        assert_eq!(scheduler.mark_stale_runners_offline(30).await, 1);
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        assert_eq!(scheduler.queue_len().await, 1);
+
+        let state = scheduler.state.read().await;
+        assert_eq!(state.runners[&runner_id].status, "offline");
+        assert!(!state.job_leases.contains_key(&job_id));
     }
 
     #[tokio::test]
@@ -1385,7 +1414,21 @@ mod tests {
         assert!(!lease.is_empty());
         assert!(scheduler.start_job(job_id, runner_id, &lease).await.is_ok());
         assert!(scheduler
+            .start_job(job_id, RunnerId::new(), &lease)
+            .await
+            .is_err());
+        assert!(scheduler
             .start_job(job_id, runner_id, "wrong")
+            .await
+            .is_err());
+        assert!(scheduler
+            .complete_job_with_lease(
+                job_id,
+                RunnerId::new(),
+                &lease,
+                true,
+                "{\"success\":true}".to_string(),
+            )
             .await
             .is_err());
         assert!(scheduler

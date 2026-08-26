@@ -205,6 +205,24 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   focused authorization tests pass. Whole-workspace validation remains a
   later managed gate after this tranche.
 
+## Verified continuation findings — 2026-08-27 role and lease tranche
+
+- Added administrator-only `PATCH /api/users/{id}/role` with a strict role
+  allowlist and last-administrator protection. Protected middleware resolves
+  the persisted role for each request, so demoted JWTs lose administrative
+  access immediately rather than retaining stale claims until expiry.
+- Added scheduler regressions for unknown heartbeats, stale-runner offline
+  transitions, assignment requeue and lease cleanup, wrong-runner rejection,
+  and wrong-lease rejection. The contract remains intentionally single-
+  scheduler: the active lease map is process-local until durable generation
+  fencing is implemented.
+- Updated the OpenAPI specification and API/job-contract documentation for
+  role management and the multi-scheduler boundary.
+- Validation: 181 API unit tests, 43 API integration tests, 66 database tests,
+  and 87 scheduler tests pass; strict Clippy and scoped formatting pass. The
+  managed full-workspace GitForge job `5db689dc-a0f9-48fa-b982-d345ea7ecd46`
+  passed with exit 0 at `2026-08-26T03:36:11Z`.
+
 - Fixed a scheduler cancellation invariant: queue removal is lazy, so stale
   `BinaryHeap` entries are now discarded by both `peek` and `dequeue` before
   they can be assigned. Added queue- and scheduler-level regression tests.

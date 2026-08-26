@@ -28,6 +28,13 @@ shared authenticated context and resolve artifact access through the owning
 job, pipeline run, and repository; unauthorized artifacts are returned as
 not-found to avoid leaking private resource existence.
 
+Administrators may change a user's persisted role with
+`PATCH /api/users/{id}/role`. Supported roles are `admin`, `maintainer`,
+`developer`, and `read_only`; non-administrators receive `403`, invalid roles
+receive `400`, and the last administrator cannot be demoted. Protected
+requests resolve the current persisted role, so demotion takes effect
+immediately even when an older JWT is presented.
+
 GitForge uses JWT tokens for API authentication. Include the token in the Authorization header:
 
 ```
@@ -60,6 +67,17 @@ GET /repos
 POST /repos
 GET /repos/{id}
 DELETE /repos/{id}
+```
+
+#### User roles
+
+```
+PATCH /users/{id}/role
+```
+
+**Request:**
+```json
+{"role": "maintainer"}
 ```
 
 **Create Repository Request:**
