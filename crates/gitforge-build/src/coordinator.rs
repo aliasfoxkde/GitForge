@@ -144,6 +144,9 @@ impl BuildCoordinator {
 
         if let Some(pid) = self.active_pids.lock().await.get(&job_id).copied() {
             let pgid = Pid::from_raw(pid as i32);
+            // A child stopped by terminal job control will not process TERM
+            // until continued. Always resume it before termination.
+            let _ = killpg(pgid, Signal::SIGCONT);
             let _ = killpg(pgid, SIGTERM);
         }
         true
@@ -345,7 +348,12 @@ async fn execute_cargo_job(
     let mut cmd = tokio::process::Command::new(&cargo_executable);
     cmd.args(&cargo_args);
 
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Builds are non-interactive. Detaching stdin prevents a child from
+    // stopping on terminal input/job-control signals when the daemon runs in
+    // a PTY.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     if let Some(ref dir) = job.working_dir {
         cmd.current_dir(dir);
@@ -435,6 +443,7 @@ async fn execute_cargo_job(
             // cannot leave background tasks holding resources indefinitely.
             if let Some(pid) = child.id() {
                 let pgid = Pid::from_raw(pid as i32);
+                let _ = killpg(pgid, Signal::SIGCONT);
                 let _ = killpg(pgid, SIGTERM);
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let _ = killpg(pgid, Signal::SIGKILL);

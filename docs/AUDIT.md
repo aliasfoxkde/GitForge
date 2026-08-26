@@ -254,4 +254,6 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
 - Validation: `cargo test -p gitforge-build` (53 library, 16 CLI, 4 daemon
   tests) and `cargo clippy -p gitforge-build --all-targets -- -D warnings`
   pass. The CLI now polls durable daemon status for synchronous submissions;
-  full workspace managed validation remains required after this change.
+  full workspace managed validation also passed through the daemon:
+  `2375c12a-75a7-4522-b3e4-1d5859e9033a` (`cargo test --workspace`, exit 0)
+  and `6f22bbf8-12cd-4bf9-a92d-40f741b06e11` (workspace Clippy, exit 0).
