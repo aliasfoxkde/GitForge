@@ -6,6 +6,7 @@ use gitforge_common::{JobId, PipelineRunId, RepoId, RunnerId};
 use gitforge_db::models::{Job as DbJob, PipelineRun as DbPipelineRun, Runner};
 use gitforge_db::Pool;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
@@ -58,6 +59,9 @@ pub struct SchedulerState {
     /// Opaque per-assignment lease tokens. A runner must present the active
     /// token for the started and completion transitions.
     pub job_leases: HashMap<JobId, String>,
+    /// Jobs cancelled by an operator in this scheduler process. Durable
+    /// status is checked as well when a database is configured.
+    pub cancelled_jobs: std::collections::HashSet<JobId>,
 }
 
 /// The scheduler-facing portion of a CI job definition. It is deliberately
@@ -85,6 +89,7 @@ impl SchedulerState {
             job_definitions: HashMap::new(),
             completed_receipts: HashMap::new(),
             job_leases: HashMap::new(),
+            cancelled_jobs: std::collections::HashSet::new(),
         }
     }
 
@@ -115,6 +120,7 @@ pub struct Scheduler {
     policy: Arc<dyn SchedulingPolicy>,
     event_tx: broadcast::Sender<SchedulerEvent>,
     db_pool: Option<Pool>,
+    recovery_done: Arc<AtomicBool>,
 }
 
 impl Scheduler {
@@ -126,6 +132,7 @@ impl Scheduler {
             policy: Arc::new(SimplePolicy::new()),
             event_tx,
             db_pool: None,
+            recovery_done: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -137,6 +144,7 @@ impl Scheduler {
             policy: Arc::new(SimplePolicy::new()),
             event_tx,
             db_pool: Some(pool),
+            recovery_done: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -147,6 +155,7 @@ impl Scheduler {
             state: self.state,
             event_tx: self.event_tx,
             db_pool: self.db_pool,
+            recovery_done: self.recovery_done,
         }
     }
 
@@ -255,6 +264,7 @@ impl Scheduler {
     /// Cancel a job
     pub async fn cancel(&self, job_id: JobId) {
         let mut state = self.state.write().await;
+        state.cancelled_jobs.insert(job_id);
         if let Some(_job) = state.queue.remove(job_id) {
             tracing::debug!("job {} cancelled", job_id);
         }
@@ -424,6 +434,26 @@ impl Scheduler {
 
     /// Try to assign jobs to available runners
     pub async fn process_queue(&self) {
+        if self.db_pool.is_some() && !self.recovery_done.swap(true, Ordering::AcqRel) {
+            if let Some(pool) = &self.db_pool {
+                match gitforge_db::queries::JobQueries::requeue_inflight(pool).await {
+                    Ok(count) if count > 0 => {
+                        tracing::warn!(count, "requeued jobs left in-flight by scheduler restart");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "failed to recover in-flight jobs");
+                        self.recovery_done.store(false, Ordering::Release);
+                        return;
+                    }
+                }
+            }
+            if let Err(error) = self.load_pending_jobs().await {
+                tracing::error!(%error, "failed to load durable jobs after scheduler recovery");
+                self.recovery_done.store(false, Ordering::Release);
+                return;
+            }
+        }
         let mut state = self.state.write().await;
         let runners = state.list_online_runners();
         let available_runners = runners.len();
@@ -513,12 +543,40 @@ impl Scheduler {
                     db_job.pipeline_run_id,
                     RepoId::new(), // RepoId not in job model, use default
                 ));
+                state.job_definitions.insert(
+                    db_job.id,
+                    JobExecutionDefinition {
+                        commands: db_job.commands,
+                        working_dir: db_job.working_dir,
+                    },
+                );
                 loaded += 1;
             }
         }
 
         tracing::info!("loaded {} pending jobs from database", loaded);
         Ok(loaded)
+    }
+
+    /// Return whether an operator has cancelled a job. This endpoint is
+    /// intentionally read-only and lets a runner terminate its local
+    /// sandbox without granting the runner authority to cancel jobs.
+    pub async fn is_cancelled(&self, job_id: JobId) -> bool {
+        {
+            let state = self.state.read().await;
+            if state.cancelled_jobs.contains(&job_id) {
+                return true;
+            }
+        }
+        if let Some(pool) = &self.db_pool {
+            return gitforge_db::queries::JobQueries::get(pool, job_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|job| job.status == "cancelled")
+                .unwrap_or(false);
+        }
+        false
     }
 
     /// Get queue length

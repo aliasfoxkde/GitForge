@@ -80,6 +80,7 @@ pub fn scheduler_routes<S: Clone + Send + Sync + 'static>(
         .route("/jobs/{id}/claim", post(claim_job))
         .route("/jobs/{id}/started", post(start_job))
         .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/jobs/{id}/cancelled", get(job_cancelled))
         .route("/jobs/{id}/assign", post(assign_job))
         .route("/jobs/{id}/complete", post(complete_job))
         .route("/pipelines/runs/{id}", get(get_pipeline_run))
@@ -252,6 +253,32 @@ async fn cancel_job(
             "contract_version": "harness.job.v1",
             "status": "cancelled",
             "job_id": job_id.to_string(),
+        })),
+    )
+}
+
+/// Let an assigned runner observe operator cancellation and stop its local
+/// executor. This does not authorize cancellation and is protected by the
+/// same scheduler token as all runner-control routes.
+async fn job_cancelled(
+    State(state): State<SchedulerServerState>,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    let job_id = match Uuid::parse_str(&job_id) {
+        Ok(id) => JobId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_job_id"})),
+            )
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "contract_version": "harness.job.v1",
+            "job_id": job_id.to_string(),
+            "cancelled": state.scheduler.is_cancelled(job_id).await,
         })),
     )
 }
@@ -622,6 +649,24 @@ mod tests {
 
         let resp = response.into_response();
         assert_status(resp, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_job_cancelled_probe_tracks_operator_cancellation() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let job_id = JobId::new();
+
+        assert!(!state.scheduler.is_cancelled(job_id).await);
+        state.scheduler.cancel(job_id).await;
+
+        let response = job_cancelled(
+            axum::extract::State(state),
+            axum::extract::Path(job_id.to_string()),
+        )
+        .await
+        .into_response();
+        assert_status(response, StatusCode::OK);
     }
 
     #[tokio::test]

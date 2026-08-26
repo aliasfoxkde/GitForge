@@ -20,8 +20,10 @@ that token for the following transitions:
 - `POST /jobs/{id}/claim` confirms the runner assignment and returns the lease.
 - `POST /jobs/{id}/started` changes the job to `running`.
 - `POST /jobs/{id}/cancel` records an operator cancellation as terminal in
-  the scheduler. It does not yet signal a running Docker executor, so a
-  cancelled running job must not be treated as physically stopped.
+  the scheduler. A running runner polls `GET /jobs/{id}/cancelled` and
+  destroys its active sandbox when the probe becomes true. The scheduler’s
+  terminal state is authoritative; runner cleanup failures remain observable
+  in runner logs.
 - `POST /jobs/{id}/complete` records the terminal receipt.
 
 Runner heartbeats are rejected for unknown runner IDs and are persisted to the
@@ -34,11 +36,12 @@ assignment, while a wrong runner or lease is rejected.
 
 ## Current boundary
 
-The crate-level lifecycle, durable heartbeat/cancellation transitions, and
-database writes are covered by scheduler, runner, and database tests. The
-in-memory assignment/lease map is not restart-safe yet: a scheduler restart
-must reconcile assigned/running database rows before accepting completions.
-Running-job cancellation, streaming log append, artifact upload, granular
-authorization, and an end-to-end service test remain follow-up work before
-exposing the endpoints outside a trusted local network. The scheduler must
-not be treated as a public API until those controls are complete.
+The crate-level lifecycle, durable heartbeat/cancellation transitions,
+database recovery writes, cancellation probe, and runner sandbox cancellation
+are covered by scheduler, runner, and database tests. A scheduler restart
+requeues durable assigned/running rows and restores persisted command
+definitions before scheduling. The lease map remains process-local and is
+invalidated by recovery; a future durable lease table is still required for
+multi-scheduler operation. Streaming log append, granular authorization, and
+an end-to-end service test remain follow-up work before exposing the endpoints
+outside a trusted local network.

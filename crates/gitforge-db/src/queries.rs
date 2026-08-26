@@ -768,11 +768,12 @@ impl JobQueries {
 
     /// List all pending jobs
     pub async fn list_pending(pool: &Pool) -> Result<Vec<crate::models::Job>> {
-        let rows =
-            sqlx::query("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC")
-                .fetch_all(pool.pool())
-                .await
-                .map_err(|e| Error::database(format!("failed to list pending jobs: {}", e)))?;
+        let rows = sqlx::query(
+            "SELECT * FROM jobs WHERE status IN ('pending', 'queued') ORDER BY created_at ASC",
+        )
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list pending jobs: {}", e)))?;
 
         let jobs = rows
             .into_iter()
@@ -809,6 +810,20 @@ impl JobQueries {
             .collect();
 
         Ok(jobs)
+    }
+
+    /// Requeue jobs that were assigned or running when the scheduler stopped.
+    /// Runner leases are process-local, so retaining those states after a
+    /// restart would strand work permanently. The next scheduler instance
+    /// safely reassigns these jobs to a live runner.
+    pub async fn requeue_inflight(pool: &Pool) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL WHERE status IN ('assigned', 'running')",
+        )
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to requeue in-flight jobs: {}", e)))?;
+        Ok(result.rows_affected())
     }
 }
 
@@ -1387,6 +1402,52 @@ mod tests {
         let pending = JobQueries::list_pending(&pool).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].name, "build");
+    }
+
+    #[tokio::test]
+    async fn test_requeue_inflight_clears_assignment_and_start_state() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "recovery-owner".to_string(),
+            "recovery@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "recovery-repo".to_string(),
+            user.id,
+            "/git/recovery".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "recovery-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "main".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+        let job = crate::models::Job::new(run.id, "build".to_string());
+        JobQueries::create(&pool, &job).await.unwrap();
+        JobQueries::update_status(&pool, job.id, "running")
+            .await
+            .unwrap();
+
+        assert_eq!(JobQueries::requeue_inflight(&pool).await.unwrap(), 1);
+        let recovered = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, "queued");
+        assert!(recovered.runner_id.is_none());
+        assert!(recovered.started_at.is_none());
     }
 
     #[tokio::test]

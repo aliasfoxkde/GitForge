@@ -53,8 +53,10 @@ workspace below that canonical root.
   proves missing bearer tokens are rejected and a valid token returns exact
   artifact bytes.
 
-The runner-executed timeout/cancellation matrix and authenticated Control
-Center API/UI artifact readback are still required before production
+The runner-executed timeout/cancellation matrix now has the scheduler probe
+and sandbox-destroy path, but still needs a Docker-backed service E2E test.
+Authenticated Control Center API/UI artifact readback is still required before
+production
 promotion. GitForge API readback is proven. Intermittent Docker
 acquisition/cleanup stalls remain an operational risk and must be observed
 through bounded failure receipts rather than hidden.

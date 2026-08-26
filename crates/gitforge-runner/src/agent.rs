@@ -256,17 +256,25 @@ impl RunnerAgent {
                                         tracing::warn!("unable to claim job {}", job.job_id);
                                         continue;
                                     };
-                                    // Execute the job
-                                    Self::execute_job(
-                                        &executor,
-                                        &job,
-                                        &fetch_client,
-                                        &fetch_url,
-                                        fetch_runner_id,
-                                        &lease_token,
-                                        fetch_token.as_deref(),
-                                    )
-                                    .await;
+                                    // Execute concurrently so the fetch loop
+                                    // remains responsive and cancellation can
+                                    // be observed while the sandbox runs.
+                                    let executor = executor.clone();
+                                    let client = fetch_client.clone();
+                                    let url = fetch_url.clone();
+                                    let token = fetch_token.clone();
+                                    tokio::spawn(async move {
+                                        Self::execute_job(
+                                            &executor,
+                                            &job,
+                                            &client,
+                                            &url,
+                                            fetch_runner_id,
+                                            &lease_token,
+                                            token.as_deref(),
+                                        )
+                                        .await;
+                                    });
                                 }
                             }
                         }
@@ -389,6 +397,43 @@ impl RunnerAgent {
 
         tracing::info!("executing job {} in container", assignment.job_id);
 
+        let cancellation_client = client.clone();
+        let cancellation_url = scheduler_url.to_string();
+        let cancellation_job_id = assignment.job_id.clone();
+        let cancellation_executor = executor.clone();
+        let cancellation_token = scheduler_token.map(ToOwned::to_owned);
+        let cancellation_watch = tokio::spawn(async move {
+            let endpoint = format!(
+                "{}/jobs/{}/cancelled",
+                cancellation_url, cancellation_job_id
+            );
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut request = cancellation_client.get(&endpoint);
+                if let Some(token) = &cancellation_token {
+                    request = request.bearer_auth(token);
+                }
+                let cancelled = match request.send().await {
+                    Ok(response) => response
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .and_then(|payload| payload["cancelled"].as_bool())
+                        .unwrap_or(false),
+                    Err(_) => false,
+                };
+                if cancelled {
+                    if let Ok(job_id) = uuid::Uuid::parse_str(&cancellation_job_id) {
+                        let job_id = JobId::from(job_id);
+                        if let Err(error) = cancellation_executor.cancel(&job_id).await {
+                            tracing::warn!(%error, %job_id, "failed to destroy cancelled sandbox");
+                        }
+                    }
+                    break;
+                }
+            }
+        });
+
         let started_url = format!("{}/jobs/{}/started", scheduler_url, assignment.job_id);
         let mut started_request = client.post(&started_url).json(&serde_json::json!({
             "runner_id": runner_id.to_string(),
@@ -409,6 +454,7 @@ impl RunnerAgent {
 
         // Execute the job
         let result = executor.execute(executable).await;
+        cancellation_watch.abort();
 
         tracing::info!(
             "job {} completed: success={}, exit_code={}",
