@@ -179,6 +179,25 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   during migration. The pre-existing service edits remain preserved alongside
   this scoped security change.
 
+## Verified continuation findings — 2026-08-27 auth boundary tranche
+
+- Activated the existing shared JWT middleware and `AuthenticatedUser`
+  extractor on the protected API route boundary. Token parsing/validation now
+  runs before protected handlers; resource-level ownership checks remain in
+  handlers where required.
+- Split runner registration from runner administration. `POST /api/runners`
+  remains an explicit unauthenticated bootstrap exception, while runner list
+  and detail routes remain protected. This exception is now represented in the
+  route structure instead of being an accidental consequence of missing
+  middleware.
+- Migrated webhook pipeline triggering to `AuthenticatedUser`, removing its
+  route-local bearer-token parser. Repository, artifact, runner-admin, and CI
+  handlers still contain legacy compatibility parsing and are tracked for the
+  next migration slices.
+- Validation: GitForge API unit tests (212), integration tests (40), focused
+  middleware tests, and webhook authorization/success tests pass. Whole-
+  workspace validation remains a later managed gate after this tranche.
+
 - Fixed a scheduler cancellation invariant: queue removal is lazy, so stale
   `BinaryHeap` entries are now discarded by both `peek` and `dequeue` before
   they can be assigned. Added queue- and scheduler-level regression tests.

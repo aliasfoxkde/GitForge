@@ -2,7 +2,7 @@
 
 use crate::auth::Claims;
 use axum::{
-    extract::Request,
+    extract::{Extension, Request},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -22,7 +22,7 @@ pub struct AuthErrorResponse {
 
 /// Authentication middleware
 pub async fn auth_middleware(
-    auth: Arc<crate::auth::ApiAuth>,
+    Extension(auth): Extension<Arc<crate::auth::ApiAuth>>,
     request: Request,
     next: Next,
 ) -> Response {

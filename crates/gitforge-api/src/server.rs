@@ -3,10 +3,13 @@
 use crate::auth::ApiAuth;
 use crate::metrics::Metrics;
 use crate::metrics_middleware::MetricsLayer;
-use crate::routes::{artifact_routes, ci_routes, repo_routes, runner_routes, webhook_routes};
+use crate::routes::{
+    artifact_routes, ci_routes, public_runner_routes, repo_routes, runner_routes, webhook_routes,
+};
 use axum::{
     extract::Extension,
     http::StatusCode,
+    middleware,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -80,6 +83,9 @@ impl ApiServer {
         public_routes = public_routes.merge(metrics);
         public_routes = public_routes.merge(dashboard);
         public_routes = public_routes.merge(swagger);
+        public_routes = public_routes
+            .nest("/api", public_runner_routes())
+            .layer(Extension(Arc::new(pool.clone())));
 
         // Auth routes (public - no auth required for login)
         let auth_routes = Router::new()
@@ -96,6 +102,11 @@ impl ApiServer {
             .merge(runner_routes())
             .merge(artifact_routes())
             .merge(webhook_routes())
+            // Authenticate once at the protected-route boundary. Individual
+            // handlers may still apply resource authorization, but token
+            // parsing and validation must not depend on every handler
+            // remembering to duplicate it.
+            .layer(middleware::from_fn(crate::middleware::auth_middleware))
             .layer(Extension(Arc::new(auth.clone())))
             .layer(Extension(pool_arc.clone()))
             .layer(Extension(Option::<Arc<Scheduler>>::None)); // Default: no scheduler

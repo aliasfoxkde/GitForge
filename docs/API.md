@@ -15,6 +15,13 @@ http://localhost:42780
 
 ## Authentication
 
+Protected `/api` routes pass through a shared JWT authentication boundary and
+receive an `AuthenticatedUser` context. Resource authorization is still
+enforced by the individual route. The one documented bootstrap exception is
+`POST /api/runners`, which is intentionally unauthenticated so a new runner
+can register before receiving credentials; runner listing and detail routes
+remain protected.
+
 GitForge uses JWT tokens for API authentication. Include the token in the Authorization header:
 
 ```

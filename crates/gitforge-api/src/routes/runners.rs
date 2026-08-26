@@ -29,8 +29,14 @@ pub struct RunnerResponse {
 /// Runner routes
 pub fn runner_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
-        .route("/runners", get(list_runners).post(register_runner))
+        .route("/runners", get(list_runners))
         .route("/runners/{id}", get(get_runner))
+}
+
+/// Runner registration is a bootstrap endpoint used before a runner has a
+/// user JWT. It is mounted separately from protected runner administration.
+pub fn public_runner_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
+    Router::new().route("/runners", axum::routing::post(register_runner))
 }
 
 /// Helper to extract and validate user from headers

@@ -2,10 +2,10 @@
 //!
 //! Allows external services to trigger pipeline runs via webhooks.
 
-use crate::auth::ApiAuth;
+use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Extension, Path},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     routing::post,
     Json, Router,
@@ -42,34 +42,14 @@ pub fn webhook_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new().route("/webhook/trigger/{pipeline_id}", post(trigger_pipeline))
 }
 
-/// Helper to extract and validate user from headers
-fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok());
-
-    let token = auth_header
-        .and_then(|h| ApiAuth::extract_token(h))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    auth.validate_token(token)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    Ok(())
-}
-
 /// Trigger a pipeline via webhook
 async fn trigger_pipeline(
     Extension(pool): Extension<Arc<Pool>>,
     Extension(scheduler): Extension<Option<Arc<Scheduler>>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    _user: AuthenticatedUser,
     Path(pipeline_id): Path<String>,
     Json(payload): Json<WebhookTriggerPayload>,
 ) -> impl IntoResponse {
-    // Check auth
-    if let Err(e) = extract_user(&auth, &headers) {
-        return e.into_response();
-    }
-
     tracing::info!(
         "Webhook trigger for pipeline {} from repo {}",
         pipeline_id,
