@@ -129,7 +129,10 @@ pub fn scheduler_routes<S: Clone + Send + Sync + 'static>(
     scheduler_routes_with_tokens(state, runner_auth_token, operator_auth_token)
 }
 
-fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
+/// Build scheduler routes with independently scoped runner and operator
+/// credentials. Public so integration tests and colocated service harnesses
+/// can exercise the real HTTP boundary without relying on process globals.
+pub fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
     state: SchedulerServerState,
     runner_auth_token: Option<Arc<str>>,
     operator_auth_token: Option<Arc<str>>,

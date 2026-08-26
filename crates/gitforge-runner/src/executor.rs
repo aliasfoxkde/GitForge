@@ -1,10 +1,12 @@
 //! Job executor with container pooling
 
 use gitforge_common::{JobId, PipelineRunId, RepoId, Result};
-use gitforge_sandbox::{DockerSandbox, Sandbox, SandboxInstance, SandboxLimits, StepResult};
+use gitforge_sandbox::{
+    DockerSandbox, OutputSink, Sandbox, SandboxInstance, SandboxLimits, StepResult,
+};
 use gitforge_storage::{
-    Artifact, ArtifactReceipt, ArtifactStore, FileJobLogStore, FileStorage, JobReceipt,
-    LogReceipt, ReceiptStatus, MAX_LOG_BYTES, RECEIPT_VERSION,
+    Artifact, ArtifactReceipt, ArtifactStore, FileJobLogStore, FileStorage, JobReceipt, LogReceipt,
+    ReceiptStatus, MAX_LOG_BYTES, RECEIPT_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -138,8 +140,7 @@ impl ContainerPool {
 pub struct JobExecutor {
     pool: ContainerPool,
     active_job_count: Arc<RwLock<usize>>, // number of jobs currently executing
-    active_instances:
-                Arc<RwLock<HashMap<JobId, (String, Option<String>, SandboxInstance)>>>, // job_id -> (image, workspace, instance)
+    active_instances: Arc<RwLock<HashMap<JobId, (String, Option<String>, SandboxInstance)>>>, // job_id -> (image, workspace, instance)
     artifact_storage: Arc<FileStorage>,
     log_store: Arc<FileJobLogStore>,
 }
@@ -184,7 +185,8 @@ impl JobExecutor {
             let Ok(metadata) = entry.metadata().await else {
                 continue;
             };
-            if !metadata.is_file() || metadata.len() > gitforge_storage::receipt::MAX_ARTIFACT_BYTES {
+            if !metadata.is_file() || metadata.len() > gitforge_storage::receipt::MAX_ARTIFACT_BYTES
+            {
                 tracing::warn!(path = %path.display(), "skipping invalid or oversized artifact");
                 continue;
             }
@@ -229,7 +231,11 @@ impl JobExecutor {
         }
 
         let data = combined.into_bytes();
-        match self.log_store.bounded_put(job_id, data, MAX_LOG_BYTES).await {
+        match self
+            .log_store
+            .bounded_put(job_id, data, MAX_LOG_BYTES)
+            .await
+        {
             Ok(receipt) => {
                 tracing::debug!("stored {} byte log for job {}", receipt.bytes, job_id);
                 Some(receipt)
@@ -248,6 +254,17 @@ impl JobExecutor {
 
     /// Execute a job
     pub async fn execute(&self, job: ExecutableJob) -> JobResult {
+        self.execute_with_output(job, None).await
+    }
+
+    /// Execute a job and forward sandbox output while each step is running.
+    /// The sink is optional so existing callers and local tests retain the
+    /// original accumulated-result behavior.
+    pub async fn execute_with_output(
+        &self,
+        job: ExecutableJob,
+        output_sink: Option<Arc<dyn OutputSink>>,
+    ) -> JobResult {
         let job_id = job.job_id; // Copy type
         let started_at = chrono::Utc::now();
         tracing::info!("executing job {}", job_id);
@@ -323,7 +340,9 @@ impl JobExecutor {
 
             let result = timeout(
                 Duration::from_secs(job.timeout_secs),
-                self.pool.sandbox.execute(&instance, &cmd),
+                self.pool
+                    .sandbox
+                    .execute_with_output(&instance, &cmd, output_sink.clone()),
             )
             .await
             .map_err(|_| gitforge_common::Error::timeout("job step timed out"))
@@ -430,8 +449,10 @@ impl JobExecutor {
         let start = tokio::time::Instant::now();
         while *self.active_job_count.read().await > 0 {
             if start.elapsed() >= timeout_duration {
-                tracing::warn!("timeout waiting for {} active jobs to complete", 
-                    *self.active_job_count.read().await);
+                tracing::warn!(
+                    "timeout waiting for {} active jobs to complete",
+                    *self.active_job_count.read().await
+                );
                 return false;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -445,13 +466,13 @@ impl JobExecutor {
             let mut instances = self.active_instances.write().await;
             std::mem::take(&mut *instances)
         };
-        
+
         for (_job_id, (_image, _workspace, instance)) in instances {
             if let Err(e) = self.pool.sandbox.destroy(instance).await {
                 tracing::warn!("failed to destroy sandbox during cancel_all_jobs: {}", e);
             }
         }
-        
+
         let mut count = self.active_job_count.write().await;
         *count = 0;
     }
@@ -544,7 +565,12 @@ impl JobResult {
     fn status(&self) -> ReceiptStatus {
         if self.success {
             ReceiptStatus::Succeeded
-        } else if self.error.as_ref().map(|e| e.contains("timeout")).unwrap_or(false) {
+        } else if self
+            .error
+            .as_ref()
+            .map(|e| e.contains("timeout"))
+            .unwrap_or(false)
+        {
             ReceiptStatus::TimedOut
         } else {
             ReceiptStatus::Failed

@@ -63,5 +63,7 @@ job logs response. A runner can upload bounded artifact bytes through
 `POST /jobs/{id}/artifacts` using `x-runner-id`, `x-lease-token`,
 `x-artifact-name`, and an optional checksum; the scheduler writes server-owned
 metadata into the shared artifact store. These endpoints remain lease-fenced
-and require the runner credential. True byte-by-byte sandbox streaming and a
-full API-to-scheduler-to-runner service test remain follow-up work.
+and require the runner credential. The sandbox contract now exposes bounded
+`OutputSink` delivery while commands run. The current integration test covers
+the scheduler/API HTTP boundary in one process; OS-process restart/recovery
+testing and durable live-stream retry semantics remain follow-up work.

@@ -3,7 +3,7 @@
 use crate::executor::{ExecutableJob, JobExecutor, JobStep};
 use gitforge_common::{Error, JobId, PipelineRunId, Result, RunnerId};
 use gitforge_db::models::Runner;
-use gitforge_sandbox::{DockerSandbox, StepResult};
+use gitforge_sandbox::{DockerSandbox, OutputSink, OutputStream, StepResult};
 use gitforge_storage::ArtifactReceipt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -489,8 +489,20 @@ impl RunnerAgent {
             }
         });
 
-        // Execute the job
-        let result = executor.execute(executable).await;
+        // Execute the job. Output is sent to the scheduler while the sandbox
+        // is running; the bounded sink applies network backpressure and never
+        // changes the job's success result if observability is degraded.
+        let live_logs = Arc::new(LiveLogSink::new(
+            client,
+            scheduler_url,
+            &assignment.job_id,
+            runner_id,
+            lease_token,
+            scheduler_token,
+        ));
+        let result = executor
+            .execute_with_output(executable, Some(live_logs.clone()))
+            .await;
         cancellation_watch.abort();
 
         tracing::info!(
@@ -508,8 +520,12 @@ impl RunnerAgent {
             lease_token,
             scheduler_token,
         };
-        if let Err(error) = report_log_chunks(&protocol, &result.step_results).await {
-            tracing::warn!(%error, job_id = %assignment.job_id, "failed to stream job logs");
+        if !live_logs.sent_any() {
+            if let Err(error) = report_log_chunks(&protocol, &result.step_results).await {
+                tracing::warn!(%error, job_id = %assignment.job_id, "failed to stream job logs");
+            }
+        } else if live_logs.failed() {
+            tracing::warn!(job_id = %assignment.job_id, "live log delivery was degraded");
         }
 
         let uploaded_artifacts = match report_artifacts(
@@ -568,6 +584,85 @@ impl RunnerAgent {
             }
             Err(error) => tracing::error!("failed to report job completion: {}", error),
         }
+    }
+}
+
+struct LiveLogSink {
+    client: Client,
+    endpoint: String,
+    runner_id: RunnerId,
+    lease_token: String,
+    scheduler_token: Option<String>,
+    sent_chunks: std::sync::atomic::AtomicUsize,
+    failed_delivery: std::sync::atomic::AtomicBool,
+}
+
+impl LiveLogSink {
+    fn new(
+        client: &Client,
+        scheduler_url: &str,
+        job_id: &str,
+        runner_id: RunnerId,
+        lease_token: &str,
+        scheduler_token: Option<&str>,
+    ) -> Self {
+        Self {
+            client: client.clone(),
+            endpoint: format!("{scheduler_url}/jobs/{job_id}/logs"),
+            runner_id,
+            lease_token: lease_token.to_string(),
+            scheduler_token: scheduler_token.map(ToOwned::to_owned),
+            sent_chunks: std::sync::atomic::AtomicUsize::new(0),
+            failed_delivery: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn sent_any(&self) -> bool {
+        self.sent_chunks.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    fn failed(&self) -> bool {
+        self.failed_delivery
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl OutputSink for LiveLogSink {
+    async fn on_output(&self, stream: OutputStream, chunk: Vec<u8>) -> gitforge_common::Result<()> {
+        let label = match stream {
+            OutputStream::Stdout => "stdout",
+            OutputStream::Stderr => "stderr",
+        };
+        let text = String::from_utf8_lossy(&chunk);
+        for part in utf8_chunks(&text, 60 * 1024) {
+            let mut request = self.client.post(&self.endpoint).json(&serde_json::json!({
+                "contract_version": "harness.job.v1",
+                "runner_id": self.runner_id.to_string(),
+                "lease_token": self.lease_token,
+                "chunk": format!("[{label}]\n{part}"),
+            }));
+            if let Some(token) = &self.scheduler_token {
+                request = request.bearer_auth(token);
+            }
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    self.sent_chunks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(response) => {
+                    self.failed_delivery
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(status = %response.status(), "scheduler rejected live log chunk");
+                }
+                Err(error) => {
+                    self.failed_delivery
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(%error, "live log delivery failed");
+                }
+            }
+        }
+        Ok(())
     }
 }
 

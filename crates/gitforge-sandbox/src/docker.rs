@@ -13,6 +13,7 @@ use bollard::Docker;
 use futures_util::StreamExt;
 use gitforge_common::{Error, JobId, Result};
 use std::path::Path;
+use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 /// Sandbox instance handle
@@ -28,6 +29,23 @@ pub struct StepResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Which output stream produced a live execution chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Receives bounded output chunks while a sandbox command is running.
+///
+/// Implementations may apply backpressure by awaiting durable delivery. The
+/// sandbox never hands out an unbounded buffer; Docker frames are delivered as
+/// they arrive and the caller controls any queueing policy.
+#[async_trait]
+pub trait OutputSink: Send + Sync {
+    async fn on_output(&self, stream: OutputStream, chunk: Vec<u8>) -> Result<()>;
 }
 
 /// Docker-based sandbox
@@ -47,7 +65,9 @@ impl DockerSandbox {
             .map_err(|e| Error::sandbox(format!("failed to connect to Docker: {}", e)))?;
 
         // Verify connection by pinging Docker
-        docker.ping().await
+        docker
+            .ping()
+            .await
             .map_err(|e| Error::sandbox(format!("Docker daemon not available: {}", e)))?;
 
         tracing::info!("Connected to Docker daemon");
@@ -72,7 +92,10 @@ impl DockerSandbox {
 
     /// Create a new Docker sandbox with custom limits (stub mode only).
     /// DEPRECATED: Use `connect_required()` for production or `stub_for_tests()` for testing.
-    #[deprecated(since = "0.1.0", note = "use connect_required() or stub_for_tests() instead")]
+    #[deprecated(
+        since = "0.1.0",
+        note = "use connect_required() or stub_for_tests() instead"
+    )]
     pub fn with_limits(limits: SandboxLimits) -> Self {
         Self {
             docker: None,
@@ -155,8 +178,31 @@ pub trait Sandbox: Send + Sync {
         self.create(job_id, image, limits).await
     }
 
-    /// Execute a command in the sandbox
-    async fn execute(&self, instance: &SandboxInstance, command: &[&str]) -> Result<StepResult>;
+    /// Execute a command in the sandbox.
+    async fn execute(&self, instance: &SandboxInstance, command: &[&str]) -> Result<StepResult> {
+        self.execute_with_output(instance, command, None).await
+    }
+
+    /// Execute a command and deliver output frames as they arrive.
+    async fn execute_with_output(
+        &self,
+        instance: &SandboxInstance,
+        command: &[&str],
+        sink: Option<Arc<dyn OutputSink>>,
+    ) -> Result<StepResult> {
+        let result = self.execute(instance, command).await?;
+        if let Some(sink) = sink {
+            if !result.stdout.is_empty() {
+                sink.on_output(OutputStream::Stdout, result.stdout.as_bytes().to_vec())
+                    .await?;
+            }
+            if !result.stderr.is_empty() {
+                sink.on_output(OutputStream::Stderr, result.stderr.as_bytes().to_vec())
+                    .await?;
+            }
+        }
+        Ok(result)
+    }
 
     /// Destroy a sandbox instance
     async fn destroy(&self, instance: SandboxInstance) -> Result<()>;
@@ -278,11 +324,15 @@ impl Sandbox for DockerSandbox {
                     config,
                 )
                 .await
-                .map_err(|e| Error::sandbox(format!("failed to create workspace container: {}", e)))?;
+                .map_err(|e| {
+                    Error::sandbox(format!("failed to create workspace container: {}", e))
+                })?;
             docker
                 .start_container(&response.id, None::<StartContainerOptions<String>>)
                 .await
-                .map_err(|e| Error::sandbox(format!("failed to start workspace container: {}", e)))?;
+                .map_err(|e| {
+                    Error::sandbox(format!("failed to start workspace container: {}", e))
+                })?;
             tracing::info!(
                 "Created workspace container {} for job {} from {}",
                 response.id,
@@ -299,6 +349,15 @@ impl Sandbox for DockerSandbox {
     }
 
     async fn execute(&self, instance: &SandboxInstance, command: &[&str]) -> Result<StepResult> {
+        self.execute_with_output(instance, command, None).await
+    }
+
+    async fn execute_with_output(
+        &self,
+        instance: &SandboxInstance,
+        command: &[&str],
+        sink: Option<Arc<dyn OutputSink>>,
+    ) -> Result<StepResult> {
         if let Some(ref docker) = self.docker {
             // Create exec instance
             let config = CreateExecOptions {
@@ -329,9 +388,15 @@ impl Sandbox for DockerSandbox {
                         item = output.next() => {
                             match item {
                                 Some(Ok(LogOutput::StdOut { message })) => {
+                                    if let Some(ref sink) = sink {
+                                        sink.on_output(OutputStream::Stdout, message.to_vec()).await?;
+                                    }
                                     stdout.push_str(&String::from_utf8_lossy(&message));
                                 }
                                 Some(Ok(LogOutput::StdErr { message })) => {
+                                    if let Some(ref sink) = sink {
+                                        sink.on_output(OutputStream::Stderr, message.to_vec()).await?;
+                                    }
                                     stderr.push_str(&String::from_utf8_lossy(&message));
                                 }
                                 Some(Ok(_)) => {}
@@ -372,11 +437,18 @@ impl Sandbox for DockerSandbox {
             // the actual command result. Only use stub_for_tests() when you explicitly
             // want stub behavior.
             tracing::debug!("Executing command in stub mode: {:?}", command);
-            Ok(StepResult {
+            let result = StepResult {
                 exit_code: 0,
                 stdout: format!("[STUB] Executing: {:?}\n", command),
                 stderr: "[STUB] Warning: running in stub mode, exit code is always 0\n".to_string(),
-            })
+            };
+            if let Some(sink) = sink {
+                sink.on_output(OutputStream::Stdout, result.stdout.as_bytes().to_vec())
+                    .await?;
+                sink.on_output(OutputStream::Stderr, result.stderr.as_bytes().to_vec())
+                    .await?;
+            }
+            Ok(result)
         }
     }
 
@@ -384,9 +456,7 @@ impl Sandbox for DockerSandbox {
         if let Some(ref docker) = self.docker {
             // Send SIGTERM for graceful shutdown first
             // Wait up to 10 seconds for container to stop gracefully
-            let stop_options = StopContainerOptions {
-                t: 10,
-            };
+            let stop_options = StopContainerOptions { t: 10 };
 
             if let Err(e) = docker
                 .stop_container(&instance.container_id, Some(stop_options))
@@ -424,6 +494,38 @@ impl Sandbox for DockerSandbox {
 mod tests {
     use super::*;
     use gitforge_common::ErrorKind;
+    use std::sync::Mutex;
+
+    struct RecordingSink(Mutex<Vec<(OutputStream, Vec<u8>)>>);
+
+    #[async_trait]
+    impl OutputSink for RecordingSink {
+        async fn on_output(&self, stream: OutputStream, chunk: Vec<u8>) -> Result<()> {
+            self.0.lock().unwrap().push((stream, chunk));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stub_streams_output_to_sink() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let instance = sandbox
+            .create(JobId::new(), "test", SandboxLimits::default())
+            .await
+            .unwrap();
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+
+        let result = sandbox
+            .execute_with_output(&instance, &["echo", "hello"], Some(sink.clone()))
+            .await
+            .unwrap();
+        let chunks = sink.0.lock().unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].0, OutputStream::Stdout);
+        assert_eq!(chunks[1].0, OutputStream::Stderr);
+        assert_eq!(chunks[0].1, result.stdout.as_bytes());
+        assert_eq!(chunks[1].1, result.stderr.as_bytes());
+    }
 
     #[tokio::test]
     async fn test_docker_sandbox_creation() {

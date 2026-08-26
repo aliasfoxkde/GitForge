@@ -7,7 +7,11 @@ use axum::{
     http::{Request, StatusCode},
 };
 use gitforge_api::{ApiAuth, ApiServer};
+use gitforge_db::models::{Runner, RunnerType};
 use gitforge_db::Pool;
+use gitforge_scheduler::{
+    create_state_with_artifact_storage, scheduler_routes_with_tokens, Scheduler,
+};
 use gitforge_storage::FileStorage;
 use gitforge_storage::{Artifact, ArtifactStore};
 use std::sync::Arc;
@@ -743,6 +747,161 @@ async fn test_api_artifact_content_requires_auth_and_returns_bytes() {
         .await
         .unwrap();
     assert_eq!(&body[..], b"artifact-data");
+}
+
+#[tokio::test]
+async fn test_scheduler_upload_is_downloadable_through_authenticated_api() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let user = gitforge_db::models::User::new(
+        "boundary-owner".to_string(),
+        "boundary-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+    gitforge_db::queries::UserQueries::set_role(&pool, user.id, "admin")
+        .await
+        .unwrap();
+    let repo = gitforge_db::models::Repository::new(
+        "boundary-repo".to_string(),
+        user.id,
+        "/git/boundary-repo".to_string(),
+    );
+    gitforge_db::queries::RepoQueries::create(&pool, &repo)
+        .await
+        .unwrap();
+    let pipeline = gitforge_db::models::Pipeline {
+        id: gitforge_common::PipelineId::new(),
+        repo_id: repo.id,
+        name: "boundary-pipeline".to_string(),
+        trigger_type: "manual".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+        .await
+        .unwrap();
+    let run = gitforge_db::models::PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "boundary-owner".to_string(),
+        "boundary-commit".to_string(),
+    );
+    gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+        .await
+        .unwrap();
+    let job = gitforge_db::models::Job::new(run.id, "boundary-job".to_string());
+    let job_id = job.id;
+    gitforge_db::queries::JobQueries::create(&pool, &job)
+        .await
+        .unwrap();
+
+    let scheduler = Scheduler::with_db(pool.clone());
+    let runner = Runner::new("boundary-runner".to_string(), RunnerType::Docker, 1);
+    let runner_id = runner.id;
+    scheduler.register_runner(runner).await;
+    scheduler
+        .enqueue_with_definition(
+            job_id,
+            run.id,
+            repo.id,
+            vec!["echo boundary".to_string()],
+            None,
+        )
+        .await;
+    let artifact_root = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(FileStorage::new(artifact_root.path()).await.unwrap());
+    let scheduler_app = scheduler_routes_with_tokens(
+        create_state_with_artifact_storage(scheduler, Some(storage.clone())),
+        Some(std::sync::Arc::from("runner-token")),
+        Some(std::sync::Arc::from("operator-token")),
+    );
+    let pending = scheduler_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/jobs/pending?runner_id={runner_id}"))
+                .header("Authorization", "Bearer runner-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.status(), StatusCode::OK);
+    let assignments: Vec<serde_json::Value> = serde_json::from_slice(
+        &axum::body::to_bytes(pending.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let lease = assignments[0]["lease_token"].as_str().unwrap();
+    let started = scheduler_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/jobs/{job_id}/started"))
+                .header("Authorization", "Bearer runner-token")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"runner_id": runner_id.to_string(), "lease_token": lease})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::OK);
+    let bytes = b"cross-process artifact";
+    let artifact = scheduler_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/jobs/{job_id}/artifacts"))
+                .header("Authorization", "Bearer runner-token")
+                .header("Content-Type", "application/octet-stream")
+                .header("x-runner-id", runner_id.to_string())
+                .header("x-lease-token", lease)
+                .header("x-artifact-name", "result.txt")
+                .body(Body::from(bytes.as_slice()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(artifact.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(artifact.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let artifact_id = payload["artifact_id"].as_str().unwrap();
+
+    let api = ApiServer::new("test-secret", pool)
+        .with_storage_extension(storage)
+        .into_router();
+    let token = ApiAuth::new("test-secret")
+        .generate_token(user.id, "boundary-owner", "admin")
+        .unwrap();
+    let response = api
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/artifacts/{artifact_id}/content"))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        &axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap()[..],
+        bytes
+    );
 }
 
 #[tokio::test]
