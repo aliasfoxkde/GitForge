@@ -2,9 +2,12 @@
 
 use crate::Scheduler;
 use axum::{
+    extract::Request,
     extract::{Path, Query, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::IntoResponse,
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
@@ -18,6 +21,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct SchedulerServerState {
     pub scheduler: Arc<Scheduler>,
+    auth_token: Option<Arc<str>>,
 }
 
 /// Runner registration request
@@ -57,6 +61,10 @@ struct LeaseRequest {
 pub fn create_state(scheduler: Scheduler) -> SchedulerServerState {
     SchedulerServerState {
         scheduler: Arc::new(scheduler),
+        auth_token: std::env::var("GITFORGE_SCHEDULER_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty())
+            .map(Arc::from),
     }
 }
 
@@ -64,16 +72,49 @@ pub fn create_state(scheduler: Scheduler) -> SchedulerServerState {
 pub fn scheduler_routes<S: Clone + Send + Sync + 'static>(
     state: SchedulerServerState,
 ) -> Router<S> {
+    let auth_token = state.auth_token.clone();
     Router::new()
         .route("/runners", post(register_runner))
         .route("/runners/{id}/heartbeat", post(runner_heartbeat))
         .route("/jobs/pending", get(get_pending_jobs))
         .route("/jobs/{id}/claim", post(claim_job))
         .route("/jobs/{id}/started", post(start_job))
+        .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/jobs/{id}/assign", post(assign_job))
         .route("/jobs/{id}/complete", post(complete_job))
         .route("/pipelines/runs/{id}", get(get_pipeline_run))
+        .layer(middleware::from_fn(move |request, next: Next| {
+            require_scheduler_auth(request, next, auth_token.clone())
+        }))
         .with_state(state)
+}
+
+async fn require_scheduler_auth(
+    request: Request,
+    next: Next,
+    expected: Option<Arc<str>>,
+) -> Response {
+    let Some(expected) = expected else {
+        tracing::error!("GITFORGE_SCHEDULER_TOKEN is unset; refusing scheduler API access");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "scheduler_auth_not_configured"})),
+        )
+            .into_response();
+    };
+    let supplied = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if supplied == Some(&format!("Bearer {expected}")) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "scheduler_auth_required"})),
+        )
+            .into_response()
+    }
 }
 
 /// Return a durable pipeline run for LAN control-plane adapters.
@@ -175,12 +216,42 @@ async fn runner_heartbeat(
         }
     };
 
-    state.scheduler.heartbeat(runner_id).await;
+    if !state.scheduler.heartbeat(runner_id).await {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "runner_not_registered"})),
+        );
+    }
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "status": "ok"
+        })),
+    )
+}
+
+/// Cancel a queued, assigned, or running job and persist the terminal state.
+async fn cancel_job(
+    State(state): State<SchedulerServerState>,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    let job_id = match Uuid::parse_str(&job_id) {
+        Ok(id) => JobId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_job_id"})),
+            )
+        }
+    };
+    state.scheduler.cancel(job_id).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "contract_version": "harness.job.v1",
+            "status": "cancelled",
+            "job_id": job_id.to_string(),
         })),
     )
 }
@@ -500,7 +571,9 @@ mod tests {
     async fn test_runner_heartbeat_valid_uuid() {
         let scheduler = crate::Scheduler::new();
         let state = create_state(scheduler);
-        let runner_id = uuid::Uuid::new_v4();
+        let runner = Runner::new("heartbeat-runner".to_string(), RunnerType::Docker, 1);
+        let runner_id = runner.id;
+        state.scheduler.register_runner(runner).await;
 
         let response = runner_heartbeat(
             axum::extract::State(state),
@@ -509,6 +582,17 @@ mod tests {
         .await;
 
         assert_status(response.into_response(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_runner_heartbeat_unknown_runner_is_not_found() {
+        let state = create_state(crate::Scheduler::new());
+        let response = runner_heartbeat(
+            axum::extract::State(state),
+            axum::extract::Path(uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+        assert_status(response.into_response(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

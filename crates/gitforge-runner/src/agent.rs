@@ -25,6 +25,8 @@ pub struct RunnerConfig {
     pub heartbeat_interval_secs: u64,
     /// Job fetch interval in seconds
     pub fetch_interval_secs: u64,
+    /// Bearer token used for scheduler service authentication.
+    pub scheduler_token: Option<String>,
 }
 
 impl Default for RunnerConfig {
@@ -36,6 +38,7 @@ impl Default for RunnerConfig {
             capacity: 2,
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
+            scheduler_token: std::env::var("GITFORGE_SCHEDULER_TOKEN").ok(),
         }
     }
 }
@@ -104,7 +107,11 @@ impl RunnerAgent {
             "capacity": runner.capacity,
         });
 
-        match self.client.post(&register_url).json(&request).send().await {
+        let mut register_request = self.client.post(&register_url).json(&request);
+        if let Some(token) = &self.config.scheduler_token {
+            register_request = register_request.bearer_auth(token);
+        }
+        match register_request.send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     if let Ok(payload) = response.json::<serde_json::Value>().await {
@@ -117,6 +124,14 @@ impl RunnerAgent {
                     }
                     tracing::info!("registered runner {} with scheduler", runner.id);
                 } else {
+                    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                        || response.status() == reqwest::StatusCode::UNAUTHORIZED
+                    {
+                        return Err(Error::internal(format!(
+                            "scheduler authentication rejected registration: {}",
+                            response.status()
+                        )));
+                    }
                     tracing::warn!(
                         "scheduler returned {} for registration, running in standalone mode",
                         response.status()
@@ -152,6 +167,7 @@ impl RunnerAgent {
         let heartbeat_interval = self.config.heartbeat_interval_secs;
         let heartbeat_client = self.client.clone();
         let heartbeat_url = self.config.scheduler_url.clone();
+        let heartbeat_token = self.config.scheduler_token.clone();
         let is_running = self.is_running.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(heartbeat_interval));
@@ -166,7 +182,11 @@ impl RunnerAgent {
                     "{}/runners/{}/heartbeat",
                     heartbeat_url, heartbeat_runner_id
                 );
-                if let Err(e) = heartbeat_client.post(&url).send().await {
+                let mut heartbeat_request = heartbeat_client.post(&url);
+                if let Some(token) = &heartbeat_token {
+                    heartbeat_request = heartbeat_request.bearer_auth(token);
+                }
+                if let Err(e) = heartbeat_request.send().await {
                     tracing::trace!("heartbeat failed: {}", e);
                 }
             }
@@ -177,6 +197,7 @@ impl RunnerAgent {
         let fetch_client = self.client.clone();
         let fetch_url = self.config.scheduler_url.clone();
         let fetch_runner_id = runner_id;
+        let fetch_token = self.config.scheduler_token.clone();
         let is_running = self.is_running.clone();
         let executor = self.executor.clone();
         tokio::spawn(async move {
@@ -190,7 +211,11 @@ impl RunnerAgent {
                 tracing::debug!("runner checking for jobs...");
 
                 let jobs_url = format!("{}/jobs/pending?runner_id={}", fetch_url, fetch_runner_id);
-                match fetch_client.get(&jobs_url).send().await {
+                let mut fetch_request = fetch_client.get(&jobs_url);
+                if let Some(token) = &fetch_token {
+                    fetch_request = fetch_request.bearer_auth(token);
+                }
+                match fetch_request.send().await {
                     Ok(response) => {
                         if response.status().is_success() {
                             if let Ok(jobs) = response.json::<Vec<JobAssignment>>().await {
@@ -205,6 +230,7 @@ impl RunnerAgent {
                                         &fetch_url,
                                         &job.job_id,
                                         fetch_runner_id,
+                                        fetch_token.as_deref(),
                                     )
                                     .await
                                     else {
@@ -219,6 +245,7 @@ impl RunnerAgent {
                                         &fetch_url,
                                         fetch_runner_id,
                                         &lease_token,
+                                        fetch_token.as_deref(),
                                     )
                                     .await;
                                 }
@@ -275,14 +302,16 @@ impl RunnerAgent {
         scheduler_url: &str,
         job_id: &str,
         runner_id: RunnerId,
+        scheduler_token: Option<&str>,
     ) -> Option<String> {
         let url = format!("{}/jobs/{}/claim", scheduler_url, job_id);
-        let response = client
+        let mut request = client
             .post(url)
-            .json(&serde_json::json!({"runner_id": runner_id.to_string()}))
-            .send()
-            .await
-            .ok()?;
+            .json(&serde_json::json!({"runner_id": runner_id.to_string()}));
+        if let Some(token) = scheduler_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.ok()?;
         if !response.status().is_success() {
             return None;
         }
@@ -303,6 +332,7 @@ impl RunnerAgent {
         scheduler_url: &str,
         runner_id: RunnerId,
         lease_token: &str,
+        scheduler_token: Option<&str>,
     ) {
         let job_id = match uuid::Uuid::parse_str(&assignment.job_id) {
             Ok(id) => JobId::from(id),
@@ -341,12 +371,14 @@ impl RunnerAgent {
         tracing::info!("executing job {} in container", assignment.job_id);
 
         let started_url = format!("{}/jobs/{}/started", scheduler_url, assignment.job_id);
-        let started = client
-            .post(&started_url)
-            .json(&serde_json::json!({
-                "runner_id": runner_id.to_string(),
-                "lease_token": lease_token,
-            }))
+        let mut started_request = client.post(&started_url).json(&serde_json::json!({
+            "runner_id": runner_id.to_string(),
+            "lease_token": lease_token,
+        }));
+        if let Some(token) = scheduler_token {
+            started_request = started_request.bearer_auth(token);
+        }
+        let started = started_request
             .send()
             .await
             .map(|response| response.status().is_success())
@@ -393,13 +425,16 @@ impl RunnerAgent {
             "artifacts": result.artifacts,
         });
 
-        if let Err(e) = client
-            .post(&complete_url)
-            .json(&complete_request)
-            .send()
-            .await
-        {
-            tracing::error!("failed to report job completion: {}", e);
+        let mut complete_request_builder = client.post(&complete_url).json(&complete_request);
+        if let Some(token) = scheduler_token {
+            complete_request_builder = complete_request_builder.bearer_auth(token);
+        }
+        match complete_request_builder.send().await {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                tracing::error!("scheduler rejected job completion: {}", response.status())
+            }
+            Err(error) => tracing::error!("failed to report job completion: {}", error),
         }
     }
 }
@@ -454,6 +489,7 @@ mod tests {
             capacity: 5,
             heartbeat_interval_secs: 60,
             fetch_interval_secs: 10,
+            scheduler_token: None,
         };
         assert_eq!(config.name, "custom-runner");
         assert_eq!(config.capacity, 5);
@@ -614,6 +650,7 @@ mod tests {
             capacity: 8,
             heartbeat_interval_secs: 15,
             fetch_interval_secs: 3,
+            scheduler_token: None,
         };
 
         assert_eq!(config.scheduler_url, "http://example.com:8081");
@@ -726,6 +763,7 @@ mod tests {
             capacity: 0,
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
+            scheduler_token: None,
         };
         assert_eq!(config.capacity, 0);
     }
@@ -794,6 +832,7 @@ mod tests {
             capacity: 4,
             heartbeat_interval_secs: 45,
             fetch_interval_secs: 10,
+            scheduler_token: None,
         };
         assert!(config.scheduler_url.contains("user:pass"));
     }
@@ -821,6 +860,7 @@ mod tests {
             capacity: 10,
             heartbeat_interval_secs: 60,
             fetch_interval_secs: 15,
+            scheduler_token: None,
         };
         let agent = RunnerAgent::new(config).await.unwrap();
         assert!(agent.runner.is_none());

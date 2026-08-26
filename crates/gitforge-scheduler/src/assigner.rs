@@ -262,6 +262,20 @@ impl Scheduler {
         state.job_assignments.remove(&job_id);
         state.assigned_jobs.remove(&job_id);
         state.job_leases.remove(&job_id);
+        drop(state);
+        if let Some(pool) = &self.db_pool {
+            let receipt = serde_json::json!({
+                "job_id": job_id.to_string(),
+                "status": "cancelled",
+                "reason": "operator requested cancellation",
+            })
+            .to_string();
+            if let Err(error) =
+                gitforge_db::queries::JobQueries::cancel(pool, job_id, &receipt).await
+            {
+                tracing::warn!(%error, %job_id, "failed to persist job cancellation");
+            }
+        }
     }
 
     /// Register a runner
@@ -281,12 +295,27 @@ impl Scheduler {
     }
 
     /// Handle runner heartbeat
-    pub async fn heartbeat(&self, runner_id: RunnerId) {
-        let mut state = self.state.write().await;
-        if let Some(runner) = state.runners.get_mut(&runner_id) {
-            runner.last_heartbeat = Some(chrono::Utc::now());
-            tracing::debug!("runner {} heartbeat", runner_id);
+    pub async fn heartbeat(&self, runner_id: RunnerId) -> bool {
+        let updated = {
+            let mut state = self.state.write().await;
+            if let Some(runner) = state.runners.get_mut(&runner_id) {
+                runner.last_heartbeat = Some(chrono::Utc::now());
+                tracing::debug!("runner {} heartbeat", runner_id);
+                true
+            } else {
+                false
+            }
+        };
+        if updated {
+            if let Some(pool) = &self.db_pool {
+                if let Err(error) =
+                    gitforge_db::queries::RunnerQueries::heartbeat(pool, runner_id).await
+                {
+                    tracing::warn!(%error, %runner_id, "failed to persist runner heartbeat");
+                }
+            }
         }
+        updated
     }
 
     /// Handle runner going offline
@@ -305,30 +334,38 @@ impl Scheduler {
             chrono::Utc::now() - chrono::Duration::seconds(heartbeat_timeout_secs);
         let mut marked_offline = 0;
 
-        let db_pool = self.db_pool.clone();
-        let mut state = self.state.write().await;
-        for runner in state.runners.values_mut() {
-            if runner.status == "online" {
-                if let Some(last_heartbeat) = runner.last_heartbeat {
-                    if last_heartbeat < stale_threshold {
-                        runner.status = "offline".to_string();
-                        tracing::warn!(
-                            "runner {} marked offline: last heartbeat {} seconds ago",
-                            runner.id,
-                            heartbeat_timeout_secs
-                        );
-                        marked_offline += 1;
-
-                        // Persist to DB if available
-                        if let Some(pool) = &db_pool {
-                            let _ = gitforge_db::queries::RunnerQueries::update_status(
-                                pool, runner.id, "offline",
-                            )
-                            .await;
+        let mut stale_runners = Vec::new();
+        {
+            let mut state = self.state.write().await;
+            for runner in state.runners.values_mut() {
+                if runner.status == "online" {
+                    if let Some(last_heartbeat) = runner.last_heartbeat {
+                        if last_heartbeat < stale_threshold {
+                            runner.status = "offline".to_string();
+                            tracing::warn!(
+                                "runner {} marked offline: last heartbeat {} seconds ago",
+                                runner.id,
+                                heartbeat_timeout_secs
+                            );
+                            marked_offline += 1;
+                            stale_runners.push(runner.id);
                         }
                     }
                 }
             }
+        }
+        if let Some(pool) = &self.db_pool {
+            for runner_id in &stale_runners {
+                if let Err(error) =
+                    gitforge_db::queries::RunnerQueries::update_status(pool, *runner_id, "offline")
+                        .await
+                {
+                    tracing::warn!(%error, %runner_id, "failed to persist stale runner status");
+                }
+            }
+        }
+        for runner_id in stale_runners {
+            self.requeue_jobs_for_offline_runner(runner_id).await;
         }
 
         marked_offline

@@ -693,6 +693,30 @@ impl JobQueries {
         Ok(())
     }
 
+    /// Persist an operator cancellation as a terminal job transition.
+    pub async fn cancel(pool: &Pool, id: JobId, result_json: &str) -> Result<()> {
+        let existing = Self::get(pool, id).await?;
+        if let Some(job) = existing {
+            if let Some(status) = JobStatus::from_str(&job.status) {
+                if status.is_terminal() {
+                    return Ok(());
+                }
+            }
+        } else {
+            return Err(Error::not_found("job", id));
+        }
+        sqlx::query(
+            "UPDATE jobs SET status = 'cancelled', finished_at = ?, result_json = ? WHERE id = ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(result_json)
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to cancel job: {}", e)))?;
+        Ok(())
+    }
+
     /// List jobs by pipeline run
     pub async fn list_by_run(
         pool: &Pool,
@@ -1306,6 +1330,12 @@ mod tests {
         );
         RunnerQueries::create(&pool, &runner).await.unwrap();
         JobQueries::assign(&pool, job.id, runner.id).await.unwrap();
+        JobQueries::cancel(&pool, job.id, r#"{"status":"cancelled"}"#)
+            .await
+            .unwrap();
+        let cancelled = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(cancelled.finished_at.is_some());
 
         // List by run
         let jobs = JobQueries::list_by_run(&pool, run.id).await.unwrap();
