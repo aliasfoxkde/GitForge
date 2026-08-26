@@ -257,3 +257,21 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   full workspace managed validation also passed through the daemon:
   `2375c12a-75a7-4522-b3e4-1d5859e9033a` (`cargo test --workspace`, exit 0)
   and `6f22bbf8-12cd-4bf9-a92d-40f741b06e11` (workspace Clippy, exit 0).
+
+## Verified continuation findings — 2026-08-28 log and artifact tranche
+
+- Added a SQLite `job_log_chunks` ledger with per-chunk and per-job bounds.
+  Appends require the active runner ID and lease token; stale runners receive
+  a conflict and cannot publish late output. The API job-log response now
+  includes ordered durable chunks alongside the terminal receipt.
+- Added authenticated scheduler runner routes for log append and artifact
+  upload. Artifact names are bounded and path-like values are rejected;
+  content is stored under server-generated IDs with optional SHA-256
+  verification and the shared API artifact root.
+- Runner agents now publish UTF-8-safe output chunks before completion and
+  upload workspace artifacts through the scheduler protocol. A scheduler HTTP
+  regression covers stale-log fencing, accepted logs, artifact checksum,
+  storage retrieval, and terminal completion.
+- Focused database, scheduler, runner, API, and service compile gates pass.
+  True live sandbox streaming and full multi-process API/scheduler/runner E2E
+  remain explicitly open.

@@ -223,6 +223,26 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create artifacts table: {}", e)))?;
 
+        // Append-only, bounded runner log chunks. The lease fields are not
+        // duplicated here: every append is authorized against the current
+        // job row in JobQueries, so reassigned runners cannot append late
+        // output from an old execution.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS job_log_chunks (
+                job_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                chunk TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (job_id, sequence),
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create job log chunks table: {}", e)))?;
+
         // Create events table
         sqlx::query(
             r#"

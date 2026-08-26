@@ -296,6 +296,22 @@ async fn test_database_durable_job_lease_fences_replay() {
             .await
             .unwrap()
     );
+    assert_eq!(
+        JobQueries::append_log_with_lease(&pool, job.id, runner.id, "lease-b", "stale")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        JobQueries::append_log_with_lease(&pool, job.id, runner.id, "lease-a", "hello\n")
+            .await
+            .unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        JobQueries::list_logs(&pool, job.id).await.unwrap()[0].chunk,
+        "hello\n"
+    );
     assert!(!JobQueries::complete_with_lease(
         &pool,
         job.id,

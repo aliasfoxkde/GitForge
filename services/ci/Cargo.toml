@@ -15,6 +15,7 @@ gitforge-db = { path = "../../crates/gitforge-db" }
 gitforge-events = { path = "../../crates/gitforge-events" }
 gitforge-ci = { path = "../../crates/gitforge-ci" }
 gitforge-scheduler = { path = "../../crates/gitforge-scheduler" }
+gitforge-storage = { path = "../../crates/gitforge-storage" }
 gitforge-process = { path = "../../crates/gitforge-process" }
 futures = { workspace = true }
 tokio = { workspace = true }

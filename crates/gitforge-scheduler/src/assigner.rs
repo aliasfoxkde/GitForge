@@ -822,6 +822,56 @@ impl Scheduler {
         self.complete_job(job_id, success, result_json).await
     }
 
+    /// Append runner output to the durable log ledger under the active lease.
+    pub async fn append_log_with_lease(
+        &self,
+        job_id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        chunk: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        let Some(pool) = &self.db_pool else {
+            anyhow::bail!("durable job logs require a scheduler database");
+        };
+        gitforge_db::queries::JobQueries::append_log_with_lease(
+            pool,
+            job_id,
+            runner_id,
+            lease_token,
+            chunk,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+    }
+
+    /// Check whether a runner may upload output for a live job lease.
+    pub async fn job_lease_active(
+        &self,
+        job_id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> bool {
+        let Some(pool) = &self.db_pool else {
+            return false;
+        };
+        gitforge_db::queries::JobQueries::lease_is_active(pool, job_id, runner_id, lease_token)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Read durable runner log chunks for the operator/API adapter.
+    pub async fn list_logs(
+        &self,
+        job_id: JobId,
+    ) -> anyhow::Result<Vec<gitforge_db::queries::JobLogChunk>> {
+        let Some(pool) = &self.db_pool else {
+            return Ok(Vec::new());
+        };
+        gitforge_db::queries::JobQueries::list_logs(pool, job_id)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    }
+
     /// Record a terminal receipt and persist it when a scheduler DB exists.
     pub async fn complete_job(
         &self,

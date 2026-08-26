@@ -669,11 +669,28 @@ async fn get_job_logs(
             let receipt = job
                 .result_json
                 .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"job_id": id, "receipt": receipt})),
-            )
-                .into_response()
+            match JobQueries::list_logs(&pool, JobId::from(uuid)).await {
+                Ok(logs) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "job_id": id,
+                        "receipt": receipt,
+                        "logs": logs,
+                    })),
+                )
+                    .into_response(),
+                Err(error) => {
+                    tracing::error!(%error, %uuid, "failed to load job logs");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "log_read_failed",
+                            "message": "Job logs are temporarily unavailable"
+                        })),
+                    )
+                        .into_response()
+                }
+            }
         }
         Err(status) => (
             status,

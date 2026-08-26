@@ -571,7 +571,137 @@ impl PipelineRunQueries {
 
 pub struct JobQueries;
 
+/// Maximum size of one runner log append.
+pub const MAX_JOB_LOG_CHUNK_BYTES: usize = 64 * 1024;
+/// Maximum durable log volume retained for one job.
+pub const MAX_JOB_LOG_BYTES: i64 = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct JobLogChunk {
+    pub sequence: i64,
+    pub chunk: String,
+    pub created_at: String,
+}
+
 impl JobQueries {
+    /// Append a log chunk only when the runner still owns the active lease.
+    /// `None` means the job is missing, terminal, or fenced by another lease.
+    pub async fn append_log_with_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        chunk: &str,
+    ) -> Result<Option<i64>> {
+        if chunk.is_empty() {
+            return Ok(None);
+        }
+        if chunk.len() > MAX_JOB_LOG_CHUNK_BYTES {
+            return Err(Error::invalid_input(format!(
+                "job log chunk exceeds {} bytes",
+                MAX_JOB_LOG_CHUNK_BYTES
+            )));
+        }
+
+        let mut tx = pool
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| Error::database(format!("failed to begin log append: {}", e)))?;
+        let Some(job) = sqlx::query("SELECT runner_id, lease_token, status FROM jobs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Error::database(format!("failed to authorize log append: {}", e)))?
+        else {
+            return Ok(None);
+        };
+
+        let assigned_runner: Option<String> = job.get("runner_id");
+        let current_token: Option<String> = job.get("lease_token");
+        let status: String = job.get("status");
+        if assigned_runner.as_deref() != Some(&runner_id.to_string())
+            || current_token.as_deref() != Some(lease_token)
+            || !matches!(status.as_str(), "assigned" | "running")
+        {
+            return Ok(None);
+        }
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(length(chunk)), 0) FROM job_log_chunks WHERE job_id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to measure job logs: {}", e)))?;
+        if total + chunk.len() as i64 > MAX_JOB_LOG_BYTES {
+            return Err(Error::invalid_input(format!(
+                "job logs exceed {} bytes",
+                MAX_JOB_LOG_BYTES
+            )));
+        }
+
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM job_log_chunks WHERE job_id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to allocate log sequence: {}", e)))?;
+        sqlx::query(
+            "INSERT INTO job_log_chunks (job_id, sequence, chunk, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(sequence)
+        .bind(chunk)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to append job log: {}", e)))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit log append: {}", e)))?;
+        Ok(Some(sequence))
+    }
+
+    /// Read durable log chunks in append order.
+    pub async fn list_logs(pool: &Pool, id: JobId) -> Result<Vec<JobLogChunk>> {
+        let rows = sqlx::query(
+            "SELECT sequence, chunk, created_at FROM job_log_chunks WHERE job_id = ? ORDER BY sequence ASC",
+        )
+        .bind(id.to_string())
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list job logs: {}", e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| JobLogChunk {
+                sequence: row.get("sequence"),
+                chunk: row.get("chunk"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    /// Check a runner lease without mutating job state.
+    pub async fn lease_is_active(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM jobs WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
+        )
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to check job lease: {}", e)))?;
+        Ok(row.is_some())
+    }
+
     /// Return the existing submission record for a scoped idempotency key.
     pub async fn get_idempotency(
         pool: &Pool,

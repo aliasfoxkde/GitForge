@@ -3,20 +3,29 @@
 //! Main entry point for the CI orchestration service.
 
 use axum::Router;
-use axum::{extract::Extension, http::StatusCode, Json};
-use futures::StreamExt;
+use axum::{
+    extract::{Extension, Request},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    Json,
+};
 use chrono::Utc;
+use futures::StreamExt;
 use gitforge_ci::{
     CiEngine, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
 };
+use gitforge_common::PipelineStatus;
+use gitforge_db::models::{Pipeline as DbPipeline, PipelineRun as DbPipelineRun};
 use gitforge_events::{
     EventBus, EventEnvelope, EventFilter, EventPayload, EventType, InMemoryEventBus,
     PushReceivedPayload,
 };
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
-use gitforge_scheduler::{create_state, scheduler_routes, Scheduler, SchedulerEvent};
-use gitforge_db::models::{Pipeline as DbPipeline, PipelineRun as DbPipelineRun};
-use gitforge_common::PipelineStatus;
+use gitforge_scheduler::{
+    create_state_with_artifact_storage, scheduler_routes, Scheduler, SchedulerEvent,
+};
+use gitforge_storage::FileStorage;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,7 +39,11 @@ type PipelineRegistry = HashMap<gitforge_common::PipelineRunId, Arc<CiEngine>>;
 struct TriggerState {
     event_bus: Arc<dyn EventBus>,
     workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
-    run_waiters: Arc<std::sync::Mutex<HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>>>,
+    run_waiters: Arc<
+        std::sync::Mutex<
+            HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
+        >,
+    >,
 }
 
 #[tokio::main]
@@ -56,7 +69,8 @@ async fn main() -> anyhow::Result<()> {
     // Initialize scheduler. Production deployments provide a database URL so
     // job definitions and completion receipts survive service restarts;
     // development keeps the in-memory fallback explicit and usable.
-    let (scheduler, scheduler_db) = if let Ok(database_url) = std::env::var("GITFORGE_DATABASE_URL") {
+    let (scheduler, scheduler_db) = if let Ok(database_url) = std::env::var("GITFORGE_DATABASE_URL")
+    {
         let pool = gitforge_db::Pool::new(&database_url).await?;
         pool.migrate().await?;
         tracing::info!(database_url = %database_url, "using durable GitForge scheduler database");
@@ -72,8 +86,14 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .unwrap_or(42781);
 
+    // Runner uploads and API downloads must use the same bounded artifact
+    // root. The scheduler never accepts a runner filesystem path.
+    let artifact_root = std::env::var("GITFORGE_ARTIFACT_ROOT")
+        .unwrap_or_else(|_| "/tmp/gitforge-artifacts".to_string());
+    let artifact_storage = Arc::new(FileStorage::new(artifact_root).await?);
+
     // Create scheduler state for HTTP server (consumes scheduler)
-    let scheduler_state = create_state(scheduler);
+    let scheduler_state = create_state_with_artifact_storage(scheduler, Some(artifact_storage));
     let scheduler_arc = scheduler_state.scheduler.clone();
     let workspace_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let run_waiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -85,7 +105,10 @@ async fn main() -> anyhow::Result<()> {
 
     let scheduler_app = Router::new()
         .route("/health", axum::routing::get(health_check))
-        .route("/pipelines/trigger", axum::routing::post(trigger_pipeline))
+        .route(
+            "/pipelines/trigger",
+            axum::routing::post(trigger_pipeline).layer(middleware::from_fn(require_trigger_auth)),
+        )
         .merge(scheduler_routes(scheduler_state))
         .layer(Extension(trigger_state))
         .layer(TraceLayer::new_for_http());
@@ -176,7 +199,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Start runner-loss detection loop: check for stale runners and re-enqueue their jobs
     let runner_loss_scheduler = scheduler_arc.clone();
-    let runner_loss_registry = pipeline_registry.clone();
     let runner_loss_shutdown = shutdown.clone();
     let _runner_loss_handle = tokio::spawn(async move {
         // Runner is considered stale if no heartbeat for 90 seconds (3x the 30s interval)
@@ -200,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
                     // Get list of offline runners and re-enqueue their jobs
                     // We need to check which runners are now offline and requeue
                     let assigned_jobs = runner_loss_scheduler.get_assigned_jobs().await;
-                    for (job_id, runner_id, pipeline_run_id) in assigned_jobs {
+                    for (_job_id, runner_id, _pipeline_run_id) in assigned_jobs {
                         // Check if the runner for this job assignment is now offline
                         // by looking at the runner's current status
                         let runner_offline = {
@@ -231,8 +253,6 @@ async fn main() -> anyhow::Result<()> {
     let _timeout_handle = tokio::spawn(async move {
         // Check for stale running jobs every 60 seconds
         let check_interval = Duration::from_secs(60);
-        let job_timeout_secs: i64 = 3600; // 1 hour default max
-
         let mut ticker = tokio::time::interval(check_interval);
         loop {
             tokio::select! {
@@ -242,8 +262,6 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     let registry = timeout_registry.read().await;
-                    let now = chrono::Utc::now();
-
                     for (run_id, engine) in registry.iter() {
                         let state = engine.state().await;
                         for (job_id, job_state) in state.jobs.iter() {
@@ -467,6 +485,7 @@ pub async fn graceful_shutdown_delay() {
 }
 
 /// Run the event consumer loop
+#[allow(clippy::too_many_arguments)]
 async fn run_event_consumer(
     event_bus: Arc<dyn EventBus>,
     scheduler: Arc<Scheduler>,
@@ -474,7 +493,11 @@ async fn run_event_consumer(
     scheduler_db: Option<gitforge_db::Pool>,
     workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
     pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
-    run_waiters: Arc<std::sync::Mutex<HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>>>,
+    run_waiters: Arc<
+        std::sync::Mutex<
+            HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
+        >,
+    >,
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     tracing::info!("starting event consumer loop");
@@ -551,13 +574,7 @@ async fn handle_push_event(
     // Get or create the pipeline definition for this repo. Durable scheduler
     // state is authoritative when configured; the in-memory default remains
     // the explicit development fallback.
-    let cached_pipeline = {
-        pipeline_cache
-            .lock()
-            .unwrap()
-            .get(&repo_id)
-            .cloned()
-    };
+    let cached_pipeline = { pipeline_cache.lock().unwrap().get(&repo_id).cloned() };
     let pipeline = if let Some(cached) = cached_pipeline {
         cached
     } else {
@@ -565,7 +582,9 @@ async fn handle_push_event(
             gitforge_db::queries::PipelineQueries::list_by_repo(pool, repo_id)
                 .await?
                 .into_iter()
-                .find_map(|pipeline| serde_json::from_value::<PipelineDefinition>(pipeline.config).ok())
+                .find_map(|pipeline| {
+                    serde_json::from_value::<PipelineDefinition>(pipeline.config).ok()
+                })
         } else {
             None
         };
@@ -683,7 +702,10 @@ async fn run_scheduler_event_consumer(
             .get(&pipeline_run_id)
             .cloned();
         let Some(engine) = engine else {
-            tracing::warn!("completion received for unknown pipeline run {}", pipeline_run_id);
+            tracing::warn!(
+                "completion received for unknown pipeline run {}",
+                pipeline_run_id
+            );
             continue;
         };
         if let Err(error) = engine.assign_job(job_id, runner_id).await {
@@ -720,7 +742,11 @@ async fn run_scheduler_event_consumer(
             .flatten();
         for next_job_id in engine.ready_jobs().await {
             if let Some(definition) = engine.job_definition(next_job_id) {
-                let commands = definition.steps.iter().map(|step| step.run.clone()).collect();
+                let commands = definition
+                    .steps
+                    .iter()
+                    .map(|step| step.run.clone())
+                    .collect();
                 let working_dir = definition
                     .steps
                     .iter()

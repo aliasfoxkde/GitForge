@@ -56,5 +56,12 @@ database persists a lease token and monotonic generation. Assignment, start,
 and completion use conditional updates so a competing scheduler or stale
 runner cannot transition a job it no longer owns. User-facing API submission,
 status, ownership, and cancellation are now implemented against durable state.
-Streaming log append, artifact transfer, and an end-to-end service test remain
-follow-up work before exposing the endpoints outside a trusted local network.
+Runner output can be appended through authenticated `POST /jobs/{id}/logs`
+requests containing `runner_id`, `lease_token`, and a bounded `chunk`. Chunks
+are persisted in SQLite in sequence order and are exposed with the user-facing
+job logs response. A runner can upload bounded artifact bytes through
+`POST /jobs/{id}/artifacts` using `x-runner-id`, `x-lease-token`,
+`x-artifact-name`, and an optional checksum; the scheduler writes server-owned
+metadata into the shared artifact store. These endpoints remain lease-fenced
+and require the runner credential. True byte-by-byte sandbox streaming and a
+full API-to-scheduler-to-runner service test remain follow-up work.

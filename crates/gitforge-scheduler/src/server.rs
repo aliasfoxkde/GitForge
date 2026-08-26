@@ -2,9 +2,10 @@
 
 use crate::Scheduler;
 use axum::{
+    body::Bytes,
     extract::Request,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     response::Response,
@@ -13,6 +14,7 @@ use axum::{
 };
 use gitforge_common::{JobId, RunnerId};
 use gitforge_db::models::{Runner, RunnerType};
+use gitforge_storage::{Artifact, ArtifactId, ArtifactStore, FileStorage, MAX_ARTIFACT_BYTES};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -23,6 +25,7 @@ pub struct SchedulerServerState {
     pub scheduler: Arc<Scheduler>,
     runner_auth_token: Option<Arc<str>>,
     operator_auth_token: Option<Arc<str>>,
+    artifact_storage: Option<Arc<FileStorage>>,
 }
 
 /// Runner registration request
@@ -58,6 +61,13 @@ struct LeaseRequest {
     lease_token: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct LogAppendRequest {
+    runner_id: String,
+    lease_token: String,
+    chunk: String,
+}
+
 /// Authenticated operator submission. The idempotency key is mandatory so a
 /// retry after a lost response cannot start duplicate work.
 #[derive(Debug, Deserialize, Serialize)]
@@ -71,6 +81,15 @@ pub struct SubmitJobRequest {
 
 /// Create scheduler server state
 pub fn create_state(scheduler: Scheduler) -> SchedulerServerState {
+    create_state_with_artifact_storage(scheduler, None)
+}
+
+/// Create scheduler state with an optional shared artifact store. The CI
+/// service should attach the same root used by the API gateway.
+pub fn create_state_with_artifact_storage(
+    scheduler: Scheduler,
+    artifact_storage: Option<Arc<FileStorage>>,
+) -> SchedulerServerState {
     let shared = std::env::var("GITFORGE_SCHEDULER_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())
@@ -89,6 +108,15 @@ pub fn create_state(scheduler: Scheduler) -> SchedulerServerState {
         scheduler: Arc::new(scheduler),
         runner_auth_token: runner,
         operator_auth_token: operator,
+        artifact_storage,
+    }
+}
+
+impl SchedulerServerState {
+    /// Attach the shared artifact store used by the API gateway.
+    pub fn with_artifact_storage(mut self, storage: Arc<FileStorage>) -> Self {
+        self.artifact_storage = Some(storage);
+        self
     }
 }
 
@@ -112,6 +140,9 @@ fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
         .route("/jobs/pending", get(get_pending_jobs))
         .route("/jobs/{id}/claim", post(claim_job))
         .route("/jobs/{id}/started", post(start_job))
+        .route("/jobs/{id}/logs", post(append_job_log))
+        .route("/jobs/{id}/artifacts", post(upload_job_artifact))
+        .layer(DefaultBodyLimit::max(MAX_ARTIFACT_BYTES as usize))
         .route("/jobs/{id}/cancelled", get(job_cancelled))
         .route("/jobs/{id}/assign", post(assign_job))
         .route("/jobs/{id}/complete", post(complete_job))
@@ -579,6 +610,192 @@ async fn start_job(
     }
 }
 
+/// Append bounded runner output while the durable lease is active.
+async fn append_job_log(
+    State(state): State<SchedulerServerState>,
+    Path(job_id): Path<String>,
+    Json(request): Json<LogAppendRequest>,
+) -> impl IntoResponse {
+    let job_id = match Uuid::parse_str(&job_id) {
+        Ok(id) => JobId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_job_id"})),
+            )
+        }
+    };
+    let runner_id = match Uuid::parse_str(&request.runner_id) {
+        Ok(id) => RunnerId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_runner_id"})),
+            )
+        }
+    };
+    match state
+        .scheduler
+        .append_log_with_lease(job_id, runner_id, &request.lease_token, &request.chunk)
+        .await
+    {
+        Ok(Some(sequence)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "contract_version": "harness.job.v1",
+                "job_id": job_id.to_string(),
+                "sequence": sequence,
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "invalid_job_lease"})),
+        ),
+        Err(error) if error.to_string().contains("exceeds") => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "log_limit_exceeded", "message": error.to_string()})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({"error": "log_persistence_failed", "message": error.to_string()}),
+            ),
+        ),
+    }
+}
+
+/// Upload one bounded artifact from a runner into the shared store.
+/// Metadata is created server-side; the runner can provide only a safe name
+/// and optional media type, never an arbitrary filesystem path.
+async fn upload_job_artifact(
+    State(state): State<SchedulerServerState>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if body.len() as u64 > MAX_ARTIFACT_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "artifact_too_large"})),
+        );
+    }
+    let job_id = match Uuid::parse_str(&job_id) {
+        Ok(id) => JobId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_job_id"})),
+            )
+        }
+    };
+    let runner_id = match headers
+        .get("x-runner-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+    {
+        Some(id) => RunnerId::from(id),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "missing_runner_id"})),
+            )
+        }
+    };
+    let Some(lease_token) = headers
+        .get("x-lease-token")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing_lease_token"})),
+        );
+    };
+    let Some(name) = headers
+        .get("x-artifact-name")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing_artifact_name"})),
+        );
+    };
+    if name.is_empty() || name.len() > 256 || name.contains('\0') || name.contains("..") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_artifact_name"})),
+        );
+    }
+    let Some(storage) = state.artifact_storage else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "artifact_storage_not_configured"})),
+        );
+    };
+    let active = state
+        .scheduler
+        .job_lease_active(job_id, runner_id, lease_token)
+        .await;
+    if !active {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "invalid_job_lease"})),
+        );
+    }
+
+    let checksum = sha256_hex(&body);
+    if let Some(expected) = headers
+        .get("x-artifact-sha256")
+        .and_then(|value| value.to_str().ok())
+    {
+        if expected != checksum {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "artifact_checksum_mismatch"})),
+            );
+        }
+    }
+    let artifact_id = ArtifactId::new();
+    let artifact = Artifact {
+        id: artifact_id,
+        job_id,
+        name: name.to_string(),
+        path: format!("gitforge://artifact/{artifact_id}"),
+        checksum: checksum.clone(),
+        size_bytes: body.len() as u64,
+        content_type: headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+        created_at: chrono::Utc::now(),
+    };
+    let artifact_id = artifact.id.to_string();
+    if let Err(error) = storage.put(&artifact, &body).await {
+        tracing::error!(%error, %job_id, "failed to persist runner artifact");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "artifact_persistence_failed"})),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "contract_version": "harness.job.v1",
+            "artifact_id": artifact_id,
+            "job_id": job_id.to_string(),
+            "name": name,
+            "sha256": checksum,
+            "bytes": body.len(),
+        })),
+    )
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
 /// Assign a job to a runner (runner claims a job)
 async fn assign_job(
     State(_state): State<SchedulerServerState>,
@@ -859,7 +1076,10 @@ mod tests {
                 None,
             )
             .await;
-        let state = create_state(scheduler);
+        let artifact_root =
+            std::env::temp_dir().join(format!("gitforge-scheduler-artifacts-{}", Uuid::new_v4()));
+        let artifact_storage = Arc::new(FileStorage::new(&artifact_root).await.unwrap());
+        let state = create_state_with_artifact_storage(scheduler, Some(artifact_storage.clone()));
         let app = scheduler_routes_with_tokens(
             state,
             Some(Arc::from("runner-token")),
@@ -902,6 +1122,79 @@ mod tests {
             .unwrap();
         assert_eq!(started.status(), StatusCode::OK);
 
+        let artifact_body = b"runner artifact";
+        let artifact_checksum = sha256_hex(artifact_body);
+        let artifact = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/jobs/{job_id}/artifacts"))
+                    .header("Authorization", "Bearer runner-token")
+                    .header("Content-Type", "application/octet-stream")
+                    .header("x-runner-id", runner_id.to_string())
+                    .header("x-lease-token", lease_token)
+                    .header("x-artifact-name", "result.txt")
+                    .header("x-artifact-sha256", artifact_checksum)
+                    .body(axum::body::Body::from(artifact_body.as_slice()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(artifact.status(), StatusCode::OK);
+        let artifact_payload = axum::body::to_bytes(artifact.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let artifact_id: String = serde_json::from_slice::<serde_json::Value>(&artifact_payload)
+            .unwrap()["artifact_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let stale_log = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/jobs/{job_id}/logs"))
+                    .header("Authorization", "Bearer runner-token")
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "runner_id": runner_id.to_string(),
+                            "lease_token": "stale",
+                            "chunk": "must be fenced"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_log.status(), StatusCode::CONFLICT);
+
+        let log = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/jobs/{job_id}/logs"))
+                    .header("Authorization", "Bearer runner-token")
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "runner_id": runner_id.to_string(),
+                            "lease_token": lease_token,
+                            "chunk": "live output\n"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(log.status(), StatusCode::OK);
+
         let completed = app
             .oneshot(
                 Request::builder()
@@ -931,6 +1224,21 @@ mod tests {
                 .status,
             "succeeded"
         );
+        assert_eq!(
+            gitforge_db::queries::JobQueries::list_logs(&pool, job_id)
+                .await
+                .unwrap()[0]
+                .chunk,
+            "live output\n"
+        );
+        let stored = artifact_storage
+            .get(gitforge_storage::ArtifactId::from(
+                Uuid::parse_str(&artifact_id).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stored, artifact_body);
+        let _ = tokio::fs::remove_dir_all(artifact_root).await;
     }
 
     #[tokio::test]
@@ -1102,6 +1410,7 @@ mod tests {
             scheduler: Arc::new(crate::Scheduler::new()),
             runner_auth_token: Some(Arc::from("runner-secret")),
             operator_auth_token: Some(Arc::from("operator-secret")),
+            artifact_storage: None,
         }
     }
 

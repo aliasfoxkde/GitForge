@@ -3,12 +3,16 @@
 use crate::executor::{ExecutableJob, JobExecutor, JobStep};
 use gitforge_common::{Error, JobId, PipelineRunId, Result, RunnerId};
 use gitforge_db::models::Runner;
-use gitforge_sandbox::DockerSandbox;
+use gitforge_sandbox::{DockerSandbox, StepResult};
+use gitforge_storage::ArtifactReceipt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
+use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration};
 
@@ -496,6 +500,36 @@ impl RunnerAgent {
             result.exit_code
         );
 
+        let protocol = RunnerProtocol {
+            client,
+            scheduler_url,
+            job_id: &assignment.job_id,
+            runner_id,
+            lease_token,
+            scheduler_token,
+        };
+        if let Err(error) = report_log_chunks(&protocol, &result.step_results).await {
+            tracing::warn!(%error, job_id = %assignment.job_id, "failed to stream job logs");
+        }
+
+        let uploaded_artifacts = match report_artifacts(
+            &protocol,
+            result.workspace_path.as_deref(),
+            &result.artifacts,
+        )
+        .await
+        {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                tracing::warn!(%error, job_id = %assignment.job_id, "failed to upload job artifacts");
+                result
+                    .artifacts
+                    .iter()
+                    .filter_map(|artifact| serde_json::to_value(artifact).ok())
+                    .collect()
+            }
+        };
+
         // Report completion to scheduler with full results
         let complete_url = format!("{}/jobs/{}/complete", scheduler_url, assignment.job_id);
 
@@ -520,7 +554,7 @@ impl RunnerAgent {
             "exit_code": result.exit_code,
             "error": result.error,
             "step_results": step_results_json,
-            "artifacts": result.artifacts,
+            "artifacts": uploaded_artifacts,
         });
 
         let mut complete_request_builder = client.post(&complete_url).json(&complete_request);
@@ -537,9 +571,140 @@ impl RunnerAgent {
     }
 }
 
+/// Upload final step output in bounded, UTF-8-safe chunks before completion.
+/// The scheduler persists each chunk under the runner lease; this provides a
+/// durable tail immediately before the terminal receipt while the sandbox
+/// streaming interface is still being expanded.
+struct RunnerProtocol<'a> {
+    client: &'a Client,
+    scheduler_url: &'a str,
+    job_id: &'a str,
+    runner_id: RunnerId,
+    lease_token: &'a str,
+    scheduler_token: Option<&'a str>,
+}
+
+async fn report_log_chunks(
+    protocol: &RunnerProtocol<'_>,
+    step_results: &[StepResult],
+) -> anyhow::Result<()> {
+    let endpoint = format!("{}/jobs/{}/logs", protocol.scheduler_url, protocol.job_id);
+    for (index, result) in step_results.iter().enumerate() {
+        let mut output = String::new();
+        if !result.stdout.is_empty() {
+            output.push_str(&format!("[step {index} stdout]\n{}\n", result.stdout));
+        }
+        if !result.stderr.is_empty() {
+            output.push_str(&format!("[step {index} stderr]\n{}\n", result.stderr));
+        }
+        for chunk in utf8_chunks(&output, 60 * 1024) {
+            let mut request = protocol.client.post(&endpoint).json(&serde_json::json!({
+                "contract_version": "harness.job.v1",
+                "runner_id": protocol.runner_id.to_string(),
+                "lease_token": protocol.lease_token,
+                "chunk": chunk,
+            }));
+            if let Some(token) = protocol.scheduler_token {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await?;
+            if !response.status().is_success() {
+                anyhow::bail!("scheduler rejected log append: {}", response.status());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn utf8_chunks(value: &str, max_bytes: usize) -> Vec<&str> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < value.len() {
+        let mut end = (start + max_bytes).min(value.len());
+        while end > start && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = value[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| start + offset)
+                .unwrap_or(value.len());
+        }
+        chunks.push(&value[start..end]);
+        start = end;
+    }
+    chunks
+}
+
+async fn report_artifacts(
+    protocol: &RunnerProtocol<'_>,
+    workspace_path: Option<&str>,
+    artifacts: &[ArtifactReceipt],
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let Some(workspace_path) = workspace_path else {
+        return Ok(Vec::new());
+    };
+    if artifacts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let artifact_root = fs::canonicalize(Path::new(workspace_path).join("artifacts")).await?;
+    let endpoint = format!(
+        "{}/jobs/{}/artifacts",
+        protocol.scheduler_url, protocol.job_id
+    );
+    let mut uploaded = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let path = artifact_root.join(&artifact.name);
+        let canonical = fs::canonicalize(&path).await?;
+        if !canonical.starts_with(&artifact_root) {
+            anyhow::bail!("artifact path escapes artifact directory");
+        }
+        let data = fs::read(&canonical).await?;
+        let checksum = sha256_hex(&data);
+        if checksum != artifact.sha256 {
+            anyhow::bail!("artifact checksum changed before upload: {}", artifact.name);
+        }
+        let mut request = protocol
+            .client
+            .post(&endpoint)
+            .header("x-runner-id", protocol.runner_id.to_string())
+            .header("x-lease-token", protocol.lease_token)
+            .header("x-artifact-name", &artifact.name)
+            .header("x-artifact-sha256", &checksum)
+            .body(data);
+        if let Some(token) = protocol.scheduler_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            anyhow::bail!("scheduler rejected artifact upload: {}", response.status());
+        }
+        uploaded.push(response.json::<serde_json::Value>().await?);
+    }
+    Ok(uploaded)
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_utf8_chunks_preserve_boundaries() {
+        let value = "ééé";
+        let chunks = utf8_chunks(value, 3);
+        assert_eq!(chunks.concat(), value);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 3));
+    }
 
     #[tokio::test]
     async fn test_runner_creation() {
