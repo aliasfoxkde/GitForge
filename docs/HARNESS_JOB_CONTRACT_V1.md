@@ -51,9 +51,10 @@ requeues durable `assigned` rows and restores persisted command definitions
 before scheduling. Durable `running` rows are fenced as failed with a restart
 receipt instead of being replayed: without a durable runner-generation lease,
 replay could duplicate external side effects if the old runner is still alive.
-The current lease map remains process-local and is invalidated by recovery;
-multi-scheduler deployment therefore remains unsupported until a durable lease
-table or equivalent fencing token is added. User-facing API submission,
+The scheduler keeps an in-process lease mirror for fast checks, while the
+database persists a lease token and monotonic generation. Assignment, start,
+and completion use conditional updates so a competing scheduler or stale
+runner cannot transition a job it no longer owns. User-facing API submission,
 status, ownership, and cancellation are now implemented against durable state.
 Streaming log append, artifact transfer, and an end-to-end service test remain
 follow-up work before exposing the endpoints outside a trusted local network.

@@ -213,15 +213,17 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   access immediately rather than retaining stale claims until expiry.
 - Added scheduler regressions for unknown heartbeats, stale-runner offline
   transitions, assignment requeue and lease cleanup, wrong-runner rejection,
-  and wrong-lease rejection. The contract remains intentionally single-
-  scheduler: the active lease map is process-local until durable generation
-  fencing is implemented.
+  wrong-lease rejection, durable assignment races, and the HTTP
+  pending/start/complete protocol. SQLite persists a lease token and monotonic
+  generation; all three transitions use conditional updates so stale runners
+  are fenced.
 - Updated the OpenAPI specification and API/job-contract documentation for
   role management and the multi-scheduler boundary.
-- Validation: 181 API unit tests, 43 API integration tests, 66 database tests,
-  and 87 scheduler tests pass; strict Clippy and scoped formatting pass. The
-  managed full-workspace GitForge job `5db689dc-a0f9-48fa-b982-d345ea7ecd46`
-  passed with exit 0 at `2026-08-26T03:36:11Z`.
+- Validation: 181 API unit tests, 43 API integration tests, 66 database unit
+  tests plus 9 database integration tests, and 89 scheduler tests pass;
+  workspace Clippy and scoped formatting pass. The managed full-workspace
+  GitForge job `f2caae83-efde-40a6-a8da-35c53ef0da33` passed with exit 0 at
+  `2026-08-26T03:46:56Z`; managed workspace Clippy also passed.
 
 - Fixed a scheduler cancellation invariant: queue removal is lazy, so stale
   `BinaryHeap` entries are now discarded by both `peek` and `dequeue` before

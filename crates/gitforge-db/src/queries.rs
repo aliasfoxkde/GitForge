@@ -713,6 +713,18 @@ impl JobQueries {
         Ok(())
     }
 
+    /// Requeue an assigned job and clear its runner fencing token.
+    pub async fn requeue(pool: &Pool, id: JobId) -> Result<()> {
+        sqlx::query(
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE id = ? AND status = 'assigned'",
+        )
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to requeue job: {}", e)))?;
+        Ok(())
+    }
+
     /// Persist the executable definition for a job. This is intentionally
     /// separate from status transitions so queueing remains idempotent.
     pub async fn set_definition(
@@ -774,6 +786,26 @@ impl JobQueries {
         Ok(())
     }
 
+    /// Atomically assign a queued job and advance its durable fencing
+    /// generation. A false result means another scheduler won the race.
+    pub async fn assign_with_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET runner_id = ?, status = 'assigned', lease_token = ?, lease_generation = lease_generation + 1 WHERE id = ? AND status IN ('pending', 'queued') AND runner_id IS NULL",
+        )
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to assign job lease: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Persist the assigned-to-running lifecycle transition.
     pub async fn start(pool: &Pool, id: JobId) -> Result<()> {
         sqlx::query(
@@ -785,6 +817,52 @@ impl JobQueries {
         .await
         .map_err(|e| Error::database(format!("failed to start job: {}", e)))?;
         Ok(())
+    }
+
+    /// Start a job only when the durable runner lease still matches.
+    pub async fn start_with_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, ?) WHERE id = ? AND runner_id = ? AND lease_token = ? AND status = 'assigned'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to start job with lease: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Complete a job only when the durable runner lease still matches. The
+    /// lease is cleared as part of the same conditional update, fencing late
+    /// completion messages after reassignment or terminal transition.
+    pub async fn complete_with_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        status: &str,
+        result_json: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = ?, finished_at = ?, result_json = ?, lease_token = NULL WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
+        )
+        .bind(status)
+        .bind(Utc::now().to_rfc3339())
+        .bind(result_json)
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to complete job with lease: {}", e)))?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Persist an operator cancellation as a terminal job transition.
@@ -918,13 +996,13 @@ impl JobQueries {
             .await
             .map_err(|e| Error::database(format!("failed to begin recovery: {}", e)))?;
         let assigned = sqlx::query(
-            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL WHERE status = 'assigned'",
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE status = 'assigned'",
         )
         .execute(&mut *transaction)
         .await
         .map_err(|e| Error::database(format!("failed to requeue assigned jobs: {}", e)))?;
         let running = sqlx::query(
-            "UPDATE jobs SET status = 'failed', runner_id = NULL, finished_at = ?, result_json = ? WHERE status = 'running'",
+            "UPDATE jobs SET status = 'failed', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE status = 'running'",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(r#"{"status":"failed","reason":"scheduler_restart_fenced_running_job"}"#)

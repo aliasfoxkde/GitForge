@@ -495,8 +495,7 @@ impl Scheduler {
 
             // Persist status change to DB
             if let Some(pool) = &db_pool {
-                let _ =
-                    gitforge_db::queries::JobQueries::update_status(pool, *job_id, "queued").await;
+                let _ = gitforge_db::queries::JobQueries::requeue(pool, *job_id).await;
             }
         }
 
@@ -584,14 +583,42 @@ impl Scheduler {
 
             match runner_id {
                 Some(r_id) => {
+                    let lease_token = state
+                        .job_leases
+                        .entry(job_id)
+                        .or_insert_with(|| Uuid::new_v4().to_string())
+                        .clone();
+
+                    // Let the durable database win races between scheduler
+                    // instances before mutating this scheduler's mirror.
+                    if let Some(pool) = &self.db_pool {
+                        match gitforge_db::queries::JobQueries::assign_with_lease(
+                            pool,
+                            job_id,
+                            r_id,
+                            &lease_token,
+                        )
+                        .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                state.queue.dequeue();
+                                state.job_leases.remove(&job_id);
+                                tracing::debug!(%job_id, "job assignment won by another scheduler");
+                                continue;
+                            }
+                            Err(error) => {
+                                state.job_leases.remove(&job_id);
+                                tracing::error!(%error, %job_id, "failed to persist durable job lease");
+                                break;
+                            }
+                        }
+                    }
+
                     // Dequeue and assign (JobId and RunnerId are Copy types)
                     state.queue.dequeue();
                     state.job_assignments.insert(job_id, r_id);
                     state.assigned_jobs.insert(job_id, (r_id, pipeline_run_id));
-                    state
-                        .job_leases
-                        .entry(job_id)
-                        .or_insert_with(|| Uuid::new_v4().to_string());
                     tracing::info!("assigned job {} to runner {}", job_id, r_id);
                     processed += 1;
 
@@ -601,22 +628,6 @@ impl Scheduler {
                         runner_id: r_id,
                     };
                     let _ = self.event_tx.send(event);
-
-                    // Persist assignment to database if available
-                    if let Some(pool) = &self.db_pool {
-                        if let Err(e) =
-                            gitforge_db::queries::JobQueries::assign(pool, job_id, r_id).await
-                        {
-                            tracing::error!("failed to persist job assignment to DB: {}", e);
-                        }
-                        if let Err(e) = gitforge_db::queries::JobQueries::update_status(
-                            pool, job_id, "assigned",
-                        )
-                        .await
-                        {
-                            tracing::error!("failed to update job status in DB: {}", e);
-                        }
-                    }
                 }
                 None => {
                     // No runner available for this job, skip remaining
@@ -759,9 +770,17 @@ impl Scheduler {
             }
         }
         if let Some(pool) = &self.db_pool {
-            gitforge_db::queries::JobQueries::start(pool, job_id)
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let accepted = gitforge_db::queries::JobQueries::start_with_lease(
+                pool,
+                job_id,
+                runner_id,
+                lease_token,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if !accepted {
+                anyhow::bail!("durable job lease is no longer active");
+            }
         }
         Ok(())
     }
@@ -782,6 +801,22 @@ impl Scheduler {
                 || state.job_leases.get(&job_id).map(String::as_str) != Some(lease_token)
             {
                 anyhow::bail!("invalid job lease or runner assignment");
+            }
+        }
+        if let Some(pool) = &self.db_pool {
+            let status = if success { "succeeded" } else { "failed" };
+            let accepted = gitforge_db::queries::JobQueries::complete_with_lease(
+                pool,
+                job_id,
+                runner_id,
+                lease_token,
+                status,
+                &result_json,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if !accepted {
+                anyhow::bail!("durable job lease is no longer active");
             }
         }
         self.complete_job(job_id, success, result_json).await
@@ -1441,6 +1476,85 @@ mod tests {
             )
             .await
             .is_ok());
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_persists_and_enforces_durable_lease() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "lease-owner".to_string(),
+            "lease-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            "lease-repo".to_string(),
+            user.id,
+            "/git/lease-repo".to_string(),
+        );
+        gitforge_db::queries::RepoQueries::create(&pool, &repo)
+            .await
+            .unwrap();
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: "lease-pipeline".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "lease-owner".to_string(),
+            "lease-commit".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+        let job = gitforge_db::models::Job::new(run.id, "durable-lease".to_string());
+        let job_id = job.id;
+        gitforge_db::queries::JobQueries::create(&pool, &job)
+            .await
+            .unwrap();
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        let runner = make_runner(RunnerId::new(), "durable-runner", "online", 1);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+        scheduler.enqueue(job_id, run.id, repo.id).await;
+        scheduler.process_queue().await;
+
+        let persisted = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runner_id, Some(runner_id));
+        assert_eq!(persisted.status, "assigned");
+        let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
+        assert!(scheduler.start_job(job_id, runner_id, &lease).await.is_ok());
+        assert!(scheduler
+            .complete_job_with_lease(
+                job_id,
+                runner_id,
+                &lease,
+                true,
+                "{\"durable\":true}".to_string(),
+            )
+            .await
+            .is_ok());
+        let completed = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "succeeded");
         assert!(scheduler.is_assigned(job_id).await.is_none());
     }
 }

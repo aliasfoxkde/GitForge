@@ -240,6 +240,85 @@ async fn test_database_job_state_transitions() {
 }
 
 #[tokio::test]
+async fn test_database_durable_job_lease_fences_replay() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let user = User::new(
+        "lease-owner".to_string(),
+        "lease-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "lease-repo".to_string(),
+        user.id,
+        "/git/lease-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+    let pipeline = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "lease-ci".to_string(),
+        trigger_type: "manual".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    PipelineQueries::create(&pool, &pipeline).await.unwrap();
+    let run = PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "lease-owner".to_string(),
+        "lease-commit".to_string(),
+    );
+    PipelineRunQueries::create(&pool, &run).await.unwrap();
+    let job = Job::new(run.id, "lease-job".to_string());
+    JobQueries::create(&pool, &job).await.unwrap();
+    let runner = Runner::new("lease-runner".to_string(), RunnerType::Docker, 1);
+    RunnerQueries::create(&pool, &runner).await.unwrap();
+
+    assert!(
+        JobQueries::assign_with_lease(&pool, job.id, runner.id, "lease-a")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !JobQueries::assign_with_lease(&pool, job.id, runner.id, "lease-b")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !JobQueries::start_with_lease(&pool, job.id, runner.id, "lease-b")
+            .await
+            .unwrap()
+    );
+    assert!(
+        JobQueries::start_with_lease(&pool, job.id, runner.id, "lease-a")
+            .await
+            .unwrap()
+    );
+    assert!(!JobQueries::complete_with_lease(
+        &pool,
+        job.id,
+        runner.id,
+        "lease-b",
+        "succeeded",
+        "{\"ok\":true}",
+    )
+    .await
+    .unwrap());
+    assert!(JobQueries::complete_with_lease(
+        &pool,
+        job.id,
+        runner.id,
+        "lease-a",
+        "succeeded",
+        "{\"ok\":true}",
+    )
+    .await
+    .unwrap());
+}
+
+#[tokio::test]
 async fn test_database_pipeline_run_status_updates() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();

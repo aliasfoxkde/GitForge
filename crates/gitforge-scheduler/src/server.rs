@@ -801,6 +801,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_http_runner_protocol_uses_durable_lease() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "http-lease-owner".to_string(),
+            "http-lease-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            "http-lease-repo".to_string(),
+            user.id,
+            "/git/http-lease-repo".to_string(),
+        );
+        gitforge_db::queries::RepoQueries::create(&pool, &repo)
+            .await
+            .unwrap();
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: "http-lease-pipeline".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "http-lease-owner".to_string(),
+            "http-lease-commit".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+        let job = gitforge_db::models::Job::new(run.id, "http-lease-job".to_string());
+        let job_id = job.id;
+        gitforge_db::queries::JobQueries::create(&pool, &job)
+            .await
+            .unwrap();
+
+        let scheduler = crate::Scheduler::with_db(pool.clone());
+        let runner = Runner::new("http-lease-runner".to_string(), RunnerType::Docker, 1);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                run.id,
+                repo.id,
+                vec!["cargo test".to_string()],
+                None,
+            )
+            .await;
+        let state = create_state(scheduler);
+        let app = scheduler_routes_with_tokens(
+            state,
+            Some(Arc::from("runner-token")),
+            Some(Arc::from("operator-token")),
+        );
+
+        let pending = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/jobs/pending?runner_id={runner_id}"))
+                    .header("Authorization", "Bearer runner-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.status(), StatusCode::OK);
+        let pending_body = axum::body::to_bytes(pending.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let assignments: Vec<serde_json::Value> = serde_json::from_slice(&pending_body).unwrap();
+        assert_eq!(assignments.len(), 1);
+        let lease_token = assignments[0]["lease_token"].as_str().unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/jobs/{job_id}/started"))
+                    .header("Authorization", "Bearer runner-token")
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"runner_id": runner_id.to_string(), "lease_token": lease_token}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+
+        let completed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/jobs/{job_id}/complete"))
+                    .header("Authorization", "Bearer runner-token")
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "runner_id": runner_id.to_string(),
+                            "lease_token": lease_token,
+                            "success": true,
+                            "receipt": {"http": true}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.status(), StatusCode::OK);
+        assert_eq!(
+            gitforge_db::queries::JobQueries::get(&pool, job_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "succeeded"
+        );
+    }
+
+    #[tokio::test]
     async fn test_job_cancelled_probe_tracks_operator_cancellation() {
         let scheduler = crate::Scheduler::new();
         let state = create_state(scheduler);
