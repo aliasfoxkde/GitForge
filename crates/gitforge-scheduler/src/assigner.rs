@@ -525,6 +525,41 @@ impl Scheduler {
                 return;
             }
         }
+
+        // Keep the scheduler responsive to jobs submitted by the separate API
+        // process after startup. `load_pending_jobs` is deduplicated by the
+        // in-memory queue and runs on the existing bounded scheduler tick.
+        if self.recovery_done.load(Ordering::Acquire) {
+            if let Err(error) = self.load_pending_jobs().await {
+                tracing::error!(%error, "failed to refresh pending durable jobs");
+            }
+        }
+
+        // API-side cancellation writes the durable row directly because API
+        // and scheduler are separate processes. Reconcile those rows before
+        // assignment so a canceled queued job cannot be handed to a runner.
+        if let Some(pool) = &self.db_pool {
+            let queued_ids = {
+                let state = self.state.read().await;
+                state
+                    .queue
+                    .all()
+                    .into_iter()
+                    .map(|job| job.job_id)
+                    .collect::<Vec<_>>()
+            };
+            for job_id in queued_ids {
+                let is_cancelled = gitforge_db::queries::JobQueries::get(pool, job_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|job| job.status == "cancelled")
+                    .unwrap_or(false);
+                if is_cancelled {
+                    self.cancel(job_id).await;
+                }
+            }
+        }
         let mut state = self.state.write().await;
         let runners = state.list_online_runners();
         let available_runners = runners.len();
@@ -879,6 +914,92 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("idempotency_key_reused"));
+    }
+
+    #[tokio::test]
+    async fn test_api_cancelled_queued_job_is_not_assigned() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "scheduler-owner".to_string(),
+            "scheduler@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo_id = RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "scheduler-repo".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: "/tmp/scheduler-repo".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: "scheduler-ci".to_string(),
+                trigger_type: "manual".to_string(),
+                config: serde_json::json!({}),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let scheduler = Scheduler::with_db(pool.clone());
+        let job_id = JobId::new();
+        let run_id = PipelineRunId::new();
+        gitforge_db::queries::PipelineRunQueries::create(
+            &pool,
+            &gitforge_db::models::PipelineRun {
+                id: run_id,
+                pipeline_id,
+                repo_id,
+                status: "queued".to_string(),
+                triggered_by: "test".to_string(),
+                commit_hash: "abc123".to_string(),
+                started_at: None,
+                finished_at: None,
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                run_id,
+                repo_id,
+                vec!["cargo test".to_string()],
+                None,
+            )
+            .await;
+        let receipt = serde_json::json!({
+            "job_id": job_id.to_string(),
+            "status": "cancelled",
+            "reason": "api test"
+        })
+        .to_string();
+        gitforge_db::queries::JobQueries::cancel(&pool, job_id, &receipt)
+            .await
+            .unwrap();
+        scheduler
+            .register_runner(make_runner(RunnerId::new(), "runner", "online", 1))
+            .await;
+        scheduler.process_queue().await;
+        assert_eq!(scheduler.queue_len().await, 0);
+        assert!(scheduler.is_assigned(job_id).await.is_none());
     }
 
     #[tokio::test]

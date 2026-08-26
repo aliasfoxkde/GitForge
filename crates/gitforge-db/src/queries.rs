@@ -178,6 +178,18 @@ impl RepoQueries {
 pub struct UserQueries;
 
 impl UserQueries {
+    /// Get the persisted role for a user. This is kept separate from the
+    /// legacy User model so existing callers remain source-compatible while
+    /// the schema gains least-privilege role persistence.
+    pub async fn get_role(pool: &Pool, id: UserId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT role FROM users WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get user role: {}", e)))?;
+        Ok(row.map(|row| row.get::<String, _>("role")))
+    }
+
     /// Create a new user
     pub async fn create(pool: &Pool, user: &crate::models::User) -> Result<()> {
         sqlx::query(
@@ -583,6 +595,21 @@ impl JobQueries {
         .await
         .map_err(|e| Error::database(format!("failed to reserve job idempotency key: {}", e)))?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Release a reservation when the first job-row write fails before the
+    /// submission has become executable. This avoids poisoning a client key
+    /// after a transient database failure.
+    pub async fn delete_idempotency(pool: &Pool, scope: &str, idempotency_key: &str) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM job_idempotency_keys WHERE scope = ? AND idempotency_key = ?",
+        )
+        .bind(scope)
+        .bind(idempotency_key)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to release job idempotency key: {}", e)))?;
+        Ok(())
     }
 
     /// Create a new job
@@ -1662,6 +1689,22 @@ mod tests {
 
         let found = UserQueries::get(&pool, UserId::new()).await.unwrap();
         assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_user_role_defaults_to_developer() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = crate::models::User::new(
+            "role-user".to_string(),
+            "role@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        assert_eq!(
+            UserQueries::get_role(&pool, user.id).await.unwrap(),
+            Some("developer".to_string())
+        );
     }
 
     #[tokio::test]

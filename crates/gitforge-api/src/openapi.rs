@@ -224,6 +224,36 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     }
                 }
             },
+            "/jobs": {
+                "post": {
+                    "tags": ["ci"],
+                    "summary": "Submit an owned job",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["pipeline_run_id", "name", "commands", "idempotency_key"],
+                                    "properties": {
+                                        "pipeline_run_id": {"type": "string", "format": "uuid"},
+                                        "name": {"type": "string", "maxLength": 128},
+                                        "commands": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64},
+                                        "working_dir": {"type": ["string", "null"]},
+                                        "idempotency_key": {"type": "string", "maxLength": 128}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {"description": "Job queued"},
+                        "200": {"description": "Idempotent replay"},
+                        "403": {"description": "Repository ownership denied"},
+                        "409": {"description": "Conflicting request or terminal run"}
+                    }
+                }
+            },
             "/jobs/{id}/logs": {
                 "get": {
                     "tags": ["ci"],
@@ -233,6 +263,21 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     ],
                     "responses": {
                         "200": {"description": "Job logs"}
+                    }
+                }
+            },
+            "/jobs/{id}/cancel": {
+                "post": {
+                    "tags": ["ci"],
+                    "summary": "Cancel an owned job",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+                    ],
+                    "responses": {
+                        "200": {"description": "Cancellation persisted"},
+                        "403": {"description": "Repository ownership denied"},
+                        "404": {"description": "Job not found"},
+                        "409": {"description": "Job already terminal"}
                     }
                 }
             },

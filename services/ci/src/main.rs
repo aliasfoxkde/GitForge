@@ -304,8 +304,45 @@ struct PipelineTriggerRequest {
 }
 
 /// Trigger a pipeline through the same typed push-event path used by Git
-/// webhooks. This endpoint is intended for the LAN-only Control Center
-/// adapter; authentication/remote ingress remains outside this MVP boundary.
+/// webhooks. This endpoint is internal control-plane automation and requires
+/// a dedicated trigger token, falling back to the scheduler operator/shared
+/// token during migration.
+async fn require_trigger_auth(request: Request, next: Next) -> Response {
+    let expected = std::env::var("GITFORGE_TRIGGER_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .or_else(|| {
+            std::env::var("GITFORGE_SCHEDULER_OPERATOR_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("GITFORGE_SCHEDULER_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty())
+        });
+    let Some(expected) = expected else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "trigger_auth_not_configured"})),
+        )
+            .into_response();
+    };
+    let supplied = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if supplied == Some(&format!("Bearer {expected}")) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "trigger_auth_required"})),
+        )
+            .into_response()
+    }
+}
+
 async fn trigger_pipeline(
     Extension(trigger_state): Extension<Arc<TriggerState>>,
     Json(request): Json<PipelineTriggerRequest>,

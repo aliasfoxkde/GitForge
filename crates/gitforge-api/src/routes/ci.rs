@@ -1,16 +1,17 @@
 //! CI API routes
 
-use crate::auth::ApiAuth;
+use crate::auth::{ApiAuth, Claims};
 use axum::{
     extract::{Extension, Path},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use gitforge_common::{JobId, PipelineId, PipelineRunId};
 use gitforge_db::{
-    queries::{JobQueries, PipelineQueries, PipelineRunQueries},
+    models::JobStatus,
+    queries::{JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries},
     Pool,
 };
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,17 @@ pub struct JobResponse {
     pub finished_at: Option<String>,
 }
 
+/// User-facing job submission. The durable idempotency key is scoped to the
+/// authenticated user so client retries cannot create duplicate work.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SubmitJobRequest {
+    pub pipeline_run_id: String,
+    pub name: String,
+    pub commands: Vec<String>,
+    pub working_dir: Option<String>,
+    pub idempotency_key: String,
+}
+
 /// CI routes
 pub fn ci_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
@@ -50,10 +62,12 @@ pub fn ci_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/pipeline-runs/{id}/jobs", get(get_pipeline_run_jobs))
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/logs", get(get_job_logs))
+        .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/jobs", post(submit_job))
 }
 
 /// Helper to extract and validate user from headers
-fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
+fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<Claims, StatusCode> {
     let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok());
 
     let token = auth_header
@@ -61,9 +75,57 @@ fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
     auth.validate_token(token)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        .map_err(|_| StatusCode::UNAUTHORIZED)
+}
 
-    Ok(())
+fn can_manage_jobs(claims: &Claims) -> bool {
+    matches!(claims.role.as_str(), "admin" | "maintainer")
+}
+
+/// Require ownership of a repository, with admin/maintainer override.
+async fn authorize_repo(
+    pool: &Pool,
+    claims: &Claims,
+    repo_id: gitforge_common::RepoId,
+) -> Result<(), StatusCode> {
+    if can_manage_jobs(claims) {
+        return Ok(());
+    }
+    match RepoQueries::get(pool, repo_id).await {
+        Ok(Some(repo)) if repo.owner_id == claims.user_id => Ok(()),
+        Ok(Some(_)) => Err(StatusCode::FORBIDDEN),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::error!(%error, %repo_id, "failed to authorize repository access");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Load a job and enforce repository ownership through its pipeline run.
+async fn authorized_job(
+    pool: &Pool,
+    claims: &Claims,
+    job_id: JobId,
+) -> Result<gitforge_db::models::Job, StatusCode> {
+    let job = match JobQueries::get(pool, job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::error!(%error, %job_id, "failed to load job for authorization");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let run = match PipelineRunQueries::get(pool, job.pipeline_run_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::error!(%error, %job_id, "failed to load pipeline run for authorization");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    authorize_repo(pool, claims, run.repo_id).await?;
+    Ok(job)
 }
 
 /// List pipelines
@@ -74,20 +136,20 @@ async fn list_pipelines(
 ) -> impl IntoResponse {
     match extract_user(&auth, &headers) {
         Err(e) => e.into_response(),
-        Ok(_) => match PipelineQueries::list(&pool).await {
+        Ok(claims) => match PipelineQueries::list(&pool).await {
             Ok(pipelines) => {
-                let response: Vec<serde_json::Value> = pipelines
-                    .into_iter()
-                    .map(|p| {
-                        serde_json::json!({
+                let mut response = Vec::new();
+                for p in pipelines {
+                    if authorize_repo(&pool, &claims, p.repo_id).await.is_ok() {
+                        response.push(serde_json::json!({
                             "id": p.id.to_string(),
                             "repo_id": p.repo_id.to_string(),
                             "name": p.name,
                             "trigger_type": p.trigger_type,
                             "created_at": p.created_at.to_rfc3339()
-                        })
-                    })
-                    .collect();
+                        }));
+                    }
+                }
                 Json(response).into_response()
             }
             Err(e) => {
@@ -107,24 +169,31 @@ async fn get_pipeline(
 ) -> impl IntoResponse {
     match extract_user(&auth, &headers) {
         Err(e) => e.into_response(),
-        Ok(_) => {
+        Ok(claims) => {
             tracing::debug!("get pipeline: {}", id);
 
             match Uuid::parse_str(&id) {
                 Ok(uuid) => {
                     let pipeline_id = PipelineId::from(uuid);
                     match PipelineQueries::get(&pool, pipeline_id).await {
-                        Ok(Some(pipeline)) => (
-                            StatusCode::OK,
-                            Json(serde_json::json!({
-                                "id": pipeline.id.to_string(),
-                                "repo_id": pipeline.repo_id.to_string(),
-                                "name": pipeline.name,
-                                "trigger_type": pipeline.trigger_type,
-                                "created_at": pipeline.created_at.to_rfc3339()
-                            })),
-                        )
-                            .into_response(),
+                        Ok(Some(pipeline)) => match authorize_repo(&pool, &claims, pipeline.repo_id).await {
+                            Ok(()) => (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "id": pipeline.id.to_string(),
+                                    "repo_id": pipeline.repo_id.to_string(),
+                                    "name": pipeline.name,
+                                    "trigger_type": pipeline.trigger_type,
+                                    "created_at": pipeline.created_at.to_rfc3339()
+                                })),
+                            )
+                                .into_response(),
+                            Err(status) => (
+                                status,
+                                Json(serde_json::json!({"error": "forbidden", "message": "Pipeline access is not permitted"})),
+                            )
+                                .into_response(),
+                        },
                         Ok(None) => (
                             StatusCode::NOT_FOUND,
                             Json(serde_json::json!({
@@ -167,12 +236,12 @@ async fn list_pipeline_runs(
 ) -> impl IntoResponse {
     match extract_user(&auth, &headers) {
         Err(e) => e.into_response(),
-        Ok(_) => match PipelineRunQueries::list(&pool).await {
+        Ok(claims) => match PipelineRunQueries::list(&pool).await {
             Ok(runs) => {
-                let response: Vec<serde_json::Value> = runs
-                    .into_iter()
-                    .map(|r| {
-                        serde_json::json!({
+                let mut response = Vec::new();
+                for r in runs {
+                    if authorize_repo(&pool, &claims, r.repo_id).await.is_ok() {
+                        response.push(serde_json::json!({
                             "id": r.id.to_string(),
                             "pipeline_id": r.pipeline_id.to_string(),
                             "status": r.status,
@@ -180,9 +249,9 @@ async fn list_pipeline_runs(
                             "triggered_by": r.triggered_by,
                             "started_at": r.started_at.map(|dt| dt.to_rfc3339()),
                             "finished_at": r.finished_at.map(|dt| dt.to_rfc3339())
-                        })
-                    })
-                    .collect();
+                        }));
+                    }
+                }
                 Json(response).into_response()
             }
             Err(e) => {
@@ -202,26 +271,33 @@ async fn get_pipeline_run(
 ) -> impl IntoResponse {
     match extract_user(&auth, &headers) {
         Err(e) => e.into_response(),
-        Ok(_) => {
+        Ok(claims) => {
             tracing::debug!("get pipeline run: {}", id);
 
             match Uuid::parse_str(&id) {
                 Ok(uuid) => {
                     let run_id = PipelineRunId::from(uuid);
                     match PipelineRunQueries::get(&pool, run_id).await {
-                        Ok(Some(run)) => (
-                            StatusCode::OK,
-                            Json(serde_json::json!({
-                                "id": run.id.to_string(),
-                                "pipeline_id": run.pipeline_id.to_string(),
-                                "status": run.status,
-                                "commit_hash": run.commit_hash,
-                                "triggered_by": run.triggered_by,
-                                "started_at": run.started_at.map(|dt| dt.to_rfc3339()),
-                                "finished_at": run.finished_at.map(|dt| dt.to_rfc3339())
-                            })),
-                        )
-                            .into_response(),
+                        Ok(Some(run)) => match authorize_repo(&pool, &claims, run.repo_id).await {
+                            Ok(()) => (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "id": run.id.to_string(),
+                                    "pipeline_id": run.pipeline_id.to_string(),
+                                    "status": run.status,
+                                    "commit_hash": run.commit_hash,
+                                    "triggered_by": run.triggered_by,
+                                    "started_at": run.started_at.map(|dt| dt.to_rfc3339()),
+                                    "finished_at": run.finished_at.map(|dt| dt.to_rfc3339())
+                                })),
+                            )
+                                .into_response(),
+                            Err(status) => (
+                                status,
+                                Json(serde_json::json!({"error": "forbidden", "message": "Pipeline run access is not permitted"})),
+                            )
+                                .into_response(),
+                        },
                         Ok(None) => (
                             StatusCode::NOT_FOUND,
                             Json(serde_json::json!({
@@ -265,12 +341,37 @@ async fn get_pipeline_run_jobs(
 ) -> impl IntoResponse {
     match extract_user(&auth, &headers) {
         Err(e) => e.into_response(),
-        Ok(_) => {
+        Ok(claims) => {
             tracing::debug!("get pipeline run jobs: {}", id);
 
             match Uuid::parse_str(&id) {
                 Ok(uuid) => {
                     let run_id = PipelineRunId::from(uuid);
+                    let run = match PipelineRunQueries::get(&pool, run_id).await {
+                        Ok(Some(run)) => run,
+                        Ok(None) => {
+                            return (
+                                StatusCode::NOT_FOUND,
+                                Json(serde_json::json!({"error": "not_found", "message": "Pipeline run not found"})),
+                            )
+                                .into_response();
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, %run_id, "failed to load pipeline run for jobs");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"error": "database_error", "message": "Failed to load pipeline run"})),
+                            )
+                                .into_response();
+                        }
+                    };
+                    if let Err(status) = authorize_repo(&pool, &claims, run.repo_id).await {
+                        return (
+                            status,
+                            Json(serde_json::json!({"error": "forbidden", "message": "Pipeline run access is not permitted"})),
+                        )
+                            .into_response();
+                    }
                     match JobQueries::list_by_run(&pool, run_id).await {
                         Ok(jobs) => {
                             let jobs_json: Vec<serde_json::Value> = jobs
@@ -315,6 +416,207 @@ async fn get_pipeline_run_jobs(
     }
 }
 
+/// Submit a user-owned job to the durable queue. The scheduler reloads queued
+/// rows on its next bounded scheduling tick, so this remains safe across the
+/// separate API and CI processes.
+async fn submit_job(
+    Extension(pool): Extension<Arc<Pool>>,
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    headers: HeaderMap,
+    Json(request): Json<SubmitJobRequest>,
+) -> impl IntoResponse {
+    let claims = match extract_user(&auth, &headers) {
+        Ok(claims) => claims,
+        Err(status) => return status.into_response(),
+    };
+    if request.name.is_empty()
+        || request.name.len() > 128
+        || request.idempotency_key.is_empty()
+        || request.idempotency_key.len() > 128
+        || request.commands.is_empty()
+        || request.commands.len() > 64
+        || request
+            .commands
+            .iter()
+            .any(|command| command.is_empty() || command.len() > 16 * 1024)
+        || request
+            .working_dir
+            .as_deref()
+            .is_some_and(|path| path.is_empty() || path.len() > 1024)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_job_submission"})),
+        )
+            .into_response();
+    }
+    let run_id = match Uuid::parse_str(&request.pipeline_run_id) {
+        Ok(uuid) => PipelineRunId::from(uuid),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_pipeline_run_id"})),
+            )
+                .into_response();
+        }
+    };
+    let run = match PipelineRunQueries::get(&pool, run_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "pipeline_run_not_found"})),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, %run_id, "failed to load pipeline run for submission");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database_error"})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(status) = authorize_repo(&pool, &claims, run.repo_id).await {
+        return (
+            status,
+            Json(serde_json::json!({"error": if status == StatusCode::FORBIDDEN { "forbidden" } else { "not_found" }})),
+        )
+            .into_response();
+    }
+    if JobStatus::from_str(&run.status)
+        .map(|status| status.is_terminal())
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "pipeline_run_already_terminal"})),
+        )
+            .into_response();
+    }
+    let fingerprint = match serde_json::to_string(&request) {
+        Ok(fingerprint) => fingerprint,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_job_submission"})),
+            )
+                .into_response();
+        }
+    };
+    let scope = format!("user:{}", claims.user_id);
+    if let Ok(Some((job_id, stored_fingerprint))) =
+        JobQueries::get_idempotency(&pool, &scope, &request.idempotency_key).await
+    {
+        if stored_fingerprint != fingerprint {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "idempotency_key_reused_with_different_request"})),
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "already_queued", "job_id": job_id.to_string()})),
+        )
+            .into_response();
+    }
+    let job_id = JobId::new();
+    match JobQueries::reserve_idempotency(
+        &pool,
+        &scope,
+        &request.idempotency_key,
+        &fingerprint,
+        job_id,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            match JobQueries::get_idempotency(&pool, &scope, &request.idempotency_key).await {
+                Ok(Some((existing_id, stored_fingerprint)))
+                    if stored_fingerprint == fingerprint =>
+                {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "status": "already_queued",
+                            "job_id": existing_id.to_string()
+                        })),
+                    )
+                        .into_response();
+                }
+                Ok(Some(_)) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "idempotency_key_reused_with_different_request"
+                        })),
+                    )
+                        .into_response();
+                }
+                Ok(None) | Err(_) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error": "idempotency_retry_race"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to reserve job idempotency key");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database_error"})),
+            )
+                .into_response();
+        }
+    }
+    let mut job = gitforge_db::models::Job::new(run_id, request.name);
+    job.id = job_id;
+    job.commands = request.commands.clone();
+    job.working_dir = request.working_dir.clone();
+    if let Err(error) = JobQueries::create(&pool, &job).await {
+        tracing::error!(%error, %job_id, "failed to create submitted job");
+        let _ = JobQueries::delete_idempotency(&pool, &scope, &request.idempotency_key).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database_error"})),
+        )
+            .into_response();
+    }
+    if let Err(error) = JobQueries::update_status(&pool, job_id, "queued").await {
+        tracing::error!(%error, %job_id, "failed to queue submitted job");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database_error"})),
+        )
+            .into_response();
+    }
+    if let Err(error) = JobQueries::set_definition(
+        &pool,
+        job_id,
+        &request.commands,
+        request.working_dir.as_deref(),
+    )
+    .await
+    {
+        tracing::error!(%error, %job_id, "failed to persist submitted job definition");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database_error"})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({"status": "queued", "job_id": job_id.to_string()})),
+    )
+        .into_response()
+}
+
 /// Get job
 async fn get_job(
     Extension(pool): Extension<Arc<Pool>>,
@@ -324,52 +626,40 @@ async fn get_job(
 ) -> impl IntoResponse {
     match extract_user(&auth, &headers) {
         Err(e) => e.into_response(),
-        Ok(_) => {
+        Ok(claims) => {
             tracing::debug!("get job: {}", id);
-
-            match Uuid::parse_str(&id) {
-                Ok(uuid) => {
-                    let job_id = JobId::from(uuid);
-                    match JobQueries::get(&pool, job_id).await {
-                        Ok(Some(job)) => (
-                            StatusCode::OK,
-                            Json(serde_json::json!({
-                                "id": job.id.to_string(),
-                                "name": job.name,
-                                "status": job.status,
-                                "runner_id": job.runner_id.map(|id| id.to_string()),
-                                "started_at": job.started_at.map(|dt| dt.to_rfc3339()),
-                                "finished_at": job.finished_at.map(|dt| dt.to_rfc3339()),
-                                "receipt": job.result_json.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
-                            })),
-                        )
-                            .into_response(),
-                        Ok(None) => (
-                            StatusCode::NOT_FOUND,
-                            Json(serde_json::json!({
-                                "error": "not_found",
-                                "message": "Job not found"
-                            })),
-                        )
-                            .into_response(),
-                        Err(e) => {
-                            tracing::error!("failed to get job: {}", e);
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(serde_json::json!({
-                                    "error": "database_error",
-                                    "message": format!("failed to get job: {}", e)
-                                })),
-                            )
-                                .into_response()
-                        }
-                    }
+            let job_id = match Uuid::parse_str(&id) {
+                Ok(uuid) => JobId::from(uuid),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "invalid_id",
+                            "message": "Invalid job ID format"
+                        })),
+                    )
+                        .into_response();
                 }
-                Err(_) => (
-                    StatusCode::BAD_REQUEST,
+            };
+            match authorized_job(&pool, &claims, job_id).await {
+                Ok(job) => (
+                    StatusCode::OK,
                     Json(serde_json::json!({
-                        "error": "invalid_id",
-                        "message": "Invalid job ID format"
+                        "id": job.id.to_string(),
+                        "name": job.name,
+                        "status": job.status,
+                        "runner_id": job.runner_id.map(|id| id.to_string()),
+                        "started_at": job.started_at.map(|dt| dt.to_rfc3339()),
+                        "finished_at": job.finished_at.map(|dt| dt.to_rfc3339()),
+                        "receipt": job.result_json.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                    })),
+                )
+                    .into_response(),
+                Err(status) => (
+                    status,
+                    Json(serde_json::json!({
+                        "error": if status == StatusCode::FORBIDDEN { "forbidden" } else { "not_found" },
+                        "message": "Job access is not permitted"
                     })),
                 )
                     .into_response(),
@@ -387,7 +677,7 @@ async fn get_job_logs(
 ) -> impl IntoResponse {
     match extract_user(&auth, &headers) {
         Err(e) => e.into_response(),
-        Ok(_) => {
+        Ok(claims) => {
             let uuid = match Uuid::parse_str(&id) {
                 Ok(uuid) => uuid,
                 Err(_) => {
@@ -401,8 +691,8 @@ async fn get_job_logs(
                         .into_response();
                 }
             };
-            match JobQueries::get(&pool, JobId::from(uuid)).await {
-                Ok(Some(job)) => {
+            match authorized_job(&pool, &claims, JobId::from(uuid)).await {
+                Ok(job) => {
                     let receipt = job
                         .result_json
                         .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
@@ -412,23 +702,105 @@ async fn get_job_logs(
                     )
                         .into_response()
                 }
-                Ok(None) => (
-                    StatusCode::NOT_FOUND,
+                Err(status) => (
+                    status,
                     Json(serde_json::json!({
-                        "error": "not_found",
-                        "message": "Job not found"
-                    })),
-                )
-                    .into_response(),
-                Err(error) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": "database_error",
-                        "message": format!("failed to get job receipt: {}", error)
+                        "error": if status == StatusCode::FORBIDDEN { "forbidden" } else { "not_found" },
+                        "message": "Job access is not permitted"
                     })),
                 )
                     .into_response(),
             }
+        }
+    }
+}
+
+/// Cancel a job through the durable control-plane state. The scheduler and
+/// runner observe this row, so API and scheduler remain safe as separate
+/// processes; no shared in-memory scheduler extension is required.
+async fn cancel_job(
+    Extension(pool): Extension<Arc<Pool>>,
+    Extension(auth): Extension<Arc<ApiAuth>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let claims = match extract_user(&auth, &headers) {
+        Ok(claims) => claims,
+        Err(status) => return status.into_response(),
+    };
+    let uuid = match Uuid::parse_str(&id) {
+        Ok(uuid) => uuid,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_id",
+                    "message": "Invalid job ID format"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let job_id = JobId::from(uuid);
+    let job = match authorized_job(&pool, &claims, job_id).await {
+        Ok(job) => job,
+        Err(status) => {
+            return (
+                status,
+                Json(serde_json::json!({
+                    "error": if status == StatusCode::FORBIDDEN { "forbidden" } else { "not_found" },
+                    "message": "Job cancellation is not permitted"
+                })),
+            )
+                .into_response();
+        }
+    };
+    if let Some(status) = JobStatus::from_str(&job.status) {
+        if status.is_terminal() && status != JobStatus::Cancelled {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "job_already_terminal",
+                    "status": job.status
+                })),
+            )
+                .into_response();
+        }
+        if status == JobStatus::Cancelled {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "contract_version": "harness.job.v1",
+                    "status": "cancelled",
+                    "job_id": job_id.to_string()
+                })),
+            )
+                .into_response();
+        }
+    }
+    let receipt = serde_json::json!({
+        "job_id": job_id.to_string(),
+        "status": "cancelled",
+        "reason": "api operator requested cancellation"
+    })
+    .to_string();
+    match JobQueries::cancel(&pool, job_id, &receipt).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "contract_version": "harness.job.v1",
+                "status": "cancelled",
+                "job_id": job_id.to_string()
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, %job_id, "failed to persist API job cancellation");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database_error", "message": "Failed to persist cancellation"})),
+            )
+                .into_response()
         }
     }
 }

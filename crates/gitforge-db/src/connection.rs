@@ -53,6 +53,7 @@ impl Pool {
                 username TEXT NOT NULL UNIQUE,
                 email TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'developer',
                 created_at TEXT NOT NULL
             )
             "#,
@@ -60,6 +61,23 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create users table: {}", e)))?;
+
+        // Add the role column for databases created before role persistence
+        // existed. Existing accounts receive the least-privileged developer
+        // role and can be promoted explicitly by an administrative workflow.
+        if let Err(error) =
+            sqlx::query("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'developer'")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(Error::database(format!(
+                    "failed to migrate users table: {}",
+                    error
+                )));
+            }
+        }
 
         // Create repositories table
         sqlx::query(

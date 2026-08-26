@@ -53,6 +53,7 @@ receipt instead of being replayed: without a durable runner-generation lease,
 replay could duplicate external side effects if the old runner is still alive.
 The lease map remains process-local and is invalidated by recovery; a future
 durable lease table may safely replace this conservative failure behavior for
-multi-scheduler operation. Streaming log append, granular authorization, and
-an end-to-end service test remain follow-up work before exposing the endpoints
-outside a trusted local network.
+multi-scheduler operation. User-facing API submission, status, ownership, and
+cancellation are now implemented against durable state. Streaming log append,
+artifact transfer, and an end-to-end service test remain follow-up work before
+exposing the endpoints outside a trusted local network.

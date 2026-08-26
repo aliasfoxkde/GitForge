@@ -161,6 +161,24 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
 
 ## Verified continuation findings — 2026-08-26
 
+## Verified continuation findings — 2026-08-27
+
+- Added persisted user roles with a `developer` default for legacy accounts;
+  login tokens now carry the database role instead of hard-coding `user`.
+- Added user-facing API job submission (`POST /api/jobs`) with bounded input,
+  per-user durable idempotency, owner/admin/maintainer authorization, and
+  replay-safe responses.
+- Added owner-aware job/run status and receipt access plus
+  `POST /api/jobs/{id}/cancel`. API cancellation writes durable state so the
+  separate scheduler and runner processes observe it without shared memory.
+- Scheduler refreshes durable pending jobs on its bounded tick and reconciles
+  API-written cancellations before assignment. Regression tests prove a
+  canceled queued job is never handed to a runner.
+- Protected the CI service's `/pipelines/trigger` LAN adapter with a dedicated
+  `GITFORGE_TRIGGER_TOKEN`, falling back to operator/shared credentials only
+  during migration. The pre-existing service edits remain preserved alongside
+  this scoped security change.
+
 - Fixed a scheduler cancellation invariant: queue removal is lazy, so stale
   `BinaryHeap` entries are now discarded by both `peek` and `dequeue` before
   they can be assigned. Added queue- and scheduler-level regression tests.

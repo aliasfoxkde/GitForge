@@ -475,7 +475,9 @@ async fn test_api_artifact_content_requires_auth_and_returns_bytes() {
     let server = ApiServer::new("test-secret", pool).with_storage_extension(Arc::new(storage));
     let app = server.into_router();
     let auth = ApiAuth::new("test-secret");
-    let token = auth.generate_token(user.id, "artifact-user", "admin").unwrap();
+    let token = auth
+        .generate_token(user.id, "artifact-user", "admin")
+        .unwrap();
 
     let unauthorized = app
         .clone()
@@ -1245,6 +1247,158 @@ async fn test_api_get_job_with_valid_auth() {
     assert!(
         response.status() == StatusCode::NOT_FOUND
             || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[tokio::test]
+async fn test_api_job_control_enforces_repository_ownership_and_persists_cancel() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let owner = gitforge_db::models::User::new(
+        "owner".to_string(),
+        "owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    let other = gitforge_db::models::User::new(
+        "other".to_string(),
+        "other@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &owner)
+        .await
+        .unwrap();
+    gitforge_db::queries::UserQueries::create(&pool, &other)
+        .await
+        .unwrap();
+
+    let repo_id = gitforge_common::RepoId::new();
+    gitforge_db::queries::RepoQueries::create(
+        &pool,
+        &gitforge_db::models::Repository {
+            id: repo_id,
+            name: "owned-repo".to_string(),
+            owner_id: owner.id,
+            visibility: "private".to_string(),
+            git_path: "/tmp/owned-repo".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let pipeline_id = gitforge_common::PipelineId::new();
+    gitforge_db::queries::PipelineQueries::create(
+        &pool,
+        &gitforge_db::models::Pipeline {
+            id: pipeline_id,
+            repo_id,
+            name: "ci".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let run_id = gitforge_common::PipelineRunId::new();
+    gitforge_db::queries::PipelineRunQueries::create(
+        &pool,
+        &gitforge_db::models::PipelineRun {
+            id: run_id,
+            pipeline_id,
+            repo_id,
+            status: "running".to_string(),
+            triggered_by: "manual".to_string(),
+            commit_hash: "abc123".to_string(),
+            started_at: Some(chrono::Utc::now()),
+            finished_at: None,
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let job = gitforge_db::models::Job::new(run_id, "build".to_string());
+    let job_id = job.id;
+    gitforge_db::queries::JobQueries::create(&pool, &job)
+        .await
+        .unwrap();
+
+    let auth = ApiAuth::new("test-secret");
+    let owner_token = auth.generate_token(owner.id, "owner", "developer").unwrap();
+    let other_token = auth.generate_token(other.id, "other", "developer").unwrap();
+    let server = ApiServer::new("test-secret", pool.clone());
+    let app = server.into_router();
+
+    let submission = serde_json::json!({
+        "pipeline_run_id": run_id.to_string(),
+        "name": "manual-check",
+        "commands": ["cargo test"],
+        "working_dir": null,
+        "idempotency_key": "api-submit-1"
+    });
+    let submitted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/jobs")
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(submission.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::CREATED);
+    let replayed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/jobs")
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(submission.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed.status(), StatusCode::OK);
+
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/jobs/{job_id}/cancel"))
+                .header("Authorization", format!("Bearer {other_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let cancelled = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/jobs/{job_id}/cancel"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    assert_eq!(
+        gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
     );
 }
 

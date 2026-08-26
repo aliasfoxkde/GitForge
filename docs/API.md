@@ -101,8 +101,27 @@ GET /pipeline-runs/{id}/jobs
 #### Jobs
 
 ```
+POST /jobs
 GET /jobs/{id}
 GET /jobs/{id}/logs
+POST /jobs/{id}/cancel
+```
+
+Job submission requires a pipeline run owned by the authenticated user (or an
+admin/maintainer role), bounded commands, and a stable `idempotency_key`.
+Retries return the original job ID; reusing a key for different parameters is
+rejected. Cancellation is persisted in the shared database so the separate CI
+scheduler and runner observe it safely.
+
+**Submit Job Request:**
+```json
+{
+  "pipeline_run_id": "run-uuid",
+  "name": "manual-check",
+  "commands": ["cargo test"],
+  "working_dir": null,
+  "idempotency_key": "attempt-uuid"
+}
 ```
 
 **Job Response:**
