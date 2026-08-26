@@ -601,14 +601,14 @@ impl JobQueries {
     /// submission has become executable. This avoids poisoning a client key
     /// after a transient database failure.
     pub async fn delete_idempotency(pool: &Pool, scope: &str, idempotency_key: &str) -> Result<()> {
-        sqlx::query(
-            "DELETE FROM job_idempotency_keys WHERE scope = ? AND idempotency_key = ?",
-        )
-        .bind(scope)
-        .bind(idempotency_key)
-        .execute(pool.pool())
-        .await
-        .map_err(|e| Error::database(format!("failed to release job idempotency key: {}", e)))?;
+        sqlx::query("DELETE FROM job_idempotency_keys WHERE scope = ? AND idempotency_key = ?")
+            .bind(scope)
+            .bind(idempotency_key)
+            .execute(pool.pool())
+            .await
+            .map_err(|e| {
+                Error::database(format!("failed to release job idempotency key: {}", e))
+            })?;
         Ok(())
     }
 
