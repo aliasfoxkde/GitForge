@@ -293,3 +293,19 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
 - Validation: scoped service `cargo check` and strict Clippy passed; the full
   workspace test passed through the manager as job
   `353c5c30-dfbe-42f4-b286-52c23f6af36c` with exit 0.
+
+## Verified continuation findings — 2026-08-25 CI integrity tranche
+
+- Active workflows and reusable templates had mutable action tags; all
+  resolvable action references are now pinned to full commit SHAs with release
+  comments identifying the reviewed tag. The formerly unresolved
+  `aws-actions/git-secrets-scan` template action was replaced with a local
+  deterministic credential-pattern scan.
+- Release Linux builds now run the locked workspace test suite before building,
+  and the release job requests GitHub artifact provenance attestations for
+  packaged archives. SBOM generation remains a separate follow-up because the
+  repository has not yet selected and pinned a CycloneDX/SPDX generator.
+- Corrected the wiki workflow's branch selector and added explicit default
+  read permissions where workflows do not need write access. All 14 workflow
+  and reusable-template YAML files parse successfully; no unpinned `uses:`
+  references remain in those files.

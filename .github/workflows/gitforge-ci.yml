@@ -19,6 +19,9 @@ env:
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
   GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
 
+permissions:
+  contents: read
+
 # Route ALL builds through GitForge instead of running directly on GitHub Actions runners.
 # This prevents build storms and zombie processes by using GitForge's build queue.
 
