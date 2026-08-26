@@ -39,9 +39,12 @@ assignment, while a wrong runner or lease is rejected.
 The crate-level lifecycle, durable heartbeat/cancellation transitions,
 database recovery writes, cancellation probe, and runner sandbox cancellation
 are covered by scheduler, runner, and database tests. A scheduler restart
-requeues durable assigned/running rows and restores persisted command
-definitions before scheduling. The lease map remains process-local and is
-invalidated by recovery; a future durable lease table is still required for
+requeues durable `assigned` rows and restores persisted command definitions
+before scheduling. Durable `running` rows are fenced as failed with a restart
+receipt instead of being replayed: without a durable runner-generation lease,
+replay could duplicate external side effects if the old runner is still alive.
+The lease map remains process-local and is invalidated by recovery; a future
+durable lease table may safely replace this conservative failure behavior for
 multi-scheduler operation. Streaming log append, granular authorization, and
 an end-to-end service test remain follow-up work before exposing the endpoints
 outside a trusted local network.

@@ -812,18 +812,36 @@ impl JobQueries {
         Ok(jobs)
     }
 
-    /// Requeue jobs that were assigned or running when the scheduler stopped.
-    /// Runner leases are process-local, so retaining those states after a
-    /// restart would strand work permanently. The next scheduler instance
-    /// safely reassigns these jobs to a live runner.
+    /// Recover jobs that were in flight when the scheduler stopped. Assigned
+    /// jobs have not started execution and are safe to requeue. Running jobs
+    /// are fenced as failed instead of being re-run automatically: the old
+    /// runner may still be alive, and requeueing would permit duplicate side
+    /// effects without a durable runner-generation lease.
     pub async fn requeue_inflight(pool: &Pool) -> Result<u64> {
-        let result = sqlx::query(
-            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL WHERE status IN ('assigned', 'running')",
+        let mut transaction = pool
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| Error::database(format!("failed to begin recovery: {}", e)))?;
+        let assigned = sqlx::query(
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL WHERE status = 'assigned'",
         )
-        .execute(pool.pool())
+        .execute(&mut *transaction)
         .await
-        .map_err(|e| Error::database(format!("failed to requeue in-flight jobs: {}", e)))?;
-        Ok(result.rows_affected())
+        .map_err(|e| Error::database(format!("failed to requeue assigned jobs: {}", e)))?;
+        let running = sqlx::query(
+            "UPDATE jobs SET status = 'failed', runner_id = NULL, finished_at = ?, result_json = ? WHERE status = 'running'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(r#"{"status":"failed","reason":"scheduler_restart_fenced_running_job"}"#)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to fence running jobs: {}", e)))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit recovery: {}", e)))?;
+        Ok(assigned.rows_affected() + running.rows_affected())
     }
 }
 
@@ -1331,9 +1349,7 @@ mod tests {
         assert_eq!(found.unwrap().name, "build");
 
         // Update status
-        JobQueries::update_status(&pool, job.id, "running")
-            .await
-            .unwrap();
+        JobQueries::start(&pool, job.id).await.unwrap();
         let found = JobQueries::get(&pool, job.id).await.unwrap();
         assert_eq!(found.unwrap().status, "running");
 
@@ -1439,15 +1455,17 @@ mod tests {
         PipelineRunQueries::create(&pool, &run).await.unwrap();
         let job = crate::models::Job::new(run.id, "build".to_string());
         JobQueries::create(&pool, &job).await.unwrap();
-        JobQueries::update_status(&pool, job.id, "running")
-            .await
-            .unwrap();
+        JobQueries::start(&pool, job.id).await.unwrap();
 
         assert_eq!(JobQueries::requeue_inflight(&pool).await.unwrap(), 1);
         let recovered = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
-        assert_eq!(recovered.status, "queued");
+        assert_eq!(recovered.status, "failed");
         assert!(recovered.runner_id.is_none());
-        assert!(recovered.started_at.is_none());
+        assert!(recovered.started_at.is_some());
+        assert!(recovered
+            .result_json
+            .as_deref()
+            .is_some_and(|receipt| receipt.contains("scheduler_restart_fenced_running_job")));
     }
 
     #[tokio::test]

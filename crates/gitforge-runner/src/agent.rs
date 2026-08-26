@@ -6,9 +6,10 @@ use gitforge_db::models::Runner;
 use gitforge_sandbox::DockerSandbox;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration};
 
 /// Runner configuration
@@ -219,6 +220,8 @@ impl RunnerAgent {
         let fetch_token = self.config.scheduler_token.clone();
         let is_running = self.is_running.clone();
         let executor = self.executor.clone();
+        let active_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let active_jobs_for_loop = active_jobs.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(fetch_interval));
             loop {
@@ -256,6 +259,13 @@ impl RunnerAgent {
                                         tracing::warn!("unable to claim job {}", job.job_id);
                                         continue;
                                     };
+                                    {
+                                        let mut active = active_jobs_for_loop.lock().await;
+                                        if !active.insert(job.job_id.clone()) {
+                                            tracing::warn!("job {} is already executing locally; skipping duplicate assignment", job.job_id);
+                                            continue;
+                                        }
+                                    }
                                     // Execute concurrently so the fetch loop
                                     // remains responsive and cancellation can
                                     // be observed while the sandbox runs.
@@ -263,6 +273,8 @@ impl RunnerAgent {
                                     let client = fetch_client.clone();
                                     let url = fetch_url.clone();
                                     let token = fetch_token.clone();
+                                    let active_jobs = active_jobs_for_loop.clone();
+                                    let active_job_id = job.job_id.clone();
                                     tokio::spawn(async move {
                                         Self::execute_job(
                                             &executor,
@@ -274,6 +286,7 @@ impl RunnerAgent {
                                             token.as_deref(),
                                         )
                                         .await;
+                                        active_jobs.lock().await.remove(&active_job_id);
                                     });
                                 }
                             }
@@ -397,43 +410,6 @@ impl RunnerAgent {
 
         tracing::info!("executing job {} in container", assignment.job_id);
 
-        let cancellation_client = client.clone();
-        let cancellation_url = scheduler_url.to_string();
-        let cancellation_job_id = assignment.job_id.clone();
-        let cancellation_executor = executor.clone();
-        let cancellation_token = scheduler_token.map(ToOwned::to_owned);
-        let cancellation_watch = tokio::spawn(async move {
-            let endpoint = format!(
-                "{}/jobs/{}/cancelled",
-                cancellation_url, cancellation_job_id
-            );
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let mut request = cancellation_client.get(&endpoint);
-                if let Some(token) = &cancellation_token {
-                    request = request.bearer_auth(token);
-                }
-                let cancelled = match request.send().await {
-                    Ok(response) => response
-                        .json::<serde_json::Value>()
-                        .await
-                        .ok()
-                        .and_then(|payload| payload["cancelled"].as_bool())
-                        .unwrap_or(false),
-                    Err(_) => false,
-                };
-                if cancelled {
-                    if let Ok(job_id) = uuid::Uuid::parse_str(&cancellation_job_id) {
-                        let job_id = JobId::from(job_id);
-                        if let Err(error) = cancellation_executor.cancel(&job_id).await {
-                            tracing::warn!(%error, %job_id, "failed to destroy cancelled sandbox");
-                        }
-                    }
-                    break;
-                }
-            }
-        });
-
         let started_url = format!("{}/jobs/{}/started", scheduler_url, assignment.job_id);
         let mut started_request = client.post(&started_url).json(&serde_json::json!({
             "runner_id": runner_id.to_string(),
@@ -451,6 +427,63 @@ impl RunnerAgent {
             tracing::error!("failed to mark job {} started", assignment.job_id);
             return;
         }
+
+        let cancellation_client = client.clone();
+        let cancellation_url = scheduler_url.to_string();
+        let cancellation_job_id = assignment.job_id.clone();
+        let cancellation_executor = executor.clone();
+        let cancellation_token = scheduler_token.map(ToOwned::to_owned);
+        let cancellation_watch = tokio::spawn(async move {
+            let endpoint = format!(
+                "{}/jobs/{}/cancelled",
+                cancellation_url, cancellation_job_id
+            );
+            let mut probe_failures = 0u8;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut request = cancellation_client.get(&endpoint);
+                if let Some(token) = &cancellation_token {
+                    request = request.bearer_auth(token);
+                }
+                match request.send().await {
+                    Ok(response) if response.status().is_success() => {
+                        probe_failures = 0;
+                        let cancelled = response
+                            .json::<serde_json::Value>()
+                            .await
+                            .ok()
+                            .and_then(|payload| payload["cancelled"].as_bool())
+                            .unwrap_or(false);
+                        if cancelled {
+                            if let Ok(job_id) = uuid::Uuid::parse_str(&cancellation_job_id) {
+                                let job_id = JobId::from(job_id);
+                                if let Err(error) = cancellation_executor.cancel(&job_id).await {
+                                    tracing::warn!(%error, %job_id, "failed to destroy cancelled sandbox");
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    Ok(response) => {
+                        probe_failures = probe_failures.saturating_add(1);
+                        tracing::warn!(status = %response.status(), attempt = probe_failures, "job cancellation probe rejected");
+                    }
+                    Err(error) => {
+                        probe_failures = probe_failures.saturating_add(1);
+                        tracing::warn!(%error, attempt = probe_failures, "job cancellation probe failed");
+                    }
+                }
+                if probe_failures >= 3 {
+                    tracing::error!(
+                        "cancellation probe unavailable repeatedly; stopping local job sandbox"
+                    );
+                    if let Ok(job_id) = uuid::Uuid::parse_str(&cancellation_job_id) {
+                        let _ = cancellation_executor.cancel(&JobId::from(job_id)).await;
+                    }
+                    break;
+                }
+            }
+        });
 
         // Execute the job
         let result = executor.execute(executable).await;
