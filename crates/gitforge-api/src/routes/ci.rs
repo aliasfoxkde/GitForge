@@ -1,9 +1,10 @@
 //! CI API routes
 
-use crate::auth::{ApiAuth, Claims};
+use crate::auth::Claims;
+use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Extension, Path},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -66,20 +67,12 @@ pub fn ci_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/jobs", post(submit_job))
 }
 
-/// Helper to extract and validate user from headers
-fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<Claims, StatusCode> {
-    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok());
-
-    let token = auth_header
-        .and_then(|h| ApiAuth::extract_token(h))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    auth.validate_token(token)
-        .map_err(|_| StatusCode::UNAUTHORIZED)
-}
-
 fn can_manage_jobs(claims: &Claims) -> bool {
     matches!(claims.role.as_str(), "admin" | "maintainer")
+}
+
+fn claims_from_user(user: AuthenticatedUser) -> Result<Claims, StatusCode> {
+    Ok(user.claims)
 }
 
 /// Require ownership of a repository, with admin/maintainer override.
@@ -131,10 +124,9 @@ async fn authorized_job(
 /// List pipelines
 async fn list_pipelines(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    user: AuthenticatedUser,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
+    match claims_from_user(user) {
         Err(e) => e.into_response(),
         Ok(claims) => match PipelineQueries::list(&pool).await {
             Ok(pipelines) => {
@@ -163,11 +155,10 @@ async fn list_pipelines(
 /// Get pipeline
 async fn get_pipeline(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
+    match claims_from_user(user) {
         Err(e) => e.into_response(),
         Ok(claims) => {
             tracing::debug!("get pipeline: {}", id);
@@ -231,10 +222,9 @@ async fn get_pipeline(
 /// List pipeline runs
 async fn list_pipeline_runs(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    user: AuthenticatedUser,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
+    match claims_from_user(user) {
         Err(e) => e.into_response(),
         Ok(claims) => match PipelineRunQueries::list(&pool).await {
             Ok(runs) => {
@@ -265,11 +255,10 @@ async fn list_pipeline_runs(
 /// Get pipeline run
 async fn get_pipeline_run(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
+    match claims_from_user(user) {
         Err(e) => e.into_response(),
         Ok(claims) => {
             tracing::debug!("get pipeline run: {}", id);
@@ -335,11 +324,10 @@ async fn get_pipeline_run(
 /// Get pipeline run jobs
 async fn get_pipeline_run_jobs(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
+    match claims_from_user(user) {
         Err(e) => e.into_response(),
         Ok(claims) => {
             tracing::debug!("get pipeline run jobs: {}", id);
@@ -1006,46 +994,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_user_without_auth_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let headers = HeaderMap::new();
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_with_invalid_token() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Bearer invalid-token".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_with_valid_token() {
-        use crate::auth::ApiAuth;
-        use gitforge_common::UserId;
-
-        let auth = ApiAuth::new("test-secret");
-        let user_id = UserId::new();
-        let token = auth.generate_token(user_id, "testuser", "user").unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Authorization",
-            format!("Bearer {}", token).parse().unwrap(),
-        );
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_ok());
-    }
-
-    #[test]
     fn test_pipeline_run_response_deserialize() {
         let json = r#"{
             "id": "run-123",
@@ -1079,57 +1027,6 @@ mod tests {
         assert_eq!(response.name, "build");
         assert_eq!(response.status, "pending");
         assert!(response.runner_id.is_none());
-    }
-
-    #[test]
-    fn test_extract_user_malformed_auth_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        // Malformed header without proper Bearer prefix
-        headers.insert("Authorization", "NotBearer token123".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_empty_bearer_token() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Bearer".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        // Empty token after Bearer should fail
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_basic_auth_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        // Basic auth instead of Bearer
-        headers.insert("Authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_user_bearer_with_extra_spaces() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        // Bearer with leading/trailing spaces
-        headers.insert("Authorization", "Bearer   ".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        // Should fail because "   " is not a valid token
-        assert!(result.is_err());
     }
 
     #[test]
@@ -1196,41 +1093,6 @@ mod tests {
         assert!(json.contains("\"triggered_by\":\"tester\""));
         assert!(json.contains("started_at"));
         assert!(json.contains("finished_at"));
-    }
-
-    #[test]
-    fn test_extract_user_malformed_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Malformed".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_user_bearer_with_leading_space() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", " Bearer token123".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_user_multiple_auth_headers() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Bearer token1".parse().unwrap());
-        headers.append("Authorization", "Bearer token2".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        // First header should be used
-        assert!(result.is_err());
     }
 
     #[test]

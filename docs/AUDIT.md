@@ -195,11 +195,15 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   shared claims context, removing their production route-local bearer-token
   parsers. Repository listing, lookup, and deletion now enforce owner access
   with admin/maintainer override; cross-user integration coverage proves
-  private repositories are hidden. CI list/read pipeline handlers still
-  contain the final compatibility parsing slice.
-- Validation: GitForge API unit tests (190), integration tests (41), focused
-  middleware tests, and webhook authorization/success tests pass. Whole-
-  workspace validation remains a later managed gate after this tranche.
+  private repositories are hidden. Artifact reads, downloads, deletion, and
+  job listing now resolve the artifact's job through its pipeline run and
+  repository owner before returning data; unauthorized artifacts are hidden
+  with not-found responses. CI pipeline list/read handlers were subsequently
+  migrated to the same shared claims context.
+- Validation: GitForge API unit tests (190 before this continuation), 42
+  integration tests including cross-user artifact scope, strict Clippy, and
+  focused authorization tests pass. Whole-workspace validation remains a
+  later managed gate after this tranche.
 
 - Fixed a scheduler cancellation invariant: queue removal is lazy, so stale
   `BinaryHeap` entries are now discarded by both `peek` and `dequeue` before

@@ -10,6 +10,11 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use gitforge_common::JobId;
+use gitforge_db::{
+    queries::{JobQueries, PipelineRunQueries, RepoQueries},
+    Pool,
+};
 use gitforge_storage::{Artifact, ArtifactId, ArtifactStore, FileStorage};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -36,6 +41,47 @@ pub fn artifact_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/jobs/{job_id}/artifacts", get(get_job_artifacts))
 }
 
+fn can_manage_artifacts(user: &AuthenticatedUser) -> bool {
+    matches!(user.claims.role.as_str(), "admin" | "maintainer")
+}
+
+/// Verify that an artifact's job belongs to a repository visible to the user.
+async fn authorize_job(
+    pool: &Pool,
+    user: &AuthenticatedUser,
+    job_id: JobId,
+) -> Result<(), StatusCode> {
+    if can_manage_artifacts(user) {
+        return Ok(());
+    }
+    let job = match JobQueries::get(pool, job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::error!(%error, %job_id, "failed to load artifact job for authorization");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let run = match PipelineRunQueries::get(pool, job.pipeline_run_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::error!(%error, %job_id, "failed to load artifact pipeline run for authorization");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    match RepoQueries::get(pool, run.repo_id).await {
+        Ok(Some(repo)) if repo.owner_id == user.claims.user_id => Ok(()),
+        // Do not reveal whether a private job exists to another user.
+        Ok(Some(_)) => Err(StatusCode::NOT_FOUND),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::error!(%error, repo_id = %run.repo_id, "failed to load artifact repository for authorization");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 /// Convert storage artifact to response
 fn artifact_to_response(artifact: &Artifact) -> ArtifactResponse {
     ArtifactResponse {
@@ -51,14 +97,30 @@ fn artifact_to_response(artifact: &Artifact) -> ArtifactResponse {
 
 /// List artifacts
 async fn list_artifacts(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
+    Extension(pool): Extension<Arc<Pool>>,
     Extension(storage): Extension<Arc<FileStorage>>,
 ) -> impl IntoResponse {
     tracing::debug!("list artifacts");
     match storage.list().await {
         Ok(artifacts) => {
-            let responses: Vec<ArtifactResponse> =
-                artifacts.iter().map(artifact_to_response).collect();
+            let mut responses = Vec::new();
+            for artifact in artifacts {
+                match authorize_job(&pool, &user, artifact.job_id).await {
+                    Ok(()) => responses.push(artifact_to_response(&artifact)),
+                    Err(StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) => {}
+                    Err(status) => {
+                        return (
+                            status,
+                            Json(ErrorResponse {
+                                error: "authorization_error".to_string(),
+                                message: "Artifact access could not be authorized".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
+            }
             Json(responses).into_response()
         }
         Err(e) => {
@@ -77,7 +139,8 @@ async fn list_artifacts(
 
 /// Get artifact metadata
 async fn get_artifact(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
+    Extension(pool): Extension<Arc<Pool>>,
     Extension(storage): Extension<Arc<FileStorage>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
@@ -99,6 +162,16 @@ async fn get_artifact(
 
     match storage.get_metadata(artifact_id).await {
         Ok(artifact) => {
+            if let Err(status) = authorize_job(&pool, &user, artifact.job_id).await {
+                return (
+                    status,
+                    Json(ErrorResponse {
+                        error: "not_found".to_string(),
+                        message: "Artifact not found".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
             let response = artifact_to_response(&artifact);
             (StatusCode::OK, Json(response)).into_response()
         }
@@ -118,7 +191,8 @@ async fn get_artifact(
 
 /// Download artifact bytes after authentication.
 async fn get_artifact_content(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
+    Extension(pool): Extension<Arc<Pool>>,
     Extension(storage): Extension<Arc<FileStorage>>,
     Path(id): Path<String>,
 ) -> Response {
@@ -135,6 +209,29 @@ async fn get_artifact_content(
                 .into_response()
         }
     };
+    let artifact = match storage.get_metadata(artifact_id).await {
+        Ok(artifact) => artifact,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "not_found".to_string(),
+                    message: "Artifact not found".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if let Err(status) = authorize_job(&pool, &user, artifact.job_id).await {
+        return (
+            status,
+            Json(ErrorResponse {
+                error: "not_found".to_string(),
+                message: "Artifact not found".to_string(),
+            }),
+        )
+            .into_response();
+    }
     match storage.get(artifact_id).await {
         Ok(data) => Response::builder()
             .status(StatusCode::OK)
@@ -155,7 +252,8 @@ async fn get_artifact_content(
 
 /// Delete artifact
 async fn delete_artifact(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
+    Extension(pool): Extension<Arc<Pool>>,
     Extension(storage): Extension<Arc<FileStorage>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
@@ -175,6 +273,29 @@ async fn delete_artifact(
         }
     };
 
+    let artifact = match storage.get_metadata(artifact_id).await {
+        Ok(artifact) => artifact,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "not_found".to_string(),
+                    message: "Artifact not found".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if let Err(status) = authorize_job(&pool, &user, artifact.job_id).await {
+        return (
+            status,
+            Json(ErrorResponse {
+                error: "not_found".to_string(),
+                message: "Artifact not found".to_string(),
+            }),
+        )
+            .into_response();
+    }
     match storage.delete(artifact_id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
@@ -193,7 +314,8 @@ async fn delete_artifact(
 
 /// Get artifacts for a job
 async fn get_job_artifacts(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
+    Extension(pool): Extension<Arc<Pool>>,
     Extension(storage): Extension<Arc<FileStorage>>,
     Path(job_id): Path<String>,
 ) -> impl IntoResponse {
@@ -212,6 +334,17 @@ async fn get_job_artifacts(
                 .into_response();
         }
     };
+
+    if let Err(status) = authorize_job(&pool, &user, job_id_val).await {
+        return (
+            status,
+            Json(ErrorResponse {
+                error: "not_found".to_string(),
+                message: "Job artifacts not found".to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     match storage.list_by_job(job_id_val).await {
         Ok(artifacts) => {

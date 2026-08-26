@@ -592,6 +592,124 @@ async fn test_api_artifact_content_requires_auth_and_returns_bytes() {
 }
 
 #[tokio::test]
+async fn test_api_artifacts_are_scoped_to_job_repository_owner() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let owner = gitforge_db::models::User::new(
+        "artifact-owner".to_string(),
+        "artifact-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    let other = gitforge_db::models::User::new(
+        "artifact-other".to_string(),
+        "artifact-other@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &owner)
+        .await
+        .unwrap();
+    gitforge_db::queries::UserQueries::create(&pool, &other)
+        .await
+        .unwrap();
+
+    let repo_id = gitforge_common::RepoId::new();
+    gitforge_db::queries::RepoQueries::create(
+        &pool,
+        &gitforge_db::models::Repository {
+            id: repo_id,
+            name: "artifact-owned-repo".to_string(),
+            owner_id: owner.id,
+            visibility: "private".to_string(),
+            git_path: "/tmp/artifact-owned-repo".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let pipeline_id = gitforge_common::PipelineId::new();
+    gitforge_db::queries::PipelineQueries::create(
+        &pool,
+        &gitforge_db::models::Pipeline {
+            id: pipeline_id,
+            repo_id,
+            name: "artifact-ci".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let run_id = gitforge_common::PipelineRunId::new();
+    gitforge_db::queries::PipelineRunQueries::create(
+        &pool,
+        &gitforge_db::models::PipelineRun {
+            id: run_id,
+            pipeline_id,
+            repo_id,
+            status: "succeeded".to_string(),
+            triggered_by: "owner".to_string(),
+            commit_hash: "artifact-commit".to_string(),
+            started_at: Some(chrono::Utc::now()),
+            finished_at: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let job = gitforge_db::models::Job::new(run_id, "artifact-build".to_string());
+    let job_id = job.id;
+    gitforge_db::queries::JobQueries::create(&pool, &job)
+        .await
+        .unwrap();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(temp_dir.path()).await.unwrap();
+    let source = temp_dir.path().join("private.txt");
+    tokio::fs::write(&source, b"private-artifact")
+        .await
+        .unwrap();
+    let artifact = Artifact::from_file(job_id, "private.txt".to_string(), &source)
+        .await
+        .unwrap();
+    let artifact_id = artifact.id.to_string();
+    storage.put(&artifact, b"private-artifact").await.unwrap();
+
+    let server = ApiServer::new("test-secret", pool).with_storage_extension(Arc::new(storage));
+    let app = server.into_router();
+    let auth = ApiAuth::new("test-secret");
+    let other_token = auth
+        .generate_token(other.id, "artifact-other", "developer")
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/artifacts/{artifact_id}/content"))
+                .header("Authorization", format!("Bearer {other_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/jobs/{job_id}/artifacts"))
+                .header("Authorization", format!("Bearer {other_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn test_api_runners_endpoint() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();

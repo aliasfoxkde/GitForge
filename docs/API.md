@@ -24,8 +24,9 @@ remain protected.
 
 Repository routes expose only repositories owned by the authenticated user,
 with `admin` and `maintainer` role overrides. Artifact routes require the
-shared authenticated context; job-to-repository artifact ownership remains
-coupled to the remaining CI authorization migration.
+shared authenticated context and resolve artifact access through the owning
+job, pipeline run, and repository; unauthorized artifacts are returned as
+not-found to avoid leaking private resource existence.
 
 GitForge uses JWT tokens for API authentication. Include the token in the Authorization header:
 
