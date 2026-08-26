@@ -96,9 +96,25 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
 
             // Wait for job to complete
             println!("waiting for job to complete...");
-            // For now just print that it was submitted
-            // In full implementation, would poll for status
-            Ok(())
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                match client.get_status(&socket_path, job_id.clone()).await? {
+                    Response::Status { status, .. } => {
+                        println!("status: {}", status);
+                        if status.starts_with("completed(")
+                            || status.starts_with("failed")
+                            || status == "cancelled"
+                        {
+                            if status.starts_with("failed") || status == "cancelled" {
+                                anyhow::bail!("job {}", status);
+                            }
+                            return Ok(());
+                        }
+                    }
+                    Response::Error { message } => anyhow::bail!("error: {}", message),
+                    response => anyhow::bail!("unexpected response: {:?}", response),
+                }
+            }
         }
         Response::Error { message } => {
             anyhow::bail!("error: {}", message);
