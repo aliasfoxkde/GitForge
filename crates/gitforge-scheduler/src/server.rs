@@ -32,16 +32,25 @@ pub struct RegisterRunnerRequest {
 /// Job info for pending jobs response
 #[derive(Debug, Serialize)]
 pub struct PendingJobInfo {
+    pub contract_version: &'static str,
     pub job_id: String,
     pub name: String,
     pub pipeline_run_id: String,
     pub commands: Vec<String>,
     pub working_dir: Option<String>,
+    pub runner_id: String,
+    pub lease_token: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct PendingJobsQuery {
     runner_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeaseRequest {
+    runner_id: String,
+    lease_token: Option<String>,
 }
 
 /// Create scheduler server state
@@ -59,6 +68,8 @@ pub fn scheduler_routes<S: Clone + Send + Sync + 'static>(
         .route("/runners", post(register_runner))
         .route("/runners/{id}/heartbeat", post(runner_heartbeat))
         .route("/jobs/pending", get(get_pending_jobs))
+        .route("/jobs/{id}/claim", post(claim_job))
+        .route("/jobs/{id}/started", post(start_job))
         .route("/jobs/{id}/assign", post(assign_job))
         .route("/jobs/{id}/complete", post(complete_job))
         .route("/pipelines/runs/{id}", get(get_pipeline_run))
@@ -191,25 +202,135 @@ async fn get_pending_jobs(
         .map(RunnerId::from);
 
     // Convert to response format
-    let job_infos: Vec<PendingJobInfo> = assigned_jobs
-        .into_iter()
-        .filter(|(_, runner_id, _, _)| {
-            requested_runner
-                .map(|requested| requested == *runner_id)
-                .unwrap_or(false)
-        })
-        .map(
-            |(job_id, _runner_id, pipeline_run_id, definition)| PendingJobInfo {
-                job_id: job_id.to_string(),
-                name: format!("job-{}", job_id),
-                pipeline_run_id: pipeline_run_id.to_string(),
-                commands: definition.commands,
-                working_dir: definition.working_dir,
-            },
-        )
-        .collect();
+    let mut job_infos = Vec::new();
+    for (job_id, runner_id, pipeline_run_id, definition) in assigned_jobs {
+        if requested_runner
+            .map(|requested| requested == runner_id)
+            .unwrap_or(false)
+        {
+            if let Some(lease_token) = state.scheduler.ensure_job_lease(job_id).await {
+                job_infos.push(PendingJobInfo {
+                    contract_version: "harness.job.v1",
+                    job_id: job_id.to_string(),
+                    name: format!("job-{}", job_id),
+                    pipeline_run_id: pipeline_run_id.to_string(),
+                    commands: definition.commands,
+                    working_dir: definition.working_dir,
+                    runner_id: runner_id.to_string(),
+                    lease_token,
+                });
+            }
+        }
+    }
 
     Json(serde_json::json!(job_infos))
+}
+
+/// Claim an already scheduler-assigned job with a runner lease.
+async fn claim_job(
+    State(state): State<SchedulerServerState>,
+    Path(job_id): Path<String>,
+    Json(request): Json<LeaseRequest>,
+) -> impl IntoResponse {
+    let job_id = match Uuid::parse_str(&job_id) {
+        Ok(id) => JobId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_job_id"})),
+            )
+        }
+    };
+    let runner_id = match Uuid::parse_str(&request.runner_id) {
+        Ok(id) => RunnerId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_runner_id"})),
+            )
+        }
+    };
+    let Some(lease_token) = state.scheduler.ensure_job_lease(job_id).await else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "job_not_assigned"})),
+        );
+    };
+    let assigned = state.scheduler.is_assigned(job_id).await == Some(runner_id);
+    if !assigned {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "runner_not_assigned"})),
+        );
+    }
+    if let Some(requested) = request.lease_token {
+        if requested != lease_token {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "invalid_lease"})),
+            );
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "contract_version": "harness.job.v1",
+            "status": "assigned",
+            "job_id": job_id.to_string(),
+            "runner_id": runner_id.to_string(),
+            "lease_token": lease_token,
+        })),
+    )
+}
+
+/// Record the assigned-to-running transition.
+async fn start_job(
+    State(state): State<SchedulerServerState>,
+    Path(job_id): Path<String>,
+    Json(request): Json<LeaseRequest>,
+) -> impl IntoResponse {
+    let job_id = match Uuid::parse_str(&job_id) {
+        Ok(id) => JobId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_job_id"})),
+            )
+        }
+    };
+    let runner_id = match Uuid::parse_str(&request.runner_id) {
+        Ok(id) => RunnerId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_runner_id"})),
+            )
+        }
+    };
+    let Some(lease_token) = request.lease_token else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing_lease_token"})),
+        );
+    };
+    match state
+        .scheduler
+        .start_job(job_id, runner_id, &lease_token)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "contract_version": "harness.job.v1",
+                "status": "running",
+                "job_id": job_id.to_string(),
+            })),
+        ),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": error.to_string()})),
+        ),
+    }
 }
 
 /// Assign a job to a runner (runner claims a job)
@@ -271,6 +392,11 @@ async fn complete_job(
     let success = request["success"].as_bool().unwrap_or(false);
     let exit_code = request["exit_code"].as_i64().unwrap_or(-1);
     let error = request["error"].as_str();
+    let runner_id = request["runner_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .map(RunnerId::from);
+    let lease_token = request["lease_token"].as_str();
 
     tracing::info!(
         "job {} completed via HTTP: success={}, exit_code={}",
@@ -289,10 +415,25 @@ async fn complete_job(
     })
     .to_string();
 
-    if let Err(error) = state.scheduler.complete_job(job_id, success, receipt).await {
+    let assigned_runner = state.scheduler.is_assigned(job_id).await;
+    let completion = match (runner_id, lease_token, assigned_runner) {
+        (Some(runner_id), Some(lease_token), Some(_)) => {
+            state
+                .scheduler
+                .complete_job_with_lease(job_id, runner_id, lease_token, success, receipt)
+                .await
+        }
+        (None, None, None) => {
+            // Preserve the synthetic no-database handler behavior used by
+            // legacy callers/tests. Real assigned jobs must use a lease.
+            state.scheduler.complete_job(job_id, success, receipt).await
+        }
+        _ => Err(anyhow::anyhow!("runner_id and lease_token are required")),
+    };
+    if let Err(error) = completion {
         tracing::error!("failed to persist job {} completion: {}", job_id, error);
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": "completion_persistence_failed",
                 "message": error.to_string(),
@@ -501,11 +642,14 @@ mod tests {
     #[test]
     fn test_pending_job_info_serialize() {
         let info = PendingJobInfo {
+            contract_version: "harness.job.v1",
             job_id: "job-123".to_string(),
             name: "build".to_string(),
             pipeline_run_id: "run-456".to_string(),
             commands: vec!["cargo build".to_string()],
             working_dir: Some("/workspace".to_string()),
+            runner_id: "runner-123".to_string(),
+            lease_token: "lease-123".to_string(),
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("job-123"));

@@ -189,10 +189,7 @@ impl RunnerAgent {
                 }
                 tracing::debug!("runner checking for jobs...");
 
-                let jobs_url = format!(
-                    "{}/jobs/pending?runner_id={}",
-                    fetch_url, fetch_runner_id
-                );
+                let jobs_url = format!("{}/jobs/pending?runner_id={}", fetch_url, fetch_runner_id);
                 match fetch_client.get(&jobs_url).send().await {
                     Ok(response) => {
                         if response.status().is_success() {
@@ -203,9 +200,27 @@ impl RunnerAgent {
                                         job.name,
                                         job.job_id
                                     );
+                                    let Some(lease_token) = Self::claim_job(
+                                        &fetch_client,
+                                        &fetch_url,
+                                        &job.job_id,
+                                        fetch_runner_id,
+                                    )
+                                    .await
+                                    else {
+                                        tracing::warn!("unable to claim job {}", job.job_id);
+                                        continue;
+                                    };
                                     // Execute the job
-                                    Self::execute_job(&executor, &job, &fetch_client, &fetch_url)
-                                        .await;
+                                    Self::execute_job(
+                                        &executor,
+                                        &job,
+                                        &fetch_client,
+                                        &fetch_url,
+                                        fetch_runner_id,
+                                        &lease_token,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -230,12 +245,12 @@ impl RunnerAgent {
     /// Otherwise, wait for jobs to complete gracefully.
     pub async fn stop(&self, force: bool) {
         *self.is_running.write().await = false;
-        
+
         if force {
             tracing::info!("force stopping - cancelling all active jobs");
             self.executor.cancel_all_jobs().await;
         }
-        
+
         let runner_id = self
             .runner
             .as_ref()
@@ -255,11 +270,39 @@ impl RunnerAgent {
     }
 
     /// Execute a job assignment
+    async fn claim_job(
+        client: &Client,
+        scheduler_url: &str,
+        job_id: &str,
+        runner_id: RunnerId,
+    ) -> Option<String> {
+        let url = format!("{}/jobs/{}/claim", scheduler_url, job_id);
+        let response = client
+            .post(url)
+            .json(&serde_json::json!({"runner_id": runner_id.to_string()}))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response
+            .json::<serde_json::Value>()
+            .await
+            .ok()?
+            .get("lease_token")
+            .and_then(|token| token.as_str())
+            .map(ToOwned::to_owned)
+    }
+
+    /// Execute a job assignment
     async fn execute_job(
         executor: &Arc<JobExecutor>,
         assignment: &JobAssignment,
         client: &Client,
         scheduler_url: &str,
+        runner_id: RunnerId,
+        lease_token: &str,
     ) {
         let job_id = match uuid::Uuid::parse_str(&assignment.job_id) {
             Ok(id) => JobId::from(id),
@@ -297,6 +340,22 @@ impl RunnerAgent {
 
         tracing::info!("executing job {} in container", assignment.job_id);
 
+        let started_url = format!("{}/jobs/{}/started", scheduler_url, assignment.job_id);
+        let started = client
+            .post(&started_url)
+            .json(&serde_json::json!({
+                "runner_id": runner_id.to_string(),
+                "lease_token": lease_token,
+            }))
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false);
+        if !started {
+            tracing::error!("failed to mark job {} started", assignment.job_id);
+            return;
+        }
+
         // Execute the job
         let result = executor.execute(executable).await;
 
@@ -324,6 +383,9 @@ impl RunnerAgent {
             .collect();
 
         let complete_request = serde_json::json!({
+            "contract_version": "harness.job.v1",
+            "runner_id": runner_id.to_string(),
+            "lease_token": lease_token,
             "success": result.success,
             "exit_code": result.exit_code,
             "error": result.error,

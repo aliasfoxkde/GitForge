@@ -148,7 +148,9 @@ impl RepoQueries {
         .bind(repo_name)
         .fetch_optional(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to get repository by owner and name: {}", e)))?;
+        .map_err(|e| {
+            Error::database(format!("failed to get repository by owner and name: {}", e))
+        })?;
 
         match row {
             Some(row) => Ok(Some(crate::models::Repository {
@@ -669,12 +671,25 @@ impl JobQueries {
 
     /// Assign a runner to a job
     pub async fn assign(pool: &Pool, id: JobId, runner_id: RunnerId) -> Result<()> {
-        sqlx::query("UPDATE jobs SET runner_id = ? WHERE id = ?")
+        sqlx::query("UPDATE jobs SET runner_id = ?, status = 'assigned' WHERE id = ?")
             .bind(runner_id.to_string())
             .bind(id.to_string())
             .execute(pool.pool())
             .await
             .map_err(|e| Error::database(format!("failed to assign job: {}", e)))?;
+        Ok(())
+    }
+
+    /// Persist the assigned-to-running lifecycle transition.
+    pub async fn start(pool: &Pool, id: JobId) -> Result<()> {
+        sqlx::query(
+            "UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, ?) WHERE id = ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to start job: {}", e)))?;
         Ok(())
     }
 
@@ -1210,7 +1225,10 @@ mod tests {
         PipelineRunQueries::update_status(&pool, run.id, "succeeded")
             .await
             .unwrap();
-        let found = PipelineRunQueries::get(&pool, run.id).await.unwrap().unwrap();
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.status, "succeeded");
         assert!(found.finished_at.is_some());
 

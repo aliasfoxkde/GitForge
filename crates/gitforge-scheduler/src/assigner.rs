@@ -8,6 +8,7 @@ use gitforge_db::Pool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
+use uuid::Uuid;
 
 /// Scheduler command
 #[derive(Debug)]
@@ -54,6 +55,9 @@ pub struct SchedulerState {
     pub assigned_jobs: HashMap<JobId, (RunnerId, PipelineRunId)>,
     pub job_definitions: HashMap<JobId, JobExecutionDefinition>,
     pub completed_receipts: HashMap<JobId, String>,
+    /// Opaque per-assignment lease tokens. A runner must present the active
+    /// token for the started and completion transitions.
+    pub job_leases: HashMap<JobId, String>,
 }
 
 /// The scheduler-facing portion of a CI job definition. It is deliberately
@@ -80,6 +84,7 @@ impl SchedulerState {
             assigned_jobs: HashMap::new(),
             job_definitions: HashMap::new(),
             completed_receipts: HashMap::new(),
+            job_leases: HashMap::new(),
         }
     }
 
@@ -256,6 +261,7 @@ impl Scheduler {
         // Also remove assignment if exists
         state.job_assignments.remove(&job_id);
         state.assigned_jobs.remove(&job_id);
+        state.job_leases.remove(&job_id);
     }
 
     /// Register a runner
@@ -316,9 +322,7 @@ impl Scheduler {
                         // Persist to DB if available
                         if let Some(pool) = &db_pool {
                             let _ = gitforge_db::queries::RunnerQueries::update_status(
-                                pool,
-                                runner.id,
-                                "offline",
+                                pool, runner.id, "offline",
                             )
                             .await;
                         }
@@ -355,6 +359,7 @@ impl Scheduler {
             // Remove from assignments
             state.job_assignments.remove(job_id);
             state.assigned_jobs.remove(job_id);
+            state.job_leases.remove(job_id);
 
             // Re-enqueue the job with the original pipeline run ID
             // Use a dummy repo_id since we don't store it per-job
@@ -410,6 +415,10 @@ impl Scheduler {
                     state.queue.dequeue();
                     state.job_assignments.insert(job_id, r_id);
                     state.assigned_jobs.insert(job_id, (r_id, pipeline_run_id));
+                    state
+                        .job_leases
+                        .entry(job_id)
+                        .or_insert_with(|| Uuid::new_v4().to_string());
                     tracing::info!("assigned job {} to runner {}", job_id, r_id);
                     processed += 1;
 
@@ -514,6 +523,69 @@ impl Scheduler {
             .collect()
     }
 
+    /// Return the current lease for a job, creating one for an existing
+    /// assignment when needed. Repeated calls are idempotent.
+    pub async fn ensure_job_lease(&self, job_id: JobId) -> Option<String> {
+        let mut state = self.state.write().await;
+        if !state.assigned_jobs.contains_key(&job_id) {
+            return None;
+        }
+        Some(
+            state
+                .job_leases
+                .entry(job_id)
+                .or_insert_with(|| Uuid::new_v4().to_string())
+                .clone(),
+        )
+    }
+
+    /// Verify the runner's lease and persist the assigned-to-running
+    /// transition. The state lock makes the check-and-use atomic in the
+    /// in-memory scheduler; the database records the durable timestamp.
+    pub async fn start_job(
+        &self,
+        job_id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> anyhow::Result<()> {
+        {
+            let state = self.state.read().await;
+            let assigned_runner = state.assigned_jobs.get(&job_id).map(|(runner, _)| *runner);
+            if assigned_runner != Some(runner_id)
+                || state.job_leases.get(&job_id).map(String::as_str) != Some(lease_token)
+            {
+                anyhow::bail!("invalid job lease or runner assignment");
+            }
+        }
+        if let Some(pool) = &self.db_pool {
+            gitforge_db::queries::JobQueries::start(pool, job_id)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Complete a job only when the active runner lease is presented.
+    pub async fn complete_job_with_lease(
+        &self,
+        job_id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        success: bool,
+        result_json: String,
+    ) -> anyhow::Result<()> {
+        {
+            let state = self.state.read().await;
+            let assigned_runner = state.assigned_jobs.get(&job_id).map(|(runner, _)| *runner);
+            if assigned_runner != Some(runner_id)
+                || state.job_leases.get(&job_id).map(String::as_str) != Some(lease_token)
+            {
+                anyhow::bail!("invalid job lease or runner assignment");
+            }
+        }
+        self.complete_job(job_id, success, result_json).await
+    }
+
     /// Record a terminal receipt and persist it when a scheduler DB exists.
     pub async fn complete_job(
         &self,
@@ -541,6 +613,7 @@ impl Scheduler {
         state.completed_receipts.insert(job_id, result_json);
         state.job_assignments.remove(&job_id);
         state.assigned_jobs.remove(&job_id);
+        state.job_leases.remove(&job_id);
         if let Some((runner_id, pipeline_run_id)) = assignment {
             let _ = self.event_tx.send(SchedulerEvent::JobCompleted {
                 job_id,
@@ -936,5 +1009,43 @@ mod tests {
         // Verify job is assigned
         let assigned = scheduler.is_assigned(job_id).await;
         assert!(assigned.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_job_lease_started_and_completion_lifecycle() {
+        let scheduler = Scheduler::new();
+        let runner = make_runner(RunnerId::new(), "lease-runner", "online", 1);
+        let runner_id = runner.id;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                PipelineRunId::new(),
+                RepoId::new(),
+                vec!["cargo test --workspace".to_string()],
+                Some("/workspace".to_string()),
+            )
+            .await;
+        scheduler.register_runner(runner).await;
+        scheduler.process_queue().await;
+
+        let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
+        assert!(!lease.is_empty());
+        assert!(scheduler.start_job(job_id, runner_id, &lease).await.is_ok());
+        assert!(scheduler
+            .start_job(job_id, runner_id, "wrong")
+            .await
+            .is_err());
+        assert!(scheduler
+            .complete_job_with_lease(
+                job_id,
+                runner_id,
+                &lease,
+                true,
+                "{\"success\":true}".to_string(),
+            )
+            .await
+            .is_ok());
+        assert!(scheduler.is_assigned(job_id).await.is_none());
     }
 }
