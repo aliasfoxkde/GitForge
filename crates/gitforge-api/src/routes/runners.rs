@@ -1,9 +1,9 @@
 //! Runner API routes
 
-use crate::auth::ApiAuth;
+use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Extension, Path},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -39,48 +39,30 @@ pub fn public_runner_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new().route("/runners", axum::routing::post(register_runner))
 }
 
-/// Helper to extract and validate user from headers
-fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok());
-
-    let token = auth_header
-        .and_then(|h| ApiAuth::extract_token(h))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    auth.validate_token(token)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    Ok(())
-}
-
 /// List runners
 async fn list_runners(
+    _user: AuthenticatedUser,
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(_) => match RunnerQueries::list(&pool).await {
-            Ok(runners) => {
-                let response: Vec<RunnerResponse> = runners
-                    .into_iter()
-                    .map(|r| RunnerResponse {
-                        id: r.id.to_string(),
-                        name: r.name,
-                        runner_type: r.runner_type,
-                        status: r.status,
-                        capacity: r.capacity,
-                        last_heartbeat: r.last_heartbeat.map(|dt| dt.to_rfc3339()),
-                    })
-                    .collect();
-                Json(response).into_response()
-            }
-            Err(e) => {
-                tracing::error!("failed to list runners: {}", e);
-                Json(serde_json::Value::Array(vec![])).into_response()
-            }
-        },
+    match RunnerQueries::list(&pool).await {
+        Ok(runners) => {
+            let response: Vec<RunnerResponse> = runners
+                .into_iter()
+                .map(|r| RunnerResponse {
+                    id: r.id.to_string(),
+                    name: r.name,
+                    runner_type: r.runner_type,
+                    status: r.status,
+                    capacity: r.capacity,
+                    last_heartbeat: r.last_heartbeat.map(|dt| dt.to_rfc3339()),
+                })
+                .collect();
+            Json(response).into_response()
+        }
+        Err(e) => {
+            tracing::error!("failed to list runners: {}", e);
+            Json(serde_json::Value::Array(vec![])).into_response()
+        }
     }
 }
 
@@ -132,63 +114,54 @@ async fn register_runner(
 
 /// Get runner
 async fn get_runner(
+    _user: AuthenticatedUser,
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(_) => {
-            tracing::debug!("get runner: {}", id);
+    tracing::debug!("get runner: {}", id);
 
-            match Uuid::parse_str(&id) {
-                Ok(uuid) => {
-                    let runner_id = RunnerId::from(uuid);
-                    match RunnerQueries::get(&pool, runner_id).await {
-                        Ok(Some(runner)) => (
-                            StatusCode::OK,
-                            Json(RunnerResponse {
-                                id: runner.id.to_string(),
-                                name: runner.name,
-                                runner_type: runner.runner_type,
-                                status: runner.status,
-                                capacity: runner.capacity,
-                                last_heartbeat: runner.last_heartbeat.map(|dt| dt.to_rfc3339()),
-                            }),
-                        )
-                            .into_response(),
-                        Ok(None) => (
-                            StatusCode::NOT_FOUND,
-                            Json(serde_json::json!({
-                                "error": "not_found",
-                                "message": "Runner not found"
-                            })),
-                        )
-                            .into_response(),
-                        Err(e) => {
-                            tracing::error!("failed to get runner: {}", e);
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(serde_json::json!({
-                                    "error": "database_error",
-                                    "message": format!("failed to get runner: {}", e)
-                                })),
-                            )
-                                .into_response()
-                        }
-                    }
-                }
-                Err(_) => (
-                    StatusCode::BAD_REQUEST,
+    match Uuid::parse_str(&id) {
+        Ok(uuid) => match RunnerQueries::get(&pool, RunnerId::from(uuid)).await {
+            Ok(Some(runner)) => (
+                StatusCode::OK,
+                Json(RunnerResponse {
+                    id: runner.id.to_string(),
+                    name: runner.name,
+                    runner_type: runner.runner_type,
+                    status: runner.status,
+                    capacity: runner.capacity,
+                    last_heartbeat: runner.last_heartbeat.map(|dt| dt.to_rfc3339()),
+                }),
+            )
+                .into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "not_found",
+                    "message": "Runner not found"
+                })),
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("failed to get runner: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
-                        "error": "invalid_id",
-                        "message": "Invalid runner ID format"
+                        "error": "database_error",
+                        "message": format!("failed to get runner: {}", e)
                     })),
                 )
-                    .into_response(),
+                    .into_response()
             }
-        }
+        },
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_id",
+                "message": "Invalid runner ID format"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -337,81 +310,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_user_without_auth_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let headers = HeaderMap::new();
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_with_invalid_token() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Bearer invalid-token".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_with_valid_token() {
-        use crate::auth::ApiAuth;
-        use gitforge_common::UserId;
-
-        let auth = ApiAuth::new("test-secret");
-        let user_id = UserId::new();
-        let token = auth.generate_token(user_id, "testuser", "user").unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Authorization",
-            format!("Bearer {}", token).parse().unwrap(),
-        );
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_runner_response_malformed_auth_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "NotBearer token123".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_runner_response_empty_bearer_token() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Bearer".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_runner_response_basic_auth_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_runner_response_all_capacities_values() {
         for cap in &[0, 1, 2, 4, 8, 16, 32, 64] {
             let response = RunnerResponse {
@@ -543,38 +441,5 @@ mod tests {
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("My Docker Runner"));
-    }
-
-    #[test]
-    fn test_extract_user_with_bearer_prefix_only() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Bearer".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_user_with_empty_bearer_token() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Bearer ".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_user_with_wrong_auth_scheme() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Digest username".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
     }
 }

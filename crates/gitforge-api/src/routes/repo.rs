@@ -1,9 +1,9 @@
 //! Repository API routes
 
-use crate::auth::ApiAuth;
+use crate::auth::Claims;
 use axum::{
     extract::{Extension, Path},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -92,66 +92,46 @@ pub fn repo_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/repos/{id}", get(get_repo).delete(delete_repo))
 }
 
-/// Helper to extract and validate user from headers
-fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<UserId, StatusCode> {
-    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok());
-
-    let token = auth_header
-        .and_then(|h| ApiAuth::extract_token(h))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    let claims = auth
-        .validate_token(token)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    Ok(claims.user_id)
+fn can_access_repo(claims: &Claims, owner_id: UserId) -> bool {
+    claims.user_id == owner_id || matches!(claims.role.as_str(), "admin" | "maintainer")
 }
 
 /// List repositories
 async fn list_repos(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    Extension(claims): Extension<Claims>,
 ) -> impl IntoResponse {
-    // Check auth
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(_) => match RepoQueries::list(&pool).await {
-            Ok(repos) => {
-                let response: Vec<RepoResponse> = repos
-                    .into_iter()
-                    .map(|r| RepoResponse {
-                        id: r.id.to_string(),
-                        name: r.name,
-                        owner_id: r.owner_id.to_string(),
-                        visibility: r.visibility,
-                        git_path: r.git_path,
-                        created_at: r.created_at.to_rfc3339(),
-                        updated_at: r.updated_at.to_rfc3339(),
-                    })
-                    .collect();
-                Json(response).into_response()
-            }
-            Err(e) => {
-                tracing::error!("failed to list repos: {}", e);
-                Json(serde_json::Value::Array(vec![])).into_response()
-            }
-        },
+    match RepoQueries::list(&pool).await {
+        Ok(repos) => {
+            let response: Vec<RepoResponse> = repos
+                .into_iter()
+                .filter(|repo| can_access_repo(&claims, repo.owner_id))
+                .map(|r| RepoResponse {
+                    id: r.id.to_string(),
+                    name: r.name,
+                    owner_id: r.owner_id.to_string(),
+                    visibility: r.visibility,
+                    git_path: r.git_path,
+                    created_at: r.created_at.to_rfc3339(),
+                    updated_at: r.updated_at.to_rfc3339(),
+                })
+                .collect();
+            Json(response).into_response()
+        }
+        Err(e) => {
+            tracing::error!("failed to list repos: {}", e);
+            Json(serde_json::Value::Array(vec![])).into_response()
+        }
     }
 }
 
 /// Create a repository
 async fn create_repo(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    Extension(claims): Extension<Claims>,
     Json(req): Json<CreateRepoRequest>,
 ) -> impl IntoResponse {
-    // Check auth and get user
-    let owner_id = match extract_user(&auth, &headers) {
-        Err(e) => return e.into_response(),
-        Ok(id) => id,
-    };
+    let owner_id = claims.user_id;
 
     tracing::debug!("create repo request: {:?} by user {}", req, owner_id);
 
@@ -201,82 +181,69 @@ async fn create_repo(
 /// Get a repository
 async fn get_repo(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // Check auth
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(_) => {
-            tracing::debug!("get repo request: {}", id);
+    tracing::debug!("get repo request: {}", id);
 
-            match Uuid::parse_str(&id) {
-                Ok(uuid) => {
-                    let repo_id = RepoId::from(uuid);
-                    match RepoQueries::get(&pool, repo_id).await {
-                        Ok(Some(repo)) => {
-                            let response = RepoResponse {
-                                id: repo.id.to_string(),
-                                name: repo.name,
-                                owner_id: repo.owner_id.to_string(),
-                                visibility: repo.visibility,
-                                git_path: repo.git_path,
-                                created_at: repo.created_at.to_rfc3339(),
-                                updated_at: repo.updated_at.to_rfc3339(),
-                            };
-                            (StatusCode::OK, Json(response)).into_response()
-                        }
-                        Ok(None) => (
-                            StatusCode::NOT_FOUND,
-                            Json(serde_json::json!({
-                                "error": "not_found",
-                                "message": "Repository not found"
-                            })),
-                        )
-                            .into_response(),
-                        Err(e) => {
-                            tracing::error!("failed to get repo: {}", e);
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(serde_json::json!({
-                                    "error": "database_error",
-                                    "message": format!("failed to get repository: {}", e)
-                                })),
-                            )
-                                .into_response()
-                        }
-                    }
-                }
-                Err(_) => (
-                    StatusCode::BAD_REQUEST,
+    match Uuid::parse_str(&id) {
+        Ok(uuid) => match RepoQueries::get(&pool, RepoId::from(uuid)).await {
+            Ok(Some(repo)) if can_access_repo(&claims, repo.owner_id) => {
+                let response = RepoResponse {
+                    id: repo.id.to_string(),
+                    name: repo.name,
+                    owner_id: repo.owner_id.to_string(),
+                    visibility: repo.visibility,
+                    git_path: repo.git_path,
+                    created_at: repo.created_at.to_rfc3339(),
+                    updated_at: repo.updated_at.to_rfc3339(),
+                };
+                (StatusCode::OK, Json(response)).into_response()
+            }
+            Ok(Some(_)) | Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "not_found",
+                    "message": "Repository not found"
+                })),
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("failed to get repo: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
-                        "error": "invalid_id",
-                        "message": "Invalid repository ID format"
+                        "error": "database_error",
+                        "message": format!("failed to get repository: {}", e)
                     })),
                 )
-                    .into_response(),
+                    .into_response()
             }
-        }
+        },
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_id",
+                "message": "Invalid repository ID format"
+            })),
+        )
+            .into_response(),
     }
 }
 
 /// Delete a repository
 async fn delete_repo(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // Check auth
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(_) => {
-            tracing::debug!("delete repo request: {}", id);
+    tracing::debug!("delete repo request: {}", id);
 
-            match Uuid::parse_str(&id) {
-                Ok(uuid) => {
-                    let repo_id = RepoId::from(uuid);
+    match Uuid::parse_str(&id) {
+        Ok(uuid) => {
+            let repo_id = RepoId::from(uuid);
+            match RepoQueries::get(&pool, repo_id).await {
+                Ok(Some(repo)) if can_access_repo(&claims, repo.owner_id) => {
                     match RepoQueries::delete(&pool, repo_id).await {
                         Ok(_) => StatusCode::NO_CONTENT.into_response(),
                         Err(e) => {
@@ -292,16 +259,35 @@ async fn delete_repo(
                         }
                     }
                 }
-                Err(_) => (
-                    StatusCode::BAD_REQUEST,
+                Ok(Some(_)) | Ok(None) => (
+                    StatusCode::NOT_FOUND,
                     Json(serde_json::json!({
-                        "error": "invalid_id",
-                        "message": "Invalid repository ID format"
+                        "error": "not_found",
+                        "message": "Repository not found"
                     })),
                 )
                     .into_response(),
+                Err(e) => {
+                    tracing::error!("failed to get repo for delete: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "database_error",
+                            "message": format!("failed to get repository: {}", e)
+                        })),
+                    )
+                        .into_response()
+                }
             }
         }
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_id",
+                "message": "Invalid repository ID format"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -391,47 +377,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_user_without_auth_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let headers = HeaderMap::new();
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_with_invalid_token() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Bearer invalid-token".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_with_valid_token() {
-        use crate::auth::ApiAuth;
-        use gitforge_common::UserId;
-
-        let auth = ApiAuth::new("test-secret");
-        let user_id = UserId::new();
-        let token = auth.generate_token(user_id, "testuser", "user").unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Authorization",
-            format!("Bearer {}", token).parse().unwrap(),
-        );
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), user_id);
-    }
-
-    #[test]
     fn test_validate_repo_name_empty() {
         let result = validate_repo_name("");
         assert!(result.is_err());
@@ -516,52 +461,6 @@ mod tests {
     fn test_validate_repo_name_org_format_invalid_second_part() {
         // org/repo where second part starts with dash
         let result = validate_repo_name("org/-invalid");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_user_malformed_auth_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "NotBearer token123".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_empty_bearer_token() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Bearer".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_basic_auth_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_user_bearer_with_leading_space() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", " Bearer token123".parse().unwrap());
-        let result = extract_user(&auth, &headers);
         assert!(result.is_err());
     }
 }

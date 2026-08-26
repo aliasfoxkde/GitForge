@@ -190,11 +190,14 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   and detail routes remain protected. This exception is now represented in the
   route structure instead of being an accidental consequence of missing
   middleware.
-- Migrated webhook pipeline triggering to `AuthenticatedUser`, removing its
-  route-local bearer-token parser. Repository, artifact, runner-admin, and CI
-  handlers still contain legacy compatibility parsing and are tracked for the
-  next migration slices.
-- Validation: GitForge API unit tests (212), integration tests (40), focused
+- Migrated webhook triggering, repository routes, artifact routes, runner
+  administration, and user-facing job submit/get/log/cancel handlers to the
+  shared claims context, removing their production route-local bearer-token
+  parsers. Repository listing, lookup, and deletion now enforce owner access
+  with admin/maintainer override; cross-user integration coverage proves
+  private repositories are hidden. CI list/read pipeline handlers still
+  contain the final compatibility parsing slice.
+- Validation: GitForge API unit tests (190), integration tests (41), focused
   middleware tests, and webhook authorization/success tests pass. Whole-
   workspace validation remains a later managed gate after this tranche.
 

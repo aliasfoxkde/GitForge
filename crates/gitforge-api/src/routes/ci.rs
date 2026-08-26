@@ -421,14 +421,9 @@ async fn get_pipeline_run_jobs(
 /// separate API and CI processes.
 async fn submit_job(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    Extension(claims): Extension<Claims>,
     Json(request): Json<SubmitJobRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_user(&auth, &headers) {
-        Ok(claims) => claims,
-        Err(status) => return status.into_response(),
-    };
     if request.name.is_empty()
         || request.name.len() > 128
         || request.idempotency_key.is_empty()
@@ -620,98 +615,86 @@ async fn submit_job(
 /// Get job
 async fn get_job(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(claims) => {
-            tracing::debug!("get job: {}", id);
-            let job_id = match Uuid::parse_str(&id) {
-                Ok(uuid) => JobId::from(uuid),
-                Err(_) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": "invalid_id",
-                            "message": "Invalid job ID format"
-                        })),
-                    )
-                        .into_response();
-                }
-            };
-            match authorized_job(&pool, &claims, job_id).await {
-                Ok(job) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "id": job.id.to_string(),
-                        "name": job.name,
-                        "status": job.status,
-                        "runner_id": job.runner_id.map(|id| id.to_string()),
-                        "started_at": job.started_at.map(|dt| dt.to_rfc3339()),
-                        "finished_at": job.finished_at.map(|dt| dt.to_rfc3339()),
-                        "receipt": job.result_json.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
-                    })),
-                )
-                    .into_response(),
-                Err(status) => (
-                    status,
-                    Json(serde_json::json!({
-                        "error": if status == StatusCode::FORBIDDEN { "forbidden" } else { "not_found" },
-                        "message": "Job access is not permitted"
-                    })),
-                )
-                    .into_response(),
-            }
+    tracing::debug!("get job: {}", id);
+    let job_id = match Uuid::parse_str(&id) {
+        Ok(uuid) => JobId::from(uuid),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_id",
+                    "message": "Invalid job ID format"
+                })),
+            )
+                .into_response();
         }
+    };
+    match authorized_job(&pool, &claims, job_id).await {
+        Ok(job) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": job.id.to_string(),
+                "name": job.name,
+                "status": job.status,
+                "runner_id": job.runner_id.map(|id| id.to_string()),
+                "started_at": job.started_at.map(|dt| dt.to_rfc3339()),
+                "finished_at": job.finished_at.map(|dt| dt.to_rfc3339()),
+                "receipt": job.result_json.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+            })),
+        )
+            .into_response(),
+        Err(status) => (
+            status,
+            Json(serde_json::json!({
+                "error": if status == StatusCode::FORBIDDEN { "forbidden" } else { "not_found" },
+                "message": "Job access is not permitted"
+            })),
+        )
+            .into_response(),
     }
 }
 
 /// Get the persisted bounded completion receipt for a job.
 async fn get_job_logs(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(claims) => {
-            let uuid = match Uuid::parse_str(&id) {
-                Ok(uuid) => uuid,
-                Err(_) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": "invalid_id",
-                            "message": "Invalid job ID format"
-                        })),
-                    )
-                        .into_response();
-                }
-            };
-            match authorized_job(&pool, &claims, JobId::from(uuid)).await {
-                Ok(job) => {
-                    let receipt = job
-                        .result_json
-                        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
-                    (
-                        StatusCode::OK,
-                        Json(serde_json::json!({"job_id": id, "receipt": receipt})),
-                    )
-                        .into_response()
-                }
-                Err(status) => (
-                    status,
-                    Json(serde_json::json!({
-                        "error": if status == StatusCode::FORBIDDEN { "forbidden" } else { "not_found" },
-                        "message": "Job access is not permitted"
-                    })),
-                )
-                    .into_response(),
-            }
+    let uuid = match Uuid::parse_str(&id) {
+        Ok(uuid) => uuid,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_id",
+                    "message": "Invalid job ID format"
+                })),
+            )
+                .into_response();
         }
+    };
+    match authorized_job(&pool, &claims, JobId::from(uuid)).await {
+        Ok(job) => {
+            let receipt = job
+                .result_json
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"job_id": id, "receipt": receipt})),
+            )
+                .into_response()
+        }
+        Err(status) => (
+            status,
+            Json(serde_json::json!({
+                "error": if status == StatusCode::FORBIDDEN { "forbidden" } else { "not_found" },
+                "message": "Job access is not permitted"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -720,14 +703,9 @@ async fn get_job_logs(
 /// processes; no shared in-memory scheduler extension is required.
 async fn cancel_job(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let claims = match extract_user(&auth, &headers) {
-        Ok(claims) => claims,
-        Err(status) => return status.into_response(),
-    };
     let uuid = match Uuid::parse_str(&id) {
         Ok(uuid) => uuid,
         Err(_) => {

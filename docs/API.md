@@ -22,6 +22,11 @@ enforced by the individual route. The one documented bootstrap exception is
 can register before receiving credentials; runner listing and detail routes
 remain protected.
 
+Repository routes expose only repositories owned by the authenticated user,
+with `admin` and `maintainer` role overrides. Artifact routes require the
+shared authenticated context; job-to-repository artifact ownership remains
+coupled to the remaining CI authorization migration.
+
 GitForge uses JWT tokens for API authentication. Include the token in the Authorization header:
 
 ```

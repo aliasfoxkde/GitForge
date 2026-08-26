@@ -3,7 +3,7 @@
 //! These tests verify API functionality with database integration.
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     http::{Request, StatusCode},
 };
 use gitforge_api::{ApiAuth, ApiServer};
@@ -264,6 +264,89 @@ async fn test_create_repo_with_valid_auth() {
     assert!(
         response.status() == StatusCode::CREATED
             || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[tokio::test]
+async fn test_repository_access_is_owner_scoped() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let owner = gitforge_db::models::User::new(
+        "owner".to_string(),
+        "owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    let other = gitforge_db::models::User::new(
+        "other".to_string(),
+        "other@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &owner)
+        .await
+        .unwrap();
+    gitforge_db::queries::UserQueries::create(&pool, &other)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+    let auth = ApiAuth::new("test-secret");
+    let owner_token = auth.generate_token(owner.id, "owner", "developer").unwrap();
+    let other_token = auth.generate_token(other.id, "other", "developer").unwrap();
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/repos")
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"name":"owner-only"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let body = to_bytes(create_response.into_body(), 16 * 1024)
+        .await
+        .unwrap();
+    let repo_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let hidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/repos/{repo_id}"))
+                .header("Authorization", format!("Bearer {other_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+    let list = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/repos")
+                .header("Authorization", format!("Bearer {other_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 16 * 1024).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Vec<serde_json::Value>>(&body)
+            .unwrap()
+            .len(),
+        0
     );
 }
 
