@@ -274,4 +274,6 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   storage retrieval, and terminal completion.
 - Focused database, scheduler, runner, API, and service compile gates pass.
   True live sandbox streaming and full multi-process API/scheduler/runner E2E
-  remain explicitly open.
+  remain explicitly open. The rebuilt manager also passed full workspace
+  tests (`813e789e-807b-4d30-b1c5-0a9dbcda6905`) and Clippy
+  (`bc4c1426-8b90-40ed-b7d1-58da3a56a5e2`), both exit 0.
