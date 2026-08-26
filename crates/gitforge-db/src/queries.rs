@@ -539,6 +539,52 @@ impl PipelineRunQueries {
 pub struct JobQueries;
 
 impl JobQueries {
+    /// Return the existing submission record for a scoped idempotency key.
+    pub async fn get_idempotency(
+        pool: &Pool,
+        scope: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<(JobId, String)>> {
+        let row = sqlx::query(
+            "SELECT job_id, request_fingerprint FROM job_idempotency_keys WHERE scope = ? AND idempotency_key = ?",
+        )
+        .bind(scope)
+        .bind(idempotency_key)
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to get job idempotency key: {}", e)))?;
+        row.map(|row| {
+            let job_id = Uuid::parse_str(&row.get::<String, _>("job_id"))
+                .map(JobId::from)
+                .map_err(|e| Error::database(format!("invalid stored idempotent job ID: {}", e)))?;
+            Ok((job_id, row.get("request_fingerprint")))
+        })
+        .transpose()
+    }
+
+    /// Reserve an idempotency key. SQLite's conflict result makes this safe
+    /// when multiple control-plane retries arrive concurrently.
+    pub async fn reserve_idempotency(
+        pool: &Pool,
+        scope: &str,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+        job_id: JobId,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO job_idempotency_keys (scope, idempotency_key, request_fingerprint, job_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(scope)
+        .bind(idempotency_key)
+        .bind(request_fingerprint)
+        .bind(job_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to reserve job idempotency key: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Create a new job
     pub async fn create(pool: &Pool, job: &crate::models::Job) -> Result<()> {
         sqlx::query(
@@ -1544,6 +1590,38 @@ mod tests {
 
         let found = JobQueries::get(&pool, JobId::new()).await.unwrap();
         assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_job_idempotency_reservation_is_stable() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let job_id = JobId::new();
+        assert!(JobQueries::reserve_idempotency(
+            &pool,
+            "operator",
+            "retry-1",
+            "fingerprint",
+            job_id
+        )
+        .await
+        .unwrap());
+        assert!(!JobQueries::reserve_idempotency(
+            &pool,
+            "operator",
+            "retry-1",
+            "fingerprint",
+            JobId::new()
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            JobQueries::get_idempotency(&pool, "operator", "retry-1")
+                .await
+                .unwrap()
+                .unwrap(),
+            (job_id, "fingerprint".to_string())
+        );
     }
 
     #[tokio::test]

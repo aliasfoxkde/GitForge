@@ -169,11 +169,29 @@ curl http://localhost:42780/health
 
 1. Verify runner is registered:
    ```bash
-   curl -H "Authorization: Bearer $GITFORGE_SCHEDULER_TOKEN" \
+   curl -H "Authorization: Bearer $GITFORGE_RUNNER_TOKEN" \
      http://localhost:42781/runners  # Scheduler API
    ```
 2. Check runner logs for heartbeat errors
 3. Verify runner can reach scheduler
+
+### Safely Submit or Cancel a Job
+
+Use the operator credential for control-plane actions. Always supply a stable
+idempotency key when submitting so retries cannot duplicate work:
+
+```bash
+curl -X POST http://localhost:42781/jobs \
+  -H "Authorization: Bearer $GITFORGE_SCHEDULER_OPERATOR_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"pipeline_run_id":"<run-id>","repo_id":"<repo-id>","commands":["cargo test"],"working_dir":null,"idempotency_key":"<attempt-id>"}'
+
+curl -X POST http://localhost:42781/jobs/<job-id>/cancel \
+  -H "Authorization: Bearer $GITFORGE_SCHEDULER_OPERATOR_TOKEN"
+```
+
+Do not use the operator credential in runners. The shared token remains only
+as a backward-compatible migration fallback.
 
 ### Database Locked
 

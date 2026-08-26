@@ -21,7 +21,8 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct SchedulerServerState {
     pub scheduler: Arc<Scheduler>,
-    auth_token: Option<Arc<str>>,
+    runner_auth_token: Option<Arc<str>>,
+    operator_auth_token: Option<Arc<str>>,
 }
 
 /// Runner registration request
@@ -57,14 +58,37 @@ struct LeaseRequest {
     lease_token: Option<String>,
 }
 
+/// Authenticated operator submission. The idempotency key is mandatory so a
+/// retry after a lost response cannot start duplicate work.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SubmitJobRequest {
+    pub pipeline_run_id: String,
+    pub repo_id: String,
+    pub commands: Vec<String>,
+    pub working_dir: Option<String>,
+    pub idempotency_key: String,
+}
+
 /// Create scheduler server state
 pub fn create_state(scheduler: Scheduler) -> SchedulerServerState {
+    let shared = std::env::var("GITFORGE_SCHEDULER_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(Arc::from);
+    let runner = std::env::var("GITFORGE_RUNNER_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(Arc::from)
+        .or_else(|| shared.clone());
+    let operator = std::env::var("GITFORGE_SCHEDULER_OPERATOR_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(Arc::from)
+        .or(shared);
     SchedulerServerState {
         scheduler: Arc::new(scheduler),
-        auth_token: std::env::var("GITFORGE_SCHEDULER_TOKEN")
-            .ok()
-            .filter(|token| !token.is_empty())
-            .map(Arc::from),
+        runner_auth_token: runner,
+        operator_auth_token: operator,
     }
 }
 
@@ -72,31 +96,46 @@ pub fn create_state(scheduler: Scheduler) -> SchedulerServerState {
 pub fn scheduler_routes<S: Clone + Send + Sync + 'static>(
     state: SchedulerServerState,
 ) -> Router<S> {
-    let auth_token = state.auth_token.clone();
-    Router::new()
+    let runner_auth_token = state.runner_auth_token.clone();
+    let operator_auth_token = state.operator_auth_token.clone();
+    scheduler_routes_with_tokens(state, runner_auth_token, operator_auth_token)
+}
+
+fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
+    state: SchedulerServerState,
+    runner_auth_token: Option<Arc<str>>,
+    operator_auth_token: Option<Arc<str>>,
+) -> Router<S> {
+    let runner_routes = Router::new()
         .route("/runners", post(register_runner))
         .route("/runners/{id}/heartbeat", post(runner_heartbeat))
         .route("/jobs/pending", get(get_pending_jobs))
         .route("/jobs/{id}/claim", post(claim_job))
         .route("/jobs/{id}/started", post(start_job))
-        .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/jobs/{id}/cancelled", get(job_cancelled))
         .route("/jobs/{id}/assign", post(assign_job))
         .route("/jobs/{id}/complete", post(complete_job))
+        .layer(middleware::from_fn(move |request, next: Next| {
+            require_scheduler_auth(request, next, runner_auth_token.clone(), "runner")
+        }));
+    let operator_routes = Router::new()
+        .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/jobs", post(submit_job))
         .route("/pipelines/runs/{id}", get(get_pipeline_run))
         .layer(middleware::from_fn(move |request, next: Next| {
-            require_scheduler_auth(request, next, auth_token.clone())
-        }))
-        .with_state(state)
+            require_scheduler_auth(request, next, operator_auth_token.clone(), "operator")
+        }));
+    runner_routes.merge(operator_routes).with_state(state)
 }
 
 async fn require_scheduler_auth(
     request: Request,
     next: Next,
     expected: Option<Arc<str>>,
+    role: &'static str,
 ) -> Response {
     let Some(expected) = expected else {
-        tracing::error!("GITFORGE_SCHEDULER_TOKEN is unset; refusing scheduler API access");
+        tracing::error!(%role, "scheduler API credential is unset; refusing access");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "scheduler_auth_not_configured"})),
@@ -255,6 +294,109 @@ async fn cancel_job(
             "job_id": job_id.to_string(),
         })),
     )
+}
+
+async fn submit_job(
+    State(state): State<SchedulerServerState>,
+    Json(request): Json<SubmitJobRequest>,
+) -> impl IntoResponse {
+    if request.idempotency_key.is_empty() || request.idempotency_key.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_idempotency_key"})),
+        );
+    }
+    if request.commands.is_empty()
+        || request.commands.len() > 64
+        || request
+            .commands
+            .iter()
+            .any(|command| command.is_empty() || command.len() > 16 * 1024)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_commands"})),
+        );
+    }
+    if request
+        .working_dir
+        .as_deref()
+        .is_some_and(|path| path.is_empty() || path.len() > 1024)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_working_dir"})),
+        );
+    }
+    let pipeline_run_id = match Uuid::parse_str(&request.pipeline_run_id) {
+        Ok(id) => gitforge_common::PipelineRunId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_pipeline_run_id"})),
+            )
+        }
+    };
+    let repo_id = match Uuid::parse_str(&request.repo_id) {
+        Ok(id) => gitforge_common::RepoId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_repo_id"})),
+            )
+        }
+    };
+    let fingerprint = match serde_json::to_string(&request) {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_request"})),
+            )
+        }
+    };
+    match state
+        .scheduler
+        .submit_idempotent(
+            pipeline_run_id,
+            repo_id,
+            request.commands,
+            request.working_dir,
+            &request.idempotency_key,
+            &fingerprint,
+        )
+        .await
+    {
+        Ok((job_id, true)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "contract_version": "harness.job.v1",
+                "status": "queued",
+                "job_id": job_id.to_string()
+            })),
+        ),
+        Ok((job_id, false)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "contract_version": "harness.job.v1",
+                "status": "already_queued",
+                "job_id": job_id.to_string()
+            })),
+        ),
+        Err(error) if error.to_string().contains("idempotency_key_reused") => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "idempotency_key_reused_with_different_request"
+            })),
+        ),
+        Err(error) => {
+            tracing::error!(%error, "operator job submission failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "durable_scheduler_unavailable"})),
+            )
+        }
+    }
 }
 
 /// Let an assigned runner observe operator cancellation and stop its local
@@ -551,7 +693,8 @@ async fn complete_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     fn assert_status(response: axum::response::Response, expected: StatusCode) {
         let status = response.status();
@@ -813,5 +956,94 @@ mod tests {
         let response = register_runner(axum::extract::State(state), axum::Json(request)).await;
 
         assert_status(response.into_response(), StatusCode::CREATED);
+    }
+
+    fn authenticated_test_state() -> SchedulerServerState {
+        SchedulerServerState {
+            scheduler: Arc::new(crate::Scheduler::new()),
+            runner_auth_token: Some(Arc::from("runner-secret")),
+            operator_auth_token: Some(Arc::from("operator-secret")),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_runner_token_can_read_runner_route() {
+        let app: Router = scheduler_routes_with_tokens(
+            authenticated_test_state(),
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/jobs/pending")
+                    .header("authorization", "Bearer runner-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_runner_token_cannot_cancel_job() {
+        let app: Router = scheduler_routes_with_tokens(
+            authenticated_test_state(),
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/jobs/{}/cancel", JobId::new()))
+                    .header("authorization", "Bearer runner-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_operator_token_can_cancel_job() {
+        let app: Router = scheduler_routes_with_tokens(
+            authenticated_test_state(),
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/jobs/{}/cancel", JobId::new()))
+                    .header("authorization", "Bearer operator-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_missing_runner_credential_is_service_unavailable() {
+        let app: Router = scheduler_routes_with_tokens(
+            authenticated_test_state(),
+            None,
+            Some(Arc::from("operator-secret")),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/jobs/pending")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

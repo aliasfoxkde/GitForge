@@ -218,6 +218,24 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create events table: {}", e)))?;
 
+        // Operator submissions use a durable idempotency record so retries
+        // after a client timeout cannot create a second executable job.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS job_idempotency_keys (
+                scope TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (scope, idempotency_key)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create job idempotency table: {}", e)))?;
+
         // Create indexes for performance
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
             .execute(&self.pool)

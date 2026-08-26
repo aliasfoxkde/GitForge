@@ -3,10 +3,12 @@
 GitForge's scheduler and runner use the `harness.job.v1` lifecycle for jobs
 submitted by the provider-neutral harness.
 
-The scheduler requires the `GITFORGE_SCHEDULER_TOKEN` environment variable at
-startup. Runner requests send it as a bearer token from the same environment
-variable. The token is runtime configuration only and must not be committed.
-Missing or invalid credentials produce a fail-closed scheduler response.
+The scheduler accepts separate runtime credentials: `GITFORGE_RUNNER_TOKEN`
+for runner lifecycle routes and `GITFORGE_SCHEDULER_OPERATOR_TOKEN` for
+operator inspection, submission, and cancellation. The older
+`GITFORGE_SCHEDULER_TOKEN` remains a temporary compatibility fallback for both
+roles. Credentials are runtime configuration only and must not be committed.
+Missing or invalid credentials produce a fail-closed response.
 
 ## Lifecycle
 
@@ -25,6 +27,12 @@ that token for the following transitions:
   terminal state is authoritative; runner cleanup failures remain observable
   in runner logs.
 - `POST /jobs/{id}/complete` records the terminal receipt.
+
+Operators submit work with `POST /jobs` and must provide nonempty commands,
+valid pipeline/repository UUIDs, and an idempotency key (maximum 128 bytes).
+The durable SQLite idempotency record makes a retry return the original job
+ID; reusing a key for a different request returns `409 Conflict`. A durable
+scheduler database is required for this endpoint.
 
 Runner heartbeats are rejected for unknown runner IDs and are persisted to the
 runner record. Stale-runner reconciliation marks the runner offline and

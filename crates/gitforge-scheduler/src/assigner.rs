@@ -247,6 +247,61 @@ impl Scheduler {
         }
     }
 
+    /// Submit an operator job exactly once across control-plane retries. This
+    /// deliberately requires the durable scheduler database; an in-memory
+    /// fallback cannot provide the same guarantee after a restart.
+    pub async fn submit_idempotent(
+        &self,
+        pipeline_run_id: PipelineRunId,
+        repo_id: RepoId,
+        commands: Vec<String>,
+        working_dir: Option<String>,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+    ) -> anyhow::Result<(JobId, bool)> {
+        let Some(pool) = &self.db_pool else {
+            return Err(anyhow::anyhow!("durable_scheduler_database_required"));
+        };
+        let scope = "operator";
+        if let Some((job_id, fingerprint)) =
+            gitforge_db::queries::JobQueries::get_idempotency(pool, scope, idempotency_key).await?
+        {
+            if fingerprint != request_fingerprint {
+                return Err(anyhow::anyhow!(
+                    "idempotency_key_reused_with_different_request"
+                ));
+            }
+            return Ok((job_id, false));
+        }
+
+        let job_id = JobId::new();
+        if !gitforge_db::queries::JobQueries::reserve_idempotency(
+            pool,
+            scope,
+            idempotency_key,
+            request_fingerprint,
+            job_id,
+        )
+        .await?
+        {
+            let Some((existing_id, fingerprint)) =
+                gitforge_db::queries::JobQueries::get_idempotency(pool, scope, idempotency_key)
+                    .await?
+            else {
+                return Err(anyhow::anyhow!("idempotency_reservation_disappeared"));
+            };
+            if fingerprint != request_fingerprint {
+                return Err(anyhow::anyhow!(
+                    "idempotency_key_reused_with_different_request"
+                ));
+            }
+            return Ok((existing_id, false));
+        }
+        self.enqueue_with_definition(job_id, pipeline_run_id, repo_id, commands, working_dir)
+            .await;
+        Ok((job_id, true))
+    }
+
     /// Enqueue a job with priority
     pub async fn enqueue_with_priority(
         &self,
@@ -760,6 +815,54 @@ mod tests {
 
         // Process queue
         scheduler.process_queue().await;
+    }
+
+    #[tokio::test]
+    async fn test_idempotent_submission_replays_same_job_and_rejects_conflict() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let scheduler = Scheduler::with_db(pool);
+        let run_id = PipelineRunId::new();
+        let repo_id = RepoId::new();
+        let first = scheduler
+            .submit_idempotent(
+                run_id,
+                repo_id,
+                vec!["cargo test".to_string()],
+                None,
+                "request-1",
+                "fingerprint-1",
+            )
+            .await
+            .unwrap();
+        let replay = scheduler
+            .submit_idempotent(
+                run_id,
+                repo_id,
+                vec!["cargo test".to_string()],
+                None,
+                "request-1",
+                "fingerprint-1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.0, replay.0);
+        assert!(first.1);
+        assert!(!replay.1);
+        let conflict = scheduler
+            .submit_idempotent(
+                run_id,
+                repo_id,
+                vec!["cargo fmt".to_string()],
+                None,
+                "request-1",
+                "fingerprint-2",
+            )
+            .await;
+        assert!(conflict
+            .unwrap_err()
+            .to_string()
+            .contains("idempotency_key_reused"));
     }
 
     #[tokio::test]

@@ -165,9 +165,11 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   `BinaryHeap` entries are now discarded by both `peek` and `dequeue` before
   they can be assigned. Added queue- and scheduler-level regression tests.
 - The scheduler control API is token-authenticated, but user-facing API
-  cancellation/ownership and role separation remain open. The shared runner
-  token is an internal control-plane credential, not a multi-tenant operator
-  authorization model.
+  cancellation/ownership remains open. Scheduler routes now separate runner
+  and operator credentials (`GITFORGE_RUNNER_TOKEN` and
+  `GITFORGE_SCHEDULER_OPERATOR_TOKEN`) with the old shared token as a
+  compatibility fallback. Operator submission is durable and idempotent;
+  user-facing JWT-to-scheduler ownership remains a follow-up.
 - Existing service edits in `services/api/src/main.rs` and
   `services/ci/src/main.rs` were pre-existing and remain intentionally
   preserved; they are not part of this queue fix.
