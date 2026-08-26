@@ -158,3 +158,16 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
 - [ ] SSH Git clone/push operations (when implemented)
 - [ ] Authentication flow
 - [ ] Webhook processing
+
+## Verified continuation findings — 2026-08-26
+
+- Fixed a scheduler cancellation invariant: queue removal is lazy, so stale
+  `BinaryHeap` entries are now discarded by both `peek` and `dequeue` before
+  they can be assigned. Added queue- and scheduler-level regression tests.
+- The scheduler control API is token-authenticated, but user-facing API
+  cancellation/ownership and role separation remain open. The shared runner
+  token is an internal control-plane credential, not a multi-tenant operator
+  authorization model.
+- Existing service edits in `services/api/src/main.rs` and
+  `services/ci/src/main.rs` were pre-existing and remain intentionally
+  preserved; they are not part of this queue fix.

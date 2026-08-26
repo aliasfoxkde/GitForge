@@ -101,16 +101,29 @@ impl JobQueue {
         self.heap.push(job);
     }
 
-    /// Dequeue the highest priority job
+    /// Dequeue the highest priority active job.
+    ///
+    /// `remove` uses lazy deletion because `BinaryHeap` has no keyed remove;
+    /// stale heap entries must therefore be skipped here as well as by
+    /// `peek`, otherwise a canceled job can be returned to the scheduler.
     pub fn dequeue(&mut self) -> Option<QueuedJob> {
-        let job = self.heap.pop()?;
-        self.by_id.remove(&job.job_id);
-        Some(job)
+        while let Some(job) = self.heap.pop() {
+            if self.by_id.remove(&job.job_id).is_some() {
+                return Some(job);
+            }
+        }
+        None
     }
 
-    /// Peek at the next job without removing it
-    pub fn peek(&self) -> Option<&QueuedJob> {
-        self.heap.peek()
+    /// Peek at the next active job without removing it.
+    pub fn peek(&mut self) -> Option<&QueuedJob> {
+        while let Some(job) = self.heap.peek() {
+            if self.by_id.contains_key(&job.job_id) {
+                return self.heap.peek();
+            }
+            self.heap.pop();
+        }
+        None
     }
 
     /// Remove a specific job from the queue
@@ -223,6 +236,23 @@ mod tests {
         let removed = queue.remove(job_id);
         assert!(removed.is_some());
         assert!(!queue.contains(job_id));
+    }
+
+    #[test]
+    fn test_removed_job_is_not_peeked_or_dequeued() {
+        let mut queue = JobQueue::new();
+        let repo_id = RepoId::new();
+        let canceled_id = JobId::new();
+        let active = QueuedJob::new(JobId::new(), PipelineRunId::new(), repo_id);
+        let canceled = QueuedJob::new(canceled_id, PipelineRunId::new(), repo_id)
+            .with_priority(Priority::High);
+        queue.enqueue(active.clone());
+        queue.enqueue(canceled);
+
+        assert!(queue.remove(canceled_id).is_some());
+        assert_eq!(queue.peek().map(|job| job.job_id), Some(active.job_id));
+        assert_eq!(queue.dequeue().map(|job| job.job_id), Some(active.job_id));
+        assert!(queue.dequeue().is_none());
     }
 
     #[test]

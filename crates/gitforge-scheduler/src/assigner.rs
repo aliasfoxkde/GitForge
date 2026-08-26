@@ -777,6 +777,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cancelled_job_cannot_be_assigned_from_lazy_queue_entry() {
+        let scheduler = Scheduler::new();
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 1);
+        scheduler.register_runner(runner).await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue(job_id, PipelineRunId::new(), RepoId::new())
+            .await;
+
+        scheduler.cancel(job_id).await;
+        scheduler.process_queue().await;
+
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        assert_eq!(scheduler.queue_len().await, 0);
+    }
+
+    #[tokio::test]
     async fn test_enqueue_with_priority() {
         let scheduler = Scheduler::new();
         let repo_id = RepoId::new();
