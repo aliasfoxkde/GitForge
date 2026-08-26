@@ -169,7 +169,8 @@ curl http://localhost:42780/health
 
 1. Verify runner is registered:
    ```bash
-   curl http://localhost:42781/runners  # Scheduler API
+   curl -H "Authorization: Bearer $GITFORGE_SCHEDULER_TOKEN" \
+     http://localhost:42781/runners  # Scheduler API
    ```
 2. Check runner logs for heartbeat errors
 3. Verify runner can reach scheduler

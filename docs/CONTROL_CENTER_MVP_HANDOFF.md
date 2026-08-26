@@ -15,11 +15,14 @@ The scheduler exposes:
 
 - `POST /pipelines/trigger` — validated LAN trigger with repository, ref,
   commit, and workspace path.
-- `GET /pipelines/runs/:id` — durable run, job, status, and bounded result
+- `GET /pipeline-runs/:id` — durable run, job, status, and bounded result
   receipt readback.
 - `POST /jobs/:id/complete` — runner completion receipt persistence.
 
 The runner currently defaults to `http://localhost:42781` and requires Docker.
+Scheduler routes require `Authorization: Bearer $GITFORGE_SCHEDULER_TOKEN`;
+the legacy `/pipelines/trigger` service route is LAN-scoped and still needs
+the same explicit authentication middleware before public deployment.
 For Control Center workspaces, set `GITFORGE_WORKSPACE_ROOT` and pass a
 workspace below that canonical root.
 
