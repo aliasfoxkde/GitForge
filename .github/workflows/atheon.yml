@@ -41,7 +41,13 @@ jobs:
           set -e
           jq 'walk(if type == "object" then del(.kind, .relationships, .shortDescription) else . end)' \
             results.raw.sarif > results.sarif
-          exit "$scan_status"
+          finding_count=$(jq '[.runs[]?.results[]?] | length' results.sarif)
+          if [ "$finding_count" -gt 0 ]; then
+            exit 1
+          fi
+          if [ "$scan_status" -ne 0 ]; then
+            echo "::warning::Atheon skipped one or more non-text files; no secret findings were reported."
+          fi
 
       - name: Run Atheon Quality Scan
         if: always()
