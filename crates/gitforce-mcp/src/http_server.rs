@@ -6,8 +6,8 @@
 
 use anyhow::Result;
 use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
-use tracing::info;
 use std::sync::Arc;
+use tracing::info;
 
 use crate::handlers::{McPHandler, ToolCall};
 use crate::JsonRpcRequest;

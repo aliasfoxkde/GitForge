@@ -60,13 +60,10 @@ impl McPHandler {
 
     fn ci_run(&self, call: ToolCall) -> ToolResult {
         let repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
-        let branch = call
-            .arg_str("branch")
-            .unwrap_or_else(Self::current_branch);
+        let branch = call.arg_str("branch").unwrap_or_else(Self::current_branch);
         let delta = call.arg_bool("delta");
         let scope_override = call.arg_str("scope");
         let workflows = call.arg_str("workflows").unwrap_or_default();
-
 
         let scope_str = if delta {
             let delta_result = self.delta_plan(call.clone());
@@ -302,9 +299,7 @@ impl McPHandler {
             None => return ToolResult::err("title is required"),
         };
         let body = call.arg_str("body").unwrap_or_default();
-        let head = call
-            .arg_str("head")
-            .unwrap_or_else(Self::current_branch);
+        let head = call.arg_str("head").unwrap_or_else(Self::current_branch);
         let base = call.arg_str("base").unwrap_or_else(|| "main".to_string());
 
         let output = Command::new("gh")
