@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: detect
-        run: ${{ github.action_path }}/../actions/detect-languages/detect.sh
+        run: ./.github/actions/detect-languages/detect.sh
 
   # ─── Lint ────────────────────────────────────────────────────────────────
   lint:
@@ -52,7 +52,6 @@ jobs:
       has_python: ${{ needs.detect-languages.outputs.has_python }}
       has_rust: ${{ needs.detect-languages.outputs.has_rust }}
       has_typescript: ${{ needs.detect-languages.outputs.has_typescript }}
-      has_bash: ${{ needs.detect-languages.outputs.has_bash }}
     secrets: inherit
 
   # ─── Test ─────────────────────────────────────────────────────────────────
@@ -64,7 +63,6 @@ jobs:
       has_python: ${{ needs.detect-languages.outputs.has_python }}
       has_rust: ${{ needs.detect-languages.outputs.has_rust }}
       has_typescript: ${{ needs.detect-languages.outputs.has_typescript }}
-      has_bash: ${{ needs.detect-languages.outputs.has_bash }}
     secrets: inherit
 
   # ─── Build ────────────────────────────────────────────────────────────────
