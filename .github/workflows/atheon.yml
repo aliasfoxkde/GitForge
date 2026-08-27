@@ -25,9 +25,8 @@ jobs:
 
       - name: Install Atheon-Enhanced
         run: |
-          wget -q https://github.com/aliasfoxkde/Atheon-Enhanced/releases/latest/download/atheon-linux-amd64
-          chmod +x atheon-linux-amd64
-          sudo mv atheon-linux-amd64 /usr/local/bin/atheon
+          go install github.com/aliasfoxkde/Atheon/cmd/atheon@v1.5.3-enhanced
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Run Atheon Security Scan (secrets + PII + security)
         run: |
@@ -70,9 +69,8 @@ jobs:
 
       - name: Install Atheon-Enhanced
         run: |
-          wget -q https://github.com/aliasfoxkde/Atheon-Enhanced/releases/latest/download/atheon-linux-amd64
-          chmod +x atheon-linux-amd64
-          sudo mv atheon-linux-amd64 /usr/local/bin/atheon
+          go install github.com/aliasfoxkde/Atheon/cmd/atheon@v1.5.3-enhanced
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Check for sensitive data in PR
         run: |
