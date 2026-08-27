@@ -39,7 +39,7 @@ jobs:
           atheon --sarif --categories=secrets,pii ./ > results.raw.sarif
           scan_status=$?
           set -e
-          jq 'walk(if type == "object" then del(.kind, .relationships) else . end)' \
+          jq 'walk(if type == "object" then del(.kind, .relationships, .shortDescription) else . end)' \
             results.raw.sarif > results.sarif
           exit "$scan_status"
 
@@ -49,7 +49,7 @@ jobs:
           set +e
           atheon --sarif --categories=ai-detection,quality ./ > quality.raw.sarif
           set -e
-          jq 'walk(if type == "object" then del(.kind, .relationships) else . end)' \
+          jq 'walk(if type == "object" then del(.kind, .relationships, .shortDescription) else . end)' \
             quality.raw.sarif > quality-results.sarif
 
       - name: Upload SARIF results to GitHub Security tab
