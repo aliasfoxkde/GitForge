@@ -111,6 +111,7 @@ jobs:
   # ─── No E2E files notice ────────────────────────────────────────────────
   no-e2e:
     name: E2E Tests
+    needs: check-e2e
     runs-on: ubuntu-latest
     if: needs.check-e2e.outputs.has_e2e == 'false'
     steps:
