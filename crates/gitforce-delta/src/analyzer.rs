@@ -77,7 +77,10 @@ impl ExecutionScope {
 
     /// Whether to run security scans for this scope
     pub fn includes_security(&self) -> bool {
-        matches!(self, ExecutionScope::Standard | ExecutionScope::Full | ExecutionScope::Heavy)
+        matches!(
+            self,
+            ExecutionScope::Standard | ExecutionScope::Full | ExecutionScope::Heavy
+        )
     }
 
     /// Whether to run E2E tests for this scope
@@ -134,7 +137,12 @@ impl DeltaPlan {
         }
 
         if !self.affected_packages.is_empty() {
-            let pkgs: Vec<&str> = self.affected_packages.iter().map(|s| s.as_str()).take(5).collect();
+            let pkgs: Vec<&str> = self
+                .affected_packages
+                .iter()
+                .map(|s| s.as_str())
+                .take(5)
+                .collect();
             let suffix = if self.affected_packages.len() > 5 {
                 format!(" + {} more", self.affected_packages.len() - 5)
             } else {
@@ -214,21 +222,13 @@ impl DeltaAnalyzer {
     /// Run git diff --stat and --numstat
     fn run_git_diff(&self) -> Result<String> {
         let mut cmd = Command::new("git");
-        cmd.args([
-            "diff",
-            "--numstat",
-            "--raw",
-            "--no-color",
-            &self.base_ref,
-        ]);
+        cmd.args(["diff", "--numstat", "--raw", "--no-color", &self.base_ref]);
         if let Some(ref head) = self.head_ref {
             cmd.arg(head);
         }
         cmd.current_dir(&self.repo_root);
 
-        let output = cmd
-            .output()
-            .context("failed to run git diff")?;
+        let output = cmd.output().context("failed to run git diff")?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -318,7 +318,6 @@ impl DeltaAnalyzer {
                     }
                 }
             }
-
             // Python packages
             else if file.path.contains("/pyproject.toml")
                 || file.path.contains("/setup.py")
@@ -326,7 +325,6 @@ impl DeltaAnalyzer {
             {
                 packages.insert("python".to_string());
             }
-
             // Rust crates
             else if file.path.contains("/Cargo.toml")
                 || file.path.contains("/Cargo.lock")
@@ -341,7 +339,6 @@ impl DeltaAnalyzer {
                     }
                 }
             }
-
             // TypeScript / Node
             else if file.path.contains("/package.json")
                 || file.path.contains("/tsconfig.json")
@@ -351,12 +348,10 @@ impl DeltaAnalyzer {
             {
                 packages.insert("typescript".to_string());
             }
-
             // Shell scripts
             else if file.path.ends_with(".sh") {
                 packages.insert("shell".to_string());
             }
-
             // Docs
             else if file.path.starts_with("docs/")
                 || file.path.ends_with(".md")
@@ -364,7 +359,6 @@ impl DeltaAnalyzer {
             {
                 packages.insert("docs".to_string());
             }
-
             // CI/CD config
             else if file.path.contains(".github/workflows/")
                 || file.path.contains(".githooks/")
@@ -457,8 +451,7 @@ impl DeltaAnalyzer {
         ];
 
         let docs_only = files.iter().all(|f| {
-            docs_extensions.iter().any(|ext| f.path.ends_with(ext))
-                || f.path.starts_with("docs/")
+            docs_extensions.iter().any(|ext| f.path.ends_with(ext)) || f.path.starts_with("docs/")
         });
 
         let config_only = files.iter().all(|f| {
@@ -483,11 +476,26 @@ mod tests {
 
     #[test]
     fn test_execution_scope_classification() {
-        assert_eq!(ExecutionScope::from_change_count(1, 5), ExecutionScope::Trivial);
-        assert_eq!(ExecutionScope::from_change_count(3, 80), ExecutionScope::Fast);
-        assert_eq!(ExecutionScope::from_change_count(15, 500), ExecutionScope::Standard);
-        assert_eq!(ExecutionScope::from_change_count(50, 2000), ExecutionScope::Heavy);
-        assert_eq!(ExecutionScope::from_change_count(200, 5000), ExecutionScope::Full);
+        assert_eq!(
+            ExecutionScope::from_change_count(1, 5),
+            ExecutionScope::Trivial
+        );
+        assert_eq!(
+            ExecutionScope::from_change_count(3, 80),
+            ExecutionScope::Fast
+        );
+        assert_eq!(
+            ExecutionScope::from_change_count(15, 500),
+            ExecutionScope::Standard
+        );
+        assert_eq!(
+            ExecutionScope::from_change_count(50, 2000),
+            ExecutionScope::Heavy
+        );
+        assert_eq!(
+            ExecutionScope::from_change_count(200, 5000),
+            ExecutionScope::Full
+        );
     }
 
     #[test]

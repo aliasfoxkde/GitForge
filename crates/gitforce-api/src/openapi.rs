@@ -2,11 +2,7 @@
 //!
 //! Interactive API documentation available at /swagger-ui when server is running.
 
-use axum::{
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
-};
+use axum::{response::IntoResponse, routing::get, Json, Router};
 use serde_json::json;
 
 /// OpenAPI 3.0 specification for GitForge API
@@ -529,7 +525,9 @@ mod tests {
     async fn test_swagger_ui_returns_html() {
         let response = swagger_ui().await.into_response();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("swagger-ui"));
         assert!(body_str.contains("GitForge API"));

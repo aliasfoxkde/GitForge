@@ -65,7 +65,12 @@ impl ApiAuth {
     }
 
     /// Generate a JWT token for a user
-    pub fn generate_token(&self, user_id: UserId, username: &str, role: &str) -> Result<String, Error> {
+    pub fn generate_token(
+        &self,
+        user_id: UserId,
+        username: &str,
+        role: &str,
+    ) -> Result<String, Error> {
         let claims = Claims::new(user_id, username, role, 24); // 24 hour expiry
 
         let token = encode(&Header::default(), &claims, &self.encoding_key)

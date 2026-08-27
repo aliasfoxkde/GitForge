@@ -45,7 +45,12 @@ impl HookPayload {
     /// Get the branch name from the ref
     pub fn branch_name(&self) -> Option<String> {
         if self.ref_name.starts_with("refs/heads/") {
-            Some(self.ref_name.strip_prefix("refs/heads/").unwrap().to_string())
+            Some(
+                self.ref_name
+                    .strip_prefix("refs/heads/")
+                    .unwrap()
+                    .to_string(),
+            )
         } else {
             None
         }
@@ -54,7 +59,12 @@ impl HookPayload {
     /// Get the tag name from the ref
     pub fn tag_name(&self) -> Option<String> {
         if self.ref_name.starts_with("refs/tags/") {
-            Some(self.ref_name.strip_prefix("refs/tags/").unwrap().to_string())
+            Some(
+                self.ref_name
+                    .strip_prefix("refs/tags/")
+                    .unwrap()
+                    .to_string(),
+            )
         } else {
             None
         }
@@ -190,7 +200,11 @@ pub async fn execute_push_hooks(
         return Err(e);
     }
 
-    tracing::info!("Successfully executed hooks for push to {} on repo {}", ref_name, repo_id);
+    tracing::info!(
+        "Successfully executed hooks for push to {} on repo {}",
+        ref_name,
+        repo_id
+    );
     Ok(())
 }
 

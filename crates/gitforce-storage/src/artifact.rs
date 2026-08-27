@@ -53,18 +53,19 @@ pub struct Artifact {
 impl Artifact {
     /// Create artifact metadata from a file
     pub async fn from_file(job_id: JobId, name: String, path: &PathBuf) -> Result<Self> {
-        let mut file = File::open(path).await.map_err(|e| {
-            Error::storage(format!("failed to open file for artifact: {}", e))
-        })?;
+        let mut file = File::open(path)
+            .await
+            .map_err(|e| Error::storage(format!("failed to open file for artifact: {}", e)))?;
 
         let mut hasher = Sha256::new();
         let mut size: u64 = 0;
         let mut buffer = vec![0u8; 8192];
 
         loop {
-            let bytes_read = file.read(&mut buffer).await.map_err(|e| {
-                Error::storage(format!("failed to read file for artifact: {}", e))
-            })?;
+            let bytes_read = file
+                .read(&mut buffer)
+                .await
+                .map_err(|e| Error::storage(format!("failed to read file for artifact: {}", e)))?;
 
             if bytes_read == 0 {
                 break;
@@ -197,7 +198,10 @@ mod tests {
         hasher.update(data);
         let result = hex::encode(hasher.finalize());
         // SHA256 of "hello world"
-        assert_eq!(result, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        assert_eq!(
+            result,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
     }
 
     #[test]
@@ -312,8 +316,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_artifact_from_file() {
-        use tokio::fs;
         use tempfile::tempdir;
+        use tokio::fs;
 
         // Create a temp file with known content
         let dir = tempdir().unwrap();
@@ -322,37 +326,52 @@ mod tests {
         fs::write(&file_path, content).await.unwrap();
 
         let job_id = JobId::new();
-        let artifact = Artifact::from_file(job_id, "test-file.txt".to_string(), &file_path).await.unwrap();
+        let artifact = Artifact::from_file(job_id, "test-file.txt".to_string(), &file_path)
+            .await
+            .unwrap();
 
         assert_eq!(artifact.job_id, job_id);
         assert_eq!(artifact.name, "test-file.txt");
         assert_eq!(artifact.size_bytes, content.len() as u64);
         // SHA256 of "hello world"
-        assert_eq!(artifact.checksum, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        assert_eq!(
+            artifact.checksum,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
         assert!(artifact.content_type.is_none());
     }
 
     #[tokio::test]
     async fn test_artifact_from_file_empty() {
-        use tokio::fs;
         use tempfile::tempdir;
+        use tokio::fs;
 
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("empty.txt");
         fs::write(&file_path, b"").await.unwrap();
 
-        let artifact = Artifact::from_file(JobId::new(), "empty.txt".to_string(), &file_path).await.unwrap();
+        let artifact = Artifact::from_file(JobId::new(), "empty.txt".to_string(), &file_path)
+            .await
+            .unwrap();
 
         assert_eq!(artifact.size_bytes, 0);
         // SHA256 of empty string
-        assert_eq!(artifact.checksum, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            artifact.checksum,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[tokio::test]
     async fn test_artifact_from_file_not_found() {
         use std::path::PathBuf;
 
-        let result = Artifact::from_file(JobId::new(), "missing.txt".to_string(), &PathBuf::from("/nonexistent/path/file.txt")).await;
+        let result = Artifact::from_file(
+            JobId::new(),
+            "missing.txt".to_string(),
+            &PathBuf::from("/nonexistent/path/file.txt"),
+        )
+        .await;
         assert!(result.is_err());
     }
 }

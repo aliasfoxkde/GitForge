@@ -44,7 +44,10 @@ impl<S: StorageBackend> HttpGitHandler<S> {
         // Get HEAD reference
         if let Ok(reference) = repo.head() {
             let ref_name = reference.name().unwrap_or("HEAD");
-            let oid = reference.target().map(|oid| oid.to_string()).unwrap_or_default();
+            let oid = reference
+                .target()
+                .map(|oid| oid.to_string())
+                .unwrap_or_default();
             if !oid.is_empty() {
                 let line = format!("{}\0 capabilities^{{}}\n", ref_name);
                 response.extend_from_slice(&Self::format_pkt_line(&format!("{} {}\n", oid, line)));
@@ -77,11 +80,7 @@ impl<S: StorageBackend> HttpGitHandler<S> {
 
 #[async_trait]
 impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
-    async fn upload_pack(
-        &self,
-        repo_id: RepoId,
-        input: Vec<u8>,
-    ) -> Result<Vec<u8>> {
+    async fn upload_pack(&self, repo_id: RepoId, input: Vec<u8>) -> Result<Vec<u8>> {
         tracing::debug!(
             "upload_pack for repo {} ({} bytes input)",
             repo_id,
@@ -103,11 +102,7 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
         self.build_ref_advertisement(repo_id).await
     }
 
-    async fn receive_pack(
-        &self,
-        repo_id: RepoId,
-        input: Vec<u8>,
-    ) -> Result<Vec<u8>> {
+    async fn receive_pack(&self, repo_id: RepoId, input: Vec<u8>) -> Result<Vec<u8>> {
         tracing::debug!(
             "receive_pack for repo {} ({} bytes input)",
             repo_id,
@@ -194,20 +189,19 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
 /// Write pack data to repository's object database
 fn write_pack_to_odb(repo: &git2::Repository, pack_data: &[u8]) -> gitforce_common::Result<()> {
     // Write pack data to repository's odb
-    let odb = repo.odb().map_err(|e| {
-        gitforce_common::Error::git(format!("Failed to get odb: {}", e))
-    })?;
+    let odb = repo
+        .odb()
+        .map_err(|e| gitforce_common::Error::git(format!("Failed to get odb: {}", e)))?;
 
     // Create a packwriter to write the pack
-    let mut packwriter = odb.packwriter().map_err(|e| {
-        gitforce_common::Error::git(format!("Failed to create packwriter: {}", e))
-    })?;
+    let mut packwriter = odb
+        .packwriter()
+        .map_err(|e| gitforce_common::Error::git(format!("Failed to create packwriter: {}", e)))?;
 
     // Write the pack data
     // The packwriter implements Write trait
-    std::io::Write::write_all(&mut packwriter, pack_data).map_err(|e| {
-        gitforce_common::Error::git(format!("Failed to write pack: {}", e))
-    })?;
+    std::io::Write::write_all(&mut packwriter, pack_data)
+        .map_err(|e| gitforce_common::Error::git(format!("Failed to write pack: {}", e)))?;
 
     // The pack is finalized when packwriter is dropped
     // (git2's OdbPackwriter::Drop implementation calls finalize)
@@ -245,8 +239,14 @@ mod tests {
 
     #[test]
     fn test_parse_content_type() {
-        assert_eq!(parse_content_type("application/x-git-upload-pack-request"), Some("application/x-git-upload-pack-request"));
-        assert_eq!(parse_content_type("text/plain; charset=utf-8"), Some("text/plain"));
+        assert_eq!(
+            parse_content_type("application/x-git-upload-pack-request"),
+            Some("application/x-git-upload-pack-request")
+        );
+        assert_eq!(
+            parse_content_type("text/plain; charset=utf-8"),
+            Some("text/plain")
+        );
     }
 
     #[test]
@@ -256,7 +256,10 @@ mod tests {
         // Just whitespace - trims to empty
         assert_eq!(parse_content_type("   "), Some(""));
         // Multiple semicolons
-        assert_eq!(parse_content_type("text/plain; charset=utf-8; boundary=abc"), Some("text/plain"));
+        assert_eq!(
+            parse_content_type("text/plain; charset=utf-8; boundary=abc"),
+            Some("text/plain")
+        );
     }
 
     #[test]
@@ -267,7 +270,10 @@ mod tests {
         );
         assert_eq!(
             parse_service("git-receive-pack/owner/repo.git/info/refs"),
-            Some(("git-receive-pack".to_string(), "owner/repo.git/info/refs".to_string()))
+            Some((
+                "git-receive-pack".to_string(),
+                "owner/repo.git/info/refs".to_string()
+            ))
         );
     }
 
@@ -281,7 +287,10 @@ mod tests {
         // Deep path
         assert_eq!(
             parse_service("/git-upload-pack/owner/repo/path/to/refs"),
-            Some(("git-upload-pack".to_string(), "owner/repo/path/to/refs".to_string()))
+            Some((
+                "git-upload-pack".to_string(),
+                "owner/repo/path/to/refs".to_string()
+            ))
         );
         // Single segment (should return None)
         assert_eq!(parse_service("git-upload-pack"), None);
@@ -383,8 +392,14 @@ mod tests {
     #[test]
     fn test_parse_content_type_with_charset() {
         // More charset variations
-        assert_eq!(parse_content_type("application/json;charset=utf-8"), Some("application/json"));
-        assert_eq!(parse_content_type("text/html; charset=ISO-8859-1"), Some("text/html"));
+        assert_eq!(
+            parse_content_type("application/json;charset=utf-8"),
+            Some("application/json")
+        );
+        assert_eq!(
+            parse_content_type("text/html; charset=ISO-8859-1"),
+            Some("text/html")
+        );
     }
 
     #[test]
@@ -392,7 +407,10 @@ mod tests {
         // Various Git URL formats
         assert_eq!(
             parse_service("/git-upload-pack/owner/project.git"),
-            Some(("git-upload-pack".to_string(), "owner/project.git".to_string()))
+            Some((
+                "git-upload-pack".to_string(),
+                "owner/project.git".to_string()
+            ))
         );
         assert_eq!(
             parse_service("git-receive-pack/my-org/my-repo"),

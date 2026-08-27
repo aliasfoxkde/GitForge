@@ -36,9 +36,7 @@ pub fn artifact_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 
 /// Helper to extract and validate user from headers
 fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let auth_header = headers
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok());
+    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok());
 
     let token = auth_header
         .and_then(|h| ApiAuth::extract_token(h))
@@ -75,18 +73,20 @@ async fn list_artifacts(
             tracing::debug!("list artifacts");
             match storage.list().await {
                 Ok(artifacts) => {
-                    let responses: Vec<ArtifactResponse> = artifacts
-                        .iter()
-                        .map(artifact_to_response)
-                        .collect();
+                    let responses: Vec<ArtifactResponse> =
+                        artifacts.iter().map(artifact_to_response).collect();
                     Json(responses).into_response()
                 }
                 Err(e) => {
                     tracing::error!("failed to list artifacts: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-                        error: "storage_error".to_string(),
-                        message: e.to_string(),
-                    })).into_response()
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "storage_error".to_string(),
+                            message: e.to_string(),
+                        }),
+                    )
+                        .into_response()
                 }
             }
         }
@@ -108,10 +108,14 @@ async fn get_artifact(
             let artifact_id = match Uuid::parse_str(&id) {
                 Ok(uuid) => ArtifactId::from(uuid),
                 Err(_) => {
-                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-                        error: "invalid_id".to_string(),
-                        message: "Invalid artifact ID format".to_string(),
-                    })).into_response();
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "invalid_id".to_string(),
+                            message: "Invalid artifact ID format".to_string(),
+                        }),
+                    )
+                        .into_response();
                 }
             };
 
@@ -122,10 +126,14 @@ async fn get_artifact(
                 }
                 Err(e) => {
                     tracing::error!("failed to get artifact metadata: {}", e);
-                    (StatusCode::NOT_FOUND, Json(ErrorResponse {
-                        error: "not_found".to_string(),
-                        message: "Artifact not found".to_string(),
-                    })).into_response()
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse {
+                            error: "not_found".to_string(),
+                            message: "Artifact not found".to_string(),
+                        }),
+                    )
+                        .into_response()
                 }
             }
         }
@@ -147,10 +155,14 @@ async fn delete_artifact(
             let artifact_id = match Uuid::parse_str(&id) {
                 Ok(uuid) => ArtifactId::from(uuid),
                 Err(_) => {
-                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-                        error: "invalid_id".to_string(),
-                        message: "Invalid artifact ID format".to_string(),
-                    })).into_response();
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "invalid_id".to_string(),
+                            message: "Invalid artifact ID format".to_string(),
+                        }),
+                    )
+                        .into_response();
                 }
             };
 
@@ -158,10 +170,14 @@ async fn delete_artifact(
                 Ok(_) => StatusCode::NO_CONTENT.into_response(),
                 Err(e) => {
                     tracing::error!("failed to delete artifact: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-                        error: "storage_error".to_string(),
-                        message: e.to_string(),
-                    })).into_response()
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "storage_error".to_string(),
+                            message: e.to_string(),
+                        }),
+                    )
+                        .into_response()
                 }
             }
         }
@@ -183,27 +199,33 @@ async fn get_job_artifacts(
             let job_id_val = match Uuid::parse_str(&job_id) {
                 Ok(uuid) => gitforce_common::JobId::from(uuid),
                 Err(_) => {
-                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-                        error: "invalid_id".to_string(),
-                        message: "Invalid job ID format".to_string(),
-                    })).into_response();
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "invalid_id".to_string(),
+                            message: "Invalid job ID format".to_string(),
+                        }),
+                    )
+                        .into_response();
                 }
             };
 
             match storage.list_by_job(job_id_val).await {
                 Ok(artifacts) => {
-                    let responses: Vec<ArtifactResponse> = artifacts
-                        .iter()
-                        .map(artifact_to_response)
-                        .collect();
+                    let responses: Vec<ArtifactResponse> =
+                        artifacts.iter().map(artifact_to_response).collect();
                     Json(responses).into_response()
                 }
                 Err(e) => {
                     tracing::error!("failed to list artifacts for job: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-                        error: "storage_error".to_string(),
-                        message: e.to_string(),
-                    })).into_response()
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "storage_error".to_string(),
+                            message: e.to_string(),
+                        }),
+                    )
+                        .into_response()
                 }
             }
         }
@@ -323,7 +345,11 @@ mod tests {
 
     #[test]
     fn test_artifact_response_various_timestamps() {
-        for ts in &["2024-01-01T00:00:00Z", "2025-12-31T23:59:59Z", "2026-07-16T12:00:00Z"] {
+        for ts in &[
+            "2024-01-01T00:00:00Z",
+            "2025-12-31T23:59:59Z",
+            "2026-07-16T12:00:00Z",
+        ] {
             let response = ArtifactResponse {
                 id: "art-ts".to_string(),
                 job_id: "job-ts".to_string(),
