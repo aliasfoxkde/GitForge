@@ -12,6 +12,11 @@ on:
       - '**.go'
       - '.github/workflows/benchmark.yml'
 
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 jobs:
   benchmark:
     name: Run Benchmarks
@@ -191,8 +196,9 @@ jobs:
 
       - name: Post benchmark comment
         if: steps.check-current.outputs.exists == 'true' && steps.fetch-base.outputs.base_exists == 'true'
-        uses: peaceiris/actions-gh-comment@v3
+        uses: peter-evans/create-or-update-comment@v4
         with:
+          issue-number: ${{ github.event.pull_request.number }}
           comment-id: ${{ steps.find-comment.outputs.comment_id }}
           body: |
             ## Benchmark Results
@@ -204,15 +210,15 @@ jobs:
 
       - name: Post new benchmark comment (no base)
         if: steps.check-current.outputs.exists == 'true' && steps.fetch-base.outputs.base_exists != 'true'
-        uses: peaceiris/actions-gh-comment@v3
+        uses: peter-evans/create-or-update-comment@v4
         with:
+          issue-number: ${{ github.event.pull_request.number }}
           body: |
             ## Benchmark Results
 
             First benchmark run on this PR. No previous baseline available for comparison.
 
             See artifacts for full benchmark data.
-          flag: ${{ steps.check-current.outputs.count == '0' && 'empty' || '' }}
 
   upload-base:
     name: Upload Base Benchmark
