@@ -114,7 +114,7 @@ impl StorageBackend for FileStorageBackend {
         let path = self.repo_path(repo_id);
 
         let repo = git2::Repository::open(&path)
-            .map_err(|e| Error::git(format!("failed to open repository at {:?}: {}", path, e)))?;
+            .map_err(|e| Error::git(format!("failed to open repository: {}", e)))?;
 
         Ok(repo)
     }

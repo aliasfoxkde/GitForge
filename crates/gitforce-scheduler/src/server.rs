@@ -202,11 +202,7 @@ mod tests {
 
     fn assert_status(response: axum::response::Response, expected: StatusCode) {
         let status = response.status();
-        assert_eq!(
-            status, expected,
-            "Expected status {:?}, got {:?}",
-            expected, status
-        );
+        assert_eq!(status, expected, "HTTP response status mismatch");
     }
 
     #[tokio::test]
