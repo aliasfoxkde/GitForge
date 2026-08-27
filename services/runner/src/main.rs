@@ -70,17 +70,28 @@ pub fn create_shutdown_flag() -> Arc<AtomicBool> {
 /// Spawn the shutdown signal handler
 pub fn spawn_shutdown_handler(shutdown_flag: Arc<AtomicBool>) {
     tokio::spawn(async move {
-        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
-        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt()).unwrap();
+        #[cfg(unix)]
+        {
+            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+            let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+                .expect("failed to install SIGINT handler");
 
-        tokio::select! {
-            _ = sigterm.recv() => {
-                tracing::info!("received SIGTERM, initiating graceful shutdown...");
-            }
-            _ = sigint.recv() => {
-                tracing::info!("received SIGINT, initiating graceful shutdown...");
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    tracing::info!("received SIGTERM, initiating graceful shutdown...");
+                }
+                _ = sigint.recv() => {
+                    tracing::info!("received SIGINT, initiating graceful shutdown...");
+                }
             }
         }
+
+        #[cfg(not(unix))]
+        if let Err(error) = signal::ctrl_c().await {
+            tracing::error!(%error, "failed to install console interrupt handler");
+        }
+
         shutdown_flag.store(true, Ordering::SeqCst);
     });
 }
