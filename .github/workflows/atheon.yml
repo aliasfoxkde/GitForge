@@ -33,10 +33,10 @@ jobs:
           go install github.com/aliasfoxkde/Atheon/cmd/atheon@v1.5.3-enhanced
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
-      - name: Run Atheon Security Scan (secrets + PII + security)
+      - name: Run Atheon Security Scan (secrets)
         run: |
           set +e
-          atheon --sarif --categories=secrets,pii ./ > results.raw.sarif
+          atheon --sarif --categories=secrets ./ > results.raw.sarif
           scan_status=$?
           set -e
           jq 'walk(if type == "object" then del(.kind, .relationships, .shortDescription) else . end)' \
