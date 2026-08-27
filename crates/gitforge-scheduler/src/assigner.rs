@@ -479,6 +479,16 @@ impl Scheduler {
         let mut state = self.state.write().await;
 
         for (job_id, pipeline_run_id, repo_id) in &jobs_to_requeue {
+            // Persist first so a database failure leaves the in-memory
+            // assignment available for a later stale-runner retry.
+            if let Some(pool) = &db_pool {
+                if let Err(error) = gitforge_db::queries::JobQueries::requeue(pool, *job_id).await
+                {
+                    tracing::error!(%error, %job_id, "failed to persist runner-loss requeue");
+                    continue;
+                }
+            }
+
             // Remove from assignments
             state.job_assignments.remove(job_id);
             state.assigned_jobs.remove(job_id);
@@ -497,11 +507,6 @@ impl Scheduler {
                 runner_id
             );
             requeued += 1;
-
-            // Persist status change to DB
-            if let Some(pool) = &db_pool {
-                let _ = gitforge_db::queries::JobQueries::requeue(pool, *job_id).await;
-            }
         }
 
         requeued
@@ -553,12 +558,16 @@ impl Scheduler {
                     .collect::<Vec<_>>()
             };
             for job_id in queued_ids {
-                let is_cancelled = gitforge_db::queries::JobQueries::get(pool, job_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|job| job.status == "cancelled")
-                    .unwrap_or(false);
+                let is_cancelled = match gitforge_db::queries::JobQueries::get(pool, job_id).await {
+                    Ok(Some(job)) => job.status == "cancelled",
+                    Ok(None) => false,
+                    Err(error) => {
+                        // Durable state is authoritative. Fail closed for
+                        // this scheduler tick if cancellation is unreadable.
+                        tracing::error!(%error, %job_id, "failed to reconcile cancellation before assignment");
+                        return;
+                    }
+                };
                 if is_cancelled {
                     self.cancel(job_id).await;
                 }
