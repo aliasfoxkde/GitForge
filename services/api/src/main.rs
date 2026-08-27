@@ -140,6 +140,8 @@ pub async fn graceful_shutdown_delay() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
 
     fn clear_env() {
@@ -148,9 +150,15 @@ mod tests {
         std::env::remove_var("DATABASE_URL");
     }
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|error| error.into_inner())
+    }
+
     #[test]
     fn test_load_config_defaults() {
         // Clear any set env vars first
+        let _lock = env_lock();
         clear_env();
 
         let config = load_config();
@@ -162,6 +170,7 @@ mod tests {
     #[test]
     fn test_load_config_from_env() {
         // Always set fresh values - clear first then set
+        let _lock = env_lock();
         clear_env();
         std::env::set_var("JWT_SECRET", "test-secret");
         std::env::set_var("PORT", "3000");

@@ -11,13 +11,18 @@
 //! 3. **Dependency Graph** — Walk reverse dependencies (if X changed, Y may break)
 //! 4. **Scope Resolution** — Determine what to run: lint-only, test, build, etc.
 //!
-//! # Example
+//! # Example (not run)
 //!
-//! ```rust
-//! let analyzer = DeltaAnalyzer::new(".", "HEAD~1").await?;
+//! ```no_run
+//! # use gitforce_delta::DeltaAnalyzer;
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let analyzer = DeltaAnalyzer::new(".", "HEAD~1");
 //! let plan = analyzer.analyze().await?;
 //! println!("Affected packages: {:?}", plan.affected_packages);
-//! println!("Run: {:?}", plan.execution_scope());
+//! println!("Run: {:?}", plan.execution_scope);
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod analyzer;
