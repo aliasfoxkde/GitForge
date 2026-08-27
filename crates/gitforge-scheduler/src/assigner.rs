@@ -488,6 +488,14 @@ impl Scheduler {
                 }
             }
 
+            // The database call above can yield while completion or another
+            // assignment changes the in-memory mirror. Never requeue a
+            // snapshot that is no longer owned by this offline runner.
+            if state.assigned_jobs.get(job_id) != Some(&(runner_id, *pipeline_run_id, *repo_id)) {
+                tracing::warn!(%job_id, %runner_id, "skipping stale runner-loss snapshot");
+                continue;
+            }
+
             // Remove from assignments
             state.job_assignments.remove(job_id);
             state.assigned_jobs.remove(job_id);
