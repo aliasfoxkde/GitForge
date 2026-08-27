@@ -133,7 +133,8 @@ When you set up the Mac Mini for macOS builds:
 
 ```bash
 # API Gateway
-JWT_SECRET="your-secret-here"
+# Export JWT_SECRET from a secret manager before starting the service.
+export JWT_SECRET
 PORT=8080
 DATABASE_URL="sqlite:/gitforge.db"
 

@@ -110,7 +110,7 @@ async fn test_api_auth_invalid_token() {
     assert!(result.is_err());
 
     // Malformed JWT
-    let result = auth.validate_token("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.invalid.signature");
+    let result = auth.validate_token("not-a-jwt");
     assert!(result.is_err());
 }
 

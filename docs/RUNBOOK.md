@@ -45,7 +45,8 @@ The API gateway exposes the REST API for frontend integration.
 cargo run -p api
 
 # Production
-JWT_SECRET="${JWT_SECRET:?set JWT_SECRET}" ./target/release/api --host 0.0.0.0 --port 8080
+export JWT_SECRET
+./target/release/api --host 0.0.0.0 --port 8080
 ```
 
 **Environment Variables:**
