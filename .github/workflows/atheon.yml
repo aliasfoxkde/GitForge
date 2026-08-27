@@ -35,11 +35,11 @@ jobs:
 
       - name: Run Atheon Security Scan (secrets + PII + security)
         run: |
-          atheon --categories=secrets,pii --sarif ./ > results.sarif
+          atheon --sarif --categories=secrets,pii ./ > results.sarif
 
       - name: Run Atheon Quality Scan
         run: |
-          atheon --categories=ai-detection,quality --sarif ./ > quality-results.sarif || true
+          atheon --sarif --categories=ai-detection,quality ./ > quality-results.sarif || true
 
       - name: Upload SARIF results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
