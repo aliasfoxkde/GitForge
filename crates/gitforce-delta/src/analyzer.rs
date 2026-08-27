@@ -278,7 +278,7 @@ impl DeltaAnalyzer {
                 }
 
                 // Try raw format
-                if let Some(raw_part) = line.split('\t').last() {
+                if let Some(raw_part) = line.split('\t').next_back() {
                     let path = raw_part.trim().to_string();
                     if path.is_empty() || path == "/dev/null" {
                         return None;

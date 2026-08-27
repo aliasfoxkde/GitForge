@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start event consumer loop
     let shutdown_consumer = shutdown.clone();
-    let consumer_handle = tokio::spawn(async move {
+    let _consumer_handle = tokio::spawn(async move {
         if let Err(e) = run_event_consumer(
             event_bus_clone,
             scheduler_clone,
@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     // Start scheduler loop
     let scheduler_clone = scheduler.clone();
     let shutdown_scheduler = shutdown.clone();
-    let scheduler_handle = tokio::spawn(async move {
+    let _scheduler_handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         loop {
             if shutdown_scheduler.load(Ordering::SeqCst) {

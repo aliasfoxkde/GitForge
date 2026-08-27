@@ -59,15 +59,15 @@ impl McPHandler {
     // ─── CI Run ────────────────────────────────────────────────────────────
 
     fn ci_run(&self, call: ToolCall) -> ToolResult {
-        let repo = call.arg_str("repo").unwrap_or_else(|| Self::infer_repo());
+        let repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
         let branch = call
             .arg_str("branch")
-            .unwrap_or_else(|| Self::current_branch());
+            .unwrap_or_else(Self::current_branch);
         let delta = call.arg_bool("delta");
         let scope_override = call.arg_str("scope");
         let workflows = call.arg_str("workflows").unwrap_or_default();
 
-        let rt = Runtime::new().expect("failed to create tokio runtime");
+
         let scope_str = if delta {
             let delta_result = self.delta_plan(call.clone());
             scope_override
@@ -101,7 +101,7 @@ impl McPHandler {
     }
 
     fn ci_status(&self, call: ToolCall) -> ToolResult {
-        let repo = call.arg_str("repo").unwrap_or_else(|| Self::infer_repo());
+        let repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
         let run_id = call.arg_str("run_id");
         let branch = call.arg_str("branch");
 
@@ -118,7 +118,7 @@ impl McPHandler {
     }
 
     fn ci_cancel(&self, call: ToolCall) -> ToolResult {
-        let repo = call.arg_str("repo").unwrap_or_else(|| Self::infer_repo());
+        let repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
         let run_id = match call.arg_str("run_id") {
             Some(id) => id,
             None => return ToolResult::err("run_id is required"),
@@ -147,9 +147,9 @@ impl McPHandler {
         let base_ref = call
             .arg_str("base_ref")
             .unwrap_or_else(|| "HEAD~1".to_string());
+        let rt = Runtime::new().expect("failed to create tokio runtime");
 
         let analyzer = DeltaAnalyzer::new(&repo_root, &base_ref);
-        let rt = Runtime::new().expect("failed to create tokio runtime");
         let plan = match rt.block_on(analyzer.analyze()) {
             Ok(p) => p,
             Err(e) => return ToolResult::err(format!("Delta analysis failed: {}", e)),
@@ -272,7 +272,7 @@ impl McPHandler {
     }
 
     fn get_repo_config(&self, call: ToolCall) -> ToolResult {
-        let _repo = call.arg_str("repo").unwrap_or_else(|| Self::infer_repo());
+        let _repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
 
         let config = RepoConfig {
             default_branch: "main".to_string(),
@@ -296,7 +296,7 @@ impl McPHandler {
     }
 
     fn pr_create(&self, call: ToolCall) -> ToolResult {
-        let repo = call.arg_str("repo").unwrap_or_else(|| Self::infer_repo());
+        let repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
         let title = match call.arg_str("title") {
             Some(t) => t,
             None => return ToolResult::err("title is required"),
@@ -304,7 +304,7 @@ impl McPHandler {
         let body = call.arg_str("body").unwrap_or_default();
         let head = call
             .arg_str("head")
-            .unwrap_or_else(|| Self::current_branch());
+            .unwrap_or_else(Self::current_branch);
         let base = call.arg_str("base").unwrap_or_else(|| "main".to_string());
 
         let output = Command::new("gh")
@@ -331,7 +331,7 @@ impl McPHandler {
     }
 
     fn pr_merge(&self, call: ToolCall) -> ToolResult {
-        let repo = call.arg_str("repo").unwrap_or_else(|| Self::infer_repo());
+        let repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
         let pr_number: u64 = match call.arg_usize("pr_number") {
             Some(n) => n as u64,
             None => return ToolResult::err("pr_number is required"),
