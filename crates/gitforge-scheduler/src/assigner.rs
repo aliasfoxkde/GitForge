@@ -53,7 +53,10 @@ pub struct SchedulerState {
     pub queue: JobQueue,
     pub runners: HashMap<RunnerId, Runner>,
     pub job_assignments: HashMap<JobId, RunnerId>,
-    pub assigned_jobs: HashMap<JobId, (RunnerId, PipelineRunId)>,
+    /// Assignment metadata retained until completion or requeue. Keeping the
+    /// repository ID here is essential: a runner-loss recovery must enqueue
+    /// the same repository, never synthesize a new UUID.
+    pub assigned_jobs: HashMap<JobId, (RunnerId, PipelineRunId, RepoId)>,
     pub job_definitions: HashMap<JobId, JobExecutionDefinition>,
     pub completed_receipts: HashMap<JobId, String>,
     /// Opaque per-assignment lease tokens. A runner must present the active
@@ -460,8 +463,10 @@ impl Scheduler {
             state
                 .assigned_jobs
                 .iter()
-                .filter(|(_, (rid, _))| *rid == runner_id)
-                .map(|(job_id, (_, pipeline_run_id))| (*job_id, *pipeline_run_id))
+                .filter(|(_, (rid, _, _))| *rid == runner_id)
+                .map(|(job_id, (_, pipeline_run_id, repo_id))| {
+                    (*job_id, *pipeline_run_id, *repo_id)
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -473,18 +478,18 @@ impl Scheduler {
         let db_pool = self.db_pool.clone();
         let mut state = self.state.write().await;
 
-        for (job_id, pipeline_run_id) in &jobs_to_requeue {
+        for (job_id, pipeline_run_id, repo_id) in &jobs_to_requeue {
             // Remove from assignments
             state.job_assignments.remove(job_id);
             state.assigned_jobs.remove(job_id);
             state.job_leases.remove(job_id);
 
-            // Re-enqueue the job with the original pipeline run ID
-            // Use a dummy repo_id since we don't store it per-job
+            // Re-enqueue the job with the original pipeline run and repository
+            // IDs. The queue entry must remain tied to the original checkout.
             state.queue.enqueue(crate::queue::QueuedJob::new(
                 *job_id,
                 *pipeline_run_id,
-                gitforge_common::RepoId::new(),
+                *repo_id,
             ));
             tracing::info!(
                 "re-enqueued job {} after runner {} went offline",
@@ -577,6 +582,7 @@ impl Scheduler {
 
             let job_id = job.job_id;
             let pipeline_run_id = job.pipeline_run_id;
+            let repo_id = job.repo_id;
 
             // Select runner using policy
             let runner_id = self.policy.select_runner(job_id, &runners).await;
@@ -618,7 +624,9 @@ impl Scheduler {
                     // Dequeue and assign (JobId and RunnerId are Copy types)
                     state.queue.dequeue();
                     state.job_assignments.insert(job_id, r_id);
-                    state.assigned_jobs.insert(job_id, (r_id, pipeline_run_id));
+                    state
+                        .assigned_jobs
+                        .insert(job_id, (r_id, pipeline_run_id, repo_id));
                     tracing::info!("assigned job {} to runner {}", job_id, r_id);
                     processed += 1;
 
@@ -655,10 +663,24 @@ impl Scheduler {
         let mut loaded = 0;
         for db_job in pending_jobs {
             if !state.queue.contains(db_job.id) {
+                // Jobs reference a pipeline run, which is the durable source
+                // of the repository identity. Refuse to enqueue if the run is
+                // missing instead of silently routing to a random repository.
+                let Some(run) =
+                    gitforge_db::queries::PipelineRunQueries::get(pool, db_job.pipeline_run_id)
+                        .await?
+                else {
+                    tracing::error!(
+                        job_id = %db_job.id,
+                        pipeline_run_id = %db_job.pipeline_run_id,
+                        "cannot recover job without its pipeline run"
+                    );
+                    continue;
+                };
                 state.queue.enqueue(QueuedJob::new(
                     db_job.id,
                     db_job.pipeline_run_id,
-                    RepoId::new(), // RepoId not in job model, use default
+                    run.repo_id,
                 ));
                 state.job_definitions.insert(
                     db_job.id,
@@ -714,7 +736,7 @@ impl Scheduler {
         state
             .assigned_jobs
             .iter()
-            .map(|(job_id, (runner_id, run_id))| (*job_id, *runner_id, *run_id))
+            .map(|(job_id, (runner_id, run_id, _repo_id))| (*job_id, *runner_id, *run_id))
             .collect()
     }
 
@@ -726,7 +748,7 @@ impl Scheduler {
         state
             .assigned_jobs
             .iter()
-            .filter_map(|(job_id, (runner_id, run_id))| {
+            .filter_map(|(job_id, (runner_id, run_id, _repo_id))| {
                 state
                     .job_definitions
                     .get(job_id)
@@ -762,7 +784,10 @@ impl Scheduler {
     ) -> anyhow::Result<()> {
         {
             let state = self.state.read().await;
-            let assigned_runner = state.assigned_jobs.get(&job_id).map(|(runner, _)| *runner);
+            let assigned_runner = state
+                .assigned_jobs
+                .get(&job_id)
+                .map(|(runner, _, _)| *runner);
             if assigned_runner != Some(runner_id)
                 || state.job_leases.get(&job_id).map(String::as_str) != Some(lease_token)
             {
@@ -796,7 +821,10 @@ impl Scheduler {
     ) -> anyhow::Result<()> {
         {
             let state = self.state.read().await;
-            let assigned_runner = state.assigned_jobs.get(&job_id).map(|(runner, _)| *runner);
+            let assigned_runner = state
+                .assigned_jobs
+                .get(&job_id)
+                .map(|(runner, _, _)| *runner);
             if assigned_runner != Some(runner_id)
                 || state.job_leases.get(&job_id).map(String::as_str) != Some(lease_token)
             {
@@ -900,7 +928,7 @@ impl Scheduler {
         state.job_assignments.remove(&job_id);
         state.assigned_jobs.remove(&job_id);
         state.job_leases.remove(&job_id);
-        if let Some((runner_id, pipeline_run_id)) = assignment {
+        if let Some((runner_id, pipeline_run_id, _repo_id)) = assignment {
             let _ = self.event_tx.send(SchedulerEvent::JobCompleted {
                 job_id,
                 pipeline_run_id,
@@ -1169,11 +1197,12 @@ mod tests {
         runner.last_heartbeat = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
         scheduler.register_runner(runner).await;
         let job_id = JobId::new();
+        let repo_id = RepoId::new();
         scheduler
             .enqueue_with_definition(
                 job_id,
                 PipelineRunId::new(),
-                RepoId::new(),
+                repo_id,
                 vec!["cargo test".to_string()],
                 None,
             )
@@ -1188,6 +1217,7 @@ mod tests {
         let state = scheduler.state.read().await;
         assert_eq!(state.runners[&runner_id].status, "offline");
         assert!(!state.job_leases.contains_key(&job_id));
+        assert_eq!(state.queue.all()[0].repo_id, repo_id);
     }
 
     #[tokio::test]
