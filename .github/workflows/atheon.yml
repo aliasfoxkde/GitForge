@@ -35,11 +35,22 @@ jobs:
 
       - name: Run Atheon Security Scan (secrets + PII + security)
         run: |
-          atheon --sarif --categories=secrets,pii ./ > results.sarif
+          set +e
+          atheon --sarif --categories=secrets,pii ./ > results.raw.sarif
+          scan_status=$?
+          set -e
+          jq 'walk(if type == "object" then del(.kind, .relationships) else . end)' \
+            results.raw.sarif > results.sarif
+          exit "$scan_status"
 
       - name: Run Atheon Quality Scan
+        if: always()
         run: |
-          atheon --sarif --categories=ai-detection,quality ./ > quality-results.sarif || true
+          set +e
+          atheon --sarif --categories=ai-detection,quality ./ > quality.raw.sarif
+          set -e
+          jq 'walk(if type == "object" then del(.kind, .relationships) else . end)' \
+            quality.raw.sarif > quality-results.sarif
 
       - name: Upload SARIF results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
