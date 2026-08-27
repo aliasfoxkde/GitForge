@@ -36,7 +36,7 @@ jobs:
       - name: Run Atheon Security Scan (secrets)
         run: |
           set +e
-          atheon --sarif --no-follow-symlinks --categories=secrets ./ > results.raw.sarif
+          atheon --sarif --categories=secrets ./ --no-follow-symlinks > results.raw.sarif
           scan_status=$?
           set -e
           jq 'walk(if type == "object" then del(.kind, .relationships, .shortDescription) else . end)' \
@@ -47,7 +47,7 @@ jobs:
         if: always()
         run: |
           set +e
-          atheon --sarif --no-follow-symlinks --categories=ai-detection,quality ./ > quality.raw.sarif
+          atheon --sarif --categories=ai-detection,quality ./ --no-follow-symlinks > quality.raw.sarif
           set -e
           jq 'walk(if type == "object" then del(.kind, .relationships, .shortDescription) else . end)' \
             quality.raw.sarif > quality-results.sarif
