@@ -75,7 +75,7 @@ body:
       label: Known false positives (examples that should NOT match)
       description: Known strings that trigger this pattern but are not secrets
       placeholder: |
-        - Test fixtures with AKIA prefix
+        - Test fixtures containing credential-shaped placeholders
         - Example keys in documentation
     validations:
       required: false

@@ -85,7 +85,7 @@ runner-2:
 For production, use PostgreSQL:
 ```toml
 [database]
-url = "postgres://gitforge:password@postgres:5432/gitforge"
+url = "postgres://gitforge:${POSTGRES_PASSWORD}@postgres:5432/gitforge"
 ```
 
 ## Monitoring

@@ -39,7 +39,7 @@ sleep 2
 echo "Starting API service..."
 cd "$INSTALL_DIR"
 DATABASE_URL="sqlite:///nas/Temp/repos/GitForge/data/gitforge.db?mode=rwc" \
-JWT_SECRET="dev-secret-change-in-prod-min-32-chars!!" \
+JWT_SECRET="${JWT_SECRET:?set JWT_SECRET before starting the API}" \
 RUST_LOG=info \
 ./target/release/api > "$LOGS_DIR/api.log" 2>&1 &
 API_PID=$!

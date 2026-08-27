@@ -69,7 +69,7 @@ setup:
 # ─── Run Services ─────────────────────────────────────────────────────────────
 run-api:
 	DATABASE_URL="sqlite:///nas/Temp/repos/GitForge/data/gitforge.db?mode=rwc" \
-	JWT_SECRET="dev-secret" \
+	JWT_SECRET="$${JWT_SECRET:?set JWT_SECRET before starting the API}" \
 	RUST_LOG=info \
 	./target/release/api
 

@@ -21,7 +21,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("port", 8080)
 	v.SetDefault("env", "development")
 	v.SetDefault("log_level", "info")
-	v.SetDefault("db_url", "postgres://postgres:password@localhost:5432/apidb?sslmode=disable")
+	v.SetDefault("db_url", "postgres://postgres:${POSTGRES_PASSWORD}@localhost:5432/apidb?sslmode=disable")
 }
 
 // Load reads configuration from file and environment variables.

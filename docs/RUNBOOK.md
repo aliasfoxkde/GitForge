@@ -45,7 +45,7 @@ The API gateway exposes the REST API for frontend integration.
 cargo run -p api
 
 # Production
-JWT_SECRET=your-secret ./target/release/api --host 0.0.0.0 --port 8080
+JWT_SECRET="${JWT_SECRET:?set JWT_SECRET}" ./target/release/api --host 0.0.0.0 --port 8080
 ```
 
 **Environment Variables:**
@@ -179,7 +179,7 @@ SQLite doesn't support concurrent writes. For multi-runner setups, use PostgreSQ
 
 ```toml
 [database]
-url = "postgres://gitforge:password@localhost:5432/gitforge"
+url = "postgres://gitforge:${POSTGRES_PASSWORD}@localhost:5432/gitforge"
 ```
 
 ## Development
@@ -221,7 +221,7 @@ port = 8080
 url = "sqlite:/data/gitforge.db"
 
 [auth]
-jwt_secret = "your-secret-here"
+jwt_secret = ""
 
 [runner]
 scheduler_url = "http://scheduler:8081"
