@@ -76,6 +76,10 @@ jobs:
   build:
     name: Build
     runs-on: ${{ matrix.os }}
+    # Cross-target builds are expected to complete in under 20 minutes; bound
+    # stalled runners so a provider/runner failure cannot remain in progress
+    # indefinitely.
+    timeout-minutes: 20
     strategy:
       matrix:
         include:
