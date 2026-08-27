@@ -2,17 +2,17 @@
 //!
 //! Local-first Git platform client for GitForge.
 
+use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
-use anyhow::Result;
 use std::path::PathBuf;
 
-mod config;
 mod client;
+mod config;
 mod sync;
 
-pub use config::Config;
 pub use client::GitForgeClient;
+pub use config::Config;
 
 #[derive(Parser, Debug)]
 #[command(name = "gitforge")]
@@ -92,7 +92,11 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
     let server = cli.server.unwrap_or_else(|| config.server_url.clone());
 
     match &cli.command {
-        Commands::Auth { login, logout, status } => {
+        Commands::Auth {
+            login,
+            logout,
+            status,
+        } => {
             if let Some(username) = login {
                 tracing::info!("Logging in as {} to {}", username, server);
                 println!("Login successful! (API not yet implemented)");
@@ -106,7 +110,12 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Commands::Repo { list, create, info, delete } => {
+        Commands::Repo {
+            list,
+            create,
+            info,
+            delete,
+        } => {
             if *list {
                 println!("Repositories:\n  (API not yet wired)");
             } else if let Some(name) = create {
@@ -119,7 +128,12 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("Repository '{}' deleted (API not yet wired)", name);
             }
         }
-        Commands::Pipeline { list, show, run, watch } => {
+        Commands::Pipeline {
+            list,
+            show,
+            run,
+            watch,
+        } => {
             if *list {
                 println!("Pipelines:\n  (API not yet wired)");
             } else if let Some(id) = show {
@@ -130,17 +144,30 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("Watching pipeline {} (not yet implemented)", id);
             }
         }
-        Commands::Runner { list, info, register, capacity } => {
+        Commands::Runner {
+            list,
+            info,
+            register,
+            capacity,
+        } => {
             if *list {
                 println!("Runners:\n  (API not yet wired)");
             } else if let Some(id) = info {
                 println!("Runner {} (API not yet wired)", id);
             } else if let Some(name) = register {
                 let cap = capacity.unwrap_or(2);
-                println!("Runner '{}' registered with capacity {} (API not yet wired)", name, cap);
+                println!(
+                    "Runner '{}' registered with capacity {} (API not yet wired)",
+                    name, cap
+                );
             }
         }
-        Commands::Sync { status, push, pull, init } => {
+        Commands::Sync {
+            status,
+            push,
+            pull,
+            init,
+        } => {
             let local_dir = config.local_data_dir.clone();
             let sync_client = sync::SyncClient::with_real_client(local_dir.clone());
 
@@ -210,8 +237,11 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(if cli.verbose { tracing::Level::DEBUG.into() } else { tracing::Level::INFO.into() })
+            tracing_subscriber::EnvFilter::from_default_env().add_directive(if cli.verbose {
+                tracing::Level::DEBUG.into()
+            } else {
+                tracing::Level::INFO.into()
+            }),
         )
         .init();
 
@@ -424,7 +454,11 @@ mod tests {
     #[tokio::test]
     async fn test_run_cli_sync_init_creates_directory() {
         let temp_dir = std::env::temp_dir();
-        let test_dir = temp_dir.join("gitforge-test-init").to_str().unwrap().to_string();
+        let test_dir = temp_dir
+            .join("gitforge-test-init")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         // Clean up if exists
         let _ = std::fs::remove_dir_all(&test_dir);
@@ -448,7 +482,11 @@ mod tests {
     #[tokio::test]
     async fn test_run_cli_sync_init_fails_if_exists() {
         let temp_dir = std::env::temp_dir();
-        let test_dir = temp_dir.join("gitforge-test-init-exists").to_str().unwrap().to_string();
+        let test_dir = temp_dir
+            .join("gitforge-test-init-exists")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         // Create directory first
         std::fs::create_dir_all(&test_dir).unwrap();
@@ -490,4 +528,3 @@ mod tests {
         assert!(result.is_ok()); // Just prints message, doesn't fail
     }
 }
-

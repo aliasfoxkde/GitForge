@@ -3,13 +3,12 @@
 use crate::limits::SandboxLimits;
 use async_trait::async_trait;
 use bollard::container::{
-    Config, CreateContainerOptions, LogOutput, RemoveContainerOptions,
-    StartContainerOptions,
+    Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StartContainerOptions,
 };
-use bollard::image::CreateImageOptions;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
-use bollard::Docker;
+use bollard::image::CreateImageOptions;
 use bollard::models::HostConfig;
+use bollard::Docker;
 use futures_util::StreamExt;
 use gitforce_common::{Error, JobId, Result};
 
@@ -110,7 +109,12 @@ impl DockerSandbox {
 #[async_trait]
 pub trait Sandbox: Send + Sync {
     /// Create a new sandbox instance
-    async fn create(&self, job_id: JobId, image: &str, limits: SandboxLimits) -> Result<SandboxInstance>;
+    async fn create(
+        &self,
+        job_id: JobId,
+        image: &str,
+        limits: SandboxLimits,
+    ) -> Result<SandboxInstance>;
 
     /// Execute a command in the sandbox
     async fn execute(&self, instance: &SandboxInstance, command: &[&str]) -> Result<StepResult>;
@@ -121,7 +125,12 @@ pub trait Sandbox: Send + Sync {
 
 #[async_trait]
 impl Sandbox for DockerSandbox {
-    async fn create(&self, job_id: JobId, image: &str, limits: SandboxLimits) -> Result<SandboxInstance> {
+    async fn create(
+        &self,
+        job_id: JobId,
+        image: &str,
+        limits: SandboxLimits,
+    ) -> Result<SandboxInstance> {
         if let Some(ref docker) = self.docker {
             // Ensure image is available
             self.ensure_image(image).await?;
@@ -133,7 +142,11 @@ impl Sandbox for DockerSandbox {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
                 cpu_period: Some(100000), // 100ms in microseconds
                 cpu_quota: Some((limits.cpu_ms * 1000) as i64), // Convert ms to microseconds
-                network_mode: if limits.network { None } else { Some("none".to_string()) },
+                network_mode: if limits.network {
+                    None
+                } else {
+                    Some("none".to_string())
+                },
                 ..Default::default()
             };
 
@@ -150,11 +163,15 @@ impl Sandbox for DockerSandbox {
                 platform: None,
             };
 
-            let response = docker.create_container(Some(options), config).await
+            let response = docker
+                .create_container(Some(options), config)
+                .await
                 .map_err(|e| Error::sandbox(format!("failed to create container: {}", e)))?;
 
             // Start container
-            docker.start_container(&response.id, None::<StartContainerOptions<String>>).await
+            docker
+                .start_container(&response.id, None::<StartContainerOptions<String>>)
+                .await
                 .map_err(|e| Error::sandbox(format!("failed to start container: {}", e)))?;
 
             tracing::info!("Created container {} for job {}", response.id, job_id);
@@ -182,11 +199,15 @@ impl Sandbox for DockerSandbox {
                 ..Default::default()
             };
 
-            let exec = docker.create_exec(&instance.container_id, config).await
+            let exec = docker
+                .create_exec(&instance.container_id, config)
+                .await
                 .map_err(|e| Error::sandbox(format!("failed to create exec: {}", e)))?;
 
             // Start exec and get results
-            let result = docker.start_exec(&exec.id, None::<StartExecOptions>).await
+            let result = docker
+                .start_exec(&exec.id, None::<StartExecOptions>)
+                .await
                 .map_err(|e| Error::sandbox(format!("failed to start exec: {}", e)))?;
 
             let mut stdout = String::new();
@@ -244,10 +265,16 @@ impl Sandbox for DockerSandbox {
                 ..Default::default()
             };
 
-            docker.remove_container(&instance.container_id, Some(options)).await
+            docker
+                .remove_container(&instance.container_id, Some(options))
+                .await
                 .map_err(|e| Error::sandbox(format!("failed to remove container: {}", e)))?;
 
-            tracing::info!("Destroyed container {} for job {}", instance.container_id, instance.job_id);
+            tracing::info!(
+                "Destroyed container {} for job {}",
+                instance.container_id,
+                instance.job_id
+            );
         }
         Ok(())
     }
@@ -278,7 +305,9 @@ mod tests {
 
         // Test with real Docker
         let job_id = JobId::new();
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await;
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await;
 
         // If Docker has issues, we fall back to stub mode
         if instance.is_err() {
@@ -306,7 +335,9 @@ mod tests {
         }
 
         let job_id = JobId::new();
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await;
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await;
         if instance.is_err() {
             return;
         }
@@ -330,13 +361,17 @@ mod tests {
         }
 
         let job_id = JobId::new();
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await;
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await;
         if instance.is_err() {
             return;
         }
         let instance = instance.unwrap();
 
-        let result = sandbox.execute(&instance, &["sh", "-c", "echo line1"]).await;
+        let result = sandbox
+            .execute(&instance, &["sh", "-c", "echo line1"])
+            .await;
         if result.is_ok() {
             assert_eq!(result.unwrap().exit_code, 0);
         }
@@ -353,11 +388,17 @@ mod tests {
         let job_id = JobId::new();
 
         // Create container (will use stub)
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
         assert!(!instance.container_id.is_empty());
 
         // Execute command (will use stub)
-        let result = sandbox.execute(&instance, &["echo", "hello"]).await.unwrap();
+        let result = sandbox
+            .execute(&instance, &["echo", "hello"])
+            .await
+            .unwrap();
         assert_eq!(result.exit_code, 0);
 
         // Destroy container (will use stub)
@@ -397,10 +438,16 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
 
         // Test with shell command
-        let result = sandbox.execute(&instance, &["sh", "-c", "echo hello && echo world"]).await.unwrap();
+        let result = sandbox
+            .execute(&instance, &["sh", "-c", "echo hello && echo world"])
+            .await
+            .unwrap();
         assert_eq!(result.exit_code, 0);
 
         sandbox.destroy(instance).await.unwrap();
@@ -411,10 +458,16 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
 
         // Multiple commands in one execution
-        let result = sandbox.execute(&instance, &["echo", "line1"]).await.unwrap();
+        let result = sandbox
+            .execute(&instance, &["echo", "line1"])
+            .await
+            .unwrap();
         assert_eq!(result.exit_code, 0);
 
         sandbox.destroy(instance).await.unwrap();
@@ -435,7 +488,10 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
         assert_eq!(instance.job_id, job_id);
 
         sandbox.destroy(instance).await.unwrap();
@@ -446,7 +502,10 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
 
         // Empty command should still work in stub mode
         let result = sandbox.execute(&instance, &[]).await.unwrap();
@@ -460,7 +519,10 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "rust:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "rust:latest", SandboxLimits::default())
+            .await
+            .unwrap();
 
         let result = sandbox.execute(&instance, &["true"]).await.unwrap();
         assert_eq!(result.exit_code, 0);
@@ -473,7 +535,10 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
 
         let result = sandbox.execute(&instance, &["false"]).await.unwrap();
         // Stub mode always returns 0, even for false command
@@ -491,9 +556,18 @@ mod tests {
         let job2 = JobId::new();
         let job3 = JobId::new();
 
-        let instance1 = sandbox.create(job1, "alpine:latest", SandboxLimits::default()).await.unwrap();
-        let instance2 = sandbox.create(job2, "ubuntu:latest", SandboxLimits::default()).await.unwrap();
-        let instance3 = sandbox.create(job3, "rust:latest", SandboxLimits::default()).await.unwrap();
+        let instance1 = sandbox
+            .create(job1, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
+        let instance2 = sandbox
+            .create(job2, "ubuntu:latest", SandboxLimits::default())
+            .await
+            .unwrap();
+        let instance3 = sandbox
+            .create(job3, "rust:latest", SandboxLimits::default())
+            .await
+            .unwrap();
 
         // Each should have unique container ID
         assert_ne!(instance1.container_id, instance2.container_id);
@@ -509,7 +583,10 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
 
         // Destroy twice should both succeed (idempotent in stub mode)
         sandbox.destroy(instance.clone()).await.unwrap();
@@ -522,7 +599,14 @@ mod tests {
         let job_id = JobId::new();
 
         // Very long image name
-        let instance = sandbox.create(job_id, "registry.example.com/verylongnamed repository/imagename:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(
+                job_id,
+                "registry.example.com/verylongnamed repository/imagename:latest",
+                SandboxLimits::default(),
+            )
+            .await
+            .unwrap();
         assert!(!instance.container_id.is_empty());
 
         sandbox.destroy(instance).await.unwrap();
@@ -595,10 +679,16 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
 
         // Test with special characters in command
-        let result = sandbox.execute(&instance, &["sh", "-c", "echo $'hello\nworld'"]).await.unwrap();
+        let result = sandbox
+            .execute(&instance, &["sh", "-c", "echo $'hello\nworld'"])
+            .await
+            .unwrap();
         assert_eq!(result.exit_code, 0);
 
         sandbox.destroy(instance).await.unwrap();
@@ -609,10 +699,16 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
 
         // Test with unicode
-        let result = sandbox.execute(&instance, &["echo", "hello world"]).await.unwrap();
+        let result = sandbox
+            .execute(&instance, &["echo", "hello world"])
+            .await
+            .unwrap();
         assert_eq!(result.exit_code, 0);
 
         sandbox.destroy(instance).await.unwrap();
@@ -623,7 +719,10 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
 
         // Test 'true' command (exit 0)
         let result = sandbox.execute(&instance, &["true"]).await.unwrap();
@@ -637,7 +736,10 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
 
         // Container ID should start with expected prefix
         assert!(instance.container_id.starts_with("gitforce-job-"));
@@ -651,7 +753,10 @@ mod tests {
         let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits::default()).await.unwrap();
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
         assert!(!instance.container_id.is_empty());
 
         sandbox.destroy(instance).await.unwrap();
@@ -665,10 +770,17 @@ mod tests {
         });
         let job_id = JobId::new();
 
-        let instance = sandbox.create(job_id, "alpine:latest", SandboxLimits {
-            network: false,
-            ..Default::default()
-        }).await.unwrap();
+        let instance = sandbox
+            .create(
+                job_id,
+                "alpine:latest",
+                SandboxLimits {
+                    network: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert!(!instance.container_id.is_empty());
 
         sandbox.destroy(instance).await.unwrap();

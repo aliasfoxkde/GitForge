@@ -256,7 +256,8 @@ jobs:
             RepoId::new(),
             "abc123".to_string(),
             TriggerType::Push,
-        ).with_ref("refs/heads/main".to_string());
+        )
+        .with_ref("refs/heads/main".to_string());
 
         assert_eq!(event.ref_name, Some("refs/heads/main".to_string()));
     }
@@ -269,7 +270,8 @@ jobs:
             RepoId::new(),
             "abc123".to_string(),
             TriggerType::Push,
-        ).with_actor(user_id);
+        )
+        .with_actor(user_id);
 
         assert_eq!(event.actor_id, Some(user_id));
     }

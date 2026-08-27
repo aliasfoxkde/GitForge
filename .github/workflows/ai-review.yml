@@ -14,7 +14,7 @@ jobs:
   claude-review:
     name: AI Code Review
     runs-on: ubuntu-latest
-    if: env.ENABLE_AI_REVIEW == 'true'
+    if: vars.ENABLE_AI_REVIEW == 'true'
     permissions:
       pull-requests: write
       contents: read
@@ -45,7 +45,7 @@ jobs:
   disabled:
     name: AI Review
     runs-on: ubuntu-latest
-    if: env.ENABLE_AI_REVIEW != 'true'
+    if: vars.ENABLE_AI_REVIEW != 'true'
     steps:
       - name: AI Review is disabled
         run: |

@@ -15,15 +15,24 @@ pub struct ToolCall {
 
 impl ToolCall {
     fn arg_bool(&self, name: &str) -> bool {
-        self.arguments.get(name).and_then(|v| v.as_bool()).unwrap_or(false)
+        self.arguments
+            .get(name)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 
     fn arg_str(&self, name: &str) -> Option<String> {
-        self.arguments.get(name).and_then(|v| v.as_str()).map(String::from)
+        self.arguments
+            .get(name)
+            .and_then(|v| v.as_str())
+            .map(String::from)
     }
 
     fn arg_usize(&self, name: &str) -> Option<usize> {
-        self.arguments.get(name).and_then(|v| v.as_u64()).map(|v| v as usize)
+        self.arguments
+            .get(name)
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
     }
 }
 
@@ -50,17 +59,12 @@ impl McPHandler {
     // ─── CI Run ────────────────────────────────────────────────────────────
 
     fn ci_run(&self, call: ToolCall) -> ToolResult {
-        let repo = call
-            .arg_str("repo")
-            .unwrap_or_else(|| Self::infer_repo());
-        let branch = call
-            .arg_str("branch")
-            .unwrap_or_else(|| Self::current_branch());
+        let repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
+        let branch = call.arg_str("branch").unwrap_or_else(Self::current_branch);
         let delta = call.arg_bool("delta");
         let scope_override = call.arg_str("scope");
         let workflows = call.arg_str("workflows").unwrap_or_default();
 
-        let rt = Runtime::new().expect("failed to create tokio runtime");
         let scope_str = if delta {
             let delta_result = self.delta_plan(call.clone());
             scope_override
@@ -94,19 +98,14 @@ impl McPHandler {
     }
 
     fn ci_status(&self, call: ToolCall) -> ToolResult {
-        let repo = call
-            .arg_str("repo")
-            .unwrap_or_else(|| Self::infer_repo());
+        let repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
         let run_id = call.arg_str("run_id");
         let branch = call.arg_str("branch");
 
         let status = if let Some(id) = run_id {
             Self::gh_run_status(&repo, &id)
         } else {
-            Self::gh_latest_run_status(
-                &repo,
-                branch.as_deref().unwrap_or("HEAD"),
-            )
+            Self::gh_latest_run_status(&repo, branch.as_deref().unwrap_or("HEAD"))
         };
 
         match status {
@@ -116,9 +115,7 @@ impl McPHandler {
     }
 
     fn ci_cancel(&self, call: ToolCall) -> ToolResult {
-        let repo = call
-            .arg_str("repo")
-            .unwrap_or_else(|| Self::infer_repo());
+        let repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
         let run_id = match call.arg_str("run_id") {
             Some(id) => id,
             None => return ToolResult::err("run_id is required"),
@@ -143,15 +140,13 @@ impl McPHandler {
     // ─── Delta Plan ───────────────────────────────────────────────────────
 
     fn delta_plan(&self, call: ToolCall) -> ToolResult {
-        let repo_root = call
-            .arg_str("repo_root")
-            .unwrap_or_else(|| ".".to_string());
+        let repo_root = call.arg_str("repo_root").unwrap_or_else(|| ".".to_string());
         let base_ref = call
             .arg_str("base_ref")
             .unwrap_or_else(|| "HEAD~1".to_string());
+        let rt = Runtime::new().expect("failed to create tokio runtime");
 
         let analyzer = DeltaAnalyzer::new(&repo_root, &base_ref);
-        let rt = Runtime::new().expect("failed to create tokio runtime");
         let plan = match rt.block_on(analyzer.analyze()) {
             Ok(p) => p,
             Err(e) => return ToolResult::err(format!("Delta analysis failed: {}", e)),
@@ -274,7 +269,7 @@ impl McPHandler {
     }
 
     fn get_repo_config(&self, call: ToolCall) -> ToolResult {
-        let _repo = call.arg_str("repo").unwrap_or_else(|| Self::infer_repo());
+        let _repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
 
         let config = RepoConfig {
             default_branch: "main".to_string(),
@@ -298,25 +293,19 @@ impl McPHandler {
     }
 
     fn pr_create(&self, call: ToolCall) -> ToolResult {
-        let repo = call
-            .arg_str("repo")
-            .unwrap_or_else(|| Self::infer_repo());
+        let repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
         let title = match call.arg_str("title") {
             Some(t) => t,
             None => return ToolResult::err("title is required"),
         };
         let body = call.arg_str("body").unwrap_or_default();
-        let head = call.arg_str("head").unwrap_or_else(|| Self::current_branch());
+        let head = call.arg_str("head").unwrap_or_else(Self::current_branch);
         let base = call.arg_str("base").unwrap_or_else(|| "main".to_string());
 
         let output = Command::new("gh")
             .args([
-                "pr", "create",
-                "--repo", &repo,
-                "--title", &title,
-                "--body", &body,
-                "--head", &head,
-                "--base", &base,
+                "pr", "create", "--repo", &repo, "--title", &title, "--body", &body, "--head",
+                &head, "--base", &base,
             ])
             .output();
 
@@ -337,21 +326,24 @@ impl McPHandler {
     }
 
     fn pr_merge(&self, call: ToolCall) -> ToolResult {
-        let repo = call
-            .arg_str("repo")
-            .unwrap_or_else(|| Self::infer_repo());
+        let repo = call.arg_str("repo").unwrap_or_else(Self::infer_repo);
         let pr_number: u64 = match call.arg_usize("pr_number") {
             Some(n) => n as u64,
             None => return ToolResult::err("pr_number is required"),
         };
-        let method = call.arg_str("method").unwrap_or_else(|| "squash".to_string());
+        let method = call
+            .arg_str("method")
+            .unwrap_or_else(|| "squash".to_string());
 
         let output = Command::new("gh")
             .args([
-                "pr", "merge",
-                "--repo", &repo,
+                "pr",
+                "merge",
+                "--repo",
+                &repo,
                 &pr_number.to_string(),
-                "--admin", "--squash",
+                "--admin",
+                "--squash",
             ])
             .output();
 
@@ -398,7 +390,12 @@ impl McPHandler {
     fn gh_run_status(repo: &str, run_id: &str) -> Result<CiStatus, String> {
         let output = Command::new("gh")
             .args([
-                "run", "view", run_id, "--repo", repo, "--json",
+                "run",
+                "view",
+                run_id,
+                "--repo",
+                repo,
+                "--json",
                 "id,status,conclusion,headBranch,headSha,runNumber,createdAt,url",
             ])
             .output()
@@ -420,7 +417,10 @@ impl McPHandler {
             branch: json["headBranch"].as_str().unwrap_or("").to_string(),
             commit: json["headSha"].as_str().unwrap_or("").to_string(),
             status: json["status"].as_str().unwrap_or("").to_string(),
-            conclusion: json.get("conclusion").and_then(|v| v.as_str()).map(String::from),
+            conclusion: json
+                .get("conclusion")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             jobs: vec![],
             triggered_by: "cli".to_string(),
             run_at: json["createdAt"].as_str().unwrap_or("").to_string(),
@@ -431,9 +431,16 @@ impl McPHandler {
     fn gh_latest_run_status(repo: &str, branch: &str) -> Result<CiStatus, String> {
         let output = Command::new("gh")
             .args([
-                "run", "list", "--repo", repo, "--branch", branch,
-                "--json", "id,status,conclusion,headBranch,headSha,runNumber,createdAt,url",
-                "--limit", "1",
+                "run",
+                "list",
+                "--repo",
+                repo,
+                "--branch",
+                branch,
+                "--json",
+                "id,status,conclusion,headBranch,headSha,runNumber,createdAt,url",
+                "--limit",
+                "1",
             ])
             .output()
             .map_err(|e| format!("gh error: {}", e))?;
@@ -456,7 +463,10 @@ impl McPHandler {
             branch: run["headBranch"].as_str().unwrap_or("").to_string(),
             commit: run["headSha"].as_str().unwrap_or("").to_string(),
             status: run["status"].as_str().unwrap_or("").to_string(),
-            conclusion: run.get("conclusion").and_then(|v| v.as_str()).map(String::from),
+            conclusion: run
+                .get("conclusion")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             jobs: vec![],
             triggered_by: "cli".to_string(),
             run_at: run["createdAt"].as_str().unwrap_or("").to_string(),

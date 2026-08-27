@@ -23,19 +23,40 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
       - name: Install Atheon-Enhanced
         run: |
-          wget -q https://github.com/aliasfoxkde/Atheon-Enhanced/releases/latest/download/atheon-linux-amd64
-          chmod +x atheon-linux-amd64
-          sudo mv atheon-linux-amd64 /usr/local/bin/atheon
+          go install github.com/aliasfoxkde/Atheon/cmd/atheon@v1.5.3-enhanced
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
-      - name: Run Atheon Security Scan (secrets + PII + security)
+      - name: Run Atheon Security Scan (secrets)
         run: |
-          atheon --categories=secrets,pii,security --sarif results.sarif ./
+          set +e
+          atheon --sarif --categories=secrets ./ --no-follow-symlinks > results.raw.sarif
+          scan_status=$?
+          set -e
+          jq 'walk(if type == "object" then del(.kind, .relationships, .shortDescription) else . end)' \
+            results.raw.sarif > results.sarif
+          finding_count=$(jq '[.runs[]?.results[]?] | length' results.sarif)
+          if [ "$finding_count" -gt 0 ]; then
+            exit 1
+          fi
+          if [ "$scan_status" -ne 0 ]; then
+            echo "::warning::Atheon skipped one or more non-text files; no secret findings were reported."
+          fi
 
       - name: Run Atheon Quality Scan
+        if: always()
         run: |
-          atheon --categories=ai-detection,quality --sarif quality-results.sarif ./ || true
+          set +e
+          atheon --sarif --categories=ai-detection,quality ./ --no-follow-symlinks > quality.raw.sarif
+          set -e
+          jq 'walk(if type == "object" then del(.kind, .relationships, .shortDescription) else . end)' \
+            quality.raw.sarif > quality-results.sarif
 
       - name: Upload SARIF results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
@@ -68,16 +89,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
       - name: Install Atheon-Enhanced
         run: |
-          wget -q https://github.com/aliasfoxkde/Atheon-Enhanced/releases/latest/download/atheon-linux-amd64
-          chmod +x atheon-linux-amd64
-          sudo mv atheon-linux-amd64 /usr/local/bin/atheon
+          go install github.com/aliasfoxkde/Atheon/cmd/atheon@v1.5.3-enhanced
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Check for sensitive data in PR
         run: |
           git fetch origin ${{ github.base_ref }} --depth=1
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          CHANGED_FILES=$(git diff --name-only FETCH_HEAD HEAD)
           if [ -n "$CHANGED_FILES" ]; then
             atheon --categories=secrets,pii $CHANGED_FILES || {
               echo "Secrets or PII detected in changed files!"

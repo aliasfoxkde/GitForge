@@ -46,9 +46,9 @@ impl FileStorageBackend {
 
     /// Ensure the root directory exists
     pub async fn ensure_root(&self) -> Result<()> {
-        tokio::fs::create_dir_all(&self.root).await.map_err(|e| {
-            Error::storage(format!("failed to create storage root: {}", e))
-        })?;
+        tokio::fs::create_dir_all(&self.root)
+            .await
+            .map_err(|e| Error::storage(format!("failed to create storage root: {}", e)))?;
         Ok(())
     }
 }
@@ -68,9 +68,9 @@ impl StorageBackend for FileStorageBackend {
         let path = self.repo_path(repo_id);
 
         // Create repository directory
-        tokio::fs::create_dir_all(&path).await.map_err(|e| {
-            Error::storage(format!("failed to create repo directory: {}", e))
-        })?;
+        tokio::fs::create_dir_all(&path)
+            .await
+            .map_err(|e| Error::storage(format!("failed to create repo directory: {}", e)))?;
 
         // Initialize bare git repository
         self.init_bare(&path).await?;
@@ -83,9 +83,9 @@ impl StorageBackend for FileStorageBackend {
         let path = self.repo_path(repo_id);
 
         if path.exists() {
-            tokio::fs::remove_dir_all(&path).await.map_err(|e| {
-                Error::storage(format!("failed to delete repository: {}", e))
-            })?;
+            tokio::fs::remove_dir_all(&path)
+                .await
+                .map_err(|e| Error::storage(format!("failed to delete repository: {}", e)))?;
             tracing::info!("deleted repository at {:?}", path);
         }
 
@@ -94,14 +94,13 @@ impl StorageBackend for FileStorageBackend {
 
     async fn init_bare(&self, path: &Path) -> Result<()> {
         // Use git2 to create a bare repository
-        let repo = git2::Repository::init_bare(path).map_err(|e| {
-            Error::git(format!("failed to initialize bare repository: {}", e))
-        })?;
+        let repo = git2::Repository::init_bare(path)
+            .map_err(|e| Error::git(format!("failed to initialize bare repository: {}", e)))?;
 
         // Configure repository for optimal git server usage
-        let mut config = repo.config().map_err(|e| {
-            Error::git(format!("failed to get repository config: {}", e))
-        })?;
+        let mut config = repo
+            .config()
+            .map_err(|e| Error::git(format!("failed to get repository config: {}", e)))?;
 
         // Disable garbage collection for server-side repos
         config.set_bool("gc.autodetach", false).ok();
@@ -114,9 +113,8 @@ impl StorageBackend for FileStorageBackend {
     async fn open(&self, repo_id: RepoId) -> Result<git2::Repository> {
         let path = self.repo_path(repo_id);
 
-        let repo = git2::Repository::open(&path).map_err(|e| {
-            Error::git(format!("failed to open repository at {:?}: {}", path, e))
-        })?;
+        let repo = git2::Repository::open(&path)
+            .map_err(|e| Error::git(format!("failed to open repository: {}", e)))?;
 
         Ok(repo)
     }

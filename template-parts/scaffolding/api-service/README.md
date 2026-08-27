@@ -52,7 +52,7 @@ make docker-build
 | `APP_PORT`    | `8080`                                                     | Port to listen on         |
 | `APP_ENV`     | `development`                                              | `development` or `production` |
 | `APP_LOG_LEVEL` | `info`                                                   | Log level (debug, info, warn, error) |
-| `APP_DB_URL`  | `postgres://postgres:password@localhost:5432/apidb?sslmode=disable` | Database connection URL |
+| `APP_DB_URL`  | `postgres://postgres:${POSTGRES_PASSWORD}@localhost:5432/apidb?sslmode=disable` | Database connection URL |
 
 ## API Endpoints
 
@@ -114,7 +114,7 @@ host: "0.0.0.0"
 port: 8080
 env: "development"
 log_level: "info"
-db_url: "postgres://postgres:password@localhost:5432/apidb?sslmode=disable"
+db_url: "postgres://postgres:${POSTGRES_PASSWORD}@localhost:5432/apidb?sslmode=disable"
 ```
 
 ## Docker

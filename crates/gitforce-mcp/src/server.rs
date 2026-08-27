@@ -72,56 +72,69 @@ impl McpServer {
                 }),
             ),
 
-            "tools/list" => JsonRpcResponse::ok(req.id.clone(), serde_json::json!({
-                "tools": [
-                    {"name": "ci_run", "description": "Trigger a CI run with optional delta analysis",
-                     "inputSchema": {"type": "object", "properties": {
-                        "repo": {"type": "string"}, "branch": {"type": "string"},
-                        "delta": {"type": "boolean", "default": true},
-                        "scope": {"type": "string", "enum": ["trivial","fast","standard","full","heavy"]},
-                        "workflows": {"type": "string"}
-                     }}},
-                    {"name": "ci_status", "description": "Get CI run status",
-                     "inputSchema": {"type": "object", "properties": {
-                        "repo": {"type": "string"}, "run_id": {"type": "string"}, "branch": {"type": "string"}
-                     }}},
-                    {"name": "ci_cancel", "description": "Cancel a running CI job",
-                     "inputSchema": {"type": "object", "properties": {
-                        "repo": {"type": "string"}, "run_id": {"type": "string", "description": "Run ID to cancel"}
-                     }, "required": ["run_id"]}},
-                    {"name": "delta_plan", "description": "Analyze git diff and preview what CI would run",
-                     "inputSchema": {"type": "object", "properties": {
-                        "repo_root": {"type": "string", "default": "."},
-                        "base_ref": {"type": "string", "default": "HEAD~1"}
-                     }}},
-                    {"name": "security_scan", "description": "Run Atheon security scan",
-                     "inputSchema": {"type": "object", "properties": {
-                        "path": {"type": "string", "default": "."},
-                        "categories": {"type": "string", "default": "secrets,pii,security"}
-                     }}},
-                    {"name": "list_repos", "description": "List accessible repositories",
-                     "inputSchema": {"type": "object", "properties": {}}},
-                    {"name": "get_repo_config", "description": "Get CI configuration for a repo",
-                     "inputSchema": {"type": "object", "properties": {"repo": {"type": "string"}}}},
-                    {"name": "pr_create", "description": "Create a pull request",
-                     "inputSchema": {"type": "object", "properties": {
-                        "repo": {"type": "string"}, "title": {"type": "string"},
-                        "body": {"type": "string"}, "head": {"type": "string"}, "base": {"type": "string", "default": "main"}
-                     }, "required": ["title"]}},
-                    {"name": "pr_merge", "description": "Merge a pull request",
-                     "inputSchema": {"type": "object", "properties": {
-                        "repo": {"type": "string"}, "pr_number": {"type": "number"},
-                        "method": {"type": "string", "enum": ["squash","merge","rebase"], "default": "squash"}
-                     }, "required": ["pr_number"]}}
-                ]
-            })),
+            "tools/list" => JsonRpcResponse::ok(
+                req.id.clone(),
+                serde_json::json!({
+                    "tools": [
+                        {"name": "ci_run", "description": "Trigger a CI run with optional delta analysis",
+                         "inputSchema": {"type": "object", "properties": {
+                            "repo": {"type": "string"}, "branch": {"type": "string"},
+                            "delta": {"type": "boolean", "default": true},
+                            "scope": {"type": "string", "enum": ["trivial","fast","standard","full","heavy"]},
+                            "workflows": {"type": "string"}
+                         }}},
+                        {"name": "ci_status", "description": "Get CI run status",
+                         "inputSchema": {"type": "object", "properties": {
+                            "repo": {"type": "string"}, "run_id": {"type": "string"}, "branch": {"type": "string"}
+                         }}},
+                        {"name": "ci_cancel", "description": "Cancel a running CI job",
+                         "inputSchema": {"type": "object", "properties": {
+                            "repo": {"type": "string"}, "run_id": {"type": "string", "description": "Run ID to cancel"}
+                         }, "required": ["run_id"]}},
+                        {"name": "delta_plan", "description": "Analyze git diff and preview what CI would run",
+                         "inputSchema": {"type": "object", "properties": {
+                            "repo_root": {"type": "string", "default": "."},
+                            "base_ref": {"type": "string", "default": "HEAD~1"}
+                         }}},
+                        {"name": "security_scan", "description": "Run Atheon security scan",
+                         "inputSchema": {"type": "object", "properties": {
+                            "path": {"type": "string", "default": "."},
+                            "categories": {"type": "string", "default": "secrets,pii,security"}
+                         }}},
+                        {"name": "list_repos", "description": "List accessible repositories",
+                         "inputSchema": {"type": "object", "properties": {}}},
+                        {"name": "get_repo_config", "description": "Get CI configuration for a repo",
+                         "inputSchema": {"type": "object", "properties": {"repo": {"type": "string"}}}},
+                        {"name": "pr_create", "description": "Create a pull request",
+                         "inputSchema": {"type": "object", "properties": {
+                            "repo": {"type": "string"}, "title": {"type": "string"},
+                            "body": {"type": "string"}, "head": {"type": "string"}, "base": {"type": "string", "default": "main"}
+                         }, "required": ["title"]}},
+                        {"name": "pr_merge", "description": "Merge a pull request",
+                         "inputSchema": {"type": "object", "properties": {
+                            "repo": {"type": "string"}, "pr_number": {"type": "number"},
+                            "method": {"type": "string", "enum": ["squash","merge","rebase"], "default": "squash"}
+                         }, "required": ["pr_number"]}}
+                    ]
+                }),
+            ),
 
             "tools/call" => {
-                let tool_name = req.params.get("name")
-                    .and_then(|v| v.as_str()).unwrap_or("");
-                let arguments = req.params.get("arguments")
-                    .and_then(|v| v.as_object()).cloned().unwrap_or_default();
-                let call = crate::handlers::ToolCall { name: tool_name.to_string(), arguments };
+                let tool_name = req
+                    .params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let arguments = req
+                    .params
+                    .get("arguments")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                let call = crate::handlers::ToolCall {
+                    name: tool_name.to_string(),
+                    arguments,
+                };
                 let result = handler.blocking_handle(call);
                 JsonRpcResponse::ok(req.id.clone(), result)
             }
@@ -130,9 +143,7 @@ impl McpServer {
                 JsonRpcResponse::ok(req.id, serde_json::json!({"ok": true}))
             }
 
-            _ => {
-                JsonRpcResponse::err(req.id, -32601, format!("Method not found: {}", req.method))
-            }
+            _ => JsonRpcResponse::err(req.id, -32601, format!("Method not found: {}", req.method)),
         }
     }
 }

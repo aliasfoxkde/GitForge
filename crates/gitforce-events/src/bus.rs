@@ -113,10 +113,7 @@ impl EventBus for InMemoryEventBus {
     async fn subscribe(&self, filter: EventFilter) -> Result<Box<dyn EventStream>> {
         let rx = self.sender.subscribe();
 
-        Ok(Box::new(InMemoryEventStream {
-            rx,
-            filter,
-        }))
+        Ok(Box::new(InMemoryEventStream { rx, filter }))
     }
 }
 
@@ -171,7 +168,7 @@ impl EventStream for InMemoryEventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{PushReceivedPayload, EventType, EventPayload};
+    use crate::event::{EventPayload, EventType, PushReceivedPayload};
 
     #[tokio::test]
     async fn test_publish_subscribe() {
@@ -203,9 +200,12 @@ mod tests {
         bus.publish(event.clone()).await.unwrap();
 
         // Receive should get the event
-        let received = tokio::time::timeout(std::time::Duration::from_secs(1), futures::StreamExt::next(&mut stream))
-            .await
-            .unwrap();
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            futures::StreamExt::next(&mut stream),
+        )
+        .await
+        .unwrap();
 
         assert!(received.is_some());
     }
@@ -275,7 +275,7 @@ mod tests {
                 new_hash: "def".to_string(),
                 pusher_id: None,
             }),
-            Some(repo_id),  // Pass repo_id to EventEnvelope::new
+            Some(repo_id), // Pass repo_id to EventEnvelope::new
             None,
         );
         assert!(filter.matches(&event));

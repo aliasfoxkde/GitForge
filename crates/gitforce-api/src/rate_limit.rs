@@ -101,7 +101,9 @@ impl RateLimiter {
 
         let clients = self.clients.read().await;
         if let Some(client) = clients.get(client_id) {
-            let elapsed = Instant::now().duration_since(client.last_update).as_secs_f64();
+            let elapsed = Instant::now()
+                .duration_since(client.last_update)
+                .as_secs_f64();
             let tokens = (client.tokens + elapsed * rate).min(self.config.burst_size as f64);
             tokens as u64
         } else {
@@ -142,15 +144,23 @@ impl<S> RateLimitMiddleware<S> {
 
 impl<S, B> tower::Service<Request<B>> for RateLimitMiddleware<S>
 where
-    S: tower::Service<Request<B>, Response = Response, Error = std::convert::Infallible> + Clone + Send + 'static,
+    S: tower::Service<Request<B>, Response = Response, Error = std::convert::Infallible>
+        + Clone
+        + Send
+        + 'static,
     S::Future: Send + 'static,
     B: Send + 'static,
 {
     type Response = Response;
     type Error = std::convert::Infallible;
-    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
 
-    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
@@ -172,7 +182,8 @@ where
                         message: "Too many requests. Please try again later.".to_string(),
                         retry_after_secs: 60,
                     }),
-                ).into_response();
+                )
+                    .into_response();
                 return Ok(response);
             }
 
@@ -208,8 +219,18 @@ fn extract_client_id<B>(request: &Request<B>) -> String {
         .headers()
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .or_else(|| request.headers().get("x-real-ip").and_then(|v| v.to_str().ok()))
-        .or_else(|| request.headers().get("cf-connecting-ip").and_then(|v| v.to_str().ok()))
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+        })
+        .or_else(|| {
+            request
+                .headers()
+                .get("cf-connecting-ip")
+                .and_then(|v| v.to_str().ok())
+        })
         .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 

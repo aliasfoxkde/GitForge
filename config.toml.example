@@ -16,14 +16,14 @@ port = 8080
 url = "sqlite:/data/gitforge.db"
 
 # PostgreSQL for production (recommended)
-# url = "postgres://gitforge:password@postgres:5432/gitforge"
+# url = "postgres://gitforge:${POSTGRES_PASSWORD}@postgres:5432/gitforge"
 
 # =============================================================================
 # Authentication
 # =============================================================================
 [auth]
 # JWT secret - CHANGE THIS IN PRODUCTION!
-jwt_secret = "changeme-in-production-min-32-chars"
+jwt_secret = ""
 token_expiry_hours = 24
 
 # =============================================================================

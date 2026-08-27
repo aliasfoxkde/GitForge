@@ -123,10 +123,7 @@ pub struct DagBuilder;
 
 impl DagBuilder {
     /// Build a job graph from a pipeline definition
-    pub fn build(
-        pipeline: &PipelineDefinition,
-        run_id: PipelineRunId,
-    ) -> Result<JobGraph> {
+    pub fn build(pipeline: &PipelineDefinition, run_id: PipelineRunId) -> Result<JobGraph> {
         let mut nodes = Vec::new();
         let mut name_to_id = HashMap::new();
 
@@ -300,9 +297,18 @@ mod tests {
         assert_eq!(order.len(), 3);
 
         // build should come before test, test should come before deploy
-        let build_idx = order.iter().position(|id| graph.get(*id).unwrap().name == "build").unwrap();
-        let test_idx = order.iter().position(|id| graph.get(*id).unwrap().name == "test").unwrap();
-        let deploy_idx = order.iter().position(|id| graph.get(*id).unwrap().name == "deploy").unwrap();
+        let build_idx = order
+            .iter()
+            .position(|id| graph.get(*id).unwrap().name == "build")
+            .unwrap();
+        let test_idx = order
+            .iter()
+            .position(|id| graph.get(*id).unwrap().name == "test")
+            .unwrap();
+        let deploy_idx = order
+            .iter()
+            .position(|id| graph.get(*id).unwrap().name == "deploy")
+            .unwrap();
 
         assert!(build_idx < test_idx);
         assert!(test_idx < deploy_idx);
@@ -405,10 +411,7 @@ mod tests {
             version: "1.0".to_string(),
             trigger_on: vec![],
             environment: HashMap::new(),
-            jobs: vec![
-                make_job("build", vec![]),
-                make_job("test", vec!["build"]),
-            ],
+            jobs: vec![make_job("build", vec![]), make_job("test", vec!["build"])],
         };
 
         let run_id = gitforce_common::PipelineRunId::new();
@@ -427,10 +430,7 @@ mod tests {
             version: "1.0".to_string(),
             trigger_on: vec![],
             environment: HashMap::new(),
-            jobs: vec![
-                make_job("build", vec![]),
-                make_job("test", vec!["build"]),
-            ],
+            jobs: vec![make_job("build", vec![]), make_job("test", vec!["build"])],
         };
 
         let run_id = gitforce_common::PipelineRunId::new();

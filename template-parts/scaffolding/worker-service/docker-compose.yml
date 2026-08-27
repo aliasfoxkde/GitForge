@@ -7,7 +7,7 @@ services:
     environment:
       POSTGRES_DB: workerdb
       POSTGRES_USER: worker
-      POSTGRES_PASSWORD: workerpassword
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -52,7 +52,7 @@ services:
         condition: service_healthy
     environment:
       AMQP_URL: "amqp://guest:guest@rabbitmq:5672/"
-      DATABASE_DSN: "postgres://worker:workerpassword@postgres:5432/workerdb?sslmode=disable"
+      DATABASE_DSN: "postgres://worker:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/workerdb?sslmode=disable"
       WORKER_COUNT: "4"
       LOG_LEVEL: "info"
       SHUTDOWN_TIMEOUT: "30"

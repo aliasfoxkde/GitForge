@@ -82,13 +82,14 @@ pub struct ServerConfig {
 
 /// Load server configuration from environment
 pub fn load_config() -> ServerConfig {
-    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "dev-secret-change-in-prod".to_string());
+    let jwt_secret =
+        std::env::var("JWT_SECRET").unwrap_or_else(|_| "dev-secret-change-in-prod".to_string());
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
         .parse::<u16>()
         .unwrap_or(8080);
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite:/gitforge.db".to_string());
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:/gitforge.db".to_string());
 
     ServerConfig {
         jwt_secret,
@@ -105,17 +106,28 @@ pub fn create_shutdown_flag() -> Arc<AtomicBool> {
 /// Spawn the shutdown signal handler
 pub fn spawn_shutdown_handler(shutdown_flag: Arc<AtomicBool>) {
     tokio::spawn(async move {
-        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
-        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt()).unwrap();
+        #[cfg(unix)]
+        {
+            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+            let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+                .expect("failed to install SIGINT handler");
 
-        tokio::select! {
-            _ = sigterm.recv() => {
-                tracing::info!("received SIGTERM, initiating graceful shutdown...");
-            }
-            _ = sigint.recv() => {
-                tracing::info!("received SIGINT, initiating graceful shutdown...");
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    tracing::info!("received SIGTERM, initiating graceful shutdown...");
+                }
+                _ = sigint.recv() => {
+                    tracing::info!("received SIGINT, initiating graceful shutdown...");
+                }
             }
         }
+
+        #[cfg(not(unix))]
+        if let Err(error) = signal::ctrl_c().await {
+            tracing::error!(%error, "failed to install console interrupt handler");
+        }
+
         shutdown_flag.store(true, Ordering::SeqCst);
     });
 }
@@ -140,6 +152,8 @@ pub async fn graceful_shutdown_delay() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
 
     fn clear_env() {
@@ -148,9 +162,17 @@ mod tests {
         std::env::remove_var("DATABASE_URL");
     }
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     #[test]
     fn test_load_config_defaults() {
         // Clear any set env vars first
+        let _lock = env_lock();
         clear_env();
 
         let config = load_config();
@@ -162,6 +184,7 @@ mod tests {
     #[test]
     fn test_load_config_from_env() {
         // Always set fresh values - clear first then set
+        let _lock = env_lock();
         clear_env();
         std::env::set_var("JWT_SECRET", "test-secret");
         std::env::set_var("PORT", "3000");

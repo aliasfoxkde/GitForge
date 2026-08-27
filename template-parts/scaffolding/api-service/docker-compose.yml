@@ -11,7 +11,7 @@ services:
       APP_PORT: "8080"
       APP_ENV: "${APP_ENV:-development}"
       APP_LOG_LEVEL: "${APP_LOG_LEVEL:-info}"
-      APP_DB_URL: "postgres://postgres:password@postgres:5432/apidb?sslmode=disable"
+      APP_DB_URL: "postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/apidb?sslmode=disable"
     depends_on:
       postgres:
         condition: service_healthy
@@ -32,7 +32,7 @@ services:
     container_name: api-postgres
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
       POSTGRES_DB: apidb
     ports:
       - "5432:5432"

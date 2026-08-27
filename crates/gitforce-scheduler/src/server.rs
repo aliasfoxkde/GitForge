@@ -77,13 +77,16 @@ async fn register_runner(
 
     tracing::info!("runner {} registered via HTTP", runner.id);
 
-    (StatusCode::CREATED, Json(serde_json::json!({
-        "id": runner.id.to_string(),
-        "name": runner.name,
-        "type": runner.runner_type,
-        "status": runner.status,
-        "capacity": runner.capacity,
-    })))
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": runner.id.to_string(),
+            "name": runner.name,
+            "type": runner.runner_type,
+            "status": runner.status,
+            "capacity": runner.capacity,
+        })),
+    )
 }
 
 /// Runner heartbeat
@@ -94,24 +97,28 @@ async fn runner_heartbeat(
     let runner_id: RunnerId = match Uuid::parse_str(&runner_id) {
         Ok(id) => RunnerId::from(id),
         Err(_) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "invalid_runner_id",
-                "message": "Invalid runner ID format"
-            })))
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_runner_id",
+                    "message": "Invalid runner ID format"
+                })),
+            )
         }
     };
 
     state.scheduler.heartbeat(runner_id).await;
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "status": "ok"
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok"
+        })),
+    )
 }
 
 /// Get pending jobs for a runner
-async fn get_pending_jobs(
-    State(state): State<SchedulerServerState>,
-) -> impl IntoResponse {
+async fn get_pending_jobs(State(state): State<SchedulerServerState>) -> impl IntoResponse {
     // Process queue to assign pending jobs
     state.scheduler.process_queue().await;
 
@@ -129,10 +136,13 @@ async fn assign_job(
     let job_id: JobId = match Uuid::parse_str(&job_id) {
         Ok(id) => JobId::from(id),
         Err(_) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "invalid_job_id",
-                "message": "Invalid job ID format"
-            })))
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_job_id",
+                    "message": "Invalid job ID format"
+                })),
+            )
         }
     };
 
@@ -145,10 +155,13 @@ async fn assign_job(
         tracing::info!("job {} assigned to runner {} via HTTP", job_id, r_id);
     }
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "status": "assigned",
-        "job_id": job_id.to_string()
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "assigned",
+            "job_id": job_id.to_string()
+        })),
+    )
 }
 
 /// Complete a job
@@ -160,20 +173,26 @@ async fn complete_job(
     let job_id: JobId = match Uuid::parse_str(&job_id) {
         Ok(id) => JobId::from(id),
         Err(_) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "invalid_job_id",
-                "message": "Invalid job ID format"
-            })))
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_job_id",
+                    "message": "Invalid job ID format"
+                })),
+            )
         }
     };
 
     let success = request["success"].as_bool().unwrap_or(false);
     tracing::info!("job {} completed via HTTP: success={}", job_id, success);
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "status": "completed",
-        "job_id": job_id.to_string()
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "completed",
+            "job_id": job_id.to_string()
+        })),
+    )
 }
 
 #[cfg(test)]
@@ -183,7 +202,7 @@ mod tests {
 
     fn assert_status(response: axum::response::Response, expected: StatusCode) {
         let status = response.status();
-        assert_eq!(status, expected, "Expected status {:?}, got {:?}", expected, status);
+        assert_eq!(status, expected, "HTTP response status mismatch");
     }
 
     #[tokio::test]
@@ -197,11 +216,7 @@ mod tests {
             capacity: 4,
         };
 
-        let response = register_runner(
-            axum::extract::State(state),
-            axum::Json(request),
-        )
-        .await;
+        let response = register_runner(axum::extract::State(state), axum::Json(request)).await;
 
         assert_status(response.into_response(), StatusCode::CREATED);
     }
@@ -217,11 +232,7 @@ mod tests {
             capacity: 8,
         };
 
-        let response = register_runner(
-            axum::extract::State(state),
-            axum::Json(request),
-        )
-        .await;
+        let response = register_runner(axum::extract::State(state), axum::Json(request)).await;
 
         assert_status(response.into_response(), StatusCode::CREATED);
     }
@@ -404,11 +415,7 @@ mod tests {
             capacity: 2,
         };
 
-        let response = register_runner(
-            axum::extract::State(state),
-            axum::Json(request),
-        )
-        .await;
+        let response = register_runner(axum::extract::State(state), axum::Json(request)).await;
 
         assert_status(response.into_response(), StatusCode::CREATED);
     }

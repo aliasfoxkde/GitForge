@@ -84,7 +84,12 @@ impl JobStateMachine {
         self.status = JobStatus::Failed;
         self.exit_code = Some(exit_code);
         self.error_message = Some(error);
-        tracing::error!("job {} failed with exit code {}: {}", self.job_id, exit_code, self.error_message.as_ref().unwrap());
+        tracing::error!(
+            "job {} failed with exit code {}: {}",
+            self.job_id,
+            exit_code,
+            self.error_message.as_ref().unwrap()
+        );
         Ok(())
     }
 

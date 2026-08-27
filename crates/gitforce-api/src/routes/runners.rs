@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use gitforce_common::RunnerId;
-use gitforce_db::{Pool, queries::RunnerQueries, models::RunnerType};
+use gitforce_db::{models::RunnerType, queries::RunnerQueries, Pool};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -35,9 +35,7 @@ pub fn runner_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 
 /// Helper to extract and validate user from headers
 fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let auth_header = headers
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok());
+    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok());
 
     let token = auth_header
         .and_then(|h| ApiAuth::extract_token(h))
@@ -57,25 +55,26 @@ async fn list_runners(
 ) -> impl IntoResponse {
     match extract_user(&auth, &headers) {
         Err(e) => e.into_response(),
-        Ok(_) => {
-            match RunnerQueries::list(&pool).await {
-                Ok(runners) => {
-                    let response: Vec<RunnerResponse> = runners.into_iter().map(|r| RunnerResponse {
+        Ok(_) => match RunnerQueries::list(&pool).await {
+            Ok(runners) => {
+                let response: Vec<RunnerResponse> = runners
+                    .into_iter()
+                    .map(|r| RunnerResponse {
                         id: r.id.to_string(),
                         name: r.name,
                         runner_type: r.runner_type,
                         status: r.status,
                         capacity: r.capacity,
                         last_heartbeat: r.last_heartbeat.map(|dt| dt.to_rfc3339()),
-                    }).collect();
-                    Json(response).into_response()
-                }
-                Err(e) => {
-                    tracing::error!("failed to list runners: {}", e);
-                    Json(serde_json::Value::Array(vec![])).into_response()
-                }
+                    })
+                    .collect();
+                Json(response).into_response()
             }
-        }
+            Err(e) => {
+                tracing::error!("failed to list runners: {}", e);
+                Json(serde_json::Value::Array(vec![])).into_response()
+            }
+        },
     }
 }
 
@@ -113,10 +112,14 @@ async fn register_runner(
         }
         Err(e) => {
             tracing::error!("failed to register runner: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "database_error",
-                "message": format!("failed to register runner: {}", e)
-            }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": format!("failed to register runner: {}", e)
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -137,37 +140,47 @@ async fn get_runner(
                 Ok(uuid) => {
                     let runner_id = RunnerId::from(uuid);
                     match RunnerQueries::get(&pool, runner_id).await {
-                        Ok(Some(runner)) => {
-                            (StatusCode::OK, Json(RunnerResponse {
+                        Ok(Some(runner)) => (
+                            StatusCode::OK,
+                            Json(RunnerResponse {
                                 id: runner.id.to_string(),
                                 name: runner.name,
                                 runner_type: runner.runner_type,
                                 status: runner.status,
                                 capacity: runner.capacity,
                                 last_heartbeat: runner.last_heartbeat.map(|dt| dt.to_rfc3339()),
-                            })).into_response()
-                        }
-                        Ok(None) => {
-                            (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                            }),
+                        )
+                            .into_response(),
+                        Ok(None) => (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({
                                 "error": "not_found",
                                 "message": "Runner not found"
-                            }))).into_response()
-                        }
+                            })),
+                        )
+                            .into_response(),
                         Err(e) => {
                             tracing::error!("failed to get runner: {}", e);
-                            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                                "error": "database_error",
-                                "message": format!("failed to get runner: {}", e)
-                            }))).into_response()
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "database_error",
+                                    "message": format!("failed to get runner: {}", e)
+                                })),
+                            )
+                                .into_response()
                         }
                     }
                 }
-                Err(_) => {
-                    (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                Err(_) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
                         "error": "invalid_id",
                         "message": "Invalid runner ID format"
-                    }))).into_response()
-                }
+                    })),
+                )
+                    .into_response(),
             }
         }
     }

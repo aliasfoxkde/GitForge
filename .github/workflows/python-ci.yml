@@ -108,7 +108,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ${{ fromJSON(env.PYTHON_VERSIONS) }}
+        python: ${{ fromJSON(vars.PYTHON_VERSIONS || '["3.11","3.12","3.13"]') }}
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -140,7 +140,7 @@ jobs:
           path: .coverage
 
   coverage:
-    needs: test
+    needs: [check-py-files, test]
     if: needs.check-py-files.outputs.has_py == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -166,7 +166,6 @@ jobs:
           uv run coverage report --fail-under=${{ env.COVERAGE_THRESHOLD }}
 
       - name: Upload to Codecov
-        if: matrix.os == 'ubuntu-latest'
         uses: codecov/codecov-action@v4
         with:
           files: .coverage

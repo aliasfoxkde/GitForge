@@ -50,8 +50,12 @@ impl From<RepoError> for gitforce_common::Error {
     fn from(err: RepoError) -> Self {
         match err {
             RepoError::NotFound(id) => gitforce_common::Error::not_found("repository", id),
-            RepoError::AlreadyExists(name) => gitforce_common::Error::already_exists("repository", name),
-            RepoError::InvalidName(name) => gitforce_common::Error::invalid_input(format!("invalid repo name: {}", name)),
+            RepoError::AlreadyExists(name) => {
+                gitforce_common::Error::already_exists("repository", name)
+            }
+            RepoError::InvalidName(name) => {
+                gitforce_common::Error::invalid_input(format!("invalid repo name: {}", name))
+            }
             RepoError::Storage(msg) => gitforce_common::Error::storage(msg),
         }
     }
@@ -67,17 +71,16 @@ impl<S: StorageBackend> RepoService<S> {
     }
 
     /// Create a new repository
-    pub async fn create(
-        &self,
-        name: String,
-        owner_id: UserId,
-    ) -> Result<RepoMetadata> {
+    pub async fn create(&self, name: String, owner_id: UserId) -> Result<RepoMetadata> {
         // Validate name
         if name.is_empty() || name.len() > 255 {
             return Err(RepoError::InvalidName(name).into());
         }
 
-        if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        if !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
             return Err(RepoError::InvalidName(name).into());
         }
 
@@ -163,7 +166,10 @@ impl<S: StorageBackend> RepoService<S> {
         let mut refs = Vec::new();
 
         // Iterate over all references
-        for name in repo.references().map_err(|e| Error::git(format!("failed to list refs: {}", e)))? {
+        for name in repo
+            .references()
+            .map_err(|e| Error::git(format!("failed to list refs: {}", e)))?
+        {
             let name = name.map_err(|e| Error::git(format!("failed to read ref: {}", e)))?;
             let ref_name = name.name().unwrap_or("").to_string();
             let is_branch = ref_name.starts_with("refs/heads/");
@@ -200,7 +206,10 @@ mod tests {
         let owner_id = UserId::new();
 
         // Create repository
-        let meta = service.create("test-repo".to_string(), owner_id).await.unwrap();
+        let meta = service
+            .create("test-repo".to_string(), owner_id)
+            .await
+            .unwrap();
         assert_eq!(meta.name, "test-repo");
 
         // Get repository
@@ -291,7 +300,10 @@ mod tests {
 
         let owner_id = UserId::new();
 
-        let meta = service.create("test-repo".to_string(), owner_id).await.unwrap();
+        let meta = service
+            .create("test-repo".to_string(), owner_id)
+            .await
+            .unwrap();
         let path = service.get_git_path(meta.id).await.unwrap();
         assert!(!path.is_empty());
 
@@ -343,7 +355,10 @@ mod tests {
         let service = RepoService::new(storage);
 
         let owner_id = UserId::new();
-        let meta = service.create("test-repo".to_string(), owner_id).await.unwrap();
+        let meta = service
+            .create("test-repo".to_string(), owner_id)
+            .await
+            .unwrap();
 
         // Fresh repo has no refs
         let refs = service.list_refs(meta.id).await.unwrap();
@@ -385,7 +400,13 @@ mod tests {
         let owner_id = UserId::new();
 
         // Test various invalid characters
-        for name in ["has!space", "has@at", "has#hash", "has$dollar", "has%percent"] {
+        for name in [
+            "has!space",
+            "has@at",
+            "has#hash",
+            "has$dollar",
+            "has%percent",
+        ] {
             let result = service.create(name.to_string(), owner_id).await;
             assert!(result.is_err(), "Expected '{}' to be invalid", name);
         }

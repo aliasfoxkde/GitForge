@@ -98,21 +98,18 @@ impl PackageMapper {
             PackageMapping::new("api/**/*.go", "go:api", "go"),
             PackageMapping::new("services/**/*.go", "go:services", "go"),
             PackageMapping::lib("**/*.go", "go:.", "go"),
-
             // ─── Python ──────────────────────────────────────────────────────
             PackageMapping::new("pyproject.toml", "python:module", "python"),
             PackageMapping::new("setup.py", "python:module", "python"),
             PackageMapping::new("src/**/*.py", "python:src", "python"),
             PackageMapping::new("tests/**/*.py", "python:tests", "python"),
             PackageMapping::lib("**/*.py", "python:.", "python"),
-
             // ─── Rust ────────────────────────────────────────────────────────
             PackageMapping::new("Cargo.toml", "rust:workspace", "rust"),
             PackageMapping::new("Cargo.lock", "rust:workspace", "rust"),
             PackageMapping::new("crates/*/Cargo.toml", "rust:crate", "rust"),
             PackageMapping::new("services/*/Cargo.toml", "rust:service", "rust"),
             PackageMapping::lib("**/*.rs", "rust:.", "rust"),
-
             // ─── TypeScript / Node ──────────────────────────────────────────
             PackageMapping::new("package.json", "ts:module", "typescript"),
             PackageMapping::new("tsconfig.json", "ts:config", "typescript"),
@@ -121,17 +118,14 @@ impl PackageMapper {
             PackageMapping::new("tests/**/*.ts", "ts:tests", "typescript"),
             PackageMapping::new("tests/**/*.tsx", "ts:tests", "typescript"),
             PackageMapping::lib("**/*.{ts,tsx,js,jsx}", "ts:.", "typescript"),
-
             // ─── Shell ───────────────────────────────────────────────────────
             PackageMapping::new("scripts/**/*.sh", "shell:scripts", "shell"),
             PackageMapping::new(".githooks/**/*.sh", "shell:hooks", "shell"),
             PackageMapping::lib("**/*.sh", "shell:.", "shell"),
-
             // ─── Docs ───────────────────────────────────────────────────────
             PackageMapping::new("docs/**/*.md", "docs", "markdown"),
             PackageMapping::new("README.md", "docs", "markdown"),
             PackageMapping::new("CHANGELOG.md", "docs", "markdown"),
-
             // ─── CI/CD ───────────────────────────────────────────────────────
             PackageMapping::new(".github/workflows/*.yml", "ci:workflows", "yaml"),
             PackageMapping::new(".github/workflows/*.yaml", "ci:workflows", "yaml"),
@@ -140,7 +134,6 @@ impl PackageMapper {
             PackageMapping::new(".githooks/*/", "ci:hooks", "shell"),
             PackageMapping::new("Makefile", "ci:makefile", "shell"),
             PackageMapping::new("**/Dockerfile*", "ci:docker", "dockerfile"),
-
             // ─── Config ──────────────────────────────────────────────────────
             PackageMapping::new("*.toml", "config", "toml"),
             PackageMapping::new("*.yaml", "config", "yaml"),
@@ -155,9 +148,7 @@ impl PackageMapper {
 
     /// Map a single changed file path to its package
     pub fn map_file(&self, file_path: &str) -> Option<&PackageMapping> {
-        self.mappings
-            .iter()
-            .find(|m| m.pattern.matches(file_path))
+        self.mappings.iter().find(|m| m.pattern.matches(file_path))
     }
 
     /// Map multiple files and return unique affected packages

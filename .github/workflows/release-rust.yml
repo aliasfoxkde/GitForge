@@ -75,12 +75,14 @@ jobs:
   # ─── Build macOS x86_64 + ARM64 ──────────────────────────────────────────
   build-macos:
     name: Build macOS
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        target:
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-latest
     steps:
       - uses: actions/checkout@v4
 

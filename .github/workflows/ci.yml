@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: detect
-        run: ${{ github.action_path }}/../actions/detect-languages/detect.sh
+        run: ./.github/actions/detect-languages/detect.sh
 
   # ─── Lint ────────────────────────────────────────────────────────────────
   lint:

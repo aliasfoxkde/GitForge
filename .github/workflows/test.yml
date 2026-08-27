@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ${{ fromJSON(env.GO_VERSIONS) }}
+        go: ${{ fromJSON(vars.GO_VERSIONS || '["1.21","1.22","1.23","1.24"]') }}
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -87,12 +87,11 @@ jobs:
   # ─── Python Tests ────────────────────────────────────────────────────────
   test-python:
     name: Test Python
-    runs-on: ubuntu-latest
     if: inputs.has_python == 'true'
     strategy:
       fail-fast: false
       matrix:
-        python: ${{ fromJSON(env.PYTHON_VERSIONS) }}
+        python: ${{ fromJSON(vars.PYTHON_VERSIONS || '["3.11","3.12","3.13"]') }}
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     env:
@@ -131,7 +130,6 @@ jobs:
   # ─── Rust Tests ─────────────────────────────────────────────────────────
   test-rust:
     name: Test Rust
-    runs-on: ubuntu-latest
     if: inputs.has_rust == 'true'
     strategy:
       fail-fast: false
@@ -176,7 +174,6 @@ jobs:
   # ─── TypeScript Tests ────────────────────────────────────────────────────
   test-ts:
     name: Test TypeScript
-    runs-on: ubuntu-latest
     if: inputs.has_typescript == 'true'
     strategy:
       fail-fast: false
