@@ -26,7 +26,6 @@ jobs:
   # ─── Go Build ───────────────────────────────────────────────────────────
   build-go:
     name: Build Go
-    runs-on: ubuntu-latest
     if: inputs.has_go == 'true'
     strategy:
       fail-fast: false
