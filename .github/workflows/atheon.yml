@@ -35,11 +35,11 @@ jobs:
 
       - name: Run Atheon Security Scan (secrets + PII + security)
         run: |
-          atheon --categories=secrets,pii,security --sarif results.sarif ./
+          atheon --categories=secrets,pii --sarif ./ > results.sarif
 
       - name: Run Atheon Quality Scan
         run: |
-          atheon --categories=ai-detection,quality --sarif quality-results.sarif ./ || true
+          atheon --categories=ai-detection,quality --sarif ./ > quality-results.sarif || true
 
       - name: Upload SARIF results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
@@ -85,7 +85,7 @@ jobs:
       - name: Check for sensitive data in PR
         run: |
           git fetch origin ${{ github.base_ref }} --depth=1
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          CHANGED_FILES=$(git diff --name-only FETCH_HEAD HEAD)
           if [ -n "$CHANGED_FILES" ]; then
             atheon --categories=secrets,pii $CHANGED_FILES || {
               echo "Secrets or PII detected in changed files!"
