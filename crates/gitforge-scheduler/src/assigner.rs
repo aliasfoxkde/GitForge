@@ -482,8 +482,7 @@ impl Scheduler {
             // Persist first so a database failure leaves the in-memory
             // assignment available for a later stale-runner retry.
             if let Some(pool) = &db_pool {
-                if let Err(error) = gitforge_db::queries::JobQueries::requeue(pool, *job_id).await
-                {
+                if let Err(error) = gitforge_db::queries::JobQueries::requeue(pool, *job_id).await {
                     tracing::error!(%error, %job_id, "failed to persist runner-loss requeue");
                     continue;
                 }
