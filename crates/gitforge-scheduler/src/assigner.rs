@@ -1221,6 +1221,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_runner_loss_preserves_repository_for_multiple_jobs() {
+        let scheduler = Scheduler::new();
+        let first_runner_id = RunnerId::new();
+        let second_runner_id = RunnerId::new();
+        let stale_heartbeat = chrono::Utc::now() - chrono::Duration::seconds(120);
+        let mut first_runner = make_runner(first_runner_id, "multi-repo-runner-a", "online", 1);
+        first_runner.last_heartbeat = Some(stale_heartbeat);
+        let mut second_runner = make_runner(second_runner_id, "multi-repo-runner-b", "online", 1);
+        second_runner.last_heartbeat = Some(stale_heartbeat);
+        scheduler.register_runner(first_runner).await;
+        scheduler.register_runner(second_runner).await;
+
+        let first_job = JobId::new();
+        let first_repo = RepoId::new();
+        let second_job = JobId::new();
+        let second_repo = RepoId::new();
+        scheduler
+            .enqueue(first_job, PipelineRunId::new(), first_repo)
+            .await;
+        scheduler
+            .enqueue(second_job, PipelineRunId::new(), second_repo)
+            .await;
+        scheduler.process_queue().await;
+        assert!(scheduler.is_assigned(first_job).await.is_some());
+        assert!(scheduler.is_assigned(second_job).await.is_some());
+
+        assert_eq!(scheduler.mark_stale_runners_offline(30).await, 2);
+
+        let state = scheduler.state.read().await;
+        assert_eq!(state.queue.len(), 2);
+        assert_eq!(
+            state
+                .queue
+                .all()
+                .iter()
+                .find(|job| job.job_id == first_job)
+                .map(|job| job.repo_id),
+            Some(first_repo)
+        );
+        assert_eq!(
+            state
+                .queue
+                .all()
+                .iter()
+                .find(|job| job.job_id == second_job)
+                .map(|job| job.repo_id),
+            Some(second_repo)
+        );
+    }
+
+    #[tokio::test]
     async fn test_runner_offline() {
         let scheduler = Scheduler::new();
         let runner_id = RunnerId::new();
