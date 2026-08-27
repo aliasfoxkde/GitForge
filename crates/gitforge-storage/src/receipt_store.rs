@@ -142,10 +142,7 @@ impl ReceiptStore for InMemoryReceiptStore {
 
     async fn list_by_workspace(&self, workspace_id: &str) -> Result<Vec<JobReceipt>> {
         let by_ws = self.by_workspace.lock().unwrap();
-        let job_ids: Vec<JobId> = by_ws
-            .get(workspace_id)
-            .cloned()
-            .unwrap_or_default();
+        let job_ids: Vec<JobId> = by_ws.get(workspace_id).cloned().unwrap_or_default();
         let receipts = self.receipts.lock().unwrap();
         Ok(job_ids
             .into_iter()
@@ -218,7 +215,9 @@ impl FileReceiptStore {
     }
 
     fn meta_path(&self, job_id: &JobId) -> PathBuf {
-        self.root.join("receipts").join(format!("{}.meta.json", job_id))
+        self.root
+            .join("receipts")
+            .join(format!("{}.meta.json", job_id))
     }
 
     fn compute_receipt_sha256(receipt: &JobReceipt) -> String {
@@ -277,7 +276,8 @@ impl ReceiptStore for FileReceiptStore {
         let mut meta_file = fs::File::create(&meta_path)
             .await
             .map_err(|e| Error::storage(format!("failed to create meta file: {}", e)))?;
-        meta_file.write_all(meta_json.as_bytes())
+        meta_file
+            .write_all(meta_json.as_bytes())
             .await
             .map_err(|e| Error::storage(format!("failed to write meta: {}", e)))?;
 

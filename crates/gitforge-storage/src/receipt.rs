@@ -150,8 +150,8 @@ impl JobReceipt {
             receipt_signature: None,
             ..self.clone()
         };
-        let canonical = serde_json::to_string(&receipt_for_signing)
-            .unwrap_or_else(|_| "{}".to_string());
+        let canonical =
+            serde_json::to_string(&receipt_for_signing).unwrap_or_else(|_| "{}".to_string());
         let mut hasher = Sha256::new();
         hasher.update(canonical.as_bytes());
         hex::encode(hasher.finalize())

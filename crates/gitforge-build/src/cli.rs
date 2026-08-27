@@ -5,8 +5,8 @@
 use anyhow::Result;
 use clap::Parser;
 
+use gitforge_build::client::{JobSubmitter, UnixSocketClient, DEFAULT_SOCKET};
 use gitforge_build::Response;
-use gitforge_build::client::{DEFAULT_SOCKET, JobSubmitter, UnixSocketClient};
 
 #[derive(Parser, Debug)]
 #[command(

@@ -2,13 +2,13 @@
 
 use crate::job::{BuildJob, BuildResult, JobStatus, MAX_CONCURRENT_JOBS};
 use crate::protocol::{JobInfo, Response};
-use nix::sys::signal::{SIGTERM, Signal, killpg};
+use nix::sys::signal::{killpg, Signal, SIGTERM};
 use nix::unistd::Pid;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
 use tracing::{error, info, warn};
 
 /// Build coordinator that limits concurrent cargo invocations

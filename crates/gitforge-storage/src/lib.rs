@@ -13,5 +13,10 @@ pub use artifact::{Artifact, ArtifactId, ArtifactStore};
 pub use cache::{CacheKey, CacheStore, FileCacheStore};
 pub use filesystem::FileStorage;
 pub use job_logs::{FileJobLogStore, InMemoryJobLogStore, JobLogMeta, JobLogStore};
-pub use receipt::{ArtifactReceipt, JobReceipt, LogReceipt, ReceiptStatus, RECEIPT_VERSION, MAX_LOG_BYTES, MAX_ARTIFACT_BYTES};
-pub use receipt_store::{FileReceiptStore, InMemoryReceiptStore, ReceiptMeta, ReceiptStore, ReceiptVerification};
+pub use receipt::{
+    ArtifactReceipt, JobReceipt, LogReceipt, ReceiptStatus, MAX_ARTIFACT_BYTES, MAX_LOG_BYTES,
+    RECEIPT_VERSION,
+};
+pub use receipt_store::{
+    FileReceiptStore, InMemoryReceiptStore, ReceiptMeta, ReceiptStore, ReceiptVerification,
+};

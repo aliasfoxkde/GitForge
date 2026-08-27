@@ -233,7 +233,10 @@ async fn git_upload_pack(
             }
         }
     } else {
-        tracing::warn!("database not available, cannot look up repository: {}", repo_path);
+        tracing::warn!(
+            "database not available, cannot look up repository: {}",
+            repo_path
+        );
         return Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(Body::from("Database not available"))
@@ -304,7 +307,10 @@ async fn git_receive_pack(
             }
         }
     } else {
-        tracing::warn!("database not available, cannot look up repository: {}", repo_path);
+        tracing::warn!(
+            "database not available, cannot look up repository: {}",
+            repo_path
+        );
         return Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(Body::from("Database not available"))
@@ -394,11 +400,7 @@ async fn run_ssh_server(config: SshServerConfig, shutdown: Arc<AtomicBool>) -> a
         }
 
         // Accept connection with timeout to allow checking shutdown flag
-        let accept_result = tokio::time::timeout(
-            Duration::from_secs(1),
-            listener.accept(),
-        )
-        .await;
+        let accept_result = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
 
         match accept_result {
             Ok(Ok((stream, peer_addr))) => {
@@ -566,13 +568,11 @@ fn handle_ssh_connection(
 
             // Process based on command
             let response = match git_cmd {
-                "git-upload-pack" => {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap()
-                        .block_on(handler.upload_pack(repo_id, vec![]))
-                }
+                "git-upload-pack" => tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(handler.upload_pack(repo_id, vec![])),
                 "git-receive-pack" => {
                     // For receive-pack, we need to read the request body
                     let mut input = Vec::new();
@@ -583,9 +583,10 @@ fn handle_ssh_connection(
                         .unwrap()
                         .block_on(handler.receive_pack(repo_id, input))
                 }
-                _ => {
-                    Err(gitforge_common::Error::git(format!("unsupported command: {}", git_cmd)))
-                }
+                _ => Err(gitforge_common::Error::git(format!(
+                    "unsupported command: {}",
+                    git_cmd
+                ))),
             };
 
             match response {

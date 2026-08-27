@@ -3,7 +3,9 @@
 //! These tests require Docker and a running test database.
 
 use gitforge_ci::{CiEngine, DagBuilder, PipelineDefinition, PipelineTriggerEvent, TriggerType};
-use gitforge_common::{JobId, JobStatus, PipelineId, PipelineRunId, PipelineStatus, RepoId, RunnerId, UserId};
+use gitforge_common::{
+    JobId, JobStatus, PipelineId, PipelineRunId, PipelineStatus, RepoId, RunnerId, UserId,
+};
 use std::collections::HashMap;
 
 /// Create a test pipeline definition
@@ -225,8 +227,12 @@ async fn test_duplicate_trigger_idempotency() {
 
     let pipeline = make_pipeline(vec![("build", vec![])]);
 
-    let engine1 = CiEngine::new(trigger.clone(), pipeline.clone()).await.unwrap();
-    let engine2 = CiEngine::new(trigger.clone(), pipeline.clone()).await.unwrap();
+    let engine1 = CiEngine::new(trigger.clone(), pipeline.clone())
+        .await
+        .unwrap();
+    let engine2 = CiEngine::new(trigger.clone(), pipeline.clone())
+        .await
+        .unwrap();
 
     // Two separate engines have separate state - idempotency is handled at the
     // trigger level (same pipeline_id + run_id would be rejected at DB level)
@@ -265,7 +271,10 @@ async fn test_job_failure_records_failure() {
     // Simulate job lifecycle: assign -> start -> fail with non-zero exit
     engine.assign_job(job_id, runner_id).await.unwrap();
     engine.start_job(job_id).await.unwrap();
-    engine.fail_job(job_id, 1, "compilation error".to_string()).await.unwrap();
+    engine
+        .fail_job(job_id, 1, "compilation error".to_string())
+        .await
+        .unwrap();
 
     let state = engine.state().await;
     assert_eq!(state.status, PipelineStatus::Failed);

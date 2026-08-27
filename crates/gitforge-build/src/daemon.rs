@@ -4,14 +4,14 @@
 
 use anyhow::Result;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 
 use gitforge_build::{
-    BuildCoordinator, MAX_CONCURRENT_JOBS, MAX_MESSAGE_SIZE, Request, Response, encode_response,
+    encode_response, BuildCoordinator, Request, Response, MAX_CONCURRENT_JOBS, MAX_MESSAGE_SIZE,
 };
 
 /// Create a shutdown flag
