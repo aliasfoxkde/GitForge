@@ -134,7 +134,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Skip cargo-audit when no lockfile is tracked
+        if: hashFiles('Cargo.lock') == ''
+        run: echo "No Cargo.lock tracked; skipping Rust dependency audit."
+
       - name: Run cargo-audit
+        if: hashFiles('Cargo.lock') != ''
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
