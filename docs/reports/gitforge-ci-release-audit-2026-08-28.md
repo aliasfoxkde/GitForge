@@ -242,13 +242,13 @@ Artifacts are uploaded individually per platform job, then downloaded, checksumm
 
 ### 9.1 Template Parts Target Directory
 
-The workspace has `template-parts/rust/target/` committed with compiled artifacts (`.rustc_info.json`, `CACHEDIR.TAG`, `debug/` and `release/` trees with `.fingerprint/`, `build/`, `deps/`, `.d` files, `.rlib`/`.rmeta`/`.so` files). This is 3386 deleted files in the working tree.
+`template-parts/rust/target/` is **already in `.gitignore`** (line 37). The 3386 deleted files visible in the working tree are pre-existing stale tracked artifacts from a prior commit — they were never cleaned up before being gitignored. Restoring them would require re-cloning from origin; the worker did not create these deletions.
 
-**This inflates the repo by hundreds of megabytes and makes clones slow.** The `.gitignore` likely does not exclude this path.
+**Impact:** The repo carries hundreds of megabytes of compiled artifacts committed to git. The `.gitignore` entry is correct; the files should be removed from git history via `git filter-branch` or BFG to reduce clone size and eliminate the working-tree noise.
 
 ### 9.2 `workspaces/` Subdirectory
 
-An untracked `workspaces/platform-aegis-gitforge-smoke-20260825/` directory exists. It is not in `.gitignore` and not in `.gitmodules`.
+`workspaces/platform-aegis-gitforge-smoke-20260825/` is an **untracked, generated test fixture**. It is not in `.gitignore`, not in `.gitmodules`, and was not part of the audit source. It should be removed.
 
 ---
 
@@ -343,7 +343,7 @@ Claiming the pipeline works from a health endpoint alone is unsupported by evide
 
 9. **SQLite concurrency.** Two processes (`api` + `ci`) sharing one SQLite file over a Docker volume with no lock timeout configuration risks writer starvation.
 
-10. **`template-parts/rust/target/` committed.** 3386 files deleted from working tree, hundreds of MB of compiled artifacts in the repo. Not in `.gitignore`.
+10. **`template-parts/rust/target/` in git history.** 3386 files deleted from working tree, hundreds of MB of compiled artifacts committed to git. `.gitignore` line 37 already contains this path — but the files remain in the current commit and history. They must be removed from git via `git filter-branch` or BFG to reduce clone size.
 
 11. **`workspaces/` not ignored.** Untracked workspace subdirectory present in working tree.
 

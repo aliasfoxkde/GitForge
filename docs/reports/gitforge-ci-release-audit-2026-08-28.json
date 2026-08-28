@@ -94,8 +94,14 @@
     },
     "template_target_committed": {
       "command": "git status --short template-parts/rust/target/ | wc -l",
-      "result": "3386 deleted files in working tree from template-parts/rust/target/ (compiled artifacts committed to repo)"
-    }
+      "result": "3386 deleted files in working tree from template-parts/rust/target/. Path IS in .gitignore (line 37) — these are pre-existing stale tracked artifacts, not worker-created deletions."
+    },
+    "workspaces_untracked": {
+      "command": "git status --short workspaces/",
+      "result": "Untracked generated test fixture: workspaces/platform-aegis-gitforge-smoke-20260825/ (to be removed by this audit correction)"
+    },
+    "branch_clean": false,
+    "branch_dirty_reason": "tracked generated-artifact deletions (template-parts/rust/target/ — pre-existing, not worker-created) plus untracked generated workspace (workspaces/platform-aegis-gitforge-smoke-20260825/)"
   },
   "service_facts": {
     "api": {
@@ -185,13 +191,13 @@
       },
       {
         "id": "G-10",
-        "title": "template-parts/rust/target/ committed to repository",
-        "detail": "3386 compiled artifact files (hundreds of MB) are tracked in git under template-parts/rust/target/. Not in .gitignore. Inflates clones, pollutes diffs."
+        "title": "template-parts/rust/target/ in git history",
+        "detail": "3386 compiled artifact files (hundreds of MB) are tracked in git under template-parts/rust/target/. Path is already in .gitignore (line 37) but files remain in the current commit and git history. They must be removed from git via git filter-branch or BFG."
       },
       {
         "id": "G-11",
         "title": "workspaces/ directory is untracked and unignored",
-        "detail": "workspaces/platform-aegis-gitforge-smoke-20260825/ is present as an untracked directory."
+        "detail": "workspaces/platform-aegis-gitforge-smoke-20260825/ is an untracked generated test fixture created by a prior smoke test run. It is not user source, not in .gitignore, and is removed by this audit correction."
       }
     ],
     "medium": [
