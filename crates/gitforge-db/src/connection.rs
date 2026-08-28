@@ -153,6 +153,7 @@ impl Pool {
                 finished_at TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
+                image TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id),
                 FOREIGN KEY (runner_id) REFERENCES runners(id)
             )
@@ -161,6 +162,28 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create jobs table: {}", e)))?;
+
+        // Create job_steps table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS job_steps (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                step_index INTEGER NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                run TEXT NOT NULL,
+                env TEXT NOT NULL DEFAULT '{}',
+                working_dir TEXT,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                UNIQUE(job_id, step_index)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create job_steps table: {}", e)))?;
+
+        // Create artifacts table
 
         // Create artifacts table
         sqlx::query(

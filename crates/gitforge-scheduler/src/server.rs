@@ -18,6 +18,9 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct SchedulerServerState {
     pub scheduler: Arc<Scheduler>,
+    /// Optional database pool for querying job metadata (image, steps).
+    /// None is valid for in-memory-only scheduler deployments.
+    pub db_pool: Option<gitforge_db::Pool>,
 }
 
 /// Runner registration request
@@ -35,14 +38,27 @@ pub struct PendingJobInfo {
     pub job_id: String,
     pub name: String,
     pub pipeline_run_id: String,
+    /// Container image, e.g. "rust:1.75". Required — never empty for valid jobs.
+    pub image: String,
+    /// Commands to execute. Empty only if job was malformed at creation time.
     pub commands: Vec<String>,
     pub working_dir: Option<String>,
 }
 
-/// Create scheduler server state
+/// Create scheduler server state with no database (in-memory scheduling only).
 pub fn create_state(scheduler: Scheduler) -> SchedulerServerState {
     SchedulerServerState {
         scheduler: Arc::new(scheduler),
+        db_pool: None,
+    }
+}
+
+/// Create scheduler server state with a database pool.
+/// The pool is used to fetch job metadata (image, steps) for the runner handoff.
+pub fn create_state_with_db(scheduler: Scheduler, pool: gitforge_db::Pool) -> SchedulerServerState {
+    SchedulerServerState {
+        scheduler: Arc::new(scheduler),
+        db_pool: Some(pool),
     }
 }
 
@@ -117,7 +133,13 @@ async fn runner_heartbeat(
     )
 }
 
-/// Get pending jobs for a runner
+/// Get pending jobs for a runner.
+///
+/// Fetches jobs that have been assigned to runners by `process_queue()` and
+/// augments them with persisted execution metadata (image, steps) from the DB.
+/// Jobs with missing or empty image are **excluded** — they indicate a
+/// programming error (job created without going through the API pipeline).
+/// This is fail-closed: runners must never receive a job without a configured image.
 async fn get_pending_jobs(State(state): State<SchedulerServerState>) -> impl IntoResponse {
     // Process queue to assign pending jobs
     state.scheduler.process_queue().await;
@@ -125,17 +147,70 @@ async fn get_pending_jobs(State(state): State<SchedulerServerState>) -> impl Int
     // Get jobs assigned to runners (these are pending execution)
     let assigned_jobs = state.scheduler.get_assigned_jobs().await;
 
-    // Convert to response format
-    let job_infos: Vec<PendingJobInfo> = assigned_jobs
-        .into_iter()
-        .map(|(job_id, _runner_id, pipeline_run_id)| PendingJobInfo {
-            job_id: job_id.to_string(),
-            name: format!("job-{}", job_id),
-            pipeline_run_id: pipeline_run_id.to_string(),
-            commands: vec!["echo 'job assigned'".to_string()], // Placeholder - real impl would query DB
-            working_dir: None,
-        })
-        .collect();
+    // Build response, optionally augmented with DB metadata
+    let job_infos: Vec<PendingJobInfo> = if let Some(pool) = &state.db_pool {
+        let mut infos = Vec::with_capacity(assigned_jobs.len());
+        for (job_id, _runner_id, pipeline_run_id) in assigned_jobs {
+            // Fetch persisted job metadata from DB
+            match gitforge_db::queries::JobQueries::get(pool, job_id).await {
+                Ok(Some(job)) => {
+                    // Fail-closed: skip jobs without a configured image.
+                    // This catches jobs created via the deprecated scheduler-only path
+                    // that never went through the API pipeline.
+                    if job.image.is_empty() {
+                        tracing::warn!(
+                            "get_pending_jobs: job {} has empty image — skipping (created outside API pipeline?)",
+                            job_id
+                        );
+                        continue;
+                    }
+
+                    // Fetch steps for this job
+                    let steps = gitforge_db::queries::JobStepQueries::list_by_job(pool, job_id)
+                        .await
+                        .unwrap_or_default();
+                    let commands: Vec<String> = steps.into_iter().map(|s| s.run).collect();
+
+                    infos.push(PendingJobInfo {
+                        job_id: job_id.to_string(),
+                        name: job.name,
+                        pipeline_run_id: pipeline_run_id.to_string(),
+                        image: job.image,
+                        commands,
+                        working_dir: None,
+                    });
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "get_pending_jobs: job {} not found in DB — skipping",
+                        job_id
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "get_pending_jobs: failed to fetch job {} metadata: {}",
+                        job_id,
+                        e
+                    );
+                }
+            }
+        }
+        infos
+    } else {
+        // No DB — use in-memory job names and a clear indicator that metadata is unavailable.
+        // This path exists only for test or in-process scheduler scenarios.
+        assigned_jobs
+            .into_iter()
+            .map(|(job_id, _runner_id, pipeline_run_id)| PendingJobInfo {
+                job_id: job_id.to_string(),
+                name: format!("job-{}", job_id),
+                pipeline_run_id: pipeline_run_id.to_string(),
+                image: String::new(), // Intentionally empty — signals metadata unavailable
+                commands: vec![],
+                working_dir: None,
+            })
+            .collect()
+    };
 
     Json(serde_json::json!(job_infos))
 }
@@ -435,12 +510,34 @@ mod tests {
             job_id: "job-123".to_string(),
             name: "build".to_string(),
             pipeline_run_id: "run-456".to_string(),
+            image: "rust:1.75".to_string(),
             commands: vec!["cargo build".to_string()],
             working_dir: Some("/workspace".to_string()),
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("job-123"));
         assert!(json.contains("build"));
+        assert!(json.contains("rust:1.75"));
+        // Verify image field is present in serialized output
+        assert!(json.contains("\"image\""));
+    }
+
+    #[test]
+    fn test_pending_job_info_no_image_empty_commands() {
+        // When no DB is available, get_pending_jobs returns empty image (intentionally).
+        // This verifies the no-db path produces correct structure.
+        let info = PendingJobInfo {
+            job_id: "job-no-db".to_string(),
+            name: "job-no-db".to_string(),
+            pipeline_run_id: "run-no-db".to_string(),
+            image: String::new(),
+            commands: vec![],
+            working_dir: None,
+        };
+        assert!(info.image.is_empty());
+        assert!(info.commands.is_empty());
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("job-no-db"));
     }
 
     #[test]

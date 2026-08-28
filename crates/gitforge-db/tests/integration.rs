@@ -125,7 +125,7 @@ async fn test_database_pipeline_with_dependencies() {
     PipelineRunQueries::create(&pool, &run).await.unwrap();
 
     // Create job
-    let job = Job::new(run.id, "build".to_string());
+    let job = Job::new(run.id, "build".to_string(), "rust:1.75");
     JobQueries::create(&pool, &job).await.unwrap();
 
     // Verify job
@@ -219,7 +219,7 @@ async fn test_database_job_state_transitions() {
     );
     PipelineRunQueries::create(&pool, &run).await.unwrap();
 
-    let job = Job::new(run.id, "build".to_string());
+    let job = Job::new(run.id, "build".to_string(), "rust:1.75");
     JobQueries::create(&pool, &job).await.unwrap();
 
     // Create runner for assignment
