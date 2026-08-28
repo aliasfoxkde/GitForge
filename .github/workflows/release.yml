@@ -27,7 +27,7 @@ jobs:
       - name: Build
         run: |
           cargo test --workspace --locked --no-fail-fast
-          cargo build --release --bin api --bin ci --bin git-server --bin runner
+          cargo build --release --locked --bin api --bin ci --bin git-server --bin runner
 
       - name: Package
         run: |
@@ -55,10 +55,10 @@ jobs:
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
       - name: Build x86_64
-        run: cargo build --release --target x86_64-apple-darwin --bin api --bin ci --bin git-server --bin runner
+        run: cargo build --release --locked --target x86_64-apple-darwin --bin api --bin ci --bin git-server --bin runner
 
       - name: Build arm64
-        run: cargo build --release --target aarch64-apple-darwin --bin api --bin ci --bin git-server --bin runner
+        run: cargo build --release --locked --target aarch64-apple-darwin --bin api --bin ci --bin git-server --bin runner
 
       - name: Package
         run: |
@@ -83,7 +83,7 @@ jobs:
 
       - name: Build
         shell: bash
-        run: cargo build --release --target x86_64-pc-windows-gnu --bin api --bin ci --bin git-server --bin runner
+        run: cargo build --release --locked --target x86_64-pc-windows-gnu --bin api --bin ci --bin git-server --bin runner
 
       - name: Package
         shell: bash

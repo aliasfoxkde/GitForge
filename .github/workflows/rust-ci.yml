@@ -46,7 +46,7 @@ jobs:
         with:
           components: clippy
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # ─── Testing ────────────────────────────────────────────────────────────────
   test:
@@ -57,7 +57,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
       - name: Run tests
-        run: cargo test --workspace --no-fail-fast
+        run: cargo test --workspace --locked --no-fail-fast
 
   # ─── Test with Race Detection ──────────────────────────────────────────────
   test-race:
@@ -74,7 +74,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libudev-dev pkg-config libssl-dev
       - name: Run tests with race detection
-        run: cargo test --workspace --no-fail-fast -- --test-threads=1
+        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
 

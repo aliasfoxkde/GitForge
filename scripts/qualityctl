@@ -64,11 +64,43 @@ if [[ ! -S "$SOCKET" ]]; then
     exit 1
 fi
 
-python3 - "$manifest" "$run_id" <<'PY'
-import json, sys
+python3 - "$manifest" "$run_id" "$ROOT" <<'PY'
+import json, shutil, subprocess, sys
 from pathlib import Path
-path, run_id = sys.argv[1:]
-Path(path).write_text(json.dumps({"run_id": run_id, "status": "running", "stages": []}, indent=2) + "\n")
+path, run_id, root = sys.argv[1:]
+
+def version(command):
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=5,
+                              check=False).stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+def git_value(*args):
+    return version(["git", "-C", root, *args])
+
+manifest = {
+    "contract_version": "gitforge.quality.v1",
+    "run_id": run_id,
+    "status": "running",
+    "repository": root,
+    "git_commit": git_value("rev-parse", "HEAD"),
+    "git_branch": git_value("branch", "--show-current"),
+    "toolchain": {
+        "cargo": version(["cargo", "--version"]),
+        "rustc": version(["rustc", "--version"]),
+        "rustup_toolchain": version(["rustup", "show", "active-toolchain"]),
+        "cargo_llvm_cov": version(["cargo", "llvm-cov", "--version"]),
+    },
+    "environment": {
+        "docker_available": shutil.which("docker") is not None,
+        "aegis_available": shutil.which("aegis") is not None,
+        "aegis_commit": "5a5c742919c078005b2835c38b368b65745e8d6f",
+        "coverage_floor_lines": 79.9,
+    },
+    "stages": [],
+}
+Path(path).write_text(json.dumps(manifest, indent=2) + "\n")
 PY
 
 record_stage() {

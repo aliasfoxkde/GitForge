@@ -162,7 +162,7 @@ jobs:
       - name: Run clippy with security-focused lints
         run: |
           # Check for common security issues in Rust code
-          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Check for unsafe code
         run: |

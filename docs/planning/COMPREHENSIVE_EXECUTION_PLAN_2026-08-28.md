@@ -52,8 +52,10 @@ Goal: make every subsequent result attributable, bounded, and recoverable.
 -  gates with per-stage timeouts and machine-readable results. The implemented
   first tranche covers format, strict Clippy, locked workspace tests, and
   optional LLVM coverage; scanner/docs/E2E stages remain follow-up additions.
-- [ ] P0-05 Add a versioned quality manifest containing tool versions, Rust
+- [x] P0-05 Add a versioned quality manifest containing tool versions, Rust
   channel, coverage floors, scanner commit, and required environment checks.
+  `scripts/qualityctl` now records the Git commit/branch, Cargo/Rust versions,
+  LLVM coverage availability, Docker/Aegis availability, and coverage floor.
 - [x] P0-06 Make generated reports land under ignored `target/quality/` and
   upload or archive them by run ID; prevent root-level artifacts such as
   `codecov.json` from appearing as untracked changes. `qualityctl` now emits
@@ -140,7 +142,9 @@ Goal: CI says what actually passed and releases are verifiable.
 - [ ] P4-08 Execute hosted GitHub workflow canaries and verify the SBOM,
   attestation, checksum, and release assets from a clean machine.
 - [ ] P4-09 Add dependency lockfile policy (`--locked`, cargo-deny/license and
-  advisory policy) to every Rust build path, including templates.
+  advisory policy) to every Rust build path, including templates. The active
+  build/test/lint/release workflows now use `--locked`; cargo-deny/license
+  policy and disabled historical/template paths remain open.
 - [ ] P4-10 Add workflow linting, action pin drift detection, shellcheck, and
   script-injection checks as required CI jobs.
 - [ ] P4-11 Add rollback/release promotion gates and a deployment canary with
