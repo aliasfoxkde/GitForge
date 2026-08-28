@@ -2,6 +2,28 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [0.3.0] - 2026-08-28
+
+### Fixed
+
+- Storage race condition: Added `sync_all()` calls to ensure artifact and cache data is flushed to disk before returning
+- Scheduler stale snapshots: Reject runner-loss snapshots that are older than current state
+- Scheduler persistence errors: Fail closed on database errors to prevent state corruption
+- Build daemon: Proper shutdown coordination and cargo flag forwarding
+- Multi-repository recovery: Preserve repository context during job recovery
+
+### Improved
+
+- Workspace rustfmt applied consistently
+- CI pipeline streaming with lease-fenced logs
+- SBOM and artifact provenance attestations added
+- LLVM coverage ratcheting in CI
+
+### Documentation
+
+- Git at Scale research: Analysis of Cursor's distributed Git architecture
+- Comprehensive execution plan: 8-phase roadmap with evidence-based tracking
+
 ## [0.2.0] - 2026-07-14
 
 ### Added
