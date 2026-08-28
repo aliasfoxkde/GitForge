@@ -643,3 +643,152 @@ impl JobResult {
         (hex::encode(hasher.finalize()), total_bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gitforge_sandbox::StepResult;
+
+    #[test]
+    fn test_executable_job_builder() {
+        let job_id = JobId::new();
+        let pipeline_run_id = PipelineRunId::new();
+        let job = ExecutableJob::new(job_id, pipeline_run_id, "rust:latest".to_string())
+            .with_steps(vec![
+                JobStep::new("build", "cargo build"),
+                JobStep::new("test", "cargo test"),
+            ])
+            .with_env([("RUST_BACKTRACE".to_string(), "1".to_string())].into_iter().collect())
+            .with_timeout(600);
+
+        assert_eq!(job.image, "rust:latest");
+        assert_eq!(job.timeout_secs, 600);
+        assert_eq!(job.steps.len(), 2);
+        assert_eq!(job.env.get("RUST_BACKTRACE"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_executable_job_defaults() {
+        let job_id = JobId::new();
+        let pipeline_run_id = PipelineRunId::new();
+        let job = ExecutableJob::new(job_id, pipeline_run_id, "alpine:latest".to_string());
+
+        assert!(job.repository_id.is_none());
+        assert!(job.base_sha.is_none());
+        assert!(job.working_dir.is_none());
+        assert_eq!(job.timeout_secs, 300);
+        assert!(job.steps.is_empty());
+        assert!(job.env.is_empty());
+    }
+
+    #[test]
+    fn test_job_step_new() {
+        let step = JobStep::new("lint", "cargo clippy");
+
+        assert_eq!(step.name, "lint");
+        assert_eq!(step.run, "cargo clippy");
+        assert!(step.env.is_none());
+        assert!(step.working_directory.is_none());
+    }
+
+    #[test]
+    fn test_job_result_status() {
+        let started = chrono::Utc::now();
+        let completed = started + chrono::Duration::seconds(30);
+
+        // Test success status
+        let success_result = JobResult {
+            job_id: JobId::new(),
+            success: true,
+            exit_code: 0,
+            step_results: vec![StepResult {
+                exit_code: 0,
+                stdout: "OK".to_string(),
+                stderr: String::new(),
+            }],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: None,
+            workspace_path: None,
+        };
+        assert_eq!(success_result.status(), ReceiptStatus::Succeeded);
+
+        // Test failure status
+        let failure_result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: 1,
+            step_results: vec![],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: Some("build failed".to_string()),
+            workspace_path: None,
+        };
+        assert_eq!(failure_result.status(), ReceiptStatus::Failed);
+
+        // Test timeout status
+        let timeout_result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: -1,
+            step_results: vec![],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: Some("operation timeout exceeded".to_string()),
+            workspace_path: None,
+        };
+        assert_eq!(timeout_result.status(), ReceiptStatus::TimedOut);
+    }
+
+    #[test]
+    fn test_compute_output_sha_empty() {
+        let (sha, bytes) = JobResult::compute_output_sha(&[]);
+        assert!(sha.is_empty());
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn test_compute_output_sha_single_artifact() {
+        let artifacts = vec![ArtifactReceipt {
+            name: "binary".to_string(),
+            uri: "gitforge://artifact/123".to_string(),
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            bytes: 1024,
+            media_type: Some("application/octet-stream".to_string()),
+        }];
+
+        let (sha, bytes) = JobResult::compute_output_sha(&artifacts);
+        assert!(!sha.is_empty());
+        assert_eq!(bytes, 1024);
+    }
+
+    #[test]
+    fn test_compute_output_sha_multiple_artifacts() {
+        let artifacts = vec![
+            ArtifactReceipt {
+                name: "a.out".to_string(),
+                uri: "gitforge://artifact/1".to_string(),
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+                bytes: 100,
+                media_type: None,
+            },
+            ArtifactReceipt {
+                name: "b.out".to_string(),
+                uri: "gitforge://artifact/2".to_string(),
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+                bytes: 200,
+                media_type: None,
+            },
+        ];
+
+        let (sha, bytes) = JobResult::compute_output_sha(&artifacts);
+        assert!(!sha.is_empty());
+        assert_eq!(bytes, 300); // 100 + 200
+    }
+}
