@@ -15,6 +15,7 @@ This directory contains both current product documentation and historical planni
 | Testing | [TESTING_STRATEGY.md](TESTING_STRATEGY.md) |
 | Contributing | [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Security policy | [SECURITY.md](SECURITY.md) |
+| Comprehensive execution plan | [planning/COMPREHENSIVE_EXECUTION_PLAN_2026-08-28.md](planning/COMPREHENSIVE_EXECUTION_PLAN_2026-08-28.md) |
 
 ## Historical Or Supporting Docs
 
@@ -35,7 +36,7 @@ When there is disagreement, prefer the canonical docs above and verify against c
 
 Follow-on AI agents should start with:
 
-1. [AUDIT.md](AUDIT.md)
-2. [HANDOFF_PLAN.md](HANDOFF_PLAN.md)
+1. [planning/COMPREHENSIVE_EXECUTION_PLAN_2026-08-28.md](planning/COMPREHENSIVE_EXECUTION_PLAN_2026-08-28.md)
+2. [AUDIT.md](AUDIT.md)
 3. The source files linked by the current phase
 4. The verification commands in [TESTING_STRATEGY.md](TESTING_STRATEGY.md)

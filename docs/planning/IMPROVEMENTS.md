@@ -10,7 +10,8 @@ Repository state after audit:
 - **Linting**: Clippy passes with `-D warnings`
 - **Formatting**: `cargo fmt --check` passes
 - **Race Detection**: Fixed storage durability issue with `sync_all()` calls
-- **Coverage**: 79.72% lines, 81.27% regions (target: 99%)
+- **Coverage**: 79.98% lines, 81.47% regions, 81.36% functions (target: 99%;
+  CI floor: 79.9% LLVM lines)
 
 ## Completed This Session
 
@@ -66,7 +67,8 @@ Repository state after audit:
 6. **Build Daemon**: 22% coverage - coordinator tests needed
 
 ### Low Priority (Architectural)
-7. **WCAG 2.1 AAA**: No browser-based frontend to test
+7. **WCAG 2.1 AAA**: Frontend templates exist; browser-based coverage is not
+   yet complete
 8. **Mutation testing**: Not yet implemented
 
 ## Immediate Next Steps
@@ -88,7 +90,7 @@ Repository state after audit:
 
 ### 4. Release Preparation
 - [ ] Verify all tests pass in CI
-- [ ] Run coverage report and verify >80%
+- [ ] Run coverage report and verify >80% (79.98% measured; 79.9% CI floor)
 - [ ] Create GitHub release with changelog
 
 ## Release Checklist
@@ -96,7 +98,8 @@ Repository state after audit:
 - [ ] All tests pass (`cargo test --workspace`)
 - [ ] Clippy clean (`cargo clippy --workspace -- -D warnings`)
 - [ ] Format check (`cargo fmt -- --check`)
-- [ ] Coverage ≥80% (currently 79.72%)
+- [ ] Coverage ≥80% (currently 79.98%; CI currently enforces 79.9% while
+  package and changed-code floors are added)
 - [ ] No race conditions (storage sync fix applied)
 - [ ] CHANGELOG updated
 - [ ] Version bumped in Cargo.toml

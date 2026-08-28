@@ -2,6 +2,11 @@
 
 Date: 2026-08-07
 
+> Superseded as the execution ledger by
+> [planning/COMPREHENSIVE_EXECUTION_PLAN_2026-08-28.md](planning/COMPREHENSIVE_EXECUTION_PLAN_2026-08-28.md).
+> Retain this document as historical task context; verify its status claims
+> against the dated audit before acting.
+
 This plan is written for a follow-on AI agent. Work top to bottom. Do not start broad refactors without first adding or confirming tests around the behavior being changed.
 
 ## Operating Rules For The Next AI
