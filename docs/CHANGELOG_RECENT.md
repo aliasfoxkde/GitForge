@@ -2,6 +2,19 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [0.3.2] - 2026-08-28
+
+### Added
+
+- MockAiProvider for AI testing with configurable behavior (success, failure, rate limiting)
+- Executor unit tests (7 new tests for JobResult, ExecutableJob, compute_output_sha)
+- Clone derive on AiError for mock support
+
+### Changed
+
+- Coverage improved from 79.80% to 80.12%
+- 46 total tests in gitforge-runner (up from 39)
+
 ## [0.3.0] - 2026-08-28
 
 ### Fixed
