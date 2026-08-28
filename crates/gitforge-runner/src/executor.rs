@@ -658,7 +658,11 @@ mod tests {
                 JobStep::new("build", "cargo build"),
                 JobStep::new("test", "cargo test"),
             ])
-            .with_env([("RUST_BACKTRACE".to_string(), "1".to_string())].into_iter().collect())
+            .with_env(
+                [("RUST_BACKTRACE".to_string(), "1".to_string())]
+                    .into_iter()
+                    .collect(),
+            )
             .with_timeout(600);
 
         assert_eq!(job.image, "rust:latest");
@@ -774,14 +778,16 @@ mod tests {
             ArtifactReceipt {
                 name: "a.out".to_string(),
                 uri: "gitforge://artifact/1".to_string(),
-                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
                 bytes: 100,
                 media_type: None,
             },
             ArtifactReceipt {
                 name: "b.out".to_string(),
                 uri: "gitforge://artifact/2".to_string(),
-                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
                 bytes: 200,
                 media_type: None,
             },

@@ -133,19 +133,17 @@ impl AiProvider for MockAiProvider {
                 // Return a default mock response
                 Ok(ReviewResponse {
                     summary: "Mock review summary".to_string(),
-                    findings: vec![
-                        ReviewFinding {
-                            file: "src/mock.rs".to_string(),
-                            line_start: Some(1),
-                            line_end: Some(10),
-                            severity: Severity::Info,
-                            category: FindingCategory::BestPractice,
-                            title: "Mock finding".to_string(),
-                            description: "This is a mock finding for testing".to_string(),
-                            suggestion: Some("Consider reviewing this in production".to_string()),
-                            code_snippet: Some("fn mock() {}".to_string()),
-                        },
-                    ],
+                    findings: vec![ReviewFinding {
+                        file: "src/mock.rs".to_string(),
+                        line_start: Some(1),
+                        line_end: Some(10),
+                        severity: Severity::Info,
+                        category: FindingCategory::BestPractice,
+                        title: "Mock finding".to_string(),
+                        description: "This is a mock finding for testing".to_string(),
+                        suggestion: Some("Consider reviewing this in production".to_string()),
+                        code_snippet: Some("fn mock() {}".to_string()),
+                    }],
                     overall_score: 100,
                     cost_cents: 1,
                     tokens_used: 100,
