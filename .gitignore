@@ -39,6 +39,7 @@ template-parts/rust/target/
 
 # ─── Rust ─────────────────────────────────────────────────────────────────────
 target/
+target/quality/
 
 # ─── Coverage & Profiling ───────────────────────────────────────────────────────────
 tarpaulin-report.*

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Run GitForge quality gates with bounded, auditable execution.
+set -u -o pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+REPORT_DIR="${QUALITY_REPORT_DIR:-$ROOT/target/quality}"
+TIMEOUT_SECONDS="${QUALITY_TIMEOUT_SECONDS:-3600}"
+BUILD_CLI="${GITFORGE_BUILD_CLI:-$ROOT/target/debug/gitforge-build}"
+BUILD_DAEMON="${GITFORGE_BUILD_DAEMON:-$ROOT/target/debug/gitforge-buildd}"
+SOCKET="${GITFORGE_BUILD_SOCKET:-/tmp/gitforge-build.sock}"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/qualityctl [--fast] [--json]
+
+Runs format, strict Clippy, workspace tests, and (unless --fast) LLVM
+coverage. Reports are written under target/quality/ and heavy Cargo stages
+run through the GitForge build manager.
+EOF
+}
+
+FAST=false
+JSON=false
+while (($#)); do
+    case "$1" in
+        --fast) FAST=true ;;
+        --json) JSON=true ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+mkdir -p "$REPORT_DIR"
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+manifest="$REPORT_DIR/quality-manifest.json"
+log_dir="$REPORT_DIR/$run_id"
+mkdir -p "$log_dir"
+
+if [[ ! -x "$BUILD_CLI" || ! -x "$BUILD_DAEMON" ]]; then
+    echo "GitForge manager binaries are missing; build gitforge-build --bins first" >&2
+    exit 2
+fi
+
+daemon_pid=""
+cleanup() {
+    if [[ -n "$daemon_pid" ]]; then
+        "$BUILD_CLI" --socket "$SOCKET" --shutdown >/dev/null 2>&1 || true
+        wait "$daemon_pid" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+if [[ ! -S "$SOCKET" ]]; then
+    "$BUILD_DAEMON" >"$log_dir/daemon.log" 2>&1 &
+    daemon_pid=$!
+    for _ in $(seq 1 100); do
+        [[ -S "$SOCKET" ]] && break
+        sleep 0.1
+    done
+fi
+if [[ ! -S "$SOCKET" ]]; then
+    echo "GitForge build manager did not create $SOCKET" >&2
+    exit 1
+fi
+
+python3 - "$manifest" "$run_id" <<'PY'
+import json, sys
+from pathlib import Path
+path, run_id = sys.argv[1:]
+Path(path).write_text(json.dumps({"run_id": run_id, "status": "running", "stages": []}, indent=2) + "\n")
+PY
+
+record_stage() {
+    local name="$1"; shift
+    local log="$log_dir/$name.log"
+    local started ended status
+    started=$(date -u +%s)
+    if timeout --signal=TERM --kill-after=15s "$TIMEOUT_SECONDS" \
+        "$BUILD_CLI" --socket "$SOCKET" --dir "$ROOT" -- "$@" >"$log" 2>&1; then
+        status=passed
+    else
+        status=failed
+    fi
+    ended=$(date -u +%s)
+    python3 - "$manifest" "$name" "$status" "$((ended-started))" "$log" <<'PY'
+import json, sys
+from pathlib import Path
+path, name, status, duration, log = sys.argv[1:]
+data = json.loads(Path(path).read_text())
+data["stages"].append({"name": name, "status": status, "duration_seconds": int(duration), "log": log})
+Path(path).write_text(json.dumps(data, indent=2) + "\n")
+PY
+    [[ "$status" == passed ]]
+}
+
+failed=0
+record_stage format fmt --all -- --check || failed=1
+record_stage clippy clippy --workspace --all-targets -- -D warnings || failed=1
+record_stage test test --workspace --locked --no-fail-fast || failed=1
+if [[ "$FAST" != true ]]; then
+    record_stage coverage llvm-cov --workspace --all-features --locked --no-fail-fast \
+        --cobertura --output-path target/quality/cobertura.xml --fail-under-lines 79.9 || failed=1
+fi
+
+python3 - "$manifest" "$failed" "$JSON" <<'PY'
+import json, sys
+from pathlib import Path
+path, failed, json_mode = sys.argv[1:]
+data = json.loads(Path(path).read_text())
+data["status"] = "failed" if failed != "0" else "passed"
+Path(path).write_text(json.dumps(data, indent=2) + "\n")
+if json_mode != "true":
+    print(json.dumps(data, indent=2))
+PY
+
+if [[ "$failed" != 0 ]]; then exit 1; fi

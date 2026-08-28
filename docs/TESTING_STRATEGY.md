@@ -27,6 +27,12 @@ gitforge-build --cancel JOB_ID
 gitforge-build --shutdown
 ```
 
+For the repeatable quality sequence, use `scripts/qualityctl --fast` for
+format, strict Clippy, and locked workspace tests, or omit `--fast` to add the
+LLVM coverage gate. It writes a JSON manifest and per-stage logs under the
+ignored `target/quality/` directory. Set `QUALITY_TIMEOUT_SECONDS` to bound a
+stage in constrained environments.
+
 For manager changes, also run the active-job shutdown smoke test described in
 `docs/AUDIT.md`; it must verify socket removal and no surviving cargo/rustc
 descendants.

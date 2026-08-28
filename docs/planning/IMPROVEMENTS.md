@@ -74,6 +74,8 @@ Repository state after audit:
 ## Immediate Next Steps
 
 ### 1. Test Infrastructure
+- [x] Add a manager-backed `scripts/qualityctl` with bounded stages and JSON
+  manifests
 - [ ] Add Docker-based integration tests for runner executor
 - [ ] Create AI provider mock implementations for testing
 - [ ] Add git-server protocol integration tests

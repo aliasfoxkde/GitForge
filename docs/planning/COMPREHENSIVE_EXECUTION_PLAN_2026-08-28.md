@@ -47,14 +47,17 @@ Goal: make every subsequent result attributable, bounded, and recoverable.
 - [x] P0-02 Keep codebase-memory indexing current and use graph discovery for
   symbol-level work.
 - [x] P0-03 Run `scripts/harnessctl doctor` and preserve failures as evidence.
-- [ ] P0-04 Add a single `scripts/qualityctl` entry point that runs the exact
+- [x] P0-04 Add a single `scripts/qualityctl` entry point that runs the exact
   local equivalents of format, lint, tests, coverage, scanner, docs, and E2E
-  gates with per-stage timeouts and machine-readable results.
+-  gates with per-stage timeouts and machine-readable results. The implemented
+  first tranche covers format, strict Clippy, locked workspace tests, and
+  optional LLVM coverage; scanner/docs/E2E stages remain follow-up additions.
 - [ ] P0-05 Add a versioned quality manifest containing tool versions, Rust
   channel, coverage floors, scanner commit, and required environment checks.
-- [ ] P0-06 Make generated reports land under ignored `target/quality/` and
+- [x] P0-06 Make generated reports land under ignored `target/quality/` and
   upload or archive them by run ID; prevent root-level artifacts such as
-  `codecov.json` from appearing as untracked changes.
+  `codecov.json` from appearing as untracked changes. `qualityctl` now emits
+  per-stage logs and a JSON manifest there.
 
 Exit criteria: a clean checkout can run one command and produce a complete,
 timestamped pass/fail manifest without relying on a developer terminal.
