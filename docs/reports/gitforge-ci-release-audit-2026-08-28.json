@@ -1,0 +1,344 @@
+{
+  "audit_date": "2026-08-28",
+  "repo": "/home/mkinney/work/gitforge-audit-20260822",
+  "branch": "feature/ci-release-audit-20260828",
+  "toolchain": {
+    "cargo": "1.98.0",
+    "rustc": "1.98.0"
+  },
+  "evidence": {
+    "workspace_tests": {
+      "command": "cargo test --workspace --no-fail-fast",
+      "exit_code": 0,
+      "result": "PASS",
+      "note": "All crates green; 9 runner service tests, scheduler tests, queue tests, process supervision tests, docker sandbox stub tests"
+    },
+    "formatting": {
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "result": "PASS",
+      "note": "All workspace crates formatted correctly"
+    },
+    "clippy_strict": {
+      "command": "cargo clippy --all-targets --all-features -- -D warnings",
+      "exit_code": 1,
+      "result": "FAIL",
+      "errors": [
+        {
+          "file": "crates/gitforge-api/src/routes/ci.rs",
+          "line": 604,
+          "lint": "clippy::unnecessary-lazy-evaluations",
+          "fix": "ok_or_else(|| \"...\") → ok_or(\"...\")"
+        },
+        {
+          "file": "crates/gitforge-api/src/routes/ci.rs",
+          "line": 608,
+          "lint": "clippy::unnecessary-lazy-evaluations",
+          "fix": "ok_or_else(|| \"...\") → ok_or(\"...\")"
+        },
+        {
+          "file": "crates/gitforge-api/src/routes/ci.rs",
+          "line": 612,
+          "lint": "clippy::unnecessary-lazy-evaluations",
+          "fix": "ok_or_else(|| \"...\") → ok_or(\"...\")"
+        }
+      ]
+    },
+    "release_build": {
+      "command": "cargo build --release",
+      "exit_code": 0,
+      "result": "PASS",
+      "duration_seconds": 81,
+      "artifacts": [
+        "target/release/api",
+        "target/release/ci",
+        "target/release/git-server",
+        "target/release/runner"
+      ]
+    },
+    "cargo_vet": {
+      "command": "cargo vet",
+      "exit_code": null,
+      "result": "SKIPPED",
+      "note": "cargo-vet not installed on this system"
+    },
+    "sandbox_fail_closed": {
+      "command": "grep -n 'GITFORGE_SANDBOX_MODE.*required' services/runner/src/main.rs",
+      "exit_code": 0,
+      "result": "CONFIRMED",
+      "detail": "services/runner/src/main.rs:17 sets GITFORGE_SANDBOX_MODE=required before any async runtime init"
+    },
+    "scheduler_no_auth": {
+      "command": "grep -rn 'Authorization' crates/gitforge-scheduler/src/server.rs",
+      "exit_code": 1,
+      "result": "CONFIRMED",
+      "detail": "No Authorization header check on any scheduler HTTP route (register_runner, heartbeat, get_pending_jobs, assign_job, complete_job)"
+    },
+    "runner_placeholder_commands": {
+      "command": "grep -n \"echo.*job assigned\" crates/gitforge-scheduler/src/server.rs",
+      "exit_code": 0,
+      "result": "CONFIRMED",
+      "detail": "crates/gitforge-scheduler/src/server.rs:135 hardcodes commands: vec![\"echo 'job assigned'.to_string()]"
+    },
+    "poll_build_stub": {
+      "command": "grep -n 'GET.*jobs.*status' .github/workflows/gitforge-ci.yml",
+      "exit_code": 1,
+      "result": "CONFIRMED",
+      "detail": "poll-build job contains only echo steps; no actual GET polling call exists in workflow"
+    },
+    "health_endpoint_insufficient": {
+      "detail": "GET /health on ci service (port 42781) returns 'OK' with no logic. Does not confirm DB connection, queue processing, runner heartbeats, Docker availability, or event bus subscribers."
+    },
+    "webhook_token_placeholder": {
+      "detail": ".github/workflows/gitforge-ci.yml:37 Authorization header reads 'Bearer $GITFO...OKEN' (redacted/truncated placeholder)"
+    },
+    "template_target_committed": {
+      "command": "git status --short template-parts/rust/target/ | wc -l",
+      "result": "3386 deleted files in working tree from template-parts/rust/target/ (compiled artifacts committed to repo)"
+    }
+  },
+  "service_facts": {
+    "api": {
+      "binary": "target/release/api",
+      "default_port": 42780,
+      "db_default": "sqlite:/gitforge.db",
+      "auth": "JWT_SECRET env var (panics if absent)",
+      "process_supervision": "init with warn-on-failure",
+      "docker_dependency": "none"
+    },
+    "ci": {
+      "binary": "target/release/ci",
+      "scheduler_port": 42781,
+      "db_default": "sqlite:./gitforge.db",
+      "event_bus": "InMemoryEventBus (non-durable)",
+      "process_supervision": "init with warn-on-failure",
+      "docker_dependency": "none",
+      "note": "Scheduler embedded in same process; scheduler loop ticks every 5 seconds"
+    },
+    "git_server": {
+      "binary": "target/release/git-server",
+      "http_port": 42782,
+      "ssh_port": 42022,
+      "git_root_default": "/var/lib/gitforge/repos",
+      "ssh_status": "pending (russh API resolution required)",
+      "process_supervision": "init with warn-on-failure",
+      "docker_dependency": "none"
+    },
+    "runner": {
+      "binary": "target/release/runner",
+      "scheduler_url_default": "http://localhost:42781",
+      "sandbox_mode": "required (fails closed without Docker)",
+      "docker_dependency": "required (connect_required() with ping)",
+      "heartbeat_interval_secs": 30,
+      "job_fetch_interval_secs": 5,
+      "default_capacity": 2
+    }
+  },
+  "gaps": {
+    "critical": [
+      {
+        "id": "G-01",
+        "title": "poll-build job is a stub — no actual job status polling",
+        "detail": "The poll-build job in gitforge-ci.yml contains only echo steps. There is no GET /api/jobs/{id}/status call, no until loop, no terminal state detection. GitHub Actions cannot determine if the enqueued build passed or failed."
+      },
+      {
+        "id": "G-02",
+        "title": "Runner receives placeholder job commands, not real pipeline steps",
+        "detail": "crates/gitforge-scheduler/src/server.rs:135 hardcodes commands: vec![\"echo 'job assigned'\"] in get_pending_jobs. Real pipeline step definitions from the DB are never transmitted to the runner."
+      },
+      {
+        "id": "G-03",
+        "title": "Runner uses hardcoded Docker image, ignores job config",
+        "detail": "RunnerAgent::execute_job hardcodes image: \"rust:latest\". The actual job's configured image is never used."
+      },
+      {
+        "id": "G-04",
+        "title": "No runner heartbeat timeout or offline eviction",
+        "detail": "Scheduler stores runner last_heartbeat in-memory only. There is no timeout threshold, no background task to mark runners offline, and no call to process_queue to reassign orphaned jobs after runner crash."
+      },
+      {
+        "id": "G-05",
+        "title": "assigned jobs survive runner crashes permanently",
+        "detail": "Jobs in 'assigned' status in DB after runner crash are never re-enqueued. No recovery mechanism exists on scheduler startup or as a background task."
+      }
+    ],
+    "high": [
+      {
+        "id": "G-06",
+        "title": "Scheduler HTTP API has no authentication",
+        "detail": "All routes (register_runner, heartbeat, get_pending_jobs, assign_job, complete_job) are unauthenticated. Any client that can reach port 42781 can register fake runners and manipulate job state."
+      },
+      {
+        "id": "G-07",
+        "title": "GitHub webhook trigger token is a placeholder",
+        "detail": "gitforge-ci.yml:37 uses 'Bearer $GITFO...OKEN' (redacted). The actual token is not confirmed to be in GitHub Secrets."
+      },
+      {
+        "id": "G-08",
+        "title": "InMemoryEventBus provides no event durability",
+        "detail": "Events are lost on CI process restart. Control-plane triggers persist the PipelineRun before publishing (correct), but native push events from git-server lack a durable backing store."
+      },
+      {
+        "id": "G-09",
+        "title": "SQLite concurrent writer contention between api and ci services",
+        "detail": "Both api and ci services open sqlite:/data/gitforge.db over Docker volume. A stuck writer in ci service will block api service queries. No lock timeout configured."
+      },
+      {
+        "id": "G-10",
+        "title": "template-parts/rust/target/ committed to repository",
+        "detail": "3386 compiled artifact files (hundreds of MB) are tracked in git under template-parts/rust/target/. Not in .gitignore. Inflates clones, pollutes diffs."
+      },
+      {
+        "id": "G-11",
+        "title": "workspaces/ directory is untracked and unignored",
+        "detail": "workspaces/platform-aegis-gitforge-smoke-20260825/ is present as an untracked directory."
+      }
+    ],
+    "medium": [
+      {
+        "id": "G-12",
+        "title": "Release artifacts have no provenance attestation",
+        "detail": "No per-binary signing, no SBOM, no reproducibility check. Only SHA256SUMS of the tar.gz archives."
+      },
+      {
+        "id": "G-13",
+        "title": "Clippy strict mode (-D warnings) fails on gitforge-api",
+        "detail": "3 unnecessary_lazy_evaluations errors prevent strict clippy from passing. Developers running 'make lint' (which calls clippy) will see failures."
+      },
+      {
+        "id": "G-14",
+        "title": "No schema migration system",
+        "detail": "Pool::migrate() exists but migration definitions are unversioned. Schema upgrades require manual intervention."
+      },
+      {
+        "id": "G-15",
+        "title": "No rate limiting on POST /pipelines/trigger",
+        "detail": "An authorized client can trigger unlimited pipeline runs without throttling."
+      },
+      {
+        "id": "G-16",
+        "title": "Stale comment in release.yml",
+        "detail": "Line 15 reads 'cross-compilation not available' but cross-compilation is actively used for macOS and Windows targets in the same file."
+      }
+    ]
+  },
+  "implementation_steps": [
+    {
+      "priority": "P0",
+      "step": 1,
+      "action": "Implement actual job status polling in poll-build job: GET /api/jobs/{job_id}/status with until loop polling until terminal state (success/failed/cancelled), exit 0 on success, exit 1 on failure",
+      "files": [".github/workflows/gitforge-ci.yml"],
+      "gap_ids": ["G-01"]
+    },
+    {
+      "priority": "P0",
+      "step": 2,
+      "action": "Wire real pipeline step commands from DB to runner job assignment: replace placeholder in get_pending_jobs with actual step data queried from PipelineQueries and JobQueries",
+      "files": ["crates/gitforge-scheduler/src/server.rs", "crates/gitforge-db/src/queries/"],
+      "gap_ids": ["G-02"]
+    },
+    {
+      "priority": "P0",
+      "step": 3,
+      "action": "Add runner heartbeat timeout and auto-offline eviction: background task checks last_heartbeat, marks runners offline after threshold (e.g., 90s), calls process_queue to reassign orphaned jobs",
+      "files": ["crates/gitforge-scheduler/src/assigner.rs"],
+      "gap_ids": ["G-04"]
+    },
+    {
+      "priority": "P0",
+      "step": 4,
+      "action": "Add assigned job recovery on scheduler startup: query jobs in 'assigned' status, verify runner is still online via heartbeat, move stale assignments back to 'queued'",
+      "files": ["crates/gitforge-scheduler/src/assigner.rs"],
+      "gap_ids": ["G-05"]
+    },
+    {
+      "priority": "P1",
+      "step": 5,
+      "action": "Add Bearer token authentication to all scheduler HTTP routes: X-Schcheduler-Token header checked against GITFORGE_SCHEDULER_TOKEN env var",
+      "files": ["crates/gitforge-scheduler/src/server.rs"],
+      "gap_ids": ["G-06"]
+    },
+    {
+      "priority": "P1",
+      "step": 6,
+      "action": "Add GITFORGE_CI_TRIGGER_TOKEN to GitHub Secrets; update gitforge-ci.yml to use secrets.GITFORGE_CI_TRIGGER_TOKEN in Authorization header",
+      "files": [".github/workflows/gitforge-ci.yml"],
+      "gap_ids": ["G-07"]
+    },
+    {
+      "priority": "P1",
+      "step": 7,
+      "action": "Configure SQLite busy_timeout or migrate to PostgreSQL for concurrent writer access; add health check to docker-compose for api service",
+      "files": ["docker-compose.yml", "crates/gitforge-db/src/connection/"],
+      "gap_ids": ["G-09"]
+    },
+    {
+      "priority": "P1",
+      "step": 8,
+      "action": "Fix Clippy strict lints in gitforge-api/src/routes/ci.rs: replace ok_or_else(|| '...') with ok_or('...') on lines 604, 608, 612",
+      "files": ["crates/gitforge-api/src/routes/ci.rs"],
+      "gap_ids": ["G-13"]
+    },
+    {
+      "priority": "P2",
+      "step": 9,
+      "action": "Upgrade runner heartbeat/fetch failure logs from trace to warn or error level to enable alerting",
+      "files": ["crates/gitforge-runner/src/agent.rs"],
+      "gap_ids": []
+    },
+    {
+      "priority": "P2",
+      "step": 10,
+      "action": "Add docker healthcheck to runner service in docker-compose: check Docker ping and sandbox connectivity",
+      "files": ["docker-compose.yml"],
+      "gap_ids": []
+    },
+    {
+      "priority": "P2",
+      "step": 11,
+      "action": "Remove template-parts/rust/target/ from git tracking, add to .gitignore, delete from history with BFG or git filter-branch",
+      "files": [".gitignore", "template-parts/rust/target/"],
+      "gap_ids": ["G-10"]
+    },
+    {
+      "priority": "P2",
+      "step": 12,
+      "action": "Add workspaces/ to .gitignore",
+      "files": [".gitignore"],
+      "gap_ids": ["G-11"]
+    },
+    {
+      "priority": "P2",
+      "step": 13,
+      "action": "Implement sqlx migration files for schema versioning",
+      "files": ["crates/gitforge-db/src/"],
+      "gap_ids": ["G-14"]
+    },
+    {
+      "priority": "P3",
+      "step": 14,
+      "action": "Add per-binary SHA256 to release artifacts; consider separate sig files per binary",
+      "files": [".github/workflows/release.yml"],
+      "gap_ids": ["G-12"]
+    },
+    {
+      "priority": "P3",
+      "step": 15,
+      "action": "Replace InMemoryEventBus with gitforge-db-backed durable event log for git-server push events",
+      "files": ["crates/gitforge-events/src/", "crates/gitforge-db/src/"],
+      "gap_ids": ["G-08"]
+    },
+    {
+      "priority": "P3",
+      "step": 16,
+      "action": "Add rate limiting to POST /pipelines/trigger using in-memory token bucket or Redis",
+      "files": ["crates/gitforge-api/src/routes/ci.rs"],
+      "gap_ids": ["G-15"]
+    }
+  ],
+  "audit_type": "read_only_with_workspace_tests",
+  "mutations_performed": "none_to_production_services",
+  "test_mutations": "cargo test executes tests in isolated temporary databases; clippy strict mode is a read-only compile check; formatting check is read-only",
+  "report_file": "docs/reports/gitforge-ci-release-audit-2026-08-28.md",
+  "receipt_file": "docs/reports/gitforge-ci-release-audit-2026-08-28.json"
+}
