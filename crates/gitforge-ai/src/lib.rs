@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// AI provider errors
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AiError {
     #[error("API error: {0}")]
     Api(String),
@@ -355,10 +355,12 @@ impl AiProviderFactory {
 
 // Re-export implementations
 mod anthropic;
+mod mock;
 mod ollama;
 mod openai;
 
 pub use anthropic::AnthropicProvider;
+pub use mock::{MockAiProvider, MockProviderConfig};
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
 
