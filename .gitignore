@@ -10,6 +10,7 @@ dist/
 *.out
 coverage.out
 coverage.html
+codecov.json
 *.html
 report.xml
 .aetheon-build/

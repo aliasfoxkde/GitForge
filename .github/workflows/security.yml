@@ -79,7 +79,73 @@ jobs:
 
       - name: Check for vulnerable dependencies
         uses: actions/dependency-review-action@40c09b7dc99638e5ddb0bfd91c1673effc064d8a # v4.8.1
-        continue-on-error: true
+
+  # ─── Aegis changed-line security gate ──────────────────────────────────────
+  # Scan only the diff so intentional historical test fixtures do not become
+  # an unreviewable baseline. New high/critical findings fail the workflow.
+  aegis-scan:
+    name: Aegis Changed-Line Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Build pinned Aegis scanner
+        env:
+          AEGIS_COMMIT: 5a5c742919c078005b2835c38b368b65745e8d6f
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/aliasfoxkde/aegis.git "$RUNNER_TEMP/aegis"
+          git -C "$RUNNER_TEMP/aegis" checkout --detach "$AEGIS_COMMIT"
+          cargo build --locked --release --manifest-path "$RUNNER_TEMP/aegis/Cargo.toml" --package aegis-cli --bin aegis
+
+      - name: Prepare changed-line diff
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BASE_REF:-}" ]; then
+            git fetch --no-tags origin "$BASE_REF"
+            git diff --unified=0 "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/gitforge.diff"
+          else
+            git diff --unified=0 HEAD^ HEAD > "$RUNNER_TEMP/gitforge.diff"
+          fi
+
+      - name: Run Aegis changed-line scan
+        env:
+          AEGIS_BIN: /home/runner/work/_temp/aegis/target/release/aegis
+        run: |
+          set -euo pipefail
+          # Resolve the actual temporary checkout path rather than relying on
+          # a hard-coded runner workspace layout.
+          AEGIS_BIN="$RUNNER_TEMP/aegis/target/release/aegis"
+          set +e
+          "$AEGIS_BIN" --format json scan . \
+            --categories secrets,security-hardening,web-security,ai-safety,supply-chain \
+            --diff "$RUNNER_TEMP/gitforge.diff" \
+            --output-file target-aegis.json
+          scanner_status=$?
+          set -e
+          test -s target-aegis.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("target-aegis.json").read_text())
+          findings = report.get("findings", [])
+          blocking = [f for f in findings if f.get("severity") in {"high", "critical"}]
+          if blocking:
+              for finding in blocking:
+                  location = finding.get("location", {})
+                  print(f"{finding.get('severity')}: {finding.get('pattern')} "
+                        f"{location.get('file')}:{location.get('line')}")
+              raise SystemExit(f"Aegis found {len(blocking)} new high/critical finding(s)")
+          print(f"Aegis changed-line scan passed ({len(findings)} non-blocking finding(s))")
+          PY
+          # Aegis may use exit 1 to indicate findings even when no blocking
+          # findings exist; the JSON severity gate above is authoritative.
+          test "$scanner_status" -eq 0 || echo "Aegis reported non-blocking findings"
 
   # ─── Rust-specific Security Checks ─────────────────────────────────────────
   rust-security:

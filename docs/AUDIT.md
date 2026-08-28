@@ -321,3 +321,14 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
   `gitforge-build test --workspace` without requiring a separator. A real
   daemon smoke test confirmed socket cleanup and no surviving rustup/cargo/rustc
   processes; cross-restart durable job recovery remains open.
+- A fresh Aegis scan on 2026-08-28 found no safe basis for treating a full-tree
+  scan as a clean gate: the current source contains intentional security-test
+  fixtures and the scanner reports large medium/high volumes, including 20
+  critical matches that require triage rather than blind suppression. GitForge
+  CI now uses a pinned Aegis build and changed-line scan that blocks only new
+  high/critical findings. The local Atheon MCP scan endpoint failed internally;
+  its binary fallback completed on scoped input but is noisy and must remain
+  bounded/excluded from generated build trees.
+- CodeQL Rust compilation and dependency review are now fail-closed; previous
+  `|| true` and `continue-on-error` behavior could report green while the
+  security analysis had not actually completed.
