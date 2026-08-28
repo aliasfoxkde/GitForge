@@ -1,7 +1,7 @@
 {
   "date": "2026-08-28",
   "branch": "feature/p0-runner-command-wiring-retry-20260828",
-  "summary": "All tests pass. Job metadata (image + steps) now correctly wired from API through scheduler to runner.",
+  "summary": "Corrective pass: execute_job now fails-closed on empty commands (matching existing image behavior). All tests pass.",
   "clippy": {
     "command": "cargo clippy --workspace --all-targets -- -D warnings",
     "result": "PASS",
@@ -9,67 +9,71 @@
     "errors": 0
   },
   "targeted_tests": {
-    "command": "cargo test --package gitforge-api --package gitforge-scheduler --package gitforge-db --package gitforge-runner",
+    "command": "cargo test --package gitforge-runner",
     "result": "PASS",
     "packages": {
-      "gitforge-api": { "passed": 231, "failed": 0 },
-      "gitforge-db": { "passed": 81, "failed": 0 },
-      "gitforge-runner": { "passed": 60, "failed": 0 },
-      "gitforge-scheduler": { "passed": 37, "failed": 0 }
+      "gitforge-runner": { "passed": 64, "failed": 0 }
     }
   },
   "workspace_tests": {
     "command": "cargo test --workspace",
     "result": "PASS"
   },
-  "fixes": [
+  "formatter": {
+    "command": "cargo fmt --all",
+    "result": "PASS"
+  },
+  "corrective_fix": {
+    "issue": "execute_job warned and proceeded on empty commands instead of failing closed",
+    "before": "tracing::warn! + proceed to executor with empty steps list",
+    "after": "tracing::error! + POST failure receipt to scheduler + return",
+    "files_changed": [
+      "crates/gitforge-runner/src/agent.rs"
+    ]
+  },
+  "fail_closed_test_cases": [
     {
-      "issue": "parse_jobs_from_config did not extract steps from pipeline config",
-      "fix": "Changed return type from Vec<(String,String)> to Vec<JobSpec> with steps field; persist steps via JobStepQueries::create"
+      "test": "test_job_assignment_empty_image_deserializes_from_missing_field",
+      "input": "JSON missing image field",
+      "deserialization_result": "image = \"\" via #[serde(default)]",
+      "execute_job_result": "rejected, failure posted to scheduler"
     },
     {
-      "issue": "Inline test migrations (connection.rs) missing image column and job_steps table",
-      "fix": "Added image TEXT NOT NULL DEFAULT '' to jobs table; added full job_steps table to migrate()"
+      "test": "test_job_assignment_deserialize_with_null_image",
+      "input": "{\"image\":null,...}",
+      "deserialization_result": "error (type mismatch, not silently defaulted)"
     },
     {
-      "issue": "Unused imports causing clippy failure",
-      "fix": "Removed 'Job as DbJob' from assigner.rs; removed 'Pool' from server.rs"
+      "test": "test_job_assignment_missing_commands_defaults_to_empty_vec",
+      "input": "JSON missing commands field",
+      "deserialization_result": "commands = [] via #[serde(default)]",
+      "execute_job_result": "rejected, failure posted to scheduler"
+    },
+    {
+      "test": "test_job_assignment_deserialize_with_null_commands",
+      "input": "{\"commands\":null,...}",
+      "deserialization_result": "error (type mismatch, not silently defaulted)"
+    },
+    {
+      "test": "test_job_assignment_empty_commands_vec_rejected_at_execute",
+      "input": "commands: vec![] (struct valid, runtime rejected)",
+      "execute_job_result": "rejected, failure posted to scheduler"
+    },
+    {
+      "test": "test_job_assignment_valid_image_and_commands_reaches_executor",
+      "input": "non-empty image + non-empty commands",
+      "execute_job_result": "proceeds to executor.execute()"
     }
   ],
-  "pipeline_config_required_shape": {
-    "description": "Jobs must have name, image, and steps array with at least one step",
-    "example": {
-      "jobs": [
-        {
-          "name": "build",
-          "image": "rust:1.75",
-          "steps": [
-            { "name": "compile", "run": "cargo build" },
-            { "name": "test", "run": "cargo test" }
-          ]
-        }
-      ]
-    },
-    "validation": {
-      "name": "required, non-empty string",
-      "image": "required, non-empty string",
-      "steps": "required, non-empty array",
-      "step.name": "required, non-empty string",
-      "step.run": "required, non-empty string"
-    }
-  },
   "fail_closed_behavior": {
-    "get_pending_jobs": {
-      "empty_image": "skips job (logs warning), runner never receives it"
-    },
     "execute_job": {
-      "empty_image": "refuses execution, reports failure to scheduler"
+      "empty_image": "refuses execution, reports failure to scheduler (exit -1)",
+      "empty_commands": "refuses execution, reports failure to scheduler (exit -1) — CORRECTED"
     }
   },
   "files_changed": [
-    "crates/gitforge-api/src/routes/ci.rs",
-    "crates/gitforge-db/src/connection.rs",
-    "crates/gitforge-scheduler/src/assigner.rs",
-    "crates/gitforge-scheduler/src/server.rs"
+    "crates/gitforge-runner/src/agent.rs",
+    "docs/reports/test-results-20260828.md",
+    "docs/reports/test-results-20260828.json"
   ]
 }

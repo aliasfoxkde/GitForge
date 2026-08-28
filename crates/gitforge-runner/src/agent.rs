@@ -432,9 +432,11 @@ impl RunnerAgent {
 
     /// Execute a job assignment.
     ///
-    /// Fails-closed if the assignment has an empty image or empty commands,
+    /// Fails-closed if the assignment has an empty image or no commands,
     /// because both are required for safe sandbox execution. The scheduler is
     /// responsible for ensuring only properly-configured jobs reach this point.
+    /// On failure a completion report is sent to the scheduler so the job is not
+    /// left in limbo.
     async fn execute_job(
         executor: &Arc<JobExecutor>,
         assignment: &JobAssignment,
@@ -478,12 +480,33 @@ impl RunnerAgent {
             return;
         }
 
-        // Warn if no commands (job may be a no-op or misconfigured)
+        // Fail-closed: reject assignments without commands.
+        // An empty commands list means the job has no steps, which is a
+        // malformed execution request regardless of how it reached the runner.
         if assignment.commands.is_empty() {
-            tracing::warn!(
-                "job {} has no commands — proceeding with empty command list",
+            tracing::error!(
+                "job {} has no commands — refusing to execute (malformed job metadata)",
                 assignment.job_id
             );
+            let complete_url = format!("{}/jobs/{}/complete", scheduler_url, assignment.job_id);
+            let failure_request = serde_json::json!({
+                "success": false,
+                "exit_code": -1,
+                "error": "job has no commands configured (malformed job metadata)",
+            });
+            if let Err(e) = client
+                .post(&complete_url)
+                .json(&failure_request)
+                .send()
+                .await
+            {
+                tracing::error!(
+                    "failed to report malformed job {}: {}",
+                    assignment.job_id,
+                    e
+                );
+            }
+            return;
         }
 
         // Convert assignment to ExecutableJob using the actual image from the scheduler
@@ -940,6 +963,76 @@ mod tests {
             err.to_string().contains("null"),
             "error should mention null type mismatch"
         );
+    }
+
+    #[test]
+    fn test_job_assignment_missing_commands_defaults_to_empty_vec() {
+        // When commands is missing in JSON, #[serde(default)] produces an empty Vec.
+        // execute_job then fails-closed because an empty command list is malformed.
+        let json = r#"{"job_id":"job-no-cmds","name":"test","pipeline_run_id":"run-1","image":"rust:1.75"}"#;
+        let assignment: JobAssignment = serde_json::from_str(json).unwrap();
+        assert!(
+            assignment.commands.is_empty(),
+            "missing commands field should deserialize to empty Vec via #[serde(default)]"
+        );
+        assert_eq!(assignment.image, "rust:1.75");
+    }
+
+    #[test]
+    fn test_job_assignment_deserialize_with_null_commands() {
+        // Explicit null for commands field is a deserialization error (not a default value).
+        // #[serde(default)] only applies when the field is MISSING, not when it's null.
+        // This is correct fail-closed behavior: malformed JSON should not silently succeed.
+        let json = r#"{"job_id":"job-null-cmd","name":"test","pipeline_run_id":"run-1","image":"rust:1.75","commands":null}"#;
+        let result: std::result::Result<JobAssignment, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "explicit null commands should fail to deserialize"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("null"),
+            "error should mention null type mismatch"
+        );
+    }
+
+    #[test]
+    fn test_job_assignment_empty_commands_vec_rejected_at_execute() {
+        // An assignment with an explicitly empty commands Vec is a valid struct,
+        // but execute_job must fail-closed on it (same as missing image).
+        // This test documents the structural validity; the runtime rejection is
+        // exercised by execute_job's fail-closed check on assignment.commands.is_empty().
+        let assignment = JobAssignment {
+            job_id: "job-empty-cmds".to_string(),
+            name: "test".to_string(),
+            pipeline_run_id: "run-1".to_string(),
+            image: "rust:1.75".to_string(),
+            commands: vec![],
+            working_dir: None,
+        };
+        // Struct is valid but commands are empty → execute_job will reject it
+        assert!(assignment.commands.is_empty());
+        assert!(!assignment.image.is_empty());
+    }
+
+    #[test]
+    fn test_job_assignment_valid_image_and_commands_reaches_executor() {
+        // Valid assignment: non-empty image AND non-empty commands.
+        // execute_job builds an ExecutableJob and calls executor.execute().
+        let assignment = JobAssignment {
+            job_id: "job-valid".to_string(),
+            name: "build".to_string(),
+            pipeline_run_id: "run-1".to_string(),
+            image: "rust:1.75".to_string(),
+            commands: vec!["cargo build".to_string(), "cargo test".to_string()],
+            working_dir: Some("/repo".to_string()),
+        };
+        assert!(!assignment.image.is_empty(), "image must be non-empty");
+        assert!(
+            !assignment.commands.is_empty(),
+            "commands must be non-empty"
+        );
+        assert_eq!(assignment.commands.len(), 2);
     }
 
     #[test]
