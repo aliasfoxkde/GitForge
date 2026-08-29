@@ -34,42 +34,32 @@ impl<S: StorageBackend> HttpGitHandler<S> {
     async fn build_ref_advertisement(&self, repo_id: RepoId) -> Result<Vec<u8>> {
         let repo = self.storage.open(repo_id).await?;
 
-        // Get all refs
+        // Smart HTTP protocol v0 starts with a service announcement and a
+        // flush packet. The previous implementation wrote plain text here,
+        // which made standard Git clients reject the response before they
+        // could discover refs.
         let mut response = Vec::new();
+        response.extend_from_slice(&Self::format_pkt_line("# service=git-upload-pack\n"));
+        response.extend_from_slice(b"0000");
 
-        // Add protocol version
-        response.extend_from_slice(b"version 2\n");
-        response.extend_from_slice(b"agent=gitforge/0.1.0\n");
-
-        // Get HEAD reference
-        if let Ok(reference) = repo.head() {
-            let ref_name = reference.name().unwrap_or("HEAD");
-            let oid = reference
-                .target()
-                .map(|oid| oid.to_string())
-                .unwrap_or_default();
-            if !oid.is_empty() {
-                let line = format!("{}\0 capabilities^{{}}\n", ref_name);
-                response.extend_from_slice(&Self::format_pkt_line(&format!("{} {}\n", oid, line)));
-            }
-        }
-
-        // Get references from packed-refs and loose refs
+        let capabilities =
+            "multi_ack_detailed no-done side-band-64k ofs-delta agent=gitforge/0.1.0";
+        let mut advertised_ref = false;
         if let Ok(refs) = repo.references() {
             for reference in refs.flatten() {
                 if let (Some(name), Some(target)) = (reference.name().ok(), reference.target()) {
-                    // Skip symbolic refs and HEAD (already handled)
                     if name.starts_with("refs/") && !name.contains("^{}") {
-                        let ref_line = format!("{} {}\n", target, name);
+                        let ref_line = if advertised_ref {
+                            format!("{} {}\n", target, name)
+                        } else {
+                            advertised_ref = true;
+                            format!("{} {}\0{}\n", target, name, capabilities)
+                        };
                         response.extend_from_slice(&Self::format_pkt_line(&ref_line));
                     }
                 }
             }
         }
-
-        // Add capabilities at the end of refs
-        let caps = "agent=gitforge/0.1.0\nno-progress\nside-band-64k\n";
-        response.extend_from_slice(&Self::format_pkt_line(caps));
 
         // End with flush pkt-line (0000)
         response.extend_from_slice(b"0000");
@@ -353,6 +343,7 @@ mod tests {
         let response = result.unwrap();
         // Response should contain ref advertisement (starts with pkt-line format)
         assert!(!response.is_empty());
+        assert!(response.starts_with(b"001e# service=git-upload-pack\n0000"));
         // Should end with flush pkt-line (0000)
         assert!(response.ends_with(b"0000"));
     }
