@@ -10,6 +10,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use chrono::Utc;
 use gitforge_common::RepoId;
 use gitforge_core::git_protocol::{http::HttpGitHandler, ssh::SshGitHandler, GitProtocolHandler};
 use gitforge_core::{FileStorageBackend, RepoService, StorageBackend};
@@ -130,6 +131,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(
             "GITFORGE_CI_TRIGGER_URL/TOKEN is not fully configured; pushes will not trigger CI"
         );
+    }
+
+    if state.db_pool.is_some() && state.ci_trigger_url.is_some() && state.ci_trigger_token.is_some()
+    {
+        let delivery_state = state.clone();
+        tokio::spawn(async move { ci_delivery_loop(delivery_state).await });
     }
 
     // Build router for Git HTTP protocol
@@ -425,7 +432,7 @@ async fn git_receive_pack(
     {
         Ok(response) => {
             for update in parse_receive_updates(&body) {
-                if let Err(error) = notify_ci(&state, repo_id, &update).await {
+                if let Err(error) = enqueue_ci_event(&state, repo_id, &update).await {
                     tracing::error!(
                         repo_id = %repo_id,
                         ref_name = %update.ref_name,
@@ -433,6 +440,9 @@ async fn git_receive_pack(
                         "failed to notify CI after accepted push"
                     );
                 }
+            }
+            if let Err(error) = deliver_pending_ci_events(&state).await {
+                tracing::warn!(error = %error, "CI outbox delivery deferred after push");
             }
             Response::builder()
                 .status(StatusCode::OK)
@@ -493,31 +503,94 @@ fn parse_receive_updates(input: &[u8]) -> Vec<ReceiveUpdate> {
     updates
 }
 
-async fn notify_ci(
+async fn enqueue_ci_event(
     state: &AppState,
     repo_id: RepoId,
     update: &ReceiveUpdate,
 ) -> anyhow::Result<()> {
-    let (Some(url), Some(token)) = (&state.ci_trigger_url, &state.ci_trigger_token) else {
+    let Some(pool) = &state.db_pool else {
+        anyhow::bail!("database is required for durable CI delivery");
+    };
+    let payload = serde_json::json!({
+        "repo_id": repo_id.to_string(),
+        "ref_name": update.ref_name,
+        "old_hash": update.old_hash,
+        "new_hash": update.new_hash,
+    });
+    sqlx::query("INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind("ci.trigger.pending")
+        .bind(payload.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool.pool())
+        .await?;
+    Ok(())
+}
+
+async fn deliver_pending_ci_events(state: &AppState) -> anyhow::Result<()> {
+    let (Some(pool), Some(url), Some(token)) = (
+        &state.db_pool,
+        &state.ci_trigger_url,
+        &state.ci_trigger_token,
+    ) else {
         return Ok(());
     };
-    let response = state
-        .http_client
-        .post(url)
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "repo_id": repo_id.to_string(),
-            "ref_name": update.ref_name,
-            "old_hash": update.old_hash,
-            "new_hash": update.new_hash,
-            "working_dir": null,
-        }))
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        anyhow::bail!("CI trigger returned HTTP {}", response.status());
+    let events = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, payload FROM events WHERE event_type = 'ci.trigger.pending' ORDER BY created_at LIMIT 50",
+    )
+    .fetch_all(pool.pool())
+    .await?;
+    for (id, payload) in events {
+        let claimed = sqlx::query(
+            "UPDATE events SET event_type = 'ci.trigger.delivering' WHERE id = ? AND event_type = 'ci.trigger.pending'",
+        )
+        .bind(&id)
+        .execute(pool.pool())
+        .await?
+        .rows_affected();
+        if claimed != 1 {
+            continue;
+        }
+        let response = state
+            .http_client
+            .post(url)
+            .bearer_auth(token)
+            .json(&serde_json::from_str::<serde_json::Value>(&payload)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {
+                sqlx::query("UPDATE events SET event_type = 'ci.trigger.delivered' WHERE id = ?")
+                    .bind(&id)
+                    .execute(pool.pool())
+                    .await?;
+            }
+            Ok(response) => {
+                sqlx::query("UPDATE events SET event_type = 'ci.trigger.pending' WHERE id = ?")
+                    .bind(&id)
+                    .execute(pool.pool())
+                    .await?;
+                anyhow::bail!("CI trigger returned HTTP {}", response.status());
+            }
+            Err(error) => {
+                sqlx::query("UPDATE events SET event_type = 'ci.trigger.pending' WHERE id = ?")
+                    .bind(&id)
+                    .execute(pool.pool())
+                    .await?;
+                anyhow::bail!("CI trigger request failed: {error}");
+            }
+        }
     }
     Ok(())
+}
+
+async fn ci_delivery_loop(state: AppState) {
+    loop {
+        if let Err(error) = deliver_pending_ci_events(&state).await {
+            tracing::warn!(error = %error, "CI outbox delivery deferred");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 /// Git receive-pack handler with additional path
