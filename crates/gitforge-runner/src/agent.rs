@@ -115,34 +115,25 @@ impl RunnerConfig {
 
         if let Ok(v) = std::env::var("GITFORGE_RUNNER_CAPACITY") {
             if !v.trim().is_empty() {
-                cfg.capacity = v
-                    .trim()
-                    .parse()
-                    .map_err(|_| Error::invalid_input(
-                        "GITFORGE_RUNNER_CAPACITY must be a valid integer",
-                    ))?;
+                cfg.capacity = v.trim().parse().map_err(|_| {
+                    Error::invalid_input("GITFORGE_RUNNER_CAPACITY must be a valid integer")
+                })?;
             }
         }
 
         if let Ok(v) = std::env::var("GITFORGE_HEARTBEAT_INTERVAL") {
             if !v.trim().is_empty() {
-                cfg.heartbeat_interval_secs = v
-                    .trim()
-                    .parse()
-                    .map_err(|_| Error::invalid_input(
-                        "GITFORGE_HEARTBEAT_INTERVAL must be a valid integer",
-                    ))?;
+                cfg.heartbeat_interval_secs = v.trim().parse().map_err(|_| {
+                    Error::invalid_input("GITFORGE_HEARTBEAT_INTERVAL must be a valid integer")
+                })?;
             }
         }
 
         if let Ok(v) = std::env::var("GITFORGE_FETCH_INTERVAL") {
             if !v.trim().is_empty() {
-                cfg.fetch_interval_secs = v
-                    .trim()
-                    .parse()
-                    .map_err(|_| Error::invalid_input(
-                        "GITFORGE_FETCH_INTERVAL must be a valid integer",
-                    ))?;
+                cfg.fetch_interval_secs = v.trim().parse().map_err(|_| {
+                    Error::invalid_input("GITFORGE_FETCH_INTERVAL must be a valid integer")
+                })?;
             }
         }
 

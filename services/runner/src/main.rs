@@ -203,11 +203,12 @@ mod tests {
 
     #[test]
     fn test_runner_service_config_missing_scheduler_url() {
-        let _guard = temp_env::with_vars([
-            ("GITFORGE_SCHEDULER_URL", None::<&str>),
-        ]);
+        let _guard = temp_env::with_vars([("GITFORGE_SCHEDULER_URL", None::<&str>)]);
         let result = gitforge_runner::RunnerConfig::from_env();
-        assert!(result.is_err(), "missing GITFORGE_SCHEDULER_URL should fail");
+        assert!(
+            result.is_err(),
+            "missing GITFORGE_SCHEDULER_URL should fail"
+        );
         let err = result.unwrap_err();
         assert!(err.to_string().contains("GITFORGE_SCHEDULER_URL"));
     }
