@@ -75,7 +75,9 @@ reqwest = { version = "0.13", features = ["json"] }
 bollard = "0.16"
 
 # JWT
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+# Use jsonwebtoken's aws-lc-rs backend; the optional rust_crypto backend pulls
+# in RSA 0.9, which has no patched release for the Marvin timing advisory.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 
 # Password hashing
 bcrypt = "0.19"

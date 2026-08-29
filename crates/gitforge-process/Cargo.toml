@@ -2,6 +2,7 @@
 name = "gitforge-process"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time", "io-util", "process", "signal"] }

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "GitForge CLI - Local-first Git platform client"
 authors = ["GitForge Team"]
+license.workspace = true
 
 [dependencies]
 gitforge-common = { path = "../gitforge-common" }
