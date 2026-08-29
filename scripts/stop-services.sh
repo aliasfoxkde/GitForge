@@ -14,10 +14,14 @@ case "$TERM_WAIT_SECONDS" in
         ;;
 esac
 
-is_owned_pid() {
-    local pid="$1" expected="$2"
-    [ -r "/proc/$pid/cmdline" ] || return 1
-    [ "$(tr '\0' ' ' < "/proc/$pid/cmdline" | sed 's/ $//')" = "$expected" ]
+owned_pids() {
+    local executable="$1" proc pid resolved
+    for proc in /proc/[0-9]*; do
+        pid="${proc##*/}"
+        [ -r "$proc/exe" ] || continue
+        resolved="$(readlink -f -- "$proc/exe" 2>/dev/null || true)"
+        [ "$resolved" = "$executable" ] && printf '%s\n' "$pid"
+    done
 }
 
 stop_service() {
@@ -25,18 +29,18 @@ stop_service() {
     local executable="$ROOT/target/release/$name"
     while read -r pid; do
         [ -n "$pid" ] || continue
-        is_owned_pid "$pid" "$executable" || continue
+        [ -r "/proc/$pid/exe" ] || continue
         echo "Stopping $name (pid $pid)"
         kill -TERM "$pid" 2>/dev/null || true
         deadline=$((SECONDS + TERM_WAIT_SECONDS))
-        while is_owned_pid "$pid" "$executable" && [ "$SECONDS" -lt "$deadline" ]; do
+        while [ "$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)" = "$executable" ] && [ "$SECONDS" -lt "$deadline" ]; do
             sleep 1
         done
-        if is_owned_pid "$pid" "$executable"; then
+        if [ "$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)" = "$executable" ]; then
             echo "$name did not stop after ${TERM_WAIT_SECONDS}s; sending KILL" >&2
             kill -KILL "$pid" 2>/dev/null || true
         fi
-    done < <(pgrep -f -x "$executable" || true)
+    done < <(owned_pids "$executable")
 }
 
 for service in api ci git-server runner; do
@@ -46,5 +50,7 @@ done
 # PID files are metadata, not authority. Remove only exact files beneath this
 # checkout after the process ownership checks above.
 for pid_file in "$DATA_DIR/api.pid" "$DATA_DIR/ci.pid" "$DATA_DIR/git.pid" "$DATA_DIR/git-server.pid" "$DATA_DIR/runner.pid"; do
-    [ -f "$pid_file" ] && rm -f -- "$pid_file"
+    if [ -f "$pid_file" ]; then
+        rm -f -- "$pid_file"
+    fi
 done

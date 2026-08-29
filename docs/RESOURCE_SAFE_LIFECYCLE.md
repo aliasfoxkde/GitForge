@@ -6,7 +6,9 @@ another worktree, or the host operating system.
 
 ## Required behavior
 
-- Identify services by an exact executable path under `GITFORGE_ROOT/target/release`.
+- Identify services by the kernel-resolved `/proc/<pid>/exe` matching an exact
+  executable path under `GITFORGE_ROOT/target/release`; service arguments are
+  therefore supported without substring matching.
 - Send `TERM` first and allow `GITFORGE_TERM_WAIT_SECONDS` (default `10`) for
   graceful shutdown.
 - Send `KILL` only to the same exact executable if it remains after the grace
@@ -26,8 +28,8 @@ GITFORGE_TERM_WAIT_SECONDS=20 \
 ```
 
 The command is safe to run when no service is running. It is intentionally not
-implemented with `pkill -f` because command-line substring matching can kill
-unrelated test runners and agent processes.
+implemented with `pkill -f` or command-line substring matching because those can
+kill unrelated test runners and agent processes.
 
 ## Validation contract
 
