@@ -48,6 +48,12 @@ because the Git ref has already been accepted, but the pending event survives
 service restart and is delivered by the Git-server outbox worker when CI
 recovers. Monitor pending events and delivery age in production.
 
+For machine-readable monitoring, run
+`scripts/gitforge-outbox-status "$GITFORGE_DATABASE_URL"`. It returns JSON
+with pending/delivering counts and the oldest active event age; a delivering
+event causes `status` to become `attention` until it is completed or returned
+to pending.
+
 ## Validation and rollout
 
 1. Copy the drop-in into each matching `*.service.d/` directory in a disposable
