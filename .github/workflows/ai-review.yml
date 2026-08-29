@@ -59,12 +59,16 @@ jobs:
           BASE_BRANCH=${{ github.base_ref || 'main' }}
           echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
 
+          # The checkout is on the PR head; fetch the base ref explicitly
+          # instead of assuming a local branch named after the base exists.
+          git fetch --no-tags origin "$BASE_BRANCH"
+
           # Generate diff
-          git diff $BASE_BRANCH...HEAD > pr.diff
+          git diff "origin/$BASE_BRANCH"...HEAD > pr.diff
           echo "diff_file=pr.diff" >> $GITHUB_OUTPUT
 
           # Count files changed
-          FILES_CHANGED=$(git diff --name-only $BASE_BRANCH...HEAD | wc -l)
+          FILES_CHANGED=$(git diff --name-only "origin/$BASE_BRANCH"...HEAD | wc -l)
           echo "files_changed=$FILES_CHANGED" >> $GITHUB_OUTPUT
 
       - name: Run AI Review

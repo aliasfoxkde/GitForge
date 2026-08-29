@@ -63,9 +63,11 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked --no-fail-fast
 
-  # ─── Test with Race Detection ──────────────────────────────────────────────
-  test-race:
-    name: Test (Race)
+  # ─── Serialized test run ───────────────────────────────────────────────────
+  # This is a deterministic single-threaded run, not a race detector. A real
+  # race detector requires a separate supported toolchain/target strategy.
+  test-serialized:
+    name: Test (Serialized)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -78,10 +80,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libudev-dev pkg-config libssl-dev
-      - name: Run tests with race detection
+      - name: Run serialized tests
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
-        env:
-          RUSTFLAGS: "-C target-feature=+crt-static"
 
   # ─── Coverage ───────────────────────────────────────────────────────────────
   coverage:
