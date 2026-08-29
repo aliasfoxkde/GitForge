@@ -5,7 +5,7 @@ use crate::protocol::{JobInfo, Response};
 use nix::sys::signal::{killpg, Signal, SIGTERM};
 use nix::unistd::Pid;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
@@ -24,17 +24,89 @@ pub struct BuildCoordinator {
     /// Process groups for running jobs, used by the control socket to cancel
     /// a build without requiring access to the worker task.
     active_pids: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
+    /// Number of admitted jobs, including queued and running jobs.
+    admitted_jobs: Arc<AtomicUsize>,
+    /// Maximum number of jobs allowed in the coordinator at once.
+    max_jobs: usize,
+    /// Configured execution concurrency, exposed in stats.
+    max_concurrent_jobs: usize,
+    /// Maximum execution time for one child process.
+    job_timeout: Duration,
+}
+
+/// Admission and execution limits for the build daemon.
+#[derive(Debug, Clone, Copy)]
+pub struct BuildCoordinatorConfig {
+    /// Number of jobs that may execute concurrently.
+    pub max_concurrent: usize,
+    /// Number of queued jobs accepted in addition to running jobs.
+    pub max_queued: usize,
+    /// Maximum wall-clock time for a child process.
+    pub job_timeout: Duration,
+}
+
+impl Default for BuildCoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: MAX_CONCURRENT_JOBS,
+            max_queued: 32,
+            job_timeout: Duration::from_secs(3600),
+        }
+    }
+}
+
+impl BuildCoordinatorConfig {
+    /// Load safe, bounded settings from the daemon environment.
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+        let max_concurrent = env_usize(
+            "GITFORGE_BUILD_MAX_CONCURRENT",
+            defaults.max_concurrent,
+            1,
+            64,
+        );
+        let max_queued = env_usize("GITFORGE_BUILD_MAX_QUEUED", defaults.max_queued, 0, 1024);
+        let timeout_secs = env_usize(
+            "GITFORGE_BUILD_TIMEOUT_SECONDS",
+            defaults.job_timeout.as_secs() as usize,
+            1,
+            86_400,
+        );
+        Self {
+            max_concurrent,
+            max_queued,
+            job_timeout: Duration::from_secs(timeout_secs as u64),
+        }
+    }
+}
+
+fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default)
 }
 
 impl BuildCoordinator {
     /// Create a new build coordinator
     pub fn new() -> Self {
+        Self::with_config(BuildCoordinatorConfig::default())
+    }
+
+    /// Create a coordinator with explicit admission and timeout limits.
+    pub fn with_config(config: BuildCoordinatorConfig) -> Self {
+        let max_concurrent = config.max_concurrent.max(1);
         Self {
-            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             completed_count: Arc::new(AtomicU64::new(0)),
             results: Arc::new(Mutex::new(HashMap::new())),
             active_pids: Arc::new(Mutex::new(HashMap::new())),
+            admitted_jobs: Arc::new(AtomicUsize::new(0)),
+            max_jobs: max_concurrent.saturating_add(config.max_queued),
+            max_concurrent_jobs: max_concurrent,
+            job_timeout: config.job_timeout,
         }
     }
 
@@ -67,7 +139,50 @@ impl BuildCoordinator {
             .await
     }
 
+    /// Try to admit an explicitly selected command without allowing an
+    /// unbounded queue to consume memory or worker tasks.
+    pub async fn try_submit_command(
+        self: &Arc<Self>,
+        program: String,
+        args: Vec<String>,
+        working_dir: Option<String>,
+    ) -> Result<uuid::Uuid, String> {
+        self.try_submit_job(BuildJob::new_command(program, args, working_dir))
+            .await
+    }
+
+    /// Try to admit a Cargo job subject to the configured queue bound.
+    pub async fn try_submit(
+        self: &Arc<Self>,
+        cargo_args: Vec<String>,
+        working_dir: Option<String>,
+    ) -> Result<uuid::Uuid, String> {
+        self.try_submit_job(BuildJob::new(cargo_args, working_dir))
+            .await
+    }
+
     async fn submit_job(self: &Arc<Self>, job: BuildJob) -> uuid::Uuid {
+        self.try_submit_job(job)
+            .await
+            .expect("legacy submission exceeded coordinator capacity")
+    }
+
+    async fn try_submit_job(self: &Arc<Self>, job: BuildJob) -> Result<uuid::Uuid, String> {
+        let mut admitted = self.admitted_jobs.load(Ordering::Acquire);
+        loop {
+            if admitted >= self.max_jobs {
+                return Err(format!("build queue is full (capacity {})", self.max_jobs));
+            }
+            match self.admitted_jobs.compare_exchange(
+                admitted,
+                admitted + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => admitted = current,
+            }
+        }
         let job_id = job.id;
         let coordinator = self.clone();
 
@@ -84,7 +199,10 @@ impl BuildCoordinator {
         tokio::spawn(async move {
             let permit = match coordinator.semaphore.clone().acquire_owned().await {
                 Ok(permit) => permit,
-                Err(_) => return,
+                Err(_) => {
+                    coordinator.admitted_jobs.fetch_sub(1, Ordering::AcqRel);
+                    return;
+                }
             };
             {
                 let mut jobs = coordinator.jobs.lock().await;
@@ -92,6 +210,7 @@ impl BuildCoordinator {
                     jobs.get(&job_id).map(|j| &j.status),
                     Some(JobStatus::Cancelled)
                 ) {
+                    coordinator.admitted_jobs.fetch_sub(1, Ordering::AcqRel);
                     return;
                 }
                 if let Some(j) = jobs.get_mut(&job_id) {
@@ -100,13 +219,19 @@ impl BuildCoordinator {
             }
 
             // Execute the job
-            let result = execute_job(&job, coordinator.active_pids.clone()).await;
+            let result = execute_job(
+                &job,
+                coordinator.active_pids.clone(),
+                coordinator.job_timeout,
+            )
+            .await;
 
             // Update job status and record completion
             {
                 let mut jobs = coordinator.jobs.lock().await;
                 if let Some(j) = jobs.get_mut(&job_id) {
                     if matches!(j.status, JobStatus::Cancelled) {
+                        coordinator.admitted_jobs.fetch_sub(1, Ordering::AcqRel);
                         drop(permit);
                         return;
                     }
@@ -139,9 +264,10 @@ impl BuildCoordinator {
 
             // Release permit (drop to signal completion)
             drop(permit);
+            coordinator.admitted_jobs.fetch_sub(1, Ordering::AcqRel);
         });
 
-        job_id
+        Ok(job_id)
     }
 
     /// Cancel a queued or running build. Running jobs are terminated through
@@ -267,13 +393,13 @@ impl BuildCoordinator {
             running_count: running,
             queued_count: queued,
             completed_count: completed,
-            max_concurrent: MAX_CONCURRENT_JOBS,
+            max_concurrent: self.max_concurrent_jobs,
         }
     }
 
     /// Wait for a job to complete and get its result
     pub async fn wait_for_job(&self, job_id: uuid::Uuid) -> Option<BuildResult> {
-        self.wait_for_job_with_timeout(job_id, Duration::from_secs(3600))
+        self.wait_for_job_with_timeout(job_id, self.job_timeout)
             .await
     }
 
@@ -370,6 +496,7 @@ impl Default for BuildCoordinator {
 async fn execute_job(
     job: &BuildJob,
     active_pids: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
+    timeout_duration: Duration,
 ) -> anyhow::Result<BuildResult> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
@@ -433,8 +560,6 @@ async fn execute_job(
     if let Some(pid) = child.id() {
         active_pids.lock().await.insert(job.id, pid);
     }
-
-    let timeout_duration = Duration::from_secs(3600); // 1 hour default timeout
 
     // Drain both pipes concurrently. Reading stdout to completion before
     // stderr can deadlock a noisy build once the stderr pipe buffer fills.
@@ -690,6 +815,41 @@ mod tests {
         let job2 = coordinator.submit(vec!["--list".to_string()], None).await;
 
         assert_ne!(job1, job2);
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_rejects_when_admission_is_full() {
+        let coordinator = Arc::new(BuildCoordinator::with_config(BuildCoordinatorConfig {
+            max_concurrent: 1,
+            max_queued: 0,
+            job_timeout: Duration::from_secs(10),
+        }));
+        let first = coordinator
+            .try_submit_command(
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), "sleep 1".to_string()],
+                None,
+            )
+            .await
+            .expect("first job should be admitted");
+        let second = coordinator
+            .try_submit_command("/bin/true".to_string(), Vec::new(), None)
+            .await;
+        assert!(second.is_err());
+        assert!(second.unwrap_err().contains("queue is full"));
+        assert!(coordinator
+            .wait_for_job_with_timeout(first, Duration::from_secs(5))
+            .await
+            .is_some());
+    }
+
+    #[test]
+    fn test_config_from_env_clamps_invalid_ranges() {
+        let config = BuildCoordinatorConfig::from_env();
+        assert!(config.max_concurrent >= 1);
+        assert!(config.max_concurrent <= 64);
+        assert!(config.max_queued <= 1024);
+        assert!(config.job_timeout >= Duration::from_secs(1));
     }
 
     // =============================================================================

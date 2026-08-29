@@ -11,8 +11,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 
 use gitforge_build::{
-    encode_response, BuildCoordinator, Request, Response, DEFAULT_SOCKET, MAX_CONCURRENT_JOBS,
-    MAX_MESSAGE_SIZE,
+    encode_response, BuildCoordinator, Request, Response, DEFAULT_SOCKET, MAX_MESSAGE_SIZE,
 };
 
 /// Create a shutdown flag
@@ -38,7 +37,11 @@ async fn main() -> Result<()> {
         .init();
 
     info!("starting gitforge-buildd daemon");
-    info!("max concurrent jobs: {}", MAX_CONCURRENT_JOBS);
+    let config = gitforge_build::coordinator::BuildCoordinatorConfig::from_env();
+    info!(
+        "build limits: max_concurrent={}, max_queued={}, timeout={:?}",
+        config.max_concurrent, config.max_queued, config.job_timeout
+    );
     let socket_path =
         std::env::var("GITFORGE_BUILD_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.to_string());
 
@@ -48,7 +51,7 @@ async fn main() -> Result<()> {
     }
 
     // Create build coordinator
-    let coordinator = Arc::new(BuildCoordinator::new());
+    let coordinator = Arc::new(BuildCoordinator::with_config(config));
 
     // Clean up old socket
     if Path::new(&socket_path).exists() {
@@ -159,20 +162,25 @@ async fn handle_connection(
         Request::Submit {
             cargo_args,
             working_dir,
-        } => {
-            let job_id = coordinator.submit(cargo_args, working_dir).await;
-            Response::Submitted {
+        } => match coordinator.try_submit(cargo_args, working_dir).await {
+            Ok(job_id) => Response::Submitted {
                 job_id: job_id.to_string(),
-            }
-        }
+            },
+            Err(message) => Response::Error { message },
+        },
         Request::Exec {
             program,
             args,
             working_dir,
         } => {
-            let job_id = coordinator.submit_command(program, args, working_dir).await;
-            Response::Submitted {
-                job_id: job_id.to_string(),
+            match coordinator
+                .try_submit_command(program, args, working_dir)
+                .await
+            {
+                Ok(job_id) => Response::Submitted {
+                    job_id: job_id.to_string(),
+                },
+                Err(message) => Response::Error { message },
             }
         }
         Request::Status { job_id } => {

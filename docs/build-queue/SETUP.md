@@ -132,6 +132,19 @@ rm target/quality/gitforge-build.sock
 gitforge-buildd &
 ```
 
+For unattended operation, configure admission limits before starting the daemon:
+
+```bash
+export GITFORGE_BUILD_MAX_CONCURRENT=8
+export GITFORGE_BUILD_MAX_QUEUED=32
+export GITFORGE_BUILD_TIMEOUT_SECONDS=3600
+gitforge-buildd
+```
+
+The queue is bounded so a burst of agent requests cannot create an unbounded
+number of worker tasks. A rejected submission is safe to retry after a short
+backoff once capacity becomes available.
+
 ### Wrapper not working
 ```bash
 # Verify alias exists
