@@ -332,3 +332,22 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
 - CodeQL Rust compilation and dependency review are now fail-closed; previous
   `|| true` and `continue-on-error` behavior could report green while the
   security analysis had not actually completed.
+
+## Verified continuation findings — 2026-08-29
+
+- The Fedora production bundle was verified listening on ports 42780 (API),
+  42781 (CI/scheduler), and 42782 (Git HTTP), with all four release binaries
+  running from the same `/home/mkinney/work/gitforge-production-20260829`
+  checkout.
+- Two orphaned deleted binaries from historical audit worktrees were found and
+  removed by exact PID after confirming they did not own a GitForge service
+  port: an 8/22 debug runner and an 8/22 scheduler. No production listener was
+  interrupted.
+- `scripts/stop-services.sh` previously used broad `pkill -f` patterns that
+  could terminate unrelated worktrees or agent jobs. It now resolves its own
+  checkout root and matches each exact release-binary path; operators must not
+  reintroduce broad process-name kills.
+- The current operational boundary is: GitForge owns production CI/build
+  execution and admission control; agent work must use an isolated checkout,
+  bounded process group, explicit timeout, and receipt. A heartbeat alone is
+  not proof of forward progress.
