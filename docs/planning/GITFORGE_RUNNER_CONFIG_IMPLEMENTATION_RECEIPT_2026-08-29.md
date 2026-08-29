@@ -12,7 +12,7 @@
 | Ref | SHA |
 |-----|-----|
 | Base (origin/main) | `e6dc32dd75a5b7c7f9ee154995f1675bcf4d5043` |
-| Final (`worker/gitforge-runner-config-20260829`) | `cbe41bb4c5b2d0e6a8f7c1d3e9a4b2f5d8c6e1a3` |
+| Final (`worker/gitforge-runner-config-20260829`) | `cbe41bb` |
 
 ## Changed Files
 
