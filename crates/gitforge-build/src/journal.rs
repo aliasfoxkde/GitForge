@@ -7,6 +7,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// Automatic compaction threshold for a local journal.
+pub const DEFAULT_COMPACTION_BYTES: u64 = 16 * 1024 * 1024;
+
 /// A durable state transition written before it is exposed as recovered state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JobJournalEvent {
@@ -105,11 +108,81 @@ impl JobJournal {
 
     /// Append one complete record and force it to stable storage.
     pub fn append(&mut self, event: &JobJournalEvent) -> io::Result<()> {
-        let record = serde_json::to_vec(event)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        self.file.write_all(&record)?;
-        self.file.write_all(b"\n")?;
-        self.file.sync_data()
+        write_event(&mut self.file, event)?;
+        if self.file.metadata()?.len() >= DEFAULT_COMPACTION_BYTES {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Replace event history with a snapshot of the latest state of every
+    /// job. The temporary file is synced before the rename so a crash cannot
+    /// leave a partially written replacement at the journal path.
+    pub fn compact(&mut self) -> io::Result<()> {
+        let replay = self.replay()?;
+        let temporary = self.path.with_extension("jsonl.compact");
+        let mut replacement = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)?;
+        for job in replay.jobs {
+            write_event(
+                &mut replacement,
+                &JobJournalEvent::Submitted {
+                    job_id: job.job_id,
+                    cargo_args: job.cargo_args,
+                    executable: job.executable,
+                    working_dir: job.working_dir,
+                },
+            )?;
+            match job.status {
+                JobStatus::Queued => {}
+                JobStatus::Running { pid } => write_event(
+                    &mut replacement,
+                    &JobJournalEvent::Started {
+                        job_id: job.job_id,
+                        pid,
+                        process_group_id: job.process_group_id,
+                        process_start_ticks: job.process_start_ticks,
+                    },
+                )?,
+                JobStatus::Completed { .. } => {
+                    if let Some(result) = job.result {
+                        write_event(
+                            &mut replacement,
+                            &JobJournalEvent::Completed {
+                                job_id: job.job_id,
+                                result,
+                            },
+                        )?;
+                    }
+                }
+                JobStatus::Failed { .. } => {
+                    if let Some(result) = job.result {
+                        write_event(
+                            &mut replacement,
+                            &JobJournalEvent::Failed {
+                                job_id: job.job_id,
+                                result,
+                            },
+                        )?;
+                    }
+                }
+                JobStatus::Cancelled => write_event(
+                    &mut replacement,
+                    &JobJournalEvent::Cancelled { job_id: job.job_id },
+                )?,
+            }
+        }
+        replacement.sync_all()?;
+        std::fs::rename(&temporary, &self.path)?;
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&self.path)?;
+        Ok(())
     }
 
     /// Replay all complete records. A final partial line is treated as a
@@ -138,6 +211,14 @@ impl JobJournal {
             jobs: states.into_values().collect(),
         })
     }
+}
+
+fn write_event(file: &mut File, event: &JobJournalEvent) -> io::Result<()> {
+    let record = serde_json::to_vec(event)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    file.write_all(&record)?;
+    file.write_all(b"\n")?;
+    file.sync_data()
 }
 
 fn apply_event(states: &mut HashMap<uuid::Uuid, RecoveredJob>, event: JobJournalEvent) {
@@ -273,5 +354,30 @@ mod tests {
         let replay = journal.replay().unwrap();
         assert_eq!(replay.jobs.len(), 1);
         assert_eq!(replay.jobs[0].job_id, id);
+    }
+
+    #[test]
+    fn compact_preserves_latest_job_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("jobs.jsonl");
+        let mut journal = JobJournal::open(&path).unwrap();
+        let id = uuid::Uuid::new_v4();
+        journal
+            .append(&JobJournalEvent::Submitted {
+                job_id: id,
+                cargo_args: vec!["test".into()],
+                executable: None,
+                working_dir: None,
+            })
+            .unwrap();
+        journal
+            .append(&JobJournalEvent::Cancelled { job_id: id })
+            .unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+        journal.compact().unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after <= before);
+        let replay = journal.replay().unwrap();
+        assert!(matches!(replay.jobs[0].status, JobStatus::Cancelled));
     }
 }

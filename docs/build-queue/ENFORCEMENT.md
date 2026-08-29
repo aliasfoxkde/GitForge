@@ -13,6 +13,10 @@ The daemon accepts these bounded environment overrides:
 | `GITFORGE_BUILD_TIMEOUT_SECONDS` | `3600` | `1..86400` | Wall-clock limit for each child process |
 | `GITFORGE_BUILD_JOURNAL` | unset | explicit filesystem path | Enable fsynced local job recovery journal |
 
+The journal automatically compacts at 16 MiB by atomically rewriting the
+latest state snapshot. This bounds transition-history growth while retaining
+the current recovery state.
+
 Values outside the allowed range are clamped. A full queue returns a protocol error immediately; callers should retry with backoff rather than repeatedly spawning local workers.
 
 ## Architecture
