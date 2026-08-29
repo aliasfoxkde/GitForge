@@ -103,7 +103,7 @@ Uses 3-phase commit for consistency across replicas. Two critical flaws:
 
 **Insight:** Rendezvous hashing lets any server handle any repository. The question "where does this repo live?" becomes "anywhere."
 
-**Recommendation:** 
+**Recommendation:**
 - Replace explicit runner-to-job assignments with consistent hashing
 - Add soft-routing layer that discovers repository location dynamically
 - Eliminate `runners` table routing entries
