@@ -12,6 +12,7 @@ jobs:
   analyze:
     name: Analyze
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       actions: read
       contents: read
@@ -30,7 +31,7 @@ jobs:
         uses: github/codeql-action/init@ce28f5bb42b7a9f2c824e633a3f6ee835bab6858 # v3.29.0
         with:
           languages: ${{ matrix.language }}
-          queries: security-extended
+          queries: security-and-quality
           # Exclude test files and template scaffolding from analysis
           config: |
             paths-ignore:
