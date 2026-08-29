@@ -38,7 +38,7 @@ for unit in gitforge-ci.service.example gitforge-runner.service.example; do
   install -m 0644 "$(dirname "$0")/../systemd/user/$unit" "$release_dir/systemd/user/$unit"
 done
 
-for policy in gitforge-ci-resource-limits.conf gitforge-runner-resource-limits.conf; do
+for policy in gitforge-resource-limits.conf gitforge-ci-resource-limits.conf gitforge-runner-resource-limits.conf; do
   install -m 0644 "$(dirname "$0")/../systemd/user/$policy" "$release_dir/systemd/user/$policy"
 done
 

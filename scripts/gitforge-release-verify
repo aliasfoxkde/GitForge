@@ -32,9 +32,19 @@ fi
 
 ci_unit="$release_dir/systemd/user/gitforge-ci.service.example"
 runner_unit="$release_dir/systemd/user/gitforge-runner.service.example"
+generic_policy="$release_dir/systemd/user/gitforge-resource-limits.conf"
+ci_policy="$release_dir/systemd/user/gitforge-ci-resource-limits.conf"
+runner_policy="$release_dir/systemd/user/gitforge-runner-resource-limits.conf"
 for unit in "$ci_unit" "$runner_unit"; do
   if [[ ! -f "$unit" ]]; then
     printf 'release verify: missing unit example: %s\n' "$unit" >&2
+    exit 1
+  fi
+done
+
+for policy in "$generic_policy" "$ci_policy" "$runner_policy"; do
+  if [[ ! -f "$policy" ]]; then
+    printf 'release verify: missing resource policy: %s\n' "$policy" >&2
     exit 1
   fi
 done
