@@ -7,7 +7,7 @@ use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::{timeout, Duration};
 use tracing::{error, info, warn};
 
@@ -32,6 +32,8 @@ pub struct BuildCoordinator {
     max_concurrent_jobs: usize,
     /// Maximum execution time for one child process.
     job_timeout: Duration,
+    /// Wakes waiters when a job changes state.
+    state_changed: Arc<Notify>,
 }
 
 /// Admission and execution limits for the build daemon.
@@ -107,6 +109,7 @@ impl BuildCoordinator {
             max_jobs: max_concurrent.saturating_add(config.max_queued),
             max_concurrent_jobs: max_concurrent,
             job_timeout: config.job_timeout,
+            state_changed: Arc::new(Notify::new()),
         }
     }
 
@@ -193,6 +196,7 @@ impl BuildCoordinator {
             let mut jobs = self.jobs.lock().await;
             jobs.insert(job_id, job.clone());
         }
+        self.state_changed.notify_waiters();
 
         // Spawn a worker that waits for capacity independently of the client
         // request. The permit lives for the complete process lifetime.
@@ -217,6 +221,7 @@ impl BuildCoordinator {
                     j.status = JobStatus::Running { pid: 0 };
                 }
             }
+            coordinator.state_changed.notify_waiters();
 
             // Execute the job
             let result = execute_job(
@@ -253,6 +258,7 @@ impl BuildCoordinator {
                 }
                 coordinator.completed_count.fetch_add(1, Ordering::SeqCst);
             }
+            coordinator.state_changed.notify_waiters();
 
             // Store result for waiters
             {
@@ -290,6 +296,7 @@ impl BuildCoordinator {
             let _ = killpg(pgid, Signal::SIGCONT);
             let _ = killpg(pgid, SIGTERM);
         }
+        self.state_changed.notify_waiters();
         true
     }
 
@@ -475,13 +482,16 @@ impl BuildCoordinator {
                 }
             }
 
-            // Check timeout
-            if start.elapsed() > timeout {
+            let remaining = timeout.checked_sub(start.elapsed())?;
+
+            // State transitions notify waiters immediately. The timeout is a
+            // recovery boundary for missed notifications or a vanished task.
+            if tokio::time::timeout(remaining, self.state_changed.notified())
+                .await
+                .is_err()
+            {
                 return None;
             }
-
-            // Brief sleep before retry
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 }

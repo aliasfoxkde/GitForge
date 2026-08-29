@@ -77,8 +77,9 @@ Goal: no hung manager request, orphaned descendant, or operator lockout.
 - [x] P1-05a Bound manager admission (`8` concurrent + `32` queued by default),
   return an immediate protocol error when full, and make concurrency, queue,
   and child wall-clock timeout configurable with bounded environment ranges.
-- [ ] P1-06 Replace polling-only client waits with a bounded event/notification
-  protocol while retaining polling as a recovery fallback.
+- [x] P1-06 Replace polling-only client waits with an in-process event
+  notification path while retaining a bounded timeout as the recovery
+  fallback. Cross-process streaming notifications remain a protocol task.
 - [ ] P1-07 Persist manager jobs and leases so a daemon restart reconstructs
   queued/running/terminal state and marks uncertain children for reconciliation.
 - [ ] P1-08 Add an orphan supervisor registry keyed by process-group ID, start
