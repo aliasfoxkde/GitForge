@@ -17,10 +17,7 @@ fn parse_uuid_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<Uuid
         .map_err(|error| Error::database(format!("invalid UUID in {}: {}", column, error)))
 }
 
-fn parse_timestamp_column(
-    row: &sqlx::sqlite::SqliteRow,
-    column: &str,
-) -> Result<DateTime<Utc>> {
+fn parse_timestamp_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<DateTime<Utc>> {
     let value: String = row
         .try_get(column)
         .map_err(|error| Error::database(format!("missing {} column: {}", column, error)))?;
@@ -57,9 +54,10 @@ fn hydrate_pipeline(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Pipel
         trigger_type: row.try_get("trigger_type").map_err(|error| {
             Error::database(format!("invalid pipeline trigger type: {}", error))
         })?,
-        config: serde_json::from_str(&row.try_get::<String, _>("config").map_err(|error| {
-            Error::database(format!("invalid pipeline config: {}", error))
-        })?)
+        config: serde_json::from_str(
+            &row.try_get::<String, _>("config")
+                .map_err(|error| Error::database(format!("invalid pipeline config: {}", error)))?,
+        )
         .map_err(|error| Error::database(format!("invalid pipeline config JSON: {}", error)))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
     })
@@ -72,9 +70,9 @@ fn hydrate_repository(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Rep
             .try_get("name")
             .map_err(|error| Error::database(format!("invalid repository name: {}", error)))?,
         owner_id: UserId::from(parse_uuid_column(&row, "owner_id")?),
-        visibility: row
-            .try_get("visibility")
-            .map_err(|error| Error::database(format!("invalid repository visibility: {}", error)))?,
+        visibility: row.try_get("visibility").map_err(|error| {
+            Error::database(format!("invalid repository visibility: {}", error))
+        })?,
         git_path: row
             .try_get("git_path")
             .map_err(|error| Error::database(format!("invalid repository git path: {}", error)))?,
@@ -91,15 +89,58 @@ fn hydrate_pipeline_run(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::P
         status: row
             .try_get("status")
             .map_err(|error| Error::database(format!("invalid pipeline run status: {}", error)))?,
-        triggered_by: row.try_get("triggered_by").map_err(|error| {
-            Error::database(format!("invalid pipeline run actor: {}", error))
-        })?,
-        commit_hash: row.try_get("commit_hash").map_err(|error| {
-            Error::database(format!("invalid pipeline run commit: {}", error))
-        })?,
+        triggered_by: row
+            .try_get("triggered_by")
+            .map_err(|error| Error::database(format!("invalid pipeline run actor: {}", error)))?,
+        commit_hash: row
+            .try_get("commit_hash")
+            .map_err(|error| Error::database(format!("invalid pipeline run commit: {}", error)))?,
         started_at: parse_optional_timestamp_column(&row, "started_at")?,
         finished_at: parse_optional_timestamp_column(&row, "finished_at")?,
         created_at: parse_timestamp_column(&row, "created_at")?,
+    })
+}
+
+fn hydrate_job(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Job> {
+    let commands: Option<String> = row
+        .try_get("commands")
+        .map_err(|error| Error::database(format!("invalid job commands column: {}", error)))?;
+    Ok(crate::models::Job {
+        id: JobId::from(parse_uuid_column(&row, "id")?),
+        pipeline_run_id: PipelineRunId::from(parse_uuid_column(&row, "pipeline_run_id")?),
+        name: row
+            .try_get("name")
+            .map_err(|error| Error::database(format!("invalid job name: {}", error)))?,
+        status: row
+            .try_get("status")
+            .map_err(|error| Error::database(format!("invalid job status: {}", error)))?,
+        runner_id: row
+            .try_get::<Option<String>, _>("runner_id")
+            .map_err(|error| Error::database(format!("invalid job runner ID: {}", error)))?
+            .map(|value| {
+                Uuid::parse_str(&value)
+                    .map(RunnerId::from)
+                    .map_err(|error| Error::database(format!("invalid job runner ID: {}", error)))
+            })
+            .transpose()?,
+        started_at: parse_optional_timestamp_column(&row, "started_at")?,
+        finished_at: parse_optional_timestamp_column(&row, "finished_at")?,
+        retry_count: row
+            .try_get("retry_count")
+            .map_err(|error| Error::database(format!("invalid job retry count: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+        commands: serde_json::from_str(&commands.unwrap_or_else(|| "[]".to_string()))
+            .map_err(|error| Error::database(format!("invalid job commands JSON: {}", error)))?,
+        image: row
+            .try_get::<Option<String>, _>("image")
+            .map_err(|error| Error::database(format!("invalid job image: {}", error)))?
+            .unwrap_or_else(|| "rust:latest".to_string()),
+        working_dir: row.try_get("working_dir").map_err(|error| {
+            Error::database(format!("invalid job working directory: {}", error))
+        })?,
+        result_json: row
+            .try_get("result_json")
+            .map_err(|error| Error::database(format!("invalid job result: {}", error)))?,
     })
 }
 
@@ -156,7 +197,10 @@ impl RepoQueries {
             .await
             .map_err(|e| Error::database(format!("failed to list repositories: {}", e)))?;
 
-        let repos = rows.into_iter().map(hydrate_repository).collect::<Result<Vec<_>>>()?;
+        let repos = rows
+            .into_iter()
+            .map(hydrate_repository)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(repos)
     }
@@ -178,7 +222,10 @@ impl RepoQueries {
             .await
             .map_err(|e| Error::database(format!("failed to list repositories: {}", e)))?;
 
-        let repos = rows.into_iter().map(hydrate_repository).collect::<Result<Vec<_>>>()?;
+        let repos = rows
+            .into_iter()
+            .map(hydrate_repository)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(repos)
     }
@@ -394,7 +441,10 @@ impl PipelineQueries {
                 .await
                 .map_err(|e| Error::database(format!("failed to list pipelines: {}", e)))?;
 
-        let pipelines = rows.into_iter().map(hydrate_pipeline).collect::<Result<Vec<_>>>()?;
+        let pipelines = rows
+            .into_iter()
+            .map(hydrate_pipeline)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(pipelines)
     }
@@ -406,7 +456,10 @@ impl PipelineQueries {
             .await
             .map_err(|e| Error::database(format!("failed to list pipelines: {}", e)))?;
 
-        let pipelines = rows.into_iter().map(hydrate_pipeline).collect::<Result<Vec<_>>>()?;
+        let pipelines = rows
+            .into_iter()
+            .map(hydrate_pipeline)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(pipelines)
     }
@@ -488,7 +541,10 @@ impl PipelineRunQueries {
         .await
         .map_err(|e| Error::database(format!("failed to list pipeline runs: {}", e)))?;
 
-        let runs = rows.into_iter().map(hydrate_pipeline_run).collect::<Result<Vec<_>>>()?;
+        let runs = rows
+            .into_iter()
+            .map(hydrate_pipeline_run)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(runs)
     }
@@ -500,7 +556,10 @@ impl PipelineRunQueries {
             .await
             .map_err(|e| Error::database(format!("failed to list pipeline runs: {}", e)))?;
 
-        let runs = rows.into_iter().map(hydrate_pipeline_run).collect::<Result<Vec<_>>>()?;
+        let runs = rows
+            .into_iter()
+            .map(hydrate_pipeline_run)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(runs)
     }
@@ -739,40 +798,7 @@ impl JobQueries {
             .await
             .map_err(|e| Error::database(format!("failed to get job: {}", e)))?;
 
-        match row {
-            Some(row) => Ok(Some(crate::models::Job {
-                id: JobId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_run_id: PipelineRunId::from(
-                    Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap(),
-                ),
-                name: row.get("name"),
-                status: row.get("status"),
-                runner_id: row
-                    .get::<Option<String>, _>("runner_id")
-                    .and_then(|s| Uuid::parse_str(&s).ok().map(RunnerId::from)),
-                started_at: row
-                    .get::<Option<String>, _>("started_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row
-                    .get::<Option<String>, _>("finished_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                retry_count: row.get("retry_count"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                commands: serde_json::from_str(
-                    &row.get::<Option<String>, _>("commands")
-                        .unwrap_or_else(|| "[]".to_string()),
-                )
-                .unwrap_or_default(),
-                image: row.get::<Option<String>, _>("image").unwrap_or_else(|| "rust:latest".to_string()),
-                working_dir: row.get("working_dir"),
-                result_json: row.get("result_json"),
-            })),
-            None => Ok(None),
-        }
+        row.map(hydrate_job).transpose()
     }
 
     /// Update job status
@@ -987,38 +1013,8 @@ impl JobQueries {
 
         let jobs = rows
             .into_iter()
-            .map(|row| crate::models::Job {
-                id: JobId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_run_id: PipelineRunId::from(
-                    Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap(),
-                ),
-                name: row.get("name"),
-                status: row.get("status"),
-                runner_id: row
-                    .get::<Option<String>, _>("runner_id")
-                    .and_then(|s| Uuid::parse_str(&s).ok().map(RunnerId::from)),
-                started_at: row
-                    .get::<Option<String>, _>("started_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row
-                    .get::<Option<String>, _>("finished_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                retry_count: row.get("retry_count"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                commands: serde_json::from_str(
-                    &row.get::<Option<String>, _>("commands")
-                        .unwrap_or_else(|| "[]".to_string()),
-                )
-                .unwrap_or_default(),
-                image: row.get::<Option<String>, _>("image").unwrap_or_else(|| "rust:latest".to_string()),
-                working_dir: row.get("working_dir"),
-                result_json: row.get("result_json"),
-            })
-            .collect();
+            .map(hydrate_job)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(jobs)
     }
@@ -1034,38 +1030,8 @@ impl JobQueries {
 
         let jobs = rows
             .into_iter()
-            .map(|row| crate::models::Job {
-                id: JobId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_run_id: PipelineRunId::from(
-                    Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap(),
-                ),
-                name: row.get("name"),
-                status: row.get("status"),
-                runner_id: row
-                    .get::<Option<String>, _>("runner_id")
-                    .and_then(|s| Uuid::parse_str(&s).ok().map(RunnerId::from)),
-                started_at: row
-                    .get::<Option<String>, _>("started_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row
-                    .get::<Option<String>, _>("finished_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                retry_count: row.get("retry_count"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                commands: serde_json::from_str(
-                    &row.get::<Option<String>, _>("commands")
-                        .unwrap_or_else(|| "[]".to_string()),
-                )
-                .unwrap_or_default(),
-                image: row.get::<Option<String>, _>("image").unwrap_or_else(|| "rust:latest".to_string()),
-                working_dir: row.get("working_dir"),
-                result_json: row.get("result_json"),
-            })
-            .collect();
+            .map(hydrate_job)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(jobs)
     }
@@ -1669,6 +1635,15 @@ mod tests {
         // List by run
         let jobs = JobQueries::list_by_run(&pool, run.id).await.unwrap();
         assert_eq!(jobs.len(), 1);
+
+        sqlx::query("UPDATE jobs SET created_at = ? WHERE id = ?")
+            .bind("2026-08-29 03:40:39")
+            .bind(job.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert!(JobQueries::get(&pool, job.id).await.is_err());
+        assert!(JobQueries::list_by_run(&pool, run.id).await.is_err());
     }
 
     #[tokio::test]
