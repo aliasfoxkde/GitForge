@@ -406,7 +406,7 @@ async fn submit_job(
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": "pipeline_run_lookup_failed"})),
-            )
+            );
         }
     }
     let fingerprint = match serde_json::to_string(&request) {
