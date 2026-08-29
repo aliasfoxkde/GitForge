@@ -39,8 +39,8 @@ async fn main() -> Result<()> {
 
     info!("starting gitforge-buildd daemon");
     info!("max concurrent jobs: {}", MAX_CONCURRENT_JOBS);
-    let socket_path = std::env::var("GITFORGE_BUILD_SOCKET")
-        .unwrap_or_else(|_| DEFAULT_SOCKET.to_string());
+    let socket_path =
+        std::env::var("GITFORGE_BUILD_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.to_string());
 
     // Initialize process supervision (subreaper + SIGCHLD)
     if let Err(e) = gitforge_process::init_without_sigchld_reaper() {

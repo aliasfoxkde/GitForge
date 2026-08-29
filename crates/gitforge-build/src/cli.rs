@@ -111,14 +111,14 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
                 match client.get_status(&socket_path, job_id.clone()).await? {
                     Response::Status { status, .. } => {
                         println!("status: {}", status);
-                        if status.starts_with("completed(")
-                            || status.starts_with("failed")
-                            || status == "cancelled"
-                        {
-                            if status.starts_with("failed") || status == "cancelled" {
+                        if let Some(exit_code) = completed_exit_code(&status) {
+                            if exit_code != 0 {
                                 anyhow::bail!("job {}", status);
                             }
                             return Ok(());
+                        }
+                        if status.starts_with("failed") || status == "cancelled" {
+                            anyhow::bail!("job {}", status);
                         }
                     }
                     Response::Error { message } => anyhow::bail!("error: {}", message),
@@ -133,6 +133,17 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
             anyhow::bail!("unexpected response: {:?}", response);
         }
     }
+}
+
+/// Extract the process exit code from the coordinator's completed status.
+/// Returning `None` for malformed statuses prevents an unknown terminal state
+/// from being treated as success by callers that rely on the CLI exit code.
+fn completed_exit_code(status: &str) -> Option<i32> {
+    status
+        .strip_prefix("completed(")?
+        .strip_suffix(')')?
+        .parse()
+        .ok()
 }
 
 async fn cancel_cmd<C: JobSubmitter>(client: &C, socket_path: &str, job_id: String) -> Result<()> {
@@ -466,6 +477,16 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.cargo_args, vec!["check", "-p", "foo", "--all-targets"]);
+    }
+
+    #[test]
+    fn test_completed_exit_code_parsing() {
+        assert_eq!(completed_exit_code("completed(0)"), Some(0));
+        assert_eq!(completed_exit_code("completed(101)"), Some(101));
+        assert_eq!(completed_exit_code("completed(-1)"), Some(-1));
+        assert_eq!(completed_exit_code("completed(nope)"), None);
+        assert_eq!(completed_exit_code("running"), None);
+        assert_eq!(completed_exit_code("completed(0) trailing"), None);
     }
 
     #[test]
