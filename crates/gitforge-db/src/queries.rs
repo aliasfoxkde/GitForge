@@ -29,6 +29,24 @@ fn parse_timestamp_column(
         .map_err(|error| Error::database(format!("invalid timestamp in {}: {}", column, error)))
 }
 
+fn parse_optional_timestamp_column(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    let value: Option<String> = row
+        .try_get(column)
+        .map_err(|error| Error::database(format!("invalid {} column: {}", column, error)))?;
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(&value)
+                .map(|date| date.with_timezone(&Utc))
+                .map_err(|error| {
+                    Error::database(format!("invalid timestamp in {}: {}", column, error))
+                })
+        })
+        .transpose()
+}
+
 fn hydrate_pipeline(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Pipeline> {
     Ok(crate::models::Pipeline {
         id: PipelineId::from(parse_uuid_column(&row, "id")?),
@@ -62,6 +80,26 @@ fn hydrate_repository(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Rep
             .map_err(|error| Error::database(format!("invalid repository git path: {}", error)))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
         updated_at: parse_timestamp_column(&row, "updated_at")?,
+    })
+}
+
+fn hydrate_pipeline_run(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::PipelineRun> {
+    Ok(crate::models::PipelineRun {
+        id: PipelineRunId::from(parse_uuid_column(&row, "id")?),
+        pipeline_id: PipelineId::from(parse_uuid_column(&row, "pipeline_id")?),
+        repo_id: RepoId::from(parse_uuid_column(&row, "repo_id")?),
+        status: row
+            .try_get("status")
+            .map_err(|error| Error::database(format!("invalid pipeline run status: {}", error)))?,
+        triggered_by: row.try_get("triggered_by").map_err(|error| {
+            Error::database(format!("invalid pipeline run actor: {}", error))
+        })?,
+        commit_hash: row.try_get("commit_hash").map_err(|error| {
+            Error::database(format!("invalid pipeline run commit: {}", error))
+        })?,
+        started_at: parse_optional_timestamp_column(&row, "started_at")?,
+        finished_at: parse_optional_timestamp_column(&row, "finished_at")?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
     })
 }
 
@@ -413,27 +451,7 @@ impl PipelineRunQueries {
             .map_err(|e| Error::database(format!("failed to get pipeline run: {}", e)))?;
 
         match row {
-            Some(row) => Ok(Some(crate::models::PipelineRun {
-                id: PipelineRunId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_id: PipelineId::from(
-                    Uuid::parse_str(&row.get::<String, _>("pipeline_id")).unwrap(),
-                ),
-                repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
-                status: row.get("status"),
-                triggered_by: row.get("triggered_by"),
-                commit_hash: row.get("commit_hash"),
-                started_at: row
-                    .get::<Option<String>, _>("started_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row
-                    .get::<Option<String>, _>("finished_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
+            Some(row) => hydrate_pipeline_run(row).map(Some),
             None => Ok(None),
         }
     }
@@ -470,30 +488,7 @@ impl PipelineRunQueries {
         .await
         .map_err(|e| Error::database(format!("failed to list pipeline runs: {}", e)))?;
 
-        let runs = rows
-            .into_iter()
-            .map(|row| crate::models::PipelineRun {
-                id: PipelineRunId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_id: PipelineId::from(
-                    Uuid::parse_str(&row.get::<String, _>("pipeline_id")).unwrap(),
-                ),
-                repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
-                status: row.get("status"),
-                triggered_by: row.get("triggered_by"),
-                commit_hash: row.get("commit_hash"),
-                started_at: row
-                    .get::<Option<String>, _>("started_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row
-                    .get::<Option<String>, _>("finished_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+        let runs = rows.into_iter().map(hydrate_pipeline_run).collect::<Result<Vec<_>>>()?;
 
         Ok(runs)
     }
@@ -505,30 +500,7 @@ impl PipelineRunQueries {
             .await
             .map_err(|e| Error::database(format!("failed to list pipeline runs: {}", e)))?;
 
-        let runs = rows
-            .into_iter()
-            .map(|row| crate::models::PipelineRun {
-                id: PipelineRunId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_id: PipelineId::from(
-                    Uuid::parse_str(&row.get::<String, _>("pipeline_id")).unwrap(),
-                ),
-                repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
-                status: row.get("status"),
-                triggered_by: row.get("triggered_by"),
-                commit_hash: row.get("commit_hash"),
-                started_at: row
-                    .get::<Option<String>, _>("started_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row
-                    .get::<Option<String>, _>("finished_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+        let runs = rows.into_iter().map(hydrate_pipeline_run).collect::<Result<Vec<_>>>()?;
 
         Ok(runs)
     }
@@ -1616,6 +1588,14 @@ mod tests {
         // List all
         let all_runs = PipelineRunQueries::list(&pool).await.unwrap();
         assert_eq!(all_runs.len(), 1);
+
+        sqlx::query("UPDATE pipeline_runs SET created_at = ? WHERE id = ?")
+            .bind("2026-08-29 03:40:39")
+            .bind(run.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert!(PipelineRunQueries::get(&pool, run.id).await.is_err());
     }
 
     #[tokio::test]
