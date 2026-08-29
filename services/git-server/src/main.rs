@@ -29,6 +29,9 @@ struct AppState {
     http_handler: Arc<HttpGitHandler<FileStorageBackend>>,
     storage: Arc<FileStorageBackend>,
     db_pool: Option<Arc<Pool>>,
+    ci_trigger_url: Option<String>,
+    ci_trigger_token: Option<String>,
+    http_client: reqwest::Client,
 }
 
 /// SSH server configuration
@@ -118,7 +121,16 @@ async fn main() -> anyhow::Result<()> {
         http_handler,
         storage: storage.clone(),
         db_pool: saved_db_pool.clone(),
+        ci_trigger_url: std::env::var("GITFORGE_CI_TRIGGER_URL").ok(),
+        ci_trigger_token: std::env::var("GITFORGE_CI_TRIGGER_TOKEN").ok(),
+        http_client: reqwest::Client::new(),
     };
+
+    if state.ci_trigger_url.is_none() || state.ci_trigger_token.is_none() {
+        tracing::warn!(
+            "GITFORGE_CI_TRIGGER_URL/TOKEN is not fully configured; pushes will not trigger CI"
+        );
+    }
 
     // Build router for Git HTTP protocol
     let app = Router::new()
@@ -411,11 +423,23 @@ async fn git_receive_pack(
         .receive_pack(repo_id, body.to_vec())
         .await
     {
-        Ok(response) => Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/x-git-receive-pack-result")
-            .body(Body::from(response))
-            .unwrap(),
+        Ok(response) => {
+            for update in parse_receive_updates(&body) {
+                if let Err(error) = notify_ci(&state, repo_id, &update).await {
+                    tracing::error!(
+                        repo_id = %repo_id,
+                        ref_name = %update.ref_name,
+                        error = %error,
+                        "failed to notify CI after accepted push"
+                    );
+                }
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/x-git-receive-pack-result")
+                .body(Body::from(response))
+                .unwrap()
+        }
         Err(e) => {
             tracing::warn!("receive-pack failed for {}: {}", repo_path, e);
             Response::builder()
@@ -424,6 +448,76 @@ async fn git_receive_pack(
                 .unwrap()
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReceiveUpdate {
+    old_hash: String,
+    new_hash: String,
+    ref_name: String,
+}
+
+fn parse_receive_updates(input: &[u8]) -> Vec<ReceiveUpdate> {
+    let mut updates = Vec::new();
+    let mut offset = 0;
+    while offset + 4 <= input.len() {
+        let Ok(length) =
+            usize::from_str_radix(&String::from_utf8_lossy(&input[offset..offset + 4]), 16)
+        else {
+            break;
+        };
+        if length == 0 {
+            break;
+        }
+        if length < 4 || offset + length > input.len() {
+            break;
+        }
+        let payload = &input[offset + 4..offset + length];
+        if let Ok(line) = std::str::from_utf8(payload) {
+            let fields: Vec<&str> = line
+                .split('\0')
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect();
+            if fields.len() >= 3 {
+                updates.push(ReceiveUpdate {
+                    old_hash: fields[0].to_string(),
+                    new_hash: fields[1].to_string(),
+                    ref_name: fields[2].to_string(),
+                });
+            }
+        }
+        offset += length;
+    }
+    updates
+}
+
+async fn notify_ci(
+    state: &AppState,
+    repo_id: RepoId,
+    update: &ReceiveUpdate,
+) -> anyhow::Result<()> {
+    let (Some(url), Some(token)) = (&state.ci_trigger_url, &state.ci_trigger_token) else {
+        return Ok(());
+    };
+    let response = state
+        .http_client
+        .post(url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "repo_id": repo_id.to_string(),
+            "ref_name": update.ref_name,
+            "old_hash": update.old_hash,
+            "new_hash": update.new_hash,
+            "working_dir": null,
+        }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("CI trigger returned HTTP {}", response.status());
+    }
+    Ok(())
 }
 
 /// Git receive-pack handler with additional path
@@ -715,6 +809,25 @@ mod tests {
         let root = get_git_root();
         assert_eq!(root, "/custom/path");
         std::env::remove_var("GIT_ROOT");
+    }
+
+    #[test]
+    fn test_parse_receive_updates() {
+        let payload = "1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 refs/heads/main\0report-status\n";
+        let input = format!("{:04x}{payload}0000", payload.len() + 4).into_bytes();
+        assert_eq!(
+            parse_receive_updates(&input),
+            vec![ReceiveUpdate {
+                old_hash: "1111111111111111111111111111111111111111".to_string(),
+                new_hash: "2222222222222222222222222222222222222222".to_string(),
+                ref_name: "refs/heads/main".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_receive_updates_rejects_truncated_packet() {
+        assert!(parse_receive_updates(b"0040incomplete").is_empty());
     }
 
     #[test]
