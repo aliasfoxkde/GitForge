@@ -981,8 +981,9 @@ mod tests {
             .lock()
             .await;
         let run_id = gitforge_common::PipelineRunId::new();
-        let test_root = tempfile::tempdir().unwrap();
-        let test_root_path = test_root.path().join(run_id.to_string());
+        let test_root_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-workspace-tests")
+            .join(run_id.to_string());
         let source = test_root_path.join("source.git");
         let seed = test_root_path.join("seed");
         tokio::fs::create_dir_all(&test_root_path).await.unwrap();
