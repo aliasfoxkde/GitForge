@@ -1,10 +1,12 @@
 //! Build coordinator with semaphore-based concurrency control
 
 use crate::job::{BuildJob, BuildResult, JobStatus, MAX_CONCURRENT_JOBS};
+use crate::journal::{JobJournal, JobJournalEvent, JournalReplay};
 use crate::protocol::{JobInfo, Response};
 use nix::sys::signal::{killpg, Signal, SIGTERM};
 use nix::unistd::Pid;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, Semaphore};
@@ -34,10 +36,12 @@ pub struct BuildCoordinator {
     job_timeout: Duration,
     /// Wakes waiters when a job changes state.
     state_changed: Arc<Notify>,
+    /// Optional durable journal for local job recovery.
+    journal: Option<Arc<Mutex<JobJournal>>>,
 }
 
 /// Admission and execution limits for the build daemon.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BuildCoordinatorConfig {
     /// Number of jobs that may execute concurrently.
     pub max_concurrent: usize,
@@ -45,6 +49,8 @@ pub struct BuildCoordinatorConfig {
     pub max_queued: usize,
     /// Maximum wall-clock time for a child process.
     pub job_timeout: Duration,
+    /// Optional append-only journal path.
+    pub journal_path: Option<PathBuf>,
 }
 
 impl Default for BuildCoordinatorConfig {
@@ -53,6 +59,7 @@ impl Default for BuildCoordinatorConfig {
             max_concurrent: MAX_CONCURRENT_JOBS,
             max_queued: 32,
             job_timeout: Duration::from_secs(3600),
+            journal_path: None,
         }
     }
 }
@@ -74,10 +81,12 @@ impl BuildCoordinatorConfig {
             1,
             86_400,
         );
+        let journal_path = std::env::var_os("GITFORGE_BUILD_JOURNAL").map(PathBuf::from);
         Self {
             max_concurrent,
             max_queued,
             job_timeout: Duration::from_secs(timeout_secs as u64),
+            journal_path,
         }
     }
 }
@@ -110,7 +119,95 @@ impl BuildCoordinator {
             max_concurrent_jobs: max_concurrent,
             job_timeout: config.job_timeout,
             state_changed: Arc::new(Notify::new()),
+            journal: None,
         }
+    }
+
+    /// Open a journal and recover its last known state before accepting work.
+    pub async fn with_journal(
+        config: BuildCoordinatorConfig,
+        path: impl AsRef<Path>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let journal = JobJournal::open(path)?;
+        let replay = journal.replay()?;
+        let mut coordinator = Self::with_config(config);
+        coordinator.journal = Some(Arc::new(Mutex::new(journal)));
+        let coordinator = Arc::new(coordinator);
+        coordinator.restore(replay).await;
+        Ok(coordinator)
+    }
+
+    async fn restore(self: &Arc<Self>, replay: JournalReplay) {
+        for recovered in replay.jobs {
+            let mut job = BuildJob::new(recovered.cargo_args, recovered.working_dir);
+            job.id = recovered.job_id;
+            job.executable = recovered.executable;
+            match recovered.status {
+                JobStatus::Queued => {
+                    if self
+                        .admitted_jobs
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                            (n < self.max_jobs).then_some(n + 1)
+                        })
+                        .is_ok()
+                    {
+                        self.jobs.lock().await.insert(job.id, job.clone());
+                        self.spawn_worker(job);
+                    } else {
+                        warn!(
+                            "dropping recovered queued job {}: admission is full",
+                            job.id
+                        );
+                    }
+                }
+                JobStatus::Completed {
+                    exit_code,
+                    duration_ms,
+                } => {
+                    job.status = JobStatus::Completed {
+                        exit_code,
+                        duration_ms,
+                    };
+                    if let Some(result) = recovered.result {
+                        self.results.lock().await.insert(job.id, result);
+                    }
+                    self.jobs.lock().await.insert(job.id, job);
+                    self.completed_count.fetch_add(1, Ordering::SeqCst);
+                }
+                JobStatus::Failed {
+                    exit_code,
+                    duration_ms,
+                    error,
+                } => {
+                    job.status = JobStatus::Failed {
+                        exit_code,
+                        duration_ms,
+                        error,
+                    };
+                    if let Some(result) = recovered.result {
+                        self.results.lock().await.insert(job.id, result);
+                    }
+                    self.jobs.lock().await.insert(job.id, job);
+                    self.completed_count.fetch_add(1, Ordering::SeqCst);
+                }
+                JobStatus::Cancelled => {
+                    job.status = JobStatus::Cancelled;
+                    self.jobs.lock().await.insert(job.id, job);
+                }
+                JobStatus::Running { pid } => {
+                    let error = format!("daemon restarted while job was running (pid {})", pid);
+                    job.status = JobStatus::Failed {
+                        exit_code: -1,
+                        duration_ms: 0,
+                        error: error.clone(),
+                    };
+                    let result = BuildResult::failed(&job, -1, String::new(), error);
+                    self.results.lock().await.insert(job.id, result);
+                    self.jobs.lock().await.insert(job.id, job);
+                }
+            }
+        }
+        self.state_changed.notify_waiters();
     }
 
     /// Get the maximum concurrent job count
@@ -187,7 +284,6 @@ impl BuildCoordinator {
             }
         }
         let job_id = job.id;
-        let coordinator = self.clone();
 
         info!("submitting job {} with args: {:?}", job_id, job.cargo_args);
 
@@ -196,10 +292,41 @@ impl BuildCoordinator {
             let mut jobs = self.jobs.lock().await;
             jobs.insert(job_id, job.clone());
         }
+        if let Err(error) = self
+            .append_journal(JobJournalEvent::Submitted {
+                job_id,
+                cargo_args: job.cargo_args.clone(),
+                executable: job.executable.clone(),
+                working_dir: job.working_dir.clone(),
+            })
+            .await
+        {
+            self.jobs.lock().await.remove(&job_id);
+            self.admitted_jobs.fetch_sub(1, Ordering::AcqRel);
+            return Err(error);
+        }
         self.state_changed.notify_waiters();
 
-        // Spawn a worker that waits for capacity independently of the client
-        // request. The permit lives for the complete process lifetime.
+        self.spawn_worker(job);
+        Ok(job_id)
+    }
+
+    async fn append_journal(&self, event: JobJournalEvent) -> Result<(), String> {
+        let Some(journal) = &self.journal else {
+            return Ok(());
+        };
+        journal
+            .lock()
+            .await
+            .append(&event)
+            .map_err(|error| format!("failed to persist build state: {}", error))
+    }
+
+    fn spawn_worker(self: &Arc<Self>, job: BuildJob) {
+        let coordinator = self.clone();
+        let job_id = job.id;
+        // The worker waits for capacity independently of the client request.
+        // The permit lives for the complete process lifetime.
         tokio::spawn(async move {
             let permit = match coordinator.semaphore.clone().acquire_owned().await {
                 Ok(permit) => permit,
@@ -222,6 +349,12 @@ impl BuildCoordinator {
                 }
             }
             coordinator.state_changed.notify_waiters();
+            if let Err(error) = coordinator
+                .append_journal(JobJournalEvent::Started { job_id, pid: 0 })
+                .await
+            {
+                error!("failed to persist start for job {}: {}", job_id, error);
+            }
 
             // Execute the job
             let result = execute_job(
@@ -260,6 +393,20 @@ impl BuildCoordinator {
             }
             coordinator.state_changed.notify_waiters();
 
+            let event = match &result {
+                Ok(result) => JobJournalEvent::Completed {
+                    job_id,
+                    result: result.clone(),
+                },
+                Err(error) => JobJournalEvent::Failed {
+                    job_id,
+                    result: BuildResult::failed(&job, -1, String::new(), error.to_string()),
+                },
+            };
+            if let Err(error) = coordinator.append_journal(event).await {
+                error!("failed to persist completion for job {}: {}", job_id, error);
+            }
+
             // Store result for waiters
             {
                 let mut results = coordinator.results.lock().await;
@@ -272,8 +419,6 @@ impl BuildCoordinator {
             drop(permit);
             coordinator.admitted_jobs.fetch_sub(1, Ordering::AcqRel);
         });
-
-        Ok(job_id)
     }
 
     /// Cancel a queued or running build. Running jobs are terminated through
@@ -295,6 +440,15 @@ impl BuildCoordinator {
             // until continued. Always resume it before termination.
             let _ = killpg(pgid, Signal::SIGCONT);
             let _ = killpg(pgid, SIGTERM);
+        }
+        if let Err(error) = self
+            .append_journal(JobJournalEvent::Cancelled { job_id })
+            .await
+        {
+            error!(
+                "failed to persist cancellation for job {}: {}",
+                job_id, error
+            );
         }
         self.state_changed.notify_waiters();
         true
@@ -833,6 +987,7 @@ mod tests {
             max_concurrent: 1,
             max_queued: 0,
             job_timeout: Duration::from_secs(10),
+            journal_path: None,
         }));
         let first = coordinator
             .try_submit_command(
@@ -851,6 +1006,84 @@ mod tests {
             .wait_for_job_with_timeout(first, Duration::from_secs(5))
             .await
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_replays_terminal_result_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join("jobs.jsonl");
+        let config = BuildCoordinatorConfig {
+            max_concurrent: 1,
+            max_queued: 1,
+            job_timeout: Duration::from_secs(10),
+            journal_path: None,
+        };
+        let first = BuildCoordinator::with_journal(config.clone(), &journal_path)
+            .await
+            .unwrap();
+        let job_id = first
+            .try_submit_command("/bin/true".into(), Vec::new(), None)
+            .await
+            .unwrap();
+        assert!(first
+            .wait_for_job_with_timeout(job_id, Duration::from_secs(5))
+            .await
+            .is_some());
+        first.shutdown(Duration::from_secs(1)).await;
+
+        let restarted = BuildCoordinator::with_journal(config, &journal_path)
+            .await
+            .unwrap();
+        let result = restarted
+            .wait_for_job_with_timeout(job_id, Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.exit_code, 0);
+        if let Response::Stats {
+            completed_count, ..
+        } = restarted.stats().await
+        {
+            assert_eq!(completed_count, 1);
+        } else {
+            panic!("expected stats response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_fences_interrupted_running_job_on_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join("jobs.jsonl");
+        let id = uuid::Uuid::new_v4();
+        let mut journal = JobJournal::open(&journal_path).unwrap();
+        journal
+            .append(&JobJournalEvent::Submitted {
+                job_id: id,
+                cargo_args: vec!["test".into()],
+                executable: None,
+                working_dir: None,
+            })
+            .unwrap();
+        journal
+            .append(&JobJournalEvent::Started {
+                job_id: id,
+                pid: 4242,
+            })
+            .unwrap();
+        drop(journal);
+
+        let coordinator =
+            BuildCoordinator::with_journal(BuildCoordinatorConfig::default(), &journal_path)
+                .await
+                .unwrap();
+        let status = coordinator.get_status(&id).await.unwrap();
+        assert!(status.0.starts_with("failed(-1): daemon restarted"));
+        let result = coordinator
+            .wait_for_job_with_timeout(id, Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("pid 4242"));
     }
 
     #[test]

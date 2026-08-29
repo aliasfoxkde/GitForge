@@ -11,6 +11,7 @@ The daemon accepts these bounded environment overrides:
 | `GITFORGE_BUILD_MAX_CONCURRENT` | `8` | `1..64` | Child processes allowed to execute concurrently |
 | `GITFORGE_BUILD_MAX_QUEUED` | `32` | `0..1024` | Additional jobs admitted while workers are busy |
 | `GITFORGE_BUILD_TIMEOUT_SECONDS` | `3600` | `1..86400` | Wall-clock limit for each child process |
+| `GITFORGE_BUILD_JOURNAL` | unset | explicit filesystem path | Enable fsynced local job recovery journal |
 
 Values outside the allowed range are clamped. A full queue returns a protocol error immediately; callers should retry with backoff rather than repeatedly spawning local workers.
 
@@ -147,6 +148,7 @@ ExecStart=/path/to/gitforge-buildd
 Environment=GITFORGE_BUILD_MAX_CONCURRENT=8
 Environment=GITFORGE_BUILD_MAX_QUEUED=32
 Environment=GITFORGE_BUILD_TIMEOUT_SECONDS=3600
+Environment=GITFORGE_BUILD_JOURNAL=%S/gitforge/build/jobs.jsonl
 Restart=on-failure
 RestartSec=5
 

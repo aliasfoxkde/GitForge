@@ -51,7 +51,11 @@ async fn main() -> Result<()> {
     }
 
     // Create build coordinator
-    let coordinator = Arc::new(BuildCoordinator::with_config(config));
+    let coordinator = if let Some(path) = config.journal_path.clone() {
+        BuildCoordinator::with_journal(config, path).await?
+    } else {
+        Arc::new(BuildCoordinator::with_config(config))
+    };
 
     // Clean up old socket
     if Path::new(&socket_path).exists() {
