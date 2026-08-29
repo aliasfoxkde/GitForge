@@ -1155,16 +1155,35 @@ mod tests {
             .join(gitforge_common::RepoId::new().to_string());
         tokio::fs::create_dir_all(&root).await.unwrap();
         let source = root.join("source.git");
+        let seed = root.join("seed");
         run_git(["init", "--bare", source.to_str().unwrap()], None).await;
+        tokio::fs::create_dir_all(&seed).await.unwrap();
+        run_git(["init", seed.to_str().unwrap()], None).await;
+        run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
+        run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
+        tokio::fs::write(seed.join("marker.txt"), "checked out\n")
+            .await
+            .unwrap();
+        run_git(["add", "marker.txt"], Some(&seed)).await;
+        run_git(["commit", "-m", "workspace fixture"], Some(&seed)).await;
+        run_git(
+            ["push", source.to_str().unwrap(), "HEAD:refs/heads/main"],
+            Some(&seed),
+        )
+        .await;
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", root.join("workspaces"));
         let (pool, repo_id) =
             test_pool_with_repository(source.to_string_lossy().into_owned()).await;
         let run_id = gitforge_common::PipelineRunId::new();
         let error = prepare_run_workspace(&pool, repo_id, run_id, "deadbeef")
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("checkout commit deadbeef failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("checkout commit deadbeef failed"),
+            "unexpected workspace preparation error: {error:#}"
+        );
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
