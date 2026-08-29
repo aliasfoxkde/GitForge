@@ -122,13 +122,15 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
                     Response::Status { status, .. } => {
                         println!("status: {}", status);
                         if let Some(exit_code) = completed_exit_code(&status) {
+                            let result = client.get_result(&socket_path, job_id.clone()).await?;
                             if exit_code != 0 {
-                                anyhow::bail!("job {}", status);
+                                return bail_with_diagnostics(&status, result);
                             }
                             return Ok(());
                         }
                         if status.starts_with("failed") || status == "cancelled" {
-                            anyhow::bail!("job {}", status);
+                            let result = client.get_result(&socket_path, job_id.clone()).await?;
+                            return bail_with_diagnostics(&status, result);
                         }
                     }
                     Response::Error { message } => anyhow::bail!("error: {}", message),
@@ -142,6 +144,22 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
         _ => {
             anyhow::bail!("unexpected response: {:?}", response);
         }
+    }
+}
+
+fn bail_with_diagnostics(status: &str, response: Response) -> Result<()> {
+    match response {
+        Response::Completed { stdout, stderr, .. } => {
+            if !stdout.is_empty() {
+                eprint!("{}", stdout);
+            }
+            if !stderr.is_empty() {
+                eprint!("{}", stderr);
+            }
+            anyhow::bail!("job {}", status);
+        }
+        Response::Error { message } => anyhow::bail!("job {}; result error: {}", status, message),
+        response => anyhow::bail!("job {}; unexpected result: {:?}", status, response),
     }
 }
 

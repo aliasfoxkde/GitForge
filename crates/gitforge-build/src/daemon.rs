@@ -191,7 +191,7 @@ async fn handle_connection(
             if let Ok(uuid) = uuid::Uuid::parse_str(&job_id) {
                 if let Some((status, wait_time_ms)) = coordinator.get_status(&uuid).await {
                     Response::Status {
-                        job_id,
+                        job_id: job_id.to_string(),
                         status,
                         wait_time_ms,
                     }
@@ -204,6 +204,37 @@ async fn handle_connection(
                 Response::Error {
                     message: "invalid job id".to_string(),
                 }
+            }
+        }
+        Request::Result { job_id } => {
+            const MAX_DIAGNOSTIC_BYTES: usize = 24 * 1024;
+            fn bound(value: &str) -> String {
+                if value.len() <= MAX_DIAGNOSTIC_BYTES {
+                    return value.to_string();
+                }
+                let mut end = MAX_DIAGNOSTIC_BYTES;
+                while !value.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}\n[output truncated by build daemon]", &value[..end])
+            }
+            match uuid::Uuid::parse_str(&job_id) {
+                Ok(job_id) => match coordinator.get_result(&job_id).await {
+                    Some(result) => Response::Completed {
+                        job_id: job_id.to_string(),
+                        success: result.success,
+                        exit_code: result.exit_code,
+                        duration_ms: result.duration_ms,
+                        stdout: bound(&result.output.stdout),
+                        stderr: bound(&result.output.stderr),
+                    },
+                    None => Response::Error {
+                        message: "job result is not available".to_string(),
+                    },
+                },
+                Err(_) => Response::Error {
+                    message: "invalid job id".to_string(),
+                },
             }
         }
         Request::Cancel { job_id } => match uuid::Uuid::parse_str(&job_id) {

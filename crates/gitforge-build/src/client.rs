@@ -40,6 +40,9 @@ pub trait JobSubmitter: Send + Sync {
     /// Read the current state of a job.
     async fn get_status(&self, socket_path: &str, job_id: String) -> DaemonResult;
 
+    /// Read a bounded terminal result, including captured diagnostics.
+    async fn get_result(&self, socket_path: &str, job_id: String) -> DaemonResult;
+
     /// Cancel a queued or running job.
     async fn cancel_job(&self, socket_path: &str, job_id: String) -> DaemonResult;
 
@@ -133,6 +136,15 @@ impl JobSubmitter for UnixSocketClient {
         let mut stream = UnixStream::connect(socket_path).await?;
         stream
             .write_all(&encode_request(&Request::Status { job_id })?)
+            .await?;
+        stream.shutdown().await?;
+        Ok(read_response(&mut stream).await?)
+    }
+
+    async fn get_result(&self, socket_path: &str, job_id: String) -> DaemonResult {
+        let mut stream = UnixStream::connect(socket_path).await?;
+        stream
+            .write_all(&encode_request(&Request::Result { job_id })?)
             .await?;
         stream.shutdown().await?;
         Ok(read_response(&mut stream).await?)
@@ -235,6 +247,17 @@ impl JobSubmitter for MockClient {
             job_id,
             status: "queued".to_string(),
             wait_time_ms: 0,
+        })
+    }
+
+    async fn get_result(&self, _socket_path: &str, job_id: String) -> DaemonResult {
+        Ok(Response::Completed {
+            job_id,
+            success: true,
+            exit_code: 0,
+            duration_ms: 0,
+            stdout: String::new(),
+            stderr: String::new(),
         })
     }
 

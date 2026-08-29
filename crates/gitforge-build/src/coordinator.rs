@@ -595,6 +595,12 @@ impl BuildCoordinator {
         })
     }
 
+    /// Return a terminal result with output bounded to the socket protocol.
+    pub async fn get_result(&self, job_id: &uuid::Uuid) -> Option<BuildResult> {
+        let results = self.results.lock().await;
+        results.get(job_id).cloned()
+    }
+
     /// List all jobs
     pub async fn list_jobs(&self) -> Vec<JobInfo> {
         let jobs = self.jobs.lock().await;
@@ -1029,6 +1035,39 @@ mod tests {
         let fake_uuid = uuid::Uuid::new_v4();
         let status = coordinator.get_status(&fake_uuid).await;
         assert!(status.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_get_result_returns_terminal_diagnostics() {
+        let coordinator = Arc::new(BuildCoordinator::with_config(BuildCoordinatorConfig {
+            max_concurrent: 1,
+            max_queued: 1,
+            job_timeout: Duration::from_secs(10),
+            journal_path: None,
+            max_retained_jobs: 4,
+            resource_limits: None,
+        }));
+        let job_id = coordinator
+            .try_submit_command(
+                "/bin/sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    "printf 'failure details' >&2; exit 7".to_string(),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        let result = coordinator
+            .wait_for_job_with_timeout(job_id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(
+            coordinator.get_result(&job_id).await.unwrap().output.stderr,
+            "failure details"
+        );
     }
 
     #[tokio::test]

@@ -33,6 +33,12 @@ the current recovery state.
 
 Values outside the allowed range are clamped. A full queue returns a protocol error immediately; callers should retry with backoff rather than repeatedly spawning local workers.
 
+Terminal diagnostics are retrieved with the daemon's `Result` request. The CLI
+uses this automatically when a waited job fails, printing bounded stdout and
+stderr before returning the nonzero status. Each stream is capped at 24 KiB at
+the socket boundary; the complete output remains available to in-process
+waiters when it has not been pruned.
+
 ## Architecture
 
 ```

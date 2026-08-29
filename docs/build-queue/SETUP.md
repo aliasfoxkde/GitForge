@@ -105,6 +105,10 @@ Available tools:
 | Bypass daemon | `cargo-wrapper --wrapper-fallback -- <cmd>` |
 | View logs | `tail -f target/quality/gitforge-build.log` |
 
+Waited jobs automatically retrieve bounded terminal stdout/stderr diagnostics
+when they fail, so the returned nonzero status includes the child error rather
+than only `completed(1)`.
+
 ## Troubleshooting
 
 ### Daemon won't start

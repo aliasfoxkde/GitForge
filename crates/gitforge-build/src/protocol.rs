@@ -12,6 +12,7 @@ impl Request {
             Request::Submit { .. } => "submit",
             Request::Exec { .. } => "exec",
             Request::Status { .. } => "status",
+            Request::Result { .. } => "result",
             Request::Cancel { .. } => "cancel",
             Request::List => "list",
             Request::Stats => "stats",
@@ -37,6 +38,8 @@ pub enum Request {
     },
     /// Check job status
     Status { job_id: String },
+    /// Read the bounded terminal result for a job.
+    Result { job_id: String },
     /// Cancel a running job
     Cancel { job_id: String },
     /// List all jobs
@@ -196,6 +199,13 @@ mod tests {
             "status"
         );
         assert_eq!(
+            Request::Result {
+                job_id: "123".to_string()
+            }
+            .name(),
+            "result"
+        );
+        assert_eq!(
             Request::Cancel {
                 job_id: "123".to_string()
             }
@@ -217,6 +227,9 @@ mod tests {
             Request::Status {
                 job_id: "test-123".to_string(),
             },
+            Request::Result {
+                job_id: "test-result".to_string(),
+            },
             Request::Cancel {
                 job_id: "test-456".to_string(),
             },
@@ -237,6 +250,7 @@ mod tests {
             match (&req, &decoded) {
                 (Request::Submit { .. }, Request::Submit { .. }) => (),
                 (Request::Status { .. }, Request::Status { .. }) => (),
+                (Request::Result { .. }, Request::Result { .. }) => (),
                 (Request::Cancel { .. }, Request::Cancel { .. }) => (),
                 (Request::List, Request::List) => (),
                 (Request::Stats, Request::Stats) => (),
