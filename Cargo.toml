@@ -75,7 +75,7 @@ reqwest = { version = "0.13", features = ["json"] }
 bollard = "0.16"
 
 # JWT
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 
 # Password hashing
 bcrypt = "0.19"
