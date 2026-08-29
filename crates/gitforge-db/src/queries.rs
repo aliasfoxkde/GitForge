@@ -836,7 +836,7 @@ impl JobQueries {
     /// Requeue an assigned job and clear its runner fencing token.
     pub async fn requeue(pool: &Pool, id: JobId) -> Result<()> {
         sqlx::query(
-            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE id = ? AND status = 'assigned'",
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE id = ? AND status IN ('assigned', 'running')",
         )
         .bind(id.to_string())
         .execute(pool.pool())
@@ -1702,6 +1702,15 @@ mod tests {
         PipelineRunQueries::create(&pool, &run).await.unwrap();
         let job = crate::models::Job::new(run.id, "build".to_string());
         JobQueries::create(&pool, &job).await.unwrap();
+        JobQueries::start(&pool, job.id).await.unwrap();
+
+        // Runner-loss recovery must clear an already-running lease, not only
+        // jobs that were assigned but had not started execution yet.
+        JobQueries::requeue(&pool, job.id).await.unwrap();
+        let requeued = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(requeued.status, "queued");
+        assert!(requeued.runner_id.is_none());
+
         JobQueries::start(&pool, job.id).await.unwrap();
 
         assert_eq!(JobQueries::requeue_inflight(&pool).await.unwrap(), 1);
