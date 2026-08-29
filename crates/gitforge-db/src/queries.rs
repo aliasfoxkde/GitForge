@@ -47,6 +47,24 @@ fn hydrate_pipeline(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Pipel
     })
 }
 
+fn hydrate_repository(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Repository> {
+    Ok(crate::models::Repository {
+        id: RepoId::from(parse_uuid_column(&row, "id")?),
+        name: row
+            .try_get("name")
+            .map_err(|error| Error::database(format!("invalid repository name: {}", error)))?,
+        owner_id: UserId::from(parse_uuid_column(&row, "owner_id")?),
+        visibility: row
+            .try_get("visibility")
+            .map_err(|error| Error::database(format!("invalid repository visibility: {}", error)))?,
+        git_path: row
+            .try_get("git_path")
+            .map_err(|error| Error::database(format!("invalid repository git path: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+        updated_at: parse_timestamp_column(&row, "updated_at")?,
+    })
+}
+
 // ============================================================================
 // Repository Queries
 // ============================================================================
@@ -84,19 +102,7 @@ impl RepoQueries {
             .map_err(|e| Error::database(format!("failed to get repository: {}", e)))?;
 
         match row {
-            Some(row) => Ok(Some(crate::models::Repository {
-                id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                owner_id: UserId::from(Uuid::parse_str(&row.get::<String, _>("owner_id")).unwrap()),
-                visibility: row.get("visibility"),
-                git_path: row.get("git_path"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                updated_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
+            Some(row) => hydrate_repository(row).map(Some),
             None => Ok(None),
         }
     }
@@ -112,22 +118,7 @@ impl RepoQueries {
             .await
             .map_err(|e| Error::database(format!("failed to list repositories: {}", e)))?;
 
-        let repos = rows
-            .into_iter()
-            .map(|row| crate::models::Repository {
-                id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                owner_id: UserId::from(Uuid::parse_str(&row.get::<String, _>("owner_id")).unwrap()),
-                visibility: row.get("visibility"),
-                git_path: row.get("git_path"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                updated_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+        let repos = rows.into_iter().map(hydrate_repository).collect::<Result<Vec<_>>>()?;
 
         Ok(repos)
     }
@@ -149,22 +140,7 @@ impl RepoQueries {
             .await
             .map_err(|e| Error::database(format!("failed to list repositories: {}", e)))?;
 
-        let repos = rows
-            .into_iter()
-            .map(|row| crate::models::Repository {
-                id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                owner_id: UserId::from(Uuid::parse_str(&row.get::<String, _>("owner_id")).unwrap()),
-                visibility: row.get("visibility"),
-                git_path: row.get("git_path"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                updated_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+        let repos = rows.into_iter().map(hydrate_repository).collect::<Result<Vec<_>>>()?;
 
         Ok(repos)
     }
@@ -191,19 +167,7 @@ impl RepoQueries {
         })?;
 
         match row {
-            Some(row) => Ok(Some(crate::models::Repository {
-                id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                owner_id: UserId::from(Uuid::parse_str(&row.get::<String, _>("owner_id")).unwrap()),
-                visibility: row.get("visibility"),
-                git_path: row.get("git_path"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                updated_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
+            Some(row) => hydrate_repository(row).map(Some),
             None => Ok(None),
         }
     }
