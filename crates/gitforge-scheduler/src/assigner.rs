@@ -498,17 +498,20 @@ impl Scheduler {
             let mut state = self.state.write().await;
             for runner in state.runners.values_mut() {
                 if runner.status == "online" {
-                    if let Some(last_heartbeat) = runner.last_heartbeat {
-                        if last_heartbeat < stale_threshold {
-                            runner.status = "offline".to_string();
-                            tracing::warn!(
-                                "runner {} marked offline: last heartbeat {} seconds ago",
-                                runner.id,
-                                heartbeat_timeout_secs
-                            );
-                            marked_offline += 1;
-                            stale_runners.push(runner.id);
-                        }
+                    // A runner can be assigned work before its first heartbeat
+                    // arrives. Treat registration time as the initial activity
+                    // timestamp so an abruptly lost runner cannot hold a lease
+                    // forever with `last_heartbeat == None`.
+                    let last_activity = runner.last_heartbeat.unwrap_or(runner.created_at);
+                    if last_activity < stale_threshold {
+                        runner.status = "offline".to_string();
+                        tracing::warn!(
+                            "runner {} marked offline: last activity {} seconds ago",
+                            runner.id,
+                            heartbeat_timeout_secs
+                        );
+                        marked_offline += 1;
+                        stale_runners.push(runner.id);
                     }
                 }
             }
@@ -1334,6 +1337,36 @@ mod tests {
         assert_eq!(state.runners[&runner_id].status, "offline");
         assert!(!state.job_leases.contains_key(&job_id));
         assert_eq!(state.queue.all()[0].repo_id, repo_id);
+    }
+
+    #[tokio::test]
+    async fn test_runner_without_heartbeat_is_offlined_from_registration_time() {
+        let scheduler = Scheduler::new();
+        let runner_id = RunnerId::new();
+        let mut runner = make_runner(runner_id, "never-heartbeated-runner", "online", 1);
+        runner.created_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+        scheduler.register_runner(runner).await;
+
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                PipelineRunId::new(),
+                RepoId::new(),
+                vec!["sleep 30".to_string()],
+                None,
+            )
+            .await;
+        scheduler.process_queue().await;
+        assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
+
+        assert_eq!(scheduler.mark_stale_runners_offline(90).await, 1);
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        assert_eq!(scheduler.queue_len().await, 1);
+
+        let state = scheduler.state.read().await;
+        assert_eq!(state.runners[&runner_id].status, "offline");
+        assert!(!state.job_leases.contains_key(&job_id));
     }
 
     #[tokio::test]

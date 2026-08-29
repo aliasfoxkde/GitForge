@@ -12,6 +12,7 @@ use bollard::models::HostConfig;
 use bollard::Docker;
 use futures_util::StreamExt;
 use gitforge_common::{Error, JobId, Result};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -58,6 +59,68 @@ pub struct DockerSandbox {
 }
 
 impl DockerSandbox {
+    /// Build a unique container name for one execution attempt.
+    ///
+    /// A runner can be terminated after creating a container but before it
+    /// records/completes the job. Reusing only the job ID then makes the
+    /// replacement runner fail with a name collision. The job prefix keeps
+    /// containers identifiable while the attempt UUID makes retries safe.
+    fn container_name(job_id: JobId) -> String {
+        format!("gitforce-job-{}-{}", job_id, uuid::Uuid::new_v4())
+    }
+
+    /// Remove containers left by an earlier attempt of the same job.
+    ///
+    /// A runner can be terminated after creating a container but before the
+    /// normal destroy path runs. Cleanup is intentionally scoped by the
+    /// ownership label, so unrelated containers are never considered.
+    async fn remove_job_containers(&self, job_id: JobId) -> Result<()> {
+        let Some(ref docker) = self.docker else {
+            return Ok(());
+        };
+
+        let mut filters = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec!["com.gitforce.managed=true".to_string()],
+        );
+        let containers = docker
+            .list_containers(Some(bollard::container::ListContainersOptions {
+                all: true,
+                filters,
+                ..Default::default()
+            }))
+            .await
+            .map_err(|e| Error::sandbox(format!("failed to list job containers: {}", e)))?;
+
+        for container in containers {
+            let owned_by_job = container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("com.gitforce.job_id"))
+                .is_some_and(|value| value == &job_id.to_string());
+            if !owned_by_job {
+                continue;
+            }
+            if let Some(id) = container.id {
+                docker
+                    .remove_container(
+                        &id,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .map_err(|e| {
+                        Error::sandbox(format!("failed to remove stale job container: {}", e))
+                    })?;
+                tracing::info!(%id, %job_id, "Removed stale sandbox container before retry");
+            }
+        }
+        Ok(())
+    }
+
     /// Create a new Docker sandbox, requiring Docker to be available.
     /// Returns an error if Docker is not available or cannot be reached.
     pub async fn connect_required() -> Result<Self> {
@@ -219,8 +282,14 @@ impl Sandbox for DockerSandbox {
         if let Some(ref docker) = self.docker {
             // Ensure image is available
             self.ensure_image(image).await?;
+            self.remove_job_containers(job_id).await?;
 
-            let container_name = format!("gitforce-job-{}", job_id);
+            let container_name = Self::container_name(job_id);
+            let job_label = job_id.to_string();
+            let labels = HashMap::from([
+                ("com.gitforce.managed", "true"),
+                ("com.gitforce.job_id", job_label.as_str()),
+            ]);
 
             // Build host config with resource limits
             let host_config = HostConfig {
@@ -240,6 +309,7 @@ impl Sandbox for DockerSandbox {
                 image: Some(image),
                 cmd: Some(vec!["sleep", "3600"]), // Keep container alive
                 host_config: Some(host_config),
+                labels: Some(labels),
                 ..Default::default()
             };
 
@@ -295,7 +365,13 @@ impl Sandbox for DockerSandbox {
 
         if let Some(ref docker) = self.docker {
             self.ensure_image(image).await?;
-            let container_name = format!("gitforce-job-{}", job_id);
+            self.remove_job_containers(job_id).await?;
+            let container_name = Self::container_name(job_id);
+            let job_label = job_id.to_string();
+            let labels = HashMap::from([
+                ("com.gitforce.managed", "true"),
+                ("com.gitforce.job_id", job_label.as_str()),
+            ]);
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
                 cpu_period: Some(100000),
@@ -316,6 +392,7 @@ impl Sandbox for DockerSandbox {
                 cmd: Some(vec!["sleep", "3600"]),
                 working_dir: Some("/workspace"),
                 host_config: Some(host_config),
+                labels: Some(labels),
                 ..Default::default()
             };
             let response = docker
@@ -500,6 +577,17 @@ mod tests {
     use std::sync::Mutex;
 
     struct RecordingSink(Mutex<Vec<(OutputStream, Vec<u8>)>>);
+
+    #[test]
+    fn test_container_names_are_unique_per_attempt() {
+        let job_id = JobId::new();
+        let first = DockerSandbox::container_name(job_id);
+        let second = DockerSandbox::container_name(job_id);
+
+        assert_ne!(first, second);
+        assert!(first.starts_with(&format!("gitforce-job-{}-", job_id)));
+        assert!(second.starts_with(&format!("gitforce-job-{}-", job_id)));
+    }
 
     #[async_trait]
     impl OutputSink for RecordingSink {
