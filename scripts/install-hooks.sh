@@ -6,7 +6,6 @@
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-HOOKS_DIR="$REPO_ROOT/.githooks"
 SCRIPTS_HOOKS="$REPO_ROOT/scripts/hooks"
 
 # Create .githooks directory

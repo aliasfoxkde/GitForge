@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - '**.rs'
+      - '**.sh'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - 'deny.toml'
@@ -12,6 +13,7 @@ on:
   pull_request:
     paths:
       - '**.rs'
+      - '**.sh'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - 'deny.toml'
@@ -62,6 +64,30 @@ jobs:
 
       - name: Check dependency policy
         run: cargo deny check
+
+  # ─── Workflow and shell policy ─────────────────────────────────────────────
+  ci-lint:
+    name: Workflow and Shell Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+
+      - name: Lint workflows
+        run: actionlint
+
+      - name: Lint operational shell scripts
+        run: shellcheck --severity=warning scripts/*.sh systemd/*.sh
 
   # ─── Secrets scan (all repos — always runs) ─────────────────────────────────
   secrets-scan:

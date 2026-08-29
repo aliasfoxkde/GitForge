@@ -25,6 +25,12 @@ CURRENT_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 # Parse arguments
 TARGET_OS="${1:-all}"
 BUILD_TYPE="${2:-release}"
+BUILD_FLAGS=()
+case "$BUILD_TYPE" in
+    release) BUILD_FLAGS+=(--release) ;;
+    debug) ;;
+    *) echo "Unsupported build type: $BUILD_TYPE (use release or debug)" >&2; exit 2 ;;
+esac
 
 # Targets for each platform
 LINUX_TARGETS=("x86_64-unknown-linux-musl" "aarch64-unknown-linux-musl")
@@ -33,17 +39,22 @@ WIN_TARGETS=("x86_64-pc-windows-gnu" "aarch64-pc-windows-gnu")
 
 # Services to build
 BINARIES=("api" "ci" "git-server" "runner" "gitforge")
+BINARIES_ARGS=()
+for binary in "${BINARIES[@]}"; do
+    BINARIES_ARGS+=(--bin "$binary")
+done
 
 build_target() {
     local target=$1
-    local os=$(echo $target | cut -d'-' -f3)
+    local os
+    os=$(printf '%s\n' "$target" | cut -d'-' -f3)
 
     echo ""
     echo "Building for $target..."
 
     case "$os" in
         linux)
-            cross build --release --target "$target" "${BINARIES[@]/#/--bin }" 2>&1
+            cross build "${BUILD_FLAGS[@]}" --target "$target" "${BINARIES_ARGS[@]}" 2>&1
             ;;
         darwin)
             # macOS cross-compilation from Linux not supported
@@ -51,7 +62,7 @@ build_target() {
             echo "   Use GitHub Actions macos-latest runner or build on macOS hardware"
             ;;
         windows)
-            cross build --release --target "$target" "${BINARIES[@/#/--bin }" 2>&1
+            cross build "${BUILD_FLAGS[@]}" --target "$target" "${BINARIES_ARGS[@]}" 2>&1
             ;;
     esac
 }
@@ -62,7 +73,7 @@ build_macos_native() {
     echo "Building for macOS (native)..."
     for target in "${MAC_TARGETS[@]}"; do
         echo "Building for $target..."
-        cargo build --release --target "$target" "${BINARIES[@/#/--bin }" 2>&1
+        cargo build "${BUILD_FLAGS[@]}" --target "$target" "${BINARIES_ARGS[@]}" 2>&1
     done
 }
 
