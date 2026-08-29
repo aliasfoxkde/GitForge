@@ -68,6 +68,26 @@ unmanaged background startup and broad process termination. Service lifecycle
 belongs to user-systemd so resource limits, restart behavior, and status remain
 observable and scoped to named GitForge units.
 
+## Atomic release pointer
+
+`gitforge-release-bundle` creates immutable releases with executables under
+`bin/`. The service examples therefore resolve binaries through
+`%h/work/gitforge-current/bin/`. Validate a release first, then preview the
+pointer change:
+
+```text
+scripts/gitforge-release-promote \
+  <release-directory> <fedora-work-root>/gitforge-current
+```
+
+The command is dry-run by default and refuses any pointer whose basename is
+not `gitforge-current` or whose existing target is not a symlink. After a
+separate canary decision, repeat the exact command with `--apply`; it creates
+a temporary symlink next to the pointer and uses an atomic rename to switch
+the pointer. The prior resolved target is printed for rollback planning. This
+command does not restart services, alter systemd units, or change production
+unless an operator explicitly invokes `--apply` against a production path.
+
 ## Validation and rollout
 
 1. Copy the drop-in into each matching `*.service.d/` directory in a disposable

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+apply=0
+if [[ "${1:-}" == "--apply" ]]; then
+  apply=1
+  shift
+fi
+
+release_dir="${1:-}"
+current_link="${2:-}"
+if [[ -z "$release_dir" || -z "$current_link" || "${3:-}" != "" ]]; then
+  echo 'usage: gitforge-release-promote [--apply] <release-directory> <gitforge-current-link>' >&2
+  echo 'default mode is dry-run; --apply atomically replaces the named symlink' >&2
+  exit 64
+fi
+
+if [[ ! -d "$release_dir" ]]; then
+  printf 'release promote: directory does not exist: %s\n' "$release_dir" >&2
+  exit 1
+fi
+
+release_dir=$(readlink -f -- "$release_dir")
+current_link=$(readlink -m -- "$current_link")
+if [[ "$(basename -- "$current_link")" != "gitforge-current" ]]; then
+  printf 'release promote: refusing non-gitforge-current pointer: %s\n' "$current_link" >&2
+  exit 64
+fi
+
+current_parent=$(dirname -- "$current_link")
+if [[ ! -d "$current_parent" ]]; then
+  printf 'release promote: pointer parent does not exist: %s\n' "$current_parent" >&2
+  exit 1
+fi
+
+if [[ -e "$current_link" && ! -L "$current_link" ]]; then
+  printf 'release promote: refusing to replace non-symlink path: %s\n' "$current_link" >&2
+  exit 1
+fi
+
+"$(dirname -- "${BASH_SOURCE[0]}")/gitforge-release-verify" "$release_dir"
+
+previous=''
+if [[ -L "$current_link" ]]; then
+  previous=$(readlink -f -- "$current_link" || true)
+fi
+
+if (( ! apply )); then
+  printf 'release promote: dry-run\n'
+  printf 'release promote: current=%s\n' "$current_link"
+  printf 'release promote: previous=%s\n' "${previous:-absent}"
+  printf 'release promote: next=%s\n' "$release_dir"
+  printf 'release promote: use --apply to atomically switch the pointer\n'
+  exit 0
+fi
+
+tmp_link="$current_parent/.gitforge-current.promote.$$"
+cleanup() {
+  rm -f -- "$tmp_link"
+}
+trap cleanup EXIT INT TERM
+
+ln -s -- "$release_dir" "$tmp_link"
+mv -Tf -- "$tmp_link" "$current_link"
+trap - EXIT INT TERM
+
+printf 'release promote: switched atomically\n'
+printf 'release promote: current=%s\n' "$current_link"
+printf 'release promote: previous=%s\n' "${previous:-absent}"
+printf 'release promote: next=%s\n' "$(readlink -f -- "$current_link")"
