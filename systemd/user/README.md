@@ -19,7 +19,7 @@ an accidental unbounded test or build cannot consume the host indefinitely:
 | Scheduler | 512M | 1G | 256 |
 | Runner | 8G | 12G | 1024 |
 
-`CPUAccounting` and `MemoryAccounting` are enabled for every unit. No CPU
+`MemoryAccounting` and `TasksAccounting` are enabled for every unit. No CPU
 quota is imposed in this first policy revision because runner children execute
 the actual build workload; CPU limits must be tuned from measured Fedora
 behavior rather than guessed.
