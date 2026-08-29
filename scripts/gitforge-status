@@ -17,7 +17,6 @@ case "${1:-}" in
 esac
 
 units=(
-    gitforge-scheduler.service
     gitforge-api.service
     gitforge-ci.service
     gitforge-git-server.service
