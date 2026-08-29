@@ -64,9 +64,9 @@ services:
       - runner-data:/data
     environment:
       - RUST_LOG=info
-      - SCHEDULER_URL=http://ci:42781
-      - RUNNER_NAME=docker-runner-1
-      - RUNNER_CAPACITY=4
+      - GITFORGE_SCHEDULER_URL=http://ci:42781
+      - GITFORGE_RUNNER_NAME=docker-runner-1
+      - GITFORGE_RUNNER_CAPACITY=4
     depends_on:
       - ci
     networks:
@@ -107,9 +107,9 @@ services:
       - runner2-data:/data
     environment:
       - RUST_LOG=info
-      - SCHEDULER_URL=http://ci:42781
-      - RUNNER_NAME=docker-runner-2
-      - RUNNER_CAPACITY=2
+      - GITFORGE_SCHEDULER_URL=http://ci:42781
+      - GITFORGE_RUNNER_NAME=docker-runner-2
+      - GITFORGE_RUNNER_CAPACITY=2
     depends_on:
       - ci
     networks:

@@ -115,25 +115,46 @@ impl RunnerConfig {
 
         if let Ok(v) = std::env::var("GITFORGE_RUNNER_CAPACITY") {
             if !v.trim().is_empty() {
-                cfg.capacity = v.trim().parse().map_err(|_| {
+                let parsed: i64 = v.trim().parse().map_err(|_| {
                     Error::invalid_input("GITFORGE_RUNNER_CAPACITY must be a valid integer")
                 })?;
+                if parsed <= 0 {
+                    return Err(Error::invalid_input(format!(
+                        "GITFORGE_RUNNER_CAPACITY must be a positive integer (got {})",
+                        parsed
+                    )));
+                }
+                cfg.capacity = parsed as i32;
             }
         }
 
         if let Ok(v) = std::env::var("GITFORGE_HEARTBEAT_INTERVAL") {
             if !v.trim().is_empty() {
-                cfg.heartbeat_interval_secs = v.trim().parse().map_err(|_| {
+                let parsed: i64 = v.trim().parse().map_err(|_| {
                     Error::invalid_input("GITFORGE_HEARTBEAT_INTERVAL must be a valid integer")
                 })?;
+                if parsed <= 0 {
+                    return Err(Error::invalid_input(format!(
+                        "GITFORGE_HEARTBEAT_INTERVAL must be a positive integer (got {})",
+                        parsed
+                    )));
+                }
+                cfg.heartbeat_interval_secs = parsed as u64;
             }
         }
 
         if let Ok(v) = std::env::var("GITFORGE_FETCH_INTERVAL") {
             if !v.trim().is_empty() {
-                cfg.fetch_interval_secs = v.trim().parse().map_err(|_| {
+                let parsed: i64 = v.trim().parse().map_err(|_| {
                     Error::invalid_input("GITFORGE_FETCH_INTERVAL must be a valid integer")
                 })?;
+                if parsed <= 0 {
+                    return Err(Error::invalid_input(format!(
+                        "GITFORGE_FETCH_INTERVAL must be a positive integer (got {})",
+                        parsed
+                    )));
+                }
+                cfg.fetch_interval_secs = parsed as u64;
             }
         }
 
@@ -255,6 +276,58 @@ mod config_tests {
         let result = RunnerConfig::from_env();
         let err = result.expect_err("empty GITFORGE_SCHEDULER_URL should fail");
         assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_from_env_zero_capacity_fails() {
+        let _guard = temp_env::with_vars([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_RUNNER_CAPACITY", Some("0")),
+        ]);
+        let result = RunnerConfig::from_env();
+        let err = result.expect_err("zero GITFORGE_RUNNER_CAPACITY should fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+        assert!(err.message.contains("GITFORGE_RUNNER_CAPACITY"));
+        assert!(err.message.contains("positive integer"));
+    }
+
+    #[test]
+    fn test_from_env_negative_capacity_fails() {
+        let _guard = temp_env::with_vars([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_RUNNER_CAPACITY", Some("-3")),
+        ]);
+        let result = RunnerConfig::from_env();
+        let err = result.expect_err("negative GITFORGE_RUNNER_CAPACITY should fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+        assert!(err.message.contains("GITFORGE_RUNNER_CAPACITY"));
+        assert!(err.message.contains("positive integer"));
+    }
+
+    #[test]
+    fn test_from_env_zero_heartbeat_interval_fails() {
+        let _guard = temp_env::with_vars([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_HEARTBEAT_INTERVAL", Some("0")),
+        ]);
+        let result = RunnerConfig::from_env();
+        let err = result.expect_err("zero GITFORGE_HEARTBEAT_INTERVAL should fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+        assert!(err.message.contains("GITFORGE_HEARTBEAT_INTERVAL"));
+        assert!(err.message.contains("positive integer"));
+    }
+
+    #[test]
+    fn test_from_env_zero_fetch_interval_fails() {
+        let _guard = temp_env::with_vars([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_FETCH_INTERVAL", Some("0")),
+        ]);
+        let result = RunnerConfig::from_env();
+        let err = result.expect_err("zero GITFORGE_FETCH_INTERVAL should fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+        assert!(err.message.contains("GITFORGE_FETCH_INTERVAL"));
+        assert!(err.message.contains("positive integer"));
     }
 
     mod temp_env {

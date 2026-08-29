@@ -274,9 +274,12 @@ capacity = 4
 |----------|---------|---------|-------------|
 | `JWT_SECRET` | api | - | JWT signing secret (required) |
 | `DATABASE_URL` | api | sqlite:/data/gitforge.db | Database URL |
-| `RUNNER_NAME` | runner | runner | Runner identifier |
-| `SCHEDULER_URL` | runner | http://localhost:42781 | Scheduler endpoint |
-| `RUNNER_CAPACITY` | runner | 2 | Max concurrent jobs |
+| `GITFORGE_RUNNER_NAME` | runner | runner | Runner identifier |
+| `GITFORGE_SCHEDULER_URL` | runner | — | Scheduler endpoint (required) |
+| `GITFORGE_RUNNER_CAPACITY` | runner | 2 | Max concurrent jobs |
+| `GITFORGE_HEARTBEAT_INTERVAL` | runner | 30 | Heartbeat interval in seconds |
+| `GITFORGE_FETCH_INTERVAL` | runner | 5 | Job-poll interval in seconds |
+| `GITFORGE_SCHEDULER_TOKEN` | runner | _(none)_ | Bearer token for scheduler API |
 | `SSH_PORT` | git-server | 42022 | SSH port |
 | `HTTP_PORT` | git-server | 42782 | HTTP port |
 
