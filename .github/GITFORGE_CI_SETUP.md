@@ -31,3 +31,11 @@ workflow is skipped rather than issuing requests to an invalid local endpoint.
 The Fedora-native GitForge path remains the source-of-truth CI path for local
 Git pushes. The GitHub workflow is only an integration bridge and must not be
 treated as proof of Fedora service health.
+
+## Supplementary dependency review
+
+The GitHub Dependency Review action is also opt-in through the repository or
+organization variable `DEPENDENCY_REVIEW_ENABLED=true`. The current repository
+does not expose the dependency-graph capability required by that action, so
+the gate remains skipped. `cargo audit` is the mandatory dependency security
+gate until GitHub support is enabled and independently verified.

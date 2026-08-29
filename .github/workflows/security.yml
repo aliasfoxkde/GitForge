@@ -71,6 +71,10 @@ jobs:
 
   # ─── Dependency Review ─────────────────────────────────────────────────────
   dependency-review:
+    # GitHub Dependency Review is unavailable until the repository's
+    # dependency-graph capability is enabled. Cargo Audit remains mandatory;
+    # opt this supplementary gate in only after GitHub reports it supported.
+    if: vars.DEPENDENCY_REVIEW_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
