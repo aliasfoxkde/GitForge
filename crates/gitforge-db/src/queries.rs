@@ -9,6 +9,44 @@ use gitforge_common::{Error, JobId, PipelineId, PipelineRunId, RepoId, Result, R
 use sqlx::Row;
 use uuid::Uuid;
 
+fn parse_uuid_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<Uuid> {
+    let value: String = row
+        .try_get(column)
+        .map_err(|error| Error::database(format!("missing {} column: {}", column, error)))?;
+    Uuid::parse_str(&value)
+        .map_err(|error| Error::database(format!("invalid UUID in {}: {}", column, error)))
+}
+
+fn parse_timestamp_column(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &str,
+) -> Result<DateTime<Utc>> {
+    let value: String = row
+        .try_get(column)
+        .map_err(|error| Error::database(format!("missing {} column: {}", column, error)))?;
+    DateTime::parse_from_rfc3339(&value)
+        .map(|date| date.with_timezone(&Utc))
+        .map_err(|error| Error::database(format!("invalid timestamp in {}: {}", column, error)))
+}
+
+fn hydrate_pipeline(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Pipeline> {
+    Ok(crate::models::Pipeline {
+        id: PipelineId::from(parse_uuid_column(&row, "id")?),
+        repo_id: RepoId::from(parse_uuid_column(&row, "repo_id")?),
+        name: row
+            .try_get("name")
+            .map_err(|error| Error::database(format!("invalid pipeline name: {}", error)))?,
+        trigger_type: row.try_get("trigger_type").map_err(|error| {
+            Error::database(format!("invalid pipeline trigger type: {}", error))
+        })?,
+        config: serde_json::from_str(&row.try_get::<String, _>("config").map_err(|error| {
+            Error::database(format!("invalid pipeline config: {}", error))
+        })?)
+        .map_err(|error| Error::database(format!("invalid pipeline config JSON: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+    })
+}
+
 // ============================================================================
 // Repository Queries
 // ============================================================================
@@ -337,16 +375,7 @@ impl PipelineQueries {
             .map_err(|e| Error::database(format!("failed to get pipeline: {}", e)))?;
 
         match row {
-            Some(row) => Ok(Some(crate::models::Pipeline {
-                id: PipelineId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
-                name: row.get("name"),
-                trigger_type: row.get("trigger_type"),
-                config: serde_json::from_str(&row.get::<String, _>("config")).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
+            Some(row) => hydrate_pipeline(row).map(Some),
             None => Ok(None),
         }
     }
@@ -363,19 +392,7 @@ impl PipelineQueries {
                 .await
                 .map_err(|e| Error::database(format!("failed to list pipelines: {}", e)))?;
 
-        let pipelines = rows
-            .into_iter()
-            .map(|row| crate::models::Pipeline {
-                id: PipelineId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
-                name: row.get("name"),
-                trigger_type: row.get("trigger_type"),
-                config: serde_json::from_str(&row.get::<String, _>("config")).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+        let pipelines = rows.into_iter().map(hydrate_pipeline).collect::<Result<Vec<_>>>()?;
 
         Ok(pipelines)
     }
@@ -387,19 +404,7 @@ impl PipelineQueries {
             .await
             .map_err(|e| Error::database(format!("failed to list pipelines: {}", e)))?;
 
-        let pipelines = rows
-            .into_iter()
-            .map(|row| crate::models::Pipeline {
-                id: PipelineId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
-                name: row.get("name"),
-                trigger_type: row.get("trigger_type"),
-                config: serde_json::from_str(&row.get::<String, _>("config")).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+        let pipelines = rows.into_iter().map(hydrate_pipeline).collect::<Result<Vec<_>>>()?;
 
         Ok(pipelines)
     }
@@ -1542,6 +1547,38 @@ mod tests {
         // List all
         let all_pipelines = PipelineQueries::list(&pool).await.unwrap();
         assert_eq!(all_pipelines.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_list_rejects_malformed_timestamp_without_panicking() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = crate::models::User::new(
+            "owner".to_string(),
+            "owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "malformed-repo".to_string(),
+            user.id,
+            "/git/malformed-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        sqlx::query(
+            "INSERT INTO pipelines (id, repo_id, name, trigger_type, config, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(PipelineId::new().to_string())
+        .bind(repo.id.to_string())
+        .bind("malformed")
+        .bind("push")
+        .bind("{}")
+        .bind("2026-08-29 03:40:39")
+        .execute(pool.pool())
+        .await
+        .unwrap();
+
+        assert!(PipelineQueries::list_by_repo(&pool, repo.id).await.is_err());
     }
 
     #[tokio::test]
