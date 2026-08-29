@@ -16,8 +16,11 @@ an accidental unbounded test or build cannot consume the host indefinitely:
 | API | 512M | 1G | 256 |
 | CI | 2G | 4G | 512 |
 | Git server | 512M | 1G | 256 |
-| Scheduler | 512M | 1G | 256 |
 | Runner | 8G | 12G | 1024 |
+
+The candidate CI unit owns the scheduler HTTP API, so scheduler resource
+accounting is included in the CI limits. The standalone scheduler row from
+older deployments is intentionally absent.
 
 `MemoryAccounting` and `TasksAccounting` are enabled for every unit. No CPU
 quota is imposed in this first policy revision because runner children execute
