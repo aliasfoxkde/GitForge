@@ -12,8 +12,12 @@ on:
       - '.github/workflows/**'
 
 env:
-  GITFORGE_API_URL: ${{ vars.GITFORGE_API_URL || 'http://localhost:42780' }}
-  GITFORGE_SCHEDULER_URL: ${{ vars.GITFORGE_SCHEDULER_URL || 'http://localhost:42781' }}
+  # GitHub-hosted runners cannot reach a private Fedora LAN address. Enable
+  # this workflow only after a reachable endpoint or self-hosted runner is
+  # deliberately configured at repository/organization scope.
+  GITFORGE_ENABLED: ${{ vars.GITFORGE_ENABLED || 'false' }}
+  GITFORGE_API_URL: ${{ vars.GITFORGE_API_URL || '' }}
+  GITFORGE_SCHEDULER_URL: ${{ vars.GITFORGE_SCHEDULER_URL || '' }}
   GITFORGE_REPO_ID: ${{ vars.GITFORGE_REPO_ID || '' }}
   GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
@@ -29,6 +33,7 @@ jobs:
   # Enqueue build job to GitForge queue instead of running directly
   enqueue-build:
     name: Enqueue Build to GitForge
+    if: vars.GITFORGE_ENABLED == 'true'
     runs-on: ubuntu-latest
     outputs:
       run_id: ${{ steps.enqueue.outputs.run_id }}
@@ -141,7 +146,7 @@ jobs:
   report-status:
     name: Report Build Status
     needs: [enqueue-build, poll-build]
-    if: always()
+    if: always() && vars.GITFORGE_ENABLED == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Report completion
