@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
     // Create and start API server. Runner and API share this LAN-local
     // filesystem root for bounded artifact metadata and content.
     let artifact_root = std::env::var("GITFORGE_ARTIFACT_ROOT")
-        .unwrap_or_else(|_| "/tmp/gitforge-artifacts".to_string());
+        .unwrap_or_else(|_| "target/gitforge-artifacts".to_string());
     let storage = FileStorage::new(artifact_root).await?;
     let server = ApiServer::new(&config.jwt_secret, pool)
         .with_storage_extension(Arc::new(storage))
