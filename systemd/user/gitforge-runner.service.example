@@ -10,7 +10,7 @@ WorkingDirectory=%h/work/gitforge-current
 EnvironmentFile=-%h/.config/gitforge/gitforge.env
 Environment=GITFORGE_SCHEDULER_URL=http://127.0.0.1:42781
 Environment=DOCKER_HOST=unix:///run/user/%U/podman/podman.sock
-ExecStart=%h/work/gitforge-current/runner
+ExecStart=%h/work/gitforge-current/bin/runner
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=20s
