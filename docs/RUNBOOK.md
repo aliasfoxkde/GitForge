@@ -126,6 +126,10 @@ docker-compose up -d
 curl http://localhost:42780/health
 curl http://localhost:42781/health  # CI/Scheduler
 
+# Read-only Fedora service and endpoint report (user-level systemd)
+./scripts/gitforge-status
+./scripts/gitforge-status --json
+
 # View logs
 docker-compose logs -f
 ```
