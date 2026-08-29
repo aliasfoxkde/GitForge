@@ -12,6 +12,7 @@ use bollard::models::HostConfig;
 use bollard::Docker;
 use futures_util::StreamExt;
 use gitforge_common::{Error, JobId, Result};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -66,6 +67,65 @@ impl DockerSandbox {
     /// containers identifiable while the attempt UUID makes retries safe.
     fn container_name(job_id: JobId) -> String {
         format!("gitforce-job-{}-{}", job_id, uuid::Uuid::new_v4())
+    }
+
+    /// Remove containers left by an earlier attempt of the same job.
+    ///
+    /// A runner can be terminated after creating a container but before the
+    /// normal destroy path runs. Cleanup is intentionally scoped by the
+    /// ownership label, so unrelated containers are never considered.
+    async fn remove_job_containers(&self, job_id: JobId) -> Result<()> {
+        let Some(ref docker) = self.docker else {
+            return Ok(());
+        };
+
+        let mut filters = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec!["com.gitforce.managed=true".to_string()],
+        );
+        let containers = docker
+            .list_containers(Some(bollard::container::ListContainersOptions {
+                all: true,
+                filters,
+                ..Default::default()
+            }))
+            .await
+            .map_err(|e| Error::sandbox(format!("failed to list job containers: {}", e)))?;
+
+        for container in containers {
+            let owned_by_job = container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("com.gitforce.job_id"))
+                .is_some_and(|value| value == &job_id.to_string());
+            if !owned_by_job {
+                continue;
+            }
+            if let Some(id) = container.id {
+                docker
+                    .remove_container(
+                        &id,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .map_err(|e| {
+                        Error::sandbox(format!("failed to remove stale job container: {}", e))
+                    })?;
+                tracing::info!(%id, %job_id, "Removed stale sandbox container before retry");
+            }
+        }
+        Ok(())
+    }
+
+    fn container_labels(job_id: JobId) -> HashMap<String, String> {
+        HashMap::from([
+            ("com.gitforce.managed".to_string(), "true".to_string()),
+            ("com.gitforce.job_id".to_string(), job_id.to_string()),
+        ])
     }
 
     /// Create a new Docker sandbox, requiring Docker to be available.
@@ -229,6 +289,7 @@ impl Sandbox for DockerSandbox {
         if let Some(ref docker) = self.docker {
             // Ensure image is available
             self.ensure_image(image).await?;
+            self.remove_job_containers(job_id).await?;
 
             let container_name = Self::container_name(job_id);
 
@@ -250,6 +311,7 @@ impl Sandbox for DockerSandbox {
                 image: Some(image),
                 cmd: Some(vec!["sleep", "3600"]), // Keep container alive
                 host_config: Some(host_config),
+                labels: Some(Self::container_labels(job_id)),
                 ..Default::default()
             };
 
@@ -305,6 +367,7 @@ impl Sandbox for DockerSandbox {
 
         if let Some(ref docker) = self.docker {
             self.ensure_image(image).await?;
+            self.remove_job_containers(job_id).await?;
             let container_name = Self::container_name(job_id);
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
@@ -326,6 +389,7 @@ impl Sandbox for DockerSandbox {
                 cmd: Some(vec!["sleep", "3600"]),
                 working_dir: Some("/workspace"),
                 host_config: Some(host_config),
+                labels: Some(Self::container_labels(job_id)),
                 ..Default::default()
             };
             let response = docker
