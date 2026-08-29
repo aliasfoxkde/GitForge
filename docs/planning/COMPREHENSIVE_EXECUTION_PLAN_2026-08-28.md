@@ -14,7 +14,7 @@ tasks, and unverified work is never counted as complete.
 | Code graph | codebase-memory-mcp: 8,135 nodes and 26,535 edges | Ready; use before text search |
 | Tests | Full workspace `cargo test` and managed GitForge builds pass in prior checkpoints | Passing baseline |
 | Coverage | `cargo llvm-cov --workspace --all-features`: 79.98% lines, 81.47% regions, 81.36% functions | Measured; below 99% target |
-| Manager | Bounded queue, concurrent pipe drains, process groups, cancellation, coordinated shutdown, stale socket cleanup | Active-job shutdown smoke-tested |
+| Manager | Bounded queue, concurrent pipe drains, process groups, cancellation, coordinated shutdown, stale socket cleanup, configurable concurrency and child timeout | Admission saturation and fresh-binary quality-controller checks pass; durable restart state remains incomplete |
 | Distributed jobs | Durable leases, requeue, cancellation, log chunks, artifact transfer, authenticated API boundary | Multi-process restart and retry semantics incomplete |
 | CI | Immutable action pins, least-privilege defaults, locked release test, SBOM, provenance, LLVM coverage ratchet | YAML validated; hosted run still required |
 | Harness | `harnessctl doctor` passes; nightly memory and analysis timers active | Opencode absence is the only doctor warning |
@@ -74,6 +74,9 @@ Goal: no hung manager request, orphaned descendant, or operator lockout.
 - [x] P1-03 Use process groups, SIGCONT/SIGTERM/SIGKILL, and child reaping.
 - [x] P1-04 Add status, list, cancel, stats, and graceful shutdown commands.
 - [x] P1-05 Bound socket message allocation and forward cargo flags naturally.
+- [x] P1-05a Bound manager admission (`8` concurrent + `32` queued by default),
+  return an immediate protocol error when full, and make concurrency, queue,
+  and child wall-clock timeout configurable with bounded environment ranges.
 - [ ] P1-06 Replace polling-only client waits with a bounded event/notification
   protocol while retaining polling as a recovery fallback.
 - [ ] P1-07 Persist manager jobs and leases so a daemon restart reconstructs
