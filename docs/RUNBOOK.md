@@ -51,6 +51,8 @@ JWT_SECRET=your-secret ./target/release/api --host 0.0.0.0 --port 42780
 **Environment Variables:**
 - `JWT_SECRET` - Secret for JWT token signing (required)
 - `DATABASE_URL` - SQLite or PostgreSQL URL
+- `GITFORGE_CI_TRIGGER_URL` - CI trigger endpoint used by Git-server after a successful push
+- `GITFORGE_CI_TRIGGER_TOKEN` - bearer token matching CI's `GITFORGE_TRIGGER_TOKEN`
 
 **Endpoints:**
 - `GET /health` - Health check (public)

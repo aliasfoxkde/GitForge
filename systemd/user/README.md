@@ -24,6 +24,29 @@ quota is imposed in this first policy revision because runner children execute
 the actual build workload; CPU limits must be tuned from measured Fedora
 behavior rather than guessed.
 
+## Cross-process Git-to-CI contract
+
+Git-server and CI are separate user services. Configure the Git-server unit
+with `DATABASE_URL` (the Git-server variable), `GIT_ROOT`,
+`GITFORGE_CI_TRIGGER_URL`, and `GITFORGE_CI_TRIGGER_TOKEN`. Configure the CI
+unit with `GITFORGE_DATABASE_URL`, `GITFORGE_TRIGGER_TOKEN`, and the scheduler
+tokens. In a standard deployment the trigger URL is:
+
+```text
+http://127.0.0.1:42781/pipelines/trigger
+```
+
+The trigger token must be identical to the CI `GITFORGE_TRIGGER_TOKEN`.
+`DATABASE_URL` and `GITFORGE_DATABASE_URL` are not interchangeable in the
+current binaries; setting only the latter leaves Git-server repository lookup
+disabled and causes Git discovery to return 503.
+
+The Git-server bridge parses successful receive-pack updates and notifies CI
+for each ref. A push can still succeed if CI is unavailable because the Git
+ref has already been accepted; production deployment therefore still requires
+a durable outbox/retry mechanism or an equivalent operational alert before
+this path is considered lossless.
+
 ## Validation and rollout
 
 1. Copy the drop-in into each matching `*.service.d/` directory in a disposable
