@@ -33,8 +33,14 @@ rows=()
 overall=0
 for unit in "${units[@]}"; do
     active="unknown"
+    enabled="unknown"
+    memory_max="unknown"
+    cpu_quota="unknown"
     if command -v systemctl >/dev/null 2>&1; then
         active=$(systemctl --user is-active "$unit" 2>/dev/null) || active="${active:-inactive}"
+        enabled=$(systemctl --user is-enabled "$unit" 2>/dev/null) || enabled="${enabled:-unknown}"
+        memory_max=$(systemctl --user show "$unit" --value --property=MemoryMax 2>/dev/null) || memory_max="${memory_max:-unknown}"
+        cpu_quota=$(systemctl --user show "$unit" --value --property=CPUQuotaPerSecUSec 2>/dev/null) || cpu_quota="${cpu_quota:-unknown}"
     fi
 
     http_status="not_applicable"
@@ -56,7 +62,7 @@ for unit in "${units[@]}"; do
         *) overall=1 ;;
     esac
 
-    rows+=("$unit|$active|$http_status")
+    rows+=("$unit|$active|$enabled|$memory_max|$cpu_quota|$http_status")
 done
 
 if [[ "$JSON" == true ]]; then
@@ -67,15 +73,18 @@ import sys
 overall, *rows = sys.argv[1:]
 services = []
 for row in rows:
-    unit, active, http_status = row.split("|", 2)
-    services.append({"unit": unit, "active": active, "http_status": http_status})
+    unit, active, enabled, memory_max, cpu_quota, http_status = row.split("|", 5)
+    services.append({"unit": unit, "active": active, "enabled": enabled,
+                     "memory_max": memory_max, "cpu_quota": cpu_quota,
+                     "http_status": http_status})
 print(json.dumps({"status": "healthy" if overall == "0" else "degraded", "services": services}))
 PY
 else
-    printf '%-32s %-10s %s\n' SERVICE SYSTEMD HTTP
+    printf '%-32s %-10s %-10s %-14s %-14s %s\n' SERVICE SYSTEMD ENABLED MEMORY_MAX CPU_QUOTA HTTP
     for row in "${rows[@]}"; do
-        IFS='|' read -r unit active http_status <<<"$row"
-        printf '%-32s %-10s %s\n' "$unit" "$active" "$http_status"
+        IFS='|' read -r unit active enabled memory_max cpu_quota http_status <<<"$row"
+        printf '%-32s %-10s %-10s %-14s %-14s %s\n' \
+            "$unit" "$active" "$enabled" "$memory_max" "$cpu_quota" "$http_status"
     done
     if ((overall == 0)); then
         printf 'overall: healthy\n'
