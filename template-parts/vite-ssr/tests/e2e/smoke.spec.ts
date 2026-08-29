@@ -11,10 +11,14 @@ test.describe('Smoke Tests', () => {
     const counter = page.locator('span.text-6xl');
     await expect(counter).toHaveText('0');
 
-    await page.click('button:has-text("+")');
+    const increaseButton = page.getByRole('button', { name: 'Increase count' });
+    await increaseButton.focus();
+    await increaseButton.press('Enter');
     await expect(counter).toHaveText('1');
 
-    await page.click('button:has-text("-")');
+    const decreaseButton = page.getByRole('button', { name: 'Decrease count' });
+    await decreaseButton.focus();
+    await decreaseButton.press('Enter');
     await expect(counter).toHaveText('0');
   });
 
@@ -22,12 +26,16 @@ test.describe('Smoke Tests', () => {
     await page.goto('/');
     const counter = page.locator('span.text-6xl');
 
-    await page.click('button:has-text("+")');
-    await page.click('button:has-text("+")');
-    await page.click('button:has-text("+")');
+    const increaseButton = page.getByRole('button', { name: 'Increase count' });
+    await increaseButton.focus();
+    await increaseButton.press('Enter');
+    await increaseButton.press('Enter');
+    await increaseButton.press('Enter');
     await expect(counter).toHaveText('3');
 
-    await page.click('button:has-text("Reset")');
+    const resetButton = page.getByRole('button', { name: 'Reset' });
+    await resetButton.focus();
+    await resetButton.press('Enter');
     await expect(counter).toHaveText('0');
   });
 });

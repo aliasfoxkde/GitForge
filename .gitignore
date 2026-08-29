@@ -12,6 +12,8 @@ coverage.out
 coverage.html
 codecov.json
 *.html
+!template-parts/vite-react-pwa/index.html
+!template-parts/vite-ssr/index.html
 report.xml
 .aetheon-build/
 

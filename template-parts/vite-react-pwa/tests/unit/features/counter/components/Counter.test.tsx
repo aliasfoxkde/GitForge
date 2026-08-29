@@ -1,8 +1,15 @@
-import { describe, it, expect } from 'vitest';
-import { render, screen, userEvent } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { beforeEach, describe, expect, it } from 'vitest';
+
 import { Counter } from '@/features/counter/components/Counter';
+import { useCounterStore } from '@/features/counter/stores/counterStore';
 
 describe('Counter', () => {
+  beforeEach(() => {
+    useCounterStore.getState().reset();
+  });
+
   it('renders initial count of 0', () => {
     render(<Counter />);
     expect(screen.getByText('0')).toBeInTheDocument();

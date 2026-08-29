@@ -5,10 +5,11 @@ import react from 'eslint-plugin-react';
 import reactHooks from 'eslint-plugin-react-hooks';
 import importPlugin from 'eslint-plugin-import';
 import prettier from 'eslint-config-prettier';
+import globals from 'globals';
 
 export default [
   {
-    ignores: ['node_modules/**', 'dist/**', '.vite/**', 'coverage/**'],
+    ignores: ['node_modules/**', 'dist/**', 'dev-dist/**', '.vite/**', 'coverage/**', 'test-results/**'],
   },
   {
     files: ['**/*.{ts,tsx}'],
@@ -20,14 +21,9 @@ export default [
         ecmaFeatures: { jsx: true },
       },
       globals: {
-        window: 'readonly',
-        document: 'readonly',
-        navigator: 'readonly',
-        console: 'readonly',
-        setTimeout: 'readonly',
-        clearTimeout: 'readonly',
-        setInterval: 'readonly',
-        clearInterval: 'readonly',
+        ...globals.browser,
+        ...globals.node,
+        ...globals.vitest,
       },
     },
     plugins: {
@@ -42,6 +38,7 @@ export default [
       ...react.configs.recommended.rules,
       ...reactHooks.configs.recommended.rules,
       'react/react-in-jsx-scope': 'off',
+      'no-undef': 'off',
       'react/prop-types': 'off',
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
       '@typescript-eslint/explicit-module-boundary-types': 'off',

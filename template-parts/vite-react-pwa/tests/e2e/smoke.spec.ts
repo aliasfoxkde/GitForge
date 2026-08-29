@@ -6,21 +6,23 @@ test.describe('Smoke Tests', () => {
     await expect(page).toHaveTitle(/Vite React PWA/);
   });
 
-  test('counter increments on click', async ({ page }) => {
+  test('counter increments from keyboard activation', async ({ page }) => {
     await page.goto('/');
     const counter = page.locator('text=0').first();
     const incrementBtn = page.locator('button', { hasText: '+' });
 
     await expect(counter).toBeVisible();
-    await incrementBtn.click();
+    await incrementBtn.focus();
+    await incrementBtn.press('Enter');
     await expect(page.locator('text=1')).toBeVisible();
   });
 
-  test('counter decrements on click', async ({ page }) => {
+  test('counter decrements from keyboard activation', async ({ page }) => {
     await page.goto('/');
     const decrementBtn = page.locator('button', { hasText: '-' });
 
-    await decrementBtn.click();
+    await decrementBtn.focus();
+    await decrementBtn.press('Enter');
     await expect(page.locator('text=-1')).toBeVisible();
   });
 
@@ -51,7 +53,7 @@ test.describe('Smoke Tests', () => {
     await expect(password).toBeFocused();
     await page.keyboard.press('Tab');
     await expect(submit).toBeFocused();
-    await submit.click();
+    await submit.press('Enter');
     await expect(page.getByRole('alert')).toHaveText('Email is required');
   });
 });

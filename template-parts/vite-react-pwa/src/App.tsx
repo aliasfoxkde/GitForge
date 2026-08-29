@@ -1,9 +1,10 @@
 import { Routes, Route } from 'react-router-dom';
-import { useAuth } from '@/features/auth';
-import { Counter } from '@/features/counter';
-import { LoginForm } from '@/features/auth/components/LoginForm';
+
 import { Button } from '@/components/Button';
 import { LoadingSpinner } from '@/components/LoadingSpinner';
+import { useAuth } from '@/features/auth';
+import { LoginForm } from '@/features/auth/components/LoginForm';
+import { Counter } from '@/features/counter';
 
 export default function App() {
   const { user, isLoading, logout } = useAuth();

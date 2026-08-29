@@ -23,7 +23,7 @@ pnpm build
 - **TailwindCSS v4** for styling
 - **Zustand 5** for state management
 - **React Router 7** for routing
-- **TanStack Query 6** for data fetching
+- **TanStack Query 5** for data fetching
 - **Vitest** for unit and integration testing
 - **Playwright** for E2E testing
 - **Cloudflare Pages** deployment ready

@@ -43,7 +43,7 @@ This template uses **Server-Side Rendering (SSR)**, which means:
 
 - Server entry point: `src/main.server.ts`
 - Client entry point: `src/main.ts` / `src/entry-client.tsx`
-- Uses `@vitejs/plugin-ssr` for server builds
+- Uses `vite-plugin-ssr` for server builds
 - Vercel config routes API requests to serverless functions
 
 ## Project Structure
@@ -136,7 +136,7 @@ The `vercel.json` file configures:
 
 - **Vite 6**: Build tool
 - **@vitejs/plugin-react**: React support
-- **@vitejs/plugin-ssr**: SSR support
+- **vite-plugin-ssr**: SSR support
 - **Tailwind CSS 4**: Styling
 - **Vitest**: Unit testing
 - **Playwright**: E2E testing

@@ -1,8 +1,12 @@
-import { defineConfig } from 'vite';
-import react from '@vitejs/plugin-react';
+import { fileURLToPath } from 'node:url';
+
 import tailwindcss from '@tailwindcss/vite';
+import react from '@vitejs/plugin-react';
+import { defineConfig } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
-import path from 'path';
+
+
+const sourceDirectory = fileURLToPath(new URL('./src', import.meta.url));
 
 export default defineConfig({
   plugins: [
@@ -28,13 +32,13 @@ export default defineConfig({
         navigateFallback: '/index.html',
       },
       devOptions: {
-        enabled: true,
+        enabled: false,
       },
     }),
   ],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      '@': sourceDirectory,
     },
   },
   build: {

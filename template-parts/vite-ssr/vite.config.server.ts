@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import ssr from '@vitejs/plugin-ssr';
+import ssr from 'vite-plugin-ssr/plugin';
 import tailwindcss from '@tailwindcss/vite';
 import { fileURLToPath } from 'node:url';
 
@@ -9,7 +9,7 @@ export default defineConfig({
     react(),
     tailwindcss(),
     ssr({
-      input: fileURLToPath(new URL('./src/main.server.ts', import.meta.url)),
+      input: fileURLToPath(new URL('./src/main.server.tsx', import.meta.url)),
     }),
   ],
   resolve: {

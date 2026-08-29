@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+
 import { useCounterStore } from '@/features/counter/stores/counterStore';
 
 describe('counterStore', () => {

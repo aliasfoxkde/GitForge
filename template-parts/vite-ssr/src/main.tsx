@@ -1,9 +1,8 @@
-import React from 'react';
 import ReactDOM from 'react-dom/client';
-import { RouterProvider, createClientRouter } from '@tanstack/react-router';
+import { RouterProvider, createRouter } from '@tanstack/react-router';
 import { rootRoute } from './root';
 
-const routeConfig = createClientRouter({ routeTree: rootRoute });
+const routeConfig = createRouter({ routeTree: rootRoute });
 
 const rootElement = document.getElementById('root')!;
 

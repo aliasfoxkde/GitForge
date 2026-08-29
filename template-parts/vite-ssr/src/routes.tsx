@@ -1,4 +1,4 @@
-import { createRootRoute, createRoute } from '@tanstack/react-router';
+import { Outlet, createRootRoute, createRoute } from '@tanstack/react-router';
 import { Counter } from '@/components/Counter';
 
 export const rootRoute = createRootRoute({
