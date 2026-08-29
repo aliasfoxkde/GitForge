@@ -50,8 +50,9 @@ Goal: make every subsequent result attributable, bounded, and recoverable.
 - [x] P0-04 Add a single `scripts/qualityctl` entry point that runs the exact
   local equivalents of format, lint, tests, coverage, scanner, docs, and E2E
 -  gates with per-stage timeouts and machine-readable results. The implemented
-  first tranche covers format, strict Clippy, locked workspace tests, and
-  optional LLVM coverage; scanner/docs/E2E stages remain follow-up additions.
+  first tranche covers frontend template checks, format, strict Clippy, locked
+  workspace tests, and optional LLVM coverage; scanner/docs stages remain
+  follow-up additions.
 - [x] P0-05 Add a versioned quality manifest containing tool versions, Rust
   channel, coverage floors, scanner commit, and required environment checks.
   `scripts/qualityctl` now records the Git commit/branch, Cargo/Rust versions,
