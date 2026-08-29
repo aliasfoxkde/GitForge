@@ -703,9 +703,7 @@ async fn handle_push_event(
                     state.run_id
                 )
             })?;
-            Some(
-                prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await?,
-            )
+            Some(prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await?)
         }
     };
     workspace_paths
@@ -1034,8 +1032,20 @@ mod tests {
         let workspace = prepare_run_workspace(&pool, repo_id, run_id, &commit)
             .await
             .unwrap();
-        assert_eq!(run_git(["rev-parse", "HEAD"], Some(std::path::Path::new(&workspace))).await, commit);
-        assert_eq!(tokio::fs::read_to_string(PathBuf::from(&workspace).join("marker.txt")).await.unwrap(), "checked out\n");
+        assert_eq!(
+            run_git(
+                ["rev-parse", "HEAD"],
+                Some(std::path::Path::new(&workspace))
+            )
+            .await,
+            commit
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(PathBuf::from(&workspace).join("marker.txt"))
+                .await
+                .unwrap(),
+            "checked out\n"
+        );
         tokio::fs::remove_dir_all(&test_root).await.unwrap();
     }
 
