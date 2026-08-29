@@ -128,6 +128,18 @@ async fn main() -> anyhow::Result<()> {
             "/git-receive-pack/{owner}/{repo}/{*path}",
             post(git_receive_pack_path),
         )
+        // Standard Git Smart HTTP routes. Keep the legacy explicit service
+        // routes above for compatibility with existing callers, but expose
+        // the paths used by ordinary `git clone`/`git fetch`/`git push`.
+        .route("/{owner}/{repo}/info/refs", get(git_info_refs))
+        .route(
+            "/{owner}/{repo}/git-upload-pack",
+            post(git_upload_pack_standard),
+        )
+        .route(
+            "/{owner}/{repo}/git-receive-pack",
+            post(git_receive_pack_standard),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -286,6 +298,32 @@ async fn git_upload_pack_path(
     git_upload_pack(Path((owner, repo)), State(state)).await
 }
 
+/// Standard Smart HTTP ref advertisement endpoint.
+async fn git_info_refs(
+    Path((owner, repo)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    git_upload_pack(
+        Path((owner, repo.trim_end_matches(".git").to_string())),
+        State(state),
+    )
+    .await
+}
+
+/// Standard Smart HTTP upload-pack endpoint.
+async fn git_upload_pack_standard(
+    Path((owner, repo)): Path<(String, String)>,
+    State(state): State<AppState>,
+    request: Request<Body>,
+) -> Response {
+    let _ = request;
+    git_upload_pack(
+        Path((owner, repo.trim_end_matches(".git").to_string())),
+        State(state),
+    )
+    .await
+}
+
 /// Git receive-pack handler (POST) - receives pack data
 async fn git_receive_pack(
     Path((owner, repo)): Path<(String, String)>,
@@ -358,6 +396,20 @@ async fn git_receive_pack_path(
     request: Request<Body>,
 ) -> Response {
     git_receive_pack(Path((owner, repo)), State(state), request).await
+}
+
+/// Standard Smart HTTP receive-pack endpoint.
+async fn git_receive_pack_standard(
+    Path((owner, repo)): Path<(String, String)>,
+    State(state): State<AppState>,
+    request: Request<Body>,
+) -> Response {
+    git_receive_pack(
+        Path((owner, repo.trim_end_matches(".git").to_string())),
+        State(state),
+        request,
+    )
+    .await
 }
 
 /// Get the git root directory from environment or use default
