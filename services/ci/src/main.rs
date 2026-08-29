@@ -974,6 +974,37 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
+    async fn test_pool_with_repository(
+        git_path: String,
+    ) -> (gitforge_db::Pool, gitforge_common::RepoId) {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "workspace-error-test".to_string(),
+            "workspace-error@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "workspace-error-test".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        (pool, repo_id)
+    }
+
     #[tokio::test]
     async fn test_prepare_run_workspace_clones_and_checks_out_exact_sha() {
         let _guard = WORKSPACE_TEST_LOCK
@@ -1048,6 +1079,123 @@ mod tests {
             "checked out\n"
         );
         tokio::fs::remove_dir_all(&test_root_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_prepare_run_workspace_rejects_unknown_repository() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let error = prepare_run_workspace(
+            &pool,
+            gitforge_common::RepoId::new(),
+            gitforge_common::PipelineRunId::new(),
+            "deadbeef",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("is not registered"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_run_workspace_rejects_unavailable_repository_path() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let missing = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-missing-source")
+            .join(gitforge_common::RepoId::new().to_string());
+        let (pool, repo_id) =
+            test_pool_with_repository(missing.to_string_lossy().into_owned()).await;
+        let error = prepare_run_workspace(
+            &pool,
+            repo_id,
+            gitforge_common::PipelineRunId::new(),
+            "deadbeef",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("git path is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_run_workspace_rejects_non_directory_repository_path() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let file =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/gitforge-ci-source-file");
+        tokio::fs::write(&file, "not a repository\n").await.unwrap();
+        let (pool, repo_id) = test_pool_with_repository(file.to_string_lossy().into_owned()).await;
+        let error = prepare_run_workspace(
+            &pool,
+            repo_id,
+            gitforge_common::PipelineRunId::new(),
+            "deadbeef",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("is not a directory"));
+        tokio::fs::remove_file(file).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_prepare_run_workspace_rejects_invalid_commit() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-invalid-commit")
+            .join(gitforge_common::RepoId::new().to_string());
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let source = root.join("source.git");
+        run_git(["init", "--bare", source.to_str().unwrap()], None).await;
+        let (pool, repo_id) =
+            test_pool_with_repository(source.to_string_lossy().into_owned()).await;
+        let run_id = gitforge_common::PipelineRunId::new();
+        let error = prepare_run_workspace(&pool, repo_id, run_id, "deadbeef")
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("checkout commit deadbeef failed"));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_validate_workspace_path_enforces_configured_root() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-validation")
+            .join(gitforge_common::RepoId::new().to_string());
+        let inside = root.join("inside");
+        let outside = root.parent().unwrap().join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", &root);
+
+        assert_eq!(
+            validate_workspace_path(inside.to_str().unwrap()).unwrap(),
+            inside.canonicalize().unwrap().to_string_lossy()
+        );
+        let error = validate_workspace_path(outside.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("workspace must be inside"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_health_check_reports_healthy() {
+        assert_eq!(health_check().await, "OK");
     }
 
     #[test]
