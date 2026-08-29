@@ -144,6 +144,41 @@ fn hydrate_job(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Job> {
     })
 }
 
+fn hydrate_runner(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Runner> {
+    Ok(crate::models::Runner {
+        id: RunnerId::from(parse_uuid_column(&row, "id")?),
+        name: row
+            .try_get("name")
+            .map_err(|error| Error::database(format!("invalid runner name: {}", error)))?,
+        runner_type: row
+            .try_get("runner_type")
+            .map_err(|error| Error::database(format!("invalid runner type: {}", error)))?,
+        status: row
+            .try_get("status")
+            .map_err(|error| Error::database(format!("invalid runner status: {}", error)))?,
+        last_heartbeat: parse_optional_timestamp_column(&row, "last_heartbeat")?,
+        capacity: row
+            .try_get("capacity")
+            .map_err(|error| Error::database(format!("invalid runner capacity: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+    })
+}
+
+fn hydrate_event(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Event> {
+    let payload: String = row
+        .try_get("payload")
+        .map_err(|error| Error::database(format!("invalid event payload column: {}", error)))?;
+    Ok(crate::models::Event {
+        id: parse_uuid_column(&row, "id")?,
+        event_type: row
+            .try_get("event_type")
+            .map_err(|error| Error::database(format!("invalid event type: {}", error)))?,
+        payload: serde_json::from_str(&payload)
+            .map_err(|error| Error::database(format!("invalid event payload JSON: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+    })
+}
+
 // ============================================================================
 // Repository Queries
 // ============================================================================
@@ -1107,23 +1142,7 @@ impl RunnerQueries {
             .await
             .map_err(|e| Error::database(format!("failed to get runner: {}", e)))?;
 
-        match row {
-            Some(row) => Ok(Some(crate::models::Runner {
-                id: RunnerId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                runner_type: row.get("runner_type"),
-                status: row.get("status"),
-                capacity: row.get("capacity"),
-                last_heartbeat: row
-                    .get::<Option<String>, _>("last_heartbeat")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
-            None => Ok(None),
-        }
+        row.map(hydrate_runner).transpose()
     }
 
     /// Update runner heartbeat
@@ -1157,21 +1176,8 @@ impl RunnerQueries {
 
         let runners = rows
             .into_iter()
-            .map(|row| crate::models::Runner {
-                id: RunnerId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                runner_type: row.get("runner_type"),
-                status: row.get("status"),
-                capacity: row.get("capacity"),
-                last_heartbeat: row
-                    .get::<Option<String>, _>("last_heartbeat")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_runner)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(runners)
     }
@@ -1186,21 +1192,8 @@ impl RunnerQueries {
 
         let runners = rows
             .into_iter()
-            .map(|row| crate::models::Runner {
-                id: RunnerId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                runner_type: row.get("runner_type"),
-                status: row.get("status"),
-                capacity: row.get("capacity"),
-                last_heartbeat: row
-                    .get::<Option<String>, _>("last_heartbeat")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_runner)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(runners)
     }
@@ -1248,15 +1241,8 @@ impl EventQueries {
 
         let events = rows
             .into_iter()
-            .map(|row| crate::models::Event {
-                id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
-                event_type: row.get("event_type"),
-                payload: serde_json::from_str(&row.get::<String, _>("payload")).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_event)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(events)
     }
@@ -1271,15 +1257,8 @@ impl EventQueries {
 
         let events = rows
             .into_iter()
-            .map(|row| crate::models::Event {
-                id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
-                event_type: row.get("event_type"),
-                payload: serde_json::from_str(&row.get::<String, _>("payload")).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_event)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(events)
     }
@@ -1756,6 +1735,15 @@ mod tests {
         // List online runners
         let online = RunnerQueries::list_online(&pool).await.unwrap();
         assert_eq!(online.len(), 1);
+
+        sqlx::query("UPDATE runners SET created_at = ? WHERE id = ?")
+            .bind("2026-08-29 03:40:39")
+            .bind(runner.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert!(RunnerQueries::get(&pool, runner.id).await.is_err());
+        assert!(RunnerQueries::list_online(&pool).await.is_err());
     }
 
     #[tokio::test]
@@ -1793,6 +1781,13 @@ mod tests {
         // List with limit 3
         let recent = EventQueries::list_recent(&pool, 3).await.unwrap();
         assert_eq!(recent.len(), 3);
+
+        sqlx::query("UPDATE events SET payload = ? WHERE id = (SELECT id FROM events LIMIT 1)")
+            .bind("not-json")
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert!(EventQueries::list_recent(&pool, 5).await.is_err());
     }
 
     #[tokio::test]
