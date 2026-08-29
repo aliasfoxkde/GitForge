@@ -951,9 +951,9 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
 
-    static WORKSPACE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static WORKSPACE_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
     async fn run_git<I, S>(args: I, cwd: Option<&std::path::Path>) -> String
     where
@@ -977,15 +977,15 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_run_workspace_clones_and_checks_out_exact_sha() {
         let _guard = WORKSPACE_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
+            .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
-            .unwrap();
+            .await;
         let run_id = gitforge_common::PipelineRunId::new();
-        let test_root = PathBuf::from("/home/mkinney/.cache/gitforge-ci-workspace-tests")
-            .join(run_id.to_string());
-        let source = test_root.join("source.git");
-        let seed = test_root.join("seed");
-        tokio::fs::create_dir_all(&test_root).await.unwrap();
+        let test_root = tempfile::tempdir().unwrap();
+        let test_root_path = test_root.path().join(run_id.to_string());
+        let source = test_root_path.join("source.git");
+        let seed = test_root_path.join("seed");
+        tokio::fs::create_dir_all(&test_root_path).await.unwrap();
         run_git(["init", "--bare", source.to_str().unwrap()], None).await;
         tokio::fs::create_dir_all(&seed).await.unwrap();
         run_git(["init", seed.to_str().unwrap()], None).await;
@@ -1028,7 +1028,7 @@ mod tests {
         )
         .await
         .unwrap();
-        std::env::set_var("GITFORGE_WORKSPACE_ROOT", test_root.join("workspaces"));
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", test_root_path.join("workspaces"));
         let workspace = prepare_run_workspace(&pool, repo_id, run_id, &commit)
             .await
             .unwrap();
@@ -1046,7 +1046,7 @@ mod tests {
                 .unwrap(),
             "checked out\n"
         );
-        tokio::fs::remove_dir_all(&test_root).await.unwrap();
+        tokio::fs::remove_dir_all(&test_root_path).await.unwrap();
     }
 
     #[test]
