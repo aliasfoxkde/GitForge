@@ -1022,6 +1022,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_enqueue_persists_declared_image_in_assignment_definition() {
+        let scheduler = Scheduler::new();
+        let job_id = JobId::new();
+        let run_id = PipelineRunId::new();
+        let repo_id = RepoId::new();
+
+        scheduler
+            .enqueue_with_definition_and_image(
+                job_id,
+                run_id,
+                repo_id,
+                vec!["echo image".to_string()],
+                "node:22".to_string(),
+                Some("/workspace".to_string()),
+            )
+            .await;
+
+        let state = scheduler.state.read().await;
+        let definition = state.job_definitions.get(&job_id).unwrap();
+        assert_eq!(definition.image, "node:22");
+        assert_eq!(definition.working_dir.as_deref(), Some("/workspace"));
+    }
+
+    #[tokio::test]
     async fn test_idempotent_submission_replays_same_job_and_rejects_conflict() {
         let pool = gitforge_db::Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
