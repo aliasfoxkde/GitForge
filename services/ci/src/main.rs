@@ -952,6 +952,92 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    static WORKSPACE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    async fn run_git<I, S>(args: I, cwd: Option<&std::path::Path>) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let mut command = tokio::process::Command::new("git");
+        command.args(args);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_prepare_run_workspace_clones_and_checks_out_exact_sha() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let run_id = gitforge_common::PipelineRunId::new();
+        let test_root = PathBuf::from("/home/mkinney/.cache/gitforge-ci-workspace-tests")
+            .join(run_id.to_string());
+        let source = test_root.join("source.git");
+        let seed = test_root.join("seed");
+        tokio::fs::create_dir_all(&test_root).await.unwrap();
+        run_git(["init", "--bare", source.to_str().unwrap()], None).await;
+        tokio::fs::create_dir_all(&seed).await.unwrap();
+        run_git(["init", seed.to_str().unwrap()], None).await;
+        run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
+        run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
+        tokio::fs::write(seed.join("marker.txt"), "checked out\n")
+            .await
+            .unwrap();
+        run_git(["add", "marker.txt"], Some(&seed)).await;
+        run_git(["commit", "-m", "workspace fixture"], Some(&seed)).await;
+        let commit = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
+        run_git(
+            ["push", source.to_str().unwrap(), "HEAD:refs/heads/main"],
+            Some(&seed),
+        )
+        .await;
+
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "workspace-test".to_string(),
+            "workspace@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "workspace-test".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: source.to_string_lossy().into_owned(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", test_root.join("workspaces"));
+        let workspace = prepare_run_workspace(&pool, repo_id, run_id, &commit)
+            .await
+            .unwrap();
+        assert_eq!(run_git(["rev-parse", "HEAD"], Some(std::path::Path::new(&workspace))).await, commit);
+        assert_eq!(tokio::fs::read_to_string(PathBuf::from(&workspace).join("marker.txt")).await.unwrap(), "checked out\n");
+        tokio::fs::remove_dir_all(&test_root).await.unwrap();
+    }
 
     #[test]
     fn test_create_default_pipeline() {
