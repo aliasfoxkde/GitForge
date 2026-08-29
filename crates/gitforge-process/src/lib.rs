@@ -11,7 +11,8 @@ pub mod signal;
 pub mod subreaper;
 
 pub use limits::{
-    apply_limits, get_cgroup_path, is_in_cgroup_v2, CpuLimit, MemoryLimit, ResourceLimits,
+    apply_cpu_limit_to_pid, apply_limits, apply_limits_to_pid, get_cgroup_path, is_in_cgroup_v2,
+    CpuLimit, MemoryLimit, ResourceLimits,
 };
 pub use pool::{JobWeight, PoolConfig, ProcessPool};
 pub use signal::{

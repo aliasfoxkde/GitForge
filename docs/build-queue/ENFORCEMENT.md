@@ -13,6 +13,19 @@ The daemon accepts these bounded environment overrides:
 | `GITFORGE_BUILD_TIMEOUT_SECONDS` | `3600` | `1..86400` | Wall-clock limit for each child process |
 | `GITFORGE_BUILD_JOURNAL` | unset | explicit filesystem path | Enable fsynced local job recovery journal |
 | `GITFORGE_BUILD_MAX_RETAINED_JOBS` | `4096` | `1..100000` | Terminal jobs retained for status/result lookups |
+| `GITFORGE_BUILD_RESOURCE_LIMITS` | enabled | `0/false/off` disables | Apply per-child CPU/address-space limits |
+| `GITFORGE_BUILD_MEMORY_BYTES` | `17179869184` | 256 MiB..64 GiB | Child address-space ceiling |
+| `GITFORGE_BUILD_CPU_TIME_SECONDS` | `3600` | `1..86400` | Child CPU-time ceiling |
+
+Resource limits are applied to the spawned child PID, not the daemon. Cargo
+jobs receive CPU and address-space limits; explicitly selected commands
+receive CPU-time limits only by default because runtimes such as Node may
+reserve large virtual WebAssembly address ranges. The daemon logs an
+application failure and continues with the child only when the
+limit command cannot be applied and journaling is disabled; with a journal
+enabled, ownership persistence remains fail-closed. CPU affinity is not
+claimed by this interface yet; the `cpus_allowed` field is informational until
+the platform-specific affinity implementation is added.
 
 The journal automatically compacts at 16 MiB by atomically rewriting the
 latest state snapshot. This bounds transition-history growth while retaining

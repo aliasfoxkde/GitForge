@@ -14,7 +14,7 @@ tasks, and unverified work is never counted as complete.
 | Code graph | codebase-memory-mcp: 8,135 nodes and 26,535 edges | Ready; use before text search |
 | Tests | Full workspace `cargo test` and managed GitForge builds pass in prior checkpoints | Passing baseline |
 | Coverage | `cargo llvm-cov --workspace --all-features`: 79.98% lines, 81.47% regions, 81.36% functions | Measured; below 99% target |
-| Manager | Bounded queue, concurrent pipe drains, process groups, cancellation, coordinated shutdown, stale socket cleanup, configurable concurrency and child timeout, optional fsynced job journal, terminal retention | Journal replay, terminal-result recovery, queued recovery, PID/start-token guarded fencing, atomic compaction, and in-memory terminal pruning pass; lease renewal, orphan registry, and crash injection remain open |
+| Manager | Bounded queue, concurrent pipe drains, process groups, cancellation, coordinated shutdown, stale socket cleanup, configurable concurrency, timeout, journal, retention, and child resource limits | Journal replay, terminal-result recovery, queued recovery, PID/start-token fencing, atomic compaction, terminal pruning, and child `prlimit` wiring pass; lease renewal, orphan registry, and crash injection remain open |
 | Distributed jobs | Durable leases, requeue, cancellation, log chunks, artifact transfer, authenticated API boundary | Multi-process restart and retry semantics incomplete |
 | CI | Immutable action pins, least-privilege defaults, locked release test, SBOM, provenance, LLVM coverage ratchet | YAML validated; hosted run still required |
 | Harness | `harnessctl doctor` passes; nightly memory and analysis timers active | Opencode absence is the only doctor warning |

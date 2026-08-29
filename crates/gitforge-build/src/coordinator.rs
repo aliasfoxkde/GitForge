@@ -38,6 +38,8 @@ pub struct BuildCoordinator {
     state_changed: Arc<Notify>,
     /// Optional durable journal for local job recovery.
     journal: Option<Arc<Mutex<JobJournal>>>,
+    /// Optional limits applied to each spawned child process.
+    resource_limits: Option<gitforge_process::ResourceLimits>,
     /// Maximum number of terminal jobs retained in memory.
     max_retained_jobs: usize,
 }
@@ -55,7 +57,11 @@ pub struct BuildCoordinatorConfig {
     pub journal_path: Option<PathBuf>,
     /// Maximum terminal jobs retained for status/result lookups.
     pub max_retained_jobs: usize,
+    /// Optional per-child resource limits. `None` disables prlimit setup.
+    pub resource_limits: Option<gitforge_process::ResourceLimits>,
 }
+
+const DEFAULT_BUILD_MEMORY_BYTES: usize = 16 * 1024 * 1024 * 1024;
 
 impl Default for BuildCoordinatorConfig {
     fn default() -> Self {
@@ -65,6 +71,11 @@ impl Default for BuildCoordinatorConfig {
             job_timeout: Duration::from_secs(3600),
             journal_path: None,
             max_retained_jobs: 4096,
+            resource_limits: Some(gitforge_process::ResourceLimits::new(
+                DEFAULT_BUILD_MEMORY_BYTES as u64,
+                3600,
+                0,
+            )),
         }
     }
 }
@@ -93,12 +104,33 @@ impl BuildCoordinatorConfig {
             1,
             100_000,
         );
+        let resource_limits = match std::env::var("GITFORGE_BUILD_RESOURCE_LIMITS")
+            .ok()
+            .as_deref()
+        {
+            Some("0" | "false" | "off") => None,
+            _ => {
+                let memory_bytes = env_usize(
+                    "GITFORGE_BUILD_MEMORY_BYTES",
+                    DEFAULT_BUILD_MEMORY_BYTES,
+                    256 * 1024 * 1024,
+                    64 * 1024 * 1024 * 1024,
+                );
+                let cpu_time_secs = env_usize("GITFORGE_BUILD_CPU_TIME_SECONDS", 3600, 1, 86_400);
+                Some(gitforge_process::ResourceLimits::new(
+                    memory_bytes as u64,
+                    cpu_time_secs as u64,
+                    0,
+                ))
+            }
+        };
         Self {
             max_concurrent,
             max_queued,
             job_timeout: Duration::from_secs(timeout_secs as u64),
             journal_path,
             max_retained_jobs,
+            resource_limits,
         }
     }
 }
@@ -133,6 +165,7 @@ impl BuildCoordinator {
             state_changed: Arc::new(Notify::new()),
             journal: None,
             max_retained_jobs: config.max_retained_jobs.max(1),
+            resource_limits: config.resource_limits,
         }
     }
 
@@ -410,6 +443,7 @@ impl BuildCoordinator {
                 coordinator.active_pids.clone(),
                 coordinator.job_timeout,
                 coordinator.journal.clone(),
+                coordinator.resource_limits.clone(),
             )
             .await;
 
@@ -724,6 +758,7 @@ async fn execute_job(
     active_pids: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
     timeout_duration: Duration,
     journal: Option<Arc<Mutex<JobJournal>>>,
+    resource_limits: Option<gitforge_process::ResourceLimits>,
 ) -> anyhow::Result<BuildResult> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
@@ -786,6 +821,19 @@ async fn execute_job(
     };
     if let Some(pid) = child.id() {
         active_pids.lock().await.insert(job.id, pid);
+        if let Some(limits) = resource_limits {
+            let limit_result = if job.executable.is_some() {
+                gitforge_process::apply_cpu_limit_to_pid(pid, limits.cpu.cpu_time_secs)
+            } else {
+                gitforge_process::apply_limits_to_pid(pid, &limits)
+            };
+            if let Err(error) = limit_result {
+                error!(
+                    "failed to apply resource limits to job {}: {}",
+                    job.id, error
+                );
+            }
+        }
         if let Some(journal) = journal {
             let start_ticks = process_start_ticks(pid);
             let event = JobJournalEvent::Started {
@@ -1076,6 +1124,7 @@ mod tests {
             job_timeout: Duration::from_secs(10),
             journal_path: None,
             max_retained_jobs: 1,
+            resource_limits: None,
         }));
         let first = coordinator
             .try_submit_command(
@@ -1106,6 +1155,7 @@ mod tests {
             job_timeout: Duration::from_secs(10),
             journal_path: None,
             max_retained_jobs: 4096,
+            resource_limits: Some(gitforge_process::ResourceLimits::default()),
         };
         let first = BuildCoordinator::with_journal(config.clone(), &journal_path)
             .await
@@ -1147,6 +1197,7 @@ mod tests {
             job_timeout: Duration::from_secs(10),
             journal_path: None,
             max_retained_jobs: 1,
+            resource_limits: None,
         }));
         let first = coordinator
             .try_submit_command("/bin/true".into(), Vec::new(), None)
