@@ -121,13 +121,6 @@ impl DockerSandbox {
         Ok(())
     }
 
-    fn container_labels(job_id: JobId) -> HashMap<String, String> {
-        HashMap::from([
-            ("com.gitforce.managed".to_string(), "true".to_string()),
-            ("com.gitforce.job_id".to_string(), job_id.to_string()),
-        ])
-    }
-
     /// Create a new Docker sandbox, requiring Docker to be available.
     /// Returns an error if Docker is not available or cannot be reached.
     pub async fn connect_required() -> Result<Self> {
@@ -292,6 +285,11 @@ impl Sandbox for DockerSandbox {
             self.remove_job_containers(job_id).await?;
 
             let container_name = Self::container_name(job_id);
+            let job_label = job_id.to_string();
+            let labels = HashMap::from([
+                ("com.gitforce.managed", "true"),
+                ("com.gitforce.job_id", job_label.as_str()),
+            ]);
 
             // Build host config with resource limits
             let host_config = HostConfig {
@@ -311,7 +309,7 @@ impl Sandbox for DockerSandbox {
                 image: Some(image),
                 cmd: Some(vec!["sleep", "3600"]), // Keep container alive
                 host_config: Some(host_config),
-                labels: Some(Self::container_labels(job_id)),
+                labels: Some(labels),
                 ..Default::default()
             };
 
@@ -369,6 +367,11 @@ impl Sandbox for DockerSandbox {
             self.ensure_image(image).await?;
             self.remove_job_containers(job_id).await?;
             let container_name = Self::container_name(job_id);
+            let job_label = job_id.to_string();
+            let labels = HashMap::from([
+                ("com.gitforce.managed", "true"),
+                ("com.gitforce.job_id", job_label.as_str()),
+            ]);
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
                 cpu_period: Some(100000),
@@ -389,7 +392,7 @@ impl Sandbox for DockerSandbox {
                 cmd: Some(vec!["sleep", "3600"]),
                 working_dir: Some("/workspace"),
                 host_config: Some(host_config),
-                labels: Some(Self::container_labels(job_id)),
+                labels: Some(labels),
                 ..Default::default()
             };
             let response = docker
