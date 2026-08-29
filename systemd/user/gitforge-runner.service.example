@@ -1,0 +1,25 @@
+[Unit]
+Description=GitForge Runner
+After=network-online.target podman.socket gitforge-ci.service
+Wants=network-online.target
+Requires=gitforge-ci.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/work/gitforge-current
+EnvironmentFile=-%h/.config/gitforge/gitforge.env
+Environment=GITFORGE_SCHEDULER_URL=http://127.0.0.1:42781
+Environment=DOCKER_HOST=unix:///run/user/%U/podman/podman.sock
+ExecStart=%h/work/gitforge-current/runner
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/gitforge
+
+[Install]
+WantedBy=default.target

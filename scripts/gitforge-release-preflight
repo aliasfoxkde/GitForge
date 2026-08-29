@@ -12,7 +12,6 @@ declare -a required=(
   "ci"
   "git-server"
   "runner"
-  "gitforge-scheduler-service"
 )
 missing=()
 for binary in "${required[@]}"; do
@@ -26,4 +25,4 @@ if ((${#missing[@]})); then
   exit 1
 fi
 
-printf 'release preflight: all required binaries present (%d)\n' "${#required[@]}"
+printf 'release preflight: all candidate binaries present (%d); CI owns scheduler\n' "${#required[@]}"

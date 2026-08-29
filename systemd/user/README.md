@@ -56,10 +56,9 @@ to pending.
 
 Before assembling a release bundle, run
 `scripts/gitforge-release-preflight <release-source-root>`. It fails closed
-unless `api`, `ci`, `git-server`, `runner`, and
-`gitforge-scheduler-service` are all present and executable. The clean candidate
-currently fails this check because the scheduler service is still sourced from
-the separate legacy checkout; do not mix that binary into a candidate bundle.
+unless `api`, `ci`, `git-server`, and `runner` are all present and executable.
+The candidate CI binary owns the scheduler HTTP API, so the legacy standalone
+`gitforge-scheduler-service` must not be mixed into the bundle.
 
 ## Validation and rollout
 
