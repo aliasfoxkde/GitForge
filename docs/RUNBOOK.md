@@ -106,19 +106,31 @@ cargo run -p ci
 The runner agent executes jobs in Docker containers.
 
 ```bash
-# Development
-cargo run -p runner
+# Development — GITFORGE_SCHEDULER_URL is required
+GITFORGE_SCHEDULER_URL=http://localhost:42781 cargo run -p runner
 
 # Production
-SCHEDULER_URL=http://localhost:42781 ./target/release/runner
+GITFORGE_SCHEDULER_URL=http://ci:42781 \
+GITFORGE_RUNNER_NAME=prod-runner-01 \
+GITFORGE_RUNNER_CAPACITY=4 \
+GITFORGE_SCHEDULER_TOKEN=<token> \
+./target/release/runner
 ```
 
 **Environment Variables:**
-- `RUNNER_NAME` - Runner name (default: runner)
-- `SCHEDULER_URL` - Scheduler URL (default: http://localhost:42781, in docker: http://ci:42781)
-- `RUNNER_CAPACITY` - Concurrent job capacity (default: 2)
-- `HEARTBEAT_INTERVAL_SECS` - Heartbeat interval (default: 30)
-- `FETCH_INTERVAL_SECS` - Job fetch interval (default: 5)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `GITFORGE_SCHEDULER_URL` | **Yes** | — | Scheduler HTTP endpoint (e.g. `http://localhost:42781`). Startup fails without this. |
+| `GITFORGE_RUNNER_NAME` | No | `runner` | Display name for this runner instance |
+| `GITFORGE_RUNNER_CAPACITY` | No | `2` | Maximum concurrent jobs |
+| `GITFORGE_HEARTBEAT_INTERVAL` | No | `30` | Heartbeat interval in seconds |
+| `GITFORGE_FETCH_INTERVAL` | No | `5` | Job-poll interval in seconds |
+| `GITFORGE_SCHEDULER_TOKEN` | No | _(none)_ | Bearer token for scheduler API authentication |
+
+> **Startup behavior**: If `GITFORGE_SCHEDULER_URL` is missing or empty, the runner exits immediately
+> with a clear error message. Invalid values for numeric variables (non-integer) also cause a fast
+> failure. Safe defaults apply to all optional variables when they are unset.
 
 ## Docker Compose
 
@@ -262,9 +274,12 @@ capacity = 4
 |----------|---------|---------|-------------|
 | `JWT_SECRET` | api | - | JWT signing secret (required) |
 | `DATABASE_URL` | api | sqlite:/data/gitforge.db | Database URL |
-| `RUNNER_NAME` | runner | runner | Runner identifier |
-| `SCHEDULER_URL` | runner | http://localhost:42781 | Scheduler endpoint |
-| `RUNNER_CAPACITY` | runner | 2 | Max concurrent jobs |
+| `GITFORGE_RUNNER_NAME` | runner | runner | Runner identifier |
+| `GITFORGE_SCHEDULER_URL` | runner | — | Scheduler endpoint (required) |
+| `GITFORGE_RUNNER_CAPACITY` | runner | 2 | Max concurrent jobs |
+| `GITFORGE_HEARTBEAT_INTERVAL` | runner | 30 | Heartbeat interval in seconds |
+| `GITFORGE_FETCH_INTERVAL` | runner | 5 | Job-poll interval in seconds |
+| `GITFORGE_SCHEDULER_TOKEN` | runner | _(none)_ | Bearer token for scheduler API |
 | `SSH_PORT` | git-server | 42022 | SSH port |
 | `HTTP_PORT` | git-server | 42782 | HTTP port |
 
