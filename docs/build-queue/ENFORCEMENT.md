@@ -12,6 +12,7 @@ The daemon accepts these bounded environment overrides:
 | `GITFORGE_BUILD_MAX_QUEUED` | `32` | `0..1024` | Additional jobs admitted while workers are busy |
 | `GITFORGE_BUILD_TIMEOUT_SECONDS` | `3600` | `1..86400` | Wall-clock limit for each child process |
 | `GITFORGE_BUILD_JOURNAL` | unset | explicit filesystem path | Enable fsynced local job recovery journal |
+| `GITFORGE_BUILD_MAX_RETAINED_JOBS` | `4096` | `1..100000` | Terminal jobs retained for status/result lookups |
 
 The journal automatically compacts at 16 MiB by atomically rewriting the
 latest state snapshot. This bounds transition-history growth while retaining

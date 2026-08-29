@@ -38,6 +38,8 @@ pub struct BuildCoordinator {
     state_changed: Arc<Notify>,
     /// Optional durable journal for local job recovery.
     journal: Option<Arc<Mutex<JobJournal>>>,
+    /// Maximum number of terminal jobs retained in memory.
+    max_retained_jobs: usize,
 }
 
 /// Admission and execution limits for the build daemon.
@@ -51,6 +53,8 @@ pub struct BuildCoordinatorConfig {
     pub job_timeout: Duration,
     /// Optional append-only journal path.
     pub journal_path: Option<PathBuf>,
+    /// Maximum terminal jobs retained for status/result lookups.
+    pub max_retained_jobs: usize,
 }
 
 impl Default for BuildCoordinatorConfig {
@@ -60,6 +64,7 @@ impl Default for BuildCoordinatorConfig {
             max_queued: 32,
             job_timeout: Duration::from_secs(3600),
             journal_path: None,
+            max_retained_jobs: 4096,
         }
     }
 }
@@ -82,11 +87,18 @@ impl BuildCoordinatorConfig {
             86_400,
         );
         let journal_path = std::env::var_os("GITFORGE_BUILD_JOURNAL").map(PathBuf::from);
+        let max_retained_jobs = env_usize(
+            "GITFORGE_BUILD_MAX_RETAINED_JOBS",
+            defaults.max_retained_jobs,
+            1,
+            100_000,
+        );
         Self {
             max_concurrent,
             max_queued,
             job_timeout: Duration::from_secs(timeout_secs as u64),
             journal_path,
+            max_retained_jobs,
         }
     }
 }
@@ -120,6 +132,7 @@ impl BuildCoordinator {
             job_timeout: config.job_timeout,
             state_changed: Arc::new(Notify::new()),
             journal: None,
+            max_retained_jobs: config.max_retained_jobs.max(1),
         }
     }
 
@@ -219,6 +232,7 @@ impl BuildCoordinator {
             }
         }
         self.state_changed.notify_waiters();
+        self.prune_terminal_jobs().await;
     }
 
     /// Get the maximum concurrent job count
@@ -333,6 +347,36 @@ impl BuildCoordinator {
             .map_err(|error| format!("failed to persist build state: {}", error))
     }
 
+    /// Remove the oldest terminal jobs once the in-memory retention bound is
+    /// exceeded. Active jobs are never evicted; the completion counter remains
+    /// cumulative even when individual results age out.
+    async fn prune_terminal_jobs(&self) {
+        let removed = {
+            let mut jobs = self.jobs.lock().await;
+            let count = jobs.len().saturating_sub(self.max_retained_jobs);
+            if count == 0 {
+                return;
+            }
+            let mut candidates: Vec<_> = jobs
+                .values()
+                .filter(|job| job.is_terminal())
+                .map(|job| (job.submitted_at, job.id))
+                .collect();
+            candidates.sort_by_key(|(submitted_at, _)| *submitted_at);
+            candidates
+                .into_iter()
+                .take(count)
+                .filter_map(|(_, id)| jobs.remove(&id).map(|_| id))
+                .collect::<Vec<_>>()
+        };
+        if !removed.is_empty() {
+            let mut results = self.results.lock().await;
+            for job_id in removed {
+                results.remove(&job_id);
+            }
+        }
+    }
+
     fn spawn_worker(self: &Arc<Self>, job: BuildJob) {
         let coordinator = self.clone();
         let job_id = job.id;
@@ -419,6 +463,7 @@ impl BuildCoordinator {
                     results.insert(job_id, r.clone());
                 }
             }
+            coordinator.prune_terminal_jobs().await;
 
             // Release permit (drop to signal completion)
             drop(permit);
@@ -1030,6 +1075,7 @@ mod tests {
             max_queued: 0,
             job_timeout: Duration::from_secs(10),
             journal_path: None,
+            max_retained_jobs: 1,
         }));
         let first = coordinator
             .try_submit_command(
@@ -1059,6 +1105,7 @@ mod tests {
             max_queued: 1,
             job_timeout: Duration::from_secs(10),
             journal_path: None,
+            max_retained_jobs: 4096,
         };
         let first = BuildCoordinator::with_journal(config.clone(), &journal_path)
             .await
@@ -1090,6 +1137,36 @@ mod tests {
         } else {
             panic!("expected stats response");
         }
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_prunes_old_terminal_jobs() {
+        let coordinator = Arc::new(BuildCoordinator::with_config(BuildCoordinatorConfig {
+            max_concurrent: 1,
+            max_queued: 1,
+            job_timeout: Duration::from_secs(10),
+            journal_path: None,
+            max_retained_jobs: 1,
+        }));
+        let first = coordinator
+            .try_submit_command("/bin/true".into(), Vec::new(), None)
+            .await
+            .unwrap();
+        coordinator
+            .wait_for_job_with_timeout(first, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let second = coordinator
+            .try_submit_command("/bin/true".into(), Vec::new(), None)
+            .await
+            .unwrap();
+        coordinator
+            .wait_for_job_with_timeout(second, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(coordinator.list_jobs().await.len() <= 1);
+        assert!(coordinator.get_status(&first).await.is_none());
+        assert!(coordinator.get_status(&second).await.is_some());
     }
 
     #[tokio::test]
