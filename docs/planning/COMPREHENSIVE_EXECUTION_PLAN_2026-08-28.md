@@ -14,7 +14,7 @@ tasks, and unverified work is never counted as complete.
 | Code graph | codebase-memory-mcp: 8,135 nodes and 26,535 edges | Ready; use before text search |
 | Tests | Full workspace `cargo test` and managed GitForge builds pass in prior checkpoints | Passing baseline |
 | Coverage | `cargo llvm-cov --workspace --all-features`: 79.98% lines, 81.47% regions, 81.36% functions | Measured; below 99% target |
-| Manager | Bounded queue, concurrent pipe drains, process groups, cancellation, coordinated shutdown, stale socket cleanup, configurable concurrency and child timeout, optional fsynced job journal | Journal replay, terminal-result recovery, queued recovery, and interrupted-running fencing pass; process-group lease reconciliation remains open |
+| Manager | Bounded queue, concurrent pipe drains, process groups, cancellation, coordinated shutdown, stale socket cleanup, configurable concurrency and child timeout, optional fsynced job journal | Journal replay, terminal-result recovery, queued recovery, and PID/start-token guarded process-group fencing pass; lease renewal, orphan registry, and crash injection remain open |
 | Distributed jobs | Durable leases, requeue, cancellation, log chunks, artifact transfer, authenticated API boundary | Multi-process restart and retry semantics incomplete |
 | CI | Immutable action pins, least-privilege defaults, locked release test, SBOM, provenance, LLVM coverage ratchet | YAML validated; hosted run still required |
 | Harness | `harnessctl doctor` passes; nightly memory and analysis timers active | Opencode absence is the only doctor warning |
@@ -84,8 +84,9 @@ Goal: no hung manager request, orphaned descendant, or operator lockout.
   queued/running/terminal state and marks uncertain children for reconciliation.
   The optional append-only journal now persists exact argv and terminal
   results, requeues queued jobs, and fences journaled running jobs as explicit
-  interrupted failures; durable process-group leases and live-child
-  reconciliation remain open.
+  interrupted failures. Journaled starts now include PID, process-group ID,
+  and Linux process-start token, so recovery only signals an identity match;
+  durable lease renewal, orphan registry, and crash injection remain open.
 - [ ] P1-08 Add an orphan supervisor registry keyed by process-group ID, start
   time, workspace, and job ID; reconcile it on startup and shutdown.
 - [ ] P1-09 Add stress tests for eight concurrent noisy dual-stream children,
