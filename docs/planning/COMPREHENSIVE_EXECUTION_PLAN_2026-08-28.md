@@ -141,15 +141,17 @@ Goal: CI says what actually passed and releases are verifiable.
   findings.
 - [ ] P4-08 Execute hosted GitHub workflow canaries and verify the SBOM,
   attestation, checksum, and release assets from a clean machine.
-- [ ] P4-09 Add dependency lockfile policy (`--locked`, cargo-deny/license and
+- [x] P4-09 Add dependency lockfile policy (`--locked`, cargo-deny/license and
   advisory policy) to every Rust build path, including templates. The active
   build/test/lint/release workflows now use `--locked`, root `cargo deny check`
   is enforced by `scripts/qualityctl` and the active Security workflow, and the
-  RSA/h2 findings were fixed. Template lockfiles remain open.
+  RSA/h2 findings were fixed. Both frontend templates now have committed pnpm
+  lockfiles and frozen-install validation.
 - [ ] P4-10 Add workflow linting, action pin drift detection, shellcheck, and
   script-injection checks as required CI jobs. The dependency-free immutable
-  action-ref check now runs in `scripts/qualityctl`; actionlint/shellcheck
-  installation and hosted enforcement remain open.
+  action-ref check now runs in `scripts/qualityctl`, and the active Security
+  workflow contains actionlint and ShellCheck jobs; local availability and
+  full hosted evidence remain open.
 - [ ] P4-11 Add rollback/release promotion gates and a deployment canary with
   health, migration, and artifact verification checks.
 
@@ -186,8 +188,9 @@ Goal: applicable web surfaces meet WCAG 2.1 A/AA and maximize AAA criteria.
 
 - [ ] P6-01 Inventory API dashboard HTML and all `template-parts` frontend
   surfaces; identify ownership and supported browsers. Vite React PWA and SSR
-  surfaces are now inventoried with real Playwright web-server configs; API
-  dashboard inventory remains open.
+  surfaces are now inventoried with real Playwright web-server configs and an
+  immutable-pinned hosted matrix workflow; API dashboard inventory remains
+  open.
 - [ ] P6-02 Add Playwright keyboard, focus order, reduced motion, reflow/zoom,
   form-label, status-message, contrast, and screen-reader-oriented checks.
 - [ ] P6-03 Run axe or equivalent automated checks and manually review all
