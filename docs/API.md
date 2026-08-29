@@ -15,6 +15,26 @@ http://localhost:42780
 
 ## Authentication
 
+Protected `/api` routes pass through a shared JWT authentication boundary and
+receive an `AuthenticatedUser` context. Resource authorization is still
+enforced by the individual route. The one documented bootstrap exception is
+`POST /api/runners`, which is intentionally unauthenticated so a new runner
+can register before receiving credentials; runner listing and detail routes
+remain protected.
+
+Repository routes expose only repositories owned by the authenticated user,
+with `admin` and `maintainer` role overrides. Artifact routes require the
+shared authenticated context and resolve artifact access through the owning
+job, pipeline run, and repository; unauthorized artifacts are returned as
+not-found to avoid leaking private resource existence.
+
+Administrators may change a user's persisted role with
+`PATCH /api/users/{id}/role`. Supported roles are `admin`, `maintainer`,
+`developer`, and `read_only`; non-administrators receive `403`, invalid roles
+receive `400`, and the last administrator cannot be demoted. Protected
+requests resolve the current persisted role, so demotion takes effect
+immediately even when an older JWT is presented.
+
 GitForge uses JWT tokens for API authentication. Include the token in the Authorization header:
 
 ```
@@ -47,6 +67,17 @@ GET /repos
 POST /repos
 GET /repos/{id}
 DELETE /repos/{id}
+```
+
+#### User roles
+
+```
+PATCH /users/{id}/role
+```
+
+**Request:**
+```json
+{"role": "maintainer"}
 ```
 
 **Create Repository Request:**
@@ -101,8 +132,27 @@ GET /pipeline-runs/{id}/jobs
 #### Jobs
 
 ```
+POST /jobs
 GET /jobs/{id}
 GET /jobs/{id}/logs
+POST /jobs/{id}/cancel
+```
+
+Job submission requires a pipeline run owned by the authenticated user (or an
+admin/maintainer role), bounded commands, and a stable `idempotency_key`.
+Retries return the original job ID; reusing a key for different parameters is
+rejected. Cancellation is persisted in the shared database so the separate CI
+scheduler and runner observe it safely.
+
+**Submit Job Request:**
+```json
+{
+  "pipeline_run_id": "run-uuid",
+  "name": "manual-check",
+  "commands": ["cargo test"],
+  "working_dir": null,
+  "idempotency_key": "attempt-uuid"
+}
 ```
 
 **Job Response:**

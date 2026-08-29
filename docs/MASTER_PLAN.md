@@ -1,7 +1,12 @@
 # GitForge Master Implementation Plan
 
-**Last Updated**: 2026-07-22
-**Goal**: Production-ready, 99% coverage, all CI passing
+**Last Updated**: 2026-08-25
+**Goal**: Production-ready, measured 99% line coverage, and all CI passing
+
+> Coverage baseline: workspace-wide `cargo llvm-cov --workspace
+> --all-features --summary-only` on 2026-08-25 measured **79.98% lines**,
+> **81.47% regions**, and **81.36% functions**. This is a baseline, not a
+> claim of completion. The CI gate must ratchet upward from measured evidence.
 
 ---
 
@@ -82,20 +87,20 @@
 
 ---
 
-## Current State (2026-07-22)
+## Current State (2026-08-25)
 
 | Metric | Value | Target |
 |--------|-------|--------|
-| Coverage | 89.65% | 99% |
-| Tests | 872+ | 950+ |
-| API Endpoints | 20/23 | 23/23 |
-| CLI Wired | ~20% | 100% |
+| Coverage (workspace lines) | 79.98% | 99% |
+| Coverage (workspace functions) | 81.36% | 99% |
+| Tests | measured by `cargo test --workspace -- --list` | increasing with behavior |
+| API Endpoints | audit required | complete and E2E-tested |
+| CLI Wired | audit required | complete and E2E-tested |
 
 ## Key Issues
 
-1. **CLI not wired to API** - Only sync commands work
-2. **Hardcoded JWT secret** - Security risk
-3. **CORS permissive** - Security risk
-4. **unwrap() in handlers** - Could panic
-5. **release-rust.yml no tests** - Could release broken builds
-6. **auto-merge merges when CI red** - Could merge bad code
+1. **Coverage is 79.98% lines** - prioritize low-covered service and executor paths
+2. **True live sandbox log streaming is open** - current transfer occurs before completion
+3. **Full multi-process API/scheduler/runner E2E is open**
+4. **Release provenance/SBOM and immutable action pinning need completion**
+5. **Orphan reaping needs a registry-backed supervisor before the legacy API can be removed**

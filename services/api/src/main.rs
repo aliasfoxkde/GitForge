@@ -5,6 +5,7 @@
 use gitforge_api::ApiServer;
 use gitforge_db::Pool;
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
+use gitforge_storage::FileStorage;
 #[allow(unused_imports)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,8 +24,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("starting GitForce API Gateway");
 
-    // Initialize process supervision (subreaper + SIGCHLD) to prevent zombies
-    if let Err(e) = gitforge_process::init() {
+    // Initialize subreaper support without a global waitpid loop. Child
+    // ownership must remain with the runtime that spawned it.
+    if let Err(e) = gitforge_process::init_without_sigchld_reaper() {
         tracing::warn!("failed to initialize process supervision: {}", e);
     }
 
@@ -37,8 +39,14 @@ async fn main() -> anyhow::Result<()> {
     pool.migrate().await?;
     tracing::info!("database connection established");
 
-    // Create and start API server
-    let server = ApiServer::new(&config.jwt_secret, pool).with_port(config.port);
+    // Create and start API server. Runner and API share this LAN-local
+    // filesystem root for bounded artifact metadata and content.
+    let artifact_root = std::env::var("GITFORGE_ARTIFACT_ROOT")
+        .unwrap_or_else(|_| "/tmp/gitforge-artifacts".to_string());
+    let storage = FileStorage::new(artifact_root).await?;
+    let server = ApiServer::new(&config.jwt_secret, pool)
+        .with_storage_extension(Arc::new(storage))
+        .with_port(config.port);
 
     tracing::info!("API Gateway listening on port {}", config.port);
 
@@ -138,6 +146,9 @@ pub async fn graceful_shutdown_delay() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn clear_env() {
         std::env::remove_var("JWT_SECRET");
@@ -147,6 +158,7 @@ mod tests {
 
     #[test]
     fn test_load_config_requires_jwt_secret() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         std::env::remove_var("JWT_SECRET");
 
@@ -162,6 +174,7 @@ mod tests {
 
     #[test]
     fn test_load_config_with_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         std::env::set_var("JWT_SECRET", "production-secret-32chars!!");
         std::env::set_var("PORT", "3000");
@@ -177,6 +190,7 @@ mod tests {
 
     #[test]
     fn test_load_config_test_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         // Explicitly remove DATABASE_URL to ensure clean state
         std::env::remove_var("DATABASE_URL");
@@ -256,6 +270,7 @@ mod tests {
 
     #[test]
     fn test_load_config_port_parsing() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         std::env::set_var("JWT_SECRET", "test-secret");
         std::env::set_var("PORT", "9000");
@@ -268,6 +283,7 @@ mod tests {
 
     #[test]
     fn test_load_config_invalid_port_uses_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         std::env::set_var("JWT_SECRET", "test-secret");
         std::env::set_var("PORT", "invalid");
@@ -281,6 +297,7 @@ mod tests {
 
     #[test]
     fn test_load_config_port_zero_is_valid() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         std::env::set_var("JWT_SECRET", "test-secret");
         std::env::set_var("PORT", "0");
@@ -294,6 +311,7 @@ mod tests {
 
     #[test]
     fn test_load_config_port_max_u16() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         std::env::set_var("JWT_SECRET", "test-secret");
         std::env::set_var("PORT", "65535");
@@ -329,6 +347,7 @@ mod tests {
 
     #[test]
     fn test_clear_env_removes_all_vars() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Set then clear
         std::env::set_var("JWT_SECRET", "test");
         std::env::set_var("PORT", "1234");

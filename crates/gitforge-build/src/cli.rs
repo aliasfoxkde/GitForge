@@ -35,7 +35,17 @@ struct Cli {
     #[arg(long)]
     stats: bool,
 
-    /// cargo command and arguments (e.g., "test --workspace")
+    /// Cancel a queued or running job
+    #[arg(long, value_name = "JOB_ID")]
+    cancel: Option<String>,
+
+    /// Gracefully stop the build daemon
+    #[arg(long)]
+    shutdown: bool,
+
+    /// cargo command and arguments (e.g., "test --workspace"); options after
+    /// the cargo command are forwarded without requiring a second `--`.
+    #[arg(trailing_var_arg = true)]
     cargo_args: Vec<String>,
 }
 
@@ -57,6 +67,14 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
 
     if cli.stats {
         return stats_cmd(client, &socket_path).await;
+    }
+
+    if let Some(job_id) = cli.cancel {
+        return cancel_cmd(client, &socket_path, job_id).await;
+    }
+
+    if cli.shutdown {
+        return shutdown_cmd(client, &socket_path).await;
     }
 
     // Need at least one cargo arg
@@ -88,9 +106,25 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
 
             // Wait for job to complete
             println!("waiting for job to complete...");
-            // For now just print that it was submitted
-            // In full implementation, would poll for status
-            Ok(())
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                match client.get_status(&socket_path, job_id.clone()).await? {
+                    Response::Status { status, .. } => {
+                        println!("status: {}", status);
+                        if status.starts_with("completed(")
+                            || status.starts_with("failed")
+                            || status == "cancelled"
+                        {
+                            if status.starts_with("failed") || status == "cancelled" {
+                                anyhow::bail!("job {}", status);
+                            }
+                            return Ok(());
+                        }
+                    }
+                    Response::Error { message } => anyhow::bail!("error: {}", message),
+                    response => anyhow::bail!("unexpected response: {:?}", response),
+                }
+            }
         }
         Response::Error { message } => {
             anyhow::bail!("error: {}", message);
@@ -98,6 +132,28 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
         _ => {
             anyhow::bail!("unexpected response: {:?}", response);
         }
+    }
+}
+
+async fn cancel_cmd<C: JobSubmitter>(client: &C, socket_path: &str, job_id: String) -> Result<()> {
+    match client.cancel_job(socket_path, job_id).await? {
+        Response::Status { status, .. } => {
+            println!("{}", status);
+            Ok(())
+        }
+        Response::Error { message } => anyhow::bail!("error: {}", message),
+        response => anyhow::bail!("unexpected response: {:?}", response),
+    }
+}
+
+async fn shutdown_cmd<C: JobSubmitter>(client: &C, socket_path: &str) -> Result<()> {
+    match client.shutdown(socket_path).await? {
+        Response::Shutdown => {
+            println!("shutdown requested");
+            Ok(())
+        }
+        Response::Error { message } => anyhow::bail!("error: {}", message),
+        response => anyhow::bail!("unexpected response: {:?}", response),
     }
 }
 
@@ -410,6 +466,12 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.cargo_args, vec!["check", "-p", "foo", "--all-targets"]);
+    }
+
+    #[test]
+    fn test_cli_forwards_cargo_options_without_separator() {
+        let cli = Cli::try_parse_from(["gitforge-build", "test", "--workspace"]).unwrap();
+        assert_eq!(cli.cargo_args, vec!["test", "--workspace"]);
     }
 
     #[test]

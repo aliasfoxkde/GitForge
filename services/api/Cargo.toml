@@ -15,6 +15,7 @@ gitforge-db = { path = "../../crates/gitforge-db" }
 gitforge-events = { path = "../../crates/gitforge-events" }
 gitforge-api = { path = "../../crates/gitforge-api" }
 gitforge-process = { path = "../../crates/gitforge-process" }
+gitforge-storage = { path = "../../crates/gitforge-storage" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

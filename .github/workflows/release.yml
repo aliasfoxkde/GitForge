@@ -10,6 +10,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   # Linux build (x86_64 only - cross-compilation not available)
@@ -17,13 +20,14 @@ jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Build
         run: |
-          cargo build --release --bin api --bin ci --bin git-server --bin runner
+          cargo test --workspace --locked --no-fail-fast
+          cargo build --release --locked --bin api --bin ci --bin git-server --bin runner
 
       - name: Package
         run: |
@@ -31,7 +35,7 @@ jobs:
           tar -czf dist/gitforge-x86_64-unknown-linux-gnu.tar.gz \
             -C target/release api ci git-server runner
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gitforge-linux
           path: dist/*
@@ -42,7 +46,7 @@ jobs:
   build-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -51,10 +55,10 @@ jobs:
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
       - name: Build x86_64
-        run: cargo build --release --target x86_64-apple-darwin --bin api --bin ci --bin git-server --bin runner
+        run: cargo build --release --locked --target x86_64-apple-darwin --bin api --bin ci --bin git-server --bin runner
 
       - name: Build arm64
-        run: cargo build --release --target aarch64-apple-darwin --bin api --bin ci --bin git-server --bin runner
+        run: cargo build --release --locked --target aarch64-apple-darwin --bin api --bin ci --bin git-server --bin runner
 
       - name: Package
         run: |
@@ -62,7 +66,7 @@ jobs:
           tar -czf dist/gitforge-x86_64-apple-darwin.tar.gz -C target/x86_64-apple-darwin/release api ci git-server runner
           tar -czf dist/gitforge-aarch64-apple-darwin.tar.gz -C target/aarch64-apple-darwin/release api ci git-server runner
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gitforge-macos
           path: dist/*
@@ -73,13 +77,13 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Build
         shell: bash
-        run: cargo build --release --target x86_64-pc-windows-gnu --bin api --bin ci --bin git-server --bin runner
+        run: cargo build --release --locked --target x86_64-pc-windows-gnu --bin api --bin ci --bin git-server --bin runner
 
       - name: Package
         shell: bash
@@ -88,7 +92,7 @@ jobs:
           tar -czf dist/gitforge-x86_64-pc-windows-gnu.tar.gz \
             -C target/x86_64-pc-windows-gnu/release api.exe ci.exe git-server.exe runner.exe
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gitforge-windows
           path: dist/*
@@ -101,14 +105,29 @@ jobs:
     if: github.repository_owner == 'aliasfoxkde'
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
+      - name: Prepare release metadata
+        run: mkdir -p dist
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: dist/gitforge-sbom.cyclonedx.json
+          artifact-name: gitforge-sbom.cyclonedx.json
+          upload-release-assets: false
+
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist/
 
@@ -126,10 +145,16 @@ jobs:
           mkdir -p dist/release
           cp dist/*/*.tar.gz dist/release/ 2>/dev/null || true
           cp dist/SHA256SUMS dist/release/ 2>/dev/null || true
+          cp dist/gitforge-sbom.cyclonedx.json dist/release/ 2>/dev/null || true
           ls -la dist/release/
 
+      - name: Attest release artifacts
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: 'dist/release/*.tar.gz'
+
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
           draft: false
           prerelease: false

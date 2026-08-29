@@ -29,7 +29,9 @@ anyhow = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
-libc = "0.2"
+
+# Process group management for proper signal handling
+nix = { version = "0.27", features = ["process", "signal"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

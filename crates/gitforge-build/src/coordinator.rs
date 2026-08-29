@@ -2,6 +2,8 @@
 
 use crate::job::{BuildJob, BuildResult, JobStatus, MAX_CONCURRENT_JOBS};
 use crate::protocol::{JobInfo, Response};
+use nix::sys::signal::{killpg, Signal, SIGTERM};
+use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -19,6 +21,9 @@ pub struct BuildCoordinator {
     completed_count: Arc<AtomicU64>,
     /// Job results for waiters
     results: Arc<Mutex<HashMap<uuid::Uuid, BuildResult>>>,
+    /// Process groups for running jobs, used by the control socket to cancel
+    /// a build without requiring access to the worker task.
+    active_pids: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
 }
 
 impl BuildCoordinator {
@@ -29,6 +34,7 @@ impl BuildCoordinator {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             completed_count: Arc::new(AtomicU64::new(0)),
             results: Arc::new(Mutex::new(HashMap::new())),
+            active_pids: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -37,7 +43,10 @@ impl BuildCoordinator {
         MAX_CONCURRENT_JOBS
     }
 
-    /// Submit a new build job - BLOCKS until a permit is available
+    /// Submit a build job without blocking the caller on capacity.
+    ///
+    /// The job remains queued until the worker task acquires a permit. This
+    /// keeps the daemon responsive when all build slots are busy.
     pub async fn submit(
         self: &Arc<Self>,
         cargo_args: Vec<String>,
@@ -55,28 +64,37 @@ impl BuildCoordinator {
             jobs.insert(job_id, job.clone());
         }
 
-        // BLOCKING: Acquire semaphore permit BEFORE returning
-        // This is the key fix - we await the acquire, blocking the caller
-        // when at capacity (max 2 concurrent)
-        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
-
-        // Update job status to running
-        {
-            let mut jobs = self.jobs.lock().await;
-            if let Some(j) = jobs.get_mut(&job_id) {
-                j.status = JobStatus::Running { pid: 0 };
-            }
-        }
-
-        // Spawn execution task - it will run but we already hold the permit
+        // Spawn a worker that waits for capacity independently of the client
+        // request. The permit lives for the complete process lifetime.
         tokio::spawn(async move {
+            let permit = match coordinator.semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            {
+                let mut jobs = coordinator.jobs.lock().await;
+                if matches!(
+                    jobs.get(&job_id).map(|j| &j.status),
+                    Some(JobStatus::Cancelled)
+                ) {
+                    return;
+                }
+                if let Some(j) = jobs.get_mut(&job_id) {
+                    j.status = JobStatus::Running { pid: 0 };
+                }
+            }
+
             // Execute the job
-            let result = execute_cargo_job(&job).await;
+            let result = execute_cargo_job(&job, coordinator.active_pids.clone()).await;
 
             // Update job status and record completion
             {
                 let mut jobs = coordinator.jobs.lock().await;
                 if let Some(j) = jobs.get_mut(&job_id) {
+                    if matches!(j.status, JobStatus::Cancelled) {
+                        drop(permit);
+                        return;
+                    }
                     match &result {
                         Ok(r) => {
                             j.status = JobStatus::Completed {
@@ -109,6 +127,65 @@ impl BuildCoordinator {
         });
 
         job_id
+    }
+
+    /// Cancel a queued or running build. Running jobs are terminated through
+    /// their process group so child processes cannot survive the request.
+    pub async fn cancel(&self, job_id: uuid::Uuid) -> bool {
+        let mut jobs = self.jobs.lock().await;
+        let Some(job) = jobs.get_mut(&job_id) else {
+            return false;
+        };
+        if job.is_terminal() {
+            return false;
+        }
+        job.status = JobStatus::Cancelled;
+        drop(jobs);
+
+        if let Some(pid) = self.active_pids.lock().await.get(&job_id).copied() {
+            let pgid = Pid::from_raw(pid as i32);
+            // A child stopped by terminal job control will not process TERM
+            // until continued. Always resume it before termination.
+            let _ = killpg(pgid, Signal::SIGCONT);
+            let _ = killpg(pgid, SIGTERM);
+        }
+        true
+    }
+
+    /// Stop all queued and running jobs, then wait for their worker tasks to
+    /// reap their children. The forceful pass is deliberately bounded so a
+    /// child that ignores SIGTERM cannot keep the daemon shutdown hanging.
+    pub async fn shutdown(&self, grace: Duration) {
+        let job_ids: Vec<_> = {
+            let jobs = self.jobs.lock().await;
+            jobs.values()
+                .filter(|job| !job.is_terminal())
+                .map(|job| job.id)
+                .collect()
+        };
+        for job_id in job_ids {
+            let _ = self.cancel(job_id).await;
+        }
+
+        let deadline = tokio::time::Instant::now() + grace;
+        while tokio::time::Instant::now() < deadline {
+            if self.active_pids.lock().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // SIGKILL is the final containment boundary. The worker still owns
+        // and awaits the child, so normal task cleanup reaps it afterward.
+        let pids: Vec<_> = self.active_pids.lock().await.values().copied().collect();
+        for pid in pids {
+            let pgid = Pid::from_raw(pid as i32);
+            let _ = killpg(pgid, Signal::SIGCONT);
+            let _ = killpg(pgid, Signal::SIGKILL);
+        }
+        while !self.active_pids.lock().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Get job status
@@ -275,7 +352,10 @@ impl Default for BuildCoordinator {
 }
 
 /// Execute a cargo job
-async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
+async fn execute_cargo_job(
+    job: &BuildJob,
+    active_pids: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
+) -> anyhow::Result<BuildResult> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
 
@@ -304,7 +384,12 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
     let mut cmd = tokio::process::Command::new(&cargo_executable);
     cmd.args(&cargo_args);
 
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Builds are non-interactive. Detaching stdin prevents a child from
+    // stopping on terminal input/job-control signals when the daemon runs in
+    // a PTY.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     if let Some(ref dir) = job.working_dir {
         cmd.current_dir(dir);
@@ -325,31 +410,36 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
             ));
         }
     };
+    if let Some(pid) = child.id() {
+        active_pids.lock().await.insert(job.id, pid);
+    }
 
     let timeout_duration = Duration::from_secs(3600); // 1 hour default timeout
 
+    // Drain both pipes concurrently. Reading stdout to completion before
+    // stderr can deadlock a noisy build once the stderr pipe buffer fills.
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let mut stdout_task = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut stream) = stdout.take() {
+            let _ = AsyncReadExt::read_to_string(&mut stream, &mut output).await;
+        }
+        output
+    });
+    let mut stderr_task = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut stream) = stderr.take() {
+            let _ = AsyncReadExt::read_to_string(&mut stream, &mut output).await;
+        }
+        output
+    });
+
     let result = timeout(timeout_duration, async {
         let start = std::time::Instant::now();
-
-        // Capture stdout
-        let mut stdout_buf = String::new();
-        if let Some(mut stdout) = child.stdout.take() {
-            AsyncReadExt::read_to_string(&mut stdout, &mut stdout_buf)
-                .await
-                .unwrap_or(0);
-        }
-        let stdout = stdout_buf;
-
-        // Capture stderr
-        let mut stderr_buf = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            AsyncReadExt::read_to_string(&mut stderr, &mut stderr_buf)
-                .await
-                .unwrap_or(0);
-        }
-        let stderr = stderr_buf;
-
-        // Wait for process to finish
+        let (stdout, stderr) = tokio::join!(&mut stdout_task, &mut stderr_task);
+        let stdout = stdout.unwrap_or_default();
+        let stderr = stderr.unwrap_or_default();
         let status = child.wait().await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -370,7 +460,7 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
     })
     .await;
 
-    match result {
+    let final_result = match result {
         Ok(Ok(r)) => {
             info!(
                 "job {} completed: success={}, exit_code={}, duration={}ms",
@@ -384,13 +474,21 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
         }
         Err(_) => {
             warn!("job {} timed out after {:?}", job.id, timeout_duration);
-            // Kill the entire process group (negative pid), not just the direct
-            // child, so that any grandchildren spawned by the cargo subprocess
-            // are also terminated.
-            let pid = child.id().unwrap_or(0) as libc::pid_t;
-            if pid > 0 {
-                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            // Kill the process group with SIGTERM first and reap the child.
+            // Abort pipe readers after the process is gone so a stuck command
+            // cannot leave background tasks holding resources indefinitely.
+            if let Some(pid) = child.id() {
+                let pgid = Pid::from_raw(pid as i32);
+                let _ = killpg(pgid, Signal::SIGCONT);
+                let _ = killpg(pgid, SIGTERM);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = killpg(pgid, Signal::SIGKILL);
+            } else {
+                let _ = child.kill().await;
             }
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
             Ok(BuildResult::failed(
                 job,
                 -1,
@@ -398,7 +496,9 @@ async fn execute_cargo_job(job: &BuildJob) -> anyhow::Result<BuildResult> {
                 format!("timed out after {:?}", timeout_duration),
             ))
         }
-    }
+    };
+    active_pids.lock().await.remove(&job.id);
+    final_result
 }
 
 #[cfg(test)]
@@ -570,5 +670,138 @@ mod tests {
         let job2 = coordinator.submit(vec!["--list".to_string()], None).await;
 
         assert_ne!(job1, job2);
+    }
+
+    // =============================================================================
+    // Negative-path tests for BuildCoordinator
+    // =============================================================================
+
+    /// Test: Job with non-zero exit code records failure
+    #[tokio::test]
+    async fn test_coordinator_job_failure_records_failure() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+
+        // Submit a command that will fail (exit code != 0)
+        let job_id = coordinator
+            .submit(vec!["--invalid-flag".to_string()], None)
+            .await;
+
+        // Wait for job to complete
+        let result = coordinator
+            .wait_for_job_with_timeout(job_id, Duration::from_secs(10))
+            .await;
+
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.job_id, job_id);
+        // A failed command should have success = false
+        assert!(!r.success, "job with invalid flag should have failed");
+        assert_ne!(r.exit_code, 0);
+    }
+
+    /// Test: Wait for non-existent job times out
+    #[tokio::test]
+    async fn test_coordinator_wait_for_nonexistent_job_times_out() {
+        let coordinator = BuildCoordinator::new();
+        let fake_uuid = uuid::Uuid::new_v4();
+
+        let result = coordinator
+            .wait_for_job_with_timeout(fake_uuid, Duration::from_millis(200))
+            .await;
+
+        assert!(
+            result.is_none(),
+            "waiting for non-existent job should timeout"
+        );
+    }
+
+    /// Test: Status of non-existent job returns None
+    #[tokio::test]
+    async fn test_coordinator_nonexistent_job_status_is_none() {
+        let coordinator = BuildCoordinator::new();
+        let fake_uuid = uuid::Uuid::new_v4();
+
+        let status = coordinator.get_status(&fake_uuid).await;
+        assert!(
+            status.is_none(),
+            "status of non-existent job should be None"
+        );
+    }
+
+    /// Test: Missing receipt - job completed but receipt not in results map
+    /// This is detectable by checking job status vs result presence
+    #[tokio::test]
+    async fn test_coordinator_missing_receipt_detectable() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+
+        // Submit a fast job
+        let job_id = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+
+        // Give time for job to register
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Job exists in the jobs map
+        let status = coordinator.get_status(&job_id).await;
+        assert!(status.is_some());
+
+        // Wait for result
+        let result = coordinator
+            .wait_for_job_with_timeout(job_id, Duration::from_secs(5))
+            .await;
+
+        // If result is None but status exists, we have a "missing receipt" scenario
+        // This could happen if results weren't properly persisted
+        match result {
+            Some(r) => {
+                // Normal case: receipt exists
+                assert_eq!(r.job_id, job_id);
+            }
+            None => {
+                // Missing receipt case - detectable
+                // In production this would indicate a persistence failure
+                let status = coordinator.get_status(&job_id).await;
+                assert!(status.is_some(), "job exists but receipt missing");
+            }
+        }
+    }
+
+    /// Test: Duplicate job submission produces unique IDs (idempotency check)
+    #[tokio::test]
+    async fn test_coordinator_duplicate_submit_unique_ids() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+
+        let job1 = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+        let job2 = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+
+        // Each submission gets a unique ID
+        assert_ne!(job1, job2, "duplicate submits should produce unique IDs");
+    }
+
+    /// Test: Job with working directory that doesn't exist still executes
+    /// (sandbox/escape prevention is at a different layer)
+    #[tokio::test]
+    async fn test_coordinator_nonexistent_working_dir() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+
+        // Submit job with non-existent working directory
+        let job_id = coordinator
+            .submit(
+                vec!["--version".to_string()],
+                Some("/nonexistent/path/does/not/exist".to_string()),
+            )
+            .await;
+
+        let result = coordinator
+            .wait_for_job_with_timeout(job_id, Duration::from_secs(5))
+            .await;
+
+        // Job should complete (will likely fail due to bad dir, but not hang)
+        assert!(result.is_some());
     }
 }

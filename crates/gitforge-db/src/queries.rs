@@ -2,11 +2,198 @@
 //!
 //! This module provides real SQLite query implementations for all database operations.
 
+use crate::models::JobStatus;
 use crate::Pool;
 use chrono::{DateTime, Utc};
 use gitforge_common::{Error, JobId, PipelineId, PipelineRunId, RepoId, Result, RunnerId, UserId};
 use sqlx::Row;
 use uuid::Uuid;
+
+fn parse_uuid_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<Uuid> {
+    let value: String = row
+        .try_get(column)
+        .map_err(|error| Error::database(format!("missing {} column: {}", column, error)))?;
+    Uuid::parse_str(&value)
+        .map_err(|error| Error::database(format!("invalid UUID in {}: {}", column, error)))
+}
+
+fn parse_timestamp_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<DateTime<Utc>> {
+    let value: String = row
+        .try_get(column)
+        .map_err(|error| Error::database(format!("missing {} column: {}", column, error)))?;
+    DateTime::parse_from_rfc3339(&value)
+        .map(|date| date.with_timezone(&Utc))
+        .map_err(|error| Error::database(format!("invalid timestamp in {}: {}", column, error)))
+}
+
+fn parse_optional_timestamp_column(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    let value: Option<String> = row
+        .try_get(column)
+        .map_err(|error| Error::database(format!("invalid {} column: {}", column, error)))?;
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(&value)
+                .map(|date| date.with_timezone(&Utc))
+                .map_err(|error| {
+                    Error::database(format!("invalid timestamp in {}: {}", column, error))
+                })
+        })
+        .transpose()
+}
+
+fn hydrate_pipeline(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Pipeline> {
+    Ok(crate::models::Pipeline {
+        id: PipelineId::from(parse_uuid_column(&row, "id")?),
+        repo_id: RepoId::from(parse_uuid_column(&row, "repo_id")?),
+        name: row
+            .try_get("name")
+            .map_err(|error| Error::database(format!("invalid pipeline name: {}", error)))?,
+        trigger_type: row.try_get("trigger_type").map_err(|error| {
+            Error::database(format!("invalid pipeline trigger type: {}", error))
+        })?,
+        config: serde_json::from_str(
+            &row.try_get::<String, _>("config")
+                .map_err(|error| Error::database(format!("invalid pipeline config: {}", error)))?,
+        )
+        .map_err(|error| Error::database(format!("invalid pipeline config JSON: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+    })
+}
+
+fn hydrate_repository(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Repository> {
+    Ok(crate::models::Repository {
+        id: RepoId::from(parse_uuid_column(&row, "id")?),
+        name: row
+            .try_get("name")
+            .map_err(|error| Error::database(format!("invalid repository name: {}", error)))?,
+        owner_id: UserId::from(parse_uuid_column(&row, "owner_id")?),
+        visibility: row.try_get("visibility").map_err(|error| {
+            Error::database(format!("invalid repository visibility: {}", error))
+        })?,
+        git_path: row
+            .try_get("git_path")
+            .map_err(|error| Error::database(format!("invalid repository git path: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+        updated_at: parse_timestamp_column(&row, "updated_at")?,
+    })
+}
+
+fn hydrate_user(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::User> {
+    Ok(crate::models::User {
+        id: UserId::from(parse_uuid_column(&row, "id")?),
+        username: row
+            .try_get("username")
+            .map_err(|error| Error::database(format!("invalid username: {}", error)))?,
+        email: row
+            .try_get("email")
+            .map_err(|error| Error::database(format!("invalid user email: {}", error)))?,
+        password_hash: row
+            .try_get("password_hash")
+            .map_err(|error| Error::database(format!("invalid password hash: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+    })
+}
+
+fn hydrate_pipeline_run(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::PipelineRun> {
+    Ok(crate::models::PipelineRun {
+        id: PipelineRunId::from(parse_uuid_column(&row, "id")?),
+        pipeline_id: PipelineId::from(parse_uuid_column(&row, "pipeline_id")?),
+        repo_id: RepoId::from(parse_uuid_column(&row, "repo_id")?),
+        status: row
+            .try_get("status")
+            .map_err(|error| Error::database(format!("invalid pipeline run status: {}", error)))?,
+        triggered_by: row
+            .try_get("triggered_by")
+            .map_err(|error| Error::database(format!("invalid pipeline run actor: {}", error)))?,
+        commit_hash: row
+            .try_get("commit_hash")
+            .map_err(|error| Error::database(format!("invalid pipeline run commit: {}", error)))?,
+        started_at: parse_optional_timestamp_column(&row, "started_at")?,
+        finished_at: parse_optional_timestamp_column(&row, "finished_at")?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+    })
+}
+
+fn hydrate_job(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Job> {
+    let commands: Option<String> = row
+        .try_get("commands")
+        .map_err(|error| Error::database(format!("invalid job commands column: {}", error)))?;
+    Ok(crate::models::Job {
+        id: JobId::from(parse_uuid_column(&row, "id")?),
+        pipeline_run_id: PipelineRunId::from(parse_uuid_column(&row, "pipeline_run_id")?),
+        name: row
+            .try_get("name")
+            .map_err(|error| Error::database(format!("invalid job name: {}", error)))?,
+        status: row
+            .try_get("status")
+            .map_err(|error| Error::database(format!("invalid job status: {}", error)))?,
+        runner_id: row
+            .try_get::<Option<String>, _>("runner_id")
+            .map_err(|error| Error::database(format!("invalid job runner ID: {}", error)))?
+            .map(|value| {
+                Uuid::parse_str(&value)
+                    .map(RunnerId::from)
+                    .map_err(|error| Error::database(format!("invalid job runner ID: {}", error)))
+            })
+            .transpose()?,
+        started_at: parse_optional_timestamp_column(&row, "started_at")?,
+        finished_at: parse_optional_timestamp_column(&row, "finished_at")?,
+        retry_count: row
+            .try_get("retry_count")
+            .map_err(|error| Error::database(format!("invalid job retry count: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+        commands: serde_json::from_str(&commands.unwrap_or_else(|| "[]".to_string()))
+            .map_err(|error| Error::database(format!("invalid job commands JSON: {}", error)))?,
+        image: row
+            .try_get::<Option<String>, _>("image")
+            .map_err(|error| Error::database(format!("invalid job image: {}", error)))?
+            .unwrap_or_else(|| "rust:latest".to_string()),
+        working_dir: row.try_get("working_dir").map_err(|error| {
+            Error::database(format!("invalid job working directory: {}", error))
+        })?,
+        result_json: row
+            .try_get("result_json")
+            .map_err(|error| Error::database(format!("invalid job result: {}", error)))?,
+    })
+}
+
+fn hydrate_runner(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Runner> {
+    Ok(crate::models::Runner {
+        id: RunnerId::from(parse_uuid_column(&row, "id")?),
+        name: row
+            .try_get("name")
+            .map_err(|error| Error::database(format!("invalid runner name: {}", error)))?,
+        runner_type: row
+            .try_get("runner_type")
+            .map_err(|error| Error::database(format!("invalid runner type: {}", error)))?,
+        status: row
+            .try_get("status")
+            .map_err(|error| Error::database(format!("invalid runner status: {}", error)))?,
+        last_heartbeat: parse_optional_timestamp_column(&row, "last_heartbeat")?,
+        capacity: row
+            .try_get("capacity")
+            .map_err(|error| Error::database(format!("invalid runner capacity: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+    })
+}
+
+fn hydrate_event(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Event> {
+    let payload: String = row
+        .try_get("payload")
+        .map_err(|error| Error::database(format!("invalid event payload column: {}", error)))?;
+    Ok(crate::models::Event {
+        id: parse_uuid_column(&row, "id")?,
+        event_type: row
+            .try_get("event_type")
+            .map_err(|error| Error::database(format!("invalid event type: {}", error)))?,
+        payload: serde_json::from_str(&payload)
+            .map_err(|error| Error::database(format!("invalid event payload JSON: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+    })
+}
 
 // ============================================================================
 // Repository Queries
@@ -45,19 +232,7 @@ impl RepoQueries {
             .map_err(|e| Error::database(format!("failed to get repository: {}", e)))?;
 
         match row {
-            Some(row) => Ok(Some(crate::models::Repository {
-                id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                owner_id: UserId::from(Uuid::parse_str(&row.get::<String, _>("owner_id")).unwrap()),
-                visibility: row.get("visibility"),
-                git_path: row.get("git_path"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                updated_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
+            Some(row) => hydrate_repository(row).map(Some),
             None => Ok(None),
         }
     }
@@ -75,20 +250,8 @@ impl RepoQueries {
 
         let repos = rows
             .into_iter()
-            .map(|row| crate::models::Repository {
-                id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                owner_id: UserId::from(Uuid::parse_str(&row.get::<String, _>("owner_id")).unwrap()),
-                visibility: row.get("visibility"),
-                git_path: row.get("git_path"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                updated_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_repository)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(repos)
     }
@@ -112,22 +275,37 @@ impl RepoQueries {
 
         let repos = rows
             .into_iter()
-            .map(|row| crate::models::Repository {
-                id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                owner_id: UserId::from(Uuid::parse_str(&row.get::<String, _>("owner_id")).unwrap()),
-                visibility: row.get("visibility"),
-                git_path: row.get("git_path"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                updated_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_repository)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(repos)
+    }
+
+    /// Get a repository by owner username and repository name
+    pub async fn get_by_owner_and_name(
+        pool: &Pool,
+        owner_username: &str,
+        repo_name: &str,
+    ) -> Result<Option<crate::models::Repository>> {
+        let row = sqlx::query(
+            r#"
+            SELECT r.* FROM repositories r
+            JOIN users u ON r.owner_id = u.id
+            WHERE u.username = ? AND r.name = ?
+            "#,
+        )
+        .bind(owner_username)
+        .bind(repo_name)
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| {
+            Error::database(format!("failed to get repository by owner and name: {}", e))
+        })?;
+
+        match row {
+            Some(row) => hydrate_repository(row).map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -138,6 +316,39 @@ impl RepoQueries {
 pub struct UserQueries;
 
 impl UserQueries {
+    /// Get the persisted role for a user. This is kept separate from the
+    /// legacy User model so existing callers remain source-compatible while
+    /// the schema gains least-privilege role persistence.
+    pub async fn get_role(pool: &Pool, id: UserId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT role FROM users WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get user role: {}", e)))?;
+        Ok(row.map(|row| row.get::<String, _>("role")))
+    }
+
+    /// Set a user's persisted least-privilege role.
+    pub async fn set_role(pool: &Pool, id: UserId, role: &str) -> Result<bool> {
+        let result = sqlx::query("UPDATE users SET role = ? WHERE id = ?")
+            .bind(role)
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to set user role: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Count users currently holding a persisted role.
+    pub async fn count_role(pool: &Pool, role: &str) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM users WHERE role = ?")
+            .bind(role)
+            .fetch_one(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to count user roles: {}", e)))?;
+        Ok(row.get::<i64, _>("count"))
+    }
+
     /// Create a new user
     pub async fn create(pool: &Pool, user: &crate::models::User) -> Result<()> {
         sqlx::query(
@@ -165,18 +376,7 @@ impl UserQueries {
             .await
             .map_err(|e| Error::database(format!("failed to get user: {}", e)))?;
 
-        match row {
-            Some(row) => Ok(Some(crate::models::User {
-                id: UserId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                username: row.get("username"),
-                email: row.get("email"),
-                password_hash: row.get("password_hash"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
-            None => Ok(None),
-        }
+        row.map(hydrate_user).transpose()
     }
 
     /// Get a user by username
@@ -190,18 +390,7 @@ impl UserQueries {
             .await
             .map_err(|e| Error::database(format!("failed to get user by username: {}", e)))?;
 
-        match row {
-            Some(row) => Ok(Some(crate::models::User {
-                id: UserId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                username: row.get("username"),
-                email: row.get("email"),
-                password_hash: row.get("password_hash"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
-            None => Ok(None),
-        }
+        row.map(hydrate_user).transpose()
     }
 
     /// List all users
@@ -213,16 +402,8 @@ impl UserQueries {
 
         let users = rows
             .into_iter()
-            .map(|row| crate::models::User {
-                id: UserId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                username: row.get("username"),
-                email: row.get("email"),
-                password_hash: row.get("password_hash"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_user)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(users)
     }
@@ -264,16 +445,7 @@ impl PipelineQueries {
             .map_err(|e| Error::database(format!("failed to get pipeline: {}", e)))?;
 
         match row {
-            Some(row) => Ok(Some(crate::models::Pipeline {
-                id: PipelineId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
-                name: row.get("name"),
-                trigger_type: row.get("trigger_type"),
-                config: serde_json::from_str(&row.get::<String, _>("config")).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
+            Some(row) => hydrate_pipeline(row).map(Some),
             None => Ok(None),
         }
     }
@@ -292,17 +464,8 @@ impl PipelineQueries {
 
         let pipelines = rows
             .into_iter()
-            .map(|row| crate::models::Pipeline {
-                id: PipelineId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
-                name: row.get("name"),
-                trigger_type: row.get("trigger_type"),
-                config: serde_json::from_str(&row.get::<String, _>("config")).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_pipeline)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(pipelines)
     }
@@ -316,17 +479,8 @@ impl PipelineQueries {
 
         let pipelines = rows
             .into_iter()
-            .map(|row| crate::models::Pipeline {
-                id: PipelineId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
-                name: row.get("name"),
-                trigger_type: row.get("trigger_type"),
-                config: serde_json::from_str(&row.get::<String, _>("config")).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_pipeline)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(pipelines)
     }
@@ -371,61 +525,27 @@ impl PipelineRunQueries {
             .map_err(|e| Error::database(format!("failed to get pipeline run: {}", e)))?;
 
         match row {
-            Some(row) => Ok(Some(crate::models::PipelineRun {
-                id: PipelineRunId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_id: PipelineId::from(
-                    Uuid::parse_str(&row.get::<String, _>("pipeline_id")).unwrap(),
-                ),
-                repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
-                status: row.get("status"),
-                triggered_by: row.get("triggered_by"),
-                commit_hash: row.get("commit_hash"),
-                started_at: row
-                    .get::<Option<String>, _>("started_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row
-                    .get::<Option<String>, _>("finished_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
+            Some(row) => hydrate_pipeline_run(row).map(Some),
             None => Ok(None),
         }
     }
 
-    /// Update pipeline run status.
-    ///
-    /// Sets `started_at` exactly once when transitioning to "running".
-    /// Sets `finished_at` exactly once when transitioning to terminal states.
-    /// Repeated calls preserve existing timestamps (idempotent).
+    /// Update pipeline run status
     pub async fn update_status(pool: &Pool, id: PipelineRunId, status: &str) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE pipeline_runs
-            SET status = ?,
-                started_at = CASE
-                    WHEN started_at IS NULL AND ? = 'running'
-                    THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                    ELSE started_at
-                END,
-                finished_at = CASE
-                    WHEN finished_at IS NULL AND ? IN ('completed', 'failed', 'cancelled')
-                    THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                    ELSE finished_at
-                END
-            WHERE id = ?
-            "#,
+        let finished_at = matches!(
+            status,
+            "succeeded" | "failed" | "cancelled" | "timed_out" | "timeout" | "timed-out"
         )
-        .bind(status)
-        .bind(status)
-        .bind(status)
-        .bind(id.to_string())
-        .execute(pool.pool())
-        .await
-        .map_err(|e| Error::database(format!("failed to update pipeline run status: {}", e)))?;
+        .then(|| Utc::now().to_rfc3339());
+        sqlx::query(
+            "UPDATE pipeline_runs SET status = ?, finished_at = COALESCE(?, finished_at) WHERE id = ?",
+        )
+            .bind(status)
+            .bind(finished_at)
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to update pipeline run status: {}", e)))?;
         Ok(())
     }
 
@@ -444,28 +564,8 @@ impl PipelineRunQueries {
 
         let runs = rows
             .into_iter()
-            .map(|row| crate::models::PipelineRun {
-                id: PipelineRunId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_id: PipelineId::from(
-                    Uuid::parse_str(&row.get::<String, _>("pipeline_id")).unwrap(),
-                ),
-                repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
-                status: row.get("status"),
-                triggered_by: row.get("triggered_by"),
-                commit_hash: row.get("commit_hash"),
-                started_at: row
-                    .get::<Option<String>, _>("started_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row
-                    .get::<Option<String>, _>("finished_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_pipeline_run)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(runs)
     }
@@ -479,28 +579,8 @@ impl PipelineRunQueries {
 
         let runs = rows
             .into_iter()
-            .map(|row| crate::models::PipelineRun {
-                id: PipelineRunId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_id: PipelineId::from(
-                    Uuid::parse_str(&row.get::<String, _>("pipeline_id")).unwrap(),
-                ),
-                repo_id: RepoId::from(Uuid::parse_str(&row.get::<String, _>("repo_id")).unwrap()),
-                status: row.get("status"),
-                triggered_by: row.get("triggered_by"),
-                commit_hash: row.get("commit_hash"),
-                started_at: row
-                    .get::<Option<String>, _>("started_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row
-                    .get::<Option<String>, _>("finished_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_pipeline_run)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(runs)
     }
@@ -512,13 +592,204 @@ impl PipelineRunQueries {
 
 pub struct JobQueries;
 
+/// Maximum size of one runner log append.
+pub const MAX_JOB_LOG_CHUNK_BYTES: usize = 64 * 1024;
+/// Maximum durable log volume retained for one job.
+pub const MAX_JOB_LOG_BYTES: i64 = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct JobLogChunk {
+    pub sequence: i64,
+    pub chunk: String,
+    pub created_at: String,
+}
+
 impl JobQueries {
+    /// Append a log chunk only when the runner still owns the active lease.
+    /// `None` means the job is missing, terminal, or fenced by another lease.
+    pub async fn append_log_with_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        chunk: &str,
+    ) -> Result<Option<i64>> {
+        if chunk.is_empty() {
+            return Ok(None);
+        }
+        if chunk.len() > MAX_JOB_LOG_CHUNK_BYTES {
+            return Err(Error::invalid_input(format!(
+                "job log chunk exceeds {} bytes",
+                MAX_JOB_LOG_CHUNK_BYTES
+            )));
+        }
+
+        let mut tx = pool
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| Error::database(format!("failed to begin log append: {}", e)))?;
+        let Some(job) = sqlx::query("SELECT runner_id, lease_token, status FROM jobs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Error::database(format!("failed to authorize log append: {}", e)))?
+        else {
+            return Ok(None);
+        };
+
+        let assigned_runner: Option<String> = job.get("runner_id");
+        let current_token: Option<String> = job.get("lease_token");
+        let status: String = job.get("status");
+        if assigned_runner.as_deref() != Some(&runner_id.to_string())
+            || current_token.as_deref() != Some(lease_token)
+            || !matches!(status.as_str(), "assigned" | "running")
+        {
+            return Ok(None);
+        }
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(length(chunk)), 0) FROM job_log_chunks WHERE job_id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to measure job logs: {}", e)))?;
+        if total + chunk.len() as i64 > MAX_JOB_LOG_BYTES {
+            return Err(Error::invalid_input(format!(
+                "job logs exceed {} bytes",
+                MAX_JOB_LOG_BYTES
+            )));
+        }
+
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM job_log_chunks WHERE job_id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to allocate log sequence: {}", e)))?;
+        sqlx::query(
+            "INSERT INTO job_log_chunks (job_id, sequence, chunk, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(sequence)
+        .bind(chunk)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to append job log: {}", e)))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit log append: {}", e)))?;
+        Ok(Some(sequence))
+    }
+
+    /// Read durable log chunks in append order.
+    pub async fn list_logs(pool: &Pool, id: JobId) -> Result<Vec<JobLogChunk>> {
+        let rows = sqlx::query(
+            "SELECT sequence, chunk, created_at FROM job_log_chunks WHERE job_id = ? ORDER BY sequence ASC",
+        )
+        .bind(id.to_string())
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list job logs: {}", e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| JobLogChunk {
+                sequence: row.get("sequence"),
+                chunk: row.get("chunk"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    /// Check a runner lease without mutating job state.
+    pub async fn lease_is_active(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM jobs WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
+        )
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to check job lease: {}", e)))?;
+        Ok(row.is_some())
+    }
+
+    /// Return the existing submission record for a scoped idempotency key.
+    pub async fn get_idempotency(
+        pool: &Pool,
+        scope: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<(JobId, String)>> {
+        let row = sqlx::query(
+            "SELECT job_id, request_fingerprint FROM job_idempotency_keys WHERE scope = ? AND idempotency_key = ?",
+        )
+        .bind(scope)
+        .bind(idempotency_key)
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to get job idempotency key: {}", e)))?;
+        row.map(|row| {
+            let job_id = Uuid::parse_str(&row.get::<String, _>("job_id"))
+                .map(JobId::from)
+                .map_err(|e| Error::database(format!("invalid stored idempotent job ID: {}", e)))?;
+            Ok((job_id, row.get("request_fingerprint")))
+        })
+        .transpose()
+    }
+
+    /// Reserve an idempotency key. SQLite's conflict result makes this safe
+    /// when multiple control-plane retries arrive concurrently.
+    pub async fn reserve_idempotency(
+        pool: &Pool,
+        scope: &str,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+        job_id: JobId,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO job_idempotency_keys (scope, idempotency_key, request_fingerprint, job_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(scope)
+        .bind(idempotency_key)
+        .bind(request_fingerprint)
+        .bind(job_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to reserve job idempotency key: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Release a reservation when the first job-row write fails before the
+    /// submission has become executable. This avoids poisoning a client key
+    /// after a transient database failure.
+    pub async fn delete_idempotency(pool: &Pool, scope: &str, idempotency_key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM job_idempotency_keys WHERE scope = ? AND idempotency_key = ?")
+            .bind(scope)
+            .bind(idempotency_key)
+            .execute(pool.pool())
+            .await
+            .map_err(|e| {
+                Error::database(format!("failed to release job idempotency key: {}", e))
+            })?;
+        Ok(())
+    }
+
     /// Create a new job
     pub async fn create(pool: &Pool, job: &crate::models::Job) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, image)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, result_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(job.id.to_string())
@@ -530,7 +801,10 @@ impl JobQueries {
         .bind(job.finished_at.map(|dt| dt.to_rfc3339()))
         .bind(job.retry_count)
         .bind(job.created_at.to_rfc3339())
+        .bind(serde_json::to_string(&job.commands).unwrap_or_else(|_| "[]".to_string()))
         .bind(&job.image)
+        .bind(&job.working_dir)
+        .bind(&job.result_json)
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to create job: {}", e)))?;
@@ -545,76 +819,204 @@ impl JobQueries {
             .await
             .map_err(|e| Error::database(format!("failed to get job: {}", e)))?;
 
-        match row {
-            Some(row) => Ok(Some(crate::models::Job {
-                id: JobId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_run_id: PipelineRunId::from(
-                    Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap(),
-                ),
-                name: row.get("name"),
-                status: row.get("status"),
-                runner_id: row
-                    .get::<Option<String>, _>("runner_id")
-                    .and_then(|s| Uuid::parse_str(&s).ok().map(RunnerId::from)),
-                started_at: row
-                    .get::<Option<String>, _>("started_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row
-                    .get::<Option<String>, _>("finished_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                retry_count: row.get("retry_count"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                image: row.get::<String, _>("image"),
-            })),
-            None => Ok(None),
-        }
+        row.map(hydrate_job).transpose()
     }
 
-    /// Update job status.
-    ///
-    /// Sets `started_at` exactly once when transitioning to "assigned" or "running".
-    /// Sets `finished_at` exactly once when transitioning to terminal states.
-    /// Repeated calls preserve existing timestamps (idempotent).
+    /// Update job status
     pub async fn update_status(pool: &Pool, id: JobId, status: &str) -> Result<()> {
+        sqlx::query("UPDATE jobs SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to update job status: {}", e)))?;
+        Ok(())
+    }
+
+    /// Requeue an assigned job and clear its runner fencing token.
+    pub async fn requeue(pool: &Pool, id: JobId) -> Result<()> {
         sqlx::query(
-            r#"
-            UPDATE jobs
-            SET status = ?,
-                started_at = CASE
-                    WHEN started_at IS NULL AND ? IN ('assigned', 'running')
-                    THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                    ELSE started_at
-                END,
-                finished_at = CASE
-                    WHEN finished_at IS NULL AND ? IN ('completed', 'failed', 'cancelled', 'timed_out')
-                    THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                    ELSE finished_at
-                END
-            WHERE id = ?
-            "#,
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE id = ? AND status = 'assigned'",
         )
-        .bind(status)
-        .bind(status)
-        .bind(status)
         .bind(id.to_string())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to update job status: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to requeue job: {}", e)))?;
+        Ok(())
+    }
+
+    /// Persist the executable definition for a job. This is intentionally
+    /// separate from status transitions so queueing remains idempotent.
+    pub async fn set_definition(
+        pool: &Pool,
+        id: JobId,
+        commands: &[String],
+        working_dir: Option<&str>,
+    ) -> Result<()> {
+        Self::set_definition_with_image(pool, id, commands, "rust:latest", working_dir).await
+    }
+
+    pub async fn set_definition_with_image(
+        pool: &Pool,
+        id: JobId,
+        commands: &[String],
+        image: &str,
+        working_dir: Option<&str>,
+    ) -> Result<()> {
+        let commands_json = serde_json::to_string(commands)
+            .map_err(|e| Error::database(format!("failed to encode job commands: {}", e)))?;
+        sqlx::query("UPDATE jobs SET commands = ?, image = ?, working_dir = ? WHERE id = ?")
+            .bind(commands_json)
+            .bind(image)
+            .bind(working_dir)
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to persist job definition: {}", e)))?;
+        Ok(())
+    }
+
+    /// Persist a terminal execution receipt. A repeated identical completion
+    /// is idempotent; a conflicting completion is rejected.
+    pub async fn complete(pool: &Pool, id: JobId, status: &str, result_json: &str) -> Result<()> {
+        let existing = Self::get(pool, id).await?;
+        if let Some(job) = existing {
+            if let Some(current) = JobStatus::from_str(&job.status) {
+                if current.is_terminal() {
+                    if job.result_json.as_deref() == Some(result_json) {
+                        return Ok(());
+                    }
+                    return Err(Error::invalid_input(
+                        "job already has a different terminal receipt",
+                    ));
+                }
+            }
+        } else {
+            return Err(Error::not_found("job", id));
+        }
+
+        sqlx::query("UPDATE jobs SET status = ?, finished_at = ?, result_json = ? WHERE id = ?")
+            .bind(status)
+            .bind(Utc::now().to_rfc3339())
+            .bind(result_json)
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to persist job receipt: {}", e)))?;
         Ok(())
     }
 
     /// Assign a runner to a job
     pub async fn assign(pool: &Pool, id: JobId, runner_id: RunnerId) -> Result<()> {
-        sqlx::query("UPDATE jobs SET runner_id = ? WHERE id = ?")
+        sqlx::query("UPDATE jobs SET runner_id = ?, status = 'assigned' WHERE id = ?")
             .bind(runner_id.to_string())
             .bind(id.to_string())
             .execute(pool.pool())
             .await
             .map_err(|e| Error::database(format!("failed to assign job: {}", e)))?;
+        Ok(())
+    }
+
+    /// Atomically assign a queued job and advance its durable fencing
+    /// generation. A false result means another scheduler won the race.
+    pub async fn assign_with_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET runner_id = ?, status = 'assigned', lease_token = ?, lease_generation = lease_generation + 1 WHERE id = ? AND status IN ('pending', 'queued') AND runner_id IS NULL",
+        )
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to assign job lease: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Persist the assigned-to-running lifecycle transition.
+    pub async fn start(pool: &Pool, id: JobId) -> Result<()> {
+        sqlx::query(
+            "UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, ?) WHERE id = ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to start job: {}", e)))?;
+        Ok(())
+    }
+
+    /// Start a job only when the durable runner lease still matches.
+    pub async fn start_with_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, ?) WHERE id = ? AND runner_id = ? AND lease_token = ? AND status = 'assigned'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to start job with lease: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Complete a job only when the durable runner lease still matches. The
+    /// lease is cleared as part of the same conditional update, fencing late
+    /// completion messages after reassignment or terminal transition.
+    pub async fn complete_with_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        status: &str,
+        result_json: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = ?, finished_at = ?, result_json = ?, lease_token = NULL WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
+        )
+        .bind(status)
+        .bind(Utc::now().to_rfc3339())
+        .bind(result_json)
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to complete job with lease: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Persist an operator cancellation as a terminal job transition.
+    pub async fn cancel(pool: &Pool, id: JobId, result_json: &str) -> Result<()> {
+        let existing = Self::get(pool, id).await?;
+        if let Some(job) = existing {
+            if let Some(status) = JobStatus::from_str(&job.status) {
+                if status.is_terminal() {
+                    return Ok(());
+                }
+            }
+        } else {
+            return Err(Error::not_found("job", id));
+        }
+        sqlx::query(
+            "UPDATE jobs SET status = 'cancelled', finished_at = ?, result_json = ? WHERE id = ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(result_json)
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to cancel job: {}", e)))?;
         Ok(())
     }
 
@@ -632,72 +1034,59 @@ impl JobQueries {
 
         let jobs = rows
             .into_iter()
-            .map(|row| crate::models::Job {
-                id: JobId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_run_id: PipelineRunId::from(
-                    Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap(),
-                ),
-                name: row.get("name"),
-                status: row.get("status"),
-                runner_id: row
-                    .get::<Option<String>, _>("runner_id")
-                    .and_then(|s| Uuid::parse_str(&s).ok().map(RunnerId::from)),
-                started_at: row
-                    .get::<Option<String>, _>("started_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row
-                    .get::<Option<String>, _>("finished_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                retry_count: row.get("retry_count"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                image: row.get::<String, _>("image"),
-            })
-            .collect();
+            .map(hydrate_job)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(jobs)
     }
 
-    /// List pending jobs
+    /// List all pending jobs
     pub async fn list_pending(pool: &Pool) -> Result<Vec<crate::models::Job>> {
-        let rows =
-            sqlx::query("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC")
-                .fetch_all(pool.pool())
-                .await
-                .map_err(|e| Error::database(format!("failed to list pending jobs: {}", e)))?;
+        let rows = sqlx::query(
+            "SELECT * FROM jobs WHERE status IN ('pending', 'queued') ORDER BY created_at ASC",
+        )
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list pending jobs: {}", e)))?;
 
         let jobs = rows
             .into_iter()
-            .map(|row| crate::models::Job {
-                id: JobId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                pipeline_run_id: PipelineRunId::from(
-                    Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap(),
-                ),
-                name: row.get("name"),
-                status: row.get("status"),
-                runner_id: row
-                    .get::<Option<String>, _>("runner_id")
-                    .and_then(|s| Uuid::parse_str(&s).ok().map(RunnerId::from)),
-                started_at: row
-                    .get::<Option<String>, _>("started_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                finished_at: row
-                    .get::<Option<String>, _>("finished_at")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                retry_count: row.get("retry_count"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-                image: row.get::<String, _>("image"),
-            })
-            .collect();
+            .map(hydrate_job)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(jobs)
+    }
+
+    /// Recover jobs that were in flight when the scheduler stopped. Assigned
+    /// jobs have not started execution and are safe to requeue. Running jobs
+    /// are fenced as failed instead of being re-run automatically: the old
+    /// runner may still be alive, and requeueing would permit duplicate side
+    /// effects without a durable runner-generation lease.
+    pub async fn requeue_inflight(pool: &Pool) -> Result<u64> {
+        let mut transaction = pool
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| Error::database(format!("failed to begin recovery: {}", e)))?;
+        let assigned = sqlx::query(
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE status = 'assigned'",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to requeue assigned jobs: {}", e)))?;
+        let running = sqlx::query(
+            "UPDATE jobs SET status = 'failed', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE status = 'running'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(r#"{"status":"failed","reason":"scheduler_restart_fenced_running_job"}"#)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to fence running jobs: {}", e)))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit recovery: {}", e)))?;
+        Ok(assigned.rows_affected() + running.rows_affected())
     }
 }
 
@@ -739,23 +1128,7 @@ impl RunnerQueries {
             .await
             .map_err(|e| Error::database(format!("failed to get runner: {}", e)))?;
 
-        match row {
-            Some(row) => Ok(Some(crate::models::Runner {
-                id: RunnerId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                runner_type: row.get("runner_type"),
-                status: row.get("status"),
-                capacity: row.get("capacity"),
-                last_heartbeat: row
-                    .get::<Option<String>, _>("last_heartbeat")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
-            None => Ok(None),
-        }
+        row.map(hydrate_runner).transpose()
     }
 
     /// Update runner heartbeat
@@ -789,21 +1162,8 @@ impl RunnerQueries {
 
         let runners = rows
             .into_iter()
-            .map(|row| crate::models::Runner {
-                id: RunnerId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                runner_type: row.get("runner_type"),
-                status: row.get("status"),
-                capacity: row.get("capacity"),
-                last_heartbeat: row
-                    .get::<Option<String>, _>("last_heartbeat")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_runner)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(runners)
     }
@@ -818,125 +1178,10 @@ impl RunnerQueries {
 
         let runners = rows
             .into_iter()
-            .map(|row| crate::models::Runner {
-                id: RunnerId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                name: row.get("name"),
-                runner_type: row.get("runner_type"),
-                status: row.get("status"),
-                capacity: row.get("capacity"),
-                last_heartbeat: row
-                    .get::<Option<String>, _>("last_heartbeat")
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_runner)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(runners)
-    }
-}
-
-// ============================================================================
-// Durable receipt queries
-// ============================================================================
-
-pub struct JobLogQueries;
-
-impl JobLogQueries {
-    pub async fn upsert(pool: &Pool, log: &crate::models::JobLog) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO job_logs (id, job_id, pipeline_run_id, stdout, stderr, stdout_truncated, stderr_truncated, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id) DO UPDATE SET pipeline_run_id=excluded.pipeline_run_id, stdout=excluded.stdout, stderr=excluded.stderr, stdout_truncated=excluded.stdout_truncated, stderr_truncated=excluded.stderr_truncated",
-        )
-        .bind(log.id.to_string())
-        .bind(log.job_id.to_string())
-        .bind(log.pipeline_run_id.to_string())
-        .bind(&log.stdout)
-        .bind(&log.stderr)
-        .bind(i32::from(log.stdout_truncated))
-        .bind(i32::from(log.stderr_truncated))
-        .bind(log.created_at.to_rfc3339())
-        .execute(pool.pool())
-        .await
-        .map_err(|e| Error::database(format!("failed to upsert job log: {}", e)))?;
-        Ok(())
-    }
-
-    pub async fn get_by_job(pool: &Pool, job_id: JobId) -> Result<Option<crate::models::JobLog>> {
-        let row = sqlx::query("SELECT * FROM job_logs WHERE job_id = ?")
-            .bind(job_id.to_string())
-            .fetch_optional(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to get job log: {}", e)))?;
-        Ok(row.map(|row| crate::models::JobLog {
-            id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
-            job_id: JobId::from(Uuid::parse_str(&row.get::<String, _>("job_id")).unwrap()),
-            pipeline_run_id: PipelineRunId::from(
-                Uuid::parse_str(&row.get::<String, _>("pipeline_run_id")).unwrap(),
-            ),
-            stdout: row.get("stdout"),
-            stderr: row.get("stderr"),
-            stdout_truncated: row.get::<i32, _>("stdout_truncated") != 0,
-            stderr_truncated: row.get::<i32, _>("stderr_truncated") != 0,
-            created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                .unwrap()
-                .with_timezone(&Utc),
-        }))
-    }
-}
-
-pub struct EventReceiptQueries;
-
-impl EventReceiptQueries {
-    pub async fn upsert(pool: &Pool, event: &crate::models::EventReceipt) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO event_receipts (id, event_type, job_id, pipeline_run_id, correlation_id, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(correlation_id) DO NOTHING",
-        )
-        .bind(event.id.to_string())
-        .bind(&event.event_type)
-        .bind(event.job_id.map(|id| id.to_string()))
-        .bind(event.pipeline_run_id.map(|id| id.to_string()))
-        .bind(&event.correlation_id)
-        .bind(event.payload.to_string())
-        .bind(event.created_at.to_rfc3339())
-        .execute(pool.pool())
-        .await
-        .map_err(|e| Error::database(format!("failed to upsert event receipt: {}", e)))?;
-        Ok(())
-    }
-
-    pub async fn list_by_run(
-        pool: &Pool,
-        run_id: PipelineRunId,
-    ) -> Result<Vec<crate::models::EventReceipt>> {
-        let rows = sqlx::query(
-            "SELECT * FROM event_receipts WHERE pipeline_run_id = ? ORDER BY created_at ASC",
-        )
-        .bind(run_id.to_string())
-        .fetch_all(pool.pool())
-        .await
-        .map_err(|e| Error::database(format!("failed to list event receipts: {}", e)))?;
-        Ok(rows
-            .into_iter()
-            .map(|row| crate::models::EventReceipt {
-                id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
-                event_type: row.get("event_type"),
-                job_id: row
-                    .get::<Option<String>, _>("job_id")
-                    .and_then(|v| Uuid::parse_str(&v).ok())
-                    .map(JobId::from),
-                pipeline_run_id: row
-                    .get::<Option<String>, _>("pipeline_run_id")
-                    .and_then(|v| Uuid::parse_str(&v).ok())
-                    .map(PipelineRunId::from),
-                correlation_id: row.get("correlation_id"),
-                payload: serde_json::from_str(&row.get::<String, _>("payload")).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect())
     }
 }
 
@@ -982,15 +1227,8 @@ impl EventQueries {
 
         let events = rows
             .into_iter()
-            .map(|row| crate::models::Event {
-                id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
-                event_type: row.get("event_type"),
-                payload: serde_json::from_str(&row.get::<String, _>("payload")).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_event)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(events)
     }
@@ -1005,83 +1243,10 @@ impl EventQueries {
 
         let events = rows
             .into_iter()
-            .map(|row| crate::models::Event {
-                id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
-                event_type: row.get("event_type"),
-                payload: serde_json::from_str(&row.get::<String, _>("payload")).unwrap_or_default(),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_event)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(events)
-    }
-}
-
-/// Queries for job_step table.
-/// Each job has one or more steps (commands to execute) stored in the job_steps table.
-pub struct JobStepQueries;
-
-impl JobStepQueries {
-    /// Insert a job step.
-    pub async fn create(pool: &Pool, step: &crate::models::JobStep) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO job_steps (id, job_id, step_index, name, run, env, working_dir)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&step.id)
-        .bind(step.job_id.to_string())
-        .bind(step.step_index)
-        .bind(&step.name)
-        .bind(&step.run)
-        .bind(step.env.to_string())
-        .bind(&step.working_dir)
-        .execute(pool.pool())
-        .await
-        .map_err(|e| Error::database(format!("failed to create job step: {}", e)))?;
-        Ok(())
-    }
-
-    /// List all steps for a job, ordered by step_index.
-    pub async fn list_by_job(
-        pool: &Pool,
-        job_id: gitforge_common::JobId,
-    ) -> Result<Vec<crate::models::JobStep>> {
-        let rows = sqlx::query("SELECT * FROM job_steps WHERE job_id = ? ORDER BY step_index ASC")
-            .bind(job_id.to_string())
-            .fetch_all(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to list job steps: {}", e)))?;
-
-        let steps = rows
-            .into_iter()
-            .map(|row| crate::models::JobStep {
-                id: row.get("id"),
-                job_id: gitforge_common::JobId::from(
-                    Uuid::parse_str(&row.get::<String, _>("job_id")).unwrap(),
-                ),
-                step_index: row.get("step_index"),
-                name: row.get("name"),
-                run: row.get("run"),
-                env: serde_json::from_str(&row.get::<String, _>("env")).unwrap_or_default(),
-                working_dir: row.get("working_dir"),
-            })
-            .collect();
-
-        Ok(steps)
-    }
-
-    /// Delete all steps for a job.
-    pub async fn delete_by_job(pool: &Pool, job_id: gitforge_common::JobId) -> Result<()> {
-        sqlx::query("DELETE FROM job_steps WHERE job_id = ?")
-            .bind(job_id.to_string())
-            .execute(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to delete job steps: {}", e)))?;
-        Ok(())
     }
 }
 
@@ -1169,6 +1334,15 @@ mod tests {
         // List all
         let all_users = UserQueries::list(&pool).await.unwrap();
         assert_eq!(all_users.len(), 1);
+
+        sqlx::query("UPDATE users SET created_at = ? WHERE id = ?")
+            .bind("2026-08-29 03:40:39")
+            .bind(user.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert!(UserQueries::get(&pool, user.id).await.is_err());
+        assert!(UserQueries::list(&pool).await.is_err());
     }
 
     #[tokio::test]
@@ -1252,6 +1426,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pipeline_list_rejects_malformed_timestamp_without_panicking() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = crate::models::User::new(
+            "owner".to_string(),
+            "owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "malformed-repo".to_string(),
+            user.id,
+            "/git/malformed-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        sqlx::query(
+            "INSERT INTO pipelines (id, repo_id, name, trigger_type, config, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(PipelineId::new().to_string())
+        .bind(repo.id.to_string())
+        .bind("malformed")
+        .bind("push")
+        .bind("{}")
+        .bind("2026-08-29 03:40:39")
+        .execute(pool.pool())
+        .await
+        .unwrap();
+
+        assert!(PipelineQueries::list_by_repo(&pool, repo.id).await.is_err());
+    }
+
+    #[tokio::test]
     async fn test_pipeline_run_queries() {
         let pool = Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
@@ -1303,6 +1509,16 @@ mod tests {
         let found = PipelineRunQueries::get(&pool, run.id).await.unwrap();
         assert_eq!(found.unwrap().status, "running");
 
+        PipelineRunQueries::update_status(&pool, run.id, "succeeded")
+            .await
+            .unwrap();
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "succeeded");
+        assert!(found.finished_at.is_some());
+
         // List by pipeline
         let runs = PipelineRunQueries::list_by_pipeline(&pool, pipeline.id)
             .await
@@ -1312,6 +1528,14 @@ mod tests {
         // List all
         let all_runs = PipelineRunQueries::list(&pool).await.unwrap();
         assert_eq!(all_runs.len(), 1);
+
+        sqlx::query("UPDATE pipeline_runs SET created_at = ? WHERE id = ?")
+            .bind("2026-08-29 03:40:39")
+            .bind(run.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert!(PipelineRunQueries::get(&pool, run.id).await.is_err());
     }
 
     #[tokio::test]
@@ -1352,7 +1576,7 @@ mod tests {
         );
         PipelineRunQueries::create(&pool, &run).await.unwrap();
 
-        let job = crate::models::Job::new(run.id, "build".to_string(), "rust:1.75");
+        let job = crate::models::Job::new(run.id, "build".to_string());
 
         // Create
         JobQueries::create(&pool, &job).await.unwrap();
@@ -1363,9 +1587,7 @@ mod tests {
         assert_eq!(found.unwrap().name, "build");
 
         // Update status
-        JobQueries::update_status(&pool, job.id, "running")
-            .await
-            .unwrap();
+        JobQueries::start(&pool, job.id).await.unwrap();
         let found = JobQueries::get(&pool, job.id).await.unwrap();
         assert_eq!(found.unwrap().status, "running");
 
@@ -1377,10 +1599,25 @@ mod tests {
         );
         RunnerQueries::create(&pool, &runner).await.unwrap();
         JobQueries::assign(&pool, job.id, runner.id).await.unwrap();
+        JobQueries::cancel(&pool, job.id, r#"{"status":"cancelled"}"#)
+            .await
+            .unwrap();
+        let cancelled = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(cancelled.finished_at.is_some());
 
         // List by run
         let jobs = JobQueries::list_by_run(&pool, run.id).await.unwrap();
         assert_eq!(jobs.len(), 1);
+
+        sqlx::query("UPDATE jobs SET created_at = ? WHERE id = ?")
+            .bind("2026-08-29 03:40:39")
+            .bind(job.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert!(JobQueries::get(&pool, job.id).await.is_err());
+        assert!(JobQueries::list_by_run(&pool, run.id).await.is_err());
     }
 
     #[tokio::test]
@@ -1421,13 +1658,61 @@ mod tests {
         );
         PipelineRunQueries::create(&pool, &run).await.unwrap();
 
-        let job = crate::models::Job::new(run.id, "build".to_string(), "rust:1.75");
+        let job = crate::models::Job::new(run.id, "build".to_string());
         JobQueries::create(&pool, &job).await.unwrap();
 
         // List pending jobs
         let pending = JobQueries::list_pending(&pool).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].name, "build");
+    }
+
+    #[tokio::test]
+    async fn test_requeue_inflight_clears_assignment_and_start_state() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "recovery-owner".to_string(),
+            "recovery@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "recovery-repo".to_string(),
+            user.id,
+            "/git/recovery".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "recovery-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "main".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+        let job = crate::models::Job::new(run.id, "build".to_string());
+        JobQueries::create(&pool, &job).await.unwrap();
+        JobQueries::start(&pool, job.id).await.unwrap();
+
+        assert_eq!(JobQueries::requeue_inflight(&pool).await.unwrap(), 1);
+        let recovered = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, "failed");
+        assert!(recovered.runner_id.is_none());
+        assert!(recovered.started_at.is_some());
+        assert!(recovered
+            .result_json
+            .as_deref()
+            .is_some_and(|receipt| receipt.contains("scheduler_restart_fenced_running_job")));
     }
 
     #[tokio::test]
@@ -1445,6 +1730,15 @@ mod tests {
         // List online runners
         let online = RunnerQueries::list_online(&pool).await.unwrap();
         assert_eq!(online.len(), 1);
+
+        sqlx::query("UPDATE runners SET created_at = ? WHERE id = ?")
+            .bind("2026-08-29 03:40:39")
+            .bind(runner.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert!(RunnerQueries::get(&pool, runner.id).await.is_err());
+        assert!(RunnerQueries::list_online(&pool).await.is_err());
     }
 
     #[tokio::test]
@@ -1482,6 +1776,13 @@ mod tests {
         // List with limit 3
         let recent = EventQueries::list_recent(&pool, 3).await.unwrap();
         assert_eq!(recent.len(), 3);
+
+        sqlx::query("UPDATE events SET payload = ? WHERE id = (SELECT id FROM events LIMIT 1)")
+            .bind("not-json")
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert!(EventQueries::list_recent(&pool, 5).await.is_err());
     }
 
     #[tokio::test]
@@ -1506,6 +1807,38 @@ mod tests {
 
         let found = JobQueries::get(&pool, JobId::new()).await.unwrap();
         assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_job_idempotency_reservation_is_stable() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let job_id = JobId::new();
+        assert!(JobQueries::reserve_idempotency(
+            &pool,
+            "operator",
+            "retry-1",
+            "fingerprint",
+            job_id
+        )
+        .await
+        .unwrap());
+        assert!(!JobQueries::reserve_idempotency(
+            &pool,
+            "operator",
+            "retry-1",
+            "fingerprint",
+            JobId::new()
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            JobQueries::get_idempotency(&pool, "operator", "retry-1")
+                .await
+                .unwrap()
+                .unwrap(),
+            (job_id, "fingerprint".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1549,6 +1882,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_user_role_defaults_to_developer() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = crate::models::User::new(
+            "role-user".to_string(),
+            "role@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        assert_eq!(
+            UserQueries::get_role(&pool, user.id).await.unwrap(),
+            Some("developer".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn test_event_queries() {
         let pool = Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
@@ -1571,437 +1920,5 @@ mod tests {
         // List recent
         let recent = EventQueries::list_recent(&pool, 10).await.unwrap();
         assert_eq!(recent.len(), 1);
-    }
-
-    // ========================================================================
-    // Timestamp persistence tests
-    // ========================================================================
-
-    async fn create_test_pipeline_run(pool: &Pool) -> crate::models::PipelineRun {
-        let user = crate::models::User::new(
-            "owner".to_string(),
-            "owner@example.com".to_string(),
-            "hash".to_string(),
-        );
-        UserQueries::create(pool, &user).await.unwrap();
-
-        let repo = crate::models::Repository::new(
-            "test-repo".to_string(),
-            user.id,
-            "/git/test".to_string(),
-        );
-        RepoQueries::create(pool, &repo).await.unwrap();
-
-        let pipeline = crate::models::Pipeline {
-            id: PipelineId::new(),
-            repo_id: repo.id,
-            name: "Test Pipeline".to_string(),
-            trigger_type: "push".to_string(),
-            config: serde_json::json!({}),
-            created_at: chrono::Utc::now(),
-        };
-        PipelineQueries::create(pool, &pipeline).await.unwrap();
-
-        let run = crate::models::PipelineRun::new(
-            pipeline.id,
-            repo.id,
-            "alice".to_string(),
-            "abc123".to_string(),
-        );
-        PipelineRunQueries::create(pool, &run).await.unwrap();
-        run
-    }
-
-    async fn create_test_job(pool: &Pool) -> (crate::models::Job, PipelineRunId) {
-        let user = crate::models::User::new(
-            "owner".to_string(),
-            "owner@example.com".to_string(),
-            "hash".to_string(),
-        );
-        UserQueries::create(pool, &user).await.unwrap();
-
-        let repo = crate::models::Repository::new(
-            "test-repo".to_string(),
-            user.id,
-            "/git/test".to_string(),
-        );
-        RepoQueries::create(pool, &repo).await.unwrap();
-
-        let pipeline = crate::models::Pipeline {
-            id: PipelineId::new(),
-            repo_id: repo.id,
-            name: "Test Pipeline".to_string(),
-            trigger_type: "push".to_string(),
-            config: serde_json::json!({}),
-            created_at: chrono::Utc::now(),
-        };
-        PipelineQueries::create(pool, &pipeline).await.unwrap();
-
-        let run = crate::models::PipelineRun::new(
-            pipeline.id,
-            repo.id,
-            "alice".to_string(),
-            "abc123".to_string(),
-        );
-        PipelineRunQueries::create(pool, &run).await.unwrap();
-
-        let job = crate::models::Job::new(run.id, "build".to_string(), "rust:1.75");
-        JobQueries::create(pool, &job).await.unwrap();
-        (job, run.id)
-    }
-
-    #[tokio::test]
-    async fn test_pipeline_run_update_status_sets_started_at_once() {
-        let pool = Pool::memory().await.unwrap();
-        pool.migrate().await.unwrap();
-
-        let run = create_test_pipeline_run(&pool).await;
-
-        // Transition to running — started_at should be set
-        PipelineRunQueries::update_status(&pool, run.id, "running")
-            .await
-            .unwrap();
-        let found = PipelineRunQueries::get(&pool, run.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(found.status, "running");
-        assert!(
-            found.started_at.is_some(),
-            "started_at must be set on first running transition"
-        );
-        let first_started_at = found.started_at;
-
-        // Transition to completed — started_at must NOT change
-        PipelineRunQueries::update_status(&pool, run.id, "completed")
-            .await
-            .unwrap();
-        let found = PipelineRunQueries::get(&pool, run.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(found.status, "completed");
-        assert_eq!(
-            found.started_at, first_started_at,
-            "started_at must not change on subsequent transitions"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_pipeline_run_update_status_sets_finished_at_once() {
-        let pool = Pool::memory().await.unwrap();
-        pool.migrate().await.unwrap();
-
-        let run = create_test_pipeline_run(&pool).await;
-
-        // Go running then completed
-        PipelineRunQueries::update_status(&pool, run.id, "running")
-            .await
-            .unwrap();
-        PipelineRunQueries::update_status(&pool, run.id, "completed")
-            .await
-            .unwrap();
-
-        let found = PipelineRunQueries::get(&pool, run.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            found.finished_at.is_some(),
-            "finished_at must be set on completed"
-        );
-        let first_finished_at = found.finished_at;
-
-        // Transition to failed — finished_at must NOT change
-        PipelineRunQueries::update_status(&pool, run.id, "failed")
-            .await
-            .unwrap();
-        let found = PipelineRunQueries::get(&pool, run.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            found.finished_at, first_finished_at,
-            "finished_at must not change once set"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_pipeline_run_update_status_idempotent() {
-        let pool = Pool::memory().await.unwrap();
-        pool.migrate().await.unwrap();
-
-        let run = create_test_pipeline_run(&pool).await;
-
-        // Run full lifecycle
-        PipelineRunQueries::update_status(&pool, run.id, "running")
-            .await
-            .unwrap();
-        PipelineRunQueries::update_status(&pool, run.id, "completed")
-            .await
-            .unwrap();
-
-        let found = PipelineRunQueries::get(&pool, run.id)
-            .await
-            .unwrap()
-            .unwrap();
-        let started_at = found.started_at;
-        let finished_at = found.finished_at;
-
-        // Repeated updates preserve timestamps
-        PipelineRunQueries::update_status(&pool, run.id, "completed")
-            .await
-            .unwrap();
-        PipelineRunQueries::update_status(&pool, run.id, "running")
-            .await
-            .unwrap();
-
-        let found = PipelineRunQueries::get(&pool, run.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(found.started_at, started_at);
-        assert_eq!(found.finished_at, finished_at);
-    }
-
-    #[tokio::test]
-    async fn test_pipeline_run_update_status_cancelled_sets_finished_at() {
-        let pool = Pool::memory().await.unwrap();
-        pool.migrate().await.unwrap();
-
-        let run = create_test_pipeline_run(&pool).await;
-
-        PipelineRunQueries::update_status(&pool, run.id, "cancelled")
-            .await
-            .unwrap();
-        let found = PipelineRunQueries::get(&pool, run.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(found.status, "cancelled");
-        assert!(
-            found.finished_at.is_some(),
-            "finished_at must be set on cancelled"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_pipeline_run_update_status_completed_sets_finished_at() {
-        let pool = Pool::memory().await.unwrap();
-        pool.migrate().await.unwrap();
-
-        let run = create_test_pipeline_run(&pool).await;
-
-        // Scheduler writes "completed" as terminal success state
-        PipelineRunQueries::update_status(&pool, run.id, "running")
-            .await
-            .unwrap();
-        PipelineRunQueries::update_status(&pool, run.id, "completed")
-            .await
-            .unwrap();
-
-        let found = PipelineRunQueries::get(&pool, run.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(found.status, "completed");
-        assert!(
-            found.finished_at.is_some(),
-            "finished_at must be set on completed"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_job_update_status_sets_started_at_once() {
-        let pool = Pool::memory().await.unwrap();
-        pool.migrate().await.unwrap();
-
-        let (job, _run_id) = create_test_job(&pool).await;
-
-        // Transition to running — started_at should be set
-        JobQueries::update_status(&pool, job.id, "running")
-            .await
-            .unwrap();
-        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
-        assert_eq!(found.status, "running");
-        assert!(
-            found.started_at.is_some(),
-            "started_at must be set on first running transition"
-        );
-        let first_started_at = found.started_at;
-
-        // Transition to completed — started_at must NOT change
-        JobQueries::update_status(&pool, job.id, "completed")
-            .await
-            .unwrap();
-        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
-        assert_eq!(found.status, "completed");
-        assert_eq!(
-            found.started_at, first_started_at,
-            "started_at must not change on subsequent transitions"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_job_update_status_sets_finished_at_once() {
-        let pool = Pool::memory().await.unwrap();
-        pool.migrate().await.unwrap();
-
-        let (job, _run_id) = create_test_job(&pool).await;
-
-        // Go running then completed
-        JobQueries::update_status(&pool, job.id, "running")
-            .await
-            .unwrap();
-        JobQueries::update_status(&pool, job.id, "completed")
-            .await
-            .unwrap();
-
-        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
-        assert!(
-            found.finished_at.is_some(),
-            "finished_at must be set on completed"
-        );
-        let first_finished_at = found.finished_at;
-
-        // Transition to failed — finished_at must NOT change
-        JobQueries::update_status(&pool, job.id, "failed")
-            .await
-            .unwrap();
-        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
-        assert_eq!(
-            found.finished_at, first_finished_at,
-            "finished_at must not change once set"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_job_update_status_idempotent() {
-        let pool = Pool::memory().await.unwrap();
-        pool.migrate().await.unwrap();
-
-        let (job, _run_id) = create_test_job(&pool).await;
-
-        // Run full lifecycle
-        JobQueries::update_status(&pool, job.id, "running")
-            .await
-            .unwrap();
-        JobQueries::update_status(&pool, job.id, "completed")
-            .await
-            .unwrap();
-
-        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
-        let started_at = found.started_at;
-        let finished_at = found.finished_at;
-
-        // Repeated updates preserve timestamps
-        JobQueries::update_status(&pool, job.id, "completed")
-            .await
-            .unwrap();
-        JobQueries::update_status(&pool, job.id, "running")
-            .await
-            .unwrap();
-
-        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
-        assert_eq!(found.started_at, started_at);
-        assert_eq!(found.finished_at, finished_at);
-    }
-
-    #[tokio::test]
-    async fn test_job_update_status_timed_out_sets_finished_at() {
-        let pool = Pool::memory().await.unwrap();
-        pool.migrate().await.unwrap();
-
-        let (job, _run_id) = create_test_job(&pool).await;
-
-        JobQueries::update_status(&pool, job.id, "running")
-            .await
-            .unwrap();
-        JobQueries::update_status(&pool, job.id, "timed_out")
-            .await
-            .unwrap();
-
-        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
-        assert_eq!(found.status, "timed_out");
-        assert!(
-            found.finished_at.is_some(),
-            "finished_at must be set on timed_out"
-        );
-    }
-
-    /// Verifies that `assigned` sets `started_at` (simulating scheduler handoff)
-    /// and that it is preserved through the completed transition.
-    #[tokio::test]
-    async fn test_job_update_status_assigned_sets_started_at_once() {
-        let pool = Pool::memory().await.unwrap();
-        pool.migrate().await.unwrap();
-
-        let (job, _run_id) = create_test_job(&pool).await;
-
-        // Transition to assigned (scheduler hands job to runner) — started_at must be set
-        JobQueries::update_status(&pool, job.id, "assigned")
-            .await
-            .unwrap();
-        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
-        assert_eq!(found.status, "assigned");
-        assert!(
-            found.started_at.is_some(),
-            "started_at must be set when transitioning to assigned"
-        );
-        let first_started_at = found.started_at;
-
-        // Transition to running — started_at must NOT change
-        JobQueries::update_status(&pool, job.id, "running")
-            .await
-            .unwrap();
-        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
-        assert_eq!(found.status, "running");
-        assert_eq!(
-            found.started_at, first_started_at,
-            "started_at must not change when transitioning from assigned to running"
-        );
-
-        // Transition to completed — started_at must STILL not change
-        JobQueries::update_status(&pool, job.id, "completed")
-            .await
-            .unwrap();
-        let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
-        assert_eq!(found.status, "completed");
-        assert_eq!(
-            found.started_at, first_started_at,
-            "started_at must not change through completed"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_durable_job_log_and_event_receipt_are_idempotent_and_queryable() {
-        let pool = Pool::memory().await.unwrap();
-        pool.migrate().await.unwrap();
-        let (job, run_id) = create_test_job(&pool).await;
-
-        let log =
-            crate::models::JobLog::new(job.id, run_id, "build output".to_string(), "".to_string());
-        JobLogQueries::upsert(&pool, &log).await.unwrap();
-        let found = JobLogQueries::get_by_job(&pool, job.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(found.stdout, "build output");
-        assert!(!found.stdout_truncated);
-
-        let event = crate::models::EventReceipt::new(
-            "job.finished",
-            Some(job.id),
-            Some(run_id),
-            format!("job.finished:{}", job.id),
-            serde_json::json!({"status": "completed"}),
-        );
-        EventReceiptQueries::upsert(&pool, &event).await.unwrap();
-        EventReceiptQueries::upsert(&pool, &event).await.unwrap();
-        let events = EventReceiptQueries::list_by_run(&pool, run_id)
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "job.finished");
     }
 }

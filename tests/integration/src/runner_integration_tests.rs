@@ -3,9 +3,9 @@
 //! These tests verify the runner agent's HTTP communication with scheduler
 //! and job execution functionality.
 
-use gitforce_runner::{RunnerAgent, RunnerConfig};
-use gitforce_runner::executor::{ExecutableJob, JobStep, JobResult, JobExecutor};
-use gitforce_common::JobId;
+use gitforge_runner::{RunnerAgent, RunnerConfig};
+use gitforge_runner::executor::{ExecutableJob, JobStep, JobResult, JobExecutor};
+use gitforge_common::JobId;
 use std::collections::HashMap;
 
 /// Test runner configuration

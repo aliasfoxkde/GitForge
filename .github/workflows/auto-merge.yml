@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
   statuses: write
 
@@ -20,7 +20,7 @@ jobs:
     if: github.event.pull_request.user.login == github.event.repository.owner.login
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check CI status
         env:
@@ -61,8 +61,7 @@ jobs:
 
           # Enable auto-merge
           gh pr merge $PR_NUMBER --squash --delete-branch --auto || {
-            echo "::warning::Auto-merge could not be enabled; leaving the PR open for manual review."
-            echo "This is non-blocking because repository policy or the token may deny enablePullRequestAutoMerge."
-            exit 0
+            echo "Auto-merge failed (可能是因为分支保护或冲突)"
+            exit 1
           }
           echo "Auto-merge enabled successfully!"

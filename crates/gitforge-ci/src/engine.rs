@@ -82,19 +82,8 @@ pub struct CiEngine {
 impl CiEngine {
     /// Create a new CI engine from a trigger event and pipeline definition
     pub async fn new(event: PipelineTriggerEvent, pipeline: PipelineDefinition) -> Result<Self> {
-        Self::new_with_run_id(event, pipeline, PipelineRunId::new()).await
-    }
+        let run_id = PipelineRunId::new();
 
-    /// Create a CI engine with a caller-supplied run ID.
-    ///
-    /// Control-plane adapters use this to return a durable identifier before
-    /// publishing an asynchronous trigger event. Native webhook callers use
-    /// `new`, which allocates an ID locally.
-    pub async fn new_with_run_id(
-        event: PipelineTriggerEvent,
-        pipeline: PipelineDefinition,
-        run_id: PipelineRunId,
-    ) -> Result<Self> {
         // Build DAG from pipeline
         let graph = DagBuilder::build(&pipeline, run_id)?;
 
@@ -116,6 +105,12 @@ impl CiEngine {
     /// Get current engine state
     pub async fn state(&self) -> CiEngineState {
         self.state.read().await.clone()
+    }
+
+    /// Return the immutable definition that produced a job ID. The scheduler
+    /// uses this to carry exact pipeline steps to the runner.
+    pub fn job_definition(&self, job_id: JobId) -> Option<crate::pipeline::JobDefinition> {
+        self.graph.get(job_id).map(|node| node.definition.clone())
     }
 
     /// Start the pipeline run
@@ -172,6 +167,35 @@ impl CiEngine {
         ready
     }
 
+    /// Queue dependency-gated jobs after a predecessor succeeds and return
+    /// the jobs that became schedulable. Entry-point jobs are queued by
+    /// `start`; downstream jobs are released through this method.
+    pub async fn queue_ready_jobs(&self) -> Result<Vec<JobId>> {
+        let mut state = self.state.write().await;
+        let mut queued = Vec::new();
+        for node in &self.graph.nodes {
+            let Some(job_state) = state.jobs.get(&node.id) else {
+                continue;
+            };
+            if job_state.status() != JobStatus::Pending {
+                continue;
+            }
+            let deps_satisfied = node.dependencies.iter().all(|dep_id| {
+                state
+                    .jobs
+                    .get(dep_id)
+                    .is_some_and(|dependency| dependency.status() == JobStatus::Succeeded)
+            });
+            if deps_satisfied {
+                if let Some(job_state) = state.jobs.get_mut(&node.id) {
+                    job_state.queue()?;
+                    queued.push(node.id);
+                }
+            }
+        }
+        Ok(queued)
+    }
+
     /// Assign a job to a runner
     pub async fn assign_job(
         &self,
@@ -223,6 +247,33 @@ impl CiEngine {
             if !state.failed_jobs().is_empty() {
                 state.status = PipelineStatus::Failed;
                 state.finished_at = Some(chrono::Utc::now());
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark a job as timed out
+    pub async fn timeout_job(&self, job_id: JobId) -> Result<()> {
+        let mut state = self.state.write().await;
+        if let Some(job_state) = state.jobs.get_mut(&job_id) {
+            job_state.timeout()?;
+            let timed_out = job_state.status() == JobStatus::TimedOut;
+
+            // Pipeline fails if any job times out or fails
+            if !state.failed_jobs().is_empty() || timed_out {
+                state.status = PipelineStatus::Failed;
+                state.finished_at = Some(chrono::Utc::now());
+            }
+        }
+        Ok(())
+    }
+
+    /// Cancel a specific job
+    pub async fn cancel_job(&self, job_id: JobId) -> Result<()> {
+        let mut state = self.state.write().await;
+        if let Some(job_state) = state.jobs.get_mut(&job_id) {
+            if !job_state.is_terminal() {
+                job_state.cancel()?;
             }
         }
         Ok(())

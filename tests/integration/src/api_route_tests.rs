@@ -3,17 +3,21 @@
 //! These tests verify API route handlers using tower's ServiceExt
 //! for oneshot requests. Tests auth, error handling, and response formats.
 
-use gitforce_api::auth::{ApiAuth, Claims};
-use gitforce_api::{ApiServer, Metrics};
-use gitforce_common::{UserId, RepoId, PipelineId, PipelineRunId, JobId, RunnerId};
-use gitforce_db::Pool;
+#[allow(unused_imports)]
+use gitforge_api::auth::{ApiAuth, Claims};
+use gitforge_api::{ApiServer, Metrics};
+#[allow(unused_imports)]
+use gitforge_common::{UserId, RepoId, PipelineId, PipelineRunId, JobId, RunnerId};
+use gitforge_db::Pool;
 use axum::{
     http::StatusCode,
     response::IntoResponse,
     routing::get,
     Router,
 };
+#[allow(unused_imports)]
 use tower::util::ServiceExt;
+#[allow(unused_imports)]
 use std::sync::Arc;
 
 /// Create a test router with auth and pool extensions
@@ -149,7 +153,7 @@ fn test_claims_future_expiry() {
 /// Test error response creation
 #[test]
 fn test_error_response_creation() {
-    use gitforce_api::server::error_response;
+    use gitforge_api::server::error_response;
 
     let response = error_response(StatusCode::NOT_FOUND, "not_found", "Resource not found");
     let response = response.into_response();

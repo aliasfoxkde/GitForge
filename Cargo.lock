@@ -92,6 +92,7 @@ dependencies = [
  "gitforge-db",
  "gitforge-events",
  "gitforge-process",
+ "gitforge-storage",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -422,6 +423,7 @@ dependencies = [
  "gitforge-events",
  "gitforge-process",
  "gitforge-scheduler",
+ "gitforge-storage",
  "serde",
  "serde_json",
  "tokio",
@@ -1135,6 +1137,7 @@ dependencies = [
  "gitforge-events",
  "gitforge-process",
  "sha2 0.11.0",
+ "ssh2",
  "tokio",
  "tower",
  "tower-http",
@@ -1209,7 +1212,7 @@ dependencies = [
  "clap",
  "futures",
  "gitforge-process",
- "libc",
+ "nix",
  "serde",
  "serde_json",
  "tempfile",
@@ -1336,15 +1339,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitforge-mcp"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.19",
-]
-
-[[package]]
 name = "gitforge-process"
 version = "0.1.0"
 dependencies = [
@@ -1379,10 +1373,11 @@ dependencies = [
  "gitforge-db",
  "gitforge-sandbox",
  "gitforge-storage",
+ "hex",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
- "serial_test",
+ "sha2 0.11.0",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -1418,8 +1413,11 @@ dependencies = [
  "futures",
  "gitforge-common",
  "gitforge-db",
+ "gitforge-storage",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.19",
  "tokio",
  "tower",
@@ -2044,6 +2042,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "libssh2-sys"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c04141a07bb0c0bc461cb657808764de571702a59bc5c726c400ac9a7625e3ab"
+dependencies = [
+ "cc",
+ "libc",
+ "libz-sys",
+ "openssl-sys",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "libz-sys"
 version = "1.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2176,6 +2188,17 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "tempfile",
+]
+
+[[package]]
+name = "nix"
+version = "0.27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2eb04e9c688eff1c89d72b407f168cf79bb9e867a9d3323ed6c01519eb9cc053"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
@@ -3215,31 +3238,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serial_test"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "699f4197115b8a7e7ff19c9a315a4bd6fffec26cc4626ef45ecaea389e081c6d"
-dependencies = [
- "futures-executor",
- "futures-util",
- "log",
- "once_cell",
- "parking_lot",
- "serial_test_derive",
-]
-
-[[package]]
-name = "serial_test_derive"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94e153fc76e1c6a068703d6d29c508a0b15c061c4b7e43da59cc097bc342673c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3562,6 +3560,18 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "ssh2"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c95eb3c09e378543395a3fa9796f897861862466ee331d59140ade4ea0dcfdfc"
+dependencies = [
+ "bitflags",
+ "libc",
+ "libssh2-sys",
+ "parking_lot",
 ]
 
 [[package]]

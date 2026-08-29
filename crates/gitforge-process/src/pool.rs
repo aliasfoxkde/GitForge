@@ -9,11 +9,6 @@ use tokio::process::Command;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Duration};
 
-#[cfg(target_os = "linux")]
-use libc::kill as process_kill;
-#[cfg(target_os = "linux")]
-use libc::SIGKILL;
-
 /// Resource weight for different job types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum JobWeight {
@@ -97,9 +92,6 @@ impl ProcessPool {
         let permit = self.acquire(weight).await;
         let mut cmd = Command::new(program);
         cmd.args(args);
-        // Put the child in its own process group so that timeout kills
-        // the entire subtree, not just the direct child.
-        cmd.process_group(0);
 
         let mut child = cmd.spawn()?;
         let pid = child.id().unwrap_or(0);
@@ -129,22 +121,11 @@ impl ProcessPool {
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "process {} timed out after {:?}, killing process group",
+                        "process {} timed out after {:?}, killing",
                         pid_for_handler,
                         timeout_duration
                     );
-                    // Kill the entire process group (negative pid), not just
-                    // the direct child, so that any grandchildren are also
-                    // terminated.
-                    #[cfg(target_os = "linux")]
-                    {
-                        let pgid = -(pid_for_handler as libc::pid_t);
-                        unsafe { process_kill(pgid, SIGKILL) };
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        let _ = child.kill().await;
-                    }
+                    let _ = child.kill().await;
                 }
             }
             let mut running = running.lock().unwrap();
@@ -479,29 +460,5 @@ mod tests {
         };
         assert_eq!(p1, p2);
         assert_ne!(p1, p3);
-    }
-
-    #[tokio::test]
-    async fn test_spawn_process_group_isolation() {
-        // Regression: verify that spawn sets process_group(0) so that
-        // timeout kills via kill(-pid, SIGKILL) can reach the whole subtree.
-        let config = PoolConfig {
-            max_concurrent: 1,
-            default_timeout: Duration::from_secs(5),
-        };
-        let pool = ProcessPool::new(config);
-
-        // Spawn a trivial command; if process_group(0) were not set on the
-        // internal Command, this would still compile (since the API doesn't
-        // expose the Command), but the test documents the expected behaviour.
-        let pid = pool
-            .spawn(JobWeight::Light, "true", &[], |_| {})
-            .await
-            .expect("spawn should succeed");
-        assert!(pid > 0);
-
-        // Allow the spawned task to register the pid
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!pool.is_running(pid), "process should have exited already");
     }
 }

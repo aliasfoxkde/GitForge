@@ -44,7 +44,7 @@ cargo-wrapper --wrapper-status
 cargo-wrapper --wrapper-status
 
 # Check daemon is running
-ls -la /tmp/gitforge-build.sock
+ls -la target/quality/gitforge-build.sock
 
 # View queue stats
 gitforge-build --stats
@@ -102,17 +102,17 @@ Available tools:
 | Submit and wait | `gitforge-build -- cargo test` |
 | Submit no-wait | `gitforge-build --no-wait -- cargo build` |
 | Bypass daemon | `cargo-wrapper --wrapper-fallback -- <cmd>` |
-| View logs | `tail -f /tmp/gitforge-build.log` |
+| View logs | `tail -f target/quality/gitforge-build.log` |
 
 ## Troubleshooting
 
 ### Daemon won't start
 ```bash
 # Check if socket exists
-ls -la /tmp/gitforge-build.sock
+ls -la target/quality/gitforge-build.sock
 
 # Remove stale socket
-rm -f /tmp/gitforge-build.sock
+rm -f target/quality/gitforge-build.sock
 
 # Try again
 gitforge-buildd
@@ -125,7 +125,7 @@ gitforge-build --stats
 
 # Kill stuck daemon
 pkill gitforge-buildd
-rm /tmp/gitforge-build.sock
+rm target/quality/gitforge-build.sock
 
 # Restart
 gitforge-buildd &

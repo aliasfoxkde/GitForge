@@ -24,14 +24,18 @@ on:
           - openai
           - ollama
 
-env:
-  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
 permissions:
   contents: read
   issues: write
   pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
 jobs:
   ai-review:
@@ -39,12 +43,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
 
       - name: Get PR diff
         id: pr-diff
@@ -53,17 +57,12 @@ jobs:
           BASE_BRANCH=${{ github.base_ref || 'main' }}
           echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
 
-          # actions/checkout leaves the PR in a detached worktree and may not
-          # create a local base branch. Fetch the exact remote base explicitly.
-          git fetch --no-tags origin "$BASE_BRANCH" --depth=1
-          BASE_REF="origin/$BASE_BRANCH"
-
           # Generate diff
-          git diff "$BASE_REF"...HEAD > pr.diff
+          git diff $BASE_BRANCH...HEAD > pr.diff
           echo "diff_file=pr.diff" >> $GITHUB_OUTPUT
 
           # Count files changed
-          FILES_CHANGED=$(git diff --name-only "$BASE_REF"...HEAD | wc -l)
+          FILES_CHANGED=$(git diff --name-only $BASE_BRANCH...HEAD | wc -l)
           echo "files_changed=$FILES_CHANGED" >> $GITHUB_OUTPUT
 
       - name: Run AI Review
@@ -74,7 +73,7 @@ jobs:
           set +e
 
           # Build the CLI first
-          cargo build --package gitforge-cli --release 2>/dev/null
+          cargo build --package gitforce-cli --release 2>/dev/null
 
           REVIEW_CMD="./target/release/gitforge review --diff --provider $PROVIDER --verbose"
 
@@ -95,7 +94,7 @@ jobs:
 
       - name: Post review comment
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
             const fs = require('fs');
@@ -132,16 +131,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
 
       - name: Run security scan
         run: |
           # Run cargo-audit or similar security checks
-          cargo install cargo-audit --quiet 2>/dev/null || true
-          cargo audit || echo "No vulnerabilities found or audit skipped"
+          cargo install cargo-audit --locked --quiet
+          cargo audit
 
   # Run standard tests alongside AI review
   test-checks:
@@ -149,13 +148,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

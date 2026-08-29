@@ -75,6 +75,11 @@ impl ArtifactStore for FileStorage {
             .await
             .map_err(|e| Error::storage(format!("failed to write artifact data: {}", e)))?;
 
+        // Ensure data is flushed to disk before returning
+        file.sync_all()
+            .await
+            .map_err(|e| Error::storage(format!("failed to sync artifact data: {}", e)))?;
+
         // Write metadata
         let meta_json = serde_json::to_string_pretty(artifact)
             .map_err(|e| Error::storage(format!("failed to serialize artifact metadata: {}", e)))?;
@@ -87,6 +92,12 @@ impl ArtifactStore for FileStorage {
             .write_all(meta_json.as_bytes())
             .await
             .map_err(|e| Error::storage(format!("failed to write artifact metadata: {}", e)))?;
+
+        // Ensure metadata is flushed to disk before returning
+        meta_file
+            .sync_all()
+            .await
+            .map_err(|e| Error::storage(format!("failed to sync artifact metadata: {}", e)))?;
 
         tracing::info!(
             "stored artifact {} ({} bytes)",
@@ -203,6 +214,11 @@ impl CacheStore for FileStorage {
             .await
             .map_err(|e| Error::storage(format!("failed to write cache data: {}", e)))?;
 
+        // Ensure data is flushed to disk before returning
+        file.sync_all()
+            .await
+            .map_err(|e| Error::storage(format!("failed to sync cache data: {}", e)))?;
+
         // Write metadata
         let now = chrono::Utc::now();
         let entry = crate::cache::CacheEntry {
@@ -223,6 +239,12 @@ impl CacheStore for FileStorage {
             .write_all(meta_json.as_bytes())
             .await
             .map_err(|e| Error::storage(format!("failed to write cache metadata: {}", e)))?;
+
+        // Ensure metadata is flushed to disk before returning
+        meta_file
+            .sync_all()
+            .await
+            .map_err(|e| Error::storage(format!("failed to sync cache metadata: {}", e)))?;
 
         tracing::debug!("cached {} bytes at {:?}", data.len(), path);
         Ok(())

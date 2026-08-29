@@ -46,13 +46,14 @@ pub async fn login(
             // Verify password
             match gitforge_common::password::verify_password(&req.password, &user.password_hash) {
                 Ok(true) => {
-                    // Generate token
-                    // TODO: Add role field to User model
-                    let token = auth.generate_token(
-                        user.id,
-                        &user.username,
-                        "user", // Default role until User model has role field
-                    );
+                    // Generate a token with the persisted least-privilege
+                    // role. Old databases are migrated with `developer`.
+                    let role = UserQueries::get_role(&pool, user.id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "developer".to_string());
+                    let token = auth.generate_token(user.id, &user.username, &role);
 
                     match token {
                         Ok(token) => {

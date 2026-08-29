@@ -25,3 +25,4 @@ tower-http = { workspace = true }
 futures = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
+ssh2 = "0.9"

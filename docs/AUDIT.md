@@ -158,3 +158,177 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
 - [ ] SSH Git clone/push operations (when implemented)
 - [ ] Authentication flow
 - [ ] Webhook processing
+
+## Verified continuation findings — 2026-08-26
+
+## Verified continuation findings — 2026-08-27
+
+- Added persisted user roles with a `developer` default for legacy accounts;
+  login tokens now carry the database role instead of hard-coding `user`.
+- Added user-facing API job submission (`POST /api/jobs`) with bounded input,
+  per-user durable idempotency, owner/admin/maintainer authorization, and
+  replay-safe responses.
+- Added owner-aware job/run status and receipt access plus
+  `POST /api/jobs/{id}/cancel`. API cancellation writes durable state so the
+  separate scheduler and runner processes observe it without shared memory.
+- Scheduler refreshes durable pending jobs on its bounded tick and reconciles
+  API-written cancellations before assignment. Regression tests prove a
+  canceled queued job is never handed to a runner.
+- Protected the CI service's `/pipelines/trigger` LAN adapter with a dedicated
+  `GITFORGE_TRIGGER_TOKEN`, falling back to operator/shared credentials only
+  during migration. The pre-existing service edits remain preserved alongside
+  this scoped security change.
+
+## Verified continuation findings — 2026-08-27 auth boundary tranche
+
+- Activated the existing shared JWT middleware and `AuthenticatedUser`
+  extractor on the protected API route boundary. Token parsing/validation now
+  runs before protected handlers; resource-level ownership checks remain in
+  handlers where required.
+- Split runner registration from runner administration. `POST /api/runners`
+  remains an explicit unauthenticated bootstrap exception, while runner list
+  and detail routes remain protected. This exception is now represented in the
+  route structure instead of being an accidental consequence of missing
+  middleware.
+- Migrated webhook triggering, repository routes, artifact routes, runner
+  administration, and user-facing job submit/get/log/cancel handlers to the
+  shared claims context, removing their production route-local bearer-token
+  parsers. Repository listing, lookup, and deletion now enforce owner access
+  with admin/maintainer override; cross-user integration coverage proves
+  private repositories are hidden. Artifact reads, downloads, deletion, and
+  job listing now resolve the artifact's job through its pipeline run and
+  repository owner before returning data; unauthorized artifacts are hidden
+  with not-found responses. CI pipeline list/read handlers were subsequently
+  migrated to the same shared claims context.
+- Validation: GitForge API unit tests (190 before this continuation), 42
+  integration tests including cross-user artifact scope, strict Clippy, and
+  focused authorization tests pass. Whole-workspace validation remains a
+  later managed gate after this tranche.
+
+## Verified continuation findings — 2026-08-27 role and lease tranche
+
+- Added administrator-only `PATCH /api/users/{id}/role` with a strict role
+  allowlist and last-administrator protection. Protected middleware resolves
+  the persisted role for each request, so demoted JWTs lose administrative
+  access immediately rather than retaining stale claims until expiry.
+- Added scheduler regressions for unknown heartbeats, stale-runner offline
+  transitions, assignment requeue and lease cleanup, wrong-runner rejection,
+  wrong-lease rejection, durable assignment races, and the HTTP
+  pending/start/complete protocol. SQLite persists a lease token and monotonic
+  generation; all three transitions use conditional updates so stale runners
+  are fenced.
+- Updated the OpenAPI specification and API/job-contract documentation for
+  role management and the multi-scheduler boundary.
+- Validation: 181 API unit tests, 43 API integration tests, 66 database unit
+  tests plus 9 database integration tests, and 89 scheduler tests pass;
+  workspace Clippy and scoped formatting pass. The managed full-workspace
+  GitForge job `f2caae83-efde-40a6-a8da-35c53ef0da33` passed with exit 0 at
+  `2026-08-26T03:46:56Z`; managed workspace Clippy also passed.
+
+- Fixed a scheduler cancellation invariant: queue removal is lazy, so stale
+  `BinaryHeap` entries are now discarded by both `peek` and `dequeue` before
+  they can be assigned. Added queue- and scheduler-level regression tests.
+- The scheduler control API is token-authenticated, but user-facing API
+  cancellation/ownership remains open. Scheduler routes now separate runner
+  and operator credentials (`GITFORGE_RUNNER_TOKEN` and
+  `GITFORGE_SCHEDULER_OPERATOR_TOKEN`) with the old shared token as a
+  compatibility fallback. Operator submission is durable and idempotent;
+  user-facing JWT-to-scheduler ownership remains a follow-up.
+- Existing service edits in `services/api/src/main.rs` and
+  `services/ci/src/main.rs` were pre-existing and remain intentionally
+  preserved; they are not part of this queue fix.
+
+## Verified continuation findings — 2026-08-27 build-manager tranche
+
+- Fixed a control-plane deadlock in `gitforge-build`: submissions no longer
+  wait for a semaphore slot before returning, so the Unix control socket stays
+  responsive when all build capacity is occupied.
+- Fixed the high-risk child-process deadlock where stdout was drained before
+  stderr. Both pipes are now drained concurrently, preventing a noisy
+  `cargo test` from blocking on a full stderr pipe.
+- Implemented the daemon `Cancel` request. Queued jobs are marked cancelled;
+  running jobs are terminated through their process group, which also avoids
+  orphaned descendants. The CLI now exposes `gitforge-build --cancel JOB_ID`.
+  Timeout cleanup now uses async sleep and reaps the child instead of blocking
+  a runtime worker thread.
+- Validation: `cargo test -p gitforge-build` (53 library, 16 CLI, 4 daemon
+  tests) and `cargo clippy -p gitforge-build --all-targets -- -D warnings`
+  pass. The CLI now polls durable daemon status for synchronous submissions;
+  full workspace managed validation also passed through the daemon:
+  `2375c12a-75a7-4522-b3e4-1d5859e9033a` (`cargo test --workspace`, exit 0)
+  and `6f22bbf8-12cd-4bf9-a92d-40f741b06e11` (workspace Clippy, exit 0).
+
+## Verified continuation findings — 2026-08-28 log and artifact tranche
+
+- Added a SQLite `job_log_chunks` ledger with per-chunk and per-job bounds.
+  Appends require the active runner ID and lease token; stale runners receive
+  a conflict and cannot publish late output. The API job-log response now
+  includes ordered durable chunks alongside the terminal receipt.
+- Added authenticated scheduler runner routes for log append and artifact
+  upload. Artifact names are bounded and path-like values are rejected;
+  content is stored under server-generated IDs with optional SHA-256
+  verification and the shared API artifact root.
+- Runner agents now publish UTF-8-safe output chunks before completion and
+  upload workspace artifacts through the scheduler protocol. A scheduler HTTP
+  regression covers stale-log fencing, accepted logs, artifact checksum,
+  storage retrieval, and terminal completion.
+- Focused database, scheduler, runner, API, and service compile gates pass.
+  True live sandbox streaming and full multi-process API/scheduler/runner E2E
+  remain explicitly open. The rebuilt manager also passed full workspace
+  tests (`813e789e-807b-4d30-b1c5-0a9dbcda6905`) and Clippy
+  (`bc4c1426-8b90-40ed-b7d1-58da3a56a5e2`), both exit 0.
+
+## Verified continuation findings — 2026-08-25 process ownership tranche
+
+- Audited all service entry points and found the process-wide
+  `waitpid(-1, WNOHANG)` reaper was enabled even where Tokio owns child
+  processes. That can consume an exit status before `Child::wait`, causing
+  false failures or hangs.
+- API, CI, runner, Git-server, and build-daemon entry points now use
+  `init_without_sigchld_reaper`; child owners are responsible for waiting on
+  children. The legacy reaper remains explicit-only until a registry-backed
+  orphan supervisor replaces it.
+- Added `gitforge-build --shutdown`, which is acknowledged over the private
+  socket and verified to terminate the daemon and remove the socket.
+- Validation: scoped service `cargo check` and strict Clippy passed; the full
+  workspace test passed through the manager as job
+  `353c5c30-dfbe-42f4-b286-52c23f6af36c` with exit 0.
+
+## Verified continuation findings — 2026-08-25 CI integrity tranche
+
+- Active workflows and reusable templates had mutable action tags; all
+  resolvable action references are now pinned to full commit SHAs with release
+  comments identifying the reviewed tag. The formerly unresolved
+  `aws-actions/git-secrets-scan` template action was replaced with a local
+  deterministic credential-pattern scan.
+- Release Linux builds now run the locked workspace test suite before building,
+  and the release job requests GitHub artifact provenance attestations for
+  packaged archives. SBOM generation remains a separate follow-up because the
+  repository has not yet selected and pinned a CycloneDX/SPDX generator.
+- Corrected the wiki workflow's branch selector and added explicit default
+  read permissions where workflows do not need write access. All 14 workflow
+  and reusable-template YAML files parse successfully; no unpinned `uses:`
+  references remain in those files.
+- Release jobs now publish a pinned CycloneDX JSON SBOM alongside archives;
+  CI coverage uses LLVM source instrumentation and enforces a 79.9% line gate,
+  matching the 79.98% workspace baseline measured on 2026-08-25. The gate is
+  intentionally a ratchet: it will rise with verified coverage improvements;
+  the 99% objective is not yet met.
+- The build manager now performs bounded coordinated shutdown: queued jobs are
+  cancelled, running process groups receive SIGCONT/SIGTERM, survivors receive
+  SIGKILL after the grace period, and the daemon waits for child reaping before
+  removing its socket. The CLI also forwards cargo flags such as
+  `gitforge-build test --workspace` without requiring a separator. A real
+  daemon smoke test confirmed socket cleanup and no surviving rustup/cargo/rustc
+  processes; cross-restart durable job recovery remains open.
+- A fresh Aegis scan on 2026-08-28 found no safe basis for treating a full-tree
+  scan as a clean gate: the current source contains intentional security-test
+  fixtures and the scanner reports large medium/high volumes, including 20
+  critical matches that require triage rather than blind suppression. GitForge
+  CI now uses a pinned Aegis build and changed-line scan that blocks only new
+  high/critical findings. The local Atheon MCP scan endpoint failed internally;
+  its binary fallback completed on scoped input but is noisy and must remain
+  bounded/excluded from generated build trees.
+- CodeQL Rust compilation and dependency review are now fail-closed; previous
+  `|| true` and `continue-on-error` behavior could report green while the
+  security analysis had not actually completed.
