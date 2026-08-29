@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Install GitForge user-systemd resource policies without restarting services.
+# Dry-run is the default; --apply is required to write files and reload the
+# user manager. A conflicting namespaced drop-in is never overwritten unless
+# --force is explicitly supplied.
+
+apply=0
+force=0
+unit_dir="${GITFORGE_SYSTEMD_USER_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
+policy_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../systemd/user" && pwd)"
+
+usage() {
+    printf 'Usage: %s [--apply] [--force] [--unit-dir DIR]\n' "$(basename "$0")"
+    printf 'Default mode reports changes without writing or reloading systemd.\n'
+}
+
+while (($#)); do
+    case "$1" in
+        --apply) apply=1 ;;
+        --force) force=1 ;;
+        --unit-dir)
+            shift
+            [[ $# -gt 0 ]] || { echo '--unit-dir requires a value' >&2; exit 64; }
+            unit_dir="$1"
+            ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'unknown option: %s\n' "$1" >&2; usage >&2; exit 64 ;;
+    esac
+    shift
+done
+
+declare -a services=(api ci git-server runner)
+declare -A policies=(
+    [api]=gitforge-resource-limits.conf
+    [ci]=gitforge-ci-resource-limits.conf
+    [git-server]=gitforge-resource-limits.conf
+    [runner]=gitforge-runner-resource-limits.conf
+)
+
+for service in "${services[@]}"; do
+    policy="${policy_dir}/${policies[$service]}"
+    target_dir="${unit_dir}/gitforge-${service}.service.d"
+    target="${target_dir}/10-gitforge-resource-limits.conf"
+    if [[ ! -f "$policy" ]]; then
+        printf 'policy install: missing source policy: %s\n' "$policy" >&2
+        exit 1
+    fi
+    if [[ -e "$target" ]] && ! cmp -s "$policy" "$target" && (( ! force )); then
+        printf 'policy install: refusing conflicting drop-in: %s\n' "$target" >&2
+        printf 'policy install: use --force only after reviewing the existing file\n' >&2
+        exit 1
+    fi
+    if (( apply )); then
+        mkdir -p "$target_dir"
+        candidate=$(mktemp "${target_dir}/.gitforge-resource-limits.XXXXXX")
+        trap 'rm -f -- "$candidate"' EXIT INT TERM
+        install -m 0644 "$policy" "$candidate"
+        mv -f -- "$candidate" "$target"
+        trap - EXIT INT TERM
+        printf 'policy install: installed %s\n' "$target"
+    else
+        printf 'policy install: would install %s -> %s\n' "$policy" "$target"
+    fi
+done
+
+if (( apply )); then
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo 'policy install: systemctl is required for --apply' >&2
+        exit 2
+    fi
+    systemctl --user daemon-reload
+    echo 'policy install: user manager reloaded; services were not restarted'
+else
+    echo 'policy install: dry-run; use --apply after review'
+fi
