@@ -63,6 +63,11 @@ unless `api`, `ci`, `git-server`, and `runner` are all present and executable.
 The candidate CI binary owns the scheduler HTTP API, so the legacy standalone
 `gitforge-scheduler-service` must not be mixed into the bundle.
 
+The legacy `make run-all` and `make stop` targets intentionally refuse
+unmanaged background startup and broad process termination. Service lifecycle
+belongs to user-systemd so resource limits, restart behavior, and status remain
+observable and scoped to named GitForge units.
+
 ## Validation and rollout
 
 1. Copy the drop-in into each matching `*.service.d/` directory in a disposable

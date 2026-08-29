@@ -82,12 +82,16 @@ run-git-server:
 	RUST_LOG=info \
 	./target/release/git-server
 
-run-all: build-release
-	./scripts/setup-services.sh
+run-all:
+	@echo "Refusing unmanaged multi-process startup." >&2
+	@echo "Use the Fedora user-systemd release procedure in systemd/user/README.md." >&2
+	@exit 2
 
 # ─── Stop Services ────────────────────────────────────────────────────────────
 stop:
-	./scripts/stop-services.sh
+	@echo "Refusing unmanaged process termination." >&2
+	@echo "Use systemctl --user with the documented GitForge release units." >&2
+	@exit 2
 
 # ─── Docker ───────────────────────────────────────────────────────────────────
 docker-build:
@@ -121,8 +125,8 @@ help:
 	@echo "  make lint              - Run linters"
 	@echo "  make fmt               - Check formatting"
 	@echo ""
-	@echo "  make run-all           - Build and run all services"
-	@echo "  make stop              - Stop all services"
+	@echo "  make run-all           - Refuse unmanaged startup; use Fedora systemd"
+	@echo "  make stop              - Refuse unmanaged termination; use Fedora systemd"
 	@echo ""
 	@echo "  make docker-build      - Build Docker image"
 	@echo "  make docker-up         - Start with Docker Compose"
