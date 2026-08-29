@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+release_dir="${1:-}"
+if [[ -z "$release_dir" ]]; then
+  echo 'usage: gitforge-release-verify <release-directory>' >&2
+  exit 64
+fi
+
+if [[ ! -d "$release_dir" ]]; then
+  printf 'release verify: directory does not exist: %s\n' "$release_dir" >&2
+  exit 1
+fi
+
+required=(api ci git-server runner)
+for binary in "${required[@]}"; do
+  if [[ ! -x "$release_dir/bin/$binary" ]]; then
+    printf 'release verify: missing or non-executable binary: %s\n' "$binary" >&2
+    exit 1
+  fi
+done
+
+if [[ ! -f "$release_dir/MANIFEST.sha256" || ! -f "$release_dir/READY" ]]; then
+  echo 'release verify: READY marker and checksum manifest are required' >&2
+  exit 1
+fi
+
+(
+  cd "$release_dir"
+  sha256sum --check MANIFEST.sha256
+)
+
+ci_unit="$release_dir/systemd/user/gitforge-ci.service.example"
+runner_unit="$release_dir/systemd/user/gitforge-runner.service.example"
+for unit in "$ci_unit" "$runner_unit"; do
+  if [[ ! -f "$unit" ]]; then
+    printf 'release verify: missing unit example: %s\n' "$unit" >&2
+    exit 1
+  fi
+done
+
+grep -Fq 'ExecStart=%h/work/gitforge-current/ci' "$ci_unit"
+grep -Fq 'Environment=SCHEDULER_PORT=42781' "$ci_unit"
+grep -Fq 'Requires=gitforge-ci.service' "$runner_unit"
+grep -Fq 'Environment=GITFORGE_SCHEDULER_URL=http://127.0.0.1:42781' "$runner_unit"
+if grep -Fq 'gitforge-scheduler.service' "$runner_unit"; then
+  echo 'release verify: runner still depends on legacy standalone scheduler' >&2
+  exit 1
+fi
+
+printf 'release verify: valid bundle=%s binaries=%d scheduler-owner=ci\n' \
+  "$release_dir" "${#required[@]}"
