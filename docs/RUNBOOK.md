@@ -1,6 +1,6 @@
 # GitForge Runbook
 
-**Last Updated**: 2026-07-14
+**Last Updated**: 2026-08-29
 
 ## Overview
 
@@ -44,12 +44,14 @@ The API gateway exposes the REST API for frontend integration.
 # Development
 cargo run -p api
 
-# Production
-JWT_SECRET=your-secret ./target/release/api --host 0.0.0.0 --port 42780
+# Production (configure through environment; the binary does not parse CLI
+# host/port flags)
+JWT_SECRET=your-secret PORT=42780 ./target/release/api
 ```
 
 **Environment Variables:**
 - `JWT_SECRET` - Secret for JWT token signing (required)
+- `PORT` - API listen port (default: `42780`)
 - `DATABASE_URL` - SQLite or PostgreSQL URL
 - `GITFORGE_CI_TRIGGER_URL` - CI trigger endpoint used by Git-server after a successful push
 - `GITFORGE_CI_TRIGGER_TOKEN` - bearer token matching CI's `GITFORGE_TRIGGER_TOKEN`
@@ -74,7 +76,7 @@ The Git server handles Git protocol over SSH and HTTP.
 cargo run -p git-server
 
 # Production
-sudo ./target/release/git-server
+./target/release/git-server
 ```
 
 **Ports:**
