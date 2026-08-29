@@ -150,7 +150,7 @@ impl JobExecutor {
     pub async fn new() -> Result<Self> {
         let pool = ContainerPool::new().await?;
         let storage_root = std::env::var("GITFORGE_ARTIFACT_ROOT")
-            .unwrap_or_else(|_| "/tmp/gitforge-artifacts".to_string());
+            .unwrap_or_else(|_| "target/gitforge-artifacts".to_string());
         let artifact_storage = FileStorage::new(storage_root.clone()).await?;
         let log_store = FileJobLogStore::new(&storage_root).await?;
         Ok(Self {

@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     // Runner uploads and API downloads must use the same bounded artifact
     // root. The scheduler never accepts a runner filesystem path.
     let artifact_root = std::env::var("GITFORGE_ARTIFACT_ROOT")
-        .unwrap_or_else(|_| "/tmp/gitforge-artifacts".to_string());
+        .unwrap_or_else(|_| "target/gitforge-artifacts".to_string());
     let artifact_storage = Arc::new(FileStorage::new(artifact_root).await?);
 
     // Create scheduler state for HTTP server (consumes scheduler)
