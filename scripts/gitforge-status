@@ -34,7 +34,7 @@ overall=0
 for unit in "${units[@]}"; do
     active="unknown"
     if command -v systemctl >/dev/null 2>&1; then
-        active=$(systemctl --user is-active "$unit" 2>/dev/null || printf 'inactive')
+        active=$(systemctl --user is-active "$unit" 2>/dev/null) || active="${active:-inactive}"
     fi
 
     http_status="not_applicable"
@@ -42,7 +42,7 @@ for unit in "${units[@]}"; do
         if command -v curl >/dev/null 2>&1; then
             http_status=$(curl --silent --show-error --max-time 5 \
                 --output /dev/null --write-out '%{http_code}' \
-                "${endpoints[$unit]}" 2>/dev/null || printf '000')
+                "${endpoints[$unit]}" 2>/dev/null) || http_status="${http_status:-000}"
         else
             http_status="curl_missing"
         fi
