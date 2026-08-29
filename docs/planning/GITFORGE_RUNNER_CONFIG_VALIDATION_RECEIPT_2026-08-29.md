@@ -15,7 +15,7 @@
 | Implementation commit | `cbe41bb` (feat(runner): require GITFORGE_SCHEDULER_URL env var at startup) |
 | Validation fix commit | `de5f045` (fmt: apply rustfmt to runner config implementation files) |
 | Receipt fix commit | `cab0d46` (docs: fix false SHA in implementation receipt) |
-| Final HEAD | `cab0d46eef43ae3b868ec7d03ec1324d9970f4ac` |
+| Final HEAD | `ccf0a824ede93015c942bd6c32ab2c17c0c3c209` |
 
 ---
 
