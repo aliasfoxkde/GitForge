@@ -185,7 +185,9 @@ machines have mutation/property tests, and documentation checks are automated.
 Goal: applicable web surfaces meet WCAG 2.1 A/AA and maximize AAA criteria.
 
 - [ ] P6-01 Inventory API dashboard HTML and all `template-parts` frontend
-  surfaces; identify ownership and supported browsers.
+  surfaces; identify ownership and supported browsers. Vite React PWA and SSR
+  surfaces are now inventoried with real Playwright web-server configs; API
+  dashboard inventory remains open.
 - [ ] P6-02 Add Playwright keyboard, focus order, reduced motion, reflow/zoom,
   form-label, status-message, contrast, and screen-reader-oriented checks.
 - [ ] P6-03 Run axe or equivalent automated checks and manually review all

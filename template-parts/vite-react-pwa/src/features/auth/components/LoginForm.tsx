@@ -37,7 +37,11 @@ export function LoginForm() {
     <Card className="w-80">
       <form onSubmit={handleSubmit} className="flex flex-col gap-4">
         <h2 className="text-lg font-semibold">Login</h2>
-        {error && <p className="text-sm text-red-500">{error}</p>}
+        {error && (
+          <p className="text-sm text-red-500" role="alert" aria-live="polite">
+            {error}
+          </p>
+        )}
         <Input
           type="email"
           label="Email"

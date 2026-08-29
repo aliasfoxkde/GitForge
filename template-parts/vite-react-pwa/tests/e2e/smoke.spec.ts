@@ -36,4 +36,22 @@ test.describe('Smoke Tests', () => {
     const manifest = await response?.json();
     expect(manifest.name).toBe('Vite React PWA');
   });
+
+  test('homepage exposes semantic landmarks and keyboard order', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.getByRole('main')).toBeVisible();
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('Vite React PWA');
+    await expect(page.getByRole('heading', { name: 'Login' })).toBeVisible();
+
+    const email = page.getByLabel('Email');
+    const password = page.getByLabel('Password');
+    const submit = page.getByRole('button', { name: 'Sign In' });
+    await email.focus();
+    await page.keyboard.press('Tab');
+    await expect(password).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(submit).toBeFocused();
+    await submit.click();
+    await expect(page.getByRole('alert')).toHaveText('Email is required');
+  });
 });
