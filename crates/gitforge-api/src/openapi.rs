@@ -32,6 +32,7 @@ pub fn get_openapi_spec() -> serde_json::Value {
             {"name": "health", "description": "Health check endpoints"},
             {"name": "repos", "description": "Repository management"},
             {"name": "ci", "description": "CI/CD pipelines"},
+            {"name": "users", "description": "Administrative user management"},
             {"name": "runners", "description": "Runner management"},
             {"name": "artifacts", "description": "Artifact management"}
         ],
@@ -140,6 +141,30 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     }
                 }
             },
+            "/users/{id}/role": {
+                "patch": {
+                    "tags": ["users"],
+                    "summary": "Update a user's role",
+                    "description": "Administrator-only role update; the last administrator cannot be demoted.",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/UpdateRoleRequest"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {"description": "Role updated"},
+                        "400": {"description": "Invalid role or user ID"},
+                        "403": {"description": "Administrator access required"},
+                        "409": {"description": "The last administrator cannot be demoted"}
+                    }
+                }
+            },
             "/pipelines": {
                 "get": {
                     "tags": ["ci"],
@@ -224,6 +249,36 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     }
                 }
             },
+            "/jobs": {
+                "post": {
+                    "tags": ["ci"],
+                    "summary": "Submit an owned job",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["pipeline_run_id", "name", "commands", "idempotency_key"],
+                                    "properties": {
+                                        "pipeline_run_id": {"type": "string", "format": "uuid"},
+                                        "name": {"type": "string", "maxLength": 128},
+                                        "commands": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64},
+                                        "working_dir": {"type": ["string", "null"]},
+                                        "idempotency_key": {"type": "string", "maxLength": 128}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {"description": "Job queued"},
+                        "200": {"description": "Idempotent replay"},
+                        "403": {"description": "Repository ownership denied"},
+                        "409": {"description": "Conflicting request or terminal run"}
+                    }
+                }
+            },
             "/jobs/{id}/logs": {
                 "get": {
                     "tags": ["ci"],
@@ -233,6 +288,21 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     ],
                     "responses": {
                         "200": {"description": "Job logs"}
+                    }
+                }
+            },
+            "/jobs/{id}/cancel": {
+                "post": {
+                    "tags": ["ci"],
+                    "summary": "Cancel an owned job",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+                    ],
+                    "responses": {
+                        "200": {"description": "Cancellation persisted"},
+                        "403": {"description": "Repository ownership denied"},
+                        "404": {"description": "Job not found"},
+                        "409": {"description": "Job already terminal"}
                     }
                 }
             },
@@ -327,6 +397,20 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     }
                 }
             },
+            "/artifacts/{id}/content": {
+                "get": {
+                    "tags": ["artifacts"],
+                    "summary": "Download artifact bytes",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "200": {"description": "Artifact bytes"},
+                        "401": {"description": "Authentication required"},
+                        "404": {"description": "Artifact not found"}
+                    }
+                }
+            },
             "/jobs/{job_id}/artifacts": {
                 "get": {
                     "tags": ["artifacts"],
@@ -366,6 +450,16 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     "properties": {
                         "name": {"type": "string"},
                         "visibility": {"type": "string", "nullable": true}
+                    }
+                },
+                "UpdateRoleRequest": {
+                    "type": "object",
+                    "required": ["role"],
+                    "properties": {
+                        "role": {
+                            "type": "string",
+                            "enum": ["admin", "maintainer", "developer", "read_only"]
+                        }
                     }
                 },
                 "PipelineRunResponse": {
@@ -497,6 +591,7 @@ mod tests {
         let paths = spec.get("paths").unwrap().as_object().unwrap();
         assert!(paths.contains_key("/health"));
         assert!(paths.contains_key("/repos"));
+        assert!(paths.contains_key("/users/{id}/role"));
         assert!(paths.contains_key("/pipelines"));
         assert!(paths.contains_key("/runners"));
         assert!(paths.contains_key("/artifacts"));

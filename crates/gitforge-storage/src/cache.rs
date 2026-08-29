@@ -1,11 +1,14 @@
 //! Cache storage
 
 use async_trait::async_trait;
-use gitforge_common::Result;
+use gitforge_common::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 /// Cache key
@@ -125,6 +128,153 @@ pub trait CacheStore: Send + Sync {
 
     /// List all cache entries
     async fn list(&self) -> Result<Vec<CacheEntry>>;
+}
+
+/// File-based cache store for persistent caching
+pub struct FileCacheStore {
+    root: PathBuf,
+}
+
+impl FileCacheStore {
+    /// Create a new file-based cache store
+    pub async fn new(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        let cache_dir = root.join("cache");
+
+        fs::create_dir_all(&cache_dir)
+            .await
+            .map_err(|e| Error::storage(format!("failed to create cache directory: {}", e)))?;
+
+        Ok(Self { root })
+    }
+
+    fn cache_path(&self, key: &CacheKey) -> PathBuf {
+        self.root.join("cache").join(key.hash())
+    }
+
+    fn meta_path(&self, key: &CacheKey) -> PathBuf {
+        self.root
+            .join("cache")
+            .join(format!("{}.meta.json", key.hash()))
+    }
+}
+
+#[async_trait]
+impl CacheStore for FileCacheStore {
+    async fn put(&self, key: CacheKey, data: Vec<u8>) -> Result<()> {
+        let size_bytes = data.len() as u64;
+        let now = chrono::Utc::now();
+
+        let entry = CacheEntry {
+            key: key.clone(),
+            size_bytes,
+            created_at: now,
+            accessed_at: now,
+        };
+
+        let cache_path = self.cache_path(&key);
+        let meta_path = self.meta_path(&key);
+
+        // Write data file
+        let mut file = fs::File::create(&cache_path)
+            .await
+            .map_err(|e| Error::storage(format!("failed to create cache file: {}", e)))?;
+        file.write_all(&data)
+            .await
+            .map_err(|e| Error::storage(format!("failed to write cache data: {}", e)))?;
+
+        // Write metadata file
+        let meta_json = serde_json::to_string(&entry)
+            .map_err(|e| Error::storage(format!("failed to serialize cache entry: {}", e)))?;
+        let mut meta_file = fs::File::create(&meta_path)
+            .await
+            .map_err(|e| Error::storage(format!("failed to create cache metadata file: {}", e)))?;
+        meta_file
+            .write_all(meta_json.as_bytes())
+            .await
+            .map_err(|e| Error::storage(format!("failed to write cache metadata: {}", e)))?;
+
+        tracing::debug!("cached {} bytes to {:?}", size_bytes, cache_path);
+        Ok(())
+    }
+
+    async fn get(&self, key: &CacheKey) -> Result<Option<Vec<u8>>> {
+        let cache_path = self.cache_path(key);
+        let meta_path = self.meta_path(key);
+
+        if !cache_path.exists() {
+            tracing::debug!("cache miss for key");
+            return Ok(None);
+        }
+
+        // Read data
+        let mut file = fs::File::open(&cache_path)
+            .await
+            .map_err(|e| Error::storage(format!("failed to open cache file: {}", e)))?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)
+            .await
+            .map_err(|e| Error::storage(format!("failed to read cache data: {}", e)))?;
+
+        // Update metadata access time
+        if meta_path.exists() {
+            if let Ok(meta_json) = fs::read_to_string(meta_path.as_path()).await {
+                if let Ok(mut entry) = serde_json::from_str::<CacheEntry>(&meta_json) {
+                    entry.accessed_at = chrono::Utc::now();
+                    if let Ok(json) = serde_json::to_string(&entry) {
+                        let _ = fs::write(meta_path.as_path(), json).await;
+                    }
+                }
+            }
+        }
+
+        tracing::debug!("cache hit for key");
+        Ok(Some(data))
+    }
+
+    async fn delete(&self, key: &CacheKey) -> Result<()> {
+        let cache_path = self.cache_path(key);
+        let meta_path = self.meta_path(key);
+
+        if cache_path.exists() {
+            fs::remove_file(&cache_path)
+                .await
+                .map_err(|e| Error::storage(format!("failed to delete cache file: {}", e)))?;
+        }
+        if meta_path.exists() {
+            fs::remove_file(&meta_path)
+                .await
+                .map_err(|e| Error::storage(format!("failed to delete cache metadata: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
+    async fn list(&self) -> Result<Vec<CacheEntry>> {
+        let cache_dir = self.root.join("cache");
+        let mut entries = Vec::new();
+
+        let mut dir = fs::read_dir(&cache_dir)
+            .await
+            .map_err(|e| Error::storage(format!("failed to read cache directory: {}", e)))?;
+
+        while let Some(item) = dir
+            .next_entry()
+            .await
+            .map_err(|e| Error::storage(format!("failed to read cache directory entry: {}", e)))?
+        {
+            let path = item.path();
+            if path.extension().map(|e| e == "meta.json").unwrap_or(false) {
+                if let Ok(meta_json) = fs::read_to_string(path.as_path()).await {
+                    if let Ok(entry) = serde_json::from_str::<CacheEntry>(&meta_json) {
+                        entries.push(entry);
+                    }
+                }
+            }
+        }
+
+        Ok(entries)
+    }
 }
 
 #[cfg(test)]

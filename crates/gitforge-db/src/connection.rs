@@ -53,6 +53,7 @@ impl Pool {
                 username TEXT NOT NULL UNIQUE,
                 email TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'developer',
                 created_at TEXT NOT NULL
             )
             "#,
@@ -60,6 +61,23 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create users table: {}", e)))?;
+
+        // Add the role column for databases created before role persistence
+        // existed. Existing accounts receive the least-privileged developer
+        // role and can be promoted explicitly by an administrative workflow.
+        if let Err(error) =
+            sqlx::query("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'developer'")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(Error::database(format!(
+                    "failed to migrate users table: {}",
+                    error
+                )));
+            }
+        }
 
         // Create repositories table
         sqlx::query(
@@ -153,7 +171,10 @@ impl Pool {
                 finished_at TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
-                image TEXT NOT NULL DEFAULT '',
+                commands TEXT NOT NULL DEFAULT '[]',
+                image TEXT NOT NULL DEFAULT 'rust:latest',
+                working_dir TEXT,
+                result_json TEXT,
                 FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id),
                 FOREIGN KEY (runner_id) REFERENCES runners(id)
             )
@@ -163,27 +184,27 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create jobs table: {}", e)))?;
 
-        // Create job_steps table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS job_steps (
-                id TEXT PRIMARY KEY,
-                job_id TEXT NOT NULL,
-                step_index INTEGER NOT NULL,
-                name TEXT NOT NULL DEFAULT '',
-                run TEXT NOT NULL,
-                env TEXT NOT NULL DEFAULT '{}',
-                working_dir TEXT,
-                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
-                UNIQUE(job_id, step_index)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Error::database(format!("failed to create job_steps table: {}", e)))?;
-
-        // Create artifacts table
+        // Additive migration for databases created before job definitions and
+        // receipts were persisted. SQLite has no portable IF NOT EXISTS form
+        // for ADD COLUMN, so tolerate only the known duplicate-column case.
+        for statement in [
+            "ALTER TABLE jobs ADD COLUMN commands TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE jobs ADD COLUMN image TEXT NOT NULL DEFAULT 'rust:latest'",
+            "ALTER TABLE jobs ADD COLUMN working_dir TEXT",
+            "ALTER TABLE jobs ADD COLUMN result_json TEXT",
+            "ALTER TABLE jobs ADD COLUMN lease_token TEXT",
+            "ALTER TABLE jobs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0",
+        ] {
+            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
+                let message = error.to_string();
+                if !message.contains("duplicate column name") {
+                    return Err(Error::database(format!(
+                        "failed to migrate jobs table: {}",
+                        error
+                    )));
+                }
+            }
+        }
 
         // Create artifacts table
         sqlx::query(
@@ -204,6 +225,26 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create artifacts table: {}", e)))?;
 
+        // Append-only, bounded runner log chunks. The lease fields are not
+        // duplicated here: every append is authorized against the current
+        // job row in JobQueries, so reassigned runners cannot append late
+        // output from an old execution.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS job_log_chunks (
+                job_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                chunk TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (job_id, sequence),
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create job log chunks table: {}", e)))?;
+
         // Create events table
         sqlx::query(
             r#"
@@ -219,47 +260,23 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create events table: {}", e)))?;
 
-        // Durable execution evidence. These tables are additive and safe for
-        // existing SQLite databases; Pool::migrate is the authoritative
-        // migration path for this MVP.
+        // Operator submissions use a durable idempotency record so retries
+        // after a client timeout cannot create a second executable job.
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS job_logs (
-                id TEXT PRIMARY KEY,
-                job_id TEXT NOT NULL UNIQUE,
-                pipeline_run_id TEXT NOT NULL,
-                stdout TEXT NOT NULL DEFAULT '',
-                stderr TEXT NOT NULL DEFAULT '',
-                stdout_truncated INTEGER NOT NULL DEFAULT 0,
-                stderr_truncated INTEGER NOT NULL DEFAULT 0,
+            CREATE TABLE IF NOT EXISTS job_idempotency_keys (
+                scope TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                job_id TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                FOREIGN KEY (job_id) REFERENCES jobs(id),
-                FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id)
+                PRIMARY KEY (scope, idempotency_key)
             )
             "#,
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create job_logs table: {}", e)))?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS event_receipts (
-                id TEXT PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                job_id TEXT,
-                pipeline_run_id TEXT,
-                correlation_id TEXT NOT NULL UNIQUE,
-                payload TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (job_id) REFERENCES jobs(id),
-                FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Error::database(format!("failed to create event_receipts table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create job idempotency table: {}", e)))?;
 
         // Create indexes for performance
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
@@ -287,22 +304,6 @@ impl Pool {
         .map_err(|e| {
             Error::database(format!("failed to create idx_repositories_owner_id: {}", e))
         })?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_job_logs_pipeline_run_id ON job_logs(pipeline_run_id)",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            Error::database(format!(
-                "failed to create idx_job_logs_pipeline_run_id: {}",
-                e
-            ))
-        })?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_event_receipts_pipeline_run_id ON event_receipts(pipeline_run_id)")
-            .execute(&self.pool)
-            .await
-            .map_err(|e| Error::database(format!("failed to create idx_event_receipts_pipeline_run_id: {}", e)))?;
 
         tracing::info!("database migrations completed successfully");
         Ok(())

@@ -2,12 +2,13 @@
 
 use crate::auth::Claims;
 use axum::{
-    extract::Request,
+    extract::{Extension, Request},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
+use gitforge_db::{queries::UserQueries, Pool};
 use std::sync::Arc;
 
 /// Paths that don't require authentication
@@ -22,7 +23,8 @@ pub struct AuthErrorResponse {
 
 /// Authentication middleware
 pub async fn auth_middleware(
-    auth: Arc<crate::auth::ApiAuth>,
+    Extension(auth): Extension<Arc<crate::auth::ApiAuth>>,
+    Extension(pool): Extension<Arc<Pool>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -58,8 +60,26 @@ pub async fn auth_middleware(
 
     // Validate token
     match auth.validate_token(token) {
-        Ok(claims) => {
-            // Store claims in extensions for route handlers
+        Ok(mut claims) => {
+            // Resolve the current persisted role so role changes take effect
+            // immediately instead of waiting for a JWT to expire.
+            match UserQueries::get_role(&pool, claims.user_id).await {
+                Ok(Some(role)) => claims.role = role,
+                Ok(None) => {
+                    return auth_error_response("invalid_token", "Unknown user");
+                }
+                Err(error) => {
+                    tracing::error!(%error, user_id = %claims.user_id, "failed to resolve authenticated user role");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(AuthErrorResponse {
+                            error: "authentication_unavailable".to_string(),
+                            message: "Authentication service unavailable".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
             let mut request = request;
             request.extensions_mut().insert(claims);
             next.run(request).await

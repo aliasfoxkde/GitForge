@@ -1,55 +1,23 @@
 //! Runner agent
 
 use crate::executor::{ExecutableJob, JobExecutor, JobStep};
-use gitforge_common::{Error, JobId, Result, RunnerId};
+use gitforge_common::{Error, JobId, PipelineRunId, Result, RunnerId};
 use gitforge_db::models::Runner;
-use gitforge_sandbox::DockerSandbox;
+use gitforge_sandbox::{DockerSandbox, OutputSink, OutputStream, StepResult};
+use gitforge_storage::ArtifactReceipt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::env;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
-use thiserror::Error as ThisError;
-use tokio::sync::RwLock;
-use tokio::time::interval;
-
-/// Configuration seam errors with actionable messages
-#[derive(ThisError, Debug)]
-pub enum ConfigError {
-    #[error("GITFORGE_SCHEDULER_URL is empty. Set a valid URL (e.g., http://localhost:42781)")]
-    EmptySchedulerUrl,
-
-    #[error("GITFORGE_RUNNER_NAME is empty. Set a non-empty runner name via GITFORGE_RUNNER_NAME")]
-    EmptyRunnerName,
-
-    #[error("GITFORGE_CAPACITY must be a positive integer. Got '{value}'. Set GITFORGE_CAPACITY to a value between 1 and 100")]
-    InvalidCapacity { value: String },
-
-    #[error("GITFORGE_HEARTBEAT_INTERVAL must be a positive integer (seconds). Got '{value}'. Set GITFORGE_HEARTBEAT_INTERVAL to a value between 1 and 3600")]
-    InvalidHeartbeatInterval { value: String },
-
-    #[error("GITFORGE_FETCH_INTERVAL must be a positive integer (seconds). Got '{value}'. Set GITFORGE_FETCH_INTERVAL to a value between 1 and 3600")]
-    InvalidFetchInterval { value: String },
-}
-
-/// Environment variable names for runner configuration
-mod env_vars {
-    /// Scheduler URL environment variable
-    pub const SCHEDULER_URL: &str = "GITFORGE_SCHEDULER_URL";
-    /// Runner name environment variable
-    pub const RUNNER_NAME: &str = "GITFORGE_RUNNER_NAME";
-    /// Runner type environment variable
-    pub const RUNNER_TYPE: &str = "GITFORGE_RUNNER_TYPE";
-    /// Runner capacity environment variable
-    pub const CAPACITY: &str = "GITFORGE_CAPACITY";
-    /// Heartbeat interval environment variable (seconds)
-    pub const HEARTBEAT_INTERVAL: &str = "GITFORGE_HEARTBEAT_INTERVAL";
-    /// Fetch interval environment variable (seconds)
-    pub const FETCH_INTERVAL: &str = "GITFORGE_FETCH_INTERVAL";
-}
+use tokio::fs;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{interval, Duration};
 
 /// Runner configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunnerConfig {
     /// Scheduler URL for job fetching
     pub scheduler_url: String,
@@ -63,156 +31,40 @@ pub struct RunnerConfig {
     pub heartbeat_interval_secs: u64,
     /// Job fetch interval in seconds
     pub fetch_interval_secs: u64,
+    /// Bearer token used for scheduler service authentication.
+    pub scheduler_token: Option<String>,
+}
+
+impl fmt::Debug for RunnerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RunnerConfig")
+            .field("scheduler_url", &self.scheduler_url)
+            .field("name", &self.name)
+            .field("runner_type", &self.runner_type)
+            .field("capacity", &self.capacity)
+            .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field("fetch_interval_secs", &self.fetch_interval_secs)
+            .field(
+                "scheduler_token",
+                &self.scheduler_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
-            scheduler_url: "http://localhost:42781".to_string(),
+            scheduler_url: std::env::var("GITFORGE_SCHEDULER_URL")
+                .unwrap_or_else(|_| "http://localhost:42781".to_string()),
             name: "runner".to_string(),
             runner_type: "docker".to_string(),
             capacity: 2,
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
+            scheduler_token: std::env::var("GITFORGE_SCHEDULER_TOKEN").ok(),
         }
-    }
-}
-
-impl RunnerConfig {
-    /// Build RunnerConfig from environment variables with validation.
-    ///
-    /// Environment variables (all optional, with sensible defaults):
-    /// - GITFORGE_SCHEDULER_URL: Scheduler URL (default: http://localhost:42781)
-    /// - GITFORGE_RUNNER_NAME: Runner name (default: runner)
-    /// - GITFORGE_RUNNER_TYPE: Runner type (default: docker)
-    /// - GITFORGE_CAPACITY: Concurrent job capacity (default: 2, range: 1-100)
-    /// - GITFORGE_HEARTBEAT_INTERVAL: Heartbeat interval in seconds (default: 30, range: 1-3600)
-    /// - GITFORGE_FETCH_INTERVAL: Job fetch interval in seconds (default: 5, range: 1-3600)
-    ///
-    /// # Errors
-    ///
-    /// Returns an actionable ConfigError if:
-    /// - GITFORGE_SCHEDULER_URL is set but empty
-    /// - GITFORGE_RUNNER_NAME is set but empty
-    /// - GITFORGE_CAPACITY is set but not a valid positive integer (1-100)
-    /// - GITFORGE_HEARTBEAT_INTERVAL is set but not a valid positive integer (1-3600)
-    /// - GITFORGE_FETCH_INTERVAL is set but not a valid positive integer (1-3600)
-    pub fn from_env() -> std::result::Result<Self, ConfigError> {
-        // Parse string values
-        let scheduler_url = match env::var(env_vars::SCHEDULER_URL) {
-            Ok(v) if v.trim().is_empty() => return Err(ConfigError::EmptySchedulerUrl),
-            Ok(v) => v,
-            Err(_) => "http://localhost:42781".to_string(),
-        };
-
-        let name = match env::var(env_vars::RUNNER_NAME) {
-            Ok(v) if v.trim().is_empty() => return Err(ConfigError::EmptyRunnerName),
-            Ok(v) => v,
-            Err(_) => "runner".to_string(),
-        };
-
-        let runner_type = env::var(env_vars::RUNNER_TYPE).unwrap_or_else(|_| "docker".to_string());
-
-        // Parse numeric values with validation
-        let capacity = Self::parse_i32_env(env_vars::CAPACITY, 1, 100, || 2)?;
-
-        let heartbeat_interval_secs =
-            Self::parse_u64_env(env_vars::HEARTBEAT_INTERVAL, 1, 3600, || 30)?;
-
-        let fetch_interval_secs = Self::parse_u64_env(env_vars::FETCH_INTERVAL, 1, 3600, || 5)?;
-
-        Ok(Self {
-            scheduler_url,
-            name,
-            runner_type,
-            capacity,
-            heartbeat_interval_secs,
-            fetch_interval_secs,
-        })
-    }
-
-    /// Parse an optional i32 environment variable with range validation.
-    fn parse_i32_env(
-        name: &str,
-        min: i32,
-        max: i32,
-        default: impl FnOnce() -> i32,
-    ) -> std::result::Result<i32, ConfigError> {
-        match env::var(name) {
-            Ok(v) => {
-                let parsed = v
-                    .parse::<i32>()
-                    .map_err(|_| ConfigError::InvalidCapacity { value: v.clone() })?;
-                if !(min..=max).contains(&parsed) {
-                    return Err(ConfigError::InvalidCapacity { value: v });
-                }
-                Ok(parsed)
-            }
-            Err(_) => Ok(default()),
-        }
-    }
-
-    /// Parse an optional u64 environment variable with range validation.
-    fn parse_u64_env(
-        name: &str,
-        min: u64,
-        max: u64,
-        default: impl FnOnce() -> u64,
-    ) -> std::result::Result<u64, ConfigError> {
-        match env::var(name) {
-            Ok(v) => {
-                let parsed = v.parse::<u64>().map_err(|_| match name {
-                    env_vars::HEARTBEAT_INTERVAL => {
-                        ConfigError::InvalidHeartbeatInterval { value: v.clone() }
-                    }
-                    env_vars::FETCH_INTERVAL => {
-                        ConfigError::InvalidFetchInterval { value: v.clone() }
-                    }
-                    _ => ConfigError::InvalidCapacity { value: v.clone() },
-                })?;
-                if !(min..=max).contains(&parsed) {
-                    return Err(match name {
-                        env_vars::HEARTBEAT_INTERVAL => {
-                            ConfigError::InvalidHeartbeatInterval { value: v }
-                        }
-                        env_vars::FETCH_INTERVAL => ConfigError::InvalidFetchInterval { value: v },
-                        _ => ConfigError::InvalidCapacity { value: v },
-                    });
-                }
-                Ok(parsed)
-            }
-            Err(_) => Ok(default()),
-        }
-    }
-
-    /// Get scheduler URL, checking environment first.
-    pub fn scheduler_url(&self) -> &str {
-        &self.scheduler_url
-    }
-
-    /// Get runner name, checking environment first.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Get runner type, checking environment first.
-    pub fn runner_type(&self) -> &str {
-        &self.runner_type
-    }
-
-    /// Get capacity, checking environment first.
-    pub fn capacity(&self) -> i32 {
-        self.capacity
-    }
-
-    /// Get heartbeat interval in seconds, checking environment first.
-    pub fn heartbeat_interval_secs(&self) -> u64 {
-        self.heartbeat_interval_secs
-    }
-
-    /// Get fetch interval in seconds, checking environment first.
-    pub fn fetch_interval_secs(&self) -> u64 {
-        self.fetch_interval_secs
     }
 }
 
@@ -225,14 +77,16 @@ pub struct JobAssignment {
     pub name: String,
     /// Pipeline run ID
     pub pipeline_run_id: String,
-    /// Container image, e.g. "rust:1.75". Required for execution.
-    #[serde(default)]
-    pub image: String,
     /// Commands to execute
-    #[serde(default)]
     pub commands: Vec<String>,
+    #[serde(default = "default_job_image")]
+    pub image: String,
     /// Working directory
     pub working_dir: Option<String>,
+}
+
+fn default_job_image() -> String {
+    "rust:latest".to_string()
 }
 
 /// Runner agent that fetches and executes jobs
@@ -255,7 +109,7 @@ impl RunnerAgent {
             .build()
             .map_err(|e| Error::internal(format!("failed to create HTTP client: {}", e)))?;
 
-        let sandbox = DockerSandbox::new().await?;
+        let sandbox = DockerSandbox::connect_required().await?;
         let executor = JobExecutor::new().await?;
 
         Ok(Self {
@@ -284,32 +138,31 @@ impl RunnerAgent {
             "capacity": runner.capacity,
         });
 
-        match self.client.post(&register_url).json(&request).send().await {
+        let mut register_request = self.client.post(&register_url).json(&request);
+        if let Some(token) = &self.config.scheduler_token {
+            register_request = register_request.bearer_auth(token);
+        }
+        match register_request.send().await {
             Ok(response) => {
                 if response.status().is_success() {
-                    match response.json::<serde_json::Value>().await {
-                        Ok(body) => {
-                            if let Some(server_id) = body
-                                .get("id")
-                                .and_then(|value| value.as_str())
-                                .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                            {
-                                runner.id = RunnerId::from(server_id);
-                            } else {
-                                tracing::warn!(
-                                    "scheduler registration response did not contain a valid runner ID"
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                "failed to decode scheduler registration response: {}",
-                                error
-                            );
+                    if let Ok(payload) = response.json::<serde_json::Value>().await {
+                        if let Some(id) = payload["id"]
+                            .as_str()
+                            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                        {
+                            runner.id = RunnerId::from(id);
                         }
                     }
                     tracing::info!("registered runner {} with scheduler", runner.id);
                 } else {
+                    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                        || response.status() == reqwest::StatusCode::UNAUTHORIZED
+                    {
+                        return Err(Error::internal(format!(
+                            "scheduler authentication rejected registration: {}",
+                            response.status()
+                        )));
+                    }
                     tracing::warn!(
                         "scheduler returned {} for registration, running in standalone mode",
                         response.status()
@@ -345,6 +198,7 @@ impl RunnerAgent {
         let heartbeat_interval = self.config.heartbeat_interval_secs;
         let heartbeat_client = self.client.clone();
         let heartbeat_url = self.config.scheduler_url.clone();
+        let heartbeat_token = self.config.scheduler_token.clone();
         let is_running = self.is_running.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(heartbeat_interval));
@@ -359,7 +213,11 @@ impl RunnerAgent {
                     "{}/runners/{}/heartbeat",
                     heartbeat_url, heartbeat_runner_id
                 );
-                if let Err(e) = heartbeat_client.post(&url).send().await {
+                let mut heartbeat_request = heartbeat_client.post(&url);
+                if let Some(token) = &heartbeat_token {
+                    heartbeat_request = heartbeat_request.bearer_auth(token);
+                }
+                if let Err(e) = heartbeat_request.send().await {
                     tracing::trace!("heartbeat failed: {}", e);
                 }
             }
@@ -369,8 +227,12 @@ impl RunnerAgent {
         let fetch_interval = self.config.fetch_interval_secs;
         let fetch_client = self.client.clone();
         let fetch_url = self.config.scheduler_url.clone();
+        let fetch_runner_id = runner_id;
+        let fetch_token = self.config.scheduler_token.clone();
         let is_running = self.is_running.clone();
         let executor = self.executor.clone();
+        let active_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let active_jobs_for_loop = active_jobs.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(fetch_interval));
             loop {
@@ -381,8 +243,12 @@ impl RunnerAgent {
                 }
                 tracing::debug!("runner checking for jobs...");
 
-                let jobs_url = format!("{}/jobs/pending", fetch_url);
-                match fetch_client.get(&jobs_url).send().await {
+                let jobs_url = format!("{}/jobs/pending?runner_id={}", fetch_url, fetch_runner_id);
+                let mut fetch_request = fetch_client.get(&jobs_url);
+                if let Some(token) = &fetch_token {
+                    fetch_request = fetch_request.bearer_auth(token);
+                }
+                match fetch_request.send().await {
                     Ok(response) => {
                         if response.status().is_success() {
                             if let Ok(jobs) = response.json::<Vec<JobAssignment>>().await {
@@ -392,9 +258,47 @@ impl RunnerAgent {
                                         job.name,
                                         job.job_id
                                     );
-                                    // Execute the job
-                                    Self::execute_job(&executor, &job, &fetch_client, &fetch_url)
+                                    let Some(lease_token) = Self::claim_job(
+                                        &fetch_client,
+                                        &fetch_url,
+                                        &job.job_id,
+                                        fetch_runner_id,
+                                        fetch_token.as_deref(),
+                                    )
+                                    .await
+                                    else {
+                                        tracing::warn!("unable to claim job {}", job.job_id);
+                                        continue;
+                                    };
+                                    {
+                                        let mut active = active_jobs_for_loop.lock().await;
+                                        if !active.insert(job.job_id.clone()) {
+                                            tracing::warn!("job {} is already executing locally; skipping duplicate assignment", job.job_id);
+                                            continue;
+                                        }
+                                    }
+                                    // Execute concurrently so the fetch loop
+                                    // remains responsive and cancellation can
+                                    // be observed while the sandbox runs.
+                                    let executor = executor.clone();
+                                    let client = fetch_client.clone();
+                                    let url = fetch_url.clone();
+                                    let token = fetch_token.clone();
+                                    let active_jobs = active_jobs_for_loop.clone();
+                                    let active_job_id = job.job_id.clone();
+                                    tokio::spawn(async move {
+                                        Self::execute_job(
+                                            &executor,
+                                            &job,
+                                            &client,
+                                            &url,
+                                            fetch_runner_id,
+                                            &lease_token,
+                                            token.as_deref(),
+                                        )
                                         .await;
+                                        active_jobs.lock().await.remove(&active_job_id);
+                                    });
                                 }
                             }
                         }
@@ -415,8 +319,16 @@ impl RunnerAgent {
     }
 
     /// Stop the runner agent
-    pub async fn stop(&self) {
+    /// If force is true, cancel all running jobs immediately.
+    /// Otherwise, wait for jobs to complete gracefully.
+    pub async fn stop(&self, force: bool) {
         *self.is_running.write().await = false;
+
+        if force {
+            tracing::info!("force stopping - cancelling all active jobs");
+            self.executor.cancel_all_jobs().await;
+        }
+
         let runner_id = self
             .runner
             .as_ref()
@@ -425,23 +337,53 @@ impl RunnerAgent {
         tracing::info!("runner {} stopped", runner_id);
     }
 
+    /// Wait for all active jobs to complete within the given timeout
+    pub async fn wait_for_jobs_complete(&self, timeout_duration: tokio::time::Duration) -> bool {
+        self.executor.wait_for_jobs_complete(timeout_duration).await
+    }
+
     /// Check if agent is running
     pub async fn is_running(&self) -> bool {
         *self.is_running.read().await
     }
 
-    /// Execute a job assignment.
-    ///
-    /// Fails-closed if the assignment has an empty image or no commands,
-    /// because both are required for safe sandbox execution. The scheduler is
-    /// responsible for ensuring only properly-configured jobs reach this point.
-    /// On failure a completion report is sent to the scheduler so the job is not
-    /// left in limbo.
+    /// Execute a job assignment
+    async fn claim_job(
+        client: &Client,
+        scheduler_url: &str,
+        job_id: &str,
+        runner_id: RunnerId,
+        scheduler_token: Option<&str>,
+    ) -> Option<String> {
+        let url = format!("{}/jobs/{}/claim", scheduler_url, job_id);
+        let mut request = client
+            .post(url)
+            .json(&serde_json::json!({"runner_id": runner_id.to_string()}));
+        if let Some(token) = scheduler_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response
+            .json::<serde_json::Value>()
+            .await
+            .ok()?
+            .get("lease_token")
+            .and_then(|token| token.as_str())
+            .map(ToOwned::to_owned)
+    }
+
+    /// Execute a job assignment
     async fn execute_job(
         executor: &Arc<JobExecutor>,
         assignment: &JobAssignment,
         client: &Client,
         scheduler_url: &str,
+        runner_id: RunnerId,
+        lease_token: &str,
+        scheduler_token: Option<&str>,
     ) {
         let job_id = match uuid::Uuid::parse_str(&assignment.job_id) {
             Ok(id) => JobId::from(id),
@@ -451,67 +393,16 @@ impl RunnerAgent {
             }
         };
 
-        // Fail-closed: reject assignments without a configured image.
-        // An empty image means the job was not properly created through the API pipeline.
-        if assignment.image.is_empty() {
-            tracing::error!(
-                "job {} has empty image — refusing to execute (job not created through API pipeline?)",
-                assignment.job_id
-            );
-            // Report failure back to scheduler so the job is not left in limbo
-            let complete_url = format!("{}/jobs/{}/complete", scheduler_url, assignment.job_id);
-            let failure_request = serde_json::json!({
-                "success": false,
-                "exit_code": -1,
-                "error": "job has no image configured (malformed job metadata)",
-            });
-            if let Err(e) = client
-                .post(&complete_url)
-                .json(&failure_request)
-                .send()
-                .await
-            {
-                tracing::error!(
-                    "failed to report malformed job {}: {}",
-                    assignment.job_id,
-                    e
-                );
-            }
-            return;
-        }
+        // Convert assignment to ExecutableJob
+        let pipeline_run_id = uuid::Uuid::parse_str(&assignment.pipeline_run_id)
+            .map(PipelineRunId::from)
+            .unwrap_or_else(|_| PipelineRunId::new());
 
-        // Fail-closed: reject assignments without commands.
-        // An empty commands list means the job has no steps, which is a
-        // malformed execution request regardless of how it reached the runner.
-        if assignment.commands.is_empty() {
-            tracing::error!(
-                "job {} has no commands — refusing to execute (malformed job metadata)",
-                assignment.job_id
-            );
-            let complete_url = format!("{}/jobs/{}/complete", scheduler_url, assignment.job_id);
-            let failure_request = serde_json::json!({
-                "success": false,
-                "exit_code": -1,
-                "error": "job has no commands configured (malformed job metadata)",
-            });
-            if let Err(e) = client
-                .post(&complete_url)
-                .json(&failure_request)
-                .send()
-                .await
-            {
-                tracing::error!(
-                    "failed to report malformed job {}: {}",
-                    assignment.job_id,
-                    e
-                );
-            }
-            return;
-        }
-
-        // Convert assignment to ExecutableJob using the actual image from the scheduler
         let executable = ExecutableJob {
             job_id,
+            pipeline_run_id,
+            repository_id: None,
+            base_sha: None,
             image: assignment.image.clone(),
             steps: assignment
                 .commands
@@ -525,17 +416,101 @@ impl RunnerAgent {
                 .collect(),
             env: std::collections::HashMap::new(),
             working_dir: assignment.working_dir.clone(),
-            timeout_secs: 3600,
+            timeout_secs: 300,
         };
 
-        tracing::info!(
-            "executing job {} in container image {}",
-            assignment.job_id,
-            assignment.image
-        );
+        tracing::info!("executing job {} in container", assignment.job_id);
 
-        // Execute the job
-        let result = executor.execute(executable).await;
+        let started_url = format!("{}/jobs/{}/started", scheduler_url, assignment.job_id);
+        let mut started_request = client.post(&started_url).json(&serde_json::json!({
+            "runner_id": runner_id.to_string(),
+            "lease_token": lease_token,
+        }));
+        if let Some(token) = scheduler_token {
+            started_request = started_request.bearer_auth(token);
+        }
+        let started = started_request
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false);
+        if !started {
+            tracing::error!("failed to mark job {} started", assignment.job_id);
+            return;
+        }
+
+        let cancellation_client = client.clone();
+        let cancellation_url = scheduler_url.to_string();
+        let cancellation_job_id = assignment.job_id.clone();
+        let cancellation_executor = executor.clone();
+        let cancellation_token = scheduler_token.map(ToOwned::to_owned);
+        let cancellation_watch = tokio::spawn(async move {
+            let endpoint = format!(
+                "{}/jobs/{}/cancelled",
+                cancellation_url, cancellation_job_id
+            );
+            let mut probe_failures = 0u8;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut request = cancellation_client.get(&endpoint);
+                if let Some(token) = &cancellation_token {
+                    request = request.bearer_auth(token);
+                }
+                match request.send().await {
+                    Ok(response) if response.status().is_success() => {
+                        probe_failures = 0;
+                        let cancelled = response
+                            .json::<serde_json::Value>()
+                            .await
+                            .ok()
+                            .and_then(|payload| payload["cancelled"].as_bool())
+                            .unwrap_or(false);
+                        if cancelled {
+                            if let Ok(job_id) = uuid::Uuid::parse_str(&cancellation_job_id) {
+                                let job_id = JobId::from(job_id);
+                                if let Err(error) = cancellation_executor.cancel(&job_id).await {
+                                    tracing::warn!(%error, %job_id, "failed to destroy cancelled sandbox");
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    Ok(response) => {
+                        probe_failures = probe_failures.saturating_add(1);
+                        tracing::warn!(status = %response.status(), attempt = probe_failures, "job cancellation probe rejected");
+                    }
+                    Err(error) => {
+                        probe_failures = probe_failures.saturating_add(1);
+                        tracing::warn!(%error, attempt = probe_failures, "job cancellation probe failed");
+                    }
+                }
+                if probe_failures >= 3 {
+                    tracing::error!(
+                        "cancellation probe unavailable repeatedly; stopping local job sandbox"
+                    );
+                    if let Ok(job_id) = uuid::Uuid::parse_str(&cancellation_job_id) {
+                        let _ = cancellation_executor.cancel(&JobId::from(job_id)).await;
+                    }
+                    break;
+                }
+            }
+        });
+
+        // Execute the job. Output is sent to the scheduler while the sandbox
+        // is running; the bounded sink applies network backpressure and never
+        // changes the job's success result if observability is degraded.
+        let live_logs = Arc::new(LiveLogSink::new(
+            client,
+            scheduler_url,
+            &assignment.job_id,
+            runner_id,
+            lease_token,
+            scheduler_token,
+        ));
+        let result = executor
+            .execute_with_output(executable, Some(live_logs.clone()))
+            .await;
+        cancellation_watch.abort();
 
         tracing::info!(
             "job {} completed: success={}, exit_code={}",
@@ -543,6 +518,40 @@ impl RunnerAgent {
             result.success,
             result.exit_code
         );
+
+        let protocol = RunnerProtocol {
+            client,
+            scheduler_url,
+            job_id: &assignment.job_id,
+            runner_id,
+            lease_token,
+            scheduler_token,
+        };
+        if !live_logs.sent_any() {
+            if let Err(error) = report_log_chunks(&protocol, &result.step_results).await {
+                tracing::warn!(%error, job_id = %assignment.job_id, "failed to stream job logs");
+            }
+        } else if live_logs.failed() {
+            tracing::warn!(job_id = %assignment.job_id, "live log delivery was degraded");
+        }
+
+        let uploaded_artifacts = match report_artifacts(
+            &protocol,
+            result.workspace_path.as_deref(),
+            &result.artifacts,
+        )
+        .await
+        {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                tracing::warn!(%error, job_id = %assignment.job_id, "failed to upload job artifacts");
+                result
+                    .artifacts
+                    .iter()
+                    .filter_map(|artifact| serde_json::to_value(artifact).ok())
+                    .collect()
+            }
+        };
 
         // Report completion to scheduler with full results
         let complete_url = format!("{}/jobs/{}/complete", scheduler_url, assignment.job_id);
@@ -561,27 +570,243 @@ impl RunnerAgent {
             .collect();
 
         let complete_request = serde_json::json!({
+            "contract_version": "harness.job.v1",
+            "runner_id": runner_id.to_string(),
+            "lease_token": lease_token,
             "success": result.success,
             "exit_code": result.exit_code,
             "error": result.error,
             "step_results": step_results_json,
+            "artifacts": uploaded_artifacts,
         });
 
-        if let Err(e) = client
-            .post(&complete_url)
-            .json(&complete_request)
-            .send()
-            .await
-        {
-            tracing::error!("failed to report job completion: {}", e);
+        let mut complete_request_builder = client.post(&complete_url).json(&complete_request);
+        if let Some(token) = scheduler_token {
+            complete_request_builder = complete_request_builder.bearer_auth(token);
+        }
+        match complete_request_builder.send().await {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                tracing::error!("scheduler rejected job completion: {}", response.status())
+            }
+            Err(error) => tracing::error!("failed to report job completion: {}", error),
         }
     }
+}
+
+struct LiveLogSink {
+    client: Client,
+    endpoint: String,
+    runner_id: RunnerId,
+    lease_token: String,
+    scheduler_token: Option<String>,
+    sent_chunks: std::sync::atomic::AtomicUsize,
+    failed_delivery: std::sync::atomic::AtomicBool,
+}
+
+impl LiveLogSink {
+    fn new(
+        client: &Client,
+        scheduler_url: &str,
+        job_id: &str,
+        runner_id: RunnerId,
+        lease_token: &str,
+        scheduler_token: Option<&str>,
+    ) -> Self {
+        Self {
+            client: client.clone(),
+            endpoint: format!("{scheduler_url}/jobs/{job_id}/logs"),
+            runner_id,
+            lease_token: lease_token.to_string(),
+            scheduler_token: scheduler_token.map(ToOwned::to_owned),
+            sent_chunks: std::sync::atomic::AtomicUsize::new(0),
+            failed_delivery: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn sent_any(&self) -> bool {
+        self.sent_chunks.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    fn failed(&self) -> bool {
+        self.failed_delivery
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl OutputSink for LiveLogSink {
+    async fn on_output(&self, stream: OutputStream, chunk: Vec<u8>) -> gitforge_common::Result<()> {
+        let label = match stream {
+            OutputStream::Stdout => "stdout",
+            OutputStream::Stderr => "stderr",
+        };
+        let text = String::from_utf8_lossy(&chunk);
+        for part in utf8_chunks(&text, 60 * 1024) {
+            let mut request = self.client.post(&self.endpoint).json(&serde_json::json!({
+                "contract_version": "harness.job.v1",
+                "runner_id": self.runner_id.to_string(),
+                "lease_token": self.lease_token,
+                "chunk": format!("[{label}]\n{part}"),
+            }));
+            if let Some(token) = &self.scheduler_token {
+                request = request.bearer_auth(token);
+            }
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    self.sent_chunks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(response) => {
+                    self.failed_delivery
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(status = %response.status(), "scheduler rejected live log chunk");
+                }
+                Err(error) => {
+                    self.failed_delivery
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(%error, "live log delivery failed");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Upload final step output in bounded, UTF-8-safe chunks before completion.
+/// The scheduler persists each chunk under the runner lease; this provides a
+/// durable tail immediately before the terminal receipt while the sandbox
+/// streaming interface is still being expanded.
+struct RunnerProtocol<'a> {
+    client: &'a Client,
+    scheduler_url: &'a str,
+    job_id: &'a str,
+    runner_id: RunnerId,
+    lease_token: &'a str,
+    scheduler_token: Option<&'a str>,
+}
+
+async fn report_log_chunks(
+    protocol: &RunnerProtocol<'_>,
+    step_results: &[StepResult],
+) -> anyhow::Result<()> {
+    let endpoint = format!("{}/jobs/{}/logs", protocol.scheduler_url, protocol.job_id);
+    for (index, result) in step_results.iter().enumerate() {
+        let mut output = String::new();
+        if !result.stdout.is_empty() {
+            output.push_str(&format!("[step {index} stdout]\n{}\n", result.stdout));
+        }
+        if !result.stderr.is_empty() {
+            output.push_str(&format!("[step {index} stderr]\n{}\n", result.stderr));
+        }
+        for chunk in utf8_chunks(&output, 60 * 1024) {
+            let mut request = protocol.client.post(&endpoint).json(&serde_json::json!({
+                "contract_version": "harness.job.v1",
+                "runner_id": protocol.runner_id.to_string(),
+                "lease_token": protocol.lease_token,
+                "chunk": chunk,
+            }));
+            if let Some(token) = protocol.scheduler_token {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await?;
+            if !response.status().is_success() {
+                anyhow::bail!("scheduler rejected log append: {}", response.status());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn utf8_chunks(value: &str, max_bytes: usize) -> Vec<&str> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < value.len() {
+        let mut end = (start + max_bytes).min(value.len());
+        while end > start && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = value[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| start + offset)
+                .unwrap_or(value.len());
+        }
+        chunks.push(&value[start..end]);
+        start = end;
+    }
+    chunks
+}
+
+async fn report_artifacts(
+    protocol: &RunnerProtocol<'_>,
+    workspace_path: Option<&str>,
+    artifacts: &[ArtifactReceipt],
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let Some(workspace_path) = workspace_path else {
+        return Ok(Vec::new());
+    };
+    if artifacts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let artifact_root = fs::canonicalize(Path::new(workspace_path).join("artifacts")).await?;
+    let endpoint = format!(
+        "{}/jobs/{}/artifacts",
+        protocol.scheduler_url, protocol.job_id
+    );
+    let mut uploaded = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let path = artifact_root.join(&artifact.name);
+        let canonical = fs::canonicalize(&path).await?;
+        if !canonical.starts_with(&artifact_root) {
+            anyhow::bail!("artifact path escapes artifact directory");
+        }
+        let data = fs::read(&canonical).await?;
+        let checksum = sha256_hex(&data);
+        if checksum != artifact.sha256 {
+            anyhow::bail!("artifact checksum changed before upload: {}", artifact.name);
+        }
+        let mut request = protocol
+            .client
+            .post(&endpoint)
+            .header("x-runner-id", protocol.runner_id.to_string())
+            .header("x-lease-token", protocol.lease_token)
+            .header("x-artifact-name", &artifact.name)
+            .header("x-artifact-sha256", &checksum)
+            .body(data);
+        if let Some(token) = protocol.scheduler_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            anyhow::bail!("scheduler rejected artifact upload: {}", response.status());
+        }
+        uploaded.push(response.json::<serde_json::Value>().await?);
+    }
+    Ok(uploaded)
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+
+    #[test]
+    fn test_utf8_chunks_preserve_boundaries() {
+        let value = "ééé";
+        let chunks = utf8_chunks(value, 3);
+        assert_eq!(chunks.concat(), value);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 3));
+    }
 
     #[tokio::test]
     async fn test_runner_creation() {
@@ -616,7 +841,7 @@ mod tests {
     async fn test_runner_agent_stop() {
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
-        agent.stop().await;
+        agent.stop(false).await;
         // No panic means success
     }
 
@@ -629,6 +854,7 @@ mod tests {
             capacity: 5,
             heartbeat_interval_secs: 60,
             fetch_interval_secs: 10,
+            scheduler_token: None,
         };
         assert_eq!(config.name, "custom-runner");
         assert_eq!(config.capacity, 5);
@@ -642,8 +868,8 @@ mod tests {
             job_id: "job-123".to_string(),
             name: "build".to_string(),
             pipeline_run_id: "run-456".to_string(),
-            image: "rust:1.75".to_string(),
             commands: vec!["cargo build".to_string(), "cargo test".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
         };
 
@@ -659,12 +885,11 @@ mod tests {
             job_id: "job-456".to_string(),
             name: "test".to_string(),
             pipeline_run_id: "run-789".to_string(),
-            image: "python:3.12".to_string(),
             commands: vec!["cargo test".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         assert!(assignment.working_dir.is_none());
-        assert_eq!(assignment.image, "python:3.12");
     }
 
     #[test]
@@ -680,8 +905,8 @@ mod tests {
             job_id: "job-123".to_string(),
             name: "build".to_string(),
             pipeline_run_id: "run-456".to_string(),
-            image: "rust:1.75".to_string(),
             commands: vec!["cargo build".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         let debug_str = format!("{:?}", assignment);
@@ -710,8 +935,8 @@ mod tests {
             job_id: "job-123".to_string(),
             name: "build".to_string(),
             pipeline_run_id: "run-456".to_string(),
-            image: "rust:1.75".to_string(),
             commands: vec!["cargo build".to_string(), "cargo test".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
         };
 
@@ -726,7 +951,6 @@ mod tests {
         assert_eq!(deserialized.name, assignment.name);
         assert_eq!(deserialized.commands, assignment.commands);
         assert_eq!(deserialized.working_dir, assignment.working_dir);
-        assert_eq!(deserialized.image, "rust:1.75");
     }
 
     #[test]
@@ -735,13 +959,12 @@ mod tests {
             job_id: "job-empty".to_string(),
             name: "noop".to_string(),
             pipeline_run_id: "run-001".to_string(),
-            image: "rust:1.75".to_string(),
             commands: vec![],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         assert!(assignment.commands.is_empty());
         assert!(assignment.working_dir.is_none());
-        assert_eq!(assignment.image, "rust:1.75");
     }
 
     #[test]
@@ -756,12 +979,11 @@ mod tests {
             job_id: "job-multi".to_string(),
             name: "full-pipeline".to_string(),
             pipeline_run_id: "run-002".to_string(),
-            image: "rust:1.75".to_string(),
             commands,
+            image: "rust:latest".to_string(),
             working_dir: Some("/project".to_string()),
         };
         assert_eq!(assignment.commands.len(), 4);
-        assert_eq!(assignment.image, "rust:1.75");
     }
 
     #[tokio::test]
@@ -799,6 +1021,7 @@ mod tests {
             capacity: 8,
             heartbeat_interval_secs: 15,
             fetch_interval_secs: 3,
+            scheduler_token: None,
         };
 
         assert_eq!(config.scheduler_url, "http://example.com:8081");
@@ -838,16 +1061,16 @@ mod tests {
             job_id: "job-1".to_string(),
             name: "build".to_string(),
             pipeline_run_id: "run-1".to_string(),
-            image: "rust:1.75".to_string(),
             commands: vec!["echo 1".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         let assignment2 = JobAssignment {
             job_id: "job-1".to_string(),
             name: "build".to_string(),
             pipeline_run_id: "run-1".to_string(),
-            image: "rust:1.75".to_string(),
             commands: vec!["echo 1".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         // JobAssignment should implement PartialEq if we add it
@@ -862,8 +1085,8 @@ mod tests {
             job_id: "minimal-job".to_string(),
             name: "test".to_string(),
             pipeline_run_id: "run-min".to_string(),
-            image: "rust:1.75".to_string(),
             commands: vec!["true".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
 
@@ -871,7 +1094,6 @@ mod tests {
         assert!(json.contains("minimal-job"));
         assert!(json.contains("test"));
         assert!(json.contains("minimal-job"));
-        assert!(json.contains("rust:1.75"));
     }
 
     #[tokio::test]
@@ -879,7 +1101,7 @@ mod tests {
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         // Stop without running should not panic
-        agent.stop().await;
+        agent.stop(false).await;
     }
 
     #[tokio::test]
@@ -891,7 +1113,7 @@ mod tests {
         let mut agent = RunnerAgent::new(config).await.unwrap();
         agent.register().await.unwrap();
         // Stop after registration should not panic
-        agent.stop().await;
+        agent.stop(false).await;
     }
 
     #[test]
@@ -915,6 +1137,7 @@ mod tests {
             capacity: 0,
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
+            scheduler_token: None,
         };
         assert_eq!(config.capacity, 0);
     }
@@ -926,130 +1149,11 @@ mod tests {
             job_id: "job-many".to_string(),
             name: "many-steps".to_string(),
             pipeline_run_id: "run-many".to_string(),
-            image: "rust:1.75".to_string(),
             commands,
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         assert_eq!(assignment.commands.len(), 100);
-        assert_eq!(assignment.image, "rust:1.75");
-    }
-
-    #[test]
-    fn test_job_assignment_empty_image_deserializes_from_missing_field() {
-        // When image is missing in JSON, #[serde(default)] should make it empty string.
-        // The runner's execute_job will then fail-closed (reject with error).
-        let json = r#"{"job_id":"job-no-img","name":"test","pipeline_run_id":"run-1","commands":["echo hello"]}"#;
-        let assignment: JobAssignment = serde_json::from_str(json).unwrap();
-        assert!(
-            assignment.image.is_empty(),
-            "missing image field should deserialize to empty string via #[serde(default)]"
-        );
-        assert_eq!(assignment.commands.len(), 1);
-    }
-
-    #[test]
-    fn test_job_assignment_deserialize_with_null_image() {
-        // Explicit null for image field is a deserialization error (not a default value).
-        // #[serde(default)] only applies when the field is MISSING, not when it's null.
-        // This is correct fail-closed behavior: malformed JSON should not silently succeed.
-        let json = r#"{"job_id":"job-null-img","name":"test","pipeline_run_id":"run-1","image":null,"commands":["true"]}"#;
-        let result: std::result::Result<JobAssignment, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "explicit null image should fail to deserialize"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("null"),
-            "error should mention null type mismatch"
-        );
-    }
-
-    #[test]
-    fn test_job_assignment_missing_commands_defaults_to_empty_vec() {
-        // When commands is missing in JSON, #[serde(default)] produces an empty Vec.
-        // execute_job then fails-closed because an empty command list is malformed.
-        let json = r#"{"job_id":"job-no-cmds","name":"test","pipeline_run_id":"run-1","image":"rust:1.75"}"#;
-        let assignment: JobAssignment = serde_json::from_str(json).unwrap();
-        assert!(
-            assignment.commands.is_empty(),
-            "missing commands field should deserialize to empty Vec via #[serde(default)]"
-        );
-        assert_eq!(assignment.image, "rust:1.75");
-    }
-
-    #[test]
-    fn test_job_assignment_deserialize_with_null_commands() {
-        // Explicit null for commands field is a deserialization error (not a default value).
-        // #[serde(default)] only applies when the field is MISSING, not when it's null.
-        // This is correct fail-closed behavior: malformed JSON should not silently succeed.
-        let json = r#"{"job_id":"job-null-cmd","name":"test","pipeline_run_id":"run-1","image":"rust:1.75","commands":null}"#;
-        let result: std::result::Result<JobAssignment, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "explicit null commands should fail to deserialize"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("null"),
-            "error should mention null type mismatch"
-        );
-    }
-
-    #[test]
-    fn test_job_assignment_empty_commands_vec_rejected_at_execute() {
-        // An assignment with an explicitly empty commands Vec is a valid struct,
-        // but execute_job must fail-closed on it (same as missing image).
-        // This test documents the structural validity; the runtime rejection is
-        // exercised by execute_job's fail-closed check on assignment.commands.is_empty().
-        let assignment = JobAssignment {
-            job_id: "job-empty-cmds".to_string(),
-            name: "test".to_string(),
-            pipeline_run_id: "run-1".to_string(),
-            image: "rust:1.75".to_string(),
-            commands: vec![],
-            working_dir: None,
-        };
-        // Struct is valid but commands are empty → execute_job will reject it
-        assert!(assignment.commands.is_empty());
-        assert!(!assignment.image.is_empty());
-    }
-
-    #[test]
-    fn test_job_assignment_valid_image_and_commands_reaches_executor() {
-        // Valid assignment: non-empty image AND non-empty commands.
-        // execute_job builds an ExecutableJob and calls executor.execute().
-        let assignment = JobAssignment {
-            job_id: "job-valid".to_string(),
-            name: "build".to_string(),
-            pipeline_run_id: "run-1".to_string(),
-            image: "rust:1.75".to_string(),
-            commands: vec!["cargo build".to_string(), "cargo test".to_string()],
-            working_dir: Some("/repo".to_string()),
-        };
-        assert!(!assignment.image.is_empty(), "image must be non-empty");
-        assert!(
-            !assignment.commands.is_empty(),
-            "commands must be non-empty"
-        );
-        assert_eq!(assignment.commands.len(), 2);
-    }
-
-    #[test]
-    fn test_job_assignment_roundtrip_with_image() {
-        let assignment = JobAssignment {
-            job_id: "job-rt".to_string(),
-            name: "build".to_string(),
-            pipeline_run_id: "run-rt".to_string(),
-            image: "rust:1.75".to_string(),
-            commands: vec!["cargo build".to_string(), "cargo test".to_string()],
-            working_dir: Some("/repo".to_string()),
-        };
-        let json = serde_json::to_string(&assignment).unwrap();
-        let deserialized: JobAssignment = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.image, "rust:1.75");
-        assert_eq!(deserialized.commands, vec!["cargo build", "cargo test"]);
-        assert_eq!(deserialized.working_dir, Some("/repo".to_string()));
     }
 
     #[test]
@@ -1058,14 +1162,13 @@ mod tests {
             job_id: "clone-test".to_string(),
             name: "test".to_string(),
             pipeline_run_id: "run-1".to_string(),
-            image: "rust:1.75".to_string(),
             commands: vec!["echo clone".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         let cloned = assignment.clone();
         assert_eq!(cloned.job_id, assignment.job_id);
         assert_eq!(cloned.commands, assignment.commands);
-        assert_eq!(cloned.image, assignment.image);
     }
 
     #[test]
@@ -1074,12 +1177,11 @@ mod tests {
             job_id: "job-unicode".to_string(),
             name: "测试任务".to_string(),
             pipeline_run_id: "run-unicode".to_string(),
-            image: "rust:1.75".to_string(),
             commands: vec!["echo 测试".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         assert_eq!(assignment.name, "测试任务");
-        assert_eq!(assignment.image, "rust:1.75");
     }
 
     #[test]
@@ -1088,16 +1190,15 @@ mod tests {
             job_id: "special-cmd".to_string(),
             name: "special".to_string(),
             pipeline_run_id: "run-special".to_string(),
-            image: "rust:1.75".to_string(),
             commands: vec![
                 "echo $HOME".to_string(),
                 "echo \"quoted\"".to_string(),
                 "echo 'single'".to_string(),
             ],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         assert_eq!(assignment.commands.len(), 3);
-        assert_eq!(assignment.image, "rust:1.75");
     }
 
     #[test]
@@ -1109,6 +1210,7 @@ mod tests {
             capacity: 4,
             heartbeat_interval_secs: 45,
             fetch_interval_secs: 10,
+            scheduler_token: None,
         };
         assert!(config.scheduler_url.contains("user:pass"));
     }
@@ -1136,6 +1238,7 @@ mod tests {
             capacity: 10,
             heartbeat_interval_secs: 60,
             fetch_interval_secs: 15,
+            scheduler_token: None,
         };
         let agent = RunnerAgent::new(config).await.unwrap();
         assert!(agent.runner.is_none());
@@ -1155,8 +1258,8 @@ mod tests {
             job_id: "empty-wd".to_string(),
             name: "test".to_string(),
             pipeline_run_id: "run-1".to_string(),
-            image: "rust:1.75".to_string(),
             commands: vec!["echo test".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: Some("".to_string()),
         };
         assert!(assignment.working_dir.is_some());
@@ -1193,7 +1296,7 @@ mod tests {
         assert!(agent.is_running().await);
 
         // Stop it
-        agent.stop().await;
+        agent.stop(false).await;
 
         // Give it time to shutdown
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1211,320 +1314,5 @@ mod tests {
         // Agent is not registered, run should fail
         let result = agent.run().await;
         assert!(result.is_err());
-    }
-
-    // ========================================
-    // Configuration Seam Tests
-    // ========================================
-
-    #[test]
-    fn test_config_error_display() {
-        let err = ConfigError::EmptySchedulerUrl;
-        assert!(err.to_string().contains("GITFORGE_SCHEDULER_URL"));
-
-        let err = ConfigError::EmptyRunnerName;
-        assert!(err.to_string().contains("GITFORGE_RUNNER_NAME"));
-
-        let err = ConfigError::InvalidCapacity {
-            value: "bad".to_string(),
-        };
-        assert!(err.to_string().contains("GITFORGE_CAPACITY"));
-        assert!(err.to_string().contains("bad"));
-
-        let err = ConfigError::InvalidHeartbeatInterval {
-            value: "0".to_string(),
-        };
-        assert!(err.to_string().contains("GITFORGE_HEARTBEAT_INTERVAL"));
-
-        let err = ConfigError::InvalidFetchInterval {
-            value: "-1".to_string(),
-        };
-        assert!(err.to_string().contains("GITFORGE_FETCH_INTERVAL"));
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_from_env_no_vars() {
-        // Clear any existing env vars
-        env::remove_var(env_vars::SCHEDULER_URL);
-        env::remove_var(env_vars::RUNNER_NAME);
-        env::remove_var(env_vars::RUNNER_TYPE);
-        env::remove_var(env_vars::CAPACITY);
-        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
-        env::remove_var(env_vars::FETCH_INTERVAL);
-
-        let config = RunnerConfig::from_env().unwrap();
-        assert_eq!(config.scheduler_url, "http://localhost:42781");
-        assert_eq!(config.name, "runner");
-        assert_eq!(config.runner_type, "docker");
-        assert_eq!(config.capacity, 2);
-        assert_eq!(config.heartbeat_interval_secs, 30);
-        assert_eq!(config.fetch_interval_secs, 5);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_from_env_with_all_vars() {
-        env::set_var(env_vars::SCHEDULER_URL, "http://custom:8081");
-        env::set_var(env_vars::RUNNER_NAME, "test-runner");
-        env::set_var(env_vars::RUNNER_TYPE, "kubernetes");
-        env::set_var(env_vars::CAPACITY, "5");
-        env::set_var(env_vars::HEARTBEAT_INTERVAL, "60");
-        env::set_var(env_vars::FETCH_INTERVAL, "10");
-
-        let config = RunnerConfig::from_env().unwrap();
-        assert_eq!(config.scheduler_url, "http://custom:8081");
-        assert_eq!(config.name, "test-runner");
-        assert_eq!(config.runner_type, "kubernetes");
-        assert_eq!(config.capacity, 5);
-        assert_eq!(config.heartbeat_interval_secs, 60);
-        assert_eq!(config.fetch_interval_secs, 10);
-
-        // Cleanup
-        env::remove_var(env_vars::SCHEDULER_URL);
-        env::remove_var(env_vars::RUNNER_NAME);
-        env::remove_var(env_vars::RUNNER_TYPE);
-        env::remove_var(env_vars::CAPACITY);
-        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
-        env::remove_var(env_vars::FETCH_INTERVAL);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_from_env_partial_vars() {
-        // Only set some vars
-        env::set_var(env_vars::RUNNER_NAME, "partial-runner");
-        env::set_var(env_vars::CAPACITY, "8");
-
-        let config = RunnerConfig::from_env().unwrap();
-        assert_eq!(config.name, "partial-runner");
-        assert_eq!(config.capacity, 8);
-        // Others should be defaults
-        assert_eq!(config.scheduler_url, "http://localhost:42781");
-        assert_eq!(config.runner_type, "docker");
-        assert_eq!(config.heartbeat_interval_secs, 30);
-        assert_eq!(config.fetch_interval_secs, 5);
-
-        // Cleanup
-        env::remove_var(env_vars::RUNNER_NAME);
-        env::remove_var(env_vars::CAPACITY);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_capacity_boundaries() {
-        // Test minimum valid
-        env::set_var(env_vars::CAPACITY, "1");
-        let config = RunnerConfig::from_env().unwrap();
-        assert_eq!(config.capacity, 1);
-        env::remove_var(env_vars::CAPACITY);
-
-        // Test maximum valid
-        env::set_var(env_vars::CAPACITY, "100");
-        let config = RunnerConfig::from_env().unwrap();
-        assert_eq!(config.capacity, 100);
-        env::remove_var(env_vars::CAPACITY);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_heartbeat_boundaries() {
-        // Test minimum valid
-        env::set_var(env_vars::HEARTBEAT_INTERVAL, "1");
-        let config = RunnerConfig::from_env().unwrap();
-        assert_eq!(config.heartbeat_interval_secs, 1);
-        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
-
-        // Test maximum valid
-        env::set_var(env_vars::HEARTBEAT_INTERVAL, "3600");
-        let config = RunnerConfig::from_env().unwrap();
-        assert_eq!(config.heartbeat_interval_secs, 3600);
-        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_fetch_boundaries() {
-        // Test minimum valid
-        env::set_var(env_vars::FETCH_INTERVAL, "1");
-        let config = RunnerConfig::from_env().unwrap();
-        assert_eq!(config.fetch_interval_secs, 1);
-        env::remove_var(env_vars::FETCH_INTERVAL);
-
-        // Test maximum valid
-        env::set_var(env_vars::FETCH_INTERVAL, "3600");
-        let config = RunnerConfig::from_env().unwrap();
-        assert_eq!(config.fetch_interval_secs, 3600);
-        env::remove_var(env_vars::FETCH_INTERVAL);
-    }
-
-    #[test]
-    fn test_config_getter_methods() {
-        let config = RunnerConfig {
-            scheduler_url: "http://getter:9090".to_string(),
-            name: "getter-test".to_string(),
-            runner_type: "firecracker".to_string(),
-            capacity: 7,
-            heartbeat_interval_secs: 45,
-            fetch_interval_secs: 15,
-        };
-
-        assert_eq!(config.scheduler_url(), "http://getter:9090");
-        assert_eq!(config.name(), "getter-test");
-        assert_eq!(config.runner_type(), "firecracker");
-        assert_eq!(config.capacity(), 7);
-        assert_eq!(config.heartbeat_interval_secs(), 45);
-        assert_eq!(config.fetch_interval_secs(), 15);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_default_preserves_values() {
-        // Verify default() produces expected values
-        let config = RunnerConfig::default();
-        assert_eq!(config.scheduler_url, "http://localhost:42781");
-        assert_eq!(config.name, "runner");
-        assert_eq!(config.runner_type, "docker");
-        assert_eq!(config.capacity, 2);
-        assert_eq!(config.heartbeat_interval_secs, 30);
-        assert_eq!(config.fetch_interval_secs, 5);
-
-        // Verify from_env() without vars matches default
-        env::remove_var(env_vars::SCHEDULER_URL);
-        env::remove_var(env_vars::RUNNER_NAME);
-        env::remove_var(env_vars::RUNNER_TYPE);
-        env::remove_var(env_vars::CAPACITY);
-        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
-        env::remove_var(env_vars::FETCH_INTERVAL);
-
-        let from_env = RunnerConfig::from_env().unwrap();
-        assert_eq!(config.scheduler_url, from_env.scheduler_url);
-        assert_eq!(config.name, from_env.name);
-        assert_eq!(config.runner_type, from_env.runner_type);
-        assert_eq!(config.capacity, from_env.capacity);
-        assert_eq!(
-            config.heartbeat_interval_secs,
-            from_env.heartbeat_interval_secs
-        );
-        assert_eq!(config.fetch_interval_secs, from_env.fetch_interval_secs);
-    }
-
-    #[test]
-    fn test_config_env_var_names() {
-        assert_eq!(env_vars::SCHEDULER_URL, "GITFORGE_SCHEDULER_URL");
-        assert_eq!(env_vars::RUNNER_NAME, "GITFORGE_RUNNER_NAME");
-        assert_eq!(env_vars::RUNNER_TYPE, "GITFORGE_RUNNER_TYPE");
-        assert_eq!(env_vars::CAPACITY, "GITFORGE_CAPACITY");
-        assert_eq!(env_vars::HEARTBEAT_INTERVAL, "GITFORGE_HEARTBEAT_INTERVAL");
-        assert_eq!(env_vars::FETCH_INTERVAL, "GITFORGE_FETCH_INTERVAL");
-    }
-
-    // ========================================
-    // Invalid Value Tests
-    // ========================================
-
-    #[test]
-    #[serial]
-    fn test_config_empty_scheduler_url() {
-        env::set_var(env_vars::SCHEDULER_URL, "");
-        let result = RunnerConfig::from_env();
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigError::EmptySchedulerUrl
-        ));
-        env::remove_var(env_vars::SCHEDULER_URL);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_empty_runner_name() {
-        env::set_var(env_vars::RUNNER_NAME, "   ");
-        let result = RunnerConfig::from_env();
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ConfigError::EmptyRunnerName));
-        env::remove_var(env_vars::RUNNER_NAME);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_invalid_capacity_non_numeric() {
-        env::set_var(env_vars::CAPACITY, "abc");
-        let result = RunnerConfig::from_env();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidCapacity { .. }));
-        assert!(err.to_string().contains("abc"));
-        env::remove_var(env_vars::CAPACITY);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_invalid_capacity_zero() {
-        env::set_var(env_vars::CAPACITY, "0");
-        let result = RunnerConfig::from_env();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidCapacity { .. }));
-        assert!(err.to_string().contains("0"));
-        env::remove_var(env_vars::CAPACITY);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_invalid_capacity_out_of_range() {
-        env::set_var(env_vars::CAPACITY, "101");
-        let result = RunnerConfig::from_env();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidCapacity { .. }));
-        assert!(err.to_string().contains("101"));
-        env::remove_var(env_vars::CAPACITY);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_invalid_heartbeat_non_numeric() {
-        env::set_var(env_vars::HEARTBEAT_INTERVAL, "xyz");
-        let result = RunnerConfig::from_env();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidHeartbeatInterval { .. }));
-        assert!(err.to_string().contains("xyz"));
-        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_invalid_heartbeat_out_of_range() {
-        env::set_var(env_vars::HEARTBEAT_INTERVAL, "0");
-        let result = RunnerConfig::from_env();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidHeartbeatInterval { .. }));
-        env::remove_var(env_vars::HEARTBEAT_INTERVAL);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_invalid_fetch_non_numeric() {
-        env::set_var(env_vars::FETCH_INTERVAL, "nan");
-        let result = RunnerConfig::from_env();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidFetchInterval { .. }));
-        assert!(err.to_string().contains("nan"));
-        env::remove_var(env_vars::FETCH_INTERVAL);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_invalid_fetch_out_of_range() {
-        env::set_var(env_vars::FETCH_INTERVAL, "99999");
-        let result = RunnerConfig::from_env();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidFetchInterval { .. }));
-        env::remove_var(env_vars::FETCH_INTERVAL);
     }
 }

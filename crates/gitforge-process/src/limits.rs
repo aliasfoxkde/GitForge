@@ -117,10 +117,8 @@ fn set_memory_limit(max_bytes: u64) -> std::io::Result<()> {
     // RLIMIT_AS = address space limit (memory)
     let output = Command::new("prlimit")
         .args([
-            "--pid",
-            &std::process::id().to_string(),
-            "--as",
-            &format!("{}", max_bytes),
+            &format!("--pid={}", std::process::id()),
+            &format!("--as={}", max_bytes),
         ])
         .output()?;
 
@@ -137,10 +135,8 @@ fn set_memory_limit(max_bytes: u64) -> std::io::Result<()> {
 fn set_cpu_limit(cpu_time_secs: u64) -> std::io::Result<()> {
     let output = Command::new("prlimit")
         .args([
-            "--pid",
-            &std::process::id().to_string(),
-            "--cpu",
-            &format!("{}", cpu_time_secs),
+            &format!("--pid={}", std::process::id()),
+            &format!("--cpu={}", cpu_time_secs),
         ])
         .output()?;
 

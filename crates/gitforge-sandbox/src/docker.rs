@@ -4,6 +4,7 @@ use crate::limits::SandboxLimits;
 use async_trait::async_trait;
 use bollard::container::{
     Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StartContainerOptions,
+    StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
@@ -11,6 +12,9 @@ use bollard::models::HostConfig;
 use bollard::Docker;
 use futures_util::StreamExt;
 use gitforge_common::{Error, JobId, Result};
+use std::path::Path;
+use std::sync::Arc;
+use tokio::time::{sleep, Duration};
 
 /// Sandbox instance handle
 #[derive(Debug, Clone)]
@@ -27,69 +31,82 @@ pub struct StepResult {
     pub stderr: String,
 }
 
+/// Which output stream produced a live execution chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Receives bounded output chunks while a sandbox command is running.
+///
+/// Implementations may apply backpressure by awaiting durable delivery. The
+/// sandbox never hands out an unbounded buffer; Docker frames are delivered as
+/// they arrive and the caller controls any queueing policy.
+#[async_trait]
+pub trait OutputSink: Send + Sync {
+    async fn on_output(&self, stream: OutputStream, chunk: Vec<u8>) -> Result<()>;
+}
+
 /// Docker-based sandbox
 pub struct DockerSandbox {
     docker: Option<Docker>,
     #[allow(dead_code)]
     default_limits: SandboxLimits,
+    /// If true, this is a stub sandbox for testing and should not be used in production
+    is_stub: bool,
 }
 
 impl DockerSandbox {
-    /// Connect to Docker and fail closed when the daemon is unavailable.
-    ///
-    /// Production runners must use this constructor. `new()` remains a
-    /// compatibility path for legacy tests and may create a stub.
+    /// Create a new Docker sandbox, requiring Docker to be available.
+    /// Returns an error if Docker is not available or cannot be reached.
     pub async fn connect_required() -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()
             .map_err(|e| Error::sandbox(format!("failed to connect to Docker: {}", e)))?;
+
+        // Verify connection by pinging Docker
         docker
             .ping()
             .await
             .map_err(|e| Error::sandbox(format!("Docker daemon not available: {}", e)))?;
+
         tracing::info!("Connected to Docker daemon");
+
         Ok(Self {
             docker: Some(docker),
             default_limits: SandboxLimits::default(),
+            is_stub: false,
         })
     }
 
-    /// Create a new Docker sandbox (connects to Docker daemon)
-    pub async fn new() -> Result<Self> {
-        if std::env::var("GITFORGE_SANDBOX_MODE").as_deref() == Ok("required") {
-            return Self::connect_required().await;
-        }
-        let docker = match Docker::connect_with_local_defaults() {
-            Ok(d) => {
-                // Verify connection by pinging Docker
-                match d.ping().await {
-                    Ok(_) => {
-                        tracing::info!("Connected to Docker daemon");
-                        Some(d)
-                    }
-                    Err(e) => {
-                        tracing::warn!("Docker daemon not available: {}. Running in stub mode.", e);
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to connect to Docker: {}. Running in stub mode.", e);
-                None
-            }
-        };
-
-        Ok(Self {
-            docker,
+    /// Create a stub sandbox for testing purposes.
+    /// This sandbox does not actually execute commands - it simulates execution.
+    /// Commands always succeed with exit code 0 in stub mode.
+    pub fn stub_for_tests() -> Self {
+        Self {
+            docker: None,
             default_limits: SandboxLimits::default(),
-        })
+            is_stub: true,
+        }
     }
 
-    /// Create a new Docker sandbox with custom limits
+    /// Create a new Docker sandbox with custom limits (stub mode only).
+    /// DEPRECATED: Use `connect_required()` for production or `stub_for_tests()` for testing.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use connect_required() or stub_for_tests() instead"
+    )]
     pub fn with_limits(limits: SandboxLimits) -> Self {
         Self {
             docker: None,
             default_limits: limits,
+            is_stub: true,
         }
+    }
+
+    /// Returns true if this is a stub sandbox used for testing.
+    pub fn is_stub(&self) -> bool {
+        self.is_stub
     }
 
     /// Check if Docker is available
@@ -147,8 +164,45 @@ pub trait Sandbox: Send + Sync {
         limits: SandboxLimits,
     ) -> Result<SandboxInstance>;
 
-    /// Execute a command in the sandbox
-    async fn execute(&self, instance: &SandboxInstance, command: &[&str]) -> Result<StepResult>;
+    /// Create a sandbox with an isolated host workspace mounted at
+    /// `/workspace`. Implementations may fall back to an ordinary sandbox
+    /// when no workspace is supplied.
+    async fn create_with_workspace(
+        &self,
+        job_id: JobId,
+        image: &str,
+        limits: SandboxLimits,
+        workspace_path: Option<&str>,
+    ) -> Result<SandboxInstance> {
+        let _ = workspace_path;
+        self.create(job_id, image, limits).await
+    }
+
+    /// Execute a command in the sandbox.
+    async fn execute(&self, instance: &SandboxInstance, command: &[&str]) -> Result<StepResult> {
+        self.execute_with_output(instance, command, None).await
+    }
+
+    /// Execute a command and deliver output frames as they arrive.
+    async fn execute_with_output(
+        &self,
+        instance: &SandboxInstance,
+        command: &[&str],
+        sink: Option<Arc<dyn OutputSink>>,
+    ) -> Result<StepResult> {
+        let result = self.execute(instance, command).await?;
+        if let Some(sink) = sink {
+            if !result.stdout.is_empty() {
+                sink.on_output(OutputStream::Stdout, result.stdout.as_bytes().to_vec())
+                    .await?;
+            }
+            if !result.stderr.is_empty() {
+                sink.on_output(OutputStream::Stderr, result.stderr.as_bytes().to_vec())
+                    .await?;
+            }
+        }
+        Ok(result)
+    }
 
     /// Destroy a sandbox instance
     async fn destroy(&self, instance: SandboxInstance) -> Result<()>;
@@ -220,7 +274,93 @@ impl Sandbox for DockerSandbox {
         }
     }
 
+    async fn create_with_workspace(
+        &self,
+        job_id: JobId,
+        image: &str,
+        limits: SandboxLimits,
+        workspace_path: Option<&str>,
+    ) -> Result<SandboxInstance> {
+        let Some(workspace_path) = workspace_path else {
+            return self.create(job_id, image, limits).await;
+        };
+
+        let workspace = Path::new(workspace_path);
+        if !workspace.is_absolute() || !workspace.is_dir() {
+            return Err(Error::sandbox(format!(
+                "workspace must be an existing absolute directory: {}",
+                workspace_path
+            )));
+        }
+
+        if let Some(ref docker) = self.docker {
+            self.ensure_image(image).await?;
+            let container_name = format!("gitforce-job-{}", job_id);
+            let host_config = HostConfig {
+                memory: Some((limits.memory_mb * 1024 * 1024) as i64),
+                cpu_period: Some(100000),
+                cpu_quota: Some((limits.cpu_ms * 1000) as i64),
+                network_mode: if limits.network {
+                    None
+                } else {
+                    Some("none".to_string())
+                },
+                // Fedora's rootless Podman enforces SELinux labels on host
+                // mounts. Private relabeling makes this per-workspace mount
+                // readable inside the sandbox without disabling enforcement.
+                binds: Some(vec![format!("{}:/workspace:Z", workspace_path)]),
+                ..Default::default()
+            };
+            let config = Config {
+                image: Some(image),
+                cmd: Some(vec!["sleep", "3600"]),
+                working_dir: Some("/workspace"),
+                host_config: Some(host_config),
+                ..Default::default()
+            };
+            let response = docker
+                .create_container(
+                    Some(CreateContainerOptions {
+                        name: &container_name,
+                        platform: None,
+                    }),
+                    config,
+                )
+                .await
+                .map_err(|e| {
+                    Error::sandbox(format!("failed to create workspace container: {}", e))
+                })?;
+            docker
+                .start_container(&response.id, None::<StartContainerOptions<String>>)
+                .await
+                .map_err(|e| {
+                    Error::sandbox(format!("failed to start workspace container: {}", e))
+                })?;
+            tracing::info!(
+                "Created workspace container {} for job {} from {}",
+                response.id,
+                job_id,
+                workspace_path
+            );
+            Ok(SandboxInstance {
+                container_id: response.id,
+                job_id,
+            })
+        } else {
+            Err(Error::sandbox("Docker is required for workspace execution"))
+        }
+    }
+
     async fn execute(&self, instance: &SandboxInstance, command: &[&str]) -> Result<StepResult> {
+        self.execute_with_output(instance, command, None).await
+    }
+
+    async fn execute_with_output(
+        &self,
+        instance: &SandboxInstance,
+        command: &[&str],
+        sink: Option<Arc<dyn OutputSink>>,
+    ) -> Result<StepResult> {
         if let Some(ref docker) = self.docker {
             // Create exec instance
             let config = CreateExecOptions {
@@ -246,17 +386,35 @@ impl Sandbox for DockerSandbox {
             let mut exit_code = 0i32;
 
             if let StartExecResults::Attached { mut output, .. } = result {
-                while let Some(item) = output.next().await {
-                    match item {
-                        Ok(LogOutput::StdOut { message }) => {
-                            stdout.push_str(&String::from_utf8_lossy(&message));
+                loop {
+                    tokio::select! {
+                        item = output.next() => {
+                            match item {
+                                Some(Ok(LogOutput::StdOut { message })) => {
+                                    if let Some(ref sink) = sink {
+                                        sink.on_output(OutputStream::Stdout, message.to_vec()).await?;
+                                    }
+                                    stdout.push_str(&String::from_utf8_lossy(&message));
+                                }
+                                Some(Ok(LogOutput::StdErr { message })) => {
+                                    if let Some(ref sink) = sink {
+                                        sink.on_output(OutputStream::Stderr, message.to_vec()).await?;
+                                    }
+                                    stderr.push_str(&String::from_utf8_lossy(&message));
+                                }
+                                Some(Ok(_)) => {}
+                                Some(Err(e)) => {
+                                    tracing::warn!("exec output error: {}", e);
+                                }
+                                None => break,
+                            }
                         }
-                        Ok(LogOutput::StdErr { message }) => {
-                            stderr.push_str(&String::from_utf8_lossy(&message));
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!("exec output error: {}", e);
+                        _ = sleep(Duration::from_secs(1)) => {
+                            match docker.inspect_exec(&exec.id).await {
+                                Ok(inspect) if inspect.running == Some(false) => break,
+                                Ok(_) => {}
+                                Err(e) => tracing::trace!("exec status poll failed: {}", e),
+                            }
                         }
                     }
                 }
@@ -278,26 +436,50 @@ impl Sandbox for DockerSandbox {
                 stderr,
             })
         } else {
-            // Stub mode
+            // Stub mode - NOTE: This always returns exit code 0, which may not reflect
+            // the actual command result. Only use stub_for_tests() when you explicitly
+            // want stub behavior.
             tracing::debug!("Executing command in stub mode: {:?}", command);
-            Ok(StepResult {
+            let result = StepResult {
                 exit_code: 0,
-                stdout: format!("Executing: {:?}\n", command),
-                stderr: String::new(),
-            })
+                stdout: format!("[STUB] Executing: {:?}\n", command),
+                stderr: "[STUB] Warning: running in stub mode, exit code is always 0\n".to_string(),
+            };
+            if let Some(sink) = sink {
+                sink.on_output(OutputStream::Stdout, result.stdout.as_bytes().to_vec())
+                    .await?;
+                sink.on_output(OutputStream::Stderr, result.stderr.as_bytes().to_vec())
+                    .await?;
+            }
+            Ok(result)
         }
     }
 
     async fn destroy(&self, instance: SandboxInstance) -> Result<()> {
         if let Some(ref docker) = self.docker {
-            // Stop and remove container
-            let options = RemoveContainerOptions {
-                force: true,
+            // Send SIGTERM for graceful shutdown first
+            // Wait up to 10 seconds for container to stop gracefully
+            let stop_options = StopContainerOptions { t: 10 };
+
+            if let Err(e) = docker
+                .stop_container(&instance.container_id, Some(stop_options))
+                .await
+            {
+                // Container might already be stopped or not exist - that's OK
+                tracing::debug!(
+                    "stop_container returned error (container may already be stopped): {}",
+                    e
+                );
+            }
+
+            // Now remove the stopped container
+            let remove_options = RemoveContainerOptions {
+                force: false,
                 ..Default::default()
             };
 
             docker
-                .remove_container(&instance.container_id, Some(options))
+                .remove_container(&instance.container_id, Some(remove_options))
                 .await
                 .map_err(|e| Error::sandbox(format!("failed to remove container: {}", e)))?;
 
@@ -314,25 +496,63 @@ impl Sandbox for DockerSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitforge_common::ErrorKind;
+    use std::sync::Mutex;
+
+    struct RecordingSink(Mutex<Vec<(OutputStream, Vec<u8>)>>);
+
+    #[async_trait]
+    impl OutputSink for RecordingSink {
+        async fn on_output(&self, stream: OutputStream, chunk: Vec<u8>) -> Result<()> {
+            self.0.lock().unwrap().push((stream, chunk));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stub_streams_output_to_sink() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let instance = sandbox
+            .create(JobId::new(), "test", SandboxLimits::default())
+            .await
+            .unwrap();
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+
+        let result = sandbox
+            .execute_with_output(&instance, &["echo", "hello"], Some(sink.clone()))
+            .await
+            .unwrap();
+        let chunks = sink.0.lock().unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].0, OutputStream::Stdout);
+        assert_eq!(chunks[1].0, OutputStream::Stderr);
+        assert_eq!(chunks[0].1, result.stdout.as_bytes());
+        assert_eq!(chunks[1].1, result.stderr.as_bytes());
+    }
 
     #[tokio::test]
     async fn test_docker_sandbox_creation() {
-        let sandbox = DockerSandbox::new().await.unwrap();
+        // Test stub mode creation works
+        let sandbox = DockerSandbox::stub_for_tests();
+        assert!(!sandbox.is_available());
+        assert!(sandbox.is_stub());
 
-        // Should always succeed even without Docker (stub mode)
-        let sandbox2 = DockerSandbox::with_limits(SandboxLimits::default());
-        assert!(!sandbox2.is_available() || sandbox.is_available()); // Either stub or real
+        // Test that connect_required returns error when Docker is unavailable
+        let result = DockerSandbox::connect_required().await;
+        // Either succeeds (Docker available) or fails with sandbox error
+        if let Err(e) = result {
+            assert_eq!(e.kind, ErrorKind::Sandbox);
+        }
     }
 
     #[tokio::test]
     #[ignore] // Requires Docker and is slow - run manually with `cargo test -- --ignored`
     async fn test_docker_sandbox_real_when_available() {
-        let sandbox = DockerSandbox::new().await.unwrap();
-
-        if !sandbox.is_available() {
-            // Skip if Docker not available - this is expected in CI
-            return;
-        }
+        // Try to connect - if Docker not available, skip
+        let sandbox = match DockerSandbox::connect_required().await {
+            Ok(s) => s,
+            Err(_) => return, // Docker not available, skip
+        };
 
         // Test with real Docker
         let job_id = JobId::new();
@@ -359,11 +579,11 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires Docker and is slow - run manually with `cargo test -- --ignored`
     async fn test_docker_sandbox_real_with_longer_command() {
-        let sandbox = DockerSandbox::new().await.unwrap();
-
-        if !sandbox.is_available() {
-            return;
-        }
+        // Try to connect - if Docker not available, skip
+        let sandbox = match DockerSandbox::connect_required().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
 
         let job_id = JobId::new();
         let instance = sandbox
@@ -385,11 +605,11 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires Docker and is slow - run manually with `cargo test -- --ignored`
     async fn test_docker_sandbox_real_multiple_commands() {
-        let sandbox = DockerSandbox::new().await.unwrap();
-
-        if !sandbox.is_available() {
-            return;
-        }
+        // Try to connect - if Docker not available, skip
+        let sandbox = match DockerSandbox::connect_required().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
 
         let job_id = JobId::new();
         let instance = sandbox
@@ -413,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn test_docker_sandbox_stub_execution() {
         // Create sandbox in stub mode
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         assert!(!sandbox.is_available());
 
         let job_id = JobId::new();
@@ -458,6 +678,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_docker_sandbox_with_custom_limits() {
         let limits = SandboxLimits::small();
         let sandbox = DockerSandbox::with_limits(limits);
@@ -466,7 +687,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_execution_with_complex_command() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox
@@ -486,7 +707,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_execution_multiple_commands() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox
@@ -516,7 +737,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_preserves_job_id() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox
@@ -530,7 +751,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_execute_empty_command() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox
@@ -547,7 +768,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_execute_single_command() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox
@@ -563,7 +784,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_execute_false_command() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox
@@ -580,7 +801,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_multiple_instances() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
 
         // Create multiple instances
         let job1 = JobId::new();
@@ -611,7 +832,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_destroy_same_instance_twice() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox
@@ -626,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_with_large_image_name() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         // Very long image name
@@ -647,7 +868,7 @@ mod tests {
     fn test_docker_sandbox_debug_trait_not_implemented() {
         // DockerSandbox doesn't implement Debug, which is intentional
         // This test documents that behavior
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         assert!(!sandbox.is_available());
     }
 
@@ -709,7 +930,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_execute_special_characters() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox
@@ -729,7 +950,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_execute_unicode() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox
@@ -749,7 +970,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_execute_exit_codes() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox
@@ -766,7 +987,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_container_id_format() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox
@@ -783,7 +1004,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_network_enabled() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits::default());
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox
@@ -797,10 +1018,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_network_disabled() {
-        let sandbox = DockerSandbox::with_limits(SandboxLimits {
-            network: false,
-            ..Default::default()
-        });
+        // Note: stub_for_tests() ignores limits, but we verify the sandbox can be created
+        let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
         let instance = sandbox

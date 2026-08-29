@@ -1,0 +1,206 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/security.yml'
+  pull_request:
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/security.yml'
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 6am UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DEFAULT_BRANCH: ${{ vars.DEFAULT_BRANCH || 'main' }}
+
+jobs:
+  # ─── Security Audit (Rust) ─────────────────────────────────────────────────
+  cargo-audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@4b8992af23a2be34fd58f8d9b50d3f4939ad1891 # cargo-audit
+
+      - name: Run security audit
+        run: cargo audit
+
+  # ─── Secrets scan (all repos — always runs) ─────────────────────────────────
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Check for committed secrets
+        run: |
+          echo "Checking for leaked secrets in commits..."
+          # Exclude issue templates (contain example patterns, not real secrets)
+          # Look for common secret patterns
+          FOUND=$(git grep -nE "ghp_[0-9a-zA-Z]{36}|gho_[0-9a-zA-Z]{36}|AKIA[0-9A-Z]{16}|xox[baprs]-[0-9a-zA-Z]{48,}" -- \
+            ':!*.lock' ':!.github/ISSUE_TEMPLATE/**' 2>/dev/null || true)
+          if [ -n "$FOUND" ]; then
+            echo "WARNING: Potential secrets found in repository:"
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "No obvious secrets detected."
+
+  # ─── Dependency Review ─────────────────────────────────────────────────────
+  dependency-review:
+    # GitHub Dependency Review is unavailable until the repository's
+    # dependency-graph capability is enabled. Cargo Audit remains mandatory;
+    # opt this supplementary gate in only after GitHub reports it supported.
+    if: vars.DEPENDENCY_REVIEW_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Check for vulnerable dependencies
+        uses: actions/dependency-review-action@40c09b7dc99638e5ddb0bfd91c1673effc064d8a # v4.8.1
+
+  # ─── Aegis changed-line security gate ──────────────────────────────────────
+  # Scan only the diff so intentional historical test fixtures do not become
+  # an unreviewable baseline. New high/critical findings fail the workflow.
+  aegis-scan:
+    name: Aegis Changed-Line Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Build pinned Aegis scanner
+        env:
+          AEGIS_COMMIT: 5a5c742919c078005b2835c38b368b65745e8d6f
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/aliasfoxkde/aegis.git "$RUNNER_TEMP/aegis"
+          git -C "$RUNNER_TEMP/aegis" checkout --detach "$AEGIS_COMMIT"
+          cargo build --locked --release --manifest-path "$RUNNER_TEMP/aegis/Cargo.toml" --package aegis-cli --bin aegis
+
+      - name: Prepare changed-line diff
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BASE_REF:-}" ]; then
+            git fetch --no-tags origin "$BASE_REF"
+            git diff --unified=0 "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/gitforge.diff"
+          else
+            git diff --unified=0 HEAD^ HEAD > "$RUNNER_TEMP/gitforge.diff"
+          fi
+
+      - name: Run Aegis changed-line scan
+        env:
+          AEGIS_BIN: /home/runner/work/_temp/aegis/target/release/aegis
+        run: |
+          set -euo pipefail
+          # Resolve the actual temporary checkout path rather than relying on
+          # a hard-coded runner workspace layout.
+          AEGIS_BIN="$RUNNER_TEMP/aegis/target/release/aegis"
+          set +e
+          "$AEGIS_BIN" --format json scan . \
+            --categories secrets,security-hardening,web-security,ai-safety,supply-chain \
+            --diff "$RUNNER_TEMP/gitforge.diff" \
+            --output-file target-aegis.json
+          scanner_status=$?
+          set -e
+          test -s target-aegis.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("target-aegis.json").read_text())
+          findings = report.get("findings", [])
+
+          # Aegis is intentionally used here as a changed-line detector, not as the
+          # sole semantic security analyzer. Its regex/AST heuristics currently emit
+          # high-severity false positives for parameterized static SQL, repository
+          # path literals, documentation, and ordinary endpoint URLs. Keep the full
+          # report for review, but make the required gate fail only for high-confidence
+          # credential exposure and code-execution classes that are unambiguous in CI.
+          blocking_patterns = {
+              "command-injection",
+              "code-execution",
+              "shell-injection",
+              "private-key-exposed",
+              "hardcoded-credential",
+              "hardcoded-secret",
+              "jwt-secret-hardcoded",
+              "aws-access-key",
+              "github-token",
+              "api-key",
+          }
+          blocking = [
+              f for f in findings
+              if f.get("severity") in {"high", "critical"}
+              and f.get("confidence") == "high"
+              and f.get("pattern") in blocking_patterns
+          ]
+          advisory = [f for f in findings if f not in blocking]
+          print(f"Aegis findings: {len(findings)} total, {len(advisory)} advisory, {len(blocking)} blocking")
+          if blocking:
+              for finding in blocking:
+                  location = finding.get("location", {})
+                  print(f"{finding.get('severity')}: {finding.get('pattern')} "
+                        f"{location.get('file')}:{location.get('line')}")
+              raise SystemExit(f"Aegis found {len(blocking)} new high/critical finding(s)")
+          print(f"Aegis changed-line scan passed ({len(findings)} non-blocking finding(s))")
+          PY
+          # Aegis may use exit 1 to indicate findings even when no blocking
+          # findings exist; the JSON severity gate above is authoritative.
+          test "$scanner_status" -eq 0 || echo "Aegis reported non-blocking findings"
+
+  # ─── Rust-specific Security Checks ─────────────────────────────────────────
+  rust-security:
+    name: Rust Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Run clippy with security-focused lints
+        run: |
+          # Check for common security issues in Rust code
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check for unsafe code
+        run: |
+          # Report any unsafe code blocks (requires review)
+          UNSAFE_COUNT=$(grep -r "unsafe" --include="*.rs" crates/ services/ 2>/dev/null | grep -v "unsafe_impl" | grep -v "// safe" | wc -l || true)
+          echo "Found $UNSAFE_COUNT unsafe code blocks"
+          if [ "$UNSAFE_COUNT" -gt 0 ]; then
+            echo "Note: Unsafe code blocks require security review"
+            grep -rn "unsafe" --include="*.rs" crates/ services/ 2>/dev/null | grep -v "unsafe_impl" | grep -v "// safe" | head -20
+          fi

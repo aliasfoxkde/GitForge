@@ -4,19 +4,19 @@
 //! - Database -> Scheduler -> CI Engine integration
 //! - Pipeline from trigger to completion
 
-use gitforce_ci::{
+use gitforge_ci::{
     CiEngine, DagBuilder, JobGraph, PipelineDefinition, PipelineExecutor,
     PipelineTriggerEvent, TriggerType, JobDefinition, StepDefinition,
 };
-use gitforce_common::{
+use gitforge_common::{
     JobId, JobStatus, PipelineId, PipelineRunId, PipelineStatus, RepoId, RunnerId, UserId,
 };
-use gitforce_db::models::{Job, Pipeline, PipelineRun, Repository, Runner, RunnerType, User};
-use gitforce_db::queries::{
+use gitforge_db::models::{Job, Pipeline, PipelineRun, Repository, Runner, RunnerType, User};
+use gitforge_db::queries::{
     JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries, RunnerQueries, UserQueries,
 };
-use gitforce_db::Pool;
-use gitforce_scheduler::{Scheduler, Priority};
+use gitforge_db::Pool;
+use gitforge_scheduler::{Scheduler, Priority};
 use std::collections::HashMap;
 
 /// Create a complete test database with all entities

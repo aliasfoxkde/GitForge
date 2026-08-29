@@ -12,9 +12,6 @@ use tokio::time::timeout;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Production runner startup must fail closed when Docker is unavailable.
-    // Library tests intentionally retain the explicit stub-compatible default.
-    std::env::set_var("GITFORGE_SANDBOX_MODE", "required");
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -25,21 +22,14 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("starting GitForce Runner Agent");
 
-    // Initialize process supervision (subreaper + SIGCHLD) to prevent zombies
-    if let Err(e) = gitforge_process::init() {
+    // Initialize subreaper support without a global waitpid loop. Child
+    // ownership must remain with the runtime that spawned it.
+    if let Err(e) = gitforge_process::init_without_sigchld_reaper() {
         tracing::warn!("failed to initialize process supervision: {}", e);
     }
 
-    // Load runner configuration from environment variables or defaults.
-    // Environment variables (all optional):
-    //   GITFORGE_SCHEDULER_URL      - Scheduler URL (default: http://localhost:42781)
-    //   GITFORGE_RUNNER_NAME        - Runner name (default: runner)
-    //   GITFORGE_RUNNER_TYPE        - Runner type (default: docker)
-    //   GITFORGE_CAPACITY           - Concurrent job capacity (default: 2, range: 1-100)
-    //   GITFORGE_HEARTBEAT_INTERVAL - Heartbeat interval seconds (default: 30, range: 1-3600)
-    //   GITFORGE_FETCH_INTERVAL     - Job fetch interval seconds (default: 5, range: 1-3600)
-    let config = RunnerConfig::from_env()
-        .map_err(|error| anyhow::anyhow!("failed to load runner configuration: {error}"))?;
+    // Load runner configuration
+    let config = RunnerConfig::default();
 
     // Create runner agent
     let mut agent = RunnerAgent::new(config).await?;
@@ -57,20 +47,34 @@ async fn main() -> anyhow::Result<()> {
     // Spawn graceful shutdown handler
     spawn_shutdown_handler(shutdown_flag);
 
+    // Start the registered agent's heartbeat and job-fetch loops. The agent
+    // owns its executor; keep the loop under a task handle so shutdown can
+    // stop it cleanly and propagate runtime failures to the service.
+    let agent_loop = agent.clone();
+    let runner_task = tokio::spawn(async move { agent_loop.run().await });
+
+    // Wait for shutdown signal
+    let shutdown_future = create_shutdown_future(shutdown.clone());
     tracing::info!("Runner Agent running, press Ctrl+C to stop");
 
-    // Run the fetch/heartbeat loops while also accepting graceful shutdown.
-    tokio::select! {
-        result = agent.run() => {
-            result?;
-        }
-        _ = create_shutdown_future(shutdown.clone()) => {
-            tracing::info!("shutdown signal received");
-            agent.stop().await;
-        }
-    }
+    // Wait for shutdown signal
+    timeout(Duration::MAX, shutdown_future).await.ok();
 
     tracing::info!("shutting down Runner Agent");
+
+    // Stop the agent gracefully (force=false to wait for jobs)
+    agent.stop(false).await;
+
+    // Wait for active jobs to complete with a timeout
+    const JOB_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+    if !agent.wait_for_jobs_complete(JOB_SHUTDOWN_TIMEOUT).await {
+        tracing::warn!("jobs did not complete in time, force cancelling");
+        agent.stop(true).await;
+    }
+
+    runner_task
+        .await
+        .map_err(|e| anyhow::anyhow!("runner task join failed: {}", e))??;
 
     // Graceful shutdown delay
     graceful_shutdown_delay().await;

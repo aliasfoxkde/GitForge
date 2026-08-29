@@ -2,16 +2,17 @@
 //!
 //! Allows external services to trigger pipeline runs via webhooks.
 
-use crate::auth::ApiAuth;
+use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Extension, Path},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     routing::post,
     Json, Router,
 };
-use gitforge_common::PipelineId;
+use gitforge_common::{JobId, PipelineId, PipelineRunId, RepoId};
 use gitforge_db::{queries::PipelineQueries, Pool};
+use gitforge_scheduler::Scheduler;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -34,15 +35,6 @@ pub struct WebhookTriggerResponse {
     pub success: bool,
     pub message: String,
     pub pipeline_id: Option<String>,
-    pub pipeline_run_id: Option<String>,
-    pub event_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CiTriggerResponse {
-    accepted: bool,
-    event_id: Option<String>,
-    pipeline_run_id: Option<String>,
 }
 
 /// Webhook routes
@@ -50,33 +42,14 @@ pub fn webhook_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new().route("/webhook/trigger/{pipeline_id}", post(trigger_pipeline))
 }
 
-/// Helper to extract and validate user from headers
-fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok());
-
-    let token = auth_header
-        .and_then(|h| ApiAuth::extract_token(h))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    auth.validate_token(token)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    Ok(())
-}
-
 /// Trigger a pipeline via webhook
 async fn trigger_pipeline(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(auth): Extension<Arc<ApiAuth>>,
-    headers: HeaderMap,
+    Extension(scheduler): Extension<Option<Arc<Scheduler>>>,
+    _user: AuthenticatedUser,
     Path(pipeline_id): Path<String>,
     Json(payload): Json<WebhookTriggerPayload>,
 ) -> impl IntoResponse {
-    // Check auth
-    if let Err(e) = extract_user(&auth, &headers) {
-        return e.into_response();
-    }
-
     tracing::info!(
         "Webhook trigger for pipeline {} from repo {}",
         pipeline_id,
@@ -93,8 +66,6 @@ async fn trigger_pipeline(
                     success: false,
                     message: "Invalid pipeline ID format".to_string(),
                     pipeline_id: None,
-                    pipeline_run_id: None,
-                    event_id: None,
                 }),
             )
                 .into_response();
@@ -104,126 +75,43 @@ async fn trigger_pipeline(
     // Verify pipeline exists
     match PipelineQueries::get(&pool, pipeline_uuid).await {
         Ok(Some(_pipeline)) => {
+            // Pipeline exists - enqueue jobs to scheduler
             tracing::info!(
                 "Triggering pipeline {} for repo {} at commit {}",
                 pipeline_id,
                 payload.repo_id,
                 payload.commit_hash
             );
-            let repo_id = match uuid::Uuid::parse_str(&payload.repo_id) {
-                Ok(value) => value.to_string(),
-                Err(_) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(WebhookTriggerResponse {
-                            success: false,
-                            message: "Invalid repository ID format".to_string(),
-                            pipeline_id: None,
-                            pipeline_run_id: None,
-                            event_id: None,
-                        }),
-                    )
-                        .into_response();
-                }
-            };
-            if !is_git_hash(&payload.commit_hash) || payload.branch.trim().is_empty() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(WebhookTriggerResponse {
-                        success: false,
-                        message: "Invalid commit hash or branch".to_string(),
-                        pipeline_id: None,
-                        pipeline_run_id: None,
-                        event_id: None,
-                    }),
-                )
-                    .into_response();
-            }
-            let token = match std::env::var("GITFORGE_CI_TRIGGER_TOKEN") {
-                Ok(token) if !token.is_empty() => token,
-                _ => {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(WebhookTriggerResponse {
-                            success: false,
-                            message: "CI trigger integration is not configured".to_string(),
-                            pipeline_id: None,
-                            pipeline_run_id: None,
-                            event_id: None,
-                        }),
-                    )
-                        .into_response();
-                }
-            };
-            let ref_name = if payload.branch.starts_with("refs/") {
-                payload.branch.clone()
+
+            // Create a job for this pipeline run
+            let repo_id = uuid::Uuid::parse_str(&payload.repo_id)
+                .map(RepoId::from)
+                .unwrap_or_else(|_| RepoId::new());
+            let run_id = PipelineRunId::new();
+            let job_id = JobId::new();
+
+            // Enqueue the job to the scheduler (if available)
+            if let Some(sched) = &scheduler {
+                sched.enqueue(job_id, run_id, repo_id).await;
+                tracing::info!(
+                    "Enqueued job {} for pipeline {} on branch {}",
+                    job_id,
+                    pipeline_id,
+                    payload.branch
+                );
             } else {
-                format!("refs/heads/{}", payload.branch)
-            };
-            let ci_url = std::env::var("GITFORGE_CI_BASE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:42781".to_string());
-            let ci_response = reqwest::Client::new()
-                .post(format!(
-                    "{}/pipelines/trigger",
-                    ci_url.trim_end_matches('/')
-                ))
-                .header("x-gitforge-trigger-token", token)
-                .json(&serde_json::json!({
-                    "repo_id": repo_id,
-                    "pipeline_id": pipeline_id,
-                    "ref_name": ref_name,
-                    "old_hash": "0000000000000000000000000000000000000000",
-                    "new_hash": payload.commit_hash,
-                }))
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await;
-            match ci_response {
-                Ok(response) => {
-                    let status = response.status();
-                    let body = response.json::<CiTriggerResponse>().await.ok();
-                    if !status.is_success() || !body.as_ref().is_some_and(|body| body.accepted) {
-                        return (
-                            StatusCode::from_u16(status.as_u16())
-                                .unwrap_or(StatusCode::BAD_GATEWAY),
-                            Json(WebhookTriggerResponse {
-                                success: false,
-                                message: "CI trigger rejected request".to_string(),
-                                pipeline_id: Some(pipeline_id),
-                                pipeline_run_id: None,
-                                event_id: body.and_then(|body| body.event_id),
-                            }),
-                        )
-                            .into_response();
-                    }
-                    let body = body.expect("successful CI response must have a body");
-                    (
-                        StatusCode::ACCEPTED,
-                        Json(WebhookTriggerResponse {
-                            success: true,
-                            message: format!("Pipeline accepted for branch '{}'", payload.branch),
-                            pipeline_id: Some(pipeline_id),
-                            pipeline_run_id: body.pipeline_run_id,
-                            event_id: body.event_id,
-                        }),
-                    )
-                        .into_response()
-                }
-                Err(error) => {
-                    tracing::error!(%error, "CI trigger request failed");
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        Json(WebhookTriggerResponse {
-                            success: false,
-                            message: "CI trigger service unavailable".to_string(),
-                            pipeline_id: Some(pipeline_id),
-                            pipeline_run_id: None,
-                            event_id: None,
-                        }),
-                    )
-                        .into_response()
-                }
+                tracing::warn!("No scheduler available, job not enqueued");
             }
+
+            (
+                StatusCode::OK,
+                Json(WebhookTriggerResponse {
+                    success: true,
+                    message: format!("Pipeline triggered for branch '{}'", payload.branch),
+                    pipeline_id: Some(pipeline_id),
+                }),
+            )
+                .into_response()
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -231,8 +119,6 @@ async fn trigger_pipeline(
                 success: false,
                 message: "Pipeline not found".to_string(),
                 pipeline_id: None,
-                pipeline_run_id: None,
-                event_id: None,
             }),
         )
             .into_response(),
@@ -244,17 +130,11 @@ async fn trigger_pipeline(
                     success: false,
                     message: "Database error".to_string(),
                     pipeline_id: None,
-                    pipeline_run_id: None,
-                    event_id: None,
                 }),
             )
                 .into_response()
         }
     }
-}
-
-fn is_git_hash(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -291,8 +171,6 @@ mod tests {
             success: true,
             message: "Pipeline triggered".to_string(),
             pipeline_id: Some("pipeline-123".to_string()),
-            pipeline_run_id: None,
-            event_id: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("success"));
@@ -305,8 +183,6 @@ mod tests {
             success: false,
             message: "Pipeline not found".to_string(),
             pipeline_id: None,
-            pipeline_run_id: None,
-            event_id: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("false"));

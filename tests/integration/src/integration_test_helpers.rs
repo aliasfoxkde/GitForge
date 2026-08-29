@@ -1,10 +1,10 @@
 //! Integration test helpers shared across all integration tests
 
-use gitforce_common::{JobId, PipelineId, PipelineRunId, RepoId, RunnerId, UserId};
-use gitforce_db::models::{Pipeline, PipelineRun, Repository, Runner, RunnerType, User};
-use gitforce_db::Pool;
-use gitforce_scheduler::{Scheduler, scheduler_routes, create_state};
-use gitforce_ci::{PipelineDefinition, PipelineTriggerEvent, TriggerType, JobDefinition, StepDefinition};
+use gitforge_common::{JobId, PipelineId, PipelineRunId, RepoId, RunnerId, UserId};
+use gitforge_db::models::{Pipeline, PipelineRun, Repository, Runner, RunnerType, User};
+use gitforge_db::Pool;
+use gitforge_scheduler::{Scheduler, scheduler_routes, create_state};
+use gitforge_ci::{PipelineDefinition, PipelineTriggerEvent, TriggerType, JobDefinition, StepDefinition};
 use std::collections::HashMap;
 
 /// Create a test user

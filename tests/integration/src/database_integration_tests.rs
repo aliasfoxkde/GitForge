@@ -6,10 +6,10 @@
 //! - Job assignment and status updates
 //! - Runner management
 
-use gitforce_common::{JobId, PipelineId, PipelineRunId, RepoId, RunnerId, UserId};
-use gitforce_db::models::{Job, Pipeline, PipelineRun, Repository, Runner, RunnerType, User};
-use gitforce_db::queries::{JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries, RunnerQueries, UserQueries};
-use gitforce_db::Pool;
+use gitforge_common::{JobId, PipelineId, PipelineRunId, RepoId, RunnerId, UserId};
+use gitforge_db::models::{Job, Pipeline, PipelineRun, Repository, Runner, RunnerType, User};
+use gitforge_db::queries::{JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries, RunnerQueries, UserQueries};
+use gitforge_db::Pool;
 use crate::integration_test_helpers::*;
 
 /// Test repository creation, retrieval, listing, and deletion
@@ -275,8 +275,8 @@ async fn test_runner_online_listing() {
 /// Test event creation and listing
 #[tokio::test]
 async fn test_event_operations() {
-    use gitforce_db::models::Event;
-    use gitforce_db::queries::EventQueries;
+    use gitforge_db::models::Event;
+    use gitforge_db::queries::EventQueries;
 
     let pool = create_test_db_pool().await;
 

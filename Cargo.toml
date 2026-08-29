@@ -16,7 +16,6 @@ members = [
     "crates/gitforge-cli",
     "crates/gitforge-ai",
     "crates/gitforge-review",
-    "crates/gitforge-mcp",
     "services/git-server",
     "services/ci",
     "services/runner",
@@ -76,7 +75,7 @@ reqwest = { version = "0.13", features = ["json"] }
 bollard = "0.16"
 
 # JWT
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 
 # Password hashing
 bcrypt = "0.19"

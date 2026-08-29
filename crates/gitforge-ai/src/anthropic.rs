@@ -397,7 +397,16 @@ mod tests {
 
     #[test]
     fn test_build_review_prompt() {
-        let provider = AnthropicProvider::new(ProviderConfig::anthropic())
+        // Prompt construction is offline and must not depend on a developer's
+        // live credential. The provider only needs a syntactically valid test
+        // configuration here; network calls are covered separately.
+        let test_key_env = "GITFORGE_TEST_ANTHROPIC_KEY";
+        std::env::set_var(test_key_env, "test-anthropic-key");
+        let config = ProviderConfig {
+            api_key_env: test_key_env.to_string(),
+            ..ProviderConfig::anthropic()
+        };
+        let provider = AnthropicProvider::new(config)
             .unwrap()
             .with_model("claude-3-5-sonnet-20241022");
 

@@ -30,6 +30,21 @@ pub fn init() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Initialize subreaper support without installing the process-wide SIGCHLD
+/// reaper.
+///
+/// Use this in processes that directly manage children through Tokio or
+/// another runtime. A global `waitpid(-1, WNOHANG)` loop can otherwise reap a
+/// child's status before its owner calls `Child::wait`, producing missing or
+/// misleading exit results. Such processes must explicitly wait for every
+/// child they start. Call [`init`] only in a process whose children are not
+/// otherwise waited on and which intentionally needs orphan reaping.
+pub fn init_without_sigchld_reaper() -> std::io::Result<()> {
+    become_subreaper()?;
+    tracing::info!("process supervision initialized without global SIGCHLD reaper");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+database_url="${1:-${GITFORGE_DATABASE_URL:-}}"
+if [[ -z "$database_url" ]]; then
+  echo 'usage: gitforge-outbox-status <sqlite:path-or-url>' >&2
+  exit 64
+fi
+
+python3 - "$database_url" <<'PY'
+import json
+import sqlite3
+import sys
+from datetime import datetime, timezone
+
+url = sys.argv[1]
+if url.startswith("sqlite:"):
+    path = url.removeprefix("sqlite:").split("?", 1)[0]
+else:
+    path = url
+
+connection = sqlite3.connect(path)
+rows = connection.execute(
+    "SELECT event_type, created_at FROM events "
+    "WHERE event_type IN ('ci.trigger.pending', 'ci.trigger.delivering')"
+).fetchall()
+connection.close()
+
+pending = [row for row in rows if row[0] == "ci.trigger.pending"]
+delivering = [row for row in rows if row[0] == "ci.trigger.delivering"]
+oldest = None
+if rows:
+    timestamps = []
+    for _, value in rows:
+        try:
+            timestamps.append(datetime.fromisoformat(value.replace("Z", "+00:00")))
+        except ValueError:
+            continue
+    if timestamps:
+        oldest = max(0, int((datetime.now(timezone.utc) - min(timestamps)).total_seconds()))
+
+print(json.dumps({
+    "status": "healthy" if not delivering else "attention",
+    "pending": len(pending),
+    "delivering": len(delivering),
+    "oldest_pending_age_seconds": oldest,
+}, separators=(",", ":")))
+PY

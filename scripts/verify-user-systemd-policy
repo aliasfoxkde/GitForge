@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Verify candidate GitForge user-systemd resource policy without installation.
+set -u -o pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+VERIFY_ROOT="${GITFORGE_POLICY_VERIFY_ROOT:-$ROOT/target/systemd-policy-verify}"
+RUN_DIR="$VERIFY_ROOT/$$"
+
+if ! command -v systemd-analyze >/dev/null 2>&1; then
+    echo "systemd-analyze is required" >&2
+    exit 2
+fi
+mkdir -p "$RUN_DIR"
+cleanup() {
+    rm -rf -- "$RUN_DIR"
+}
+trap cleanup EXIT INT TERM
+
+failed=0
+for service in api ci git-server runner scheduler; do
+    unit="$RUN_DIR/gitforge-$service.service"
+    policy="$ROOT/systemd/user/gitforge-resource-limits.conf"
+    case "$service" in
+        ci) policy="$ROOT/systemd/user/gitforge-ci-resource-limits.conf" ;;
+        runner) policy="$ROOT/systemd/user/gitforge-runner-resource-limits.conf" ;;
+    esac
+
+    {
+        printf '[Unit]\nDescription=Disposable GitForge policy check (%s)\n\n' "$service"
+        printf '[Service]\nType=oneshot\nExecStart=/usr/bin/true\n'
+        cat "$policy"
+        printf '\n[Install]\nWantedBy=default.target\n'
+    } > "$unit"
+    if ! systemd-analyze verify "$unit"; then
+        failed=1
+    fi
+done
+
+if ((failed)); then
+    echo "candidate user-systemd policy: invalid" >&2
+    exit 1
+fi
+echo "candidate user-systemd policy: valid"

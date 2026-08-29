@@ -12,8 +12,19 @@ on:
       - '.github/workflows/**'
 
 env:
-  GITFORGE_API_URL: ${{ vars.GITFORGE_API_URL || 'http://localhost:42780' }}
+  # GitHub-hosted runners cannot reach a private Fedora LAN address. Enable
+  # this workflow only after a reachable endpoint or self-hosted runner is
+  # deliberately configured at repository/organization scope.
+  GITFORGE_ENABLED: ${{ vars.GITFORGE_ENABLED || 'false' }}
+  GITFORGE_API_URL: ${{ vars.GITFORGE_API_URL || '' }}
+  GITFORGE_SCHEDULER_URL: ${{ vars.GITFORGE_SCHEDULER_URL || '' }}
+  GITFORGE_REPO_ID: ${{ vars.GITFORGE_REPO_ID || '' }}
+  GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
+  GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
   GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
+
+permissions:
+  contents: read
 
 # Route ALL builds through GitForge instead of running directly on GitHub Actions runners.
 # This prevents build storms and zombie processes by using GitForge's build queue.
@@ -22,26 +33,49 @@ jobs:
   # Enqueue build job to GitForge queue instead of running directly
   enqueue-build:
     name: Enqueue Build to GitForge
+    if: vars.GITFORGE_ENABLED == 'true'
     runs-on: ubuntu-latest
     outputs:
-      job_id: ${{ steps.enqueue.outputs.job_id }}
+      run_id: ${{ steps.enqueue.outputs.run_id }}
       build_status: ${{ steps.enqueue.outputs.status }}
     steps:
+      - name: Validate GitForge configuration
+        run: |
+          set -euo pipefail
+          : "${GITFORGE_API_URL:?GITFORGE_API_URL is required}"
+          : "${GITFORGE_SCHEDULER_URL:?GITFORGE_SCHEDULER_URL is required}"
+          : "${GITFORGE_REPO_ID:?GITFORGE_REPO_ID is required (GitForge UUID, not GitHub repository_id)}"
+          : "${GITFORGE_API_TOKEN:?GITFORGE_API_TOKEN is required}"
+          [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
+            echo "GITFORGE_REPO_ID must be a UUID" >&2
+            exit 1
+          }
+          [[ "$GITFORGE_POLL_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+            echo "GITFORGE_POLL_TIMEOUT_SECONDS must be a positive integer" >&2
+            exit 1
+          }
+          [[ "$GITFORGE_POLL_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+            echo "GITFORGE_POLL_INTERVAL_SECONDS must be a positive integer" >&2
+            exit 1
+          }
       - name: Enqueue build job
         id: enqueue
         run: |
-          set +e  # Don't fail on curl error
-          # Call GitForge webhook API to enqueue build job
+          set -euo pipefail
+          # Trigger the GitForge CI service. The service returns the durable
+          # pipeline-run ID; polling the API by pipeline ID was a protocol
+          # mismatch and could never observe the created run.
+          PAYLOAD=$(jq -n \
+            --arg repo "$GITFORGE_REPO_ID" \
+            --arg ref "${{ github.ref_name }}" \
+            --arg old "${{ github.event.before }}" \
+            --arg new "${{ github.sha }}" \
+            '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            "$GITFORGE_API_URL/api/webhook/trigger/${{ github.event.repository.id }}" \
+            "$GITFORGE_SCHEDULER_URL/pipelines/trigger" \
             -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{
-              "repo_id": "${{ github.repository_id }}",
-              "commit_hash": "${{ github.sha }}",
-              "branch": "${{ github.ref_name }}",
-              "pipeline_name": "rust-ci"
-            }' 2>&1)
+            -d "$PAYLOAD" 2>&1)
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
@@ -49,27 +83,18 @@ jobs:
           echo "HTTP Code: $HTTP_CODE"
           echo "Response: $BODY"
 
-          # Check if we got a successful response
-          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
-            JOB_ID=$(echo "$BODY" | jq -r '.pipeline_id // empty')
-            if [ -n "$JOB_ID" ] && [ "$JOB_ID" != "null" ]; then
-              echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
+            RUN_ID=$(echo "$BODY" | jq -r '.pipeline_run_id // empty')
+            if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
+              echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
               echo "status=enqueued" >> $GITHUB_OUTPUT
-              echo "Successfully enqueued job $JOB_ID"
+              echo "Successfully enqueued pipeline run $RUN_ID"
               exit 0
             fi
           fi
 
-          # Fallback: GitForge unavailable or error, use direct build
-          echo "status=fallback" >> $GITHUB_OUTPUT
-          echo "GitForge unavailable (HTTP $HTTP_CODE), will run direct build"
-
-      # Fallback: If GitForge unavailable, run tests directly
-      - name: Fallback - Run tests directly
-        if: steps.enqueue.outputs.build_status == 'fallback'
-        run: |
-          echo "Running tests directly on Actions runner..."
-          cargo test --workspace --no-fail-fast
+          echo "GitForge enqueue failed (HTTP $HTTP_CODE); refusing to bypass GitForge" >&2
+          exit 1
 
   # Poll GitForge for build status (when GitForge is available)
   poll-build:
@@ -77,21 +102,59 @@ jobs:
     needs: enqueue-build
     if: needs.enqueue-build.outputs.build_status == 'enqueued'
     runs-on: ubuntu-latest
+    outputs:
+      terminal_status: ${{ steps.poll.outputs.terminal_status }}
     steps:
       - name: Poll for build completion
+        id: poll
         run: |
+          set -euo pipefail
           echo "Build enqueued, polling GitForge for status..."
-          echo "Runner should pick up job: ${{ needs.enqueue-build.outputs.job_id }}"
-          # In production, poll GET /api/jobs/{id}/status until complete
+          RUN_ID='${{ needs.enqueue-build.outputs.run_id }}'
+          STATUS_URL="$GITFORGE_API_URL/api/pipeline-runs/$RUN_ID"
+
+          deadline=$(( $(date +%s) + GITFORGE_POLL_TIMEOUT_SECONDS ))
+          while :; do
+            RESPONSE=$(curl --fail-with-body --silent --show-error \
+              --max-time 30 \
+              -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+              -H "Accept: application/json" \
+              "$STATUS_URL")
+            STATUS=$(echo "$RESPONSE" | jq -r '.status // .state // empty' | tr '[:upper:]' '[:lower:]')
+            echo "GitForge pipeline run $RUN_ID status: ${STATUS:-unknown}"
+
+            case "$STATUS" in
+              completed|succeeded|success|passed|failed|failure|cancelled|canceled|timed_out|timeout|error)
+                echo "terminal_status=$STATUS" >> "$GITHUB_OUTPUT"
+                case "$STATUS" in
+                  completed|succeeded|success|passed) exit 0 ;;
+                  *) echo "GitForge job reached unsuccessful terminal state: $STATUS" >&2; exit 1 ;;
+                esac
+                ;;
+              *)
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                  echo "GitForge pipeline run did not reach a terminal state within ${GITFORGE_POLL_TIMEOUT_SECONDS}s" >&2
+                  echo "terminal_status=timeout" >> "$GITHUB_OUTPUT"
+                  exit 1
+                fi
+                sleep "$GITFORGE_POLL_INTERVAL_SECONDS"
+                ;;
+            esac
+          done
 
   # Report final status to GitHub
   report-status:
     name: Report Build Status
     needs: [enqueue-build, poll-build]
-    if: always()
+    if: always() && vars.GITFORGE_ENABLED == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Report completion
         run: |
-          echo "Build completed"
-          echo "Final status: ${{ needs.enqueue-build.outputs.build_status }}"
+          echo "GitForge enqueue status: ${{ needs.enqueue-build.outputs.build_status }}"
+          echo "GitForge poll job result: ${{ needs.poll-build.result }}"
+          echo "GitForge terminal status: ${{ needs.poll-build.outputs.terminal_status || 'not-reached' }}"
+          if [ "${{ needs.poll-build.result }}" != "success" ]; then
+            echo "GitForge CI did not complete successfully" >&2
+            exit 1
+          fi

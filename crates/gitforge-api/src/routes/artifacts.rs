@@ -1,13 +1,19 @@
 //! Artifact API routes
 
-use crate::auth::ApiAuth;
+use crate::middleware::AuthenticatedUser;
 use crate::server::ErrorResponse;
 use axum::{
+    body::Body,
     extract::{Extension, Path},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
+};
+use gitforge_common::JobId;
+use gitforge_db::{
+    queries::{JobQueries, PipelineRunQueries, RepoQueries},
+    Pool,
 };
 use gitforge_storage::{Artifact, ArtifactId, ArtifactStore, FileStorage};
 use serde::{Deserialize, Serialize};
@@ -31,21 +37,49 @@ pub fn artifact_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/artifacts", get(list_artifacts))
         .route("/artifacts/{id}", get(get_artifact).delete(delete_artifact))
+        .route("/artifacts/{id}/content", get(get_artifact_content))
         .route("/jobs/{job_id}/artifacts", get(get_job_artifacts))
 }
 
-/// Helper to extract and validate user from headers
-fn extract_user(auth: &ApiAuth, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok());
+fn can_manage_artifacts(user: &AuthenticatedUser) -> bool {
+    matches!(user.claims.role.as_str(), "admin" | "maintainer")
+}
 
-    let token = auth_header
-        .and_then(|h| ApiAuth::extract_token(h))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    auth.validate_token(token)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    Ok(())
+/// Verify that an artifact's job belongs to a repository visible to the user.
+async fn authorize_job(
+    pool: &Pool,
+    user: &AuthenticatedUser,
+    job_id: JobId,
+) -> Result<(), StatusCode> {
+    if can_manage_artifacts(user) {
+        return Ok(());
+    }
+    let job = match JobQueries::get(pool, job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::error!(%error, %job_id, "failed to load artifact job for authorization");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let run = match PipelineRunQueries::get(pool, job.pipeline_run_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::error!(%error, %job_id, "failed to load artifact pipeline run for authorization");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    match RepoQueries::get(pool, run.repo_id).await {
+        Ok(Some(repo)) if repo.owner_id == user.claims.user_id => Ok(()),
+        // Do not reveal whether a private job exists to another user.
+        Ok(Some(_)) => Err(StatusCode::NOT_FOUND),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::error!(%error, repo_id = %run.repo_id, "failed to load artifact repository for authorization");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Convert storage artifact to response
@@ -63,171 +97,271 @@ fn artifact_to_response(artifact: &Artifact) -> ArtifactResponse {
 
 /// List artifacts
 async fn list_artifacts(
-    Extension(auth): Extension<Arc<ApiAuth>>,
+    user: AuthenticatedUser,
+    Extension(pool): Extension<Arc<Pool>>,
     Extension(storage): Extension<Arc<FileStorage>>,
-    headers: HeaderMap,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(_) => {
-            tracing::debug!("list artifacts");
-            match storage.list().await {
-                Ok(artifacts) => {
-                    let responses: Vec<ArtifactResponse> =
-                        artifacts.iter().map(artifact_to_response).collect();
-                    Json(responses).into_response()
-                }
-                Err(e) => {
-                    tracing::error!("failed to list artifacts: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: "storage_error".to_string(),
-                            message: e.to_string(),
-                        }),
-                    )
-                        .into_response()
+    tracing::debug!("list artifacts");
+    match storage.list().await {
+        Ok(artifacts) => {
+            let mut responses = Vec::new();
+            for artifact in artifacts {
+                match authorize_job(&pool, &user, artifact.job_id).await {
+                    Ok(()) => responses.push(artifact_to_response(&artifact)),
+                    Err(StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) => {}
+                    Err(status) => {
+                        return (
+                            status,
+                            Json(ErrorResponse {
+                                error: "authorization_error".to_string(),
+                                message: "Artifact access could not be authorized".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
                 }
             }
+            Json(responses).into_response()
+        }
+        Err(e) => {
+            tracing::error!("failed to list artifacts: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "storage_error".to_string(),
+                    message: e.to_string(),
+                }),
+            )
+                .into_response()
         }
     }
 }
 
 /// Get artifact metadata
 async fn get_artifact(
-    Extension(auth): Extension<Arc<ApiAuth>>,
+    user: AuthenticatedUser,
+    Extension(pool): Extension<Arc<Pool>>,
     Extension(storage): Extension<Arc<FileStorage>>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(_) => {
-            tracing::debug!("get artifact: {}", id);
+    tracing::debug!("get artifact: {}", id);
 
-            let artifact_id = match Uuid::parse_str(&id) {
-                Ok(uuid) => ArtifactId::from(uuid),
-                Err(_) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: "invalid_id".to_string(),
-                            message: "Invalid artifact ID format".to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-            };
-
-            match storage.get_metadata(artifact_id).await {
-                Ok(artifact) => {
-                    let response = artifact_to_response(&artifact);
-                    (StatusCode::OK, Json(response)).into_response()
-                }
-                Err(e) => {
-                    tracing::error!("failed to get artifact metadata: {}", e);
-                    (
-                        StatusCode::NOT_FOUND,
-                        Json(ErrorResponse {
-                            error: "not_found".to_string(),
-                            message: "Artifact not found".to_string(),
-                        }),
-                    )
-                        .into_response()
-                }
-            }
+    let artifact_id = match Uuid::parse_str(&id) {
+        Ok(uuid) => ArtifactId::from(uuid),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "invalid_id".to_string(),
+                    message: "Invalid artifact ID format".to_string(),
+                }),
+            )
+                .into_response();
         }
+    };
+
+    match storage.get_metadata(artifact_id).await {
+        Ok(artifact) => {
+            if let Err(status) = authorize_job(&pool, &user, artifact.job_id).await {
+                return (
+                    status,
+                    Json(ErrorResponse {
+                        error: "not_found".to_string(),
+                        message: "Artifact not found".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            let response = artifact_to_response(&artifact);
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => {
+            tracing::error!("failed to get artifact metadata: {}", e);
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "not_found".to_string(),
+                    message: "Artifact not found".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Download artifact bytes after authentication.
+async fn get_artifact_content(
+    user: AuthenticatedUser,
+    Extension(pool): Extension<Arc<Pool>>,
+    Extension(storage): Extension<Arc<FileStorage>>,
+    Path(id): Path<String>,
+) -> Response {
+    let artifact_id = match Uuid::parse_str(&id) {
+        Ok(uuid) => ArtifactId::from(uuid),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "invalid_id".to_string(),
+                    message: "Invalid artifact ID format".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
+    let artifact = match storage.get_metadata(artifact_id).await {
+        Ok(artifact) => artifact,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "not_found".to_string(),
+                    message: "Artifact not found".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if let Err(status) = authorize_job(&pool, &user, artifact.job_id).await {
+        return (
+            status,
+            Json(ErrorResponse {
+                error: "not_found".to_string(),
+                message: "Artifact not found".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    match storage.get(artifact_id).await {
+        Ok(data) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/octet-stream")
+            .header("content-length", data.len())
+            .body(Body::from(data))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "not_found".to_string(),
+                message: "Artifact not found".to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
 /// Delete artifact
 async fn delete_artifact(
-    Extension(auth): Extension<Arc<ApiAuth>>,
+    user: AuthenticatedUser,
+    Extension(pool): Extension<Arc<Pool>>,
     Extension(storage): Extension<Arc<FileStorage>>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(_) => {
-            tracing::debug!("delete artifact: {}", id);
+    tracing::debug!("delete artifact: {}", id);
 
-            let artifact_id = match Uuid::parse_str(&id) {
-                Ok(uuid) => ArtifactId::from(uuid),
-                Err(_) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: "invalid_id".to_string(),
-                            message: "Invalid artifact ID format".to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-            };
+    let artifact_id = match Uuid::parse_str(&id) {
+        Ok(uuid) => ArtifactId::from(uuid),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "invalid_id".to_string(),
+                    message: "Invalid artifact ID format".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
 
-            match storage.delete(artifact_id).await {
-                Ok(_) => StatusCode::NO_CONTENT.into_response(),
-                Err(e) => {
-                    tracing::error!("failed to delete artifact: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: "storage_error".to_string(),
-                            message: e.to_string(),
-                        }),
-                    )
-                        .into_response()
-                }
-            }
+    let artifact = match storage.get_metadata(artifact_id).await {
+        Ok(artifact) => artifact,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "not_found".to_string(),
+                    message: "Artifact not found".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if let Err(status) = authorize_job(&pool, &user, artifact.job_id).await {
+        return (
+            status,
+            Json(ErrorResponse {
+                error: "not_found".to_string(),
+                message: "Artifact not found".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    match storage.delete(artifact_id).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!("failed to delete artifact: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "storage_error".to_string(),
+                    message: e.to_string(),
+                }),
+            )
+                .into_response()
         }
     }
 }
 
 /// Get artifacts for a job
 async fn get_job_artifacts(
-    Extension(auth): Extension<Arc<ApiAuth>>,
+    user: AuthenticatedUser,
+    Extension(pool): Extension<Arc<Pool>>,
     Extension(storage): Extension<Arc<FileStorage>>,
-    headers: HeaderMap,
     Path(job_id): Path<String>,
 ) -> impl IntoResponse {
-    match extract_user(&auth, &headers) {
-        Err(e) => e.into_response(),
-        Ok(_) => {
-            tracing::debug!("get job artifacts: {}", job_id);
+    tracing::debug!("get job artifacts: {}", job_id);
 
-            let job_id_val = match Uuid::parse_str(&job_id) {
-                Ok(uuid) => gitforge_common::JobId::from(uuid),
-                Err(_) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: "invalid_id".to_string(),
-                            message: "Invalid job ID format".to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-            };
+    let job_id_val = match Uuid::parse_str(&job_id) {
+        Ok(uuid) => gitforge_common::JobId::from(uuid),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "invalid_id".to_string(),
+                    message: "Invalid job ID format".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
 
-            match storage.list_by_job(job_id_val).await {
-                Ok(artifacts) => {
-                    let responses: Vec<ArtifactResponse> =
-                        artifacts.iter().map(artifact_to_response).collect();
-                    Json(responses).into_response()
-                }
-                Err(e) => {
-                    tracing::error!("failed to list artifacts for job: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: "storage_error".to_string(),
-                            message: e.to_string(),
-                        }),
-                    )
-                        .into_response()
-                }
-            }
+    if let Err(status) = authorize_job(&pool, &user, job_id_val).await {
+        return (
+            status,
+            Json(ErrorResponse {
+                error: "not_found".to_string(),
+                message: "Job artifacts not found".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    match storage.list_by_job(job_id_val).await {
+        Ok(artifacts) => {
+            let responses: Vec<ArtifactResponse> =
+                artifacts.iter().map(artifact_to_response).collect();
+            Json(responses).into_response()
+        }
+        Err(e) => {
+            tracing::error!("failed to list artifacts for job: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "storage_error".to_string(),
+                    message: e.to_string(),
+                }),
+            )
+                .into_response()
         }
     }
 }
@@ -390,83 +524,6 @@ mod tests {
         let response: ArtifactResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.id, "min");
         assert_eq!(response.size_bytes, 1);
-    }
-
-    #[test]
-    fn test_extract_user_without_auth_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let headers = HeaderMap::new();
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_with_invalid_token() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Bearer invalid-token".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_with_valid_token() {
-        use crate::auth::ApiAuth;
-        use gitforge_common::UserId;
-
-        let auth = ApiAuth::new("test-secret");
-        let user_id = UserId::new();
-        let token = auth.generate_token(user_id, "testuser", "user").unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Authorization",
-            format!("Bearer {}", token).parse().unwrap(),
-        );
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_extract_user_malformed_auth_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        // Malformed header without proper Bearer prefix
-        headers.insert("Authorization", "NotBearer token123".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_empty_bearer_token() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Bearer".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_extract_user_basic_auth_header() {
-        use crate::auth::ApiAuth;
-
-        let auth = ApiAuth::new("test-secret");
-        let mut headers = HeaderMap::new();
-        // Basic auth instead of Bearer
-        headers.insert("Authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
-        let result = extract_user(&auth, &headers);
-        assert!(result.is_err());
     }
 
     #[test]

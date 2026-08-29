@@ -6,7 +6,10 @@ use super::GitProtocolHandler;
 use crate::storage::StorageBackend;
 use async_trait::async_trait;
 use gitforge_common::{RepoId, Result};
+use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 
 /// HTTP Git protocol handler
 pub struct HttpGitHandler<S: StorageBackend> {
@@ -31,50 +34,52 @@ impl<S: StorageBackend> HttpGitHandler<S> {
     }
 
     /// Build ref advertisement from repository
-    async fn build_ref_advertisement(&self, repo_id: RepoId) -> Result<Vec<u8>> {
+    async fn build_ref_advertisement(&self, repo_id: RepoId, service: &str) -> Result<Vec<u8>> {
         let repo = self.storage.open(repo_id).await?;
 
-        // Get all refs
+        // Smart HTTP protocol v0 starts with a service announcement and a
+        // flush packet. The previous implementation wrote plain text here,
+        // which made standard Git clients reject the response before they
+        // could discover refs.
         let mut response = Vec::new();
+        response.extend_from_slice(&Self::format_pkt_line(&format!("# service={service}\n")));
+        response.extend_from_slice(b"0000");
 
-        // Add protocol version
-        response.extend_from_slice(b"version 2\n");
-        response.extend_from_slice(b"agent=gitforge/0.1.0\n");
-
-        // Get HEAD reference
-        if let Ok(reference) = repo.head() {
-            let ref_name = reference.name().unwrap_or("HEAD");
-            let oid = reference
-                .target()
-                .map(|oid| oid.to_string())
-                .unwrap_or_default();
-            if !oid.is_empty() {
-                let line = format!("{}\0 capabilities^{{}}\n", ref_name);
-                response.extend_from_slice(&Self::format_pkt_line(&format!("{} {}\n", oid, line)));
-            }
-        }
-
-        // Get references from packed-refs and loose refs
+        let capabilities =
+            "multi_ack_detailed no-done side-band-64k ofs-delta agent=gitforge/0.1.0";
+        let mut advertised_ref = false;
         if let Ok(refs) = repo.references() {
             for reference in refs.flatten() {
                 if let (Some(name), Some(target)) = (reference.name().ok(), reference.target()) {
-                    // Skip symbolic refs and HEAD (already handled)
                     if name.starts_with("refs/") && !name.contains("^{}") {
-                        let ref_line = format!("{} {}\n", target, name);
+                        let ref_line = if advertised_ref {
+                            format!("{} {}\n", target, name)
+                        } else {
+                            advertised_ref = true;
+                            format!("{} {}\0{}\n", target, name, capabilities)
+                        };
                         response.extend_from_slice(&Self::format_pkt_line(&ref_line));
                     }
                 }
             }
         }
 
-        // Add capabilities at the end of refs
-        let caps = "agent=gitforge/0.1.0\nno-progress\nside-band-64k\n";
-        response.extend_from_slice(&Self::format_pkt_line(caps));
-
         // End with flush pkt-line (0000)
         response.extend_from_slice(b"0000");
 
         Ok(response)
+    }
+
+    /// Build the receive-pack ref advertisement used by standard Git pushes.
+    pub async fn receive_pack_advertisement(&self, repo_id: RepoId) -> Result<Vec<u8>> {
+        if !self.storage.exists(repo_id).await {
+            return Err(gitforge_common::Error::git(format!(
+                "Repository {} not found",
+                repo_id
+            )));
+        }
+        self.build_ref_advertisement(repo_id, "git-receive-pack")
+            .await
     }
 }
 
@@ -99,7 +104,8 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
         // In smart HTTP, the client first does a GET to /info/refs to discover refs
         // then a POST with upload-pack request
         // For now, return the ref advertisement
-        self.build_ref_advertisement(repo_id).await
+        self.build_ref_advertisement(repo_id, "git-upload-pack")
+            .await
     }
 
     async fn receive_pack(&self, repo_id: RepoId, input: Vec<u8>) -> Result<Vec<u8>> {
@@ -117,98 +123,40 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
             )));
         }
 
-        // Open the repository
+        if input.is_empty() {
+            return Ok(b"0000".to_vec());
+        }
+
+        // Let Git parse the request, update refs, execute hooks, and produce
+        // correctly framed status output. Writing only the pack to the object
+        // database leaves refs unchanged and breaks clients.
         let repo = self.storage.open(repo_id).await?;
-
-        // Process the pack data if present
-        let mut unpack_ok = false;
-
-        if !input.is_empty() {
-            // Find the pack data start
-            // Git pack protocol: after flush pkt (0000), the pack data begins
-            // Pack data starts with "PACK" magic bytes (0x50 0x41 0x43 0x4b)
-            let pack_start = input.windows(4).position(|w| w == [0x50, 0x41, 0x43, 0x4b]);
-
-            if let Some(pos) = pack_start {
-                let pack_data = &input[pos..];
-                if pack_data.len() > 8 {
-                    match write_pack_to_odb(&repo, pack_data) {
-                        Ok(()) => {
-                            unpack_ok = true;
-                            tracing::info!("Successfully unpacked pack data for repo {}", repo_id);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to process pack data: {}", e);
-                        }
-                    }
-                }
-            } else {
-                // No pack data - could be a ref-only update
-                unpack_ok = true;
-            }
-        } else {
-            // Empty input - just checking capabilities, that's ok
-            unpack_ok = true;
+        let mut child = Command::new("git-receive-pack")
+            .arg("--stateless-rpc")
+            .arg(repo.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                gitforge_common::Error::git(format!("failed to execute git-receive-pack: {error}"))
+            })?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&input).await.map_err(|error| {
+                gitforge_common::Error::git(format!("failed to send receive-pack request: {error}"))
+            })?;
         }
-
-        // Get current refs to report
-        let mut updated_refs = Vec::new();
-        if let Ok(references) = repo.references() {
-            for reference in references.flatten() {
-                if let Ok(name) = reference.name() {
-                    if name.starts_with("refs/") && !name.contains("^{}") {
-                        updated_refs.push(name.to_string());
-                    }
-                }
-            }
+        let output = child.wait_with_output().await.map_err(|error| {
+            gitforge_common::Error::git(format!("failed to wait for git-receive-pack: {error}"))
+        })?;
+        if !output.status.success() {
+            return Err(gitforge_common::Error::git(format!(
+                "git-receive-pack failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
-
-        // Build response
-        let mut response = Vec::new();
-
-        // Report unpack result
-        if unpack_ok {
-            response.extend_from_slice(b"unpack ok\n");
-        } else {
-            response.extend_from_slice(b"unpack error\n");
-        }
-
-        // Report each ref update
-        for ref_name in &updated_refs {
-            let ok_line = format!("ok {}\n", ref_name);
-            response.extend_from_slice(ok_line.as_bytes());
-        }
-
-        // End with flush
-        response.extend_from_slice(b"0000");
-
-        Ok(response)
+        return Ok(output.stdout);
     }
-}
-
-/// Write pack data to repository's object database
-fn write_pack_to_odb(repo: &git2::Repository, pack_data: &[u8]) -> gitforge_common::Result<()> {
-    // Write pack data to repository's odb
-    let odb = repo
-        .odb()
-        .map_err(|e| gitforge_common::Error::git(format!("Failed to get odb: {}", e)))?;
-
-    // Create a packwriter to write the pack
-    let mut packwriter = odb
-        .packwriter()
-        .map_err(|e| gitforge_common::Error::git(format!("Failed to create packwriter: {}", e)))?;
-
-    // Write the pack data
-    // The packwriter implements Write trait
-    std::io::Write::write_all(&mut packwriter, pack_data)
-        .map_err(|e| gitforge_common::Error::git(format!("Failed to write pack: {}", e)))?;
-
-    // The pack is finalized when packwriter is dropped
-    // (git2's OdbPackwriter::Drop implementation calls finalize)
-    drop(packwriter);
-
-    tracing::debug!("Wrote pack data ({} bytes) to odb", pack_data.len());
-    Ok(())
 }
 
 /// Parse Content-Type header for git protocol
@@ -353,8 +301,24 @@ mod tests {
         let response = result.unwrap();
         // Response should contain ref advertisement (starts with pkt-line format)
         assert!(!response.is_empty());
+        assert!(response.starts_with(b"001e# service=git-upload-pack\n0000"));
         // Should end with flush pkt-line (0000)
         assert!(response.ends_with(b"0000"));
+    }
+
+    #[tokio::test]
+    async fn test_receive_pack_advertisement_uses_receive_service() {
+        use crate::storage::FileStorageBackend;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let handler = HttpGitHandler::new(storage.clone());
+        let repo_id = RepoId::new();
+        storage.create(repo_id).await.unwrap();
+
+        let response = handler.receive_pack_advertisement(repo_id).await.unwrap();
+        assert!(response.starts_with(b"001f# service=git-receive-pack\n0000"));
     }
 
     #[tokio::test]

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_root="${1:-}"
+if [[ -z "$source_root" ]]; then
+  echo 'usage: gitforge-release-preflight <release-source-root>' >&2
+  exit 64
+fi
+
+declare -a required=(
+  "api"
+  "ci"
+  "git-server"
+  "runner"
+)
+missing=()
+for binary in "${required[@]}"; do
+  if [[ ! -x "$source_root/$binary" ]]; then
+    missing+=("$binary")
+  fi
+done
+
+if ((${#missing[@]})); then
+  printf 'release preflight: missing required binaries: %s\n' "${missing[*]}" >&2
+  exit 1
+fi
+
+printf 'release preflight: all candidate binaries present (%d); CI owns scheduler\n' "${#required[@]}"

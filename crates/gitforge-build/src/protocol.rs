@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Maximum message size in bytes
-const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB
+pub const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB
 
 impl Request {
     /// Get a string name for the request type (for logging)
