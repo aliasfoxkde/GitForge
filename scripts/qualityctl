@@ -7,7 +7,7 @@ REPORT_DIR="${QUALITY_REPORT_DIR:-$ROOT/target/quality}"
 TIMEOUT_SECONDS="${QUALITY_TIMEOUT_SECONDS:-3600}"
 BUILD_CLI="${GITFORGE_BUILD_CLI:-$ROOT/target/debug/gitforge-build}"
 BUILD_DAEMON="${GITFORGE_BUILD_DAEMON:-$ROOT/target/debug/gitforge-buildd}"
-SOCKET="${GITFORGE_BUILD_SOCKET:-/tmp/gitforge-build.sock}"
+SOCKET="${GITFORGE_BUILD_SOCKET:-$ROOT/target/quality/gitforge-build.sock}"
 
 usage() {
     cat <<'EOF'
