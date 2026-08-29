@@ -23,17 +23,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check CI status
+        id: gate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          # gh evaluates the repository's actual required checks, including
-          # check runs and legacy status contexts. Do not infer readiness from
-          # a check-run field (`type`) that is not present in the API payload.
-          if ! gh pr checks "$PR_NUMBER" --required; then
-            echo "Required checks are pending or failing; auto-merge remains disabled."
+          # gh evaluates all check runs and legacy status contexts. Do not
+          # infer readiness from a check-run field (`type`) that is not present
+          # in the API payload.
+          if ! gh pr checks "$PR_NUMBER"; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Checks are pending or failing; auto-merge remains disabled."
             exit 0
           fi
 
@@ -43,12 +45,15 @@ jobs:
               echo "Required checks pass; merge state is $MERGE_STATE."
               ;;
             *)
+              echo "ready=false" >> "$GITHUB_OUTPUT"
               echo "Merge state $MERGE_STATE is not safe for auto-merge." >&2
               exit 0
               ;;
           esac
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Enable auto-merge
+        if: steps.gate.outputs.ready == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
