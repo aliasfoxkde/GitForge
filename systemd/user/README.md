@@ -54,6 +54,13 @@ with pending/delivering counts and the oldest active event age; a delivering
 event causes `status` to become `attention` until it is completed or returned
 to pending.
 
+Before assembling a release bundle, run
+`scripts/gitforge-release-preflight <release-source-root>`. It fails closed
+unless `api`, `ci`, `git-server`, `runner`, and
+`gitforge-scheduler-service` are all present and executable. The clean candidate
+currently fails this check because the scheduler service is still sourced from
+the separate legacy checkout; do not mix that binary into a candidate bundle.
+
 ## Validation and rollout
 
 1. Copy the drop-in into each matching `*.service.d/` directory in a disposable
