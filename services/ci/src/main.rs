@@ -471,6 +471,78 @@ fn validate_workspace_path(path: &str) -> Result<String, String> {
     Ok(workspace.to_string_lossy().into_owned())
 }
 
+/// Create an isolated checkout for a push-triggered run when the caller did
+/// not supply an already prepared workspace. The checkout is rooted under a
+/// configured directory and named by the immutable run ID, so concurrent runs
+/// cannot share mutable source state.
+async fn prepare_run_workspace(
+    pool: &gitforge_db::Pool,
+    repo_id: gitforge_common::RepoId,
+    run_id: gitforge_common::PipelineRunId,
+    commit_hash: &str,
+) -> anyhow::Result<String> {
+    let repository = gitforge_db::queries::RepoQueries::get(pool, repo_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repository {} is not registered", repo_id))?;
+    let source = std::fs::canonicalize(&repository.git_path).map_err(|error| {
+        anyhow::anyhow!(
+            "repository {} git path is unavailable ({}): {}",
+            repo_id,
+            repository.git_path,
+            error
+        )
+    })?;
+    if !source.is_dir() {
+        return Err(anyhow::anyhow!(
+            "repository {} git path is not a directory: {}",
+            repo_id,
+            source.display()
+        ));
+    }
+
+    let root = std::env::var("GITFORGE_WORKSPACE_ROOT")
+        .unwrap_or_else(|_| "/var/lib/gitforge/workspaces".to_string());
+    tokio::fs::create_dir_all(&root).await?;
+    let workspace = std::path::PathBuf::from(root).join(run_id.to_string());
+    if tokio::fs::try_exists(&workspace).await? {
+        return Err(anyhow::anyhow!(
+            "workspace already exists for run {}",
+            run_id
+        ));
+    }
+
+    let clone = tokio::process::Command::new("git")
+        .args(["clone", "--local", "--no-checkout"])
+        .arg(&source)
+        .arg(&workspace)
+        .output()
+        .await?;
+    if !clone.status.success() {
+        return Err(anyhow::anyhow!(
+            "checkout clone failed for run {}: {}",
+            run_id,
+            String::from_utf8_lossy(&clone.stderr).trim()
+        ));
+    }
+
+    let checkout = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&workspace)
+        .args(["checkout", "--detach", commit_hash])
+        .output()
+        .await?;
+    if !checkout.status.success() {
+        return Err(anyhow::anyhow!(
+            "checkout commit {} failed for run {}: {}",
+            commit_hash,
+            run_id,
+            String::from_utf8_lossy(&checkout.stderr).trim()
+        ));
+    }
+
+    Ok(workspace.to_string_lossy().into_owned())
+}
+
 /// Create the shutdown future that waits for shutdown signal
 pub async fn create_shutdown_future(shutdown: Arc<AtomicBool>) {
     wait_for_shutdown(shutdown).await;
@@ -596,7 +668,7 @@ async fn handle_push_event(
             .insert(repo_id, pipeline.clone());
         pipeline
     };
-    let workspace_path = workspace_paths
+    let requested_workspace = workspace_paths
         .lock()
         .expect("workspace cache lock poisoned")
         .get(&repo_id)
@@ -622,6 +694,24 @@ async fn handle_push_event(
     tracing::info!("enqueueing {} ready jobs", ready_jobs.len());
 
     let state = engine.state().await;
+    let workspace_path = match requested_workspace {
+        Some(path) => Some(path),
+        None => {
+            let pool = scheduler_db.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "push run {} has no workspace and durable repository storage is unavailable",
+                    state.run_id
+                )
+            })?;
+            Some(
+                prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await?,
+            )
+        }
+    };
+    workspace_paths
+        .lock()
+        .expect("workspace cache lock poisoned")
+        .insert(repo_id, workspace_path.clone());
     pipeline_registry
         .write()
         .await
