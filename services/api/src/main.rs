@@ -14,6 +14,12 @@ use tokio::time::timeout;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // This service is configured through environment variables. Rejecting
+    // unsupported arguments prevents an operator from believing that a custom
+    // port/host was applied when the process would otherwise silently ignore
+    // it and bind the production default.
+    validate_cli_args(std::env::args().skip(1))?;
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -85,6 +91,22 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("API Gateway stopped");
     Ok(())
+}
+
+/// Reject command-line arguments because API configuration is environment based.
+///
+/// In particular, silently accepting `--port` is dangerous: the server would
+/// continue using `PORT` (or 42780), which can collide with another instance.
+pub fn validate_cli_args(args: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
+    let args: Vec<String> = args.into_iter().collect();
+    if args.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "unsupported API command-line arguments: {}; configure the service with environment variables (PORT, DATABASE_URL, JWT_SECRET)",
+        args.join(" ")
+    )
 }
 
 /// Server configuration
@@ -170,6 +192,20 @@ mod tests {
             result.is_err(),
             "load_config should panic without JWT_SECRET"
         );
+    }
+
+    #[test]
+    fn test_validate_cli_args_accepts_empty_arguments() {
+        assert!(validate_cli_args(Vec::<String>::new()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_cli_args_rejects_unsupported_port_argument() {
+        let error = validate_cli_args(vec!["--port".to_string(), "42880".to_string()])
+            .expect_err("unsupported arguments must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("--port"));
+        assert!(message.contains("PORT"));
     }
 
     #[test]
