@@ -31,7 +31,7 @@ impl<S: StorageBackend> HttpGitHandler<S> {
     }
 
     /// Build ref advertisement from repository
-    async fn build_ref_advertisement(&self, repo_id: RepoId) -> Result<Vec<u8>> {
+    async fn build_ref_advertisement(&self, repo_id: RepoId, service: &str) -> Result<Vec<u8>> {
         let repo = self.storage.open(repo_id).await?;
 
         // Smart HTTP protocol v0 starts with a service announcement and a
@@ -39,7 +39,7 @@ impl<S: StorageBackend> HttpGitHandler<S> {
         // which made standard Git clients reject the response before they
         // could discover refs.
         let mut response = Vec::new();
-        response.extend_from_slice(&Self::format_pkt_line("# service=git-upload-pack\n"));
+        response.extend_from_slice(&Self::format_pkt_line(&format!("# service={service}\n")));
         response.extend_from_slice(b"0000");
 
         let capabilities =
@@ -66,6 +66,18 @@ impl<S: StorageBackend> HttpGitHandler<S> {
 
         Ok(response)
     }
+
+    /// Build the receive-pack ref advertisement used by standard Git pushes.
+    pub async fn receive_pack_advertisement(&self, repo_id: RepoId) -> Result<Vec<u8>> {
+        if !self.storage.exists(repo_id).await {
+            return Err(gitforge_common::Error::git(format!(
+                "Repository {} not found",
+                repo_id
+            )));
+        }
+        self.build_ref_advertisement(repo_id, "git-receive-pack")
+            .await
+    }
 }
 
 #[async_trait]
@@ -89,7 +101,8 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
         // In smart HTTP, the client first does a GET to /info/refs to discover refs
         // then a POST with upload-pack request
         // For now, return the ref advertisement
-        self.build_ref_advertisement(repo_id).await
+        self.build_ref_advertisement(repo_id, "git-upload-pack")
+            .await
     }
 
     async fn receive_pack(&self, repo_id: RepoId, input: Vec<u8>) -> Result<Vec<u8>> {
@@ -346,6 +359,21 @@ mod tests {
         assert!(response.starts_with(b"001e# service=git-upload-pack\n0000"));
         // Should end with flush pkt-line (0000)
         assert!(response.ends_with(b"0000"));
+    }
+
+    #[tokio::test]
+    async fn test_receive_pack_advertisement_uses_receive_service() {
+        use crate::storage::FileStorageBackend;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let handler = HttpGitHandler::new(storage.clone());
+        let repo_id = RepoId::new();
+        storage.create(repo_id).await.unwrap();
+
+        let response = handler.receive_pack_advertisement(repo_id).await.unwrap();
+        assert!(response.starts_with(b"001f# service=git-receive-pack\n0000"));
     }
 
     #[tokio::test]

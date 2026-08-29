@@ -4,7 +4,7 @@
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{Request, StatusCode},
     response::Response,
     routing::{get, post},
@@ -36,6 +36,11 @@ struct SshServerConfig {
     port: u16,
     storage: Arc<FileStorageBackend>,
     db_pool: Option<Arc<Pool>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct InfoRefsQuery {
+    service: Option<String>,
 }
 
 #[tokio::main]
@@ -301,13 +306,45 @@ async fn git_upload_pack_path(
 /// Standard Smart HTTP ref advertisement endpoint.
 async fn git_info_refs(
     Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<InfoRefsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    git_upload_pack(
-        Path((owner, repo.trim_end_matches(".git").to_string())),
-        State(state),
-    )
-    .await
+    let repo = repo.trim_end_matches(".git").to_string();
+    if query.service.as_deref() != Some("git-receive-pack") {
+        return git_upload_pack(Path((owner, repo)), State(state)).await;
+    }
+
+    let repo_path = format!("{owner}/{repo}");
+    let repo_id = match lookup_repo_id(&state.db_pool, &owner, &repo).await {
+        Some(id) => id,
+        None => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from(format!("Repository not found: {repo_path}")))
+                .unwrap()
+        }
+    };
+    if !state.storage.exists(repo_id).await {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from(format!("Repository not found: {repo_path}")))
+            .unwrap();
+    }
+    match state.http_handler.receive_pack_advertisement(repo_id).await {
+        Ok(response) => Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                "Content-Type",
+                "application/x-git-receive-pack-advertisement",
+            )
+            .header("Cache-Control", "no-cache")
+            .body(Body::from(response))
+            .unwrap(),
+        Err(error) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from(format!("Error: {error}")))
+            .unwrap(),
+    }
 }
 
 /// Standard Smart HTTP upload-pack endpoint.
