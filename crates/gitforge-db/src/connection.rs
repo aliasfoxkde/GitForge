@@ -172,6 +172,7 @@ impl Pool {
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 commands TEXT NOT NULL DEFAULT '[]',
+                image TEXT NOT NULL DEFAULT 'rust:latest',
                 working_dir TEXT,
                 result_json TEXT,
                 FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id),
@@ -188,6 +189,7 @@ impl Pool {
         // for ADD COLUMN, so tolerate only the known duplicate-column case.
         for statement in [
             "ALTER TABLE jobs ADD COLUMN commands TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE jobs ADD COLUMN image TEXT NOT NULL DEFAULT 'rust:latest'",
             "ALTER TABLE jobs ADD COLUMN working_dir TEXT",
             "ALTER TABLE jobs ADD COLUMN result_json TEXT",
             "ALTER TABLE jobs ADD COLUMN lease_token TEXT",

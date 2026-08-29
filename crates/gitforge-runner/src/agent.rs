@@ -79,8 +79,14 @@ pub struct JobAssignment {
     pub pipeline_run_id: String,
     /// Commands to execute
     pub commands: Vec<String>,
+    #[serde(default = "default_job_image")]
+    pub image: String,
     /// Working directory
     pub working_dir: Option<String>,
+}
+
+fn default_job_image() -> String {
+    "rust:latest".to_string()
 }
 
 /// Runner agent that fetches and executes jobs
@@ -397,7 +403,7 @@ impl RunnerAgent {
             pipeline_run_id,
             repository_id: None,
             base_sha: None,
-            image: "rust:latest".to_string(), // Default image - would come from job config
+            image: assignment.image.clone(),
             steps: assignment
                 .commands
                 .iter()

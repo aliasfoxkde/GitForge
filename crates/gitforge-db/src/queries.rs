@@ -767,8 +767,8 @@ impl JobQueries {
     pub async fn create(pool: &Pool, job: &crate::models::Job) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, working_dir, result_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, result_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(job.id.to_string())
@@ -781,6 +781,7 @@ impl JobQueries {
         .bind(job.retry_count)
         .bind(job.created_at.to_rfc3339())
         .bind(serde_json::to_string(&job.commands).unwrap_or_else(|_| "[]".to_string()))
+        .bind(&job.image)
         .bind(&job.working_dir)
         .bind(&job.result_json)
         .execute(pool.pool())
@@ -825,6 +826,7 @@ impl JobQueries {
                         .unwrap_or_else(|| "[]".to_string()),
                 )
                 .unwrap_or_default(),
+                image: row.get::<Option<String>, _>("image").unwrap_or_else(|| "rust:latest".to_string()),
                 working_dir: row.get("working_dir"),
                 result_json: row.get("result_json"),
             })),
@@ -863,10 +865,21 @@ impl JobQueries {
         commands: &[String],
         working_dir: Option<&str>,
     ) -> Result<()> {
+        Self::set_definition_with_image(pool, id, commands, "rust:latest", working_dir).await
+    }
+
+    pub async fn set_definition_with_image(
+        pool: &Pool,
+        id: JobId,
+        commands: &[String],
+        image: &str,
+        working_dir: Option<&str>,
+    ) -> Result<()> {
         let commands_json = serde_json::to_string(commands)
             .map_err(|e| Error::database(format!("failed to encode job commands: {}", e)))?;
-        sqlx::query("UPDATE jobs SET commands = ?, working_dir = ? WHERE id = ?")
+        sqlx::query("UPDATE jobs SET commands = ?, image = ?, working_dir = ? WHERE id = ?")
             .bind(commands_json)
+            .bind(image)
             .bind(working_dir)
             .bind(id.to_string())
             .execute(pool.pool())
@@ -1060,6 +1073,7 @@ impl JobQueries {
                         .unwrap_or_else(|| "[]".to_string()),
                 )
                 .unwrap_or_default(),
+                image: row.get::<Option<String>, _>("image").unwrap_or_else(|| "rust:latest".to_string()),
                 working_dir: row.get("working_dir"),
                 result_json: row.get("result_json"),
             })
@@ -1106,6 +1120,7 @@ impl JobQueries {
                         .unwrap_or_else(|| "[]".to_string()),
                 )
                 .unwrap_or_default(),
+                image: row.get::<Option<String>, _>("image").unwrap_or_else(|| "rust:latest".to_string()),
                 working_dir: row.get("working_dir"),
                 result_json: row.get("result_json"),
             })

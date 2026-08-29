@@ -70,6 +70,7 @@ pub struct Job {
     /// Commands are persisted with the job so runners never need a
     /// placeholder or independently reconstructed definition.
     pub commands: Vec<String>,
+    pub image: String,
     pub working_dir: Option<String>,
     /// JSON-encoded bounded execution receipt, when the job is terminal.
     pub result_json: Option<String>,
@@ -89,6 +90,7 @@ impl Job {
             retry_count: 0,
             created_at: Utc::now(),
             commands: Vec::new(),
+            image: "rust:latest".to_string(),
             working_dir: None,
             result_json: None,
         }

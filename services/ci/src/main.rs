@@ -665,7 +665,14 @@ async fn handle_push_event(
                 .find_map(|step| step.working_directory.clone());
             let working_dir = working_dir.or_else(|| workspace_path.clone());
             scheduler
-                .enqueue_with_definition(job_id, state.run_id, repo_id, commands, working_dir)
+                .enqueue_with_definition_and_image(
+                    job_id,
+                    state.run_id,
+                    repo_id,
+                    commands,
+                    definition.image.clone(),
+                    working_dir,
+                )
                 .await;
             tracing::debug!("enqueued job {} for pipeline run {}", job_id, state.run_id);
         }
@@ -754,11 +761,12 @@ async fn run_scheduler_event_consumer(
                     .find_map(|step| step.working_directory.clone())
                     .or_else(|| workspace_path.clone());
                 scheduler
-                    .enqueue_with_definition(
+                    .enqueue_with_definition_and_image(
                         next_job_id,
                         state.run_id,
                         state.repo_id,
                         commands,
+                        definition.image.clone(),
                         working_dir,
                     )
                     .await;

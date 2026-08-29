@@ -73,6 +73,7 @@ pub struct SchedulerState {
 #[derive(Debug, Clone)]
 pub struct JobExecutionDefinition {
     pub commands: Vec<String>,
+    pub image: String,
     pub working_dir: Option<String>,
 }
 
@@ -229,6 +230,26 @@ impl Scheduler {
         commands: Vec<String>,
         working_dir: Option<String>,
     ) {
+        self.enqueue_with_definition_and_image(
+            job_id,
+            pipeline_run_id,
+            repo_id,
+            commands,
+            "rust:latest".to_string(),
+            working_dir,
+        )
+        .await;
+    }
+
+    pub async fn enqueue_with_definition_and_image(
+        &self,
+        job_id: JobId,
+        pipeline_run_id: PipelineRunId,
+        repo_id: RepoId,
+        commands: Vec<String>,
+        image: String,
+        working_dir: Option<String>,
+    ) {
         let job = QueuedJob::new(job_id, pipeline_run_id, repo_id);
         let mut state = self.state.write().await;
         state.queue.enqueue(job);
@@ -236,6 +257,7 @@ impl Scheduler {
             job_id,
             JobExecutionDefinition {
                 commands: commands.clone(),
+                image: image.clone(),
                 working_dir: working_dir.clone(),
             },
         );
@@ -253,10 +275,11 @@ impl Scheduler {
             {
                 tracing::error!("failed to update job status in DB: {}", e);
             }
-            if let Err(e) = gitforge_db::queries::JobQueries::set_definition(
+            if let Err(e) = gitforge_db::queries::JobQueries::set_definition_with_image(
                 pool,
                 job_id,
                 &commands,
+                &image,
                 working_dir.as_deref(),
             )
             .await
@@ -702,6 +725,7 @@ impl Scheduler {
                     db_job.id,
                     JobExecutionDefinition {
                         commands: db_job.commands,
+                        image: db_job.image,
                         working_dir: db_job.working_dir,
                     },
                 );
