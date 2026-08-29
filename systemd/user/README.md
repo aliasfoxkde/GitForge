@@ -41,11 +41,12 @@ The trigger token must be identical to the CI `GITFORGE_TRIGGER_TOKEN`.
 current binaries; setting only the latter leaves Git-server repository lookup
 disabled and causes Git discovery to return 503.
 
-The Git-server bridge parses successful receive-pack updates and notifies CI
-for each ref. A push can still succeed if CI is unavailable because the Git
-ref has already been accepted; production deployment therefore still requires
-a durable outbox/retry mechanism or an equivalent operational alert before
-this path is considered lossless.
+The Git-server bridge parses successful receive-pack updates, persists one
+`ci.trigger.pending` event per ref in the shared `events` table, and retries
+delivery until CI acknowledges it. A push can still succeed while CI is down
+because the Git ref has already been accepted, but the pending event survives
+service restart and is delivered by the Git-server outbox worker when CI
+recovers. Monitor pending events and delivery age in production.
 
 ## Validation and rollout
 
