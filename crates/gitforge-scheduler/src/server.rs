@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use gitforge_common::{JobId, PipelineRunId, RepoId, RunnerId};
+use gitforge_common::{JobId, RunnerId};
 use gitforge_db::models::{Runner, RunnerType};
 use gitforge_storage::{Artifact, ArtifactId, ArtifactStore, FileStorage, MAX_ARTIFACT_BYTES};
 use serde::{Deserialize, Serialize};
@@ -942,6 +942,7 @@ async fn complete_job(
 mod tests {
     use super::*;
     use axum::http::{Request, StatusCode};
+    use gitforge_common::{PipelineRunId, RepoId};
     use tower::ServiceExt;
 
     fn assert_status(response: axum::response::Response, expected: StatusCode) {
