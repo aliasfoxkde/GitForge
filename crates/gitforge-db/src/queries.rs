@@ -81,6 +81,22 @@ fn hydrate_repository(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Rep
     })
 }
 
+fn hydrate_user(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::User> {
+    Ok(crate::models::User {
+        id: UserId::from(parse_uuid_column(&row, "id")?),
+        username: row
+            .try_get("username")
+            .map_err(|error| Error::database(format!("invalid username: {}", error)))?,
+        email: row
+            .try_get("email")
+            .map_err(|error| Error::database(format!("invalid user email: {}", error)))?,
+        password_hash: row
+            .try_get("password_hash")
+            .map_err(|error| Error::database(format!("invalid password hash: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+    })
+}
+
 fn hydrate_pipeline_run(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::PipelineRun> {
     Ok(crate::models::PipelineRun {
         id: PipelineRunId::from(parse_uuid_column(&row, "id")?),
@@ -360,18 +376,7 @@ impl UserQueries {
             .await
             .map_err(|e| Error::database(format!("failed to get user: {}", e)))?;
 
-        match row {
-            Some(row) => Ok(Some(crate::models::User {
-                id: UserId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                username: row.get("username"),
-                email: row.get("email"),
-                password_hash: row.get("password_hash"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
-            None => Ok(None),
-        }
+        row.map(hydrate_user).transpose()
     }
 
     /// Get a user by username
@@ -385,18 +390,7 @@ impl UserQueries {
             .await
             .map_err(|e| Error::database(format!("failed to get user by username: {}", e)))?;
 
-        match row {
-            Some(row) => Ok(Some(crate::models::User {
-                id: UserId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                username: row.get("username"),
-                email: row.get("email"),
-                password_hash: row.get("password_hash"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })),
-            None => Ok(None),
-        }
+        row.map(hydrate_user).transpose()
     }
 
     /// List all users
@@ -408,16 +402,8 @@ impl UserQueries {
 
         let users = rows
             .into_iter()
-            .map(|row| crate::models::User {
-                id: UserId::from(Uuid::parse_str(&row.get::<String, _>("id")).unwrap()),
-                username: row.get("username"),
-                email: row.get("email"),
-                password_hash: row.get("password_hash"),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
-                    .unwrap()
-                    .with_timezone(&Utc),
-            })
-            .collect();
+            .map(hydrate_user)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(users)
     }
@@ -1348,6 +1334,15 @@ mod tests {
         // List all
         let all_users = UserQueries::list(&pool).await.unwrap();
         assert_eq!(all_users.len(), 1);
+
+        sqlx::query("UPDATE users SET created_at = ? WHERE id = ?")
+            .bind("2026-08-29 03:40:39")
+            .bind(user.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert!(UserQueries::get(&pool, user.id).await.is_err());
+        assert!(UserQueries::list(&pool).await.is_err());
     }
 
     #[tokio::test]
