@@ -3,7 +3,7 @@
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
 use gitforge_common::{JobId, PipelineRunId, RepoId, RunnerId};
-use gitforge_db::models::{Job as DbJob, PipelineRun as DbPipelineRun, Runner};
+use gitforge_db::models::{Job as DbJob, JobStatus, PipelineRun as DbPipelineRun, Runner};
 use gitforge_db::Pool;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -371,6 +371,14 @@ impl Scheduler {
         state.job_leases.remove(&job_id);
         drop(state);
         if let Some(pool) = &self.db_pool {
+            let pipeline_run_id = match gitforge_db::queries::JobQueries::get(pool, job_id).await {
+                Ok(Some(job)) => Some(job.pipeline_run_id),
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(%error, %job_id, "failed to load parent pipeline before cancellation");
+                    None
+                }
+            };
             let receipt = serde_json::json!({
                 "job_id": job_id.to_string(),
                 "status": "cancelled",
@@ -382,7 +390,51 @@ impl Scheduler {
             {
                 tracing::warn!(%error, %job_id, "failed to persist job cancellation");
             }
+            if let Some(pipeline_run_id) = pipeline_run_id {
+                if let Err(error) = self
+                    .finalize_pipeline_if_terminal(pool, pipeline_run_id)
+                    .await
+                {
+                    tracing::warn!(%error, %job_id, %pipeline_run_id, "failed to finalize parent pipeline after cancellation");
+                }
+            }
         }
+    }
+
+    /// Finalize a durable parent run once all of its jobs are terminal. This
+    /// is needed for operator cancellation because the cancellation endpoint
+    /// transitions a job directly and does not pass through the normal runner
+    /// completion path.
+    async fn finalize_pipeline_if_terminal(
+        &self,
+        pool: &Pool,
+        pipeline_run_id: PipelineRunId,
+    ) -> anyhow::Result<()> {
+        let jobs = gitforge_db::queries::JobQueries::list_by_run(pool, pipeline_run_id).await?;
+        if jobs.is_empty()
+            || !jobs.iter().all(|job| {
+                JobStatus::from_str(&job.status).is_some_and(|status| status.is_terminal())
+            })
+        {
+            return Ok(());
+        }
+
+        let status = if jobs
+            .iter()
+            .any(|job| JobStatus::from_str(&job.status) == Some(JobStatus::Cancelled))
+        {
+            "cancelled"
+        } else if jobs
+            .iter()
+            .any(|job| JobStatus::from_str(&job.status) == Some(JobStatus::Failed))
+        {
+            "failed"
+        } else {
+            "succeeded"
+        };
+        gitforge_db::queries::PipelineRunQueries::update_status(pool, pipeline_run_id, status)
+            .await?;
+        Ok(())
     }
 
     /// Register a runner
@@ -1751,5 +1803,67 @@ mod tests {
             .unwrap();
         assert_eq!(completed.status, "succeeded");
         assert!(scheduler.is_assigned(job_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_cancel_finalizes_single_job_pipeline_run() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "cancel-owner".to_string(),
+            "cancel-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            "cancel-repo".to_string(),
+            user.id,
+            "/git/cancel-repo".to_string(),
+        );
+        gitforge_db::queries::RepoQueries::create(&pool, &repo)
+            .await
+            .unwrap();
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: "cancel-pipeline".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "cancel-owner".to_string(),
+            "cancel-commit".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+        let job = gitforge_db::models::Job::new(run.id, "cancel-job".to_string());
+        let job_id = job.id;
+        gitforge_db::queries::JobQueries::create(&pool, &job)
+            .await
+            .unwrap();
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        scheduler.cancel(job_id).await;
+
+        let cancelled = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        let finalized = gitforge_db::queries::PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finalized.status, "cancelled");
+        assert!(finalized.finished_at.is_some());
     }
 }
