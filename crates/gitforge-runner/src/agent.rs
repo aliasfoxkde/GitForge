@@ -980,6 +980,7 @@ mod tests {
             name: "full-pipeline".to_string(),
             pipeline_run_id: "run-002".to_string(),
             commands,
+            image: "rust:latest".to_string(),
             working_dir: Some("/project".to_string()),
         };
         assert_eq!(assignment.commands.len(), 4);
