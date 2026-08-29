@@ -386,6 +386,28 @@ async fn submit_job(
             )
         }
     };
+    match state.scheduler.get_pipeline_run(pipeline_run_id).await {
+        Ok(Some(run)) if run.repo_id == repo_id => {}
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "pipeline_run_repository_mismatch"})),
+            )
+        }
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "pipeline_run_not_found"})),
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, %pipeline_run_id, "failed to validate pipeline run");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "pipeline_run_lookup_failed"})),
+            )
+        }
+    }
     let fingerprint = match serde_json::to_string(&request) {
         Ok(value) => value,
         Err(_) => {
@@ -1503,6 +1525,44 @@ mod tests {
                     .uri(format!("/jobs/{}/cancel", JobId::new()))
                     .header("authorization", "Bearer operator-secret")
                     .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_operator_submit_unknown_pipeline_run_is_not_found() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let state = SchedulerServerState {
+            scheduler: Arc::new(crate::Scheduler::with_db(pool)),
+            runner_auth_token: Some(Arc::from("runner-secret")),
+            operator_auth_token: Some(Arc::from("operator-secret")),
+            artifact_storage: None,
+        };
+        let app: Router = scheduler_routes_with_tokens(
+            state,
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/jobs")
+                    .header("authorization", "Bearer operator-secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "pipeline_run_id": PipelineRunId::new().to_string(),
+                            "repo_id": RepoId::new().to_string(),
+                            "commands": ["/bin/true"],
+                            "idempotency_key": "unknown-run-test"
+                        })
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
