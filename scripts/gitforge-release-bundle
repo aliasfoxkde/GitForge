@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_root="${1:-}"
+bundle_root="${2:-}"
+release_id="${3:-}"
+
+if [[ -z "$source_root" || -z "$bundle_root" || -z "$release_id" ]]; then
+  echo 'usage: gitforge-release-bundle <source-root> <bundle-root> <release-id>' >&2
+  exit 64
+fi
+
+if [[ ! -d "$source_root" ]]; then
+  printf 'release bundle: source root does not exist: %s\n' "$source_root" >&2
+  exit 1
+fi
+
+if [[ ! "$release_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  printf 'release bundle: invalid release id: %s\n' "$release_id" >&2
+  exit 64
+fi
+
+"$(dirname "$0")/gitforge-release-preflight" "$source_root"
+
+release_dir="$bundle_root/$release_id"
+if [[ -e "$release_dir" ]]; then
+  printf 'release bundle: refusing to overwrite existing release: %s\n' "$release_dir" >&2
+  exit 1
+fi
+
+mkdir -p "$release_dir/bin" "$release_dir/systemd/user"
+
+for binary in api ci git-server runner; do
+  install -m 0755 "$source_root/$binary" "$release_dir/bin/$binary"
+done
+
+for unit in gitforge-ci.service.example gitforge-runner.service.example; do
+  install -m 0644 "$(dirname "$0")/../systemd/user/$unit" "$release_dir/systemd/user/$unit"
+done
+
+for policy in gitforge-ci-resource-limits.conf gitforge-runner-resource-limits.conf; do
+  install -m 0644 "$(dirname "$0")/../systemd/user/$policy" "$release_dir/systemd/user/$policy"
+done
+
+(
+  cd "$release_dir"
+  sha256sum bin/* systemd/user/* | sort > MANIFEST.sha256
+  touch READY
+)
+
+printf 'release bundle: assembled %s\n' "$release_dir"
+printf 'release bundle: files=%s\n' "$(wc -l < "$release_dir/MANIFEST.sha256")"
+printf 'release bundle: ready\n'
