@@ -144,8 +144,8 @@ Goal: CI says what actually passed and releases are verifiable.
 - [ ] P4-09 Add dependency lockfile policy (`--locked`, cargo-deny/license and
   advisory policy) to every Rust build path, including templates. The active
   build/test/lint/release workflows now use `--locked`, root `cargo deny check`
-  is enforced by `scripts/qualityctl`, and the RSA/h2 findings were fixed.
-  Template lockfiles and hosted workflow enforcement remain open.
+  is enforced by `scripts/qualityctl` and the active Security workflow, and the
+  RSA/h2 findings were fixed. Template lockfiles remain open.
 - [ ] P4-10 Add workflow linting, action pin drift detection, shellcheck, and
   script-injection checks as required CI jobs. The dependency-free immutable
   action-ref check now runs in `scripts/qualityctl`; actionlint/shellcheck
