@@ -55,15 +55,253 @@ impl fmt::Debug for RunnerConfig {
 
 impl Default for RunnerConfig {
     fn default() -> Self {
+        // Hardcoded safe defaults — used only by existing tests that construct
+        // RunnerConfig directly without env vars.
         Self {
-            scheduler_url: std::env::var("GITFORGE_SCHEDULER_URL")
-                .unwrap_or_else(|_| "http://localhost:42781".to_string()),
+            scheduler_url: "http://localhost:42781".to_string(),
             name: "runner".to_string(),
             runner_type: "docker".to_string(),
             capacity: 2,
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
-            scheduler_token: std::env::var("GITFORGE_SCHEDULER_TOKEN").ok(),
+            scheduler_token: None,
+        }
+    }
+}
+
+impl RunnerConfig {
+    /// Load runner configuration from the environment, then validate.
+    ///
+    /// **Required:**
+    /// - `GITFORGE_SCHEDULER_URL` — scheduler HTTP endpoint (e.g. `http://localhost:42781`).
+    ///   If unset or empty, the runner exits immediately with an error at startup.
+    ///
+    /// **Optional** (safe defaults when absent):
+    /// - `GITFORGE_RUNNER_NAME`        — runner display name (default: `"runner"`)
+    /// - `GITFORGE_RUNNER_CAPACITY`   — concurrent job slots (default: `2`)
+    /// - `GITFORGE_HEARTBEAT_INTERVAL` — heartbeat seconds (default: `30`)
+    /// - `GITFORGE_FETCH_INTERVAL`    — job-poll seconds (default: `5`)
+    ///
+    /// **Optional credentials** (no default — runner runs unauthenticated if unset):
+    /// - `GITFORGE_SCHEDULER_TOKEN`  — bearer token for scheduler API
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `GITFORGE_SCHEDULER_URL` is missing or empty.
+    /// Numeric parse failures also cause startup to fail fast.
+    pub fn from_env() -> Result<Self> {
+        let scheduler_url = std::env::var("GITFORGE_SCHEDULER_URL")
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|_| String::new());
+
+        if scheduler_url.is_empty() {
+            return Err(Error::invalid_input(
+                "GITFORGE_SCHEDULER_URL is not set or is empty; \
+                 the runner requires a scheduler URL to register with.\n\
+                 Hint: set GITFORGE_SCHEDULER_URL=http://localhost:42781 (or your CI address)",
+            ));
+        }
+
+        // Start from safe defaults, then override from the environment.
+        let mut cfg = Self::default();
+
+        cfg.scheduler_url = scheduler_url;
+
+        if let Ok(v) = std::env::var("GITFORGE_RUNNER_NAME") {
+            if !v.trim().is_empty() {
+                cfg.name = v.trim().to_string();
+            }
+        }
+
+        if let Ok(v) = std::env::var("GITFORGE_RUNNER_CAPACITY") {
+            if !v.trim().is_empty() {
+                cfg.capacity = v
+                    .trim()
+                    .parse()
+                    .map_err(|_| Error::invalid_input(
+                        "GITFORGE_RUNNER_CAPACITY must be a valid integer",
+                    ))?;
+            }
+        }
+
+        if let Ok(v) = std::env::var("GITFORGE_HEARTBEAT_INTERVAL") {
+            if !v.trim().is_empty() {
+                cfg.heartbeat_interval_secs = v
+                    .trim()
+                    .parse()
+                    .map_err(|_| Error::invalid_input(
+                        "GITFORGE_HEARTBEAT_INTERVAL must be a valid integer",
+                    ))?;
+            }
+        }
+
+        if let Ok(v) = std::env::var("GITFORGE_FETCH_INTERVAL") {
+            if !v.trim().is_empty() {
+                cfg.fetch_interval_secs = v
+                    .trim()
+                    .parse()
+                    .map_err(|_| Error::invalid_input(
+                        "GITFORGE_FETCH_INTERVAL must be a valid integer",
+                    ))?;
+            }
+        }
+
+        if let Ok(v) = std::env::var("GITFORGE_SCHEDULER_TOKEN") {
+            cfg.scheduler_token = if v.trim().is_empty() {
+                None
+            } else {
+                Some(v.trim().to_string())
+            };
+        }
+
+        Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn test_from_env_valid_complete() {
+        let _guard = temp_env::with_vars([
+            ("GITFORGE_SCHEDULER_URL", Some("http://ci:42781")),
+            ("GITFORGE_RUNNER_NAME", Some("prod-runner-01")),
+            ("GITFORGE_RUNNER_CAPACITY", Some("4")),
+            ("GITFORGE_HEARTBEAT_INTERVAL", Some("60")),
+            ("GITFORGE_FETCH_INTERVAL", Some("10")),
+            ("GITFORGE_SCHEDULER_TOKEN", Some("secret-token")),
+        ]);
+        let cfg = RunnerConfig::from_env().expect("valid env should parse");
+        assert_eq!(cfg.scheduler_url, "http://ci:42781");
+        assert_eq!(cfg.name, "prod-runner-01");
+        assert_eq!(cfg.capacity, 4);
+        assert_eq!(cfg.heartbeat_interval_secs, 60);
+        assert_eq!(cfg.fetch_interval_secs, 10);
+        assert_eq!(cfg.scheduler_token.as_deref(), Some("secret-token"));
+        assert_eq!(cfg.runner_type, "docker");
+    }
+
+    #[test]
+    fn test_from_env_optional_defaults() {
+        let _guard = temp_env::with_vars([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_RUNNER_NAME", None::<&str>),
+            ("GITFORGE_RUNNER_CAPACITY", None::<&str>),
+            ("GITFORGE_HEARTBEAT_INTERVAL", None::<&str>),
+            ("GITFORGE_FETCH_INTERVAL", None::<&str>),
+            ("GITFORGE_SCHEDULER_TOKEN", None::<&str>),
+        ]);
+        let cfg = RunnerConfig::from_env().expect("valid env should parse");
+        assert_eq!(cfg.scheduler_url, "http://localhost:42781");
+        assert_eq!(cfg.name, "runner");
+        assert_eq!(cfg.capacity, 2);
+        assert_eq!(cfg.heartbeat_interval_secs, 30);
+        assert_eq!(cfg.fetch_interval_secs, 5);
+        assert!(cfg.scheduler_token.is_none());
+    }
+
+    #[test]
+    fn test_from_env_missing_scheduler_url() {
+        let _guard = temp_env::with_vars([
+            ("GITFORGE_SCHEDULER_URL", None::<&str>),
+            ("GITFORGE_RUNNER_NAME", None::<&str>),
+        ]);
+        let result = RunnerConfig::from_env();
+        let err = result.expect_err("missing GITFORGE_SCHEDULER_URL should fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+        assert!(err.message.contains("GITFORGE_SCHEDULER_URL"));
+    }
+
+    #[test]
+    fn test_from_env_invalid_capacity() {
+        let _guard = temp_env::with_vars([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_RUNNER_CAPACITY", Some("not-a-number")),
+        ]);
+        let result = RunnerConfig::from_env();
+        let err = result.expect_err("invalid GITFORGE_RUNNER_CAPACITY should fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+        assert!(err.message.contains("GITFORGE_RUNNER_CAPACITY"));
+    }
+
+    #[test]
+    fn test_from_env_invalid_heartbeat_interval() {
+        let _guard = temp_env::with_vars([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_HEARTBEAT_INTERVAL", Some("not-an-int")),
+        ]);
+        let result = RunnerConfig::from_env();
+        let err = result.expect_err("invalid GITFORGE_HEARTBEAT_INTERVAL should fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+        assert!(err.message.contains("GITFORGE_HEARTBEAT_INTERVAL"));
+    }
+
+    #[test]
+    fn test_from_env_invalid_fetch_interval() {
+        let _guard = temp_env::with_vars([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_FETCH_INTERVAL", Some("-5")),
+        ]);
+        let result = RunnerConfig::from_env();
+        let err = result.expect_err("negative GITFORGE_FETCH_INTERVAL should fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+        assert!(err.message.contains("GITFORGE_FETCH_INTERVAL"));
+    }
+
+    #[test]
+    fn test_from_env_test_isolation() {
+        // Verify that with a truly clean environment (no GITFORGE_SCHEDULER_URL),
+        // from_env() fails as expected. This guards against env pollution between tests.
+        let result = RunnerConfig::from_env();
+        let err = result.expect_err("from_env fails when GITFORGE_SCHEDULER_URL is not set");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_from_env_empty_scheduler_url_fails() {
+        let _guard = temp_env::with_vars([("GITFORGE_SCHEDULER_URL", Some(""))]);
+        let result = RunnerConfig::from_env();
+        let err = result.expect_err("empty GITFORGE_SCHEDULER_URL should fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+    }
+
+    mod temp_env {
+        //! Minimal env-isolation for tests. Guards restore original env on drop.
+        pub struct TempVars {
+            _guard: Vec<(String, Option<String>)>,
+        }
+
+        pub fn with_vars<I, K, V>(vars: I) -> TempVars
+        where
+            I: IntoIterator<Item = (K, Option<V>)>,
+            K: AsRef<str>,
+            V: AsRef<str>,
+        {
+            let mut guards = Vec::new();
+            for (key, value) in vars {
+                let key = key.as_ref().to_string();
+                let value = value.as_ref().map(|v| v.as_ref().to_string());
+                let prev = std::env::var(&key).ok();
+                if let Some(ref v) = value {
+                    std::env::set_var(&key, v);
+                } else {
+                    std::env::remove_var(&key);
+                }
+                guards.push((key, prev));
+            }
+            TempVars { _guard: guards }
+        }
+
+        impl Drop for TempVars {
+            fn drop(&mut self) {
+                for (key, value) in self._guard.iter().rev() {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
         }
     }
 }
