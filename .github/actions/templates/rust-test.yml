@@ -30,7 +30,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
-          version: ${{ inputs.rust_version }}
+          toolchain: ${{ inputs.rust_version }}
           components: rustfmt, clippy
 
       - name: Cache cargo registry
@@ -61,7 +61,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
-          version: ${{ inputs.rust_version }}
+          toolchain: ${{ inputs.rust_version }}
           components: rustfmt, clippy
 
       - name: Check formatting
@@ -81,7 +81,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
-          version: ${{ inputs.rust_version }}
+          toolchain: ${{ inputs.rust_version }}
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov

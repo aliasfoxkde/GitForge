@@ -38,6 +38,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@4b8992af23a2be34fd58f8d9b50d3f4939ad1891 # cargo-audit
@@ -157,6 +159,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
+          toolchain: stable
           components: clippy
 
       - name: Run clippy with security-focused lints
