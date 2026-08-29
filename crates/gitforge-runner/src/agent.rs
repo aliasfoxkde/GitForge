@@ -869,6 +869,7 @@ mod tests {
             name: "build".to_string(),
             pipeline_run_id: "run-456".to_string(),
             commands: vec!["cargo build".to_string(), "cargo test".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
         };
 
@@ -885,6 +886,7 @@ mod tests {
             name: "test".to_string(),
             pipeline_run_id: "run-789".to_string(),
             commands: vec!["cargo test".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         assert!(assignment.working_dir.is_none());
@@ -904,6 +906,7 @@ mod tests {
             name: "build".to_string(),
             pipeline_run_id: "run-456".to_string(),
             commands: vec!["cargo build".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         let debug_str = format!("{:?}", assignment);
@@ -933,6 +936,7 @@ mod tests {
             name: "build".to_string(),
             pipeline_run_id: "run-456".to_string(),
             commands: vec!["cargo build".to_string(), "cargo test".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
         };
 
@@ -956,6 +960,7 @@ mod tests {
             name: "noop".to_string(),
             pipeline_run_id: "run-001".to_string(),
             commands: vec![],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         assert!(assignment.commands.is_empty());
@@ -1056,6 +1061,7 @@ mod tests {
             name: "build".to_string(),
             pipeline_run_id: "run-1".to_string(),
             commands: vec!["echo 1".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         let assignment2 = JobAssignment {
@@ -1063,6 +1069,7 @@ mod tests {
             name: "build".to_string(),
             pipeline_run_id: "run-1".to_string(),
             commands: vec!["echo 1".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         // JobAssignment should implement PartialEq if we add it
@@ -1078,6 +1085,7 @@ mod tests {
             name: "test".to_string(),
             pipeline_run_id: "run-min".to_string(),
             commands: vec!["true".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
 
@@ -1141,6 +1149,7 @@ mod tests {
             name: "many-steps".to_string(),
             pipeline_run_id: "run-many".to_string(),
             commands,
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         assert_eq!(assignment.commands.len(), 100);
@@ -1153,6 +1162,7 @@ mod tests {
             name: "test".to_string(),
             pipeline_run_id: "run-1".to_string(),
             commands: vec!["echo clone".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         let cloned = assignment.clone();
@@ -1167,6 +1177,7 @@ mod tests {
             name: "测试任务".to_string(),
             pipeline_run_id: "run-unicode".to_string(),
             commands: vec!["echo 测试".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         assert_eq!(assignment.name, "测试任务");
@@ -1183,6 +1194,7 @@ mod tests {
                 "echo \"quoted\"".to_string(),
                 "echo 'single'".to_string(),
             ],
+            image: "rust:latest".to_string(),
             working_dir: None,
         };
         assert_eq!(assignment.commands.len(), 3);
@@ -1246,6 +1258,7 @@ mod tests {
             name: "test".to_string(),
             pipeline_run_id: "run-1".to_string(),
             commands: vec!["echo test".to_string()],
+            image: "rust:latest".to_string(),
             working_dir: Some("".to_string()),
         };
         assert!(assignment.working_dir.is_some());
