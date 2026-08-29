@@ -3,7 +3,7 @@
 //! Main entry point for the runner agent service.
 
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
-use gitforge_runner::{RunnerAgent, RunnerConfig};
+use gitforge_runner::RunnerAgent;
 #[allow(unused_imports)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
