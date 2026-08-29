@@ -58,6 +58,16 @@ pub struct DockerSandbox {
 }
 
 impl DockerSandbox {
+    /// Build a unique container name for one execution attempt.
+    ///
+    /// A runner can be terminated after creating a container but before it
+    /// records/completes the job. Reusing only the job ID then makes the
+    /// replacement runner fail with a name collision. The job prefix keeps
+    /// containers identifiable while the attempt UUID makes retries safe.
+    fn container_name(job_id: JobId) -> String {
+        format!("gitforce-job-{}-{}", job_id, uuid::Uuid::new_v4())
+    }
+
     /// Create a new Docker sandbox, requiring Docker to be available.
     /// Returns an error if Docker is not available or cannot be reached.
     pub async fn connect_required() -> Result<Self> {
@@ -220,7 +230,7 @@ impl Sandbox for DockerSandbox {
             // Ensure image is available
             self.ensure_image(image).await?;
 
-            let container_name = format!("gitforce-job-{}", job_id);
+            let container_name = Self::container_name(job_id);
 
             // Build host config with resource limits
             let host_config = HostConfig {
@@ -295,7 +305,7 @@ impl Sandbox for DockerSandbox {
 
         if let Some(ref docker) = self.docker {
             self.ensure_image(image).await?;
-            let container_name = format!("gitforce-job-{}", job_id);
+            let container_name = Self::container_name(job_id);
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
                 cpu_period: Some(100000),
@@ -500,6 +510,17 @@ mod tests {
     use std::sync::Mutex;
 
     struct RecordingSink(Mutex<Vec<(OutputStream, Vec<u8>)>>);
+
+    #[test]
+    fn test_container_names_are_unique_per_attempt() {
+        let job_id = JobId::new();
+        let first = DockerSandbox::container_name(job_id);
+        let second = DockerSandbox::container_name(job_id);
+
+        assert_ne!(first, second);
+        assert!(first.starts_with(&format!("gitforce-job-{}-", job_id)));
+        assert!(second.starts_with(&format!("gitforce-job-{}-", job_id)));
+    }
 
     #[async_trait]
     impl OutputSink for RecordingSink {
