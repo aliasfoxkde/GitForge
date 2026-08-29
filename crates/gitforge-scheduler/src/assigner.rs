@@ -3,7 +3,7 @@
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
 use gitforge_common::{JobId, PipelineRunId, RepoId, RunnerId};
-use gitforge_db::models::{Job as DbJob, Runner};
+use gitforge_db::models::Runner;
 use gitforge_db::Pool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,12 +146,13 @@ impl Scheduler {
         state.queue.enqueue(job);
         tracing::debug!("job {} enqueued", job_id);
 
-        // Persist to database if available - creates a new job row
+        // Persist to database if available - creates a new job row.
+        // NOTE: This path is deprecated. Jobs must be created with full metadata
+        // (including image) via the API layer BEFORE enqueueing.
+        // Use `enqueue_persisted_job()` instead to avoid creating rows without images.
         if let Some(pool) = &self.db_pool {
-            let db_job = DbJob::new(pipeline_run_id, format!("job-{}", job_id));
-            if let Err(e) = gitforge_db::queries::JobQueries::create(pool, &db_job).await {
-                tracing::error!("failed to persist job to DB: {}", e);
-            }
+            // The job must already exist in the DB with image set.
+            // Just update its status to "queued".
             if let Err(e) =
                 gitforge_db::queries::JobQueries::update_status(pool, job_id, "queued").await
             {

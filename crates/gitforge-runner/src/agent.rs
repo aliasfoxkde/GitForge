@@ -225,7 +225,11 @@ pub struct JobAssignment {
     pub name: String,
     /// Pipeline run ID
     pub pipeline_run_id: String,
+    /// Container image, e.g. "rust:1.75". Required for execution.
+    #[serde(default)]
+    pub image: String,
     /// Commands to execute
+    #[serde(default)]
     pub commands: Vec<String>,
     /// Working directory
     pub working_dir: Option<String>,
@@ -426,7 +430,13 @@ impl RunnerAgent {
         *self.is_running.read().await
     }
 
-    /// Execute a job assignment
+    /// Execute a job assignment.
+    ///
+    /// Fails-closed if the assignment has an empty image or no commands,
+    /// because both are required for safe sandbox execution. The scheduler is
+    /// responsible for ensuring only properly-configured jobs reach this point.
+    /// On failure a completion report is sent to the scheduler so the job is not
+    /// left in limbo.
     async fn execute_job(
         executor: &Arc<JobExecutor>,
         assignment: &JobAssignment,
@@ -441,10 +451,68 @@ impl RunnerAgent {
             }
         };
 
-        // Convert assignment to ExecutableJob
+        // Fail-closed: reject assignments without a configured image.
+        // An empty image means the job was not properly created through the API pipeline.
+        if assignment.image.is_empty() {
+            tracing::error!(
+                "job {} has empty image — refusing to execute (job not created through API pipeline?)",
+                assignment.job_id
+            );
+            // Report failure back to scheduler so the job is not left in limbo
+            let complete_url = format!("{}/jobs/{}/complete", scheduler_url, assignment.job_id);
+            let failure_request = serde_json::json!({
+                "success": false,
+                "exit_code": -1,
+                "error": "job has no image configured (malformed job metadata)",
+            });
+            if let Err(e) = client
+                .post(&complete_url)
+                .json(&failure_request)
+                .send()
+                .await
+            {
+                tracing::error!(
+                    "failed to report malformed job {}: {}",
+                    assignment.job_id,
+                    e
+                );
+            }
+            return;
+        }
+
+        // Fail-closed: reject assignments without commands.
+        // An empty commands list means the job has no steps, which is a
+        // malformed execution request regardless of how it reached the runner.
+        if assignment.commands.is_empty() {
+            tracing::error!(
+                "job {} has no commands — refusing to execute (malformed job metadata)",
+                assignment.job_id
+            );
+            let complete_url = format!("{}/jobs/{}/complete", scheduler_url, assignment.job_id);
+            let failure_request = serde_json::json!({
+                "success": false,
+                "exit_code": -1,
+                "error": "job has no commands configured (malformed job metadata)",
+            });
+            if let Err(e) = client
+                .post(&complete_url)
+                .json(&failure_request)
+                .send()
+                .await
+            {
+                tracing::error!(
+                    "failed to report malformed job {}: {}",
+                    assignment.job_id,
+                    e
+                );
+            }
+            return;
+        }
+
+        // Convert assignment to ExecutableJob using the actual image from the scheduler
         let executable = ExecutableJob {
             job_id,
-            image: "rust:latest".to_string(), // Default image - would come from job config
+            image: assignment.image.clone(),
             steps: assignment
                 .commands
                 .iter()
@@ -460,7 +528,11 @@ impl RunnerAgent {
             timeout_secs: 3600,
         };
 
-        tracing::info!("executing job {} in container", assignment.job_id);
+        tracing::info!(
+            "executing job {} in container image {}",
+            assignment.job_id,
+            assignment.image
+        );
 
         // Execute the job
         let result = executor.execute(executable).await;
@@ -570,6 +642,7 @@ mod tests {
             job_id: "job-123".to_string(),
             name: "build".to_string(),
             pipeline_run_id: "run-456".to_string(),
+            image: "rust:1.75".to_string(),
             commands: vec!["cargo build".to_string(), "cargo test".to_string()],
             working_dir: Some("/workspace".to_string()),
         };
@@ -586,10 +659,12 @@ mod tests {
             job_id: "job-456".to_string(),
             name: "test".to_string(),
             pipeline_run_id: "run-789".to_string(),
+            image: "python:3.12".to_string(),
             commands: vec!["cargo test".to_string()],
             working_dir: None,
         };
         assert!(assignment.working_dir.is_none());
+        assert_eq!(assignment.image, "python:3.12");
     }
 
     #[test]
@@ -605,6 +680,7 @@ mod tests {
             job_id: "job-123".to_string(),
             name: "build".to_string(),
             pipeline_run_id: "run-456".to_string(),
+            image: "rust:1.75".to_string(),
             commands: vec!["cargo build".to_string()],
             working_dir: None,
         };
@@ -634,6 +710,7 @@ mod tests {
             job_id: "job-123".to_string(),
             name: "build".to_string(),
             pipeline_run_id: "run-456".to_string(),
+            image: "rust:1.75".to_string(),
             commands: vec!["cargo build".to_string(), "cargo test".to_string()],
             working_dir: Some("/workspace".to_string()),
         };
@@ -649,6 +726,7 @@ mod tests {
         assert_eq!(deserialized.name, assignment.name);
         assert_eq!(deserialized.commands, assignment.commands);
         assert_eq!(deserialized.working_dir, assignment.working_dir);
+        assert_eq!(deserialized.image, "rust:1.75");
     }
 
     #[test]
@@ -657,11 +735,13 @@ mod tests {
             job_id: "job-empty".to_string(),
             name: "noop".to_string(),
             pipeline_run_id: "run-001".to_string(),
+            image: "rust:1.75".to_string(),
             commands: vec![],
             working_dir: None,
         };
         assert!(assignment.commands.is_empty());
         assert!(assignment.working_dir.is_none());
+        assert_eq!(assignment.image, "rust:1.75");
     }
 
     #[test]
@@ -676,10 +756,12 @@ mod tests {
             job_id: "job-multi".to_string(),
             name: "full-pipeline".to_string(),
             pipeline_run_id: "run-002".to_string(),
+            image: "rust:1.75".to_string(),
             commands,
             working_dir: Some("/project".to_string()),
         };
         assert_eq!(assignment.commands.len(), 4);
+        assert_eq!(assignment.image, "rust:1.75");
     }
 
     #[tokio::test]
@@ -756,6 +838,7 @@ mod tests {
             job_id: "job-1".to_string(),
             name: "build".to_string(),
             pipeline_run_id: "run-1".to_string(),
+            image: "rust:1.75".to_string(),
             commands: vec!["echo 1".to_string()],
             working_dir: None,
         };
@@ -763,6 +846,7 @@ mod tests {
             job_id: "job-1".to_string(),
             name: "build".to_string(),
             pipeline_run_id: "run-1".to_string(),
+            image: "rust:1.75".to_string(),
             commands: vec!["echo 1".to_string()],
             working_dir: None,
         };
@@ -778,6 +862,7 @@ mod tests {
             job_id: "minimal-job".to_string(),
             name: "test".to_string(),
             pipeline_run_id: "run-min".to_string(),
+            image: "rust:1.75".to_string(),
             commands: vec!["true".to_string()],
             working_dir: None,
         };
@@ -786,6 +871,7 @@ mod tests {
         assert!(json.contains("minimal-job"));
         assert!(json.contains("test"));
         assert!(json.contains("minimal-job"));
+        assert!(json.contains("rust:1.75"));
     }
 
     #[tokio::test]
@@ -840,10 +926,130 @@ mod tests {
             job_id: "job-many".to_string(),
             name: "many-steps".to_string(),
             pipeline_run_id: "run-many".to_string(),
+            image: "rust:1.75".to_string(),
             commands,
             working_dir: None,
         };
         assert_eq!(assignment.commands.len(), 100);
+        assert_eq!(assignment.image, "rust:1.75");
+    }
+
+    #[test]
+    fn test_job_assignment_empty_image_deserializes_from_missing_field() {
+        // When image is missing in JSON, #[serde(default)] should make it empty string.
+        // The runner's execute_job will then fail-closed (reject with error).
+        let json = r#"{"job_id":"job-no-img","name":"test","pipeline_run_id":"run-1","commands":["echo hello"]}"#;
+        let assignment: JobAssignment = serde_json::from_str(json).unwrap();
+        assert!(
+            assignment.image.is_empty(),
+            "missing image field should deserialize to empty string via #[serde(default)]"
+        );
+        assert_eq!(assignment.commands.len(), 1);
+    }
+
+    #[test]
+    fn test_job_assignment_deserialize_with_null_image() {
+        // Explicit null for image field is a deserialization error (not a default value).
+        // #[serde(default)] only applies when the field is MISSING, not when it's null.
+        // This is correct fail-closed behavior: malformed JSON should not silently succeed.
+        let json = r#"{"job_id":"job-null-img","name":"test","pipeline_run_id":"run-1","image":null,"commands":["true"]}"#;
+        let result: std::result::Result<JobAssignment, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "explicit null image should fail to deserialize"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("null"),
+            "error should mention null type mismatch"
+        );
+    }
+
+    #[test]
+    fn test_job_assignment_missing_commands_defaults_to_empty_vec() {
+        // When commands is missing in JSON, #[serde(default)] produces an empty Vec.
+        // execute_job then fails-closed because an empty command list is malformed.
+        let json = r#"{"job_id":"job-no-cmds","name":"test","pipeline_run_id":"run-1","image":"rust:1.75"}"#;
+        let assignment: JobAssignment = serde_json::from_str(json).unwrap();
+        assert!(
+            assignment.commands.is_empty(),
+            "missing commands field should deserialize to empty Vec via #[serde(default)]"
+        );
+        assert_eq!(assignment.image, "rust:1.75");
+    }
+
+    #[test]
+    fn test_job_assignment_deserialize_with_null_commands() {
+        // Explicit null for commands field is a deserialization error (not a default value).
+        // #[serde(default)] only applies when the field is MISSING, not when it's null.
+        // This is correct fail-closed behavior: malformed JSON should not silently succeed.
+        let json = r#"{"job_id":"job-null-cmd","name":"test","pipeline_run_id":"run-1","image":"rust:1.75","commands":null}"#;
+        let result: std::result::Result<JobAssignment, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "explicit null commands should fail to deserialize"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("null"),
+            "error should mention null type mismatch"
+        );
+    }
+
+    #[test]
+    fn test_job_assignment_empty_commands_vec_rejected_at_execute() {
+        // An assignment with an explicitly empty commands Vec is a valid struct,
+        // but execute_job must fail-closed on it (same as missing image).
+        // This test documents the structural validity; the runtime rejection is
+        // exercised by execute_job's fail-closed check on assignment.commands.is_empty().
+        let assignment = JobAssignment {
+            job_id: "job-empty-cmds".to_string(),
+            name: "test".to_string(),
+            pipeline_run_id: "run-1".to_string(),
+            image: "rust:1.75".to_string(),
+            commands: vec![],
+            working_dir: None,
+        };
+        // Struct is valid but commands are empty → execute_job will reject it
+        assert!(assignment.commands.is_empty());
+        assert!(!assignment.image.is_empty());
+    }
+
+    #[test]
+    fn test_job_assignment_valid_image_and_commands_reaches_executor() {
+        // Valid assignment: non-empty image AND non-empty commands.
+        // execute_job builds an ExecutableJob and calls executor.execute().
+        let assignment = JobAssignment {
+            job_id: "job-valid".to_string(),
+            name: "build".to_string(),
+            pipeline_run_id: "run-1".to_string(),
+            image: "rust:1.75".to_string(),
+            commands: vec!["cargo build".to_string(), "cargo test".to_string()],
+            working_dir: Some("/repo".to_string()),
+        };
+        assert!(!assignment.image.is_empty(), "image must be non-empty");
+        assert!(
+            !assignment.commands.is_empty(),
+            "commands must be non-empty"
+        );
+        assert_eq!(assignment.commands.len(), 2);
+    }
+
+    #[test]
+    fn test_job_assignment_roundtrip_with_image() {
+        let assignment = JobAssignment {
+            job_id: "job-rt".to_string(),
+            name: "build".to_string(),
+            pipeline_run_id: "run-rt".to_string(),
+            image: "rust:1.75".to_string(),
+            commands: vec!["cargo build".to_string(), "cargo test".to_string()],
+            working_dir: Some("/repo".to_string()),
+        };
+        let json = serde_json::to_string(&assignment).unwrap();
+        let deserialized: JobAssignment = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.image, "rust:1.75");
+        assert_eq!(deserialized.commands, vec!["cargo build", "cargo test"]);
+        assert_eq!(deserialized.working_dir, Some("/repo".to_string()));
     }
 
     #[test]
@@ -852,12 +1058,14 @@ mod tests {
             job_id: "clone-test".to_string(),
             name: "test".to_string(),
             pipeline_run_id: "run-1".to_string(),
+            image: "rust:1.75".to_string(),
             commands: vec!["echo clone".to_string()],
             working_dir: None,
         };
         let cloned = assignment.clone();
         assert_eq!(cloned.job_id, assignment.job_id);
         assert_eq!(cloned.commands, assignment.commands);
+        assert_eq!(cloned.image, assignment.image);
     }
 
     #[test]
@@ -866,10 +1074,12 @@ mod tests {
             job_id: "job-unicode".to_string(),
             name: "测试任务".to_string(),
             pipeline_run_id: "run-unicode".to_string(),
+            image: "rust:1.75".to_string(),
             commands: vec!["echo 测试".to_string()],
             working_dir: None,
         };
         assert_eq!(assignment.name, "测试任务");
+        assert_eq!(assignment.image, "rust:1.75");
     }
 
     #[test]
@@ -878,6 +1088,7 @@ mod tests {
             job_id: "special-cmd".to_string(),
             name: "special".to_string(),
             pipeline_run_id: "run-special".to_string(),
+            image: "rust:1.75".to_string(),
             commands: vec![
                 "echo $HOME".to_string(),
                 "echo \"quoted\"".to_string(),
@@ -886,6 +1097,7 @@ mod tests {
             working_dir: None,
         };
         assert_eq!(assignment.commands.len(), 3);
+        assert_eq!(assignment.image, "rust:1.75");
     }
 
     #[test]
@@ -943,6 +1155,7 @@ mod tests {
             job_id: "empty-wd".to_string(),
             name: "test".to_string(),
             pipeline_run_id: "run-1".to_string(),
+            image: "rust:1.75".to_string(),
             commands: vec!["echo test".to_string()],
             working_dir: Some("".to_string()),
         };

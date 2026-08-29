@@ -517,8 +517,8 @@ impl JobQueries {
     pub async fn create(pool: &Pool, job: &crate::models::Job) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, image)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(job.id.to_string())
@@ -530,6 +530,7 @@ impl JobQueries {
         .bind(job.finished_at.map(|dt| dt.to_rfc3339()))
         .bind(job.retry_count)
         .bind(job.created_at.to_rfc3339())
+        .bind(&job.image)
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to create job: {}", e)))?;
@@ -567,6 +568,7 @@ impl JobQueries {
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
                     .unwrap()
                     .with_timezone(&Utc),
+                image: row.get::<String, _>("image"),
             })),
             None => Ok(None),
         }
@@ -652,13 +654,14 @@ impl JobQueries {
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
                     .unwrap()
                     .with_timezone(&Utc),
+                image: row.get::<String, _>("image"),
             })
             .collect();
 
         Ok(jobs)
     }
 
-    /// List all pending jobs
+    /// List pending jobs
     pub async fn list_pending(pool: &Pool) -> Result<Vec<crate::models::Job>> {
         let rows =
             sqlx::query("SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC")
@@ -690,6 +693,7 @@ impl JobQueries {
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
                     .unwrap()
                     .with_timezone(&Utc),
+                image: row.get::<String, _>("image"),
             })
             .collect();
 
@@ -1015,6 +1019,72 @@ impl EventQueries {
     }
 }
 
+/// Queries for job_step table.
+/// Each job has one or more steps (commands to execute) stored in the job_steps table.
+pub struct JobStepQueries;
+
+impl JobStepQueries {
+    /// Insert a job step.
+    pub async fn create(pool: &Pool, step: &crate::models::JobStep) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO job_steps (id, job_id, step_index, name, run, env, working_dir)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&step.id)
+        .bind(step.job_id.to_string())
+        .bind(step.step_index)
+        .bind(&step.name)
+        .bind(&step.run)
+        .bind(step.env.to_string())
+        .bind(&step.working_dir)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to create job step: {}", e)))?;
+        Ok(())
+    }
+
+    /// List all steps for a job, ordered by step_index.
+    pub async fn list_by_job(
+        pool: &Pool,
+        job_id: gitforge_common::JobId,
+    ) -> Result<Vec<crate::models::JobStep>> {
+        let rows = sqlx::query("SELECT * FROM job_steps WHERE job_id = ? ORDER BY step_index ASC")
+            .bind(job_id.to_string())
+            .fetch_all(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to list job steps: {}", e)))?;
+
+        let steps = rows
+            .into_iter()
+            .map(|row| crate::models::JobStep {
+                id: row.get("id"),
+                job_id: gitforge_common::JobId::from(
+                    Uuid::parse_str(&row.get::<String, _>("job_id")).unwrap(),
+                ),
+                step_index: row.get("step_index"),
+                name: row.get("name"),
+                run: row.get("run"),
+                env: serde_json::from_str(&row.get::<String, _>("env")).unwrap_or_default(),
+                working_dir: row.get("working_dir"),
+            })
+            .collect();
+
+        Ok(steps)
+    }
+
+    /// Delete all steps for a job.
+    pub async fn delete_by_job(pool: &Pool, job_id: gitforge_common::JobId) -> Result<()> {
+        sqlx::query("DELETE FROM job_steps WHERE job_id = ?")
+            .bind(job_id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to delete job steps: {}", e)))?;
+        Ok(())
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1282,7 +1352,7 @@ mod tests {
         );
         PipelineRunQueries::create(&pool, &run).await.unwrap();
 
-        let job = crate::models::Job::new(run.id, "build".to_string());
+        let job = crate::models::Job::new(run.id, "build".to_string(), "rust:1.75");
 
         // Create
         JobQueries::create(&pool, &job).await.unwrap();
@@ -1351,7 +1421,7 @@ mod tests {
         );
         PipelineRunQueries::create(&pool, &run).await.unwrap();
 
-        let job = crate::models::Job::new(run.id, "build".to_string());
+        let job = crate::models::Job::new(run.id, "build".to_string(), "rust:1.75");
         JobQueries::create(&pool, &job).await.unwrap();
 
         // List pending jobs
@@ -1575,7 +1645,7 @@ mod tests {
         );
         PipelineRunQueries::create(pool, &run).await.unwrap();
 
-        let job = crate::models::Job::new(run.id, "build".to_string());
+        let job = crate::models::Job::new(run.id, "build".to_string(), "rust:1.75");
         JobQueries::create(pool, &job).await.unwrap();
         (job, run.id)
     }

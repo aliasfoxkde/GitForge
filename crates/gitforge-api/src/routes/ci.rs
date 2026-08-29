@@ -10,8 +10,8 @@ use axum::{
 };
 use gitforge_common::{JobId, PipelineId, PipelineRunId};
 use gitforge_db::{
-    models::{Job, PipelineRun},
-    queries::{JobQueries, PipelineQueries, PipelineRunQueries},
+    models::{Job, JobStep, PipelineRun},
+    queries::{JobQueries, JobStepQueries, PipelineQueries, PipelineRunQueries},
     Pool,
 };
 use gitforge_scheduler::Scheduler;
@@ -503,9 +503,10 @@ async fn trigger_pipeline(
     let commit_hash = request.commit_hash.unwrap_or_else(|| "HEAD".to_string());
 
     // Parse and validate jobs from pipeline config BEFORE creating PipelineRun
-    // This ensures invalid config cannot orphan a pipeline run
-    let job_names = match parse_jobs_from_config(&pipeline.config) {
-        Ok(names) => names,
+    // This ensures invalid config cannot orphan a pipeline run.
+    // Each job must have a non-empty 'image' field.
+    let job_specs = match parse_jobs_from_config(&pipeline.config) {
+        Ok(specs) => specs,
         Err(e) => {
             tracing::error!("failed to parse pipeline config: {}", e);
             return (
@@ -542,19 +543,40 @@ async fn trigger_pipeline(
 
     // Create jobs in database
     let mut triggered_jobs = Vec::new();
-    for job_name in &job_names {
-        let job = Job::new(pipeline_run.id, job_name.clone());
+    for spec in &job_specs {
+        let job = Job::new(pipeline_run.id, spec.name.clone(), &spec.image);
 
         if let Err(e) = JobQueries::create(&pool, &job).await {
-            tracing::error!("failed to create job {}: {}", job_name, e);
+            tracing::error!("failed to create job {}: {}", spec.name, e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": "database_error",
-                    "message": format!("failed to create job {}: {}", job_name, e)
+                    "message": format!("failed to create job {}: {}", spec.name, e)
                 })),
             )
                 .into_response();
+        }
+
+        // Persist each step for this job
+        for (step_idx, (step_name, step_run)) in spec.steps.iter().enumerate() {
+            let step = JobStep::new(job.id, step_idx as i32, step_name, step_run);
+            if let Err(e) = JobStepQueries::create(&pool, &step).await {
+                tracing::error!(
+                    "failed to create step {} for job {}: {}",
+                    step_name,
+                    spec.name,
+                    e
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "database_error",
+                        "message": format!("failed to create step {} for job {}: {}", step_name, spec.name, e)
+                    })),
+                )
+                    .into_response();
+            }
         }
 
         triggered_jobs.push(TriggeredJobInfo {
@@ -599,25 +621,71 @@ async fn trigger_pipeline(
     (StatusCode::CREATED, Json(response)).into_response()
 }
 
-/// Parse job names from pipeline config
-fn parse_jobs_from_config(config: &serde_json::Value) -> Result<Vec<String>, String> {
+/// A parsed job specification from a pipeline config.
+/// Contains the job name, the container image, and the ordered list of steps to run.
+#[derive(Debug, Clone)]
+struct JobSpec {
+    name: String,
+    image: String,
+    /// Steps extracted from the pipeline config. Each step has a name and a command.
+    steps: Vec<(String, String)>,
+}
+
+/// Parse job metadata (name, image, and steps) from pipeline config.
+/// Each job must have a non-empty 'name', 'image', and at least one 'steps' entry.
+fn parse_jobs_from_config(config: &serde_json::Value) -> Result<Vec<JobSpec>, String> {
     let jobs = config
         .get("jobs")
         .ok_or("missing 'jobs' field in pipeline config")?;
 
     let jobs_array = jobs.as_array().ok_or("'jobs' must be an array")?;
 
-    let mut names = Vec::new();
-    for job in jobs_array {
+    let mut result = Vec::new();
+    for (idx, job) in jobs_array.iter().enumerate() {
         let name = job
             .get("name")
             .and_then(|n| n.as_str())
-            .ok_or("job missing 'name' field")?
+            .ok_or_else(|| format!("job[{}] missing 'name' field", idx))?
             .to_string();
-        names.push(name);
+        let image = job
+            .get("image")
+            .and_then(|i| i.as_str())
+            .ok_or_else(|| format!("job[{}] missing 'image' field", idx))?
+            .to_string();
+
+        // Parse steps: each step has a "run" field with the command
+        let steps_value = job
+            .get("steps")
+            .and_then(|s| s.as_array())
+            .ok_or_else(|| format!("job[{}] missing 'steps' field", idx))?;
+        let mut steps = Vec::new();
+        for (step_idx, step) in steps_value.iter().enumerate() {
+            let step_name = step
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| format!("job[{}].steps[{}] missing 'name' field", idx, step_idx))?
+                .to_string();
+            let run = step
+                .get("run")
+                .and_then(|r| r.as_str())
+                .ok_or_else(|| format!("job[{}].steps[{}] missing 'run' field", idx, step_idx))?
+                .to_string();
+            if run.is_empty() {
+                return Err(format!(
+                    "job[{}].steps[{}] 'run' field must not be empty",
+                    idx, step_idx
+                ));
+            }
+            steps.push((step_name, run));
+        }
+        if steps.is_empty() {
+            return Err(format!("job[{}] must have at least one step", idx));
+        }
+
+        result.push(JobSpec { name, image, steps });
     }
 
-    Ok(names)
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1142,26 +1210,65 @@ mod tests {
     fn test_parse_jobs_from_config_valid() {
         let config = serde_json::json!({
             "jobs": [
-                {"name": "build", "image": "rust:latest"},
-                {"name": "test", "image": "rust:latest"},
-                {"name": "deploy", "image": "docker:latest"}
+                {
+                    "name": "build",
+                    "image": "rust:latest",
+                    "steps": [
+                        {"name": "compile", "run": "cargo build"},
+                        {"name": "check", "run": "cargo check"}
+                    ]
+                },
+                {
+                    "name": "test",
+                    "image": "rust:latest",
+                    "steps": [
+                        {"name": "unit", "run": "cargo test"}
+                    ]
+                },
+                {
+                    "name": "deploy",
+                    "image": "docker:latest",
+                    "steps": [
+                        {"name": "push", "run": "docker push"}
+                    ]
+                }
             ]
         });
 
         let result = parse_jobs_from_config(&config).unwrap();
-        assert_eq!(result, vec!["build", "test", "deploy"]);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].name, "build");
+        assert_eq!(result[0].image, "rust:latest");
+        assert_eq!(result[0].steps.len(), 2);
+        assert_eq!(result[0].steps[0].0, "compile");
+        assert_eq!(result[0].steps[0].1, "cargo build");
+        assert_eq!(result[1].name, "test");
+        assert_eq!(result[1].steps.len(), 1);
+        assert_eq!(result[1].steps[0].1, "cargo test");
+        assert_eq!(result[2].name, "deploy");
     }
 
     #[test]
     fn test_parse_jobs_from_config_single_job() {
         let config = serde_json::json!({
             "jobs": [
-                {"name": "build"}
+                {
+                    "name": "build",
+                    "image": "rust:1.75",
+                    "steps": [
+                        {"name": "compile", "run": "cargo build --release"}
+                    ]
+                }
             ]
         });
 
         let result = parse_jobs_from_config(&config).unwrap();
-        assert_eq!(result, vec!["build"]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "build");
+        assert_eq!(result[0].image, "rust:1.75");
+        assert_eq!(result[0].steps.len(), 1);
+        assert_eq!(result[0].steps[0].0, "compile");
+        assert_eq!(result[0].steps[0].1, "cargo build --release");
     }
 
     #[test]
@@ -1200,14 +1307,70 @@ mod tests {
     fn test_parse_jobs_from_config_job_missing_name() {
         let config = serde_json::json!({
             "jobs": [
-                {"name": "build"},
-                {"image": "rust:latest"}
+                {
+                    "name": "build",
+                    "image": "rust:latest",
+                    "steps": [{"name": "c", "run": "cargo build"}]
+                },
+                {
+                    "image": "rust:latest",
+                    "steps": [{"name": "c", "run": "cargo build"}]
+                }
             ]
         });
 
         let result = parse_jobs_from_config(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("job missing 'name' field"));
+        assert!(result.unwrap_err().contains("job[1] missing 'name' field"));
+    }
+
+    #[test]
+    fn test_parse_jobs_from_config_job_missing_image() {
+        // Job with name but no image should fail
+        let config = serde_json::json!({
+            "jobs": [
+                {
+                    "name": "build",
+                    "steps": [{"name": "c", "run": "cargo build"}]
+                }
+            ]
+        });
+
+        let result = parse_jobs_from_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("job[0] missing 'image' field"));
+    }
+
+    #[test]
+    fn test_parse_jobs_from_config_valid_with_different_images() {
+        let config = serde_json::json!({
+            "jobs": [
+                {
+                    "name": "build",
+                    "image": "rust:1.75",
+                    "steps": [{"name": "c", "run": "cargo build"}]
+                },
+                {
+                    "name": "test",
+                    "image": "python:3.12",
+                    "steps": [{"name": "p", "run": "pytest"}]
+                },
+                {
+                    "name": "deploy",
+                    "image": "node:20",
+                    "steps": [{"name": "n", "run": "npm deploy"}]
+                }
+            ]
+        });
+
+        let result = parse_jobs_from_config(&config).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].name, "build");
+        assert_eq!(result[0].image, "rust:1.75");
+        assert_eq!(result[1].name, "test");
+        assert_eq!(result[1].image, "python:3.12");
+        assert_eq!(result[2].name, "deploy");
+        assert_eq!(result[2].image, "node:20");
     }
 
     #[test]
@@ -1216,6 +1379,78 @@ mod tests {
 
         let result = parse_jobs_from_config(&config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_jobs_from_config_job_missing_steps() {
+        // Job without steps field should fail
+        let config = serde_json::json!({
+            "jobs": [
+                {"name": "build", "image": "rust:latest"}
+            ]
+        });
+
+        let result = parse_jobs_from_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing 'steps' field"));
+    }
+
+    #[test]
+    fn test_parse_jobs_from_config_step_missing_run() {
+        // Step without 'run' field should fail
+        let config = serde_json::json!({
+            "jobs": [
+                {
+                    "name": "build",
+                    "image": "rust:latest",
+                    "steps": [
+                        {"name": "compile"}
+                    ]
+                }
+            ]
+        });
+
+        let result = parse_jobs_from_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing 'run' field"));
+    }
+
+    #[test]
+    fn test_parse_jobs_from_config_step_empty_run() {
+        // Step with empty 'run' string should fail
+        let config = serde_json::json!({
+            "jobs": [
+                {
+                    "name": "build",
+                    "image": "rust:latest",
+                    "steps": [
+                        {"name": "compile", "run": ""}
+                    ]
+                }
+            ]
+        });
+
+        let result = parse_jobs_from_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_parse_jobs_from_config_zero_steps() {
+        // Job with empty steps array should fail
+        let config = serde_json::json!({
+            "jobs": [
+                {
+                    "name": "build",
+                    "image": "rust:latest",
+                    "steps": []
+                }
+            ]
+        });
+
+        let result = parse_jobs_from_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must have at least one step"));
     }
 
     #[test]

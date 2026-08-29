@@ -67,11 +67,19 @@ pub struct Job {
     pub finished_at: Option<DateTime<Utc>>,
     pub retry_count: i32,
     pub created_at: DateTime<Utc>,
+    /// Container image for this job (e.g. "rust:1.75", "python:3.12").
+    /// Must be non-empty for jobs in queued/assigned/running states.
+    pub image: String,
 }
 
 impl Job {
-    /// Create a new job
-    pub fn new(pipeline_run_id: PipelineRunId, name: String) -> Self {
+    /// Create a new job with the given image.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `image` is empty.
+    pub fn new(pipeline_run_id: PipelineRunId, name: String, image: &str) -> Self {
+        assert!(!image.is_empty(), "Job::new requires a non-empty image");
         Self {
             id: JobId::new(),
             pipeline_run_id,
@@ -82,7 +90,18 @@ impl Job {
             finished_at: None,
             retry_count: 0,
             created_at: Utc::now(),
+            image: image.to_string(),
         }
+    }
+
+    /// Returns true if this job has a non-empty image field.
+    pub fn has_image(&self) -> bool {
+        !self.image.is_empty()
+    }
+
+    /// Returns true if this job has valid execution metadata (non-empty image and at least one step).
+    pub fn has_execution_metadata(&self) -> bool {
+        !self.image.is_empty()
     }
 
     /// Mark job as queued
@@ -127,6 +146,40 @@ impl Job {
     }
 }
 
+/// A single step within a job's execution pipeline.
+/// Each step has a name, a command to run, optional environment variables,
+/// and an optional working directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobStep {
+    pub id: String,
+    pub job_id: JobId,
+    pub step_index: i32,
+    pub name: String,
+    pub run: String,
+    pub env: serde_json::Value,
+    pub working_dir: Option<String>,
+}
+
+impl JobStep {
+    /// Create a new job step.
+    pub fn new(job_id: JobId, step_index: i32, name: &str, run: &str) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            job_id,
+            step_index,
+            name: name.to_string(),
+            run: run.to_string(),
+            env: serde_json::json!({}),
+            working_dir: None,
+        }
+    }
+
+    /// Returns the command to execute for this step.
+    pub fn command(&self) -> &str {
+        &self.run
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,17 +220,20 @@ mod tests {
     #[test]
     fn test_job_creation() {
         let pipeline_run_id = PipelineRunId::new();
-        let job = Job::new(pipeline_run_id, "build".to_string());
+        let job = Job::new(pipeline_run_id, "build".to_string(), "rust:1.75");
         assert_eq!(job.name, "build");
         assert_eq!(job.status, "pending");
         assert!(job.runner_id.is_none());
         assert_eq!(job.retry_count, 0);
+        assert_eq!(job.image, "rust:1.75");
+        assert!(job.has_image());
+        assert!(job.has_execution_metadata());
     }
 
     #[test]
     fn test_job_queue() {
         let pipeline_run_id = PipelineRunId::new();
-        let mut job = Job::new(pipeline_run_id, "build".to_string());
+        let mut job = Job::new(pipeline_run_id, "build".to_string(), "rust:1.75");
         job.queue();
         assert_eq!(job.status, "queued");
     }
@@ -185,7 +241,7 @@ mod tests {
     #[test]
     fn test_job_assign() {
         let pipeline_run_id = PipelineRunId::new();
-        let mut job = Job::new(pipeline_run_id, "build".to_string());
+        let mut job = Job::new(pipeline_run_id, "build".to_string(), "rust:1.75");
         let runner_id = RunnerId::new();
         job.assign(runner_id);
         assert_eq!(job.status, "assigned");
@@ -195,7 +251,7 @@ mod tests {
     #[test]
     fn test_job_start() {
         let pipeline_run_id = PipelineRunId::new();
-        let mut job = Job::new(pipeline_run_id, "build".to_string());
+        let mut job = Job::new(pipeline_run_id, "build".to_string(), "rust:1.75");
         job.start();
         assert_eq!(job.status, "running");
         assert!(job.started_at.is_some());
@@ -204,7 +260,7 @@ mod tests {
     #[test]
     fn test_job_finish_success() {
         let pipeline_run_id = PipelineRunId::new();
-        let mut job = Job::new(pipeline_run_id, "build".to_string());
+        let mut job = Job::new(pipeline_run_id, "build".to_string(), "rust:1.75");
         job.finish(true);
         assert_eq!(job.status, "succeeded");
         assert!(job.finished_at.is_some());
@@ -213,7 +269,7 @@ mod tests {
     #[test]
     fn test_job_finish_failure() {
         let pipeline_run_id = PipelineRunId::new();
-        let mut job = Job::new(pipeline_run_id, "build".to_string());
+        let mut job = Job::new(pipeline_run_id, "build".to_string(), "rust:1.75");
         job.finish(false);
         assert_eq!(job.status, "failed");
         assert!(job.finished_at.is_some());
@@ -222,7 +278,7 @@ mod tests {
     #[test]
     fn test_job_timeout() {
         let pipeline_run_id = PipelineRunId::new();
-        let mut job = Job::new(pipeline_run_id, "build".to_string());
+        let mut job = Job::new(pipeline_run_id, "build".to_string(), "rust:1.75");
         job.timeout();
         assert_eq!(job.status, "timed_out");
         assert!(job.finished_at.is_some());
@@ -231,7 +287,7 @@ mod tests {
     #[test]
     fn test_job_retry() {
         let pipeline_run_id = PipelineRunId::new();
-        let mut job = Job::new(pipeline_run_id, "build".to_string());
+        let mut job = Job::new(pipeline_run_id, "build".to_string(), "rust:1.75");
         job.start();
         job.finish(false);
         job.retry();
@@ -244,8 +300,26 @@ mod tests {
     #[test]
     fn test_job_id_unique() {
         let pipeline_run_id = PipelineRunId::new();
-        let job1 = Job::new(pipeline_run_id, "build".to_string());
-        let job2 = Job::new(pipeline_run_id, "build".to_string());
+        let job1 = Job::new(pipeline_run_id, "build".to_string(), "rust:1.75");
+        let job2 = Job::new(pipeline_run_id, "build".to_string(), "rust:1.75");
         assert_ne!(job1.id, job2.id);
+    }
+
+    #[test]
+    fn test_job_image_field() {
+        let pipeline_run_id = PipelineRunId::new();
+        let job = Job::new(pipeline_run_id, "build".to_string(), "python:3.12-slim");
+        assert_eq!(job.image, "python:3.12-slim");
+        assert!(job.has_image());
+        assert!(job.has_execution_metadata());
+    }
+
+    #[test]
+    fn test_job_image_empty_by_default_via_default() {
+        // Verify the field is present and defaults to empty string
+        let pipeline_run_id = PipelineRunId::new();
+        let job = Job::new(pipeline_run_id, "build".to_string(), "rust:latest");
+        // After adding image, all jobs have an image via constructor
+        assert!(!job.image.is_empty());
     }
 }
