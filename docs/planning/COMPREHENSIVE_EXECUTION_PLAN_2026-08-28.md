@@ -146,7 +146,9 @@ Goal: CI says what actually passed and releases are verifiable.
   build/test/lint/release workflows now use `--locked`; cargo-deny/license
   policy and disabled historical/template paths remain open.
 - [ ] P4-10 Add workflow linting, action pin drift detection, shellcheck, and
-  script-injection checks as required CI jobs.
+  script-injection checks as required CI jobs. The dependency-free immutable
+  action-ref check now runs in `scripts/qualityctl`; actionlint/shellcheck
+  installation and hosted enforcement remain open.
 - [ ] P4-11 Add rollback/release promotion gates and a deployment canary with
   health, migration, and artifact verification checks.
 

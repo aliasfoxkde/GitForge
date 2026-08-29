@@ -14,8 +14,8 @@ usage() {
 Usage: scripts/qualityctl [--fast] [--json]
 
 Runs format, strict Clippy, workspace tests, and (unless --fast) LLVM
-coverage. Reports are written under target/quality/ and heavy Cargo stages
-run through the GitForge build manager.
+coverage, plus dependency-free CI policy checks. Reports are written under
+target/quality/ and heavy stages run through the GitForge build manager.
 EOF
 }
 
@@ -52,7 +52,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [[ ! -S "$SOCKET" ]]; then
-    "$BUILD_DAEMON" >"$log_dir/daemon.log" 2>&1 &
+    GITFORGE_BUILD_SOCKET="$SOCKET" "$BUILD_DAEMON" >"$log_dir/daemon.log" 2>&1 &
     daemon_pid=$!
     for _ in $(seq 1 100); do
         [[ -S "$SOCKET" ]] && break
@@ -127,6 +127,7 @@ PY
 }
 
 failed=0
+record_stage ci-policy python3 scripts/check-ci-policy.py || failed=1
 record_stage format fmt --all -- --check || failed=1
 record_stage clippy clippy --workspace --all-targets -- -D warnings || failed=1
 record_stage test test --workspace --locked --no-fail-fast || failed=1
