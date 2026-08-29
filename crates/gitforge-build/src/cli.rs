@@ -27,6 +27,10 @@ struct Cli {
     #[arg(short = 'n', long)]
     no_wait: bool,
 
+    /// Run an explicitly selected non-Cargo executable.
+    #[arg(long, value_name = "PROGRAM")]
+    exec: Option<String>,
+
     /// List all jobs
     #[arg(short, long)]
     list: bool,
@@ -78,7 +82,7 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
     }
 
     // Need at least one cargo arg
-    if cli.cargo_args.is_empty() {
+    if cli.cargo_args.is_empty() && cli.exec.is_none() {
         anyhow::bail!("no cargo command specified. Usage: gitforge-build <cargo args...>");
     }
 
@@ -92,9 +96,15 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
     };
 
     // Submit job
-    let response = client
-        .submit_job(&socket_path, cli.cargo_args.clone(), working_dir)
-        .await?;
+    let response = if let Some(program) = cli.exec.clone() {
+        client
+            .submit_command(&socket_path, program, cli.cargo_args.clone(), working_dir)
+            .await?
+    } else {
+        client
+            .submit_job(&socket_path, cli.cargo_args.clone(), working_dir)
+            .await?
+    };
 
     match response {
         Response::Submitted { job_id } => {
@@ -463,6 +473,20 @@ mod tests {
     fn test_cli_parse_no_wait() {
         let cli = Cli::try_parse_from(["gitforge-build", "-n", "--", "build"]).unwrap();
         assert!(cli.no_wait);
+    }
+
+    #[test]
+    fn test_cli_parse_exec() {
+        let cli = Cli::try_parse_from([
+            "gitforge-build",
+            "--exec",
+            "scripts/check-ci-policy.py",
+            "--",
+            "--help",
+        ])
+        .unwrap();
+        assert_eq!(cli.exec.as_deref(), Some("scripts/check-ci-policy.py"));
+        assert_eq!(cli.cargo_args, vec!["--help"]);
     }
 
     #[test]

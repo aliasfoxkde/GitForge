@@ -101,6 +101,7 @@ Available tools:
 | Submit job | `gitforge-build -- cargo build` |
 | Submit and wait | `gitforge-build -- cargo test` |
 | Submit no-wait | `gitforge-build --no-wait -- cargo build` |
+| Submit managed executable | `gitforge-build --exec scripts/frontend-quality.sh` |
 | Bypass daemon | `cargo-wrapper --wrapper-fallback -- <cmd>` |
 | View logs | `tail -f target/quality/gitforge-build.log` |
 

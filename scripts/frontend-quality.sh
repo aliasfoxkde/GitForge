@@ -12,7 +12,7 @@ for template in "$ROOT/template-parts/vite-react-pwa" "$ROOT/template-parts/vite
         pnpm run typecheck
         pnpm run build
         pnpm run lint
-        pnpm exec vitest run
+        pnpm exec vitest run --maxWorkers=2 --minWorkers=1
         pnpm exec playwright test --workers=1
     )
 done

@@ -951,7 +951,8 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
 
     static WORKSPACE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -979,7 +980,7 @@ mod tests {
         let _guard = WORKSPACE_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap();
+            .await;
         let run_id = gitforge_common::PipelineRunId::new();
         let test_root = PathBuf::from("/home/mkinney/.cache/gitforge-ci-workspace-tests")
             .join(run_id.to_string());

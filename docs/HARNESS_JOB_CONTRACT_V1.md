@@ -10,6 +10,12 @@ operator inspection, submission, and cancellation. The older
 roles. Credentials are runtime configuration only and must not be committed.
 Missing or invalid credentials produce a fail-closed response.
 
+The local Unix-socket build manager keeps Cargo submission as its default and
+supports an explicit `Request::Exec`/`gitforge-build --exec PROGRAM` contract
+for non-Cargo checks. This path passes argv directly to the selected program;
+it does not add shell interpretation. Both modes share queue admission,
+process-group cleanup, cancellation, and terminal exit-code propagation.
+
 ## Lifecycle
 
 ```text

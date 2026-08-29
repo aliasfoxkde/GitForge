@@ -108,7 +108,16 @@ record_stage() {
     local log="$log_dir/$name.log"
     local started ended status
     started=$(date -u +%s)
-    if timeout --signal=TERM --kill-after=15s "$TIMEOUT_SECONDS" \
+    if [[ "${1:-}" == "--exec" ]]; then
+        local program="$2"
+        shift 2
+        if timeout --signal=TERM --kill-after=15s "$TIMEOUT_SECONDS" \
+            "$BUILD_CLI" --socket "$SOCKET" --dir "$ROOT" --exec "$program" -- "$@" >"$log" 2>&1; then
+            status=passed
+        else
+            status=failed
+        fi
+    elif timeout --signal=TERM --kill-after=15s "$TIMEOUT_SECONDS" \
         "$BUILD_CLI" --socket "$SOCKET" --dir "$ROOT" -- "$@" >"$log" 2>&1; then
         status=passed
     else
@@ -127,8 +136,8 @@ PY
 }
 
 failed=0
-record_stage ci-policy python3 scripts/check-ci-policy.py || failed=1
-record_stage frontend scripts/frontend-quality.sh || failed=1
+record_stage ci-policy --exec python3 scripts/check-ci-policy.py || failed=1
+record_stage frontend --exec scripts/frontend-quality.sh || failed=1
 record_stage dependency-policy deny check || failed=1
 record_stage format fmt --all -- --check || failed=1
 record_stage clippy clippy --workspace --all-targets -- -D warnings || failed=1

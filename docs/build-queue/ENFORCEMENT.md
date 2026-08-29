@@ -160,7 +160,10 @@ In `.claude/CLAUDE.md` or project settings:
 ```markdown
 # Build Enforcement
 
-All cargo builds MUST route through gitforge-build:
+All cargo builds MUST route through gitforge-build. Non-Cargo automation may
+use the explicit `--exec PROGRAM` path so the same queue, timeout, process
+group, cancellation, and output containment apply; the executable is never
+invoked through a shell unless the caller explicitly selects a shell.
 - Use `cargo build` → routes through cargo-wrapper alias
 - Use `cargo test` → routes through cargo-wrapper alias
 - NEVER call cargo directly without the wrapper

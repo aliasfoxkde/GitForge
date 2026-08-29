@@ -56,6 +56,8 @@ pub struct BuildJob {
     pub id: uuid::Uuid,
     /// Cargo command and arguments (e.g., ["test", "--workspace"])
     pub cargo_args: Vec<String>,
+    /// Explicit executable for non-Cargo jobs. `None` means use Cargo.
+    pub executable: Option<String>,
     /// Working directory
     pub working_dir: Option<String>,
     /// Job weight (affects resource allocation)
@@ -74,6 +76,21 @@ impl BuildJob {
         Self {
             id: uuid::Uuid::new_v4(),
             cargo_args,
+            executable: None,
+            working_dir,
+            weight,
+            status: JobStatus::Queued,
+            submitted_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Create a job for an explicitly selected executable.
+    pub fn new_command(program: String, args: Vec<String>, working_dir: Option<String>) -> Self {
+        let weight = JobWeight::from_cargo_cmd(args.first().map(String::as_str).unwrap_or(""));
+        Self {
+            id: uuid::Uuid::new_v4(),
+            cargo_args: args,
+            executable: Some(program),
             working_dir,
             weight,
             status: JobStatus::Queued,

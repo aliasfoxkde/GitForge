@@ -165,6 +165,16 @@ async fn handle_connection(
                 job_id: job_id.to_string(),
             }
         }
+        Request::Exec {
+            program,
+            args,
+            working_dir,
+        } => {
+            let job_id = coordinator.submit_command(program, args, working_dir).await;
+            Response::Submitted {
+                job_id: job_id.to_string(),
+            }
+        }
         Request::Status { job_id } => {
             if let Ok(uuid) = uuid::Uuid::parse_str(&job_id) {
                 if let Some((status, wait_time_ms)) = coordinator.get_status(&uuid).await {

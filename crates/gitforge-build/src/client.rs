@@ -22,6 +22,15 @@ pub trait JobSubmitter: Send + Sync {
         working_dir: Option<String>,
     ) -> DaemonResult;
 
+    /// Submit an explicitly selected non-Cargo command.
+    async fn submit_command(
+        &self,
+        socket_path: &str,
+        program: String,
+        args: Vec<String>,
+        working_dir: Option<String>,
+    ) -> DaemonResult;
+
     /// List all jobs
     async fn list_jobs(&self, socket_path: &str) -> DaemonResult;
 
@@ -76,6 +85,24 @@ impl JobSubmitter for UnixSocketClient {
 
         let response = read_response(&mut stream).await?;
         Ok(response)
+    }
+
+    async fn submit_command(
+        &self,
+        socket_path: &str,
+        program: String,
+        args: Vec<String>,
+        working_dir: Option<String>,
+    ) -> DaemonResult {
+        let mut stream = UnixStream::connect(socket_path).await?;
+        let request = Request::Exec {
+            program,
+            args,
+            working_dir,
+        };
+        stream.write_all(&encode_request(&request)?).await?;
+        stream.shutdown().await?;
+        Ok(read_response(&mut stream).await?)
     }
 
     async fn list_jobs(&self, socket_path: &str) -> DaemonResult {
@@ -180,6 +207,16 @@ impl JobSubmitter for MockClient {
         &self,
         _socket_path: &str,
         _cargo_args: Vec<String>,
+        _working_dir: Option<String>,
+    ) -> DaemonResult {
+        Ok(self.submit_response.clone())
+    }
+
+    async fn submit_command(
+        &self,
+        _socket_path: &str,
+        _program: String,
+        _args: Vec<String>,
         _working_dir: Option<String>,
     ) -> DaemonResult {
         Ok(self.submit_response.clone())

@@ -10,6 +10,9 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'jsdom',
+    fileParallelism: false,
+    maxWorkers: 2,
+    minWorkers: 1,
     setupFiles: ['./src/test/setup.ts'],
     include: ['tests/**/*.test.{ts,tsx}'],
     coverage: {

@@ -10,6 +10,7 @@ impl Request {
     pub fn name(&self) -> &'static str {
         match self {
             Request::Submit { .. } => "submit",
+            Request::Exec { .. } => "exec",
             Request::Status { .. } => "status",
             Request::Cancel { .. } => "cancel",
             Request::List => "list",
@@ -26,6 +27,12 @@ pub enum Request {
     /// Submit a new build job
     Submit {
         cargo_args: Vec<String>,
+        working_dir: Option<String>,
+    },
+    /// Submit an explicitly selected non-Cargo command.
+    Exec {
+        program: String,
+        args: Vec<String>,
         working_dir: Option<String>,
     },
     /// Check job status
@@ -216,6 +223,11 @@ mod tests {
             Request::List,
             Request::Stats,
             Request::Shutdown,
+            Request::Exec {
+                program: "true".to_string(),
+                args: vec![],
+                working_dir: None,
+            },
         ];
 
         for req in requests {
@@ -229,6 +241,7 @@ mod tests {
                 (Request::List, Request::List) => (),
                 (Request::Stats, Request::Stats) => (),
                 (Request::Shutdown, Request::Shutdown) => (),
+                (Request::Exec { .. }, Request::Exec { .. }) => (),
                 _ => panic!("type mismatch"),
             }
         }

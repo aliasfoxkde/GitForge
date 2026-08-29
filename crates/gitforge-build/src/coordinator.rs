@@ -52,7 +52,22 @@ impl BuildCoordinator {
         cargo_args: Vec<String>,
         working_dir: Option<String>,
     ) -> uuid::Uuid {
-        let job = BuildJob::new(cargo_args, working_dir);
+        self.submit_job(BuildJob::new(cargo_args, working_dir))
+            .await
+    }
+
+    /// Submit an explicitly selected non-Cargo command.
+    pub async fn submit_command(
+        self: &Arc<Self>,
+        program: String,
+        args: Vec<String>,
+        working_dir: Option<String>,
+    ) -> uuid::Uuid {
+        self.submit_job(BuildJob::new_command(program, args, working_dir))
+            .await
+    }
+
+    async fn submit_job(self: &Arc<Self>, job: BuildJob) -> uuid::Uuid {
         let job_id = job.id;
         let coordinator = self.clone();
 
@@ -85,7 +100,7 @@ impl BuildCoordinator {
             }
 
             // Execute the job
-            let result = execute_cargo_job(&job, coordinator.active_pids.clone()).await;
+            let result = execute_job(&job, coordinator.active_pids.clone()).await;
 
             // Update job status and record completion
             {
@@ -352,7 +367,7 @@ impl Default for BuildCoordinator {
 }
 
 /// Execute a cargo job
-async fn execute_cargo_job(
+async fn execute_job(
     job: &BuildJob,
     active_pids: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
 ) -> anyhow::Result<BuildResult> {
@@ -365,9 +380,14 @@ async fn execute_cargo_job(
     // Strategy:
     // 1. CARGO_REAL env var (set by wrapper in bypass mode)
     // 2. rustup run stable cargo (always uses real cargo)
-    let cargo_executable = std::env::var("CARGO_REAL").unwrap_or_else(|_| "rustup".to_string());
+    let cargo_executable = job
+        .executable
+        .clone()
+        .unwrap_or_else(|| std::env::var("CARGO_REAL").unwrap_or_else(|_| "rustup".to_string()));
 
-    let cargo_args = if cargo_executable == "rustup" {
+    let cargo_args = if job.executable.is_some() {
+        job.cargo_args.clone()
+    } else if cargo_executable == "rustup" {
         // rustup run stable cargo [cargo args...]
         let mut args = vec!["run".to_string(), "stable".to_string(), "cargo".to_string()];
         args.extend(job.cargo_args.clone());
