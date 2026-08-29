@@ -742,14 +742,27 @@ async fn execute_job(
     if let Some(pid) = child.id() {
         active_pids.lock().await.insert(job.id, pid);
         if let Some(journal) = journal {
+            let start_ticks = process_start_ticks(pid);
             let event = JobJournalEvent::Started {
                 job_id: job.id,
                 pid,
                 process_group_id: pid as i32,
-                process_start_ticks: process_start_ticks(pid),
+                process_start_ticks: start_ticks,
             };
-            if let Err(error) = journal.lock().await.append(&event) {
-                error!("failed to persist start for job {}: {}", job.id, error);
+            let journal_error = journal.lock().await.append(&event).err();
+            if journal_error.is_some() || start_ticks.is_none() {
+                // A journal-enabled child must never outlive its durable
+                // ownership record. Fail closed if identity persistence is
+                // unavailable, then reap the process group before returning.
+                let pgid = Pid::from_raw(pid as i32);
+                let _ = killpg(pgid, Signal::SIGCONT);
+                let _ = killpg(pgid, Signal::SIGKILL);
+                let _ = child.wait().await;
+                active_pids.lock().await.remove(&job.id);
+                let reason = journal_error
+                    .map(|error| format!("failed to persist start: {}", error))
+                    .unwrap_or_else(|| "process identity unavailable".to_string());
+                return Ok(BuildResult::failed(job, -1, String::new(), reason));
             }
         }
     }
