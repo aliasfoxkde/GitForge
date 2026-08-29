@@ -18,7 +18,12 @@ pub enum JobJournalEvent {
         working_dir: Option<String>,
     },
     /// A worker acquired capacity and started the child process.
-    Started { job_id: uuid::Uuid, pid: u32 },
+    Started {
+        job_id: uuid::Uuid,
+        pid: u32,
+        process_group_id: i32,
+        process_start_ticks: Option<u64>,
+    },
     /// A child was reaped and its complete result is authoritative.
     Completed {
         job_id: uuid::Uuid,
@@ -42,6 +47,8 @@ pub struct RecoveredJob {
     pub working_dir: Option<String>,
     pub status: JobStatus,
     pub result: Option<BuildResult>,
+    pub process_group_id: i32,
+    pub process_start_ticks: Option<u64>,
 }
 
 /// Result of replaying the journal.
@@ -150,13 +157,22 @@ fn apply_event(states: &mut HashMap<uuid::Uuid, RecoveredJob>, event: JobJournal
                     working_dir,
                     status: JobStatus::Queued,
                     result: None,
+                    process_group_id: 0,
+                    process_start_ticks: None,
                 },
             );
         }
-        JobJournalEvent::Started { job_id, pid } => {
+        JobJournalEvent::Started {
+            job_id,
+            pid,
+            process_group_id,
+            process_start_ticks,
+        } => {
             if let Some(job) = states.get_mut(&job_id) {
                 job.status = JobStatus::Running { pid };
                 job.result = None;
+                job.process_group_id = process_group_id;
+                job.process_start_ticks = process_start_ticks;
             }
         }
         JobJournalEvent::Completed { job_id, result } => {

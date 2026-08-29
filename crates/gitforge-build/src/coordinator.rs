@@ -195,6 +195,17 @@ impl BuildCoordinator {
                     self.jobs.lock().await.insert(job.id, job);
                 }
                 JobStatus::Running { pid } => {
+                    if pid > 0
+                        && recovered.process_group_id > 0
+                        && recovered
+                            .process_start_ticks
+                            .is_some_and(|ticks| process_start_ticks(pid) == Some(ticks))
+                    {
+                        let pgid = Pid::from_raw(recovered.process_group_id);
+                        let _ = killpg(pgid, Signal::SIGCONT);
+                        let _ = killpg(pgid, SIGTERM);
+                        let _ = killpg(pgid, Signal::SIGKILL);
+                    }
                     let error = format!("daemon restarted while job was running (pid {})", pid);
                     job.status = JobStatus::Failed {
                         exit_code: -1,
@@ -349,18 +360,12 @@ impl BuildCoordinator {
                 }
             }
             coordinator.state_changed.notify_waiters();
-            if let Err(error) = coordinator
-                .append_journal(JobJournalEvent::Started { job_id, pid: 0 })
-                .await
-            {
-                error!("failed to persist start for job {}: {}", job_id, error);
-            }
-
             // Execute the job
             let result = execute_job(
                 &job,
                 coordinator.active_pids.clone(),
                 coordinator.job_timeout,
+                coordinator.journal.clone(),
             )
             .await;
 
@@ -656,11 +661,24 @@ impl Default for BuildCoordinator {
     }
 }
 
+/// Read Linux's monotonically increasing process-start token. It prevents a
+/// recycled PID from being mistaken for the child recorded in the journal.
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let content = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = content
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    fields.get(19)?.parse().ok()
+}
+
 /// Execute a cargo job
 async fn execute_job(
     job: &BuildJob,
     active_pids: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
     timeout_duration: Duration,
+    journal: Option<Arc<Mutex<JobJournal>>>,
 ) -> anyhow::Result<BuildResult> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
@@ -723,6 +741,17 @@ async fn execute_job(
     };
     if let Some(pid) = child.id() {
         active_pids.lock().await.insert(job.id, pid);
+        if let Some(journal) = journal {
+            let event = JobJournalEvent::Started {
+                job_id: job.id,
+                pid,
+                process_group_id: pid as i32,
+                process_start_ticks: process_start_ticks(pid),
+            };
+            if let Err(error) = journal.lock().await.append(&event) {
+                error!("failed to persist start for job {}: {}", job.id, error);
+            }
+        }
     }
 
     // Drain both pipes concurrently. Reading stdout to completion before
@@ -1068,6 +1097,8 @@ mod tests {
             .append(&JobJournalEvent::Started {
                 job_id: id,
                 pid: 4242,
+                process_group_id: 4242,
+                process_start_ticks: Some(1),
             })
             .unwrap();
         drop(journal);
