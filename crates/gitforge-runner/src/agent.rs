@@ -56,7 +56,8 @@ impl fmt::Debug for RunnerConfig {
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
-            scheduler_url: "http://localhost:42781".to_string(),
+            scheduler_url: std::env::var("GITFORGE_SCHEDULER_URL")
+                .unwrap_or_else(|_| "http://localhost:42781".to_string()),
             name: "runner".to_string(),
             runner_type: "docker".to_string(),
             capacity: 2,
