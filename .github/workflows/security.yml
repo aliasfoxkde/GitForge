@@ -60,10 +60,8 @@ jobs:
           echo "Checking for leaked secrets in commits..."
           # Exclude issue templates (contain example patterns, not real secrets)
           # Look for common secret patterns
-          FOUND=$(grep -rnE "ghp_[0-9a-zA-Z]{36}|gho_[0-9a-zA-Z]{36}|AKIA[0-9A-Z]{16}|xox[baprs]-[0-9a-zA-Z]{48,}" \
-            --include="*.rs" --include="*.toml" --include="*.yaml" --include="*.yml" \
-            --include="*.sh" --include="*.json" --include="*.md" \
-            --exclude-dir=target --exclude-dir=.git . 2>/dev/null || true)
+          FOUND=$(git grep -nE "ghp_[0-9a-zA-Z]{36}|gho_[0-9a-zA-Z]{36}|AKIA[0-9A-Z]{16}|xox[baprs]-[0-9a-zA-Z]{48,}" -- \
+            ':!*.lock' ':!.github/ISSUE_TEMPLATE/**' 2>/dev/null || true)
           if [ -n "$FOUND" ]; then
             echo "WARNING: Potential secrets found in repository:"
             echo "$FOUND"

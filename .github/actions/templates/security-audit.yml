@@ -45,7 +45,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          matches=$(git grep -nE 'gh[pousr]_[0-9A-Za-z]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[0-9A-Za-z-]{20,}' -- . ':!*.lock' || true)
+          matches=$(git grep -nE 'gh[pousr]_[0-9A-Za-z]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[0-9A-Za-z-]{20,}' -- ':!*.lock' ':!.github/ISSUE_TEMPLATE/**' || true)
           if [[ -n "$matches" ]]; then
             echo "Potential credential material found in tracked files:" >&2
             echo "$matches" >&2
