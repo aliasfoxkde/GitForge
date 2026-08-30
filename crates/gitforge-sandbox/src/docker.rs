@@ -1419,10 +1419,7 @@ mod tests {
         };
 
         assert_eq!(
-            instance
-                .workspace_path
-                .as_ref()
-                .map(|_| "/workspace"),
+            instance.workspace_path.as_ref().map(|_| "/workspace"),
             Some("/workspace")
         );
     }
