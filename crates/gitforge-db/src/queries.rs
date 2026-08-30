@@ -723,6 +723,27 @@ impl JobQueries {
         Ok(row.is_some())
     }
 
+    /// Persist the scheduler's in-memory lease so durable lease validation
+    /// (which reads this row) accepts the lease handed to the runner.
+    /// Returns whether a row was updated.
+    pub async fn sync_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET runner_id = ?, lease_token = ?, status = 'assigned' WHERE id = ? AND status IN ('queued', 'assigned')",
+        )
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to sync job lease: {}", e)))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Return the existing submission record for a scoped idempotency key.
     pub async fn get_idempotency(
         pool: &Pool,
