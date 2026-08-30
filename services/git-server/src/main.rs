@@ -414,9 +414,16 @@ async fn git_upload_pack_standard(
             .body(Body::from(format!("Repository not found: {repo_path}")))
             .unwrap();
     }
-    let body = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
-        .await
-        .unwrap_or_default();
+    let body = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!("failed to read upload-pack body: {}", error);
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("Bad request: {}", error)))
+                .unwrap();
+        }
+    };
     match state.http_handler.upload_pack(repo_id, body.to_vec()).await {
         Ok(response) => Response::builder()
             .status(StatusCode::OK)
