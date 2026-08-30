@@ -372,12 +372,55 @@ async fn git_upload_pack_standard(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> Response {
-    let _ = request;
-    git_upload_pack(
-        Path((owner, repo.trim_end_matches(".git").to_string())),
-        State(state),
-    )
-    .await
+    // Smart HTTP fetch: pipe the client wants/haves through upload-pack
+    // instead of replaying the ref advertisement.
+    let repo = repo.trim_end_matches(".git").to_string();
+    let repo_path = format!("{owner}/{repo}");
+    let repo_id = if let Some(_pool) = &state.db_pool {
+        match lookup_repo_id(&state.db_pool, &owner, &repo).await {
+            Some(id) => id,
+            None => {
+                tracing::warn!("repository not found in DB: {}", repo_path);
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from(format!("Repository not found: {repo_path}")))
+                    .unwrap();
+            }
+        }
+    } else {
+        tracing::warn!(
+            "database not available, cannot look up repository: {}",
+            repo_path
+        );
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from("Database not available"))
+            .unwrap();
+    };
+    if !state.storage.exists(repo_id).await {
+        tracing::warn!("repository not found in storage: {}", repo_path);
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from(format!("Repository not found: {repo_path}")))
+            .unwrap();
+    }
+    let body = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    match state.http_handler.upload_pack(repo_id, body.to_vec()).await {
+        Ok(response) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/x-git-upload-pack-result")
+            .body(Body::from(response))
+            .unwrap(),
+        Err(e) => {
+            tracing::warn!("upload-pack failed for {}: {}", repo_path, e);
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("Error: {}", e)))
+                .unwrap()
+        }
+    }
 }
 
 /// Git receive-pack handler (POST) - receives pack data
