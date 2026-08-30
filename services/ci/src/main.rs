@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
     let scheduler_state = create_state_with_artifact_storage(scheduler, Some(artifact_storage));
     let scheduler_arc = scheduler_state.scheduler.clone();
     let workspace_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let run_workspace_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let run_waiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let trigger_state = Arc::new(TriggerState {
         event_bus: event_bus.clone(),
@@ -136,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
     let pipeline_cache_clone = pipeline_cache.clone();
     let scheduler_db_clone = scheduler_db.clone();
     let workspace_paths_clone = workspace_paths.clone();
+    let run_workspace_paths_clone = run_workspace_paths.clone();
     let run_waiters_clone = run_waiters.clone();
     let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -157,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
             pipeline_cache_clone,
             scheduler_db_clone,
             workspace_paths_clone,
+            run_workspace_paths_clone,
             pipeline_registry_clone,
             run_waiters_clone,
             shutdown_consumer,
@@ -169,14 +172,14 @@ async fn main() -> anyhow::Result<()> {
 
     let completion_scheduler = scheduler_arc.clone();
     let completion_registry = pipeline_registry.clone();
-    let completion_workspace_paths = workspace_paths.clone();
+    let completion_run_workspace_paths = run_workspace_paths.clone();
     let completion_db = scheduler_db.clone();
     let completion_shutdown = shutdown.clone();
     let _completion_handle = tokio::spawn(async move {
         run_scheduler_event_consumer(
             completion_scheduler,
             completion_registry,
-            completion_workspace_paths,
+            completion_run_workspace_paths,
             completion_db,
             completion_shutdown,
         )
@@ -564,6 +567,9 @@ async fn run_event_consumer(
     pipeline_cache: Arc<std::sync::Mutex<PipelineCache>>,
     scheduler_db: Option<gitforge_db::Pool>,
     workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    run_workspace_paths: Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
     pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
     run_waiters: Arc<
         std::sync::Mutex<
@@ -594,7 +600,7 @@ async fn run_event_consumer(
                 match event {
                     Some(event) => {
                         tracing::debug!("received event: {:?}", event.event_type);
-                        match handle_push_event(&event, &scheduler, &pipeline_cache, scheduler_db.as_ref(), &workspace_paths, &pipeline_registry).await {
+                        match handle_push_event(&event, &scheduler, &pipeline_cache, scheduler_db.as_ref(), &workspace_paths, &run_workspace_paths, &pipeline_registry).await {
                             Ok(run_id) => {
                                 if let Some(waiter) = run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id) {
                                     let _ = waiter.send(run_id);
@@ -625,6 +631,9 @@ async fn handle_push_event(
     pipeline_cache: &Arc<std::sync::Mutex<PipelineCache>>,
     scheduler_db: Option<&gitforge_db::Pool>,
     workspace_paths: &Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    run_workspace_paths: &Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
     pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
 ) -> anyhow::Result<gitforge_common::PipelineRunId> {
     // Only handle PushReceived events
@@ -705,10 +714,10 @@ async fn handle_push_event(
             Some(prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await?)
         }
     };
-    workspace_paths
+    run_workspace_paths
         .lock()
         .expect("workspace cache lock poisoned")
-        .insert(repo_id, workspace_path.clone());
+        .insert(state.run_id, workspace_path.clone());
     pipeline_registry
         .write()
         .await
@@ -771,7 +780,9 @@ async fn handle_push_event(
 async fn run_scheduler_event_consumer(
     scheduler: Arc<Scheduler>,
     pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
-    workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    run_workspace_paths: Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
     scheduler_db: Option<gitforge_db::Pool>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -829,10 +840,10 @@ async fn run_scheduler_event_consumer(
         }
 
         let state = engine.state().await;
-        let workspace_path = workspace_paths
+        let workspace_path = run_workspace_paths
             .lock()
             .expect("workspace cache lock poisoned")
-            .get(&state.repo_id)
+            .get(&state.run_id)
             .cloned()
             .flatten();
         for next_job_id in engine.ready_jobs().await {
@@ -875,6 +886,10 @@ async fn run_scheduler_event_consumer(
                 )
                 .await;
             }
+            run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .remove(&state.run_id);
             pipeline_registry.write().await.remove(&state.run_id);
         }
     }
