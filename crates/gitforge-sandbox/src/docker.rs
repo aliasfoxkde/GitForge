@@ -387,10 +387,11 @@ impl Sandbox for DockerSandbox {
                     Some("none".to_string())
                 },
                 // Fedora's rootless container engine enforces SELinux labels on
-                // host mounts. Private relabeling makes this per-workspace
-                // mount readable inside the sandbox without disabling
-                // enforcement.
-                binds: Some(vec![format!("{}:/workspace:Z", workspace_path)]),
+                // host mounts. The workspace is intentionally shared by jobs in
+                // one pipeline run, so use a shared relabel. Private `:Z`
+                // relabeling is racy when concurrent jobs mount the same
+                // checkout and can leave one container unable to see files.
+                binds: Some(vec![format!("{}:/workspace:z", workspace_path)]),
                 ..Default::default()
             };
             let config = Config {
