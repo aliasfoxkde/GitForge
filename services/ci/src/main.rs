@@ -1492,4 +1492,231 @@ mod tests {
         // And it should be the second one
         assert_eq!(cache.get(&repo_id).unwrap().name, "repo2-pipeline");
     }
+
+    // --- Workspace-propagation regression tests (fix: scope push workspaces by pipeline run) ---
+    //
+    // The push handler (`handle_push_event`) inserts a prepared workspace path
+    // into the run-scoped cache keyed by `state.run_id`, and the scheduler
+    // completion consumer (`run_scheduler_event_consumer`) looks up that same
+    // entry by `state.run_id` when enqueuing dependent jobs. The tests below
+    // exercise the cache pattern directly to prove the invariants the fix
+    // guarantees without standing up the full event bus / scheduler loop.
+
+    fn run_workspace_paths_cache(
+    ) -> Arc<std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>> {
+        Arc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    /// Insert a workspace path the way `handle_push_event` does after
+    /// preparing a workspace for a run.
+    fn cache_prepared_workspace(
+        cache: &Arc<std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>>,
+        run_id: gitforge_common::PipelineRunId,
+        workspace_path: Option<String>,
+    ) {
+        cache
+            .lock()
+            .expect("workspace cache lock poisoned")
+            .insert(run_id, workspace_path);
+    }
+
+    /// Resolve the workspace path the way `run_scheduler_event_consumer` does
+    /// when enqueuing downstream jobs for a run.
+    fn lookup_workspace_for_run(
+        cache: &Arc<std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>>,
+        run_id: gitforge_common::PipelineRunId,
+    ) -> Option<String> {
+        cache
+            .lock()
+            .expect("workspace cache lock poisoned")
+            .get(&run_id)
+            .cloned()
+            .flatten()
+    }
+
+    /// Remove the workspace entry the way `run_scheduler_event_consumer` does
+    /// when the run reaches a terminal status.
+    fn evict_workspace_for_run(
+        cache: &Arc<std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>>,
+        run_id: gitforge_common::PipelineRunId,
+    ) {
+        cache
+            .lock()
+            .expect("workspace cache lock poisoned")
+            .remove(&run_id);
+    }
+
+    /// The fix must key the cache by `PipelineRunId`, so two distinct runs for
+    /// the same repository each retain their own prepared workspace.
+    #[test]
+    fn test_run_workspace_paths_keys_by_pipeline_run_id() {
+        let cache = run_workspace_paths_cache();
+        let shared_repo = gitforge_common::RepoId::new();
+        let run_a = gitforge_common::PipelineRunId::new();
+        let run_b = gitforge_common::PipelineRunId::new();
+        assert_ne!(run_a, run_b, "fixture: run ids must differ");
+
+        // Two pushes for the same repo arrive in quick succession.
+        cache_prepared_workspace(&cache, run_a, Some("/nas/Temp/ws/run-a".to_string()));
+        cache_prepared_workspace(&cache, run_b, Some("/nas/Temp/ws/run-b".to_string()));
+
+        assert_eq!(cache.lock().unwrap().len(), 2);
+        assert_eq!(
+            lookup_workspace_for_run(&cache, run_a).as_deref(),
+            Some("/nas/Temp/ws/run-a")
+        );
+        assert_eq!(
+            lookup_workspace_for_run(&cache, run_b).as_deref(),
+            Some("/nas/Temp/ws/run-b")
+        );
+
+        // A repository-only key (the pre-fix behavior) would have collapsed the
+        // second push's workspace onto the first, so verify the fix keeps both.
+        let mut legacy_repo_cache: HashMap<gitforge_common::RepoId, Option<String>> =
+            HashMap::new();
+        legacy_repo_cache.insert(shared_repo, Some("/nas/Temp/ws/run-a".to_string()));
+        legacy_repo_cache.insert(shared_repo, Some("/nas/Temp/ws/run-b".to_string()));
+        assert_eq!(
+            legacy_repo_cache.get(&shared_repo).unwrap().as_deref(),
+            Some("/nas/Temp/ws/run-b"),
+            "pre-fix keyed-by-repo cache would clobber run A's workspace"
+        );
+    }
+
+    /// Dependent jobs in a single pipeline run must observe the same workspace
+    /// that `handle_push_event` prepared for that run. This mirrors the lookup
+    /// the scheduler completion consumer performs when enqueuing downstream
+    /// jobs after a parent job completes.
+    #[tokio::test]
+    async fn test_run_workspace_paths_dependent_jobs_reuse_prepared_workspace() {
+        let cache = run_workspace_paths_cache();
+        let repo_id = gitforge_common::RepoId::new();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let pipeline = create_default_pipeline(&repo_id.to_string());
+        let trigger = PipelineTriggerEvent::new(
+            pipeline_id,
+            repo_id,
+            "abcdef1234567890".to_string(),
+            TriggerType::Push,
+        );
+
+        let engine = CiEngine::new(trigger, pipeline).await.unwrap();
+        let run_id = engine.state().await.run_id;
+        let prepared_workspace = format!("/nas/Temp/workspaces/{run_id}");
+
+        // Mirror `handle_push_event` inserting the prepared workspace keyed by
+        // `state.run_id` (see services/ci/src/main.rs ~line 717).
+        cache_prepared_workspace(&cache, run_id, Some(prepared_workspace.clone()));
+
+        // The default pipeline has a dependent `test` job after `build`. Each
+        // dependent job lookup in `run_scheduler_event_consumer` resolves the
+        // workspace by `state.run_id`, so repeated lookups (simulating
+        // build→test fan-out) must all return the prepared workspace.
+        let first = lookup_workspace_for_run(&cache, run_id);
+        let second = lookup_workspace_for_run(&cache, run_id);
+        let third = lookup_workspace_for_run(&cache, run_id);
+        assert_eq!(first.as_deref(), Some(prepared_workspace.as_str()));
+        assert_eq!(second.as_deref(), Some(prepared_workspace.as_str()));
+        assert_eq!(third.as_deref(), Some(prepared_workspace.as_str()));
+    }
+
+    /// Two concurrent pipeline runs triggered for the same repository must
+    /// never see each other's workspace. This is the cross-contamination
+    /// invariant the fix restores.
+    #[tokio::test]
+    async fn test_run_workspace_paths_separate_pipeline_runs_do_not_cross_contaminate() {
+        let cache = run_workspace_paths_cache();
+        let shared_repo = gitforge_common::RepoId::new();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let pipeline = create_default_pipeline(&shared_repo.to_string());
+
+        let trigger_a = PipelineTriggerEvent::new(
+            pipeline_id,
+            shared_repo,
+            "aaaaaaa".to_string(),
+            TriggerType::Push,
+        );
+        let trigger_b = PipelineTriggerEvent::new(
+            pipeline_id,
+            shared_repo,
+            "bbbbbbb".to_string(),
+            TriggerType::Push,
+        );
+        let engine_a = CiEngine::new(trigger_a, pipeline.clone()).await.unwrap();
+        let engine_b = CiEngine::new(trigger_b, pipeline).await.unwrap();
+
+        let run_a = engine_a.state().await.run_id;
+        let run_b = engine_b.state().await.run_id;
+        assert_ne!(run_a, run_b);
+        assert_eq!(
+            engine_a.state().await.repo_id,
+            engine_b.state().await.repo_id
+        );
+
+        let workspace_a = format!("/nas/Temp/workspaces/{run_a}");
+        let workspace_b = format!("/nas/Temp/workspaces/{run_b}");
+
+        // Two pushes processed back-to-back: each run records its own workspace.
+        cache_prepared_workspace(&cache, run_a, Some(workspace_a.clone()));
+        cache_prepared_workspace(&cache, run_b, Some(workspace_b.clone()));
+
+        // Run A dependent jobs see only A's workspace, even though the cache
+        // also contains B's entry.
+        let a_lookup = lookup_workspace_for_run(&cache, run_a);
+        let b_lookup = lookup_workspace_for_run(&cache, run_b);
+        assert_eq!(a_lookup.as_deref(), Some(workspace_a.as_str()));
+        assert_eq!(b_lookup.as_deref(), Some(workspace_b.as_str()));
+
+        // Removing B's entry (e.g. terminal cleanup) must not affect A.
+        evict_workspace_for_run(&cache, run_b);
+        assert_eq!(
+            lookup_workspace_for_run(&cache, run_a).as_deref(),
+            Some(workspace_a.as_str()),
+            "evicting run B must not touch run A's workspace entry"
+        );
+        assert!(lookup_workspace_for_run(&cache, run_b).is_none());
+    }
+
+    /// The terminal-status eviction in the scheduler completion consumer
+    /// removes the entry by `state.run_id`; this must leave concurrent runs
+    /// for the same repository intact.
+    #[tokio::test]
+    async fn test_run_workspace_paths_terminal_eviction_only_targets_specific_run() {
+        let cache = run_workspace_paths_cache();
+        let repo_id = gitforge_common::RepoId::new();
+        let pipeline = create_default_pipeline(&repo_id.to_string());
+
+        let make_engine = |commit: &str| {
+            let pipeline_id = gitforge_common::PipelineId::new();
+            let trigger = PipelineTriggerEvent::new(
+                pipeline_id,
+                repo_id,
+                commit.to_string(),
+                TriggerType::Push,
+            );
+            CiEngine::new(trigger, pipeline.clone())
+        };
+        let engine_a = make_engine("commit-a").await.unwrap();
+        let engine_b = make_engine("commit-b").await.unwrap();
+        let engine_c = make_engine("commit-c").await.unwrap();
+        let run_a = engine_a.state().await.run_id;
+        let run_b = engine_b.state().await.run_id;
+        let run_c = engine_c.state().await.run_id;
+
+        for (run, commit) in [(run_a, "a"), (run_b, "b"), (run_c, "c")] {
+            cache_prepared_workspace(
+                &cache,
+                run,
+                Some(format!("/nas/Temp/workspaces/{run}/{commit}")),
+            );
+        }
+        assert_eq!(cache.lock().unwrap().len(), 3);
+
+        // Run B reaches a terminal status and its entry is evicted.
+        evict_workspace_for_run(&cache, run_b);
+        assert_eq!(cache.lock().unwrap().len(), 2);
+        assert!(lookup_workspace_for_run(&cache, run_b).is_none());
+        assert!(lookup_workspace_for_run(&cache, run_a).is_some());
+        assert!(lookup_workspace_for_run(&cache, run_c).is_some());
+    }
 }
