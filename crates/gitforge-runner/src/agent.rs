@@ -638,7 +638,7 @@ impl RunnerAgent {
                         if response.status().is_success() {
                             if let Ok(jobs) = response.json::<Vec<JobAssignment>>().await {
                                 for job in jobs {
-                                    tracing::info!(
+                                    tracing::debug!(
                                         "received job assignment: {} ({})",
                                         job.name,
                                         job.job_id
@@ -677,6 +677,11 @@ impl RunnerAgent {
                                             continue;
                                         }
                                     }
+                                    tracing::info!(
+                                        "accepted job assignment: {} ({})",
+                                        job.name,
+                                        job.job_id
+                                    );
                                     // Execute concurrently so the fetch loop
                                     // remains responsive and cancellation can
                                     // be observed while the sandbox runs.
