@@ -36,6 +36,9 @@ use tower_http::trace::TraceLayer;
 type PipelineCache = HashMap<gitforge_common::RepoId, PipelineDefinition>;
 type PipelineRegistry = HashMap<gitforge_common::PipelineRunId, Arc<CiEngine>>;
 
+/// Path of the pipeline definition inside a repository checkout.
+const PIPELINE_CONFIG_PATH: &str = ".gitforce.yml";
+
 struct TriggerState {
     event_bus: Arc<dyn EventBus>,
     workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
@@ -471,6 +474,73 @@ fn validate_workspace_path(path: &str) -> Result<String, String> {
     Ok(workspace.to_string_lossy().into_owned())
 }
 
+/// Load the pipeline definition committed at the pushed revision. CI
+/// configuration is code: the definition that governs a run is the one
+/// committed at the exact hash being tested, not the most recent one the
+/// control plane happens to have cached.
+///
+/// Returns `Ok(None)` when the revision carries no committed definition so
+/// callers can fall back to durable/cached/default configuration. A committed
+/// but unparseable definition is an error — silently running a different
+/// pipeline than the one the author pushed would be worse than failing the
+/// trigger.
+async fn load_pipeline_from_commit(
+    pool: &gitforge_db::Pool,
+    repo_id: gitforge_common::RepoId,
+    commit_hash: &str,
+) -> anyhow::Result<Option<PipelineDefinition>> {
+    let repository = gitforge_db::queries::RepoQueries::get(pool, repo_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repository {} is not registered", repo_id))?;
+
+    let committed = tokio::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repository.git_path)
+        .args([
+            "cat-file",
+            "-e",
+            &format!("{}:{}", commit_hash, PIPELINE_CONFIG_PATH),
+        ])
+        .output()
+        .await?;
+    if !committed.status.success() {
+        return Ok(None);
+    }
+
+    let show = tokio::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repository.git_path)
+        .args(["show", &format!("{}:{}", commit_hash, PIPELINE_CONFIG_PATH)])
+        .output()
+        .await?;
+    if !show.status.success() {
+        anyhow::bail!(
+            "failed to read {} at {} for repo {}: {}",
+            PIPELINE_CONFIG_PATH,
+            commit_hash,
+            repo_id,
+            String::from_utf8_lossy(&show.stderr).trim()
+        );
+    }
+
+    let yaml = String::from_utf8(show.stdout).map_err(|error| {
+        anyhow::anyhow!(
+            "{} at {} is not valid UTF-8: {}",
+            PIPELINE_CONFIG_PATH,
+            commit_hash,
+            error
+        )
+    })?;
+    PipelineDefinition::parse(&yaml).map(Some).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid {} at {}: {}",
+            PIPELINE_CONFIG_PATH,
+            commit_hash,
+            error
+        )
+    })
+}
+
 /// Create an isolated checkout for a push-triggered run when the caller did
 /// not supply an already prepared workspace. The checkout is rooted under a
 /// configured directory and named by the immutable run ID, so concurrent runs
@@ -644,30 +714,48 @@ async fn handle_push_event(
         payload.new_hash
     );
 
-    // Get or create the pipeline definition for this repo. Durable scheduler
-    // state is authoritative when configured; the in-memory default remains
-    // the explicit development fallback.
-    let cached_pipeline = { pipeline_cache.lock().unwrap().get(&repo_id).cloned() };
-    let pipeline = if let Some(cached) = cached_pipeline {
-        cached
-    } else {
-        let persisted = if let Some(pool) = scheduler_db {
-            gitforge_db::queries::PipelineQueries::list_by_repo(pool, repo_id)
-                .await?
-                .into_iter()
-                .find_map(|pipeline| {
-                    serde_json::from_value::<PipelineDefinition>(pipeline.config).ok()
-                })
-        } else {
-            None
-        };
-        let pipeline = persisted.unwrap_or_else(|| create_default_pipeline(&repo_id.to_string()));
-        pipeline_cache
-            .lock()
-            .unwrap()
-            .insert(repo_id, pipeline.clone());
-        pipeline
+    // Get or create the pipeline definition for this repo. The definition
+    // committed at the pushed revision is authoritative: CI configuration is
+    // code, so a push that changes it must govern this and later runs without
+    // a control-plane restart. The in-memory cache and durable rows only
+    // apply when the revision carries no committed definition.
+    let committed_pipeline = match scheduler_db {
+        Some(pool) => match load_pipeline_from_commit(pool, repo_id, &payload.new_hash).await {
+            Ok(pipeline) => pipeline,
+            Err(error) => return Err(error),
+        },
+        None => None,
     };
+    let pipeline = if let Some(committed) = committed_pipeline {
+        tracing::info!(
+            "using {} committed at {} for repo {}",
+            PIPELINE_CONFIG_PATH,
+            payload.new_hash,
+            repo_id
+        );
+        committed
+    } else {
+        let cached_pipeline = { pipeline_cache.lock().unwrap().get(&repo_id).cloned() };
+        if let Some(cached) = cached_pipeline {
+            cached
+        } else {
+            let persisted = if let Some(pool) = scheduler_db {
+                gitforge_db::queries::PipelineQueries::list_by_repo(pool, repo_id)
+                    .await?
+                    .into_iter()
+                    .find_map(|pipeline| {
+                        serde_json::from_value::<PipelineDefinition>(pipeline.config).ok()
+                    })
+            } else {
+                None
+            };
+            persisted.unwrap_or_else(|| create_default_pipeline(&repo_id.to_string()))
+        }
+    };
+    pipeline_cache
+        .lock()
+        .unwrap()
+        .insert(repo_id, pipeline.clone());
     let requested_workspace = workspace_paths
         .lock()
         .expect("workspace cache lock poisoned")
@@ -1120,6 +1208,125 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("git path is unavailable"));
+    }
+
+    /// Seed a bare repository with two commits: the first without a pipeline
+    /// definition, the second carrying one. Returns (bare repo path, first
+    /// commit, second commit).
+    async fn seed_commit_pipeline_fixture() -> (PathBuf, String, String) {
+        let run_id = gitforge_common::PipelineRunId::new();
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-pipeline-config-tests")
+            .join(run_id.to_string());
+        let bare = test_root.join("source.git");
+        let seed = test_root.join("seed");
+        tokio::fs::create_dir_all(&test_root).await.unwrap();
+        run_git(["init", "--bare", bare.to_str().unwrap()], None).await;
+        tokio::fs::create_dir_all(&seed).await.unwrap();
+        run_git(["init", seed.to_str().unwrap()], None).await;
+        run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
+        run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
+        tokio::fs::write(seed.join("README.md"), "no ci config yet\n")
+            .await
+            .unwrap();
+        run_git(["add", "README.md"], Some(&seed)).await;
+        run_git(["commit", "-m", "without pipeline"], Some(&seed)).await;
+        let without = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
+        tokio::fs::write(
+            seed.join(PIPELINE_CONFIG_PATH),
+            "name: fixture-ci\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment:\n  CI: \"true\"\njobs:\n  - name: echo\n    image: busybox:latest\n    steps:\n      - name: echo\n        run: echo committed-config\n",
+        )
+        .await
+        .unwrap();
+        run_git(["add", PIPELINE_CONFIG_PATH], Some(&seed)).await;
+        run_git(["commit", "-m", "with pipeline"], Some(&seed)).await;
+        let with = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
+        run_git(
+            ["push", bare.to_str().unwrap(), "HEAD:refs/heads/main"],
+            Some(&seed),
+        )
+        .await;
+        (bare, without, with)
+    }
+
+    #[tokio::test]
+    async fn test_load_pipeline_from_commit_reads_committed_definition() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let (bare, _without, with) = seed_commit_pipeline_fixture().await;
+        let (pool, repo_id) = test_pool_with_repository(bare.to_string_lossy().into_owned()).await;
+
+        let pipeline = load_pipeline_from_commit(&pool, repo_id, &with)
+            .await
+            .unwrap()
+            .expect("committed definition must load");
+        assert_eq!(pipeline.name, "fixture-ci");
+        assert_eq!(pipeline.jobs.len(), 1);
+        assert_eq!(pipeline.jobs[0].steps[0].run, "echo committed-config");
+    }
+
+    #[tokio::test]
+    async fn test_load_pipeline_from_commit_falls_back_when_revision_has_no_config() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let (bare, without, _with) = seed_commit_pipeline_fixture().await;
+        let (pool, repo_id) = test_pool_with_repository(bare.to_string_lossy().into_owned()).await;
+
+        assert!(load_pipeline_from_commit(&pool, repo_id, &without)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_load_pipeline_from_commit_rejects_invalid_committed_definition() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let run_id = gitforge_common::PipelineRunId::new();
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-pipeline-config-tests")
+            .join(run_id.to_string());
+        let bare = test_root.join("source.git");
+        let seed = test_root.join("seed");
+        tokio::fs::create_dir_all(&test_root).await.unwrap();
+        run_git(["init", "--bare", bare.to_str().unwrap()], None).await;
+        tokio::fs::create_dir_all(&seed).await.unwrap();
+        run_git(["init", seed.to_str().unwrap()], None).await;
+        run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
+        run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
+        tokio::fs::write(seed.join(PIPELINE_CONFIG_PATH), "::: not a pipeline\n")
+            .await
+            .unwrap();
+        run_git(["add", PIPELINE_CONFIG_PATH], Some(&seed)).await;
+        run_git(["commit", "-m", "broken pipeline"], Some(&seed)).await;
+        let commit = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
+        run_git(
+            ["push", bare.to_str().unwrap(), "HEAD:refs/heads/main"],
+            Some(&seed),
+        )
+        .await;
+        let (pool, repo_id) = test_pool_with_repository(bare.to_string_lossy().into_owned()).await;
+
+        let error = load_pipeline_from_commit(&pool, repo_id, &commit)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid .gitforce.yml"));
+    }
+
+    #[tokio::test]
+    async fn test_load_pipeline_from_commit_rejects_unknown_repository() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let error = load_pipeline_from_commit(&pool, gitforge_common::RepoId::new(), "deadbeef")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is not registered"));
     }
 
     #[tokio::test]
