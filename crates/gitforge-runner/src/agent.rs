@@ -987,7 +987,15 @@ impl RunnerAgent {
         match complete_request_builder.send().await {
             Ok(response) if response.status().is_success() => {}
             Ok(response) => {
-                tracing::error!("scheduler rejected job completion: {}", response.status())
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                tracing::error!(
+                    job_id = %assignment.job_id,
+                    runner_id = %runner_id,
+                    status = %status,
+                    response_body = %body,
+                    "scheduler rejected job completion"
+                );
             }
             Err(error) => tracing::error!("failed to report job completion: {}", error),
         }
