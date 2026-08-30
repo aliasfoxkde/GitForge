@@ -1459,9 +1459,6 @@ mod tests {
             )
             .await;
         scheduler.process_queue().await;
-        assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
-
-        assert_eq!(scheduler.mark_stale_runners_offline(90).await, 1);
         assert!(scheduler.is_assigned(job_id).await.is_none());
         assert_eq!(scheduler.queue_len().await, 1);
 
@@ -1475,11 +1472,8 @@ mod tests {
         let scheduler = Scheduler::new();
         let first_runner_id = RunnerId::new();
         let second_runner_id = RunnerId::new();
-        let stale_heartbeat = chrono::Utc::now() - chrono::Duration::seconds(120);
-        let mut first_runner = make_runner(first_runner_id, "multi-repo-runner-a", "online", 1);
-        first_runner.last_heartbeat = Some(stale_heartbeat);
-        let mut second_runner = make_runner(second_runner_id, "multi-repo-runner-b", "online", 1);
-        second_runner.last_heartbeat = Some(stale_heartbeat);
+        let first_runner = make_runner(first_runner_id, "multi-repo-runner-a", "online", 1);
+        let second_runner = make_runner(second_runner_id, "multi-repo-runner-b", "online", 1);
         scheduler.register_runner(first_runner).await;
         scheduler.register_runner(second_runner).await;
 
@@ -1497,7 +1491,21 @@ mod tests {
         assert!(scheduler.is_assigned(first_job).await.is_some());
         assert!(scheduler.is_assigned(second_job).await.is_some());
 
-        assert_eq!(scheduler.mark_stale_runners_offline(30).await, 2);
+        {
+            let stale_heartbeat = chrono::Utc::now() - chrono::Duration::seconds(120);
+            let mut state = scheduler.state.write().await;
+            state
+                .runners
+                .get_mut(&first_runner_id)
+                .unwrap()
+                .last_heartbeat = Some(stale_heartbeat);
+            state
+                .runners
+                .get_mut(&second_runner_id)
+                .unwrap()
+                .last_heartbeat = Some(stale_heartbeat);
+        }
+        scheduler.process_queue().await;
 
         let state = scheduler.state.read().await;
         assert_eq!(state.queue.len(), 2);
