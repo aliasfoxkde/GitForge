@@ -5,7 +5,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-use gitforge_build::client::{JobSubmitter, UnixSocketClient, DEFAULT_SOCKET};
+use gitforge_build::client::{configured_socket_path, JobSubmitter, UnixSocketClient};
 use gitforge_build::Response;
 
 #[derive(Parser, Debug)]
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
 /// Run the CLI with a given client implementation (allows mocking in tests)
 pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
     let cli = Cli::parse();
-    let socket_path = cli.socket.unwrap_or_else(|| DEFAULT_SOCKET.to_string());
+    let socket_path = cli.socket.unwrap_or_else(configured_socket_path);
 
     // If just listing or showing stats, handle specially
     if cli.list {
