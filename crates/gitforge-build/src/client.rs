@@ -8,6 +8,12 @@ use anyhow::Result;
 /// Default socket path
 pub const DEFAULT_SOCKET: &str = "/tmp/gitforge-build.sock";
 
+/// Resolve the daemon socket from the environment, retaining the legacy
+/// default for standalone development use.
+pub fn configured_socket_path() -> String {
+    std::env::var("GITFORGE_BUILD_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.to_string())
+}
+
 /// Result type for daemon operations
 pub type DaemonResult = Result<Response>;
 

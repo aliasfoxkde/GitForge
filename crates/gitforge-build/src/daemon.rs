@@ -11,7 +11,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 
 use gitforge_build::{
-    encode_response, BuildCoordinator, Request, Response, MAX_CONCURRENT_JOBS, MAX_MESSAGE_SIZE,
+    configured_socket_path, encode_response, BuildCoordinator, Request, Response,
+    MAX_CONCURRENT_JOBS, MAX_MESSAGE_SIZE,
 };
 
 /// Create a shutdown flag
@@ -25,9 +26,6 @@ pub async fn create_shutdown_future(shutdown: Arc<AtomicBool>) {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 }
-
-/// Socket path for the daemon
-const SOCKET_PATH: &str = "/tmp/gitforge-build.sock";
 
 fn handle_cli_args() -> bool {
     let mut args = std::env::args().skip(1);
@@ -73,22 +71,24 @@ async fn main() -> Result<()> {
     // Create build coordinator
     let coordinator = Arc::new(BuildCoordinator::new());
 
+    let socket_path = configured_socket_path();
+
     // Clean up old socket
-    if Path::new(SOCKET_PATH).exists() {
-        std::fs::remove_file(SOCKET_PATH)?;
+    if Path::new(&socket_path).exists() {
+        std::fs::remove_file(&socket_path)?;
     }
 
     // Create Unix socket listener
-    let listener = UnixListener::bind(SOCKET_PATH)?;
+    let listener = UnixListener::bind(&socket_path)?;
 
     // Set socket permissions (owner only)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(SOCKET_PATH, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
     }
 
-    info!("listening on {}", SOCKET_PATH);
+    info!("listening on {}", socket_path);
 
     // Handle connections. The socket shutdown request and OS signal share the
     // same flag so operators can use the manager to stop the daemon without
@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
 
     // Close socket
     drop(listener);
-    let _ = std::fs::remove_file(SOCKET_PATH);
+    let _ = std::fs::remove_file(&socket_path);
 
     // Do not leave cargo, rustc, or test descendants orphaned when the
     // control daemon is stopped. Give cooperative cancellation a short
