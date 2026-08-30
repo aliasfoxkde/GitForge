@@ -643,6 +643,21 @@ impl RunnerAgent {
                                         job.name,
                                         job.job_id
                                     );
+                                    // Do not claim a job that this process is
+                                    // already executing. Claiming first would
+                                    // rotate the durable lease and fence the
+                                    // original execution, causing its live-log
+                                    // and completion requests to return 409.
+                                    {
+                                        let active = active_jobs_for_loop.lock().await;
+                                        if active.contains(&job.job_id) {
+                                            tracing::debug!(
+                                                "job {} is already executing locally; ignoring duplicate assignment",
+                                                job.job_id
+                                            );
+                                            continue;
+                                        }
+                                    }
                                     let Some(lease_token) = Self::claim_job(
                                         &fetch_client,
                                         &fetch_url,
