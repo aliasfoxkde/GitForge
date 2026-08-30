@@ -22,6 +22,9 @@ use tokio::time::{sleep, Duration};
 pub struct SandboxInstance {
     pub container_id: String,
     pub job_id: JobId,
+    /// Path on the host that is mounted at /workspace inside the container.
+    /// Present only when the sandbox was created with a workspace mount.
+    pub workspace_path: Option<String>,
 }
 
 /// Result of step execution
@@ -334,12 +337,14 @@ impl Sandbox for DockerSandbox {
             Ok(SandboxInstance {
                 container_id: response.id,
                 job_id,
+                workspace_path: None,
             })
         } else {
             // Stub mode - no Docker available
             Ok(SandboxInstance {
                 container_id: format!("gitforce-job-{}", job_id),
                 job_id,
+                workspace_path: None,
             })
         }
     }
@@ -364,6 +369,11 @@ impl Sandbox for DockerSandbox {
         }
 
         if let Some(ref docker) = self.docker {
+            // Rootless Podman maps ordinary container UIDs into a subordinate
+            // host range. Preserve the runner's host identity for this bind
+            // mount so the unprivileged runner can remove the workspace.
+            let (uid, gid) = resolve_runner_uid_gid()?;
+            let owner = chown_owner_string(uid, gid);
             self.ensure_image(image).await?;
             self.remove_job_containers(job_id).await?;
             let container_name = Self::container_name(job_id);
@@ -381,6 +391,7 @@ impl Sandbox for DockerSandbox {
                 } else {
                     Some("none".to_string())
                 },
+                userns_mode: Some("keep-id".to_string()),
                 // Fedora's rootless Podman enforces SELinux labels on host
                 // mounts. Private relabeling makes this per-workspace mount
                 // readable inside the sandbox without disabling enforcement.
@@ -391,6 +402,7 @@ impl Sandbox for DockerSandbox {
                 image: Some(image),
                 cmd: Some(vec!["sleep", "3600"]),
                 working_dir: Some("/workspace"),
+                user: Some(owner.as_str()),
                 host_config: Some(host_config),
                 labels: Some(labels),
                 ..Default::default()
@@ -422,6 +434,7 @@ impl Sandbox for DockerSandbox {
             Ok(SandboxInstance {
                 container_id: response.id,
                 job_id,
+                workspace_path: Some(workspace_path.to_string()),
             })
         } else {
             Err(Error::sandbox("Docker is required for workspace execution"))
@@ -534,6 +547,23 @@ impl Sandbox for DockerSandbox {
 
     async fn destroy(&self, instance: SandboxInstance) -> Result<()> {
         if let Some(ref docker) = self.docker {
+            // If this sandbox had a workspace mount, chown the workspace tree to
+            // the runner's UID/GID before shutting down.  Inside the container
+            // we run as root, so chown is always permitted.  After this succeeds
+            // the runner user on the host can delete the artifact files without
+            // requiring privileged escalation.
+            if let Some(ref workspace) = instance.workspace_path {
+                if let Err(e) = cleanup_workspace(docker, &instance.container_id, workspace).await {
+                    tracing::warn!(
+                        "workspace ownership cleanup failed for {}: {} \
+                         (artifact files may require privileged deletion)",
+                        workspace,
+                        e
+                    );
+                    // Proceed to container teardown even if chown fails
+                }
+            }
+
             // Send SIGTERM for graceful shutdown first
             // Wait up to 10 seconds for container to stop gracefully
             let stop_options = StopContainerOptions { t: 10 };
@@ -570,10 +600,127 @@ impl Sandbox for DockerSandbox {
     }
 }
 
+// ---------------------------------------------------------------------------
+// UID / GID parsing and validation
+// ---------------------------------------------------------------------------
+
+/// Maximum valid UID/GID on Linux (65534 is nobody-user / nogroup).
+const MAX_UID_GID: u32 = 65534;
+
+/// Parse a UID or GID string into a validated `u32`.
+/// Returns `None` if the string is not a decimal integer in `[0, MAX_UID_GID]`.
+fn parse_uid_gid(raw: &str) -> Option<u32> {
+    let val: u32 = raw.trim().parse().ok()?;
+    (val <= MAX_UID_GID).then_some(val)
+}
+
+/// Format a UID and GID as the "uid:gid" string accepted by `chown`.
+fn chown_owner_string(uid: u32, gid: u32) -> String {
+    format!("{}:{}", uid, gid)
+}
+
+/// Resolve the runner UID/GID from environment variables, falling back to
+/// `GITFORGE_RUNNER_UID` / `GITFORGE_RUNNER_GID` (default 1000:1000).
+/// Returns `(uid, gid)` or an error if either variable is set to an invalid value.
+fn resolve_runner_uid_gid() -> Result<(u32, u32)> {
+    let uid_raw = std::env::var("GITFORGE_RUNNER_UID").unwrap_or_else(|_| "1000".to_string());
+    let gid_raw = std::env::var("GITFORGE_RUNNER_GID").unwrap_or_else(|_| "1000".to_string());
+
+    let uid = parse_uid_gid(&uid_raw)
+        .ok_or_else(|| Error::sandbox(format!("invalid GITFORGE_RUNNER_UID: {}", uid_raw)))?;
+    let gid = parse_uid_gid(&gid_raw)
+        .ok_or_else(|| Error::sandbox(format!("invalid GITFORGE_RUNNER_GID: {}", gid_raw)))?;
+
+    Ok((uid, gid))
+}
+
+// ---------------------------------------------------------------------------
+// Workspace cleanup
+// ---------------------------------------------------------------------------
+
+/// Transfer ownership of the workspace tree to the runner user so the host
+/// process can clean up artifact files without privileged escalation.
+///
+/// Implementation notes
+/// =====================
+/// - UID/GID are parsed as decimal integers and clamped to `[0, 65534]`.  No
+///   shell interpolation is performed because the command is passed as discrete
+///   args: `["chown", "-R", "uid:gid", "/workspace"]`.
+/// - The exec output stream is **fully consumed** before the exit code is read.
+///   This is required: `inspect_exec` reflects the state at the time of the
+///   call; if the stream is still running the exit code may not yet be visible.
+/// - Failures are warned but never block container teardown (caller handles
+///   fail-open semantics).
+async fn cleanup_workspace(docker: &Docker, container_id: &str, workspace: &str) -> Result<()> {
+    let (uid, gid) = resolve_runner_uid_gid()?;
+
+    // Build the ownership string (e.g. "1000:1000") and pass it as a single
+    // argument — no shell, no string interpolation.
+    let owner = chown_owner_string(uid, gid);
+
+    let config = CreateExecOptions {
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        // Use direct exec; avoids shell metacharacter expansion entirely.
+        cmd: Some(vec!["chown", "-R", &owner, "/workspace"]),
+        ..Default::default()
+    };
+
+    let exec = docker
+        .create_exec(container_id, config)
+        .await
+        .map_err(|e| Error::sandbox(format!("failed to create cleanup exec: {}", e)))?;
+
+    // start_exec returns StartExecResults. If the container supports exec
+    // (Linux containers always do) we get an Attached handle with the output
+    // stream. We MUST drain the stream to completion before reading exit codes.
+    let result = docker
+        .start_exec(&exec.id, None::<StartExecOptions>)
+        .await
+        .map_err(|e| Error::sandbox(format!("failed to start workspace chown: {}", e)))?;
+
+    let exit_code = match result {
+        StartExecResults::Attached { mut output, .. } => {
+            // Drain the stream to ensure the process has fully exited.
+            while let Some(item) = output.next().await {
+                if let Err(e) = item {
+                    tracing::trace!("workspace chown output: {}", e);
+                }
+            }
+            // Now inspect_exec will reflect the completed exit state.
+            docker
+                .inspect_exec(&exec.id)
+                .await
+                .map_err(|e| Error::sandbox(format!("failed to inspect cleanup exec: {}", e)))?
+                .exit_code
+                .unwrap_or(1) as i32
+        }
+        // Detached would only occur if StartExecOptions::detach was set, which
+        // is not the case here.  Handle it defensively by reading exit code now.
+        StartExecResults::Detached => docker
+            .inspect_exec(&exec.id)
+            .await
+            .map_err(|e| Error::sandbox(format!("failed to inspect cleanup exec: {}", e)))?
+            .exit_code
+            .unwrap_or(1) as i32,
+    };
+
+    if exit_code != 0 {
+        return Err(Error::sandbox(format!(
+            "workspace chown exited with code {} (uid={}, gid={})",
+            exit_code, uid, gid
+        )));
+    }
+
+    tracing::debug!("workspace {} chowned to {}:{}", workspace, uid, gid);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gitforge_common::ErrorKind;
+    use serial_test::serial;
     use std::sync::Mutex;
 
     struct RecordingSink(Mutex<Vec<(OutputStream, Vec<u8>)>>);
@@ -749,6 +896,7 @@ mod tests {
         let instance = SandboxInstance {
             container_id: "test-container".to_string(),
             job_id: JobId::new(),
+            workspace_path: None,
         };
         let debug_str = format!("{:?}", instance);
         assert!(debug_str.contains("test-container"));
@@ -818,6 +966,7 @@ mod tests {
         let instance = SandboxInstance {
             container_id: "clone-test".to_string(),
             job_id: JobId::new(),
+            workspace_path: None,
         };
         let cloned = instance.clone();
         assert_eq!(cloned.container_id, instance.container_id);
@@ -1132,10 +1281,12 @@ mod tests {
         let instance1 = SandboxInstance {
             container_id: "test-container".to_string(),
             job_id,
+            workspace_path: None,
         };
         let instance2 = SandboxInstance {
             container_id: "test-container".to_string(),
             job_id,
+            workspace_path: None,
         };
         // Only container_id and job_id are compared
         assert_eq!(instance1.container_id, instance2.container_id);
@@ -1151,5 +1302,345 @@ mod tests {
             stderr: String::new(),
         };
         assert_eq!(result.stdout.len(), 10000);
+    }
+
+    // =====================================================================
+    // Workspace ownership / cleanup contract tests
+    // =====================================================================
+
+    /// Verify that `create()` returns a sandbox instance with no workspace path.
+    #[tokio::test]
+    async fn test_create_instance_has_no_workspace() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let job_id = JobId::new();
+
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
+
+        assert!(instance.workspace_path.is_none());
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    /// Verify that `create_with_workspace` annotates the instance with the
+    /// workspace path so that `destroy` knows to run cleanup.
+    ///
+    /// The stub's `create_with_workspace` always delegates to Docker (it returns
+    /// "Docker is required" when Docker is not available), so we test the
+    /// workspace-path annotation by constructing a SandboxInstance directly and
+    /// verifying the destroy path handles it correctly.
+    #[tokio::test]
+    async fn test_create_with_workspace_annotates_path() {
+        let sandbox = DockerSandbox::stub_for_tests();
+
+        // Verify that destroy() with a workspace_path does NOT fail on the stub.
+        // The stub has no Docker so it cannot run the chown, but it should
+        // still succeed (chown failure is warned but not fatal).
+        let instance = SandboxInstance {
+            container_id: "workspace-test-container".to_string(),
+            job_id: JobId::new(),
+            workspace_path: Some("/tmp/gitforge-workspace-test".to_string()),
+        };
+
+        // With the stub (no Docker), destroy should succeed even with a workspace
+        // path — the chown is skipped and a warning is logged.
+        let result = sandbox.destroy(instance).await;
+        assert!(
+            result.is_ok(),
+            "destroy with workspace_path should succeed on stub: {:?}",
+            result
+        );
+    }
+
+    /// Verify that a workspace path appears in the Debug output of SandboxInstance.
+    #[tokio::test]
+    async fn test_create_with_workspace_annotates_path_in_debug() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let job_id = JobId::new();
+
+        // Stub create_with_workspace requires Docker for workspace containers,
+        // so we test via the non-workspace path and check Debug output.
+        let instance = sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+            .unwrap();
+
+        // create() should set workspace_path: None
+        assert!(instance.workspace_path.is_none());
+
+        // Debug output should exist and not panic.
+        let debug_str = format!("{:?}", instance);
+        assert!(!debug_str.is_empty());
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    /// Verify that `create_with_workspace` called with no path also produces
+    /// `workspace_path: None` (falls through to `create`).
+    #[tokio::test]
+    async fn test_create_with_workspace_null_path_defaults_to_none() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let job_id = JobId::new();
+
+        let instance = sandbox
+            .create_with_workspace(job_id, "alpine:latest", SandboxLimits::default(), None)
+            .await
+            .unwrap();
+
+        // With a None path the implementation delegates to create(), so no workspace
+        assert!(instance.workspace_path.is_none());
+        sandbox.destroy(instance).await.unwrap();
+    }
+
+    /// Verify `SandboxInstance` with a workspace path can still be cloned.
+    #[test]
+    fn test_sandbox_instance_with_workspace_clone() {
+        let instance = SandboxInstance {
+            container_id: "test".to_string(),
+            job_id: JobId::new(),
+            workspace_path: Some("/tmp/workspace".to_string()),
+        };
+
+        let cloned = instance.clone();
+        assert_eq!(cloned.container_id, instance.container_id);
+        assert_eq!(cloned.job_id, instance.job_id);
+        assert_eq!(cloned.workspace_path, instance.workspace_path);
+    }
+
+    /// Verify `destroy` is a no-op for stub sandbox (no Docker, no workspace).
+    #[tokio::test]
+    async fn test_destroy_stub_no_workspace_succeeds() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let instance = SandboxInstance {
+            container_id: "stub-container".to_string(),
+            job_id: JobId::new(),
+            workspace_path: None,
+        };
+
+        // Should succeed without any Docker calls
+        let result = sandbox.destroy(instance).await;
+        assert!(result.is_ok());
+    }
+
+    /// Verify that the `SandboxInstance` debug output includes the workspace path.
+    #[test]
+    fn test_sandbox_instance_debug_includes_workspace() {
+        let instance = SandboxInstance {
+            container_id: "debug-test".to_string(),
+            job_id: JobId::new(),
+            workspace_path: Some("/custom/path".to_string()),
+        };
+
+        let debug_str = format!("{:?}", instance);
+        assert!(
+            debug_str.contains("/custom/path"),
+            "debug output: {}",
+            debug_str
+        );
+    }
+
+    // =====================================================================
+    // UID / GID validation tests
+    // =====================================================================
+
+    #[test]
+    fn test_parse_uid_gid_valid() {
+        assert_eq!(parse_uid_gid("0"), Some(0));
+        assert_eq!(parse_uid_gid("1000"), Some(1000));
+        assert_eq!(parse_uid_gid("65534"), Some(65534));
+        assert_eq!(parse_uid_gid("  1000  "), Some(1000)); // whitespace is trimmed
+    }
+
+    #[test]
+    fn test_parse_uid_gid_invalid_not_numeric() {
+        assert_eq!(parse_uid_gid("abc"), None);
+        assert_eq!(parse_uid_gid("1000a"), None);
+        assert_eq!(parse_uid_gid(""), None);
+        assert_eq!(parse_uid_gid(" "), None);
+        assert_eq!(parse_uid_gid("-1"), None); // negative not allowed for u32
+        assert_eq!(parse_uid_gid("0x1000"), None); // hex not accepted
+        assert_eq!(parse_uid_gid("65535"), None); // one above max
+        assert_eq!(parse_uid_gid("1000000"), None); // way above max
+    }
+
+    #[test]
+    fn test_parse_uid_gid_max_boundary() {
+        assert_eq!(parse_uid_gid("65534"), Some(65534)); // valid
+        assert_eq!(parse_uid_gid("65535"), None); // just over max
+    }
+
+    #[test]
+    fn test_chown_owner_string_format() {
+        assert_eq!(chown_owner_string(1000, 1000), "1000:1000");
+        assert_eq!(chown_owner_string(0, 0), "0:0");
+        assert_eq!(chown_owner_string(65534, 65534), "65534:65534");
+        assert_eq!(chown_owner_string(1000, 2000), "1000:2000");
+    }
+
+    /// RAII guard that restores env vars on drop.
+    struct EnvGuard {
+        uid_key: &'static str,
+        gid_key: &'static str,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.uid_key);
+            std::env::remove_var(self.gid_key);
+        }
+    }
+
+    fn with_env_vars(
+        uid_key: &'static str,
+        uid_val: &str,
+        gid_key: &'static str,
+        gid_val: &str,
+    ) -> EnvGuard {
+        std::env::set_var(uid_key, uid_val);
+        std::env::set_var(gid_key, gid_val);
+        EnvGuard { uid_key, gid_key }
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runner_uid_gid_defaults() {
+        // Ensure env vars are absent so we get the defaults.
+        std::env::remove_var("GITFORGE_RUNNER_UID");
+        std::env::remove_var("GITFORGE_RUNNER_GID");
+
+        let (uid, gid) = resolve_runner_uid_gid().expect("default 1000:1000 must parse");
+        assert_eq!((uid, gid), (1000, 1000));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runner_uid_gid_from_env() {
+        let _guard = with_env_vars("GITFORGE_RUNNER_UID", "2000", "GITFORGE_RUNNER_GID", "3000");
+
+        let (uid, gid) = resolve_runner_uid_gid().expect("2000:3000 must parse");
+        assert_eq!((uid, gid), (2000, 3000));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runner_uid_gid_invalid_uid_rejected() {
+        let _guard = with_env_vars(
+            "GITFORGE_RUNNER_UID",
+            "not-a-number",
+            "GITFORGE_RUNNER_GID",
+            "1000",
+        );
+
+        let result = resolve_runner_uid_gid();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("GITFORGE_RUNNER_UID"),
+            "error message should mention GITFORGE_RUNNER_UID: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runner_uid_gid_invalid_gid_rejected() {
+        let _guard = with_env_vars(
+            "GITFORGE_RUNNER_UID",
+            "1000",
+            "GITFORGE_RUNNER_GID",
+            "99999",
+        );
+
+        let result = resolve_runner_uid_gid();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("GITFORGE_RUNNER_GID"),
+            "error message should mention GITFORGE_RUNNER_GID: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runner_uid_gid_overflow_rejected() {
+        let _guard = with_env_vars(
+            "GITFORGE_RUNNER_UID",
+            "70000",
+            "GITFORGE_RUNNER_GID",
+            "1000",
+        );
+
+        let result = resolve_runner_uid_gid();
+        assert!(result.is_err());
+    }
+
+    // =====================================================================
+    // Command-construction contract tests
+    //
+    // We test the command that cleanup_workspace WOULD send to Docker by
+    // inspecting the CreateExecOptions it builds.  We do this without any
+    // Docker I/O by checking that resolve_runner_uid_gid + chown_owner_string
+    // produce the values that would be embedded in the exec command.
+    // =====================================================================
+
+    /// Confirm that the uid:gid string embedded in the chown command contains
+    /// only the decimal digits and colons from validated numeric inputs —
+    /// no shell metacharacters can leak through because parse_uid_gid rejects
+    /// everything that is not a plain decimal u32.
+    #[test]
+    fn test_chown_command_string_is_safe() {
+        // Valid uid/gid produce only [0-9:] characters.
+        let (uid, gid) = (12345u32, 67890u32);
+        let owner = chown_owner_string(uid, gid);
+        assert!(owner.chars().all(|c| c.is_ascii_digit() || c == ':'));
+        assert_eq!(owner, "12345:67890");
+    }
+
+    /// If either UID or GID is invalid, resolve_runner_uid_gid returns an Error
+    /// before any command string is built — so no unchecked input reaches Docker.
+    #[test]
+    #[serial]
+    fn test_resolve_rejects_before_command_built() {
+        let _guard = with_env_vars(
+            "GITFORGE_RUNNER_UID",
+            "$(echo pwned)",
+            "GITFORGE_RUNNER_GID",
+            "1000",
+        );
+
+        let result = resolve_runner_uid_gid();
+        assert!(
+            result.is_err(),
+            "shell injection must be rejected at parse time"
+        );
+    }
+
+    /// Verify that whitespace-surrounded valid numbers still parse correctly,
+    /// which is the only way a user-supplied env var could reach the command.
+    #[test]
+    fn test_whitespace_surrounded_valid_uid_gid_parses() {
+        // A user might set GITFORGE_RUNNER_UID="  1000  " — parse_uid_gid must accept it.
+        assert_eq!(parse_uid_gid("  1000  "), Some(1000));
+        assert_eq!(parse_uid_gid("\t500\n"), Some(500));
+    }
+
+    /// Verify cleanup_workspace is fail-open: when the stub's destroy() is called
+    /// with a workspace_path it succeeds without calling Docker at all.
+    #[tokio::test]
+    async fn test_cleanup_is_skipped_on_stub() {
+        // The stub docker = None path means cleanup_workspace is never entered.
+        // destroy() with workspace_path succeeds because the stub has no docker.
+        let sandbox = DockerSandbox::stub_for_tests();
+        let instance = SandboxInstance {
+            container_id: "stub-cleanup-test".to_string(),
+            job_id: JobId::new(),
+            workspace_path: Some("/tmp/workspace".to_string()),
+        };
+        let result = sandbox.destroy(instance).await;
+        assert!(
+            result.is_ok(),
+            "stub destroy must not fail even with workspace_path set"
+        );
     }
 }

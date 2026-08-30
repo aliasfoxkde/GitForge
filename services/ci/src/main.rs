@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
     let scheduler_state = create_state_with_artifact_storage(scheduler, Some(artifact_storage));
     let scheduler_arc = scheduler_state.scheduler.clone();
     let workspace_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let run_workspace_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let run_waiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let trigger_state = Arc::new(TriggerState {
         event_bus: event_bus.clone(),
@@ -136,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
     let pipeline_cache_clone = pipeline_cache.clone();
     let scheduler_db_clone = scheduler_db.clone();
     let workspace_paths_clone = workspace_paths.clone();
+    let run_workspace_paths_clone = run_workspace_paths.clone();
     let run_waiters_clone = run_waiters.clone();
     let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -157,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
             pipeline_cache_clone,
             scheduler_db_clone,
             workspace_paths_clone,
+            run_workspace_paths_clone,
             pipeline_registry_clone,
             run_waiters_clone,
             shutdown_consumer,
@@ -169,14 +172,14 @@ async fn main() -> anyhow::Result<()> {
 
     let completion_scheduler = scheduler_arc.clone();
     let completion_registry = pipeline_registry.clone();
-    let completion_workspace_paths = workspace_paths.clone();
+    let completion_run_workspace_paths = run_workspace_paths.clone();
     let completion_db = scheduler_db.clone();
     let completion_shutdown = shutdown.clone();
     let _completion_handle = tokio::spawn(async move {
         run_scheduler_event_consumer(
             completion_scheduler,
             completion_registry,
-            completion_workspace_paths,
+            completion_run_workspace_paths,
             completion_db,
             completion_shutdown,
         )
@@ -326,20 +329,19 @@ struct PipelineTriggerRequest {
 /// webhooks. This endpoint is internal control-plane automation and requires
 /// a dedicated trigger token, falling back to the scheduler operator/shared
 /// token during migration.
+fn configured_trigger_token(get_var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    [
+        "GITFORGE_TRIGGER_TOKEN",
+        "GITFORGE_CI_TRIGGER_TOKEN",
+        "GITFORGE_SCHEDULER_OPERATOR_TOKEN",
+        "GITFORGE_SCHEDULER_TOKEN",
+    ]
+    .into_iter()
+    .find_map(|name| get_var(name).filter(|token| !token.is_empty()))
+}
+
 async fn require_trigger_auth(request: Request, next: Next) -> Response {
-    let expected = std::env::var("GITFORGE_TRIGGER_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty())
-        .or_else(|| {
-            std::env::var("GITFORGE_SCHEDULER_OPERATOR_TOKEN")
-                .ok()
-                .filter(|token| !token.is_empty())
-        })
-        .or_else(|| {
-            std::env::var("GITFORGE_SCHEDULER_TOKEN")
-                .ok()
-                .filter(|token| !token.is_empty())
-        });
+    let expected = configured_trigger_token(|name| std::env::var(name).ok());
     let Some(expected) = expected else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -565,6 +567,9 @@ async fn run_event_consumer(
     pipeline_cache: Arc<std::sync::Mutex<PipelineCache>>,
     scheduler_db: Option<gitforge_db::Pool>,
     workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    run_workspace_paths: Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
     pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
     run_waiters: Arc<
         std::sync::Mutex<
@@ -595,7 +600,7 @@ async fn run_event_consumer(
                 match event {
                     Some(event) => {
                         tracing::debug!("received event: {:?}", event.event_type);
-                        match handle_push_event(&event, &scheduler, &pipeline_cache, scheduler_db.as_ref(), &workspace_paths, &pipeline_registry).await {
+                        match handle_push_event(&event, &scheduler, &pipeline_cache, scheduler_db.as_ref(), &workspace_paths, &run_workspace_paths, &pipeline_registry).await {
                             Ok(run_id) => {
                                 if let Some(waiter) = run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id) {
                                     let _ = waiter.send(run_id);
@@ -626,6 +631,9 @@ async fn handle_push_event(
     pipeline_cache: &Arc<std::sync::Mutex<PipelineCache>>,
     scheduler_db: Option<&gitforge_db::Pool>,
     workspace_paths: &Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    run_workspace_paths: &Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
     pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
 ) -> anyhow::Result<gitforge_common::PipelineRunId> {
     // Only handle PushReceived events
@@ -706,10 +714,10 @@ async fn handle_push_event(
             Some(prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await?)
         }
     };
-    workspace_paths
+    run_workspace_paths
         .lock()
         .expect("workspace cache lock poisoned")
-        .insert(repo_id, workspace_path.clone());
+        .insert(state.run_id, workspace_path.clone());
     pipeline_registry
         .write()
         .await
@@ -772,7 +780,9 @@ async fn handle_push_event(
 async fn run_scheduler_event_consumer(
     scheduler: Arc<Scheduler>,
     pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
-    workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    run_workspace_paths: Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
     scheduler_db: Option<gitforge_db::Pool>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -830,10 +840,10 @@ async fn run_scheduler_event_consumer(
         }
 
         let state = engine.state().await;
-        let workspace_path = workspace_paths
+        let workspace_path = run_workspace_paths
             .lock()
             .expect("workspace cache lock poisoned")
-            .get(&state.repo_id)
+            .get(&state.run_id)
             .cloned()
             .flatten();
         for next_job_id in engine.ready_jobs().await {
@@ -876,6 +886,10 @@ async fn run_scheduler_event_consumer(
                 )
                 .await;
             }
+            run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .remove(&state.run_id);
             pipeline_registry.write().await.remove(&state.run_id);
         }
     }
@@ -954,6 +968,34 @@ mod tests {
     use std::sync::OnceLock;
 
     static WORKSPACE_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn trigger_token_accepts_git_server_compatibility_name() {
+        let token = configured_trigger_token(|name| {
+            (name == "GITFORGE_CI_TRIGGER_TOKEN").then(|| "shared-secret".to_string())
+        });
+        assert_eq!(token.as_deref(), Some("shared-secret"));
+    }
+
+    #[test]
+    fn trigger_token_prefers_dedicated_name_over_compatibility_alias() {
+        let token = configured_trigger_token(|name| match name {
+            "GITFORGE_TRIGGER_TOKEN" => Some("dedicated".to_string()),
+            "GITFORGE_CI_TRIGGER_TOKEN" => Some("compatibility".to_string()),
+            _ => None,
+        });
+        assert_eq!(token.as_deref(), Some("dedicated"));
+    }
+
+    #[test]
+    fn trigger_token_ignores_empty_values_and_falls_back() {
+        let token = configured_trigger_token(|name| match name {
+            "GITFORGE_TRIGGER_TOKEN" => Some(String::new()),
+            "GITFORGE_CI_TRIGGER_TOKEN" => Some("compatibility".to_string()),
+            _ => None,
+        });
+        assert_eq!(token.as_deref(), Some("compatibility"));
+    }
 
     async fn run_git<I, S>(args: I, cwd: Option<&std::path::Path>) -> String
     where
@@ -1449,5 +1491,232 @@ mod tests {
         assert_eq!(cache.len(), 1);
         // And it should be the second one
         assert_eq!(cache.get(&repo_id).unwrap().name, "repo2-pipeline");
+    }
+
+    // --- Workspace-propagation regression tests (fix: scope push workspaces by pipeline run) ---
+    //
+    // The push handler (`handle_push_event`) inserts a prepared workspace path
+    // into the run-scoped cache keyed by `state.run_id`, and the scheduler
+    // completion consumer (`run_scheduler_event_consumer`) looks up that same
+    // entry by `state.run_id` when enqueuing dependent jobs. The tests below
+    // exercise the cache pattern directly to prove the invariants the fix
+    // guarantees without standing up the full event bus / scheduler loop.
+
+    fn run_workspace_paths_cache(
+    ) -> Arc<std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>> {
+        Arc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    /// Insert a workspace path the way `handle_push_event` does after
+    /// preparing a workspace for a run.
+    fn cache_prepared_workspace(
+        cache: &Arc<std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>>,
+        run_id: gitforge_common::PipelineRunId,
+        workspace_path: Option<String>,
+    ) {
+        cache
+            .lock()
+            .expect("workspace cache lock poisoned")
+            .insert(run_id, workspace_path);
+    }
+
+    /// Resolve the workspace path the way `run_scheduler_event_consumer` does
+    /// when enqueuing downstream jobs for a run.
+    fn lookup_workspace_for_run(
+        cache: &Arc<std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>>,
+        run_id: gitforge_common::PipelineRunId,
+    ) -> Option<String> {
+        cache
+            .lock()
+            .expect("workspace cache lock poisoned")
+            .get(&run_id)
+            .cloned()
+            .flatten()
+    }
+
+    /// Remove the workspace entry the way `run_scheduler_event_consumer` does
+    /// when the run reaches a terminal status.
+    fn evict_workspace_for_run(
+        cache: &Arc<std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>>,
+        run_id: gitforge_common::PipelineRunId,
+    ) {
+        cache
+            .lock()
+            .expect("workspace cache lock poisoned")
+            .remove(&run_id);
+    }
+
+    /// The fix must key the cache by `PipelineRunId`, so two distinct runs for
+    /// the same repository each retain their own prepared workspace.
+    #[test]
+    fn test_run_workspace_paths_keys_by_pipeline_run_id() {
+        let cache = run_workspace_paths_cache();
+        let shared_repo = gitforge_common::RepoId::new();
+        let run_a = gitforge_common::PipelineRunId::new();
+        let run_b = gitforge_common::PipelineRunId::new();
+        assert_ne!(run_a, run_b, "fixture: run ids must differ");
+
+        // Two pushes for the same repo arrive in quick succession.
+        cache_prepared_workspace(&cache, run_a, Some("/nas/Temp/ws/run-a".to_string()));
+        cache_prepared_workspace(&cache, run_b, Some("/nas/Temp/ws/run-b".to_string()));
+
+        assert_eq!(cache.lock().unwrap().len(), 2);
+        assert_eq!(
+            lookup_workspace_for_run(&cache, run_a).as_deref(),
+            Some("/nas/Temp/ws/run-a")
+        );
+        assert_eq!(
+            lookup_workspace_for_run(&cache, run_b).as_deref(),
+            Some("/nas/Temp/ws/run-b")
+        );
+
+        // A repository-only key (the pre-fix behavior) would have collapsed the
+        // second push's workspace onto the first, so verify the fix keeps both.
+        let mut legacy_repo_cache: HashMap<gitforge_common::RepoId, Option<String>> =
+            HashMap::new();
+        legacy_repo_cache.insert(shared_repo, Some("/nas/Temp/ws/run-a".to_string()));
+        legacy_repo_cache.insert(shared_repo, Some("/nas/Temp/ws/run-b".to_string()));
+        assert_eq!(
+            legacy_repo_cache.get(&shared_repo).unwrap().as_deref(),
+            Some("/nas/Temp/ws/run-b"),
+            "pre-fix keyed-by-repo cache would clobber run A's workspace"
+        );
+    }
+
+    /// Dependent jobs in a single pipeline run must observe the same workspace
+    /// that `handle_push_event` prepared for that run. This mirrors the lookup
+    /// the scheduler completion consumer performs when enqueuing downstream
+    /// jobs after a parent job completes.
+    #[tokio::test]
+    async fn test_run_workspace_paths_dependent_jobs_reuse_prepared_workspace() {
+        let cache = run_workspace_paths_cache();
+        let repo_id = gitforge_common::RepoId::new();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let pipeline = create_default_pipeline(&repo_id.to_string());
+        let trigger = PipelineTriggerEvent::new(
+            pipeline_id,
+            repo_id,
+            "abcdef1234567890".to_string(),
+            TriggerType::Push,
+        );
+
+        let engine = CiEngine::new(trigger, pipeline).await.unwrap();
+        let run_id = engine.state().await.run_id;
+        let prepared_workspace = format!("/nas/Temp/workspaces/{run_id}");
+
+        // Mirror `handle_push_event` inserting the prepared workspace keyed by
+        // `state.run_id` (see services/ci/src/main.rs ~line 717).
+        cache_prepared_workspace(&cache, run_id, Some(prepared_workspace.clone()));
+
+        // The default pipeline has a dependent `test` job after `build`. Each
+        // dependent job lookup in `run_scheduler_event_consumer` resolves the
+        // workspace by `state.run_id`, so repeated lookups (simulating
+        // build→test fan-out) must all return the prepared workspace.
+        let first = lookup_workspace_for_run(&cache, run_id);
+        let second = lookup_workspace_for_run(&cache, run_id);
+        let third = lookup_workspace_for_run(&cache, run_id);
+        assert_eq!(first.as_deref(), Some(prepared_workspace.as_str()));
+        assert_eq!(second.as_deref(), Some(prepared_workspace.as_str()));
+        assert_eq!(third.as_deref(), Some(prepared_workspace.as_str()));
+    }
+
+    /// Two concurrent pipeline runs triggered for the same repository must
+    /// never see each other's workspace. This is the cross-contamination
+    /// invariant the fix restores.
+    #[tokio::test]
+    async fn test_run_workspace_paths_separate_pipeline_runs_do_not_cross_contaminate() {
+        let cache = run_workspace_paths_cache();
+        let shared_repo = gitforge_common::RepoId::new();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let pipeline = create_default_pipeline(&shared_repo.to_string());
+
+        let trigger_a = PipelineTriggerEvent::new(
+            pipeline_id,
+            shared_repo,
+            "aaaaaaa".to_string(),
+            TriggerType::Push,
+        );
+        let trigger_b = PipelineTriggerEvent::new(
+            pipeline_id,
+            shared_repo,
+            "bbbbbbb".to_string(),
+            TriggerType::Push,
+        );
+        let engine_a = CiEngine::new(trigger_a, pipeline.clone()).await.unwrap();
+        let engine_b = CiEngine::new(trigger_b, pipeline).await.unwrap();
+
+        let run_a = engine_a.state().await.run_id;
+        let run_b = engine_b.state().await.run_id;
+        assert_ne!(run_a, run_b);
+        assert_eq!(
+            engine_a.state().await.repo_id,
+            engine_b.state().await.repo_id
+        );
+
+        let workspace_a = format!("/nas/Temp/workspaces/{run_a}");
+        let workspace_b = format!("/nas/Temp/workspaces/{run_b}");
+
+        // Two pushes processed back-to-back: each run records its own workspace.
+        cache_prepared_workspace(&cache, run_a, Some(workspace_a.clone()));
+        cache_prepared_workspace(&cache, run_b, Some(workspace_b.clone()));
+
+        // Run A dependent jobs see only A's workspace, even though the cache
+        // also contains B's entry.
+        let a_lookup = lookup_workspace_for_run(&cache, run_a);
+        let b_lookup = lookup_workspace_for_run(&cache, run_b);
+        assert_eq!(a_lookup.as_deref(), Some(workspace_a.as_str()));
+        assert_eq!(b_lookup.as_deref(), Some(workspace_b.as_str()));
+
+        // Removing B's entry (e.g. terminal cleanup) must not affect A.
+        evict_workspace_for_run(&cache, run_b);
+        assert_eq!(
+            lookup_workspace_for_run(&cache, run_a).as_deref(),
+            Some(workspace_a.as_str()),
+            "evicting run B must not touch run A's workspace entry"
+        );
+        assert!(lookup_workspace_for_run(&cache, run_b).is_none());
+    }
+
+    /// The terminal-status eviction in the scheduler completion consumer
+    /// removes the entry by `state.run_id`; this must leave concurrent runs
+    /// for the same repository intact.
+    #[tokio::test]
+    async fn test_run_workspace_paths_terminal_eviction_only_targets_specific_run() {
+        let cache = run_workspace_paths_cache();
+        let repo_id = gitforge_common::RepoId::new();
+        let pipeline = create_default_pipeline(&repo_id.to_string());
+
+        let make_engine = |commit: &str| {
+            let pipeline_id = gitforge_common::PipelineId::new();
+            let trigger = PipelineTriggerEvent::new(
+                pipeline_id,
+                repo_id,
+                commit.to_string(),
+                TriggerType::Push,
+            );
+            CiEngine::new(trigger, pipeline.clone())
+        };
+        let engine_a = make_engine("commit-a").await.unwrap();
+        let engine_b = make_engine("commit-b").await.unwrap();
+        let engine_c = make_engine("commit-c").await.unwrap();
+        let run_a = engine_a.state().await.run_id;
+        let run_b = engine_b.state().await.run_id;
+        let run_c = engine_c.state().await.run_id;
+
+        for (run, commit) in [(run_a, "a"), (run_b, "b"), (run_c, "c")] {
+            cache_prepared_workspace(
+                &cache,
+                run,
+                Some(format!("/nas/Temp/workspaces/{run}/{commit}")),
+            );
+        }
+        assert_eq!(cache.lock().unwrap().len(), 3);
+
+        // Run B reaches a terminal status and its entry is evicted.
+        evict_workspace_for_run(&cache, run_b);
+        assert_eq!(cache.lock().unwrap().len(), 2);
+        assert!(lookup_workspace_for_run(&cache, run_b).is_none());
+        assert!(lookup_workspace_for_run(&cache, run_a).is_some());
+        assert!(lookup_workspace_for_run(&cache, run_c).is_some());
     }
 }
