@@ -638,11 +638,26 @@ impl RunnerAgent {
                         if response.status().is_success() {
                             if let Ok(jobs) = response.json::<Vec<JobAssignment>>().await {
                                 for job in jobs {
-                                    tracing::info!(
+                                    tracing::debug!(
                                         "received job assignment: {} ({})",
                                         job.name,
                                         job.job_id
                                     );
+                                    // Do not claim a job that this process is
+                                    // already executing. Claiming first would
+                                    // rotate the durable lease and fence the
+                                    // original execution, causing its live-log
+                                    // and completion requests to return 409.
+                                    {
+                                        let active = active_jobs_for_loop.lock().await;
+                                        if active.contains(&job.job_id) {
+                                            tracing::debug!(
+                                                "job {} is already executing locally; ignoring duplicate assignment",
+                                                job.job_id
+                                            );
+                                            continue;
+                                        }
+                                    }
                                     let Some(lease_token) = Self::claim_job(
                                         &fetch_client,
                                         &fetch_url,
@@ -662,6 +677,11 @@ impl RunnerAgent {
                                             continue;
                                         }
                                     }
+                                    tracing::info!(
+                                        "accepted job assignment: {} ({})",
+                                        job.name,
+                                        job.job_id
+                                    );
                                     // Execute concurrently so the fetch loop
                                     // remains responsive and cancellation can
                                     // be observed while the sandbox runs.
@@ -972,7 +992,15 @@ impl RunnerAgent {
         match complete_request_builder.send().await {
             Ok(response) if response.status().is_success() => {}
             Ok(response) => {
-                tracing::error!("scheduler rejected job completion: {}", response.status())
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                tracing::error!(
+                    job_id = %assignment.job_id,
+                    runner_id = %runner_id,
+                    status = %status,
+                    response_body = %body,
+                    "scheduler rejected job completion"
+                );
             }
             Err(error) => tracing::error!("failed to report job completion: {}", error),
         }

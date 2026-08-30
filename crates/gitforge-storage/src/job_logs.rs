@@ -155,6 +155,10 @@ impl FileJobLogStore {
         file.write_all(&stored_data)
             .await
             .map_err(|e| Error::storage(format!("failed to write log data: {}", e)))?;
+        file.flush()
+            .await
+            .map_err(|e| Error::storage(format!("failed to flush log data: {}", e)))?;
+        drop(file);
 
         // Write metadata
         let meta = JobLogMeta {
@@ -171,6 +175,11 @@ impl FileJobLogStore {
             .write_all(meta_json.as_bytes())
             .await
             .map_err(|e| Error::storage(format!("failed to write log metadata: {}", e)))?;
+        meta_file
+            .flush()
+            .await
+            .map_err(|e| Error::storage(format!("failed to flush log metadata: {}", e)))?;
+        drop(meta_file);
 
         if truncated {
             tracing::warn!(
@@ -212,6 +221,10 @@ impl JobLogStore for FileJobLogStore {
         file.write_all(&data)
             .await
             .map_err(|e| Error::storage(format!("failed to write log data: {}", e)))?;
+        file.flush()
+            .await
+            .map_err(|e| Error::storage(format!("failed to flush log data: {}", e)))?;
+        drop(file);
 
         // Write metadata
         let meta_json = serde_json::to_string(&meta)
@@ -223,6 +236,11 @@ impl JobLogStore for FileJobLogStore {
             .write_all(meta_json.as_bytes())
             .await
             .map_err(|e| Error::storage(format!("failed to write log metadata: {}", e)))?;
+        meta_file
+            .flush()
+            .await
+            .map_err(|e| Error::storage(format!("failed to flush log metadata: {}", e)))?;
+        drop(meta_file);
 
         tracing::debug!("stored job log for job {} ({} bytes)", job_id, size_bytes);
         Ok(())
