@@ -455,10 +455,11 @@ impl Sandbox for DockerSandbox {
                 // fixed container path. Docker exec does not inherit the
                 // container's configured working directory, so set it here
                 // explicitly or commands run outside the checkout.
-                working_dir: instance
-                    .workspace_path
-                    .as_ref()
-                    .map(|_| "/workspace".to_string()),
+                working_dir: if instance.workspace_path.is_some() {
+                    Some("/workspace")
+                } else {
+                    None
+                },
                 ..Default::default()
             };
 
@@ -1421,8 +1422,8 @@ mod tests {
             instance
                 .workspace_path
                 .as_ref()
-                .map(|_| "/workspace".to_string()),
-            Some("/workspace".to_string())
+                .map(|_| "/workspace"),
+            Some("/workspace")
         );
     }
 
