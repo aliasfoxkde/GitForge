@@ -584,7 +584,10 @@ async fn prepare_run_workspace(
     }
 
     let clone = tokio::process::Command::new("git")
-        .args(["clone", "--local", "--no-checkout"])
+        // --no-hardlinks: source object stores may contain files written by
+        // sandboxed writers (container UIDs). Hardlinking those fails with
+        // EPERM under protected_hardlinks; copying keeps checkout working.
+        .args(["clone", "--local", "--no-hardlinks", "--no-checkout"])
         .arg(&source)
         .arg(&workspace)
         .output()
