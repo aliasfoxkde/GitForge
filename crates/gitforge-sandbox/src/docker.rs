@@ -451,6 +451,14 @@ impl Sandbox for DockerSandbox {
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 cmd: Some(command.to_vec()),
+                // `create_with_workspace` mounts the host checkout at this
+                // fixed container path. Docker exec does not inherit the
+                // container's configured working directory, so set it here
+                // explicitly or commands run outside the checkout.
+                working_dir: instance
+                    .workspace_path
+                    .as_ref()
+                    .map(|_| "/workspace".to_string()),
                 ..Default::default()
             };
 
@@ -1399,6 +1407,23 @@ mod tests {
         assert_eq!(cloned.container_id, instance.container_id);
         assert_eq!(cloned.job_id, instance.job_id);
         assert_eq!(cloned.workspace_path, instance.workspace_path);
+    }
+
+    #[test]
+    fn workspace_execs_use_the_container_mount_point() {
+        let instance = SandboxInstance {
+            container_id: "test".to_string(),
+            job_id: JobId::new(),
+            workspace_path: Some("/host/workspace".to_string()),
+        };
+
+        assert_eq!(
+            instance
+                .workspace_path
+                .as_ref()
+                .map(|_| "/workspace".to_string()),
+            Some("/workspace".to_string())
+        );
     }
 
     /// Verify `destroy` is a no-op for stub sandbox (no Docker, no workspace).
