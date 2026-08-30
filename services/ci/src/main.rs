@@ -702,27 +702,6 @@ async fn handle_push_event(
     tracing::info!("enqueueing {} ready jobs", ready_jobs.len());
 
     let state = engine.state().await;
-    let workspace_path = match requested_workspace {
-        Some(path) => Some(path),
-        None => {
-            let pool = scheduler_db.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "push run {} has no workspace and durable repository storage is unavailable",
-                    state.run_id
-                )
-            })?;
-            Some(prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await?)
-        }
-    };
-    run_workspace_paths
-        .lock()
-        .expect("workspace cache lock poisoned")
-        .insert(state.run_id, workspace_path.clone());
-    pipeline_registry
-        .write()
-        .await
-        .insert(state.run_id, engine.clone());
-
     if let Some(pool) = scheduler_db {
         let db_pipeline = DbPipeline {
             id: pipeline_id,
@@ -744,6 +723,38 @@ async fn handle_push_event(
         db_run.start();
         gitforge_db::queries::PipelineRunQueries::create(pool, &db_run).await?;
     }
+
+    let workspace_path = match requested_workspace {
+        Some(path) => Some(path),
+        None => {
+            let pool = scheduler_db.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "push run {} has no workspace and durable repository storage is unavailable",
+                    state.run_id
+                )
+            })?;
+            match prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    let _ = gitforge_db::queries::PipelineRunQueries::update_status(
+                        pool,
+                        state.run_id,
+                        "failed",
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+        }
+    };
+    run_workspace_paths
+        .lock()
+        .expect("workspace cache lock poisoned")
+        .insert(state.run_id, workspace_path.clone());
+    pipeline_registry
+        .write()
+        .await
+        .insert(state.run_id, engine.clone());
 
     for job_id in ready_jobs {
         if let Some(_job_state) = state.jobs.get(&job_id) {
