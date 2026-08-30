@@ -106,6 +106,13 @@ impl StorageBackend for FileStorageBackend {
         config.set_bool("gc.autodetach", false).ok();
         config.set_bool("gc.auto", false).ok();
 
+        // Point HEAD at the default branch. init_bare leaves HEAD on an
+        // unborn `master`, and clients that push `main` never rewrite it, so
+        // clones of newly provisioned repositories could not check out.
+        // Setting the symref target of an unborn HEAD is valid here.
+        repo.set_head("refs/heads/main")
+            .map_err(|e| Error::git(format!("failed to set default branch: {}", e)))?;
+
         tracing::debug!("initialized bare git repository at {:?}", path);
         Ok(())
     }
@@ -142,6 +149,14 @@ mod tests {
         // Open repository
         let repo = backend.open(repo_id).await.unwrap();
         assert!(repo.is_bare());
+
+        // HEAD must point at the default branch so clones of a freshly
+        // provisioned (still empty) repository can check out after a push.
+        let head = std::fs::read(path.join("HEAD")).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&head).trim(),
+            "ref: refs/heads/main"
+        );
 
         // Delete repository
         backend.delete(repo_id).await.unwrap();
