@@ -11,6 +11,11 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
+/// Maximum heartbeat age before a runner is considered lost by the normal
+/// scheduler tick. Keep this bounded so an interrupted runner cannot retain a
+/// durable job lease indefinitely.
+const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 90;
+
 /// Scheduler command
 #[derive(Debug)]
 pub enum SchedulerCommand {
@@ -657,6 +662,20 @@ impl Scheduler {
                 self.recovery_done.store(false, Ordering::Release);
                 return;
             }
+        }
+
+        // Runner loss is reconciled on the same bounded tick that performs
+        // assignment. Without this call, the tested recovery path exists only
+        // as an API and an abruptly terminated runner can remain online in the
+        // live scheduler forever.
+        let marked_offline = self
+            .mark_stale_runners_offline(DEFAULT_HEARTBEAT_TIMEOUT_SECS)
+            .await;
+        if marked_offline > 0 {
+            tracing::warn!(
+                marked_offline,
+                "reconciled stale runners during queue processing"
+            );
         }
 
         // Keep the scheduler responsive to jobs submitted by the separate API
@@ -1390,8 +1409,7 @@ mod tests {
     async fn test_stale_runner_is_offlined_and_assigned_job_is_requeued() {
         let scheduler = Scheduler::new();
         let runner_id = RunnerId::new();
-        let mut runner = make_runner(runner_id, "stale-runner", "online", 1);
-        runner.last_heartbeat = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        let runner = make_runner(runner_id, "stale-runner", "online", 1);
         scheduler.register_runner(runner).await;
         let job_id = JobId::new();
         let repo_id = RepoId::new();
@@ -1407,7 +1425,12 @@ mod tests {
         scheduler.process_queue().await;
         assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
 
-        assert_eq!(scheduler.mark_stale_runners_offline(30).await, 1);
+        {
+            let mut state = scheduler.state.write().await;
+            state.runners.get_mut(&runner_id).unwrap().last_heartbeat =
+                Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        }
+        scheduler.process_queue().await;
         assert!(scheduler.is_assigned(job_id).await.is_none());
         assert_eq!(scheduler.queue_len().await, 1);
 
