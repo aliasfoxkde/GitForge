@@ -29,8 +29,31 @@ pub async fn create_shutdown_future(shutdown: Arc<AtomicBool>) {
 /// Socket path for the daemon
 const SOCKET_PATH: &str = "/tmp/gitforge-build.sock";
 
+fn handle_cli_args() -> bool {
+    let mut args = std::env::args().skip(1);
+    let Some(arg) = args.next() else {
+        return false;
+    };
+
+    match arg.as_str() {
+        "--help" | "-h" => {
+            println!("GitForge build daemon\\n\\nUsage: gitforge-buildd\\n\\nOptions:\\n  -h, --help       Print help\\n  -V, --version    Print version");
+            true
+        }
+        "--version" | "-V" => {
+            println!("gitforge-buildd {}", env!("CARGO_PKG_VERSION"));
+            true
+        }
+        _ => false,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if handle_cli_args() {
+        return Ok(());
+    }
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
