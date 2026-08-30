@@ -120,7 +120,16 @@ fn set_memory_limit(max_bytes: u64) -> std::io::Result<()> {
             &format!("--pid={}", std::process::id()),
             &format!("--as={}", max_bytes),
         ])
-        .output()?;
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::warn!("prlimit unavailable, skipping memory limit: {}", e);
+            // Don't fail - prlimit might not be available in all environments
+            return Ok(());
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -138,7 +147,15 @@ fn set_cpu_limit(cpu_time_secs: u64) -> std::io::Result<()> {
             &format!("--pid={}", std::process::id()),
             &format!("--cpu={}", cpu_time_secs),
         ])
-        .output()?;
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::warn!("prlimit unavailable, skipping cpu limit: {}", e);
+            return Ok(());
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
