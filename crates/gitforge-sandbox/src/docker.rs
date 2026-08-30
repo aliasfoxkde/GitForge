@@ -369,11 +369,6 @@ impl Sandbox for DockerSandbox {
         }
 
         if let Some(ref docker) = self.docker {
-            // Rootless Podman maps ordinary container UIDs into a subordinate
-            // host range. Preserve the runner's host identity for this bind
-            // mount so the unprivileged runner can remove the workspace.
-            let (uid, gid) = resolve_runner_uid_gid()?;
-            let owner = chown_owner_string(uid, gid);
             self.ensure_image(image).await?;
             self.remove_job_containers(job_id).await?;
             let container_name = Self::container_name(job_id);
@@ -391,10 +386,10 @@ impl Sandbox for DockerSandbox {
                 } else {
                     Some("none".to_string())
                 },
-                userns_mode: Some("keep-id".to_string()),
-                // Fedora's rootless Podman enforces SELinux labels on host
-                // mounts. Private relabeling makes this per-workspace mount
-                // readable inside the sandbox without disabling enforcement.
+                // Fedora's rootless container engine enforces SELinux labels on
+                // host mounts. Private relabeling makes this per-workspace
+                // mount readable inside the sandbox without disabling
+                // enforcement.
                 binds: Some(vec![format!("{}:/workspace:Z", workspace_path)]),
                 ..Default::default()
             };
@@ -402,7 +397,6 @@ impl Sandbox for DockerSandbox {
                 image: Some(image),
                 cmd: Some(vec!["sleep", "3600"]),
                 working_dir: Some("/workspace"),
-                user: Some(owner.as_str()),
                 host_config: Some(host_config),
                 labels: Some(labels),
                 ..Default::default()
