@@ -926,7 +926,7 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 steps: vec![
                     StepDefinition {
                         name: "setup".to_string(),
-                        run: "cargo fetch".to_string(),
+                        run: "rustup component add rustfmt clippy && cargo fetch".to_string(),
                         env: None,
                         working_directory: None,
                         condition: None,
