@@ -391,10 +391,10 @@ impl Sandbox for DockerSandbox {
                 } else {
                     Some("none".to_string())
                 },
-                userns_mode: Some("keep-id".to_string()),
-                // Fedora's rootless Podman enforces SELinux labels on host
-                // mounts. Private relabeling makes this per-workspace mount
-                // readable inside the sandbox without disabling enforcement.
+                // Fedora's rootless container engine enforces SELinux labels on
+                // host mounts. Private relabeling makes this per-workspace
+                // mount readable inside the sandbox without disabling
+                // enforcement.
                 binds: Some(vec![format!("{}:/workspace:Z", workspace_path)]),
                 ..Default::default()
             };
