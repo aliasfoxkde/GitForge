@@ -402,7 +402,7 @@ impl Sandbox for DockerSandbox {
                 image: Some(image),
                 cmd: Some(vec!["sleep", "3600"]),
                 working_dir: Some("/workspace"),
-                user: Some(owner),
+                user: Some(owner.as_str()),
                 host_config: Some(host_config),
                 labels: Some(labels),
                 ..Default::default()
