@@ -334,14 +334,24 @@ async fn git_info_refs(
     }
 
     let repo_path = format!("{owner}/{repo}");
-    let repo_id = match lookup_repo_id(&state.db_pool, &owner, &repo).await {
-        Some(id) => id,
-        None => {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from(format!("Repository not found: {repo_path}")))
-                .unwrap()
+    let repo_id = if state.db_pool.is_some() {
+        match lookup_repo_id(&state.db_pool, &owner, &repo).await {
+            Some(id) => id,
+            None => {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from(format!("Repository not found: {repo_path}")))
+                    .unwrap()
+            }
         }
+    } else {
+        tracing::warn!(
+            "database not available for info/refs, cannot look up repository: {repo_path}"
+        );
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from("Database not available"))
+            .unwrap();
     };
     if !state.storage.exists(repo_id).await {
         return Response::builder()
