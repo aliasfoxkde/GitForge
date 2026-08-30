@@ -77,6 +77,45 @@ pub struct JobExecutionDefinition {
     pub working_dir: Option<String>,
 }
 
+/// Return the scheduler resource class for jobs that must not overlap on one
+/// runner. Workspace-wide Cargo tests contend for the same checkout and build
+/// artifacts, so a runner admits at most one of them at a time.
+fn resource_class(definition: &JobExecutionDefinition) -> Option<&'static str> {
+    definition
+        .commands
+        .iter()
+        .any(|command| {
+            command
+                .split_whitespace()
+                .any(|argument| argument == "cargo")
+                && command
+                    .split_whitespace()
+                    .any(|argument| argument == "test")
+                && command
+                    .split_whitespace()
+                    .any(|argument| argument == "--workspace")
+        })
+        .then_some("workspace-cargo-test")
+}
+
+fn runner_has_resource_class_conflict(
+    state: &SchedulerState,
+    runner_id: RunnerId,
+    definition: &JobExecutionDefinition,
+) -> bool {
+    let Some(class) = resource_class(definition) else {
+        return false;
+    };
+
+    state
+        .assigned_jobs
+        .iter()
+        .any(|(job_id, (assigned_runner, _, _))| {
+            *assigned_runner == runner_id
+                && state.job_definitions.get(job_id).and_then(resource_class) == Some(class)
+        })
+}
+
 impl Default for SchedulerState {
     fn default() -> Self {
         Self::new()
@@ -660,12 +699,15 @@ impl Scheduler {
         }
         let mut state = self.state.write().await;
         let runners = state.list_online_runners();
-        let available_runners = runners.len();
+        let available_capacity: usize = runners
+            .iter()
+            .map(|runner| runner.capacity.max(0) as usize)
+            .sum();
 
-        // Process multiple jobs if we have multiple runners
-        // Use a loop to batch process jobs
+        // Bound one tick by the advertised aggregate capacity. Resource-class
+        // admission below may make the actual batch smaller.
         let mut processed = 0;
-        let max_jobs_per_batch = available_runners.max(1);
+        let max_jobs_per_batch = available_capacity.max(1);
 
         while processed < max_jobs_per_batch {
             // Peek at next job
@@ -677,9 +719,24 @@ impl Scheduler {
             let job_id = job.job_id;
             let pipeline_run_id = job.pipeline_run_id;
             let repo_id = job.repo_id;
+            let definition = state.job_definitions.get(&job_id).cloned();
 
             // Select runner using policy
-            let runner_id = self.policy.select_runner(job_id, &runners).await;
+            let mut available = runners.clone();
+            for runner in &mut available {
+                let in_flight = state
+                    .assigned_jobs
+                    .values()
+                    .filter(|(assigned_runner, _, _)| *assigned_runner == runner.id)
+                    .count() as i32;
+                runner.capacity = (runner.capacity - in_flight).max(0);
+                if let Some(definition) = &definition {
+                    if runner_has_resource_class_conflict(&state, runner.id, definition) {
+                        runner.capacity = 0;
+                    }
+                }
+            }
+            let runner_id = self.policy.select_runner(job_id, &available).await;
 
             match runner_id {
                 Some(r_id) => {
@@ -1564,6 +1621,51 @@ mod tests {
         // Job should be assigned
         let assigned = scheduler.is_assigned(job_id).await;
         assert!(assigned.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_workspace_cargo_tests_are_admitted_exclusively_per_runner() {
+        let scheduler = Scheduler::new();
+        let runner = make_runner(RunnerId::new(), "fedora-runner", "online", 4);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+
+        let first_job = JobId::new();
+        let second_job = JobId::new();
+        let run_id = PipelineRunId::new();
+        let repo_id = RepoId::new();
+        for job_id in [first_job, second_job] {
+            scheduler
+                .enqueue_with_definition(
+                    job_id,
+                    run_id,
+                    repo_id,
+                    vec!["cargo test --workspace".to_string()],
+                    Some("/workspace".to_string()),
+                )
+                .await;
+        }
+
+        scheduler.process_queue().await;
+
+        assert_eq!(scheduler.is_assigned(first_job).await, Some(runner_id));
+        assert!(scheduler.is_assigned(second_job).await.is_none());
+        assert_eq!(scheduler.queue_len().await, 1);
+
+        let first_lease = scheduler.ensure_job_lease(first_job).await.unwrap();
+        scheduler
+            .complete_job_with_lease(
+                first_job,
+                runner_id,
+                &first_lease,
+                true,
+                "{\"success\":true}".to_string(),
+            )
+            .await
+            .unwrap();
+        scheduler.process_queue().await;
+
+        assert_eq!(scheduler.is_assigned(second_job).await, Some(runner_id));
     }
 
     #[tokio::test]
