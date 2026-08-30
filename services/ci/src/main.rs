@@ -326,20 +326,19 @@ struct PipelineTriggerRequest {
 /// webhooks. This endpoint is internal control-plane automation and requires
 /// a dedicated trigger token, falling back to the scheduler operator/shared
 /// token during migration.
+fn configured_trigger_token(get_var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    [
+        "GITFORGE_TRIGGER_TOKEN",
+        "GITFORGE_CI_TRIGGER_TOKEN",
+        "GITFORGE_SCHEDULER_OPERATOR_TOKEN",
+        "GITFORGE_SCHEDULER_TOKEN",
+    ]
+    .into_iter()
+    .find_map(|name| get_var(name).filter(|token| !token.is_empty()))
+}
+
 async fn require_trigger_auth(request: Request, next: Next) -> Response {
-    let expected = std::env::var("GITFORGE_TRIGGER_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty())
-        .or_else(|| {
-            std::env::var("GITFORGE_SCHEDULER_OPERATOR_TOKEN")
-                .ok()
-                .filter(|token| !token.is_empty())
-        })
-        .or_else(|| {
-            std::env::var("GITFORGE_SCHEDULER_TOKEN")
-                .ok()
-                .filter(|token| !token.is_empty())
-        });
+    let expected = configured_trigger_token(|name| std::env::var(name).ok());
     let Some(expected) = expected else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -954,6 +953,34 @@ mod tests {
     use std::sync::OnceLock;
 
     static WORKSPACE_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn trigger_token_accepts_git_server_compatibility_name() {
+        let token = configured_trigger_token(|name| {
+            (name == "GITFORGE_CI_TRIGGER_TOKEN").then(|| "shared-secret".to_string())
+        });
+        assert_eq!(token.as_deref(), Some("shared-secret"));
+    }
+
+    #[test]
+    fn trigger_token_prefers_dedicated_name_over_compatibility_alias() {
+        let token = configured_trigger_token(|name| match name {
+            "GITFORGE_TRIGGER_TOKEN" => Some("dedicated".to_string()),
+            "GITFORGE_CI_TRIGGER_TOKEN" => Some("compatibility".to_string()),
+            _ => None,
+        });
+        assert_eq!(token.as_deref(), Some("dedicated"));
+    }
+
+    #[test]
+    fn trigger_token_ignores_empty_values_and_falls_back() {
+        let token = configured_trigger_token(|name| match name {
+            "GITFORGE_TRIGGER_TOKEN" => Some(String::new()),
+            "GITFORGE_CI_TRIGGER_TOKEN" => Some("compatibility".to_string()),
+            _ => None,
+        });
+        assert_eq!(token.as_deref(), Some("compatibility"));
+    }
 
     async fn run_git<I, S>(args: I, cwd: Option<&std::path::Path>) -> String
     where
