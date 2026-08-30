@@ -45,9 +45,33 @@ impl<S: StorageBackend> HttpGitHandler<S> {
         response.extend_from_slice(&Self::format_pkt_line(&format!("# service={service}\n")));
         response.extend_from_slice(b"0000");
 
-        let capabilities =
-            "multi_ack_detailed no-done side-band-64k ofs-delta agent=gitforge/0.1.0";
+        let mut capabilities = if service == "git-receive-pack" {
+            // Receive-pack negotiation: without report-status the client
+            // cannot learn the ref update result and misreports the push.
+            "report-status-v2 report-status delete-refs side-band-64k quiet atomic ofs-delta agent=gitforge/0.1.0"
+        } else {
+            "multi_ack_detailed no-done side-band-64k ofs-delta agent=gitforge/0.1.0"
+        }
+        .to_string();
+        // Clone/fetch need the HEAD symref to pick the default branch;
+        // without it clients fetch the objects but cannot check out.
+        if let Ok(head) = repo.head() {
+            if let Ok(name) = head.name() {
+                capabilities = format!("{capabilities} symref=HEAD:{name}");
+            }
+        }
+        // Advertise the HEAD pseudo-ref first, exactly like git upload-pack
+        // does: clients require the HEAD entry (plus the symref capability)
+        // to select and check out the default branch on clone.
         let mut advertised_ref = false;
+        if let Ok(head) = repo.head() {
+            if let Some(oid) = head.target() {
+                response.extend_from_slice(&Self::format_pkt_line(&format!(
+                    "{oid} HEAD\0{capabilities}\n"
+                )));
+                advertised_ref = true;
+            }
+        }
         if let Ok(refs) = repo.references() {
             for reference in refs.flatten() {
                 if let (Some(name), Some(target)) = (reference.name().ok(), reference.target()) {
@@ -62,6 +86,16 @@ impl<S: StorageBackend> HttpGitHandler<S> {
                     }
                 }
             }
+        }
+
+        if !advertised_ref {
+            // An empty repository advertises no refs; the protocol still
+            // requires the zero-id capabilities line so clients can
+            // negotiate (without it pushes land but clients misreport).
+            let cap_line = format!(
+                "0000000000000000000000000000000000000000 capabilities^{{}}\0{capabilities}\n"
+            );
+            response.extend_from_slice(&Self::format_pkt_line(&cap_line));
         }
 
         // End with flush pkt-line (0000)
@@ -100,12 +134,42 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
             )));
         }
 
-        // For upload-pack, we need to return the ref advertisement
-        // In smart HTTP, the client first does a GET to /info/refs to discover refs
-        // then a POST with upload-pack request
-        // For now, return the ref advertisement
-        self.build_ref_advertisement(repo_id, "git-upload-pack")
-            .await
+        if input.is_empty() {
+            // Legacy explicit-route callers fetch the advertisement directly.
+            return self
+                .build_ref_advertisement(repo_id, "git-upload-pack")
+                .await;
+        }
+
+        // Serve fetch negotiation by piping the client wants/haves through a
+        // real git-upload-pack (same shape as receive_pack): returning the
+        // advertisement here made clones and fetches unusable.
+        let repo = self.storage.open(repo_id).await?;
+        let mut child = Command::new("git-upload-pack")
+            .arg("--stateless-rpc")
+            .arg(repo.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                gitforge_common::Error::git(format!("failed to execute git-upload-pack: {error}"))
+            })?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&input).await.map_err(|error| {
+                gitforge_common::Error::git(format!("failed to send upload-pack request: {error}"))
+            })?;
+        }
+        let output = child.wait_with_output().await.map_err(|error| {
+            gitforge_common::Error::git(format!("failed to wait for git-upload-pack: {error}"))
+        })?;
+        if !output.status.success() {
+            return Err(gitforge_common::Error::git(format!(
+                "git-upload-pack failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(output.stdout)
     }
 
     async fn receive_pack(&self, repo_id: RepoId, input: Vec<u8>) -> Result<Vec<u8>> {
@@ -295,8 +359,8 @@ mod tests {
         let repo_id = RepoId::new();
         storage.create(repo_id).await.unwrap();
 
-        // Now upload_pack should work and return a valid response
-        let result = handler.upload_pack(repo_id, vec![1, 2, 3]).await;
+        // Empty input returns the ref advertisement (legacy explicit route).
+        let result = handler.upload_pack(repo_id, vec![]).await;
         assert!(result.is_ok());
         let response = result.unwrap();
         // Response should contain ref advertisement (starts with pkt-line format)
@@ -304,6 +368,11 @@ mod tests {
         assert!(response.starts_with(b"001e# service=git-upload-pack\n0000"));
         // Should end with flush pkt-line (0000)
         assert!(response.ends_with(b"0000"));
+
+        // Non-empty input pipes through a real git-upload-pack, so garbage
+        // bytes are rejected by git instead of answered with an advertisement.
+        let result = handler.upload_pack(repo_id, vec![1, 2, 3]).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
