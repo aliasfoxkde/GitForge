@@ -414,7 +414,7 @@ async fn git_upload_pack_standard(
             .body(Body::from(format!("Repository not found: {repo_path}")))
             .unwrap();
     }
-    let body = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
+    let body = match axum::body::to_bytes(request.into_body(), max_git_body_bytes()).await {
         Ok(body) => body,
         Err(error) => {
             tracing::warn!("failed to read upload-pack body: {}", error);
@@ -480,10 +480,19 @@ async fn git_receive_pack(
             .unwrap();
     }
 
-    // Read request body
-    let body = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
-        .await
-        .unwrap_or_default();
+    // Read request body. Oversized pushes are rejected explicitly instead of
+    // being silently truncated to an empty pack, which used to hang up on
+    // clients mid-send.
+    let body = match axum::body::to_bytes(request.into_body(), max_git_body_bytes()).await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!("failed to read receive-pack body: {}", error);
+            return Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(Body::from(format!("Receive-pack body rejected: {}", error)))
+                .unwrap();
+        }
+    };
 
     match state
         .http_handler
@@ -679,6 +688,17 @@ async fn git_receive_pack_standard(
 /// Get the git root directory from environment or use default
 pub fn get_git_root() -> String {
     std::env::var("GIT_ROOT").unwrap_or_else(|_| "/var/lib/gitforge/repos".to_string())
+}
+
+/// Maximum buffered request body for Git Smart HTTP. The previous hardcoded
+/// 10 MiB cap silently truncated real-world pushes (a small monorepo history
+/// can exceed it many times over), so the limit is configurable and the
+/// default covers large repositories. Bounds memory use on the server.
+pub fn max_git_body_bytes() -> usize {
+    std::env::var("GITFORGE_MAX_GIT_BODY_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(512 * 1024 * 1024)
 }
 
 /// Create the shutdown future that waits for shutdown signal

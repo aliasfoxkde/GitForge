@@ -912,17 +912,38 @@ impl Scheduler {
     /// Return the current lease for a job, creating one for an existing
     /// assignment when needed. Repeated calls are idempotent.
     pub async fn ensure_job_lease(&self, job_id: JobId) -> Option<String> {
-        let mut state = self.state.write().await;
-        if !state.assigned_jobs.contains_key(&job_id) {
-            return None;
-        }
-        Some(
+        let lease = {
+            let mut state = self.state.write().await;
+            if !state.assigned_jobs.contains_key(&job_id) {
+                return None;
+            }
             state
                 .job_leases
                 .entry(job_id)
                 .or_insert_with(|| Uuid::new_v4().to_string())
-                .clone(),
-        )
+                .clone()
+        };
+        // Keep the durable row in sync with the lease handed to the runner.
+        // Lease validation reads the database, and a stale or missing row
+        // would otherwise fence off every start request for this job.
+        if let Some(pool) = &self.db_pool {
+            let runner_id = {
+                let state = self.state.read().await;
+                state
+                    .assigned_jobs
+                    .get(&job_id)
+                    .map(|(runner_id, _, _)| *runner_id)
+            };
+            if let Some(runner_id) = runner_id {
+                if let Err(error) =
+                    gitforge_db::queries::JobQueries::sync_lease(pool, job_id, runner_id, &lease)
+                        .await
+                {
+                    tracing::warn!("failed to sync lease for job {}: {}", job_id, error);
+                }
+            }
+        }
+        Some(lease)
     }
 
     /// Verify the runner's lease and persist the assigned-to-running
