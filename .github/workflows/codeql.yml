@@ -50,7 +50,10 @@ jobs:
         if: matrix.language == 'rust'
         run: |
           cargo fetch --locked
-          cargo build --workspace --release --locked
+          # CodeQL needs a complete instrumentable build, not release
+          # optimizations. Debug mode keeps analysis bounded and avoids
+          # duplicating the release-build gate in Rust CI.
+          cargo build --workspace --locked
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@ce28f5bb42b7a9f2c824e633a3f6ee835bab6858 # v3.29.0
