@@ -369,11 +369,6 @@ impl Sandbox for DockerSandbox {
         }
 
         if let Some(ref docker) = self.docker {
-            // Rootless Podman maps ordinary container UIDs into a subordinate
-            // host range. Preserve the runner's host identity for this bind
-            // mount so the unprivileged runner can remove the workspace.
-            let (uid, gid) = resolve_runner_uid_gid()?;
-            let owner = chown_owner_string(uid, gid);
             self.ensure_image(image).await?;
             self.remove_job_containers(job_id).await?;
             let container_name = Self::container_name(job_id);
@@ -402,7 +397,6 @@ impl Sandbox for DockerSandbox {
                 image: Some(image),
                 cmd: Some(vec!["sleep", "3600"]),
                 working_dir: Some("/workspace"),
-                user: Some(owner.as_str()),
                 host_config: Some(host_config),
                 labels: Some(labels),
                 ..Default::default()
