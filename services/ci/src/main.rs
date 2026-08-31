@@ -641,11 +641,10 @@ async fn remove_run_workspace_dir(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             // Rootless Podman maps container root to a subordinate host UID.
-            // In that mode the service user cannot remove files created by a
-            // job through the ordinary host namespace. `podman unshare`
-            // re-enters the storage namespace and is given only the exact,
-            // symlink-checked run-owned path.
-            let result = timeout(
+            // A hardened systemd service may be unable to create the nested
+            // user namespace itself, so try the direct path first and then
+            // delegate the exact validated path to a transient user service.
+            let direct = timeout(
                 Duration::from_secs(120),
                 tokio::process::Command::new("podman")
                     .args(["unshare", "rm", "-rf", "--"])
@@ -653,21 +652,92 @@ async fn remove_run_workspace_dir(
                     .output(),
             )
             .await;
-            match result {
+            let direct_failed = match direct {
                 Ok(Ok(output)) if output.status.success() => {
                     tracing::info!(
                         %run_id,
                         workspace = %workspace.display(),
                         "removed run workspace through rootless namespace"
                     );
-                    true
+                    return true;
                 }
                 Ok(Ok(output)) => {
+                    let diagnostic = String::from_utf8_lossy(&output.stderr)
+                        .trim()
+                        .chars()
+                        .take(512)
+                        .collect::<String>();
                     tracing::warn!(
                         %run_id,
                         workspace = %workspace.display(),
                         status = ?output.status.code(),
-                        "rootless workspace cleanup failed"
+                        stderr = %diagnostic,
+                        "direct rootless workspace cleanup failed; trying transient service"
+                    );
+                    true
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        %run_id,
+                        %error,
+                        workspace = %workspace.display(),
+                        "could not start direct rootless workspace cleanup; trying transient service"
+                    );
+                    true
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        %run_id,
+                        workspace = %workspace.display(),
+                        "direct rootless workspace cleanup timed out; trying transient service"
+                    );
+                    true
+                }
+            };
+            if !direct_failed {
+                return false;
+            }
+
+            let delegated = timeout(
+                Duration::from_secs(120),
+                tokio::process::Command::new("systemd-run")
+                    .args([
+                        "--user",
+                        "--quiet",
+                        "--wait",
+                        "--pipe",
+                        "--collect",
+                        "/usr/bin/podman",
+                        "unshare",
+                        "rm",
+                        "-rf",
+                        "--",
+                    ])
+                    .arg(&workspace)
+                    .output(),
+            )
+            .await;
+            match delegated {
+                Ok(Ok(output)) if output.status.success() => {
+                    tracing::info!(
+                        %run_id,
+                        workspace = %workspace.display(),
+                        "removed run workspace through transient rootless service"
+                    );
+                    true
+                }
+                Ok(Ok(output)) => {
+                    let diagnostic = String::from_utf8_lossy(&output.stderr)
+                        .trim()
+                        .chars()
+                        .take(512)
+                        .collect::<String>();
+                    tracing::warn!(
+                        %run_id,
+                        workspace = %workspace.display(),
+                        status = ?output.status.code(),
+                        stderr = %diagnostic,
+                        "transient rootless workspace cleanup failed"
                     );
                     false
                 }
@@ -676,7 +746,7 @@ async fn remove_run_workspace_dir(
                         %run_id,
                         %error,
                         workspace = %workspace.display(),
-                        "could not start rootless workspace cleanup"
+                        "could not start transient rootless workspace cleanup"
                     );
                     false
                 }
@@ -684,7 +754,7 @@ async fn remove_run_workspace_dir(
                     tracing::warn!(
                         %run_id,
                         workspace = %workspace.display(),
-                        "rootless workspace cleanup timed out"
+                        "transient rootless workspace cleanup timed out"
                     );
                     false
                 }
