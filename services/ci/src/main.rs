@@ -1123,7 +1123,10 @@ mod tests {
 
     #[test]
     fn trigger_token_matches_raw_and_bearer_credentials() {
-        assert!(trigger_token_matches("shared-secret", Some("shared-secret")));
+        assert!(trigger_token_matches(
+            "shared-secret",
+            Some("shared-secret")
+        ));
         assert!(trigger_token_matches(
             "shared-secret",
             Some("Bearer shared-secret")
@@ -1133,7 +1136,10 @@ mod tests {
     #[test]
     fn trigger_token_rejects_missing_mismatched_and_malformed_credentials() {
         assert!(!trigger_token_matches("shared-secret", None));
-        assert!(!trigger_token_matches("shared-secret", Some("wrong-secret")));
+        assert!(!trigger_token_matches(
+            "shared-secret",
+            Some("wrong-secret")
+        ));
         assert!(!trigger_token_matches(
             "shared-secret",
             Some("Basic shared-secret")
