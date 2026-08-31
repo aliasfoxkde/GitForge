@@ -922,6 +922,8 @@ async fn prepare_run_workspace(
     // Workspace and repository storage may be mounted with policies that
     // reject hard links; a regular clone is portable across those filesystems.
     let clone = tokio::process::Command::new("git")
+        // --no-local: avoid hard links and local-object alternates for
+        // portability across protected or differently-owned storage.
         .args(["clone", "--no-local", "--no-checkout"])
         .arg(&source)
         .arg(&workspace)
