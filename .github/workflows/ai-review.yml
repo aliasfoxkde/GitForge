@@ -89,7 +89,7 @@ jobs:
           echo "$OUTPUT"
 
           # Extract summary for GitHub comment
-          SUMMARY=$(echo "$OUTPUT" | grep -A 20 "CODE REVIEW RESULTS" | head -30 || echo "Review completed")
+          SUMMARY=$(echo "$OUTPUT" | grep -A 20 "CODE REVIEW RESULTS" | head -30 | tr '\n' ' ' || echo "Review completed")
           echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
 
           # Check for critical findings
