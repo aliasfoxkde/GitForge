@@ -12,7 +12,9 @@ jobs:
   analyze:
     name: Analyze
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Rust query evaluation can exceed the default job budget on this
+    # multi-crate workspace; keep the guard bounded but allow completion.
+    timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0

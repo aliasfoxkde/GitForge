@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use gitforge_common::{RepoId, UserId};
+use gitforge_core::{FileStorageBackend, StorageBackend};
 use gitforge_db::{queries::RepoQueries, Pool};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -147,9 +148,44 @@ async fn create_repo(
             .into_response();
     }
 
-    let git_path = format!("/git/repos/{}", req.name);
+    let repo_id = RepoId::new();
+    let storage_root = std::env::var("GIT_ROOT")
+        .ok()
+        .filter(|root| !root.trim().is_empty())
+        .unwrap_or_else(|| "target/gitforge-repos".to_string());
+    let storage = FileStorageBackend::new(&storage_root);
 
-    let repo = gitforge_db::models::Repository::new(req.name, owner_id, git_path.clone());
+    if let Err(error) = storage.ensure_root().await {
+        tracing::error!(%error, "failed to initialize git storage root");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "storage_error",
+                "message": "failed to initialize repository storage"
+            })),
+        )
+            .into_response();
+    }
+
+    let git_path = storage.repo_path(repo_id);
+    if let Err(error) = storage.create(repo_id).await {
+        tracing::error!(%error, repo_id = %repo_id, "failed to provision bare repository");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "storage_error",
+                "message": "failed to provision repository storage"
+            })),
+        )
+            .into_response();
+    }
+
+    let repo = gitforge_db::models::Repository::new_with_id(
+        repo_id,
+        req.name,
+        owner_id,
+        git_path.to_string_lossy().into_owned(),
+    );
 
     match RepoQueries::create(&pool, &repo).await {
         Ok(_) => {
@@ -165,6 +201,13 @@ async fn create_repo(
             (StatusCode::CREATED, Json(response)).into_response()
         }
         Err(e) => {
+            if let Err(cleanup_error) = storage.delete(repo_id).await {
+                tracing::error!(
+                    %cleanup_error,
+                    repo_id = %repo_id,
+                    "failed to clean up repository storage after database error"
+                );
+            }
             tracing::error!("failed to create repo: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
