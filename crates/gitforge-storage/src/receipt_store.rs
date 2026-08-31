@@ -235,6 +235,39 @@ impl FileReceiptStore {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
     }
+
+    async fn write_atomic(path: &PathBuf, contents: &[u8]) -> Result<()> {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("receipt");
+        let temporary_path = path.with_file_name(format!(
+            ".{file_name}.tmp-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+
+        let result = async {
+            let mut file = fs::File::create(&temporary_path).await.map_err(|e| {
+                Error::storage(format!("failed to create temporary receipt file: {}", e))
+            })?;
+            file.write_all(contents).await.map_err(|e| {
+                Error::storage(format!("failed to write temporary receipt file: {}", e))
+            })?;
+            file.sync_all().await.map_err(|e| {
+                Error::storage(format!("failed to flush temporary receipt file: {}", e))
+            })?;
+            fs::rename(&temporary_path, path)
+                .await
+                .map_err(|e| Error::storage(format!("failed to publish receipt file: {}", e)))
+        }
+        .await;
+
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary_path).await;
+        }
+        result
+    }
 }
 
 #[async_trait]
@@ -250,12 +283,7 @@ impl ReceiptStore for FileReceiptStore {
         let receipt_path = self.receipt_path(&job_id);
         let receipt_json = serde_json::to_string_pretty(receipt)
             .map_err(|e| Error::storage(format!("failed to serialize receipt: {}", e)))?;
-        let mut file = fs::File::create(&receipt_path)
-            .await
-            .map_err(|e| Error::storage(format!("failed to create receipt file: {}", e)))?;
-        file.write_all(receipt_json.as_bytes())
-            .await
-            .map_err(|e| Error::storage(format!("failed to write receipt: {}", e)))?;
+        Self::write_atomic(&receipt_path, receipt_json.as_bytes()).await?;
 
         // Write metadata for indexing
         let workspace_id = Self::extract_workspace_id(receipt);
@@ -273,13 +301,7 @@ impl ReceiptStore for FileReceiptStore {
         let meta_path = self.meta_path(&job_id);
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| Error::storage(format!("failed to serialize meta: {}", e)))?;
-        let mut meta_file = fs::File::create(&meta_path)
-            .await
-            .map_err(|e| Error::storage(format!("failed to create meta file: {}", e)))?;
-        meta_file
-            .write_all(meta_json.as_bytes())
-            .await
-            .map_err(|e| Error::storage(format!("failed to write meta: {}", e)))?;
+        Self::write_atomic(&meta_path, meta_json.as_bytes()).await?;
 
         tracing::debug!("persisted receipt for job {}", job_id);
         Ok(())

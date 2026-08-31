@@ -1,12 +1,12 @@
 # GitForge Handoff
 
-**Last Updated:** 2026-08-21
-**Evidence boundary (central audit):** branch `chore/GIT-W2-06-A-promotion-runner-sigterm`, HEAD `945f5bd`, 2 dirty status entries. Refresh this boundary before relying on any test or rating below; numeric ratings are historical context, not release gates.
+**Last Updated:** 2026-08-30
+**Evidence boundary (central audit):** branch `main`, HEAD `cc73e57`, 6 dirty status entries (preserved generated/untracked template artifacts under `template-parts/`). Refresh this boundary before relying on any test or rating below; numeric ratings are historical context, not release gates.
 **Status:** 🔄 Active — runner loop source-fixed; service-auth, durable-compose wiring, and live runner lifecycle remain unproven
 **Location:** `/nas/Temp/repos/GitForge`
 **Rating:** 7.5/10 (historical context only)
 
-> **Current execution authority:** Use `/nas/Temp/repos/Platform-Architecture/docs/planning/HANDOFF_AUDIT_2026-08-13.md` for verified cross-repository findings and `/nas/Temp/repos/Platform-Architecture/docs/planning/CODEX_CLI_EXECUTION_PACKETS_2026-08-13.md` for bounded implementation sessions. The runner lifecycle remains a blocker until the registered agent actually enters its run loop and executes a disposable job.
+> **Current execution authority:** Use `/nas/Temp/repos/Platform-Architecture/docs/planning/HANDOFF_AUDIT_2026-08-13.md` for verified cross-repository findings and `/nas/Temp/repos/Platform-Architecture/docs/planning/CODEX_CLI_EXECUTION_PACKETS_2026-08-13.md` for bounded implementation sessions. The authority filenames are explicit for provenance checks. The runner lifecycle is evidenced by a completed disposable Control Center canary; continue requiring a release receipt and post-promotion canary for future changes.
 
 ---
 

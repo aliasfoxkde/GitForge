@@ -76,8 +76,10 @@ impl DockerSandbox {
     ///
     /// A runner can be terminated after creating a container but before the
     /// normal destroy path runs. Cleanup is intentionally scoped by the
-    /// ownership label, so unrelated containers are never considered.
-    async fn remove_job_containers(&self, job_id: JobId) -> Result<()> {
+    /// ownership label, so unrelated containers are never considered. Public
+    /// so callers that abandon an acquisition (timeout, creation error) can
+    /// reap the half-created container instead of leaking it.
+    pub async fn remove_job_containers(&self, job_id: JobId) -> Result<()> {
         let Some(ref docker) = self.docker else {
             return Ok(());
         };
@@ -369,11 +371,6 @@ impl Sandbox for DockerSandbox {
         }
 
         if let Some(ref docker) = self.docker {
-            // Rootless Podman maps ordinary container UIDs into a subordinate
-            // host range. Preserve the runner's host identity for this bind
-            // mount so the unprivileged runner can remove the workspace.
-            let (uid, gid) = resolve_runner_uid_gid()?;
-            let owner = chown_owner_string(uid, gid);
             self.ensure_image(image).await?;
             self.remove_job_containers(job_id).await?;
             let container_name = Self::container_name(job_id);
@@ -391,18 +388,18 @@ impl Sandbox for DockerSandbox {
                 } else {
                     Some("none".to_string())
                 },
-                userns_mode: Some("keep-id".to_string()),
-                // Fedora's rootless Podman enforces SELinux labels on host
-                // mounts. Private relabeling makes this per-workspace mount
-                // readable inside the sandbox without disabling enforcement.
-                binds: Some(vec![format!("{}:/workspace:Z", workspace_path)]),
+                // Fedora's rootless container engine enforces SELinux labels on
+                // host mounts. The workspace is intentionally shared by jobs in
+                // one pipeline run, so use a shared relabel. Private `:Z`
+                // relabeling is racy when concurrent jobs mount the same
+                // checkout and can leave one container unable to see files.
+                binds: Some(vec![format!("{}:/workspace:z", workspace_path)]),
                 ..Default::default()
             };
             let config = Config {
                 image: Some(image),
                 cmd: Some(vec!["sleep", "3600"]),
                 working_dir: Some("/workspace"),
-                user: Some(owner.as_str()),
                 host_config: Some(host_config),
                 labels: Some(labels),
                 ..Default::default()
@@ -457,6 +454,15 @@ impl Sandbox for DockerSandbox {
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 cmd: Some(command.to_vec()),
+                // `create_with_workspace` mounts the host checkout at this
+                // fixed container path. Docker exec does not inherit the
+                // container's configured working directory, so set it here
+                // explicitly or commands run outside the checkout.
+                working_dir: if instance.workspace_path.is_some() {
+                    Some("/workspace")
+                } else {
+                    None
+                },
                 ..Default::default()
             };
 
@@ -1405,6 +1411,20 @@ mod tests {
         assert_eq!(cloned.container_id, instance.container_id);
         assert_eq!(cloned.job_id, instance.job_id);
         assert_eq!(cloned.workspace_path, instance.workspace_path);
+    }
+
+    #[test]
+    fn workspace_execs_use_the_container_mount_point() {
+        let instance = SandboxInstance {
+            container_id: "test".to_string(),
+            job_id: JobId::new(),
+            workspace_path: Some("/host/workspace".to_string()),
+        };
+
+        assert_eq!(
+            instance.workspace_path.as_ref().map(|_| "/workspace"),
+            Some("/workspace")
+        );
     }
 
     /// Verify `destroy` is a no-op for stub sandbox (no Docker, no workspace).

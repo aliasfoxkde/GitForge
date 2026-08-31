@@ -11,6 +11,11 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
+/// Maximum heartbeat age before a runner is considered lost by the normal
+/// scheduler tick. Keep this bounded so an interrupted runner cannot retain a
+/// durable job lease indefinitely.
+const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 90;
+
 /// Scheduler command
 #[derive(Debug)]
 pub enum SchedulerCommand {
@@ -659,6 +664,20 @@ impl Scheduler {
             }
         }
 
+        // Runner loss is reconciled on the same bounded tick that performs
+        // assignment. Without this call, the tested recovery path exists only
+        // as an API and an abruptly terminated runner can remain online in the
+        // live scheduler forever.
+        let marked_offline = self
+            .mark_stale_runners_offline(DEFAULT_HEARTBEAT_TIMEOUT_SECS)
+            .await;
+        if marked_offline > 0 {
+            tracing::warn!(
+                marked_offline,
+                "reconciled stale runners during queue processing"
+            );
+        }
+
         // Keep the scheduler responsive to jobs submitted by the separate API
         // process after startup. `load_pending_jobs` is deduplicated by the
         // in-memory queue and runs on the existing bounded scheduler tick.
@@ -689,6 +708,28 @@ impl Scheduler {
                         // Durable state is authoritative. Fail closed for
                         // this scheduler tick if cancellation is unreadable.
                         tracing::error!(%error, %job_id, "failed to reconcile cancellation before assignment");
+                        return;
+                    }
+                };
+                if is_cancelled {
+                    self.cancel(job_id).await;
+                }
+            }
+
+            // API-side cancellation can race with assignment. Assigned jobs
+            // are no longer present in the queue, so reconcile that mirror
+            // separately; otherwise a cancelled job remains eligible for the
+            // runner's next assignment poll indefinitely.
+            let assigned_ids = {
+                let state = self.state.read().await;
+                state.assigned_jobs.keys().copied().collect::<Vec<_>>()
+            };
+            for job_id in assigned_ids {
+                let is_cancelled = match gitforge_db::queries::JobQueries::get(pool, job_id).await {
+                    Ok(Some(job)) => job.status == "cancelled",
+                    Ok(None) => false,
+                    Err(error) => {
+                        tracing::error!(%error, %job_id, "failed to reconcile assigned-job cancellation");
                         return;
                     }
                 };
@@ -1227,7 +1268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_api_cancelled_queued_job_is_not_assigned() {
+    async fn test_api_cancelled_assigned_job_is_not_reassigned() {
         let pool = gitforge_db::Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
         let user = gitforge_db::models::User::new(
@@ -1295,6 +1336,12 @@ mod tests {
                 None,
             )
             .await;
+        scheduler
+            .register_runner(make_runner(RunnerId::new(), "runner", "online", 1))
+            .await;
+        scheduler.process_queue().await;
+        assert!(scheduler.is_assigned(job_id).await.is_some());
+
         let receipt = serde_json::json!({
             "job_id": job_id.to_string(),
             "status": "cancelled",
@@ -1304,9 +1351,6 @@ mod tests {
         gitforge_db::queries::JobQueries::cancel(&pool, job_id, &receipt)
             .await
             .unwrap();
-        scheduler
-            .register_runner(make_runner(RunnerId::new(), "runner", "online", 1))
-            .await;
         scheduler.process_queue().await;
         assert_eq!(scheduler.queue_len().await, 0);
         assert!(scheduler.is_assigned(job_id).await.is_none());
@@ -1390,8 +1434,7 @@ mod tests {
     async fn test_stale_runner_is_offlined_and_assigned_job_is_requeued() {
         let scheduler = Scheduler::new();
         let runner_id = RunnerId::new();
-        let mut runner = make_runner(runner_id, "stale-runner", "online", 1);
-        runner.last_heartbeat = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        let runner = make_runner(runner_id, "stale-runner", "online", 1);
         scheduler.register_runner(runner).await;
         let job_id = JobId::new();
         let repo_id = RepoId::new();
@@ -1407,7 +1450,12 @@ mod tests {
         scheduler.process_queue().await;
         assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
 
-        assert_eq!(scheduler.mark_stale_runners_offline(30).await, 1);
+        {
+            let mut state = scheduler.state.write().await;
+            state.runners.get_mut(&runner_id).unwrap().last_heartbeat =
+                Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        }
+        scheduler.process_queue().await;
         assert!(scheduler.is_assigned(job_id).await.is_none());
         assert_eq!(scheduler.queue_len().await, 1);
 
@@ -1436,9 +1484,6 @@ mod tests {
             )
             .await;
         scheduler.process_queue().await;
-        assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
-
-        assert_eq!(scheduler.mark_stale_runners_offline(90).await, 1);
         assert!(scheduler.is_assigned(job_id).await.is_none());
         assert_eq!(scheduler.queue_len().await, 1);
 
@@ -1452,11 +1497,8 @@ mod tests {
         let scheduler = Scheduler::new();
         let first_runner_id = RunnerId::new();
         let second_runner_id = RunnerId::new();
-        let stale_heartbeat = chrono::Utc::now() - chrono::Duration::seconds(120);
-        let mut first_runner = make_runner(first_runner_id, "multi-repo-runner-a", "online", 1);
-        first_runner.last_heartbeat = Some(stale_heartbeat);
-        let mut second_runner = make_runner(second_runner_id, "multi-repo-runner-b", "online", 1);
-        second_runner.last_heartbeat = Some(stale_heartbeat);
+        let first_runner = make_runner(first_runner_id, "multi-repo-runner-a", "online", 1);
+        let second_runner = make_runner(second_runner_id, "multi-repo-runner-b", "online", 1);
         scheduler.register_runner(first_runner).await;
         scheduler.register_runner(second_runner).await;
 
@@ -1474,7 +1516,21 @@ mod tests {
         assert!(scheduler.is_assigned(first_job).await.is_some());
         assert!(scheduler.is_assigned(second_job).await.is_some());
 
-        assert_eq!(scheduler.mark_stale_runners_offline(30).await, 2);
+        {
+            let stale_heartbeat = chrono::Utc::now() - chrono::Duration::seconds(120);
+            let mut state = scheduler.state.write().await;
+            state
+                .runners
+                .get_mut(&first_runner_id)
+                .unwrap()
+                .last_heartbeat = Some(stale_heartbeat);
+            state
+                .runners
+                .get_mut(&second_runner_id)
+                .unwrap()
+                .last_heartbeat = Some(stale_heartbeat);
+        }
+        scheduler.process_queue().await;
 
         let state = scheduler.state.read().await;
         assert_eq!(state.queue.len(), 2);

@@ -638,11 +638,26 @@ impl RunnerAgent {
                         if response.status().is_success() {
                             if let Ok(jobs) = response.json::<Vec<JobAssignment>>().await {
                                 for job in jobs {
-                                    tracing::info!(
+                                    tracing::debug!(
                                         "received job assignment: {} ({})",
                                         job.name,
                                         job.job_id
                                     );
+                                    // Do not claim a job that this process is
+                                    // already executing. Claiming first would
+                                    // rotate the durable lease and fence the
+                                    // original execution, causing its live-log
+                                    // and completion requests to return 409.
+                                    {
+                                        let active = active_jobs_for_loop.lock().await;
+                                        if active.contains(&job.job_id) {
+                                            tracing::debug!(
+                                                "job {} is already executing locally; ignoring duplicate assignment",
+                                                job.job_id
+                                            );
+                                            continue;
+                                        }
+                                    }
                                     let Some(lease_token) = Self::claim_job(
                                         &fetch_client,
                                         &fetch_url,
@@ -662,6 +677,11 @@ impl RunnerAgent {
                                             continue;
                                         }
                                     }
+                                    tracing::info!(
+                                        "accepted job assignment: {} ({})",
+                                        job.name,
+                                        job.job_id
+                                    );
                                     // Execute concurrently so the fetch loop
                                     // remains responsive and cancellation can
                                     // be observed while the sandbox runs.
@@ -814,13 +834,32 @@ impl RunnerAgent {
         if let Some(token) = scheduler_token {
             started_request = started_request.bearer_auth(token);
         }
-        let started = started_request
-            .send()
-            .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false);
+        let started = match started_request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    true
+                } else {
+                    let body = response.text().await.unwrap_or_default();
+                    tracing::error!(
+                        job_id = %assignment.job_id,
+                        %status,
+                        response = %body,
+                        "failed to mark job started"
+                    );
+                    false
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    job_id = %assignment.job_id,
+                    error = %error,
+                    "failed to reach scheduler while marking job started"
+                );
+                false
+            }
+        };
         if !started {
-            tracing::error!("failed to mark job {} started", assignment.job_id);
             return;
         }
 
@@ -912,12 +951,14 @@ impl RunnerAgent {
             lease_token,
             scheduler_token,
         };
-        if !live_logs.sent_any() {
+        if !live_logs.sent_any() || live_logs.failed() {
+            // Nothing — or not everything — reached the scheduler live, so
+            // re-upload the full step output while the lease is still valid.
+            // Chunks append by sequence; a degraded stream may duplicate the
+            // prefix it did deliver, which beats a silently truncated log.
             if let Err(error) = report_log_chunks(&protocol, &result.step_results).await {
                 tracing::warn!(%error, job_id = %assignment.job_id, "failed to stream job logs");
             }
-        } else if live_logs.failed() {
-            tracing::warn!(job_id = %assignment.job_id, "live log delivery was degraded");
         }
 
         let uploaded_artifacts = match report_artifacts(
@@ -948,8 +989,12 @@ impl RunnerAgent {
             .map(|sr| {
                 serde_json::json!({
                     "exit_code": sr.exit_code,
-                    "stdout": sr.stdout,
-                    "stderr": sr.stderr,
+                    // Output is already streamed to the durable log ledger.
+                    // Keep the completion receipt bounded so a scanner that
+                    // emits megabytes cannot make the completion request fail
+                    // and leave the assignment eligible for re-execution.
+                    "stdout": bounded_receipt_text(&sr.stdout),
+                    "stderr": bounded_receipt_text(&sr.stderr),
                 })
             })
             .collect();
@@ -972,10 +1017,52 @@ impl RunnerAgent {
         match complete_request_builder.send().await {
             Ok(response) if response.status().is_success() => {}
             Ok(response) => {
-                tracing::error!("scheduler rejected job completion: {}", response.status())
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                tracing::error!(
+                    job_id = %assignment.job_id,
+                    runner_id = %runner_id,
+                    status = %status,
+                    response_body = %body,
+                    "scheduler rejected job completion"
+                );
             }
             Err(error) => tracing::error!("failed to report job completion: {}", error),
         }
+    }
+}
+
+const MAX_RECEIPT_STREAM_BYTES: usize = 64 * 1024;
+
+fn bounded_receipt_text(value: &str) -> String {
+    if value.len() <= MAX_RECEIPT_STREAM_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_RECEIPT_STREAM_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[output truncated; full output is available in the job log ledger]",
+        &value[..end]
+    )
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::{bounded_receipt_text, MAX_RECEIPT_STREAM_BYTES};
+
+    #[test]
+    fn receipt_output_is_bounded_and_marked() {
+        let output = "x".repeat(MAX_RECEIPT_STREAM_BYTES + 100);
+        let receipt = bounded_receipt_text(&output);
+        assert!(receipt.len() < MAX_RECEIPT_STREAM_BYTES + 100);
+        assert!(receipt.contains("output truncated"));
+    }
+
+    #[test]
+    fn receipt_output_preserves_small_output() {
+        assert_eq!(bounded_receipt_text("ok"), "ok");
     }
 }
 
