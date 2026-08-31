@@ -8,7 +8,6 @@ set -euo pipefail
 BROWSER="chromium"
 PARALLEL=1
 MAX_PARALLEL="${E2E_MAX_WORKERS:-4}"
-COVERAGE=false
 REPORT_FORMAT="list"
 TIMEOUT=30000
 BASE_URL="${E2E_BASE_URL:-http://localhost:3000}"
@@ -26,7 +25,6 @@ E2E Test Runner — runs Playwright tests with configurable options.
 OPTIONS
   -b, --browser BROWSER     Browser to use: chromium, firefox, webkit (default: chromium)
   -p, --parallel N          Number of parallel workers (default: 1)
-  -c, --coverage            Enable coverage collection (default: false)
   -r, --report FORMAT       Report format: list, html, json (default: list)
   -t, --timeout MS          Test timeout in milliseconds (default: 30000)
   -u, --base-url URL        Base URL for tests (default: http://localhost:3000)
@@ -36,8 +34,8 @@ OPTIONS
 
 EXAMPLES
   $(basename "$0") --browser firefox --parallel 4
-  $(basename "$0") --coverage --report html --timeout 60000
-  $(basename "$0") -b webkit -p 2 -c -r json -e API_KEY=test123
+  $(basename "$0") --report html --timeout 60000
+  $(basename "$0") -b webkit -p 2 -r json -e API_KEY=test123
 
 ENVIRONMENT
   E2E_BASE_URL       Base URL (default: http://localhost:3000)
@@ -59,10 +57,6 @@ while [[ $# -gt 0 ]]; do
 		-p|--parallel)
 			PARALLEL="$2"
 			shift 2
-			;;
-		-c|--coverage)
-			COVERAGE=true
-			shift
 			;;
 		-r|--report)
 			REPORT_FORMAT="$2"
@@ -167,11 +161,6 @@ if [[ -n "$ENV_VARS" ]]; then
 	done <<< "$ENV_VARS"
 fi
 
-# Coverage flags
-if [[ "$COVERAGE" == true ]]; then
-	export E2E_COVERAGE=true
-fi
-
 # ── Ensure Report Directory Exists ─────────────────────────────────────────────
 mkdir -p "$REPORT_DIR"
 
@@ -179,7 +168,6 @@ mkdir -p "$REPORT_DIR"
 echo "=== E2E Test Runner ==="
 echo "Browser:     $BROWSER"
 echo "Parallel:    $PARALLEL"
-echo "Coverage:    $COVERAGE"
 echo "Report:      $REPORT_FORMAT"
 echo "Timeout:     ${TIMEOUT}ms"
 echo "Base URL:    $BASE_URL"

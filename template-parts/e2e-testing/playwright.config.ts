@@ -9,7 +9,6 @@ const snapshotDir = process.env.E2E_SNAPSHOT_DIR || './tests/e2e/snapshots';
  *
  * Full-featured config for dark-factory E2E testing with:
  * - Multi-browser support (Chromium, Firefox, WebKit)
- * - Coverage collection via @vitest/coverage-v8
  * - Rich reporting (list, HTML, JSON)
  * - Debugging aids (traces, screenshots, videos)
  */
@@ -97,23 +96,6 @@ export default defineConfig({
 		actionTimeout: 10000,
 		navigationTimeout: 30000,
 	},
-
-	// ── Coverage ───────────────────────────────────────────────────────────────
-	// Note: Requires @vitest/coverage-v8 and coverage setup in test files
-	coverage: process.env.E2E_COVERAGE === 'true'
-		? {
-				provider: 'v8',
-				reporter: ['text', 'json', 'html'],
-				reportsDirectory: './test-reports/coverage',
-				exclude: [
-					'node_modules/**',
-					'dist/**',
-					'tests/**',
-					'**/*.config.ts',
-					'**/global-*.ts',
-				],
-		  }
-		: undefined,
 
 	// ── Web Server (optional) ─────────────────────────────────────────────────
 	webServer: process.env.CI
