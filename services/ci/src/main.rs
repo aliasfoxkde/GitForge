@@ -84,6 +84,24 @@ async fn main() -> anyhow::Result<()> {
         (Scheduler::new(), None)
     };
 
+    // Recover runs stranded non-terminal by a previous process lifetime, then
+    // reclaim workspaces of already-terminal runs. Spawned so a large sweep
+    // cannot delay startup; it only ever touches run-owned directories of
+    // terminal runs, never the checkout of a run the scheduler may requeue.
+    if let Some(pool) = &scheduler_db {
+        let sweep_pool = pool.clone();
+        tokio::spawn(async move {
+            let finalized = reconcile_orphaned_runs(&sweep_pool).await;
+            if finalized > 0 {
+                tracing::info!(finalized, "startup run reconciliation complete");
+            }
+            let removed = sweep_terminal_workspaces(&sweep_pool).await;
+            if removed > 0 {
+                tracing::info!(removed, "startup workspace sweep complete");
+            }
+        });
+    }
+
     // Start scheduler HTTP API server on port 42781
     let scheduler_port: u16 = std::env::var("SCHEDULER_PORT")
         .unwrap_or_else(|_| "42781".to_string())
@@ -466,8 +484,7 @@ fn validate_workspace_path(path: &str) -> Result<String, String> {
     if !workspace.is_dir() {
         return Err("workspace must be a directory".to_string());
     }
-    let root_path = std::env::var("GITFORGE_WORKSPACE_ROOT")
-        .unwrap_or_else(|_| "/nas/Temp/control-center-workspaces".to_string());
+    let root_path = workspace_root();
     let root = std::fs::canonicalize(&root_path)
         .map_err(|error| format!("workspace root is not accessible: {}", error))?;
     if !workspace.starts_with(&root) {
@@ -543,6 +560,161 @@ async fn load_pipeline_from_commit(
     })
 }
 
+/// Single source of truth for the run-workspace root, so workspace creation,
+/// path validation, and cleanup cannot drift onto different defaults.
+fn workspace_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("GITFORGE_WORKSPACE_ROOT")
+            .unwrap_or_else(|_| "/var/lib/gitforge/workspaces".to_string()),
+    )
+}
+
+/// Delete a run's workspace directory. Only directories GitForge itself
+/// created — `<root>/<run id>` — are ever removed. A caller-supplied working
+/// directory inside the root may share the tree and must survive the run.
+/// Returns whether a directory was removed.
+async fn remove_run_workspace_dir(
+    root: &std::path::Path,
+    run_id: gitforge_common::PipelineRunId,
+    path: Option<&str>,
+) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let workspace = std::path::PathBuf::from(path);
+    if workspace != root.join(run_id.to_string()) {
+        tracing::debug!(
+            %run_id,
+            workspace = %workspace.display(),
+            "workspace is not run-owned; leaving it in place"
+        );
+        return false;
+    }
+    match tokio::fs::remove_dir_all(&workspace).await {
+        Ok(()) => {
+            tracing::info!(%run_id, workspace = %workspace.display(), "removed run workspace");
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::warn!(
+                %run_id,
+                %error,
+                workspace = %workspace.display(),
+                "failed to remove run workspace"
+            );
+            false
+        }
+    }
+}
+
+/// Finalize runs left non-terminal by a previous process lifetime whose jobs
+/// are all already terminal (or were never enqueued). Without this, a
+/// control-plane restart strands such runs in `running` forever: no engine
+/// exists to observe their completion. Runs with unfinished jobs are left
+/// alone — scheduler recovery still owns those. Returns the number of runs
+/// finalized.
+async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
+    let runs = match gitforge_db::queries::PipelineRunQueries::list(pool).await {
+        Ok(runs) => runs,
+        Err(error) => {
+            tracing::warn!(%error, "run reconciliation skipped");
+            return 0;
+        }
+    };
+
+    let mut finalized = 0;
+    for run in runs {
+        if matches!(
+            run.status.as_str(),
+            "succeeded" | "failed" | "cancelled" | "timed_out" | "timeout" | "timed-out"
+        ) {
+            continue;
+        }
+        let jobs = gitforge_db::queries::JobQueries::list_by_run(pool, run.id)
+            .await
+            .unwrap_or_default();
+        let unfinished = jobs.iter().any(|job| {
+            gitforge_db::models::JobStatus::from_str(&job.status)
+                .is_some_and(|status| !status.is_terminal())
+        });
+        if unfinished {
+            continue;
+        }
+        let status = if jobs.is_empty() {
+            // No engine will ever enqueue work for this run.
+            "cancelled"
+        } else if jobs.iter().any(|job| job.status == "cancelled") {
+            "cancelled"
+        } else if jobs.iter().any(|job| job.status == "failed") {
+            "failed"
+        } else {
+            "succeeded"
+        };
+        if gitforge_db::queries::PipelineRunQueries::update_status(pool, run.id, status)
+            .await
+            .is_ok()
+        {
+            tracing::info!(run = %run.id, status, "finalized orphaned run");
+            finalized += 1;
+        }
+    }
+    finalized
+}
+
+/// Remove workspaces left behind by runs that are already terminal — for
+/// example after a crash or control-plane restart. Non-terminal and unknown
+/// runs are left untouched: a requeued job still executes in its original
+/// checkout. Returns the number of directories removed.
+async fn sweep_terminal_workspaces(pool: &gitforge_db::Pool) -> usize {
+    let root = workspace_root();
+    let mut entries = match tokio::fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, root = %root.display(), "workspace sweep skipped");
+            return 0;
+        }
+    };
+
+    let mut removed = 0;
+    while let Some(entry) = entries.next_entry().await.transpose() {
+        let Ok(entry) = entry else { continue };
+        if !entry.path().is_dir() {
+            continue;
+        }
+        // GitForge-created workspaces are named exactly by their run ID.
+        let Some(uuid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<uuid::Uuid>().ok())
+        else {
+            continue;
+        };
+        let run_id = gitforge_common::PipelineRunId::from(uuid);
+        let run = gitforge_db::queries::PipelineRunQueries::get(pool, run_id)
+            .await
+            .ok()
+            .flatten();
+        let is_terminal = run.is_some_and(|run| {
+            matches!(
+                run.status.as_str(),
+                "succeeded" | "failed" | "cancelled" | "timed_out" | "timeout" | "timed-out"
+            )
+        });
+        if !is_terminal {
+            continue;
+        }
+        if remove_run_workspace_dir(&root, run_id, Some(&entry.path().to_string_lossy())).await {
+            removed += 1;
+        }
+    }
+
+    if removed > 0 {
+        tracing::info!(removed, "swept workspaces of terminal runs");
+    }
+    removed
+}
+
 /// Create an isolated checkout for a push-triggered run when the caller did
 /// not supply an already prepared workspace. The checkout is rooted under a
 /// configured directory and named by the immutable run ID, so concurrent runs
@@ -572,10 +744,9 @@ async fn prepare_run_workspace(
         ));
     }
 
-    let root = std::env::var("GITFORGE_WORKSPACE_ROOT")
-        .unwrap_or_else(|_| "/var/lib/gitforge/workspaces".to_string());
+    let root = workspace_root();
     tokio::fs::create_dir_all(&root).await?;
-    let workspace = std::path::PathBuf::from(root).join(run_id.to_string());
+    let workspace = root.join(run_id.to_string());
     if tokio::fs::try_exists(&workspace).await? {
         return Err(anyhow::anyhow!(
             "workspace already exists for run {}",
@@ -988,10 +1159,19 @@ async fn run_scheduler_event_consumer(
                 )
                 .await;
             }
-            run_workspace_paths
+            let workspace_path = run_workspace_paths
                 .lock()
                 .expect("workspace cache lock poisoned")
-                .remove(&state.run_id);
+                .remove(&state.run_id)
+                .flatten();
+            // Free the checkout once nothing references it. Spawned so a
+            // large delete cannot stall completion processing for other
+            // runs; removal only ever targets the run-owned directory.
+            let root = workspace_root();
+            let run_id = state.run_id;
+            tokio::spawn(async move {
+                remove_run_workspace_dir(&root, run_id, workspace_path.as_deref()).await;
+            });
             pipeline_registry.write().await.remove(&state.run_id);
         }
     }
@@ -1303,6 +1483,246 @@ mod tests {
         )
         .await;
         (bare, without, with)
+    }
+
+    /// Pool with a user, repository, and pipeline for run-seeding tests.
+    async fn sweep_test_pool() -> (
+        gitforge_db::Pool,
+        gitforge_common::RepoId,
+        gitforge_common::PipelineId,
+    ) {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "sweep-owner".to_string(),
+            "sweep@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "sweep-repo".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: "/tmp/sweep-repo".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: "sweep-pipeline".to_string(),
+                trigger_type: "push".to_string(),
+                config: serde_json::json!({}),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        (pool, repo_id, pipeline_id)
+    }
+
+    async fn seed_run(
+        pool: &gitforge_db::Pool,
+        repo_id: gitforge_common::RepoId,
+        pipeline_id: gitforge_common::PipelineId,
+        status: &str,
+    ) -> gitforge_common::PipelineRunId {
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline_id,
+            repo_id,
+            "push".to_string(),
+            "abc123".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(pool, &run)
+            .await
+            .unwrap();
+        gitforge_db::queries::PipelineRunQueries::update_status(pool, run.id, status)
+            .await
+            .unwrap();
+        run.id
+    }
+
+    #[tokio::test]
+    async fn test_remove_run_workspace_deletes_only_run_owned_directory() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-cleanup-tests")
+            .join(gitforge_common::PipelineRunId::new().to_string());
+        let run_id = gitforge_common::PipelineRunId::new();
+        let owned = root.join(run_id.to_string());
+        let foreign = root.join("operator-prepared");
+        tokio::fs::create_dir_all(owned.join("checkout"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(foreign.join("checkout"))
+            .await
+            .unwrap();
+        tokio::fs::write(owned.join("marker.txt"), "owned")
+            .await
+            .unwrap();
+        tokio::fs::write(foreign.join("marker.txt"), "foreign")
+            .await
+            .unwrap();
+
+        assert!(
+            remove_run_workspace_dir(&root, run_id, Some(owned.to_str().unwrap())).await,
+            "run-owned workspace must be removed"
+        );
+        assert!(!tokio::fs::try_exists(&owned).await.unwrap());
+
+        // A caller-supplied directory inside the root must survive the run.
+        assert!(
+            !remove_run_workspace_dir(&root, run_id, Some(foreign.to_str().unwrap())).await,
+            "non-run-owned workspace must be left in place"
+        );
+        assert!(tokio::fs::try_exists(&foreign).await.unwrap());
+
+        // Removing an already-gone workspace and an absent path are no-ops.
+        assert!(!remove_run_workspace_dir(&root, run_id, Some(owned.to_str().unwrap())).await);
+        assert!(!remove_run_workspace_dir(&root, run_id, None).await);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_removes_only_terminal_run_workspaces() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        let succeeded = seed_run(&pool, repo_id, pipeline_id, "succeeded").await;
+        let failed = seed_run(&pool, repo_id, pipeline_id, "failed").await;
+        let running = seed_run(&pool, repo_id, pipeline_id, "running").await;
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-sweep-tests")
+            .join(gitforge_common::PipelineRunId::new().to_string());
+        for run in [succeeded, failed, running] {
+            tokio::fs::create_dir_all(root.join(run.to_string()).join("checkout"))
+                .await
+                .unwrap();
+        }
+        let foreign = root.join("operator-prepared");
+        tokio::fs::create_dir_all(foreign.join("checkout"))
+            .await
+            .unwrap();
+        let file = root.join("notes.txt");
+        tokio::fs::write(&file, "not a workspace").await.unwrap();
+
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", &root);
+        let removed = sweep_terminal_workspaces(&pool).await;
+
+        assert_eq!(removed, 2, "only terminal-run workspaces are swept");
+        assert!(!tokio::fs::try_exists(root.join(succeeded.to_string()))
+            .await
+            .unwrap());
+        assert!(!tokio::fs::try_exists(root.join(failed.to_string()))
+            .await
+            .unwrap());
+        assert!(
+            tokio::fs::try_exists(root.join(running.to_string()))
+                .await
+                .unwrap(),
+            "non-terminal run workspace must be kept"
+        );
+        assert!(
+            tokio::fs::try_exists(&foreign).await.unwrap(),
+            "non-run-owned directory must be kept"
+        );
+        assert!(tokio::fs::try_exists(&file).await.unwrap());
+    }
+
+    async fn seed_job(
+        pool: &gitforge_db::Pool,
+        run_id: gitforge_common::PipelineRunId,
+        name: &str,
+        status: &str,
+    ) {
+        let job = gitforge_db::models::Job::new(run_id, name.to_string());
+        gitforge_db::queries::JobQueries::create(pool, &job)
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::update_status(pool, job.id, status)
+            .await
+            .unwrap();
+    }
+
+    async fn run_status(
+        pool: &gitforge_db::Pool,
+        run_id: gitforge_common::PipelineRunId,
+    ) -> String {
+        gitforge_db::queries::PipelineRunQueries::get(pool, run_id)
+            .await
+            .unwrap()
+            .expect("seeded run")
+            .status
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_finalizes_orphaned_runs() {
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+
+        let all_succeeded = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, all_succeeded, "lint", "succeeded").await;
+        seed_job(&pool, all_succeeded, "test", "succeeded").await;
+
+        let mixed_failed = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, mixed_failed, "lint", "succeeded").await;
+        seed_job(&pool, mixed_failed, "test", "failed").await;
+
+        let cancelled_job = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, cancelled_job, "lint", "cancelled").await;
+
+        let still_active = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, still_active, "lint", "queued").await;
+
+        let jobless = seed_run(&pool, repo_id, pipeline_id, "queued").await;
+
+        let finalized = reconcile_orphaned_runs(&pool).await;
+
+        assert_eq!(
+            run_status(&pool, all_succeeded).await,
+            "succeeded",
+            "all-terminal-jobs run must finalize to succeeded"
+        );
+        assert_eq!(
+            run_status(&pool, mixed_failed).await,
+            "failed",
+            "any failed job must finalize the run as failed"
+        );
+        assert_eq!(
+            run_status(&pool, cancelled_job).await,
+            "cancelled",
+            "a cancelled job must finalize the run as cancelled"
+        );
+        assert_eq!(
+            run_status(&pool, jobless).await,
+            "cancelled",
+            "a run with no jobs can never start; it is cancelled"
+        );
+        assert_eq!(
+            run_status(&pool, still_active).await,
+            "running",
+            "runs with unfinished jobs belong to scheduler recovery, not reconciliation"
+        );
+        assert_eq!(finalized, 4, "only the orphaned runs are finalized");
+
+        // Reconciliation is idempotent: a second pass finds nothing stranded.
+        assert_eq!(reconcile_orphaned_runs(&pool).await, 0);
     }
 
     #[tokio::test]
