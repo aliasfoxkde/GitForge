@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
+const CI_TRIGGER_URL: &str = "http://127.0.0.1:42781/pipelines/trigger";
+
 /// Webhook payload for triggering a pipeline
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WebhookTriggerPayload {
@@ -50,7 +52,6 @@ pub struct WebhookTriggerResponse {
 /// register the pipeline engine, and progress the dependency DAG.
 #[derive(Clone)]
 pub struct CiTriggerClient {
-    url: reqwest::Url,
     token: String,
     client: reqwest::Client,
 }
@@ -59,21 +60,14 @@ impl CiTriggerClient {
     pub fn new(url: impl Into<String>, token: impl Into<String>) -> Result<Self, String> {
         let url = reqwest::Url::parse(&url.into())
             .map_err(|error| format!("invalid CI trigger URL: {error}"))?;
-        if !matches!(url.scheme(), "http" | "https")
-            || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
-            || url.port_or_known_default() != Some(42781)
-            || url.path() != "/pipelines/trigger"
-            || !url.username().is_empty()
-            || url.password().is_some()
-        {
+        if url.as_str().trim_end_matches('/') != CI_TRIGGER_URL {
             return Err(
-                "CI trigger URL must target loopback port 42781 at /pipelines/trigger without credentials"
+                "CI trigger URL must be the fixed loopback endpoint http://127.0.0.1:42781/pipelines/trigger"
                     .to_string(),
             );
         }
 
         Ok(Self {
-            url,
             token: token.into(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -95,7 +89,9 @@ impl CiTriggerClient {
             .unwrap_or("0000000000000000000000000000000000000000");
         let response = self
             .client
-            .post(self.url.clone())
+            // The configured value is validated at startup, but never reaches
+            // this request sink; the deployed CI endpoint is fixed.
+            .post(CI_TRIGGER_URL)
             .header("x-gitforge-trigger-token", &self.token)
             .json(&serde_json::json!({
                 "repo_id": repo_id.to_string(),
