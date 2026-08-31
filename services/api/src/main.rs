@@ -54,9 +54,9 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("GITFORGE_CI_TRIGGER_URL").ok(),
         std::env::var("GITFORGE_CI_TRIGGER_TOKEN").ok(),
     ) {
-        (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
-            Some(Arc::new(CiTriggerClient::new(url, token)?))
-        }
+        (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => Some(
+            Arc::new(CiTriggerClient::new(url, token).map_err(anyhow::Error::msg)?),
+        ),
         (None, None) => None,
         _ => anyhow::bail!(
             "GITFORGE_CI_TRIGGER_URL and GITFORGE_CI_TRIGGER_TOKEN must be configured together"

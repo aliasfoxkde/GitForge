@@ -50,19 +50,33 @@ pub struct WebhookTriggerResponse {
 /// register the pipeline engine, and progress the dependency DAG.
 #[derive(Clone)]
 pub struct CiTriggerClient {
-    url: String,
+    url: reqwest::Url,
     token: String,
     client: reqwest::Client,
 }
 
 impl CiTriggerClient {
-    pub fn new(url: impl Into<String>, token: impl Into<String>) -> Result<Self, reqwest::Error> {
+    pub fn new(url: impl Into<String>, token: impl Into<String>) -> Result<Self, String> {
+        let url = reqwest::Url::parse(&url.into())
+            .map_err(|error| format!("invalid CI trigger URL: {error}"))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(
+                "CI trigger URL must use http/https, include a host, and omit credentials"
+                    .to_string(),
+            );
+        }
+
         Ok(Self {
-            url: url.into().trim_end_matches('/').to_string(),
+            url,
             token: token.into(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
-                .build()?,
+                .build()
+                .map_err(|error| format!("failed to build CI trigger client: {error}"))?,
         })
     }
 
@@ -78,7 +92,7 @@ impl CiTriggerClient {
             .unwrap_or("0000000000000000000000000000000000000000");
         let response = self
             .client
-            .post(&self.url)
+            .post(self.url.clone())
             .header("x-gitforge-trigger-token", &self.token)
             .json(&serde_json::json!({
                 "repo_id": repo_id.to_string(),
