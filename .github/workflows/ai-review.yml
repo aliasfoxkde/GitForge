@@ -105,9 +105,12 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
+          env:
+            REVIEW_SUMMARY: ${{ steps.review.outputs.summary }}
+            CRITICAL_FINDINGS: ${{ steps.review.outputs.critical_findings }}
           script: |
-            const summary = `${{ steps.review.outputs.summary || 'Review completed' }}`;
-            const hasCritical = `${{ steps.review.outputs.critical_findings }}` === 'true';
+            const summary = process.env.REVIEW_SUMMARY || 'Review completed';
+            const hasCritical = process.env.CRITICAL_FINDINGS === 'true';
 
             const body = `
             ## 🤖 AI Code Review Results
