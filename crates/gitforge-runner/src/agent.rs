@@ -1361,6 +1361,23 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_job_assignment_defaults_timeout() {
+        let assignment: JobAssignment = serde_json::from_str(
+            r#"{
+                "job_id":"legacy-job",
+                "name":"test",
+                "pipeline_run_id":"run-legacy",
+                "commands":["true"],
+                "image":"rust:latest",
+                "working_dir":null
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(assignment.timeout_secs, 300);
+    }
+
+    #[test]
     fn test_job_assignment_without_working_dir() {
         let assignment = JobAssignment {
             job_id: "job-456".to_string(),
