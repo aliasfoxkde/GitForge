@@ -724,6 +724,32 @@ mod tests {
         assert!(job.env.is_empty());
     }
 
+    #[tokio::test]
+    #[ignore]
+    async fn test_real_docker_job_timeout_reaps_sandbox() {
+        let executor = JobExecutor::new().await.expect("Docker must be available");
+        let job_id = JobId::new();
+        let job = ExecutableJob::new(job_id, PipelineRunId::new(), "alpine:latest".to_string())
+            .with_steps(vec![JobStep::new("hang", "sleep 30")])
+            .with_timeout(5);
+
+        let result = executor.execute(job).await;
+
+        assert!(!result.success);
+        assert_eq!(result.exit_code, -1);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("timeout")));
+        assert_eq!(executor.active_job_count().await, 0);
+        assert!(executor
+            .pool
+            .sandbox
+            .remove_job_containers(job_id)
+            .await
+            .is_ok());
+    }
+
     #[test]
     fn test_job_step_new() {
         let step = JobStep::new("lint", "cargo clippy");
