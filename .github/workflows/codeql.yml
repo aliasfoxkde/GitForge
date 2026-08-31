@@ -33,7 +33,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@ce28f5bb42b7a9f2c824e633a3f6ee835bab6858 # v3.29.0
+        uses: github/codeql-action/init@03e4368ac7daa2bd82b3e85262f3bf87ee112f57 # v3.36.0
         with:
           languages: ${{ matrix.language }}
           queries: security-and-quality
@@ -45,7 +45,7 @@ jobs:
               - 'template-parts/**'
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@ce28f5bb42b7a9f2c824e633a3f6ee835bab6858 # v3.29.0
+        uses: github/codeql-action/autobuild@03e4368ac7daa2bd82b3e85262f3bf87ee112f57 # v3.36.0
         if: matrix.language == 'go'
 
       - name: Build Rust
@@ -58,6 +58,6 @@ jobs:
           cargo build --workspace --locked
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@ce28f5bb42b7a9f2c824e633a3f6ee835bab6858 # v3.29.0
+        uses: github/codeql-action/analyze@03e4368ac7daa2bd82b3e85262f3bf87ee112f57 # v3.36.0
         with:
           category: "/language:${{matrix.language}}"
