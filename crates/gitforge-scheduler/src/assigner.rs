@@ -303,10 +303,12 @@ impl Scheduler {
             job_id,
             pipeline_run_id,
             repo_id,
-            commands,
-            image,
-            working_dir,
-            DEFAULT_JOB_TIMEOUT_SECS,
+            JobExecutionDefinition {
+                commands,
+                image,
+                working_dir,
+                timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+            },
         )
         .await;
     }
@@ -317,21 +319,18 @@ impl Scheduler {
         job_id: JobId,
         pipeline_run_id: PipelineRunId,
         repo_id: RepoId,
-        commands: Vec<String>,
-        image: String,
-        working_dir: Option<String>,
-        timeout_secs: u64,
+        definition: JobExecutionDefinition,
     ) {
-        let timeout_secs = timeout_secs.clamp(5, 24 * 60 * 60);
+        let timeout_secs = definition.timeout_secs.clamp(5, 24 * 60 * 60);
         let job = QueuedJob::new(job_id, pipeline_run_id, repo_id);
         let mut state = self.state.write().await;
         state.queue.enqueue(job);
         state.job_definitions.insert(
             job_id,
             JobExecutionDefinition {
-                commands: commands.clone(),
-                image: image.clone(),
-                working_dir: working_dir.clone(),
+                commands: definition.commands.clone(),
+                image: definition.image.clone(),
+                working_dir: definition.working_dir.clone(),
                 timeout_secs,
             },
         );
@@ -352,9 +351,9 @@ impl Scheduler {
             if let Err(e) = gitforge_db::queries::JobQueries::set_definition_with_image_and_timeout(
                 pool,
                 job_id,
-                &commands,
-                &image,
-                working_dir.as_deref(),
+                &definition.commands,
+                &definition.image,
+                definition.working_dir.as_deref(),
                 timeout_secs,
             )
             .await
@@ -1239,10 +1238,12 @@ mod tests {
                 job_id,
                 run_id,
                 repo_id,
-                vec!["echo image".to_string()],
-                "node:22".to_string(),
-                Some("/workspace".to_string()),
-                900,
+                JobExecutionDefinition {
+                    commands: vec!["echo image".to_string()],
+                    image: "node:22".to_string(),
+                    working_dir: Some("/workspace".to_string()),
+                    timeout_secs: 900,
+                },
             )
             .await;
 
