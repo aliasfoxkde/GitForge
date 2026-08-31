@@ -10,9 +10,12 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use gitforge_common::{JobId, PipelineId, PipelineRunId, RepoId};
-use gitforge_db::{queries::PipelineQueries, Pool};
-use gitforge_scheduler::Scheduler;
+use gitforge_common::{JobId, PipelineId, RepoId};
+use gitforge_db::{
+    queries::{PipelineQueries, PipelineRunQueries},
+    Pool,
+};
+use gitforge_scheduler::{assigner::JobExecutionDefinition, Scheduler};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -74,8 +77,105 @@ async fn trigger_pipeline(
 
     // Verify pipeline exists
     match PipelineQueries::get(&pool, pipeline_uuid).await {
-        Ok(Some(_pipeline)) => {
-            // Pipeline exists - enqueue jobs to scheduler
+        Ok(Some(pipeline)) => {
+            let repo_id = match uuid::Uuid::parse_str(&payload.repo_id) {
+                Ok(uuid) if RepoId::from(uuid) == pipeline.repo_id => RepoId::from(uuid),
+                _ => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(WebhookTriggerResponse {
+                            success: false,
+                            message: "Webhook repository does not match pipeline".to_string(),
+                            pipeline_id: None,
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+
+            let definition: gitforge_ci::PipelineDefinition = match serde_json::from_value(
+                pipeline.config.clone(),
+            ) {
+                Ok(definition) => definition,
+                Err(error) => {
+                    tracing::error!(%error, %pipeline_id, "stored pipeline definition is invalid");
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(WebhookTriggerResponse {
+                            success: false,
+                            message: "Stored pipeline definition is invalid".to_string(),
+                            pipeline_id: None,
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+            let Some(job_definition) = definition.jobs.iter().find(|job| job.needs.is_empty())
+            else {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(WebhookTriggerResponse {
+                        success: false,
+                        message: "Pipeline has no runnable entry job".to_string(),
+                        pipeline_id: None,
+                    }),
+                )
+                    .into_response();
+            };
+            let timeout_secs = match job_definition.timeout_secs() {
+                Ok(timeout_secs) => timeout_secs,
+                Err(error) => {
+                    tracing::error!(%error, job = %job_definition.name, "pipeline job timeout is invalid");
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(WebhookTriggerResponse {
+                            success: false,
+                            message: format!(
+                                "Invalid timeout for job '{}': {error}",
+                                job_definition.name
+                            ),
+                            pipeline_id: None,
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+            let commands = job_definition
+                .steps
+                .iter()
+                .map(|step| step.run.clone())
+                .collect();
+            let working_dir = job_definition
+                .steps
+                .iter()
+                .find_map(|step| step.working_directory.clone());
+
+            // Persist the run before queueing so scheduler job foreign keys
+            // and recovery have a durable parent record.
+            let run = gitforge_db::models::PipelineRun::new(
+                pipeline.id,
+                repo_id,
+                "webhook".to_string(),
+                payload.commit_hash.clone(),
+            );
+            let run_id = run.id;
+            if let Err(error) = PipelineRunQueries::create(&pool, &run).await {
+                tracing::error!(%error, %pipeline_id, "failed to persist webhook pipeline run");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(WebhookTriggerResponse {
+                        success: false,
+                        message: "Failed to persist pipeline run".to_string(),
+                        pipeline_id: None,
+                    }),
+                )
+                    .into_response();
+            }
+
+            // Pipeline exists - enqueue its first runnable job with the
+            // stored execution contract. Dependent-job progression is handled
+            // by the CI DAG integration and is intentionally not fabricated
+            // by this webhook adapter.
             tracing::info!(
                 "Triggering pipeline {} for repo {} at commit {}",
                 pipeline_id,
@@ -84,15 +184,23 @@ async fn trigger_pipeline(
             );
 
             // Create a job for this pipeline run
-            let repo_id = uuid::Uuid::parse_str(&payload.repo_id)
-                .map(RepoId::from)
-                .unwrap_or_else(|_| RepoId::new());
-            let run_id = PipelineRunId::new();
             let job_id = JobId::new();
 
             // Enqueue the job to the scheduler (if available)
             if let Some(sched) = &scheduler {
-                sched.enqueue(job_id, run_id, repo_id).await;
+                sched
+                    .enqueue_with_definition_and_image_and_timeout(
+                        job_id,
+                        run_id,
+                        repo_id,
+                        JobExecutionDefinition {
+                            commands,
+                            image: job_definition.image.clone(),
+                            working_dir,
+                            timeout_secs,
+                        },
+                    )
+                    .await;
                 tracing::info!(
                     "Enqueued job {} for pipeline {} on branch {}",
                     job_id,
