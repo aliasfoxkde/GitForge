@@ -161,6 +161,28 @@ GitForge is a self-hosted Git platform with CI/CD capabilities. This document au
 
 ## Verified continuation findings — 2026-08-26
 
+## Verified continuation findings — 2026-08-31 Docker mode correction
+
+The older Docker sandbox entry above is historical and no longer describes the
+current production construction path. Current source inspection at GitForge
+`origin/main` `609ad25` shows:
+
+- `RunnerAgent::new` constructs the sandbox with
+  `DockerSandbox::connect_required().await?`.
+- `ContainerPool::new` uses the same required-Docker constructor.
+- `connect_required` connects to and pings the Docker daemon, returning an
+  error when Docker is unavailable.
+- `stub_for_tests` is an explicitly named test constructor. The deprecated
+  `with_limits` constructor is also documented as stub-only.
+
+Therefore production runner startup cannot silently enter stub mode through the
+standard constructors. Stub execution still intentionally returns synthetic
+success for unit tests, so callers must not use it for production validation;
+the API should retain this explicit-mode boundary in future refactors. The
+remaining operational qualification is to build/promote the exact GitForge
+source SHA on Fedora after disk and swap admission recover, then run one
+authenticated disposable job through the real Docker path.
+
 ## Verified continuation findings — 2026-08-27
 
 - Added persisted user roles with a `developer` default for legacy accounts;
