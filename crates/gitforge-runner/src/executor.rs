@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::RwLock;
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant};
 
 /// Default number of pre-warmed containers per image
 const POOL_SIZE: usize = 2;
@@ -278,10 +278,12 @@ impl JobExecutor {
     ) -> JobResult {
         let job_id = job.job_id; // Copy type
         let started_at = chrono::Utc::now();
+        let job_timeout = Duration::from_secs(job.timeout_secs.clamp(5, 24 * 60 * 60));
+        let deadline = Instant::now() + job_timeout;
         tracing::info!("executing job {}", job_id);
 
         // Acquire container from pool
-        let acquire_timeout = Duration::from_secs(job.timeout_secs.clamp(5, 60));
+        let acquire_timeout = job_timeout.min(Duration::from_secs(60));
         let instance = match timeout(
             acquire_timeout,
             self.pool
@@ -346,20 +348,28 @@ impl JobExecutor {
         let mut step_results = Vec::new();
         let mut success = true;
         let mut final_exit_code = 0;
+        let mut timed_out = false;
 
         for step in &job.steps {
             tracing::debug!("executing step: {}", step.name);
             let cmd = vec!["sh", "-c", &step.run];
 
-            let result = timeout(
-                Duration::from_secs(job.timeout_secs),
-                self.pool
-                    .sandbox
-                    .execute_with_output(&instance, &cmd, output_sink.clone()),
-            )
-            .await
-            .map_err(|_| gitforge_common::Error::timeout("job step timed out"))
-            .and_then(|result| result);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let result = if remaining.is_zero() {
+                Err(gitforge_common::Error::timeout(
+                    "job timed out before step started",
+                ))
+            } else {
+                timeout(
+                    remaining,
+                    self.pool
+                        .sandbox
+                        .execute_with_output(&instance, &cmd, output_sink.clone()),
+                )
+                .await
+                .map_err(|_| gitforge_common::Error::timeout("job timed out"))
+                .and_then(|result| result)
+            };
 
             match result {
                 Ok(step_result) => {
@@ -378,6 +388,7 @@ impl JobExecutor {
                 Err(e) => {
                     success = false;
                     final_exit_code = -1;
+                    timed_out = deadline <= Instant::now();
                     step_results.push(StepResult {
                         exit_code: -1,
                         stdout: String::new(),
@@ -385,6 +396,22 @@ impl JobExecutor {
                     });
                     break;
                 }
+            }
+        }
+
+        // A dropped Docker exec stream does not guarantee that the process
+        // inside the container has exited.  Tear down the exact container
+        // immediately on timeout, before artifact/log collection, so timed-out
+        // jobs cannot leave an active exec or conmon helper behind.
+        if timed_out {
+            if timeout(
+                Duration::from_secs(15),
+                self.pool.sandbox.destroy(instance.clone()),
+            )
+            .await
+            .is_err()
+            {
+                tracing::error!(%job_id, "timed-out sandbox teardown exceeded 15 seconds");
             }
         }
 
@@ -402,14 +429,16 @@ impl JobExecutor {
             instances.remove(&job_id)
         };
         if let Some((image, workspace, inst)) = released {
-            if timeout(
-                Duration::from_secs(30),
-                self.pool.release(&image, inst, workspace.as_deref()),
-            )
-            .await
-            .is_err()
-            {
-                tracing::warn!("timed out cleaning up sandbox for job {}", job_id);
+            if !timed_out {
+                if timeout(
+                    Duration::from_secs(30),
+                    self.pool.release(&image, inst, workspace.as_deref()),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!("timed out cleaning up sandbox for job {}", job_id);
+                }
             }
         }
 
