@@ -36,17 +36,15 @@ async fn webhook_fixture(
     gitforge_db::queries::UserQueries::create(&pool, &user)
         .await
         .unwrap();
-    let repo_id = gitforge_common::RepoId::new();
-    gitforge_db::queries::RepoQueries::create(
-        &pool,
-        &gitforge_db::models::Repository::new(
-            "webhook-repo".to_string(),
-            user.id,
-            "/git/webhook-repo".to_string(),
-        ),
-    )
-    .await
-    .unwrap();
+    let repo = gitforge_db::models::Repository::new(
+        "webhook-repo".to_string(),
+        user.id,
+        "/git/webhook-repo".to_string(),
+    );
+    let repo_id = repo.id;
+    gitforge_db::queries::RepoQueries::create(&pool, &repo)
+        .await
+        .unwrap();
     let pipeline = gitforge_db::models::Pipeline {
         id: gitforge_common::PipelineId::new(),
         repo_id,
