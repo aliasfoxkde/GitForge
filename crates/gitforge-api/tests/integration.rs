@@ -7,6 +7,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use gitforge_api::{ApiAuth, ApiServer};
+use gitforge_ci::{JobDefinition, PipelineDefinition, StepDefinition, TriggerType};
 use gitforge_db::models::{Runner, RunnerType};
 use gitforge_db::Pool;
 use gitforge_scheduler::{
@@ -777,27 +778,7 @@ async fn test_scheduler_upload_is_downloadable_through_authenticated_api() {
         repo_id: repo.id,
         name: "boundary-pipeline".to_string(),
         trigger_type: "manual".to_string(),
-        config: serde_json::json!({
-            "name": "test-pipeline",
-            "version": "1.0",
-            "trigger_on": ["push"],
-            "environment": {},
-            "jobs": [{
-                "name": "test",
-                "image": "alpine:latest",
-                "needs": [],
-                "env": {},
-                "steps": [{
-                    "name": "smoke",
-                    "run": "printf webhook-test",
-                    "env": null,
-                    "working_directory": null,
-                    "condition": null
-                }],
-                "timeout": "30s",
-                "retry": null
-            }]
-        }),
+        config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
     };
     gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
@@ -1708,13 +1689,35 @@ async fn test_api_webhook_trigger_success() {
         .await
         .unwrap();
 
-    // Create a pipeline first
+    // Create a pipeline first with the same typed contract that the webhook
+    // deserializes from persisted configuration.
+    let pipeline_definition = PipelineDefinition {
+        name: "test-pipeline".to_string(),
+        version: "1.0".to_string(),
+        trigger_on: vec![TriggerType::Push],
+        environment: std::collections::HashMap::new(),
+        jobs: vec![JobDefinition {
+            name: "test".to_string(),
+            image: "alpine:latest".to_string(),
+            needs: vec![],
+            env: std::collections::HashMap::new(),
+            steps: vec![StepDefinition {
+                name: "smoke".to_string(),
+                run: "printf webhook-test".to_string(),
+                env: None,
+                working_directory: None,
+                condition: None,
+            }],
+            timeout: Some("30s".to_string()),
+            retry: None,
+        }],
+    };
     let pipeline = gitforge_db::models::Pipeline {
         id: gitforge_common::PipelineId::new(),
         repo_id,
         name: "test-pipeline".to_string(),
         trigger_type: "push".to_string(),
-        config: serde_json::json!({}),
+        config: serde_json::to_value(pipeline_definition).unwrap(),
         created_at: chrono::Utc::now(),
     };
     gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
