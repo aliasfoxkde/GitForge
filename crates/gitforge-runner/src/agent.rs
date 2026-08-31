@@ -468,6 +468,14 @@ pub struct JobAssignment {
     pub image: String,
     /// Working directory
     pub working_dir: Option<String>,
+    /// Maximum seconds allowed for each command. Defaults for old scheduler
+    /// responses are applied during deserialization.
+    #[serde(default = "default_job_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_job_timeout_secs() -> u64 {
+    300
 }
 
 fn default_job_image() -> String {
@@ -821,7 +829,7 @@ impl RunnerAgent {
                 .collect(),
             env: std::collections::HashMap::new(),
             working_dir: assignment.working_dir.clone(),
-            timeout_secs: 300,
+            timeout_secs: assignment.timeout_secs.clamp(5, 24 * 60 * 60),
         };
 
         tracing::info!("executing job {} in container", assignment.job_id);
@@ -1343,12 +1351,30 @@ mod tests {
             commands: vec!["cargo build".to_string(), "cargo test".to_string()],
             image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
+            timeout_secs: 300,
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
         let deserialized: JobAssignment = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.job_id, "job-123");
         assert_eq!(deserialized.commands.len(), 2);
+    }
+
+    #[test]
+    fn test_legacy_job_assignment_defaults_timeout() {
+        let assignment: JobAssignment = serde_json::from_str(
+            r#"{
+                "job_id":"legacy-job",
+                "name":"test",
+                "pipeline_run_id":"run-legacy",
+                "commands":["true"],
+                "image":"rust:latest",
+                "working_dir":null
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(assignment.timeout_secs, 300);
     }
 
     #[test]
@@ -1360,6 +1386,7 @@ mod tests {
             commands: vec!["cargo test".to_string()],
             image: "rust:latest".to_string(),
             working_dir: None,
+            timeout_secs: 300,
         };
         assert!(assignment.working_dir.is_none());
     }
@@ -1380,6 +1407,7 @@ mod tests {
             commands: vec!["cargo build".to_string()],
             image: "rust:latest".to_string(),
             working_dir: None,
+            timeout_secs: 300,
         };
         let debug_str = format!("{:?}", assignment);
         assert!(debug_str.contains("job-123"));
@@ -1410,6 +1438,7 @@ mod tests {
             commands: vec!["cargo build".to_string(), "cargo test".to_string()],
             image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
+            timeout_secs: 300,
         };
 
         // Test JSON serialization
@@ -1434,6 +1463,7 @@ mod tests {
             commands: vec![],
             image: "rust:latest".to_string(),
             working_dir: None,
+            timeout_secs: 300,
         };
         assert!(assignment.commands.is_empty());
         assert!(assignment.working_dir.is_none());
@@ -1454,6 +1484,7 @@ mod tests {
             commands,
             image: "rust:latest".to_string(),
             working_dir: Some("/project".to_string()),
+            timeout_secs: 300,
         };
         assert_eq!(assignment.commands.len(), 4);
     }
@@ -1536,6 +1567,7 @@ mod tests {
             commands: vec!["echo 1".to_string()],
             image: "rust:latest".to_string(),
             working_dir: None,
+            timeout_secs: 300,
         };
         let assignment2 = JobAssignment {
             job_id: "job-1".to_string(),
@@ -1544,6 +1576,7 @@ mod tests {
             commands: vec!["echo 1".to_string()],
             image: "rust:latest".to_string(),
             working_dir: None,
+            timeout_secs: 300,
         };
         // JobAssignment should implement PartialEq if we add it
         // For now just verify individual field equality
@@ -1560,6 +1593,7 @@ mod tests {
             commands: vec!["true".to_string()],
             image: "rust:latest".to_string(),
             working_dir: None,
+            timeout_secs: 300,
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
@@ -1624,6 +1658,7 @@ mod tests {
             commands,
             image: "rust:latest".to_string(),
             working_dir: None,
+            timeout_secs: 300,
         };
         assert_eq!(assignment.commands.len(), 100);
     }
@@ -1637,6 +1672,7 @@ mod tests {
             commands: vec!["echo clone".to_string()],
             image: "rust:latest".to_string(),
             working_dir: None,
+            timeout_secs: 300,
         };
         let cloned = assignment.clone();
         assert_eq!(cloned.job_id, assignment.job_id);
@@ -1652,6 +1688,7 @@ mod tests {
             commands: vec!["echo 测试".to_string()],
             image: "rust:latest".to_string(),
             working_dir: None,
+            timeout_secs: 300,
         };
         assert_eq!(assignment.name, "测试任务");
     }
@@ -1669,6 +1706,7 @@ mod tests {
             ],
             image: "rust:latest".to_string(),
             working_dir: None,
+            timeout_secs: 300,
         };
         assert_eq!(assignment.commands.len(), 3);
     }
@@ -1733,6 +1771,7 @@ mod tests {
             commands: vec!["echo test".to_string()],
             image: "rust:latest".to_string(),
             working_dir: Some("".to_string()),
+            timeout_secs: 300,
         };
         assert!(assignment.working_dir.is_some());
     }

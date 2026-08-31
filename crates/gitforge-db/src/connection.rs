@@ -192,6 +192,7 @@ impl Pool {
                 commands TEXT NOT NULL DEFAULT '[]',
                 image TEXT NOT NULL DEFAULT 'rust:latest',
                 working_dir TEXT,
+                timeout_secs INTEGER NOT NULL DEFAULT 300,
                 result_json TEXT,
                 FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id),
                 FOREIGN KEY (runner_id) REFERENCES runners(id)
@@ -209,6 +210,7 @@ impl Pool {
             "ALTER TABLE jobs ADD COLUMN commands TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE jobs ADD COLUMN image TEXT NOT NULL DEFAULT 'rust:latest'",
             "ALTER TABLE jobs ADD COLUMN working_dir TEXT",
+            "ALTER TABLE jobs ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 300",
             "ALTER TABLE jobs ADD COLUMN result_json TEXT",
             "ALTER TABLE jobs ADD COLUMN lease_token TEXT",
             "ALTER TABLE jobs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0",

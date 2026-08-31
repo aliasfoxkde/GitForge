@@ -47,6 +47,7 @@ pub struct PendingJobInfo {
     pub commands: Vec<String>,
     pub image: String,
     pub working_dir: Option<String>,
+    pub timeout_secs: u64,
     pub runner_id: String,
     pub lease_token: String,
 }
@@ -520,6 +521,7 @@ async fn get_pending_jobs(
                     commands: definition.commands,
                     image: definition.image,
                     working_dir: definition.working_dir,
+                    timeout_secs: definition.timeout_secs,
                     runner_id: runner_id.to_string(),
                     lease_token,
                 });
@@ -1396,6 +1398,7 @@ mod tests {
             commands: vec!["cargo build".to_string()],
             image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
+            timeout_secs: 300,
             runner_id: "runner-123".to_string(),
             lease_token: "lease-123".to_string(),
         };

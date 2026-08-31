@@ -103,6 +103,9 @@ pub async fn graceful_shutdown_delay() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_create_shutdown_flag_initial_state() {
@@ -184,6 +187,7 @@ mod tests {
 
     #[test]
     fn test_runner_service_config_from_env_success() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let _guard = temp_env::with_vars([
             ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
             ("GITFORGE_RUNNER_NAME", Some("test-runner")),
@@ -203,6 +207,7 @@ mod tests {
 
     #[test]
     fn test_runner_service_config_missing_scheduler_url() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let _guard = temp_env::with_vars([("GITFORGE_SCHEDULER_URL", None::<&str>)]);
         let result = gitforge_runner::RunnerConfig::from_env();
         assert!(

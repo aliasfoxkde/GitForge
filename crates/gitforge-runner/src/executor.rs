@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::RwLock;
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant};
 
 /// Default number of pre-warmed containers per image
 const POOL_SIZE: usize = 2;
@@ -278,10 +278,12 @@ impl JobExecutor {
     ) -> JobResult {
         let job_id = job.job_id; // Copy type
         let started_at = chrono::Utc::now();
+        let job_timeout = Duration::from_secs(job.timeout_secs.clamp(5, 24 * 60 * 60));
+        let deadline = Instant::now() + job_timeout;
         tracing::info!("executing job {}", job_id);
 
         // Acquire container from pool
-        let acquire_timeout = Duration::from_secs(job.timeout_secs.clamp(5, 60));
+        let acquire_timeout = job_timeout.min(Duration::from_secs(60));
         let instance = match timeout(
             acquire_timeout,
             self.pool
@@ -346,20 +348,29 @@ impl JobExecutor {
         let mut step_results = Vec::new();
         let mut success = true;
         let mut final_exit_code = 0;
+        let mut timed_out = false;
+        let mut failure_error = None;
 
         for step in &job.steps {
             tracing::debug!("executing step: {}", step.name);
             let cmd = vec!["sh", "-c", &step.run];
 
-            let result = timeout(
-                Duration::from_secs(job.timeout_secs),
-                self.pool
-                    .sandbox
-                    .execute_with_output(&instance, &cmd, output_sink.clone()),
-            )
-            .await
-            .map_err(|_| gitforge_common::Error::timeout("job step timed out"))
-            .and_then(|result| result);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let result = if remaining.is_zero() {
+                Err(gitforge_common::Error::timeout(
+                    "job timed out before step started",
+                ))
+            } else {
+                timeout(
+                    remaining,
+                    self.pool
+                        .sandbox
+                        .execute_with_output(&instance, &cmd, output_sink.clone()),
+                )
+                .await
+                .map_err(|_| gitforge_common::Error::timeout("job timed out"))
+                .and_then(|result| result)
+            };
 
             match result {
                 Ok(step_result) => {
@@ -378,14 +389,31 @@ impl JobExecutor {
                 Err(e) => {
                     success = false;
                     final_exit_code = -1;
+                    timed_out = deadline <= Instant::now();
+                    failure_error = Some(format!("execution error: {}", e));
                     step_results.push(StepResult {
                         exit_code: -1,
                         stdout: String::new(),
-                        stderr: format!("execution error: {}", e),
+                        stderr: failure_error.clone().unwrap_or_default(),
                     });
                     break;
                 }
             }
+        }
+
+        // A dropped Docker exec stream does not guarantee that the process
+        // inside the container has exited.  Tear down the exact container
+        // immediately on timeout, before artifact/log collection, so timed-out
+        // jobs cannot leave an active exec or conmon helper behind.
+        if timed_out
+            && timeout(
+                Duration::from_secs(15),
+                self.pool.sandbox.destroy(instance.clone()),
+            )
+            .await
+            .is_err()
+        {
+            tracing::error!(%job_id, "timed-out sandbox teardown exceeded 15 seconds");
         }
 
         // Collect artifacts
@@ -401,7 +429,7 @@ impl JobExecutor {
             let mut instances = self.active_instances.write().await;
             instances.remove(&job_id)
         };
-        if let Some((image, workspace, inst)) = released {
+        if let (Some((image, workspace, inst)), false) = (released, timed_out) {
             if timeout(
                 Duration::from_secs(30),
                 self.pool.release(&image, inst, workspace.as_deref()),
@@ -434,7 +462,7 @@ impl JobExecutor {
             error: if success {
                 None
             } else {
-                Some("job failed".to_string())
+                failure_error.or_else(|| Some("job failed".to_string()))
             },
             workspace_path: job.working_dir.clone(),
         }
@@ -696,6 +724,32 @@ mod tests {
         assert_eq!(job.timeout_secs, 300);
         assert!(job.steps.is_empty());
         assert!(job.env.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_real_docker_job_timeout_reaps_sandbox() {
+        let executor = JobExecutor::new().await.expect("Docker must be available");
+        let job_id = JobId::new();
+        let job = ExecutableJob::new(job_id, PipelineRunId::new(), "alpine:latest".to_string())
+            .with_steps(vec![JobStep::new("hang", "sleep 30")])
+            .with_timeout(5);
+
+        let result = executor.execute(job).await;
+
+        assert!(!result.success);
+        assert_eq!(result.exit_code, -1);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("timeout")));
+        assert_eq!(executor.active_job_count().await, 0);
+        assert!(executor
+            .pool
+            .sandbox
+            .remove_job_containers(job_id)
+            .await
+            .is_ok());
     }
 
     #[test]

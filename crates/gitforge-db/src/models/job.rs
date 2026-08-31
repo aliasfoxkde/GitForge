@@ -72,6 +72,8 @@ pub struct Job {
     pub commands: Vec<String>,
     pub image: String,
     pub working_dir: Option<String>,
+    /// Maximum execution time in seconds. Older databases default to 300.
+    pub timeout_secs: u64,
     /// JSON-encoded bounded execution receipt, when the job is terminal.
     pub result_json: Option<String>,
 }
@@ -92,6 +94,7 @@ impl Job {
             commands: Vec::new(),
             image: "rust:latest".to_string(),
             working_dir: None,
+            timeout_secs: 300,
             result_json: None,
         }
     }

@@ -80,7 +80,12 @@ pub struct JobExecutionDefinition {
     pub commands: Vec<String>,
     pub image: String,
     pub working_dir: Option<String>,
+    /// Maximum seconds allowed for each runner step. Older callers that do
+    /// not provide a value retain the safe legacy default.
+    pub timeout_secs: u64,
 }
+
+pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 300;
 
 /// Return the scheduler resource class for jobs that must not overlap on one
 /// runner. Workspace-wide Cargo tests contend for the same checkout and build
@@ -294,15 +299,39 @@ impl Scheduler {
         image: String,
         working_dir: Option<String>,
     ) {
+        self.enqueue_with_definition_and_image_and_timeout(
+            job_id,
+            pipeline_run_id,
+            repo_id,
+            JobExecutionDefinition {
+                commands,
+                image,
+                working_dir,
+                timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+            },
+        )
+        .await;
+    }
+
+    /// Enqueue a job with an explicit, bounded execution timeout.
+    pub async fn enqueue_with_definition_and_image_and_timeout(
+        &self,
+        job_id: JobId,
+        pipeline_run_id: PipelineRunId,
+        repo_id: RepoId,
+        definition: JobExecutionDefinition,
+    ) {
+        let timeout_secs = definition.timeout_secs.clamp(5, 24 * 60 * 60);
         let job = QueuedJob::new(job_id, pipeline_run_id, repo_id);
         let mut state = self.state.write().await;
         state.queue.enqueue(job);
         state.job_definitions.insert(
             job_id,
             JobExecutionDefinition {
-                commands: commands.clone(),
-                image: image.clone(),
-                working_dir: working_dir.clone(),
+                commands: definition.commands.clone(),
+                image: definition.image.clone(),
+                working_dir: definition.working_dir.clone(),
+                timeout_secs,
             },
         );
         tracing::debug!("job {} enqueued", job_id);
@@ -319,12 +348,13 @@ impl Scheduler {
             {
                 tracing::error!("failed to update job status in DB: {}", e);
             }
-            if let Err(e) = gitforge_db::queries::JobQueries::set_definition_with_image(
+            if let Err(e) = gitforge_db::queries::JobQueries::set_definition_with_image_and_timeout(
                 pool,
                 job_id,
-                &commands,
-                &image,
-                working_dir.as_deref(),
+                &definition.commands,
+                &definition.image,
+                definition.working_dir.as_deref(),
+                timeout_secs,
             )
             .await
             {
@@ -656,6 +686,15 @@ impl Scheduler {
                         return;
                     }
                 }
+                match gitforge_db::queries::JobQueries::reconcile_expired(pool).await {
+                    Ok(count) if count > 0 => {
+                        tracing::warn!(count, "reconciled jobs that exceeded their timeout");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "failed to reconcile expired jobs");
+                    }
+                }
             }
             if let Err(error) = self.load_pending_jobs().await {
                 tracing::error!(%error, "failed to load durable jobs after scheduler recovery");
@@ -880,6 +919,7 @@ impl Scheduler {
                         commands: db_job.commands,
                         image: db_job.image,
                         working_dir: db_job.working_dir,
+                        timeout_secs: db_job.timeout_secs,
                     },
                 );
                 loaded += 1;
@@ -1203,13 +1243,16 @@ mod tests {
         let repo_id = RepoId::new();
 
         scheduler
-            .enqueue_with_definition_and_image(
+            .enqueue_with_definition_and_image_and_timeout(
                 job_id,
                 run_id,
                 repo_id,
-                vec!["echo image".to_string()],
-                "node:22".to_string(),
-                Some("/workspace".to_string()),
+                JobExecutionDefinition {
+                    commands: vec!["echo image".to_string()],
+                    image: "node:22".to_string(),
+                    working_dir: Some("/workspace".to_string()),
+                    timeout_secs: 900,
+                },
             )
             .await;
 
@@ -1217,6 +1260,7 @@ mod tests {
         let definition = state.job_definitions.get(&job_id).unwrap();
         assert_eq!(definition.image, "node:22");
         assert_eq!(definition.working_dir.as_deref(), Some("/workspace"));
+        assert_eq!(definition.timeout_secs, 900);
     }
 
     #[tokio::test]

@@ -76,19 +76,20 @@ jobs:
         env:
           PROVIDER: ${{ github.event.inputs.provider || 'anthropic' }}
         run: |
-          set +e
-
           # Build the CLI first
-          cargo build --package gitforce-cli --release 2>/dev/null
+          cargo build --package gitforge-cli --release --locked
 
           REVIEW_CMD="./target/release/gitforge review --diff --provider $PROVIDER --verbose"
 
           # Run the review and capture output
-          OUTPUT=$($REVIEW_CMD 2>&1 || true)
+          set +e
+          OUTPUT=$($REVIEW_CMD 2>&1)
+          REVIEW_STATUS=$?
+          set -e
           echo "$OUTPUT"
 
           # Extract summary for GitHub comment
-          SUMMARY=$(echo "$OUTPUT" | grep -A 20 "CODE REVIEW RESULTS" | head -30 || echo "Review completed")
+          SUMMARY=$(echo "$OUTPUT" | grep -A 20 "CODE REVIEW RESULTS" | head -30 | tr '\n' ' ' || echo "Review completed")
           echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
 
           # Check for critical findings
@@ -98,16 +99,18 @@ jobs:
             echo "critical_findings=false" >> $GITHUB_OUTPUT
           fi
 
+          echo "review_status=$REVIEW_STATUS" >> $GITHUB_OUTPUT
+
       - name: Post review comment
         if: github.event_name == 'pull_request'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
+          env:
+            REVIEW_SUMMARY: ${{ steps.review.outputs.summary }}
+            CRITICAL_FINDINGS: ${{ steps.review.outputs.critical_findings }}
           script: |
-            const fs = require('fs');
-            const output = fs.readFileSync(process.env.GITHUB_OUTPUT, 'utf8');
-
-            const summary = output.match(/summary=(.*)/s)?.[1] || 'Review completed';
-            const hasCritical = output.includes('critical_findings=true');
+            const summary = process.env.REVIEW_SUMMARY || 'Review completed';
+            const hasCritical = process.env.CRITICAL_FINDINGS === 'true';
 
             const body = `
             ## 🤖 AI Code Review Results
@@ -125,6 +128,12 @@ jobs:
               repo: context.repo.repo,
               body: body
             });
+
+      - name: Fail when review execution fails
+        if: steps.review.outputs.review_status != '0'
+        run: |
+          echo "AI review command failed with status ${{ steps.review.outputs.review_status }}"
+          exit 1
 
       - name: Fail on critical issues
         if: steps.review.outputs.critical_findings == 'true'

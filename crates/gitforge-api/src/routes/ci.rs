@@ -51,6 +51,8 @@ pub struct SubmitJobRequest {
     pub commands: Vec<String>,
     pub working_dir: Option<String>,
     pub idempotency_key: String,
+    /// Optional bounded timeout such as `45m` or `900s`.
+    pub timeout: Option<String>,
 }
 
 /// CI routes
@@ -412,6 +414,19 @@ async fn submit_job(
     Extension(claims): Extension<Claims>,
     Json(request): Json<SubmitJobRequest>,
 ) -> impl IntoResponse {
+    let timeout_secs = match gitforge_ci::parse_timeout_secs(request.timeout.as_deref()) {
+        Ok(timeout_secs) => timeout_secs,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_timeout",
+                    "message": error
+                })),
+            )
+                .into_response();
+        }
+    };
     if request.name.is_empty()
         || request.name.len() > 128
         || request.idempotency_key.is_empty()
@@ -561,6 +576,7 @@ async fn submit_job(
     job.id = job_id;
     job.commands = request.commands.clone();
     job.working_dir = request.working_dir.clone();
+    job.timeout_secs = timeout_secs;
     if let Err(error) = JobQueries::create(&pool, &job).await {
         tracing::error!(%error, %job_id, "failed to create submitted job");
         let _ = JobQueries::delete_idempotency(&pool, &scope, &request.idempotency_key).await;
@@ -578,11 +594,13 @@ async fn submit_job(
         )
             .into_response();
     }
-    if let Err(error) = JobQueries::set_definition(
+    if let Err(error) = JobQueries::set_definition_with_image_and_timeout(
         &pool,
         job_id,
         &request.commands,
+        "rust:latest",
         request.working_dir.as_deref(),
+        timeout_secs,
     )
     .await
     {

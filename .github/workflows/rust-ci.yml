@@ -103,7 +103,31 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@562f912bf8a1174eb1007c4afe216a9187a8d722 # cargo-llvm-cov
       - name: Generate coverage report
-        run: cargo llvm-cov --workspace --all-features --locked --no-fail-fast --cobertura --output-path cobertura.xml --fail-under-lines 79.9
+        run: cargo llvm-cov --workspace --all-features --locked --no-fail-fast --cobertura --output-path cobertura.xml -- --test-threads=1
+
+      - name: Publish coverage diagnostics
+        if: ${{ always() && hashFiles('cobertura.xml') != '' }}
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("cobertura.xml").getroot()
+          rate = float(root.attrib["line-rate"]) * 100
+          covered = root.attrib.get("lines-covered", "unknown")
+          valid = root.attrib.get("lines-valid", "unknown")
+          print(f"Coverage line rate: {rate:.4f}% ({covered}/{valid} lines)")
+          if rate < 79.9:
+              raise SystemExit("Coverage line rate is below the required 79.9% threshold")
+          PY
+
+      - name: Upload coverage report
+        if: ${{ always() && hashFiles('cobertura.xml') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage-${{ github.run_id }}
+          path: cobertura.xml
+          if-no-files-found: error
+
       - name: Upload coverage to Codecov
         if: ${{ env.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
