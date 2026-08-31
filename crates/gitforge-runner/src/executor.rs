@@ -403,16 +403,15 @@ impl JobExecutor {
         // inside the container has exited.  Tear down the exact container
         // immediately on timeout, before artifact/log collection, so timed-out
         // jobs cannot leave an active exec or conmon helper behind.
-        if timed_out {
-            if timeout(
+        if timed_out
+            && timeout(
                 Duration::from_secs(15),
                 self.pool.sandbox.destroy(instance.clone()),
             )
             .await
             .is_err()
-            {
-                tracing::error!(%job_id, "timed-out sandbox teardown exceeded 15 seconds");
-            }
+        {
+            tracing::error!(%job_id, "timed-out sandbox teardown exceeded 15 seconds");
         }
 
         // Collect artifacts
@@ -428,17 +427,15 @@ impl JobExecutor {
             let mut instances = self.active_instances.write().await;
             instances.remove(&job_id)
         };
-        if let Some((image, workspace, inst)) = released {
-            if !timed_out {
-                if timeout(
-                    Duration::from_secs(30),
-                    self.pool.release(&image, inst, workspace.as_deref()),
-                )
-                .await
-                .is_err()
-                {
-                    tracing::warn!("timed out cleaning up sandbox for job {}", job_id);
-                }
+        if let (Some((image, workspace, inst)), false) = (released, timed_out) {
+            if timeout(
+                Duration::from_secs(30),
+                self.pool.release(&image, inst, workspace.as_deref()),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("timed out cleaning up sandbox for job {}", job_id);
             }
         }
 
