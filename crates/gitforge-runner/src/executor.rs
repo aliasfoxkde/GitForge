@@ -349,6 +349,7 @@ impl JobExecutor {
         let mut success = true;
         let mut final_exit_code = 0;
         let mut timed_out = false;
+        let mut failure_error = None;
 
         for step in &job.steps {
             tracing::debug!("executing step: {}", step.name);
@@ -389,10 +390,11 @@ impl JobExecutor {
                     success = false;
                     final_exit_code = -1;
                     timed_out = deadline <= Instant::now();
+                    failure_error = Some(format!("execution error: {}", e));
                     step_results.push(StepResult {
                         exit_code: -1,
                         stdout: String::new(),
-                        stderr: format!("execution error: {}", e),
+                        stderr: failure_error.clone().unwrap_or_default(),
                     });
                     break;
                 }
@@ -460,7 +462,7 @@ impl JobExecutor {
             error: if success {
                 None
             } else {
-                Some("job failed".to_string())
+                failure_error.or_else(|| Some("job failed".to_string()))
             },
             workspace_path: job.working_dir.clone(),
         }
