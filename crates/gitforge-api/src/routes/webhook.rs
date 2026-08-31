@@ -60,12 +60,14 @@ impl CiTriggerClient {
         let url = reqwest::Url::parse(&url.into())
             .map_err(|error| format!("invalid CI trigger URL: {error}"))?;
         if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
+            || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+            || url.port_or_known_default() != Some(42781)
+            || url.path() != "/pipelines/trigger"
             || !url.username().is_empty()
             || url.password().is_some()
         {
             return Err(
-                "CI trigger URL must use http/https, include a host, and omit credentials"
+                "CI trigger URL must target loopback port 42781 at /pipelines/trigger without credentials"
                     .to_string(),
             );
         }
@@ -75,6 +77,7 @@ impl CiTriggerClient {
             token: token.into(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|error| format!("failed to build CI trigger client: {error}"))?,
         })
@@ -450,6 +453,19 @@ mod ci_trigger_client_tests {
     #[test]
     fn rejects_unsupported_ci_trigger_scheme() {
         assert!(CiTriggerClient::new("ftp://127.0.0.1/trigger", "token").is_err());
+    }
+
+    #[test]
+    fn rejects_non_loopback_ci_trigger_host() {
+        assert!(
+            CiTriggerClient::new("http://ci.internal:42781/pipelines/trigger", "token").is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_ci_trigger_port_or_path() {
+        assert!(CiTriggerClient::new("http://127.0.0.1:42780/pipelines/trigger", "token").is_err());
+        assert!(CiTriggerClient::new("http://127.0.0.1:42781/other", "token").is_err());
     }
 
     #[test]
