@@ -1832,6 +1832,10 @@ async fn test_api_webhook_trigger_success() {
         "webhook response: {}",
         String::from_utf8_lossy(&body)
     );
+    // Webhook enqueueing is durable so it works when API and CI are separate
+    // processes. The scheduler loads the persisted queued job on its normal
+    // recovery tick rather than requiring an in-process extension.
+    assert_eq!(scheduler.load_pending_jobs().await.unwrap(), 1);
     assert_eq!(scheduler.queue_len().await, 1);
 }
 
