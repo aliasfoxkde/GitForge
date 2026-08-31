@@ -130,7 +130,12 @@ impl DagBuilder {
         // First pass: create all nodes
         for job in &pipeline.jobs {
             let job_id = JobId::new();
-            name_to_id.insert(job.name.clone(), job_id);
+            if name_to_id.insert(job.name.clone(), job_id).is_some() {
+                return Err(gitforge_common::Error::invalid_input(format!(
+                    "pipeline contains duplicate job name '{}'",
+                    job.name
+                )));
+            }
 
             nodes.push(JobNode {
                 id: job_id,
@@ -142,12 +147,16 @@ impl DagBuilder {
 
         // Second pass: resolve dependencies
         for node in &mut nodes {
-            let dep_ids: Vec<JobId> = node
-                .definition
-                .needs
-                .iter()
-                .filter_map(|name| name_to_id.get(name).copied())
-                .collect();
+            let mut dep_ids = Vec::with_capacity(node.definition.needs.len());
+            for name in &node.definition.needs {
+                let Some(dep_id) = name_to_id.get(name).copied() else {
+                    return Err(gitforge_common::Error::invalid_input(format!(
+                        "job '{}' references missing dependency '{}'",
+                        node.name, name
+                    )));
+                };
+                dep_ids.push(dep_id);
+            }
 
             node.dependencies = dep_ids;
         }
@@ -274,6 +283,36 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("circular"));
+    }
+
+    #[test]
+    fn test_reject_missing_dependency() {
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![make_job("test", vec!["build"])],
+        };
+
+        let result = DagBuilder::build(&pipeline, gitforge_common::PipelineRunId::new());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("missing dependency 'build'"));
+    }
+
+    #[test]
+    fn test_reject_duplicate_job_name() {
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![make_job("build", vec![]), make_job("build", vec![])],
+        };
+
+        let result = DagBuilder::build(&pipeline, gitforge_common::PipelineRunId::new());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("duplicate job name 'build'"));
     }
 
     #[test]
