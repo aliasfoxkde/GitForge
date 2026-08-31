@@ -777,7 +777,27 @@ async fn test_scheduler_upload_is_downloadable_through_authenticated_api() {
         repo_id: repo.id,
         name: "boundary-pipeline".to_string(),
         trigger_type: "manual".to_string(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({
+            "name": "test-pipeline",
+            "version": "1.0",
+            "trigger_on": ["push"],
+            "environment": {},
+            "jobs": [{
+                "name": "test",
+                "image": "alpine:latest",
+                "needs": [],
+                "env": {},
+                "steps": [{
+                    "name": "smoke",
+                    "run": "printf webhook-test",
+                    "env": null,
+                    "working_directory": null,
+                    "condition": null
+                }],
+                "timeout": "30s",
+                "retry": null
+            }]
+        }),
         created_at: chrono::Utc::now(),
     };
     gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
