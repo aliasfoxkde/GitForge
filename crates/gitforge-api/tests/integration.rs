@@ -18,7 +18,14 @@ use gitforge_storage::{Artifact, ArtifactStore};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-async fn webhook_fixture(config: serde_json::Value) -> (axum::Router, gitforge_common::PipelineId, gitforge_common::RepoId, String) {
+async fn webhook_fixture(
+    config: serde_json::Value,
+) -> (
+    axum::Router,
+    gitforge_common::PipelineId,
+    gitforge_common::RepoId,
+    String,
+) {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();
     let user = gitforge_db::models::User::new(
@@ -54,7 +61,12 @@ async fn webhook_fixture(config: serde_json::Value) -> (axum::Router, gitforge_c
     let token = ApiAuth::new("test-secret")
         .generate_token(user.id, "webhook-test", "admin")
         .unwrap();
-    (ApiServer::new("test-secret", pool).into_router(), pipeline.id, repo_id, token)
+    (
+        ApiServer::new("test-secret", pool).into_router(),
+        pipeline.id,
+        repo_id,
+        token,
+    )
 }
 
 fn webhook_definition(job: JobDefinition) -> serde_json::Value {
@@ -1833,7 +1845,9 @@ async fn test_api_webhook_trigger_rejects_invalid_stored_definition() {
                 .uri(format!("/api/webhook/trigger/{pipeline_id}"))
                 .header("Authorization", format!("Bearer {token}"))
                 .header("Content-Type", "application/json")
-                .body(Body::from(format!(r#"{{"repo_id":"{repo_id}","commit_hash":"abc123","branch":"main"}}"#)))
+                .body(Body::from(format!(
+                    r#"{{"repo_id":"{repo_id}","commit_hash":"abc123","branch":"main"}}"#
+                )))
                 .unwrap(),
         )
         .await
@@ -1852,7 +1866,9 @@ async fn test_api_webhook_trigger_rejects_pipeline_without_entry_job() {
                 .uri(format!("/api/webhook/trigger/{pipeline_id}"))
                 .header("Authorization", format!("Bearer {token}"))
                 .header("Content-Type", "application/json")
-                .body(Body::from(format!(r#"{{"repo_id":"{repo_id}","commit_hash":"abc123","branch":"main"}}"#)))
+                .body(Body::from(format!(
+                    r#"{{"repo_id":"{repo_id}","commit_hash":"abc123","branch":"main"}}"#
+                )))
                 .unwrap(),
         )
         .await
@@ -1871,7 +1887,9 @@ async fn test_api_webhook_trigger_rejects_invalid_job_timeout() {
                 .uri(format!("/api/webhook/trigger/{pipeline_id}"))
                 .header("Authorization", format!("Bearer {token}"))
                 .header("Content-Type", "application/json")
-                .body(Body::from(format!(r#"{{"repo_id":"{repo_id}","commit_hash":"abc123","branch":"main"}}"#)))
+                .body(Body::from(format!(
+                    r#"{{"repo_id":"{repo_id}","commit_hash":"abc123","branch":"main"}}"#
+                )))
                 .unwrap(),
         )
         .await
@@ -1890,7 +1908,10 @@ async fn test_api_webhook_trigger_rejects_repository_mismatch() {
                 .uri(format!("/api/webhook/trigger/{pipeline_id}"))
                 .header("Authorization", format!("Bearer {token}"))
                 .header("Content-Type", "application/json")
-                .body(Body::from(format!(r#"{{"repo_id":"{}","commit_hash":"abc123","branch":"main"}}"#, gitforge_common::RepoId::new())))
+                .body(Body::from(format!(
+                    r#"{{"repo_id":"{}","commit_hash":"abc123","branch":"main"}}"#,
+                    gitforge_common::RepoId::new()
+                )))
                 .unwrap(),
         )
         .await
