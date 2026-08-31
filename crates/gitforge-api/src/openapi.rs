@@ -265,7 +265,8 @@ pub fn get_openapi_spec() -> serde_json::Value {
                                         "name": {"type": "string", "maxLength": 128},
                                         "commands": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64},
                                         "working_dir": {"type": ["string", "null"]},
-                                        "idempotency_key": {"type": "string", "maxLength": 128}
+                                        "idempotency_key": {"type": "string", "maxLength": 128},
+                                        "timeout": {"type": ["string", "null"], "description": "Bounded duration such as 45m or 900s; defaults to 300s"}
                                     }
                                 }
                             }
