@@ -21,7 +21,10 @@ if [[ ! -d "$release_dir" ]]; then
 fi
 
 release_dir=$(readlink -f -- "$release_dir")
-current_link=$(readlink -m -- "$current_link")
+# Normalize the link's pathname without resolving its final symlink.  Resolving
+# it here makes an existing gitforge-current pointer look like the release
+# directory it targets, defeating the basename safety check below.
+current_link=$(realpath -m -s -- "$current_link")
 if [[ "$(basename -- "$current_link")" != "gitforge-current" ]]; then
   printf 'release promote: refusing non-gitforge-current pointer: %s\n' "$current_link" >&2
   exit 64
