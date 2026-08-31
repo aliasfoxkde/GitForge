@@ -1,12 +1,14 @@
 import { defineConfig, devices } from '@playwright/test';
 import { resolve } from 'path';
 
+const reportDir = process.env.E2E_REPORT_DIR || './test-reports';
+const snapshotDir = process.env.E2E_SNAPSHOT_DIR || './tests/e2e/snapshots';
+
 /**
  * Playwright E2E Configuration
  *
  * Full-featured config for dark-factory E2E testing with:
  * - Multi-browser support (Chromium, Firefox, WebKit)
- * - Coverage collection via @vitest/coverage-v8
  * - Rich reporting (list, HTML, JSON)
  * - Debugging aids (traces, screenshots, videos)
  */
@@ -15,7 +17,7 @@ export default defineConfig({
 	testDir: './tests/e2e',
 
 	// ── Output ────────────────────────────────────────────────────────────────
-	outputDir: process.env.E2E_REPORT_DIR || './test-reports',
+	outputDir: reportDir,
 
 	// ── Timeout & Retries ─────────────────────────────────────────────────────
 	timeout: parseInt(process.env.E2E_TIMEOUT || '30000', 10),
@@ -25,8 +27,8 @@ export default defineConfig({
 	// Multiple reporters for different needs
 	reporter: [
 		['list'],                      // Console output
-		['html', { outputFolder: 'test-reports/html', open: 'never' }],
-		['json', { outputFile: 'test-reports/results.json' }],
+		['html', { outputFolder: `${reportDir}/html`, open: 'never' }],
+		['json', { outputFile: `${reportDir}/results.json` }],
 	],
 
 	// ── Global Setup ──────────────────────────────────────────────────────────
@@ -95,23 +97,6 @@ export default defineConfig({
 		navigationTimeout: 30000,
 	},
 
-	// ── Coverage ───────────────────────────────────────────────────────────────
-	// Note: Requires @vitest/coverage-v8 and coverage setup in test files
-	coverage: process.env.E2E_COVERAGE === 'true'
-		? {
-				provider: 'v8',
-				reporter: ['text', 'json', 'html'],
-				reportsDirectory: './test-reports/coverage',
-				exclude: [
-					'node_modules/**',
-					'dist/**',
-					'tests/**',
-					'**/*.config.ts',
-					'**/global-*.ts',
-				],
-		  }
-		: undefined,
-
 	// ── Web Server (optional) ─────────────────────────────────────────────────
 	webServer: process.env.CI
 		? undefined   // In CI, app is already running
@@ -123,7 +108,7 @@ export default defineConfig({
 		  },
 
 	// ── Paths ──────────────────────────────────────────────────────────────────
-	snapshotDir: './tests/e2e/snapshots',
+	snapshotDir,
 
 	// ── TypeScript ─────────────────────────────────────────────────────────────
 	typescriptDir: './tests/e2e/tsconfig',
