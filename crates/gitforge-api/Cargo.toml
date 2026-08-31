@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 gitforge-common = { path = "../gitforge-common" }
+gitforge-core = { path = "../gitforge-core" }
 gitforge-db = { path = "../gitforge-db" }
 gitforge-events = { path = "../gitforge-events" }
 gitforge-ci = { path = "../gitforge-ci" }

@@ -687,7 +687,9 @@ async fn git_receive_pack_standard(
 
 /// Get the git root directory from environment or use default
 pub fn get_git_root() -> String {
-    std::env::var("GIT_ROOT").unwrap_or_else(|_| "/var/lib/gitforge/repos".to_string())
+    // Keep the development default aligned with API repository provisioning.
+    // Production deployments should set GIT_ROOT explicitly to a durable path.
+    std::env::var("GIT_ROOT").unwrap_or_else(|_| "target/gitforge-repos".to_string())
 }
 
 /// Maximum buffered request body for Git Smart HTTP. The previous hardcoded
@@ -953,7 +955,7 @@ mod tests {
     fn test_get_git_root_default() {
         std::env::remove_var("GIT_ROOT");
         let root = get_git_root();
-        assert_eq!(root, "/var/lib/gitforge/repos");
+        assert_eq!(root, "target/gitforge-repos");
     }
 
     #[test]

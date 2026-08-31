@@ -35,9 +35,17 @@ pub struct Repository {
 impl Repository {
     /// Create a new repository
     pub fn new(name: String, owner_id: UserId, git_path: String) -> Self {
+        Self::new_with_id(RepoId::new(), name, owner_id, git_path)
+    }
+
+    /// Create a repository record with an already allocated identity.
+    ///
+    /// Storage-backed callers allocate the ID before provisioning the bare
+    /// repository so the database path and filesystem path cannot diverge.
+    pub fn new_with_id(id: RepoId, name: String, owner_id: UserId, git_path: String) -> Self {
         let now = Utc::now();
         Self {
-            id: RepoId::new(),
+            id,
             name,
             owner_id,
             visibility: Visibility::Private.as_str().to_string(),

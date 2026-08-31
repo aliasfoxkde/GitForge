@@ -1043,6 +1043,7 @@ dependencies = [
  "chrono",
  "gitforge-ci",
  "gitforge-common",
+ "gitforge-core",
  "gitforge-db",
  "gitforge-events",
  "gitforge-scheduler",
