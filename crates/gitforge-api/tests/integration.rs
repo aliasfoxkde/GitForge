@@ -1740,8 +1740,11 @@ async fn test_api_webhook_trigger_success() {
         .await
         .unwrap();
 
-    // Pipeline found, trigger accepted
-    assert_eq!(response.status(), StatusCode::OK);
+    // Pipeline found, trigger accepted. Include the response body on failure
+    // so fixture/schema drift is diagnosed instead of reported as a bare 422.
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "webhook response: {}", String::from_utf8_lossy(&body));
 }
 
 #[tokio::test]
