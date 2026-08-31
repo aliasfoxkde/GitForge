@@ -932,12 +932,14 @@ impl RunnerAgent {
             lease_token,
             scheduler_token,
         };
-        if !live_logs.sent_any() {
+        if !live_logs.sent_any() || live_logs.failed() {
+            // Nothing — or not everything — reached the scheduler live, so
+            // re-upload the full step output while the lease is still valid.
+            // Chunks append by sequence; a degraded stream may duplicate the
+            // prefix it did deliver, which beats a silently truncated log.
             if let Err(error) = report_log_chunks(&protocol, &result.step_results).await {
                 tracing::warn!(%error, job_id = %assignment.job_id, "failed to stream job logs");
             }
-        } else if live_logs.failed() {
-            tracing::warn!(job_id = %assignment.job_id, "live log delivery was degraded");
         }
 
         let uploaded_artifacts = match report_artifacts(

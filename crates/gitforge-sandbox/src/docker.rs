@@ -76,8 +76,10 @@ impl DockerSandbox {
     ///
     /// A runner can be terminated after creating a container but before the
     /// normal destroy path runs. Cleanup is intentionally scoped by the
-    /// ownership label, so unrelated containers are never considered.
-    async fn remove_job_containers(&self, job_id: JobId) -> Result<()> {
+    /// ownership label, so unrelated containers are never considered. Public
+    /// so callers that abandon an acquisition (timeout, creation error) can
+    /// reap the half-created container instead of leaking it.
+    pub async fn remove_job_containers(&self, job_id: JobId) -> Result<()> {
         let Some(ref docker) = self.docker else {
             return Ok(());
         };
