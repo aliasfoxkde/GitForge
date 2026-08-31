@@ -41,6 +41,20 @@ GitForge uses JWT tokens for API authentication. Include the token in the Author
 Authorization: Bearer <your-token>
 ```
 
+The public authentication endpoints are mounted at the server root, not under
+the protected `/api` prefix:
+
+```
+POST /auth/login
+GET /auth/status
+```
+
+`POST /auth/login` accepts `username` and `password` and returns `token`,
+`token_type`, and `expires_in`. `GET /auth/status` returns an
+`authenticated` boolean and, for a valid bearer token, the user identity and
+role. User registration is not exposed by the GitForge API; users must be
+provisioned through the supported administrative/bootstrap path.
+
 ### Endpoints
 
 #### Health Check

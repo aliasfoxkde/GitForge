@@ -12,10 +12,10 @@ use axum::{
 };
 use gitforge_common::{JobId, PipelineId, RepoId};
 use gitforge_db::{
-    queries::{PipelineQueries, PipelineRunQueries},
+    models::JobStatus,
+    queries::{JobQueries, PipelineQueries, PipelineRunQueries},
     Pool,
 };
-use gitforge_scheduler::{assigner::JobExecutionDefinition, Scheduler};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -48,7 +48,7 @@ pub fn webhook_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 /// Trigger a pipeline via webhook
 async fn trigger_pipeline(
     Extension(pool): Extension<Arc<Pool>>,
-    scheduler: Option<Extension<Arc<Scheduler>>>,
+    _scheduler: Option<Extension<Arc<gitforge_scheduler::Scheduler>>>,
     _user: AuthenticatedUser,
     Path(pipeline_id): Path<String>,
     Json(payload): Json<WebhookTriggerPayload>,
@@ -140,7 +140,7 @@ async fn trigger_pipeline(
                         .into_response();
                 }
             };
-            let commands = job_definition
+            let commands: Vec<String> = job_definition
                 .steps
                 .iter()
                 .map(|step| step.run.clone())
@@ -172,10 +172,12 @@ async fn trigger_pipeline(
                     .into_response();
             }
 
-            // Pipeline exists - enqueue its first runnable job with the
-            // stored execution contract. Dependent-job progression is handled
-            // by the CI DAG integration and is intentionally not fabricated
-            // by this webhook adapter.
+            // Pipeline exists - persist its first runnable job using the
+            // durable queue contract. The API and CI scheduler are separate
+            // processes in production, so relying on an optional in-memory
+            // Scheduler extension loses work (the run remains pending forever).
+            // The scheduler reloads queued jobs from the shared database on
+            // its next bounded tick.
             tracing::info!(
                 "Triggering pipeline {} for repo {} at commit {}",
                 pipeline_id,
@@ -183,32 +185,96 @@ async fn trigger_pipeline(
                 payload.commit_hash
             );
 
-            // Create a job for this pipeline run
             let job_id = JobId::new();
+            let idempotency_key = format!("webhook:{pipeline_id}:{}", payload.commit_hash);
+            let fingerprint = serde_json::json!({
+                "name": job_definition.name,
+                "commands": commands,
+                "working_dir": working_dir,
+                "image": job_definition.image,
+                "timeout_secs": timeout_secs,
+            })
+            .to_string();
+            let scope = format!("webhook:{pipeline_id}");
 
-            // Enqueue the job to the scheduler (if available)
-            if let Some(Extension(sched)) = scheduler {
-                sched
-                    .enqueue_with_definition_and_image_and_timeout(
+            match JobQueries::get_idempotency(&pool, &scope, &idempotency_key).await {
+                Ok(Some((existing_job_id, stored_fingerprint))) => {
+                    if stored_fingerprint != fingerprint {
+                        let _ = PipelineRunQueries::update_status(&pool, run_id, "failed").await;
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(WebhookTriggerResponse {
+                                success: false,
+                                message: "Webhook idempotency key was reused with a different job"
+                                    .to_string(),
+                                pipeline_id: None,
+                            }),
+                        )
+                            .into_response();
+                    }
+                    let _ = PipelineRunQueries::update_status(&pool, run_id, "cancelled").await;
+                    tracing::info!(%existing_job_id, %pipeline_id, "Webhook delivery already queued");
+                }
+                Ok(None) => {
+                    if let Err(error) = JobQueries::reserve_idempotency(
+                        &pool,
+                        &scope,
+                        &idempotency_key,
+                        &fingerprint,
                         job_id,
-                        run_id,
-                        repo_id,
-                        JobExecutionDefinition {
-                            commands,
-                            image: job_definition.image.clone(),
-                            working_dir,
-                            timeout_secs,
-                        },
                     )
-                    .await;
-                tracing::info!(
-                    "Enqueued job {} for pipeline {} on branch {}",
-                    job_id,
-                    pipeline_id,
-                    payload.branch
-                );
-            } else {
-                tracing::warn!("No scheduler available, job not enqueued");
+                    .await
+                    {
+                        let _ = PipelineRunQueries::update_status(&pool, run_id, "failed").await;
+                        tracing::error!(%error, %pipeline_id, "failed to reserve webhook job idempotency key");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(WebhookTriggerResponse {
+                                success: false,
+                                message: "Failed to queue pipeline job".to_string(),
+                                pipeline_id: None,
+                            }),
+                        )
+                            .into_response();
+                    }
+                    let mut job =
+                        gitforge_db::models::Job::new(run_id, job_definition.name.clone());
+                    job.id = job_id;
+                    job.commands = commands.clone();
+                    job.image = job_definition.image.clone();
+                    job.working_dir = working_dir.clone();
+                    job.timeout_secs = timeout_secs;
+                    job.status = JobStatus::Queued.as_str().to_string();
+                    if let Err(error) = JobQueries::create(&pool, &job).await {
+                        let _ =
+                            JobQueries::delete_idempotency(&pool, &scope, &idempotency_key).await;
+                        let _ = PipelineRunQueries::update_status(&pool, run_id, "failed").await;
+                        tracing::error!(%error, %pipeline_id, "failed to persist webhook job");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(WebhookTriggerResponse {
+                                success: false,
+                                message: "Failed to queue pipeline job".to_string(),
+                                pipeline_id: None,
+                            }),
+                        )
+                            .into_response();
+                    }
+                    tracing::info!(%job_id, %pipeline_id, "Persisted webhook job in durable queue");
+                }
+                Err(error) => {
+                    let _ = PipelineRunQueries::update_status(&pool, run_id, "failed").await;
+                    tracing::error!(%error, %pipeline_id, "failed to inspect webhook idempotency key");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(WebhookTriggerResponse {
+                            success: false,
+                            message: "Failed to queue pipeline job".to_string(),
+                            pipeline_id: None,
+                        }),
+                    )
+                        .into_response();
+                }
             }
 
             (

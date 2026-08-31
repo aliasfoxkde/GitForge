@@ -30,6 +30,7 @@ pub fn get_openapi_spec() -> serde_json::Value {
         ],
         "tags": [
             {"name": "health", "description": "Health check endpoints"},
+            {"name": "auth", "description": "Authentication status and login"},
             {"name": "repos", "description": "Repository management"},
             {"name": "ci", "description": "CI/CD pipelines"},
             {"name": "users", "description": "Administrative user management"},
@@ -37,6 +38,74 @@ pub fn get_openapi_spec() -> serde_json::Value {
             {"name": "artifacts", "description": "Artifact management"}
         ],
         "paths": {
+            "/auth/login": {
+                "post": {
+                    "tags": ["auth"],
+                    "summary": "Authenticate a user",
+                    "description": "Authenticates a persisted user and returns a 24-hour bearer token. This public route is mounted at /auth/login, not under /api.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["username", "password"],
+                                    "properties": {
+                                        "username": {"type": "string"},
+                                        "password": {"type": "string", "format": "password"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Authenticated",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["token", "token_type", "expires_in"],
+                                        "properties": {
+                                            "token": {"type": "string"},
+                                            "token_type": {"type": "string", "example": "Bearer"},
+                                            "expires_in": {"type": "integer", "format": "int64", "example": 86400}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "401": {"description": "Invalid username or password"}
+                    }
+                }
+            },
+            "/auth/status": {
+                "get": {
+                    "tags": ["auth"],
+                    "summary": "Check authentication status",
+                    "description": "Reports whether the supplied bearer token is valid. This public route is mounted at /auth/status, not under /api.",
+                    "responses": {
+                        "200": {
+                            "description": "Authentication status",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["authenticated"],
+                                        "properties": {
+                                            "authenticated": {"type": "boolean"},
+                                            "user_id": {"type": "string"},
+                                            "username": {"type": "string"},
+                                            "role": {"type": "string"},
+                                            "message": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             "/health": {
                 "get": {
                     "tags": ["health"],
@@ -590,12 +659,27 @@ mod tests {
     fn test_api_paths_exist() {
         let spec = get_openapi_spec();
         let paths = spec.get("paths").unwrap().as_object().unwrap();
+        assert!(paths.contains_key("/auth/login"));
+        assert!(paths.contains_key("/auth/status"));
         assert!(paths.contains_key("/health"));
         assert!(paths.contains_key("/repos"));
         assert!(paths.contains_key("/users/{id}/role"));
         assert!(paths.contains_key("/pipelines"));
         assert!(paths.contains_key("/runners"));
         assert!(paths.contains_key("/artifacts"));
+    }
+
+    #[test]
+    fn test_openapi_auth_routes_are_public_root_routes() {
+        let spec = get_openapi_spec();
+        let paths = spec.get("paths").unwrap().as_object().unwrap();
+        let login = paths.get("/auth/login").unwrap().as_object().unwrap();
+        assert!(login.get("post").is_some());
+        assert!(login.get("post").unwrap().get("security").is_none());
+        let status = paths.get("/auth/status").unwrap().as_object().unwrap();
+        assert!(status.get("get").is_some());
+        assert!(status.get("get").unwrap().get("security").is_none());
+        assert!(!paths.contains_key("/api/auth/login"));
     }
 
     #[test]
