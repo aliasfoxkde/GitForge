@@ -434,6 +434,31 @@ async fn trigger_pipeline(
 }
 
 #[cfg(test)]
+mod ci_trigger_client_tests {
+    use super::CiTriggerClient;
+
+    #[test]
+    fn accepts_http_ci_trigger_url_without_credentials() {
+        assert!(CiTriggerClient::new("http://127.0.0.1:42781/pipelines/trigger", "token").is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_ci_trigger_url() {
+        assert!(CiTriggerClient::new("not a URL", "token").is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_ci_trigger_scheme() {
+        assert!(CiTriggerClient::new("ftp://127.0.0.1/trigger", "token").is_err());
+    }
+
+    #[test]
+    fn rejects_ci_trigger_credentials() {
+        assert!(CiTriggerClient::new("http://user:password@127.0.0.1/trigger", "token").is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
