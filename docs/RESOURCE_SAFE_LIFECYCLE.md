@@ -18,11 +18,6 @@ another worktree, or the host operating system.
   checkout or a GitForge-managed artifact root; never use shared `/tmp`.
 - Run only one repository validation job per constrained runner unless an
   explicit capacity policy says otherwise.
-- Host workspaces are retained by default. Automatic cleanup is opt-in and
-  requires `GITFORGE_AUTO_CLEANUP_WORKSPACES=true` plus
-  `GITFORGE_WORKSPACE_ROOT`; only a single immediate child of that root, shared
-  by all terminal jobs in a pipeline, may be removed after parent finalization.
-  Caller-owned or ambiguous paths are refused and logged.
 
 ## Operator command
 

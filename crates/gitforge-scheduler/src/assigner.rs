@@ -6,7 +6,6 @@ use gitforge_common::{JobId, PipelineRunId, RepoId, RunnerId};
 use gitforge_db::models::{Job as DbJob, JobStatus, PipelineRun as DbPipelineRun, Runner};
 use gitforge_db::Pool;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -16,46 +15,6 @@ use uuid::Uuid;
 /// scheduler tick. Keep this bounded so an interrupted runner cannot retain a
 /// durable job lease indefinitely.
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 90;
-
-/// Return the only workspace that is safe for automatic post-pipeline cleanup.
-///
-/// Cleanup is deliberately opt-in at the deployment boundary. A job may use a
-/// caller-owned directory, and deleting an arbitrary path after a terminal
-/// status would be a destructive privilege escalation. The managed workspace
-/// must therefore be an immediate child of `GITFORGE_WORKSPACE_ROOT`.
-fn managed_workspace_for_cleanup(jobs: &[DbJob], workspace_root: Option<&Path>) -> Option<PathBuf> {
-    let root = workspace_root?.canonicalize().ok()?;
-    let mut paths = jobs
-        .iter()
-        .filter_map(|job| job.working_dir.as_deref())
-        .map(Path::new)
-        .collect::<Vec<_>>();
-    paths.dedup();
-    let path = *paths.first()?;
-    if paths.len() != 1 || path.parent()? != root || path.file_name()?.is_empty() {
-        return None;
-    }
-    Some(path.to_path_buf())
-}
-
-async fn cleanup_managed_workspace(jobs: &[DbJob]) -> anyhow::Result<()> {
-    let enabled = std::env::var("GITFORGE_AUTO_CLEANUP_WORKSPACES")
-        .map(|value| value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if !enabled {
-        return Ok(());
-    }
-    let root = std::env::var_os("GITFORGE_WORKSPACE_ROOT").map(PathBuf::from);
-    let Some(path) = managed_workspace_for_cleanup(jobs, root.as_deref()) else {
-        anyhow::bail!("workspace cleanup refused: path is not one managed run child")
-    };
-    tokio::fs::remove_dir_all(&path).await.map_err(|error| {
-        anyhow::anyhow!(
-            "failed to remove managed workspace {}: {error}",
-            path.display()
-        )
-    })
-}
 
 /// Scheduler command
 #[derive(Debug)]
@@ -519,9 +478,6 @@ impl Scheduler {
         };
         gitforge_db::queries::PipelineRunQueries::update_status(pool, pipeline_run_id, status)
             .await?;
-        if let Err(error) = cleanup_managed_workspace(&jobs).await {
-            tracing::error!(%error, %pipeline_run_id, "managed workspace cleanup failed");
-        }
         Ok(())
     }
 
@@ -1219,42 +1175,6 @@ mod tests {
             last_heartbeat: None,
             created_at: chrono::Utc::now(),
         }
-    }
-
-    #[test]
-    fn managed_workspace_requires_one_direct_child_of_root() {
-        let root = Path::new("/");
-        let run_id = PipelineRunId::new();
-        let mut job = DbJob::new(run_id, "validation".to_string());
-        let workspace = root.join("gitforge-run-1");
-        job.working_dir = Some(workspace.to_string_lossy().into_owned());
-
-        assert_eq!(
-            managed_workspace_for_cleanup(&[job.clone()], Some(root)),
-            Some(workspace.clone())
-        );
-
-        job.working_dir = Some(
-            root.join("nested")
-                .join("run-1")
-                .to_string_lossy()
-                .into_owned(),
-        );
-        assert_eq!(managed_workspace_for_cleanup(&[job], Some(root)), None);
-    }
-
-    #[test]
-    fn managed_workspace_refuses_mixed_paths() {
-        let root = Path::new("/");
-        let mut first = DbJob::new(PipelineRunId::new(), "first".to_string());
-        let mut second = DbJob::new(first.pipeline_run_id, "second".to_string());
-        first.working_dir = Some(root.join("gitforge-run-1").to_string_lossy().into_owned());
-        second.working_dir = Some(root.join("gitforge-run-2").to_string_lossy().into_owned());
-
-        assert_eq!(
-            managed_workspace_for_cleanup(&[first, second], Some(root)),
-            None
-        );
     }
 
     #[tokio::test]
