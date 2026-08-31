@@ -1132,6 +1132,21 @@ impl JobQueries {
             .map_err(|e| Error::database(format!("failed to commit recovery: {}", e)))?;
         Ok(assigned.rows_affected() + running.rows_affected())
     }
+
+    /// Mark running jobs whose persisted deadline has elapsed as timed out.
+    /// The status predicate makes this safe against a concurrent completion:
+    /// only a still-running job can be reconciled by the watchdog.
+    pub async fn reconcile_expired(pool: &Pool) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'timed_out', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE status = 'running' AND started_at IS NOT NULL AND datetime(started_at, '+' || timeout_secs || ' seconds') <= datetime('now')",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(r#"{"status":"timed_out","reason":"job_timeout_reconciled_by_watchdog"}"#)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to reconcile expired jobs: {}", e)))?;
+        Ok(result.rows_affected())
+    }
 }
 
 // ============================================================================
@@ -1644,6 +1659,26 @@ mod tests {
         assert_eq!(configured.commands, vec!["cargo test"]);
         assert_eq!(configured.timeout_secs, 900);
 
+        let mut expired = crate::models::Job::new(run.id, "expired".to_string());
+        expired.timeout_secs = 5;
+        JobQueries::create(&pool, &expired).await.unwrap();
+        JobQueries::start(&pool, expired.id).await.unwrap();
+        sqlx::query("UPDATE jobs SET started_at = ? WHERE id = ?")
+            .bind((Utc::now() - chrono::Duration::seconds(60)).to_rfc3339())
+            .bind(expired.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert_eq!(JobQueries::reconcile_expired(&pool).await.unwrap(), 1);
+        assert_eq!(
+            JobQueries::get(&pool, expired.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "timed_out"
+        );
+
         // Update status
         JobQueries::start(&pool, job.id).await.unwrap();
         let found = JobQueries::get(&pool, job.id).await.unwrap();
@@ -1666,7 +1701,7 @@ mod tests {
 
         // List by run
         let jobs = JobQueries::list_by_run(&pool, run.id).await.unwrap();
-        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs.len(), 2);
 
         sqlx::query("UPDATE jobs SET created_at = ? WHERE id = ?")
             .bind("2026-08-29 03:40:39")

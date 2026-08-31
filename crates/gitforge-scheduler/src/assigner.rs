@@ -686,6 +686,15 @@ impl Scheduler {
                         return;
                     }
                 }
+                match gitforge_db::queries::JobQueries::reconcile_expired(pool).await {
+                    Ok(count) if count > 0 => {
+                        tracing::warn!(count, "reconciled jobs that exceeded their timeout");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "failed to reconcile expired jobs");
+                    }
+                }
             }
             if let Err(error) = self.load_pending_jobs().await {
                 tracing::error!(%error, "failed to load durable jobs after scheduler recovery");
