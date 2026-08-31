@@ -4,6 +4,51 @@ use gitforge_common::{PipelineId, RepoId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+pub const MIN_TIMEOUT_SECS: u64 = 5;
+pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// Parse a human-readable job timeout into bounded seconds.
+///
+/// Supported forms are plain seconds (`900`) and a single suffix of `s`,
+/// `m`, or `h` (`45m`). Missing values use the safe legacy default. Compound
+/// durations and zero/unbounded values are rejected so the scheduler and
+/// runner share one deterministic contract.
+pub fn parse_timeout_secs(value: Option<&str>) -> Result<u64, String> {
+    let Some(raw) = value else {
+        return Ok(DEFAULT_TIMEOUT_SECS);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("timeout must not be empty".to_string());
+    }
+    let (number, multiplier) = match raw.chars().last() {
+        Some('s') => (&raw[..raw.len() - 1], 1),
+        Some('m') => (&raw[..raw.len() - 1], 60),
+        Some('h') => (&raw[..raw.len() - 1], 60 * 60),
+        Some(last) if last.is_ascii_digit() => (raw, 1),
+        _ => {
+            return Err(format!(
+                "invalid timeout '{}': use seconds, s, m, or h",
+                raw
+            ))
+        }
+    };
+    let amount: u64 = number
+        .parse()
+        .map_err(|_| format!("invalid timeout '{}': expected a positive integer", raw))?;
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("timeout '{}' overflows", raw))?;
+    if !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&seconds) {
+        return Err(format!(
+            "timeout '{}' must be between {} seconds and {} seconds",
+            raw, MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS
+        ));
+    }
+    Ok(seconds)
+}
+
 /// Pipeline trigger event
 #[derive(Debug, Clone)]
 pub struct PipelineTriggerEvent {
@@ -105,6 +150,10 @@ impl JobDefinition {
     pub fn has_dependencies(&self) -> bool {
         !self.needs.is_empty()
     }
+
+    pub fn timeout_secs(&self) -> Result<u64, String> {
+        parse_timeout_secs(self.timeout.as_deref())
+    }
 }
 
 /// Step definition within a job
@@ -153,6 +202,18 @@ jobs:
         assert_eq!(pipeline.name, "test-pipeline");
         assert_eq!(pipeline.jobs.len(), 1);
         assert_eq!(pipeline.jobs[0].name, "build");
+    }
+
+    #[test]
+    fn test_parse_timeout_secs_bounds_and_units() {
+        assert_eq!(parse_timeout_secs(None).unwrap(), DEFAULT_TIMEOUT_SECS);
+        assert_eq!(parse_timeout_secs(Some("5s")).unwrap(), 5);
+        assert_eq!(parse_timeout_secs(Some("45m")).unwrap(), 2700);
+        assert_eq!(parse_timeout_secs(Some("1h")).unwrap(), 3600);
+        assert_eq!(parse_timeout_secs(Some("900")).unwrap(), 900);
+        assert!(parse_timeout_secs(Some("0s")).is_err());
+        assert!(parse_timeout_secs(Some("2d")).is_err());
+        assert!(parse_timeout_secs(Some("86401")).is_err());
     }
 
     #[test]
