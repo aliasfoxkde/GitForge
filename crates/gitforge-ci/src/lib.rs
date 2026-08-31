@@ -12,6 +12,7 @@ pub use dag::{DagBuilder, JobGraph, JobNode};
 pub use engine::CiEngine;
 pub use executor::PipelineExecutor;
 pub use pipeline::{
-    JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
+    parse_timeout_secs, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition,
+    TriggerType,
 };
 pub use state::JobStateMachine;
