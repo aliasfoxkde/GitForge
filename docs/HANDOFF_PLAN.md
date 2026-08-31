@@ -117,6 +117,7 @@ Implementation plan:
    - `/swagger-ui`
    - `/api-docs/openapi.json`
    - `/auth/login`
+   - `/auth/status`
    - runner registration if that remains intentionally unauthenticated
 5. Remove route-local `extract_user` functions.
 6. Replace duplicated auth tests with:
