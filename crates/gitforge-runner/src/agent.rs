@@ -834,13 +834,32 @@ impl RunnerAgent {
         if let Some(token) = scheduler_token {
             started_request = started_request.bearer_auth(token);
         }
-        let started = started_request
-            .send()
-            .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false);
+        let started = match started_request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    true
+                } else {
+                    let body = response.text().await.unwrap_or_default();
+                    tracing::error!(
+                        job_id = %assignment.job_id,
+                        %status,
+                        response = %body,
+                        "failed to mark job started"
+                    );
+                    false
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    job_id = %assignment.job_id,
+                    error = %error,
+                    "failed to reach scheduler while marking job started"
+                );
+                false
+            }
+        };
         if !started {
-            tracing::error!("failed to mark job {} started", assignment.job_id);
             return;
         }
 
