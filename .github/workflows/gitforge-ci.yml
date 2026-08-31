@@ -11,6 +11,10 @@ on:
       - '**/Cargo.lock'
       - '.github/workflows/**'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   # GitHub-hosted runners cannot reach a private Fedora LAN address. Enable
   # this workflow only after a reachable endpoint or self-hosted runner is
