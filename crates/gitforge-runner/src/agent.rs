@@ -989,8 +989,12 @@ impl RunnerAgent {
             .map(|sr| {
                 serde_json::json!({
                     "exit_code": sr.exit_code,
-                    "stdout": sr.stdout,
-                    "stderr": sr.stderr,
+                    // Output is already streamed to the durable log ledger.
+                    // Keep the completion receipt bounded so a scanner that
+                    // emits megabytes cannot make the completion request fail
+                    // and leave the assignment eligible for re-execution.
+                    "stdout": bounded_receipt_text(&sr.stdout),
+                    "stderr": bounded_receipt_text(&sr.stderr),
                 })
             })
             .collect();
@@ -1025,6 +1029,40 @@ impl RunnerAgent {
             }
             Err(error) => tracing::error!("failed to report job completion: {}", error),
         }
+    }
+}
+
+const MAX_RECEIPT_STREAM_BYTES: usize = 64 * 1024;
+
+fn bounded_receipt_text(value: &str) -> String {
+    if value.len() <= MAX_RECEIPT_STREAM_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_RECEIPT_STREAM_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[output truncated; full output is available in the job log ledger]",
+        &value[..end]
+    )
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::{bounded_receipt_text, MAX_RECEIPT_STREAM_BYTES};
+
+    #[test]
+    fn receipt_output_is_bounded_and_marked() {
+        let output = "x".repeat(MAX_RECEIPT_STREAM_BYTES + 100);
+        let receipt = bounded_receipt_text(&output);
+        assert!(receipt.len() < MAX_RECEIPT_STREAM_BYTES + 100);
+        assert!(receipt.contains("output truncated"));
+    }
+
+    #[test]
+    fn receipt_output_preserves_small_output() {
+        assert_eq!(bounded_receipt_text("ok"), "ok");
     }
 }
 
