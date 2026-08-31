@@ -703,17 +703,6 @@ pub fn max_git_body_bytes() -> usize {
         .unwrap_or(512 * 1024 * 1024)
 }
 
-/// Maximum buffered request body for Git Smart HTTP. The previous hardcoded
-/// 10 MiB cap silently truncated real-world pushes (a small monorepo history
-/// can exceed it many times over), so the limit is configurable and the
-/// default covers large repositories. Bounds memory use on the server.
-pub fn max_git_body_bytes() -> usize {
-    std::env::var("GITFORGE_MAX_GIT_BODY_BYTES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(512 * 1024 * 1024)
-}
-
 /// Create the shutdown future that waits for shutdown signal
 pub async fn create_shutdown_future(shutdown: Arc<AtomicBool>) {
     wait_for_shutdown(shutdown).await;
