@@ -147,6 +147,15 @@ impl ApiServer {
         }
     }
 
+    /// Add the cross-process CI trigger client used by authenticated webhooks.
+    pub fn with_ci_trigger_client(self, client: Arc<crate::routes::CiTriggerClient>) -> Self {
+        let app = self.router.layer(Extension(client));
+        Self {
+            router: app,
+            ..self
+        }
+    }
+
     /// Set the port
     #[must_use]
     pub fn with_port(mut self, port: u16) -> Self {

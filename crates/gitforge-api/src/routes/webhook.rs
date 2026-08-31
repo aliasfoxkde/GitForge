@@ -18,6 +18,9 @@ use gitforge_db::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
+
+const CI_TRIGGER_URL: &str = "http://127.0.0.1:42781/pipelines/trigger";
 
 /// Webhook payload for triggering a pipeline
 #[derive(Debug, Deserialize, Serialize)]
@@ -28,6 +31,10 @@ pub struct WebhookTriggerPayload {
     pub commit_hash: String,
     /// Branch name
     pub branch: String,
+    /// Previous commit hash when supplied by the webhook provider. A missing
+    /// value is treated as an initial push by the CI bridge.
+    #[serde(default)]
+    pub old_commit_hash: Option<String>,
     /// Optional pipeline name (defaults to "default")
     pub pipeline_name: Option<String>,
 }
@@ -40,6 +47,77 @@ pub struct WebhookTriggerResponse {
     pub pipeline_id: Option<String>,
 }
 
+/// HTTP client for the separately deployed CI orchestrator. The API gateway
+/// must hand webhook execution to CI so CI can create the run-owned checkout,
+/// register the pipeline engine, and progress the dependency DAG.
+#[derive(Clone)]
+pub struct CiTriggerClient {
+    token: String,
+    client: reqwest::Client,
+}
+
+impl CiTriggerClient {
+    pub fn new(url: impl Into<String>, token: impl Into<String>) -> Result<Self, String> {
+        let url = reqwest::Url::parse(&url.into())
+            .map_err(|error| format!("invalid CI trigger URL: {error}"))?;
+        if url.as_str().trim_end_matches('/') != CI_TRIGGER_URL {
+            return Err(
+                "CI trigger URL must be the fixed loopback endpoint http://127.0.0.1:42781/pipelines/trigger"
+                    .to_string(),
+            );
+        }
+
+        Ok(Self {
+            token: token.into(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| format!("failed to build CI trigger client: {error}"))?,
+        })
+    }
+
+    async fn trigger(
+        &self,
+        repo_id: RepoId,
+        branch: &str,
+        old_commit_hash: Option<&str>,
+        commit_hash: &str,
+    ) -> Result<Option<String>, String> {
+        let old_hash = old_commit_hash
+            .filter(|hash| !hash.is_empty())
+            .unwrap_or("0000000000000000000000000000000000000000");
+        let response = self
+            .client
+            // The configured value is validated at startup, but never reaches
+            // this request sink; the deployed CI endpoint is fixed.
+            .post(CI_TRIGGER_URL)
+            .header("x-gitforge-trigger-token", &self.token)
+            .json(&serde_json::json!({
+                "repo_id": repo_id.to_string(),
+                "ref_name": branch,
+                "old_hash": old_hash,
+                "new_hash": commit_hash,
+                "working_dir": null
+            }))
+            .send()
+            .await
+            .map_err(|error| format!("CI trigger request failed: {error}"))?;
+        let status = response.status();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| format!("CI trigger returned invalid JSON: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("CI trigger returned HTTP {status}: {body}"));
+        }
+        Ok(body
+            .get("pipeline_run_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string))
+    }
+}
+
 /// Webhook routes
 pub fn webhook_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new().route("/webhook/trigger/{pipeline_id}", post(trigger_pipeline))
@@ -48,7 +126,7 @@ pub fn webhook_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 /// Trigger a pipeline via webhook
 async fn trigger_pipeline(
     Extension(pool): Extension<Arc<Pool>>,
-    _scheduler: Option<Extension<Arc<gitforge_scheduler::Scheduler>>>,
+    ci_trigger: Option<Extension<Arc<CiTriggerClient>>>,
     _user: AuthenticatedUser,
     Path(pipeline_id): Path<String>,
     Json(payload): Json<WebhookTriggerPayload>,
@@ -92,6 +170,49 @@ async fn trigger_pipeline(
                         .into_response();
                 }
             };
+
+            if let Some(Extension(client)) = ci_trigger {
+                match client
+                    .trigger(
+                        repo_id,
+                        &payload.branch,
+                        payload.old_commit_hash.as_deref(),
+                        &payload.commit_hash,
+                    )
+                    .await
+                {
+                    Ok(run_id) => {
+                        return (
+                            StatusCode::ACCEPTED,
+                            Json(WebhookTriggerResponse {
+                                success: true,
+                                message: format!(
+                                    "Pipeline delegated to CI for branch '{}'{}",
+                                    payload.branch,
+                                    run_id
+                                        .as_deref()
+                                        .map(|id| format!(" (run {id})"))
+                                        .unwrap_or_default()
+                                ),
+                                pipeline_id: Some(pipeline_id),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, %pipeline_id, "failed to delegate webhook to CI");
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(WebhookTriggerResponse {
+                                success: false,
+                                message: "CI trigger unavailable".to_string(),
+                                pipeline_id: None,
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
+            }
 
             let definition: gitforge_ci::PipelineDefinition = match serde_json::from_value(
                 pipeline.config.clone(),
@@ -308,6 +429,44 @@ async fn trigger_pipeline(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod ci_trigger_client_tests {
+    use super::CiTriggerClient;
+
+    #[test]
+    fn accepts_http_ci_trigger_url_without_credentials() {
+        assert!(CiTriggerClient::new("http://127.0.0.1:42781/pipelines/trigger", "token").is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_ci_trigger_url() {
+        assert!(CiTriggerClient::new("not a URL", "token").is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_ci_trigger_scheme() {
+        assert!(CiTriggerClient::new("ftp://127.0.0.1/trigger", "token").is_err());
+    }
+
+    #[test]
+    fn rejects_non_loopback_ci_trigger_host() {
+        assert!(
+            CiTriggerClient::new("http://ci.internal:42781/pipelines/trigger", "token").is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_ci_trigger_port_or_path() {
+        assert!(CiTriggerClient::new("http://127.0.0.1:42780/pipelines/trigger", "token").is_err());
+        assert!(CiTriggerClient::new("http://127.0.0.1:42781/other", "token").is_err());
+    }
+
+    #[test]
+    fn rejects_ci_trigger_credentials() {
+        assert!(CiTriggerClient::new("http://user:password@127.0.0.1/trigger", "token").is_err());
     }
 }
 

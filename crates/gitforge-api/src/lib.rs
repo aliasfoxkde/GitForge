@@ -21,4 +21,5 @@ pub mod server;
 pub use auth::{ApiAuth, Claims};
 pub use metrics::Metrics;
 pub use rate_limit::{RateLimitConfig, RateLimiter};
+pub use routes::CiTriggerClient;
 pub use server::ApiServer;
