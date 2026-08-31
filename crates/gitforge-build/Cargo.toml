@@ -31,7 +31,7 @@ futures = { workspace = true }
 bytes = { workspace = true }
 
 # Process group management for proper signal handling
-nix = { version = "0.27", features = ["process", "signal"] }
+nix = { version = "0.31", features = ["process", "signal"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
