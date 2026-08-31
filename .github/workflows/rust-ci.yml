@@ -103,7 +103,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@562f912bf8a1174eb1007c4afe216a9187a8d722 # cargo-llvm-cov
       - name: Generate coverage report
-        run: cargo llvm-cov --workspace --all-features --locked --no-fail-fast --cobertura --output-path cobertura.xml --fail-under-lines 79.9 -- --test-threads=1
+        run: cargo llvm-cov --workspace --all-features --locked --no-fail-fast --cobertura --output-path cobertura.xml -- --test-threads=1
 
       - name: Publish coverage diagnostics
         if: ${{ always() && hashFiles('cobertura.xml') != '' }}
@@ -116,6 +116,8 @@ jobs:
           covered = root.attrib.get("lines-covered", "unknown")
           valid = root.attrib.get("lines-valid", "unknown")
           print(f"Coverage line rate: {rate:.4f}% ({covered}/{valid} lines)")
+          if rate < 79.9:
+              raise SystemExit("Coverage line rate is below the required 79.9% threshold")
           PY
 
       - name: Upload coverage report
