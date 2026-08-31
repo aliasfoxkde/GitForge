@@ -1,6 +1,9 @@
 import { defineConfig, devices } from '@playwright/test';
 import { resolve } from 'path';
 
+const reportDir = process.env.E2E_REPORT_DIR || './test-reports';
+const snapshotDir = process.env.E2E_SNAPSHOT_DIR || './tests/e2e/snapshots';
+
 /**
  * Playwright E2E Configuration
  *
@@ -15,7 +18,7 @@ export default defineConfig({
 	testDir: './tests/e2e',
 
 	// ── Output ────────────────────────────────────────────────────────────────
-	outputDir: process.env.E2E_REPORT_DIR || './test-reports',
+	outputDir: reportDir,
 
 	// ── Timeout & Retries ─────────────────────────────────────────────────────
 	timeout: parseInt(process.env.E2E_TIMEOUT || '30000', 10),
@@ -25,8 +28,8 @@ export default defineConfig({
 	// Multiple reporters for different needs
 	reporter: [
 		['list'],                      // Console output
-		['html', { outputFolder: 'test-reports/html', open: 'never' }],
-		['json', { outputFile: 'test-reports/results.json' }],
+		['html', { outputFolder: `${reportDir}/html`, open: 'never' }],
+		['json', { outputFile: `${reportDir}/results.json` }],
 	],
 
 	// ── Global Setup ──────────────────────────────────────────────────────────
@@ -123,7 +126,7 @@ export default defineConfig({
 		  },
 
 	// ── Paths ──────────────────────────────────────────────────────────────────
-	snapshotDir: './tests/e2e/snapshots',
+	snapshotDir,
 
 	// ── TypeScript ─────────────────────────────────────────────────────────────
 	typescriptDir: './tests/e2e/tsconfig',

@@ -7,6 +7,7 @@ set -euo pipefail
 # ── Defaults ──────────────────────────────────────────────────────────────────
 BROWSER="chromium"
 PARALLEL=1
+MAX_PARALLEL="${E2E_MAX_WORKERS:-4}"
 COVERAGE=false
 REPORT_FORMAT="list"
 TIMEOUT=30000
@@ -41,6 +42,7 @@ EXAMPLES
 ENVIRONMENT
   E2E_BASE_URL       Base URL (default: http://localhost:3000)
   E2E_REPORT_DIR     Report output directory (default: ./test-reports)
+  E2E_MAX_WORKERS    Maximum allowed workers (default: 4; raise explicitly on dedicated runners)
   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
   PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH
   PLAYWRIGHT_WEBKIT_EXECUTABLE_PATH
@@ -108,6 +110,16 @@ if ! [[ "$PARALLEL" =~ ^[0-9]+$ ]] || (( PARALLEL < 1)); then
 	exit 1
 fi
 
+if ! [[ "$MAX_PARALLEL" =~ ^[0-9]+$ ]] || (( MAX_PARALLEL < 1)); then
+	echo "Invalid E2E_MAX_WORKERS value: $MAX_PARALLEL (must be a positive integer)" >&2
+	exit 1
+fi
+
+if (( PARALLEL > MAX_PARALLEL )); then
+	echo "Parallel value $PARALLEL exceeds E2E_MAX_WORKERS limit $MAX_PARALLEL" >&2
+	exit 1
+fi
+
 if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || (( TIMEOUT < 1000)); then
 	echo "Invalid timeout: $TIMEOUT (must be >= 1000ms)" >&2
 	exit 1
@@ -134,6 +146,8 @@ esac
 # Project filter
 if [[ -n "$PLAYWRIGHT_PROJECT" ]]; then
 	PW_ARGS+=(--project="$PLAYWRIGHT_PROJECT")
+else
+	PW_ARGS+=(--project="$BROWSER")
 fi
 
 # Parallel workers
@@ -156,7 +170,6 @@ fi
 # Coverage flags
 if [[ "$COVERAGE" == true ]]; then
 	export E2E_COVERAGE=true
-	PW_ARGS+=(--coverage)
 fi
 
 # ── Ensure Report Directory Exists ─────────────────────────────────────────────
