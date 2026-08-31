@@ -18,6 +18,74 @@ use gitforge_storage::{Artifact, ArtifactStore};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+async fn webhook_fixture(config: serde_json::Value) -> (axum::Router, gitforge_common::PipelineId, gitforge_common::RepoId, String) {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let user = gitforge_db::models::User::new(
+        "webhook-test".to_string(),
+        "webhook-test@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+    let repo_id = gitforge_common::RepoId::new();
+    gitforge_db::queries::RepoQueries::create(
+        &pool,
+        &gitforge_db::models::Repository::new(
+            "webhook-repo".to_string(),
+            user.id,
+            "/git/webhook-repo".to_string(),
+        ),
+    )
+    .await
+    .unwrap();
+    let pipeline = gitforge_db::models::Pipeline {
+        id: gitforge_common::PipelineId::new(),
+        repo_id,
+        name: "webhook-pipeline".to_string(),
+        trigger_type: "push".to_string(),
+        config,
+        created_at: chrono::Utc::now(),
+    };
+    gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+        .await
+        .unwrap();
+    let token = ApiAuth::new("test-secret")
+        .generate_token(user.id, "webhook-test", "admin")
+        .unwrap();
+    (ApiServer::new("test-secret", pool).into_router(), pipeline.id, repo_id, token)
+}
+
+fn webhook_definition(job: JobDefinition) -> serde_json::Value {
+    serde_json::to_value(PipelineDefinition {
+        name: "webhook-pipeline".to_string(),
+        version: "1.0".to_string(),
+        trigger_on: vec![TriggerType::Push],
+        environment: std::collections::HashMap::new(),
+        jobs: vec![job],
+    })
+    .unwrap()
+}
+
+fn webhook_job(needs: Vec<String>, timeout: Option<&str>) -> JobDefinition {
+    JobDefinition {
+        name: "webhook-job".to_string(),
+        image: "alpine:latest".to_string(),
+        needs,
+        env: std::collections::HashMap::new(),
+        steps: vec![StepDefinition {
+            name: "smoke".to_string(),
+            run: "printf webhook-test".to_string(),
+            env: None,
+            working_directory: None,
+            condition: None,
+        }],
+        timeout: timeout.map(str::to_string),
+        retry: None,
+    }
+}
+
 #[tokio::test]
 async fn test_api_server_creation() {
     let pool = Pool::memory().await.unwrap();
@@ -1753,6 +1821,81 @@ async fn test_api_webhook_trigger_success() {
         "webhook response: {}",
         String::from_utf8_lossy(&body)
     );
+}
+
+#[tokio::test]
+async fn test_api_webhook_trigger_rejects_invalid_stored_definition() {
+    let (app, pipeline_id, repo_id, token) = webhook_fixture(serde_json::json!({})).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/webhook/trigger/{pipeline_id}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"repo_id":"{repo_id}","commit_hash":"abc123","branch":"main"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn test_api_webhook_trigger_rejects_pipeline_without_entry_job() {
+    let config = webhook_definition(webhook_job(vec!["missing".to_string()], Some("30s")));
+    let (app, pipeline_id, repo_id, token) = webhook_fixture(config).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/webhook/trigger/{pipeline_id}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"repo_id":"{repo_id}","commit_hash":"abc123","branch":"main"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn test_api_webhook_trigger_rejects_invalid_job_timeout() {
+    let config = webhook_definition(webhook_job(vec![], Some("1s")));
+    let (app, pipeline_id, repo_id, token) = webhook_fixture(config).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/webhook/trigger/{pipeline_id}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"repo_id":"{repo_id}","commit_hash":"abc123","branch":"main"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn test_api_webhook_trigger_rejects_repository_mismatch() {
+    let config = webhook_definition(webhook_job(vec![], Some("30s")));
+    let (app, pipeline_id, _repo_id, token) = webhook_fixture(config).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/webhook/trigger/{pipeline_id}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"repo_id":"{}","commit_hash":"abc123","branch":"main"}}"#, gitforge_common::RepoId::new())))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
