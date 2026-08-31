@@ -2,7 +2,7 @@
 //!
 //! Main entry point for the REST API gateway.
 
-use gitforge_api::ApiServer;
+use gitforge_api::{ApiServer, CiTriggerClient};
 use gitforge_db::Pool;
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
 use gitforge_storage::FileStorage;
@@ -50,9 +50,25 @@ async fn main() -> anyhow::Result<()> {
     let artifact_root = std::env::var("GITFORGE_ARTIFACT_ROOT")
         .unwrap_or_else(|_| "target/gitforge-artifacts".to_string());
     let storage = FileStorage::new(artifact_root).await?;
+    let ci_trigger_client = match (
+        std::env::var("GITFORGE_CI_TRIGGER_URL").ok(),
+        std::env::var("GITFORGE_CI_TRIGGER_TOKEN").ok(),
+    ) {
+        (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
+            Some(Arc::new(CiTriggerClient::new(url, token)?))
+        }
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "GITFORGE_CI_TRIGGER_URL and GITFORGE_CI_TRIGGER_TOKEN must be configured together"
+        ),
+    };
     let server = ApiServer::new(&config.jwt_secret, pool)
         .with_storage_extension(Arc::new(storage))
         .with_port(config.port);
+    let server = match ci_trigger_client {
+        Some(client) => server.with_ci_trigger_client(client),
+        None => server,
+    };
 
     tracing::info!("API Gateway listening on port {}", config.port);
 
