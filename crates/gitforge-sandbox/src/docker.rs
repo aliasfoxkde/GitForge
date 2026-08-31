@@ -2,13 +2,13 @@
 
 use crate::limits::SandboxLimits;
 use async_trait::async_trait;
-use bollard::container::{
-    Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StartContainerOptions,
+use bollard::container::LogOutput;
+use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+use bollard::models::{ContainerCreateBody, HostConfig};
+use bollard::query_parameters::{
+    CreateContainerOptions, CreateImageOptions, ListContainersOptions, RemoveContainerOptions,
     StopContainerOptions,
 };
-use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
-use bollard::image::CreateImageOptions;
-use bollard::models::HostConfig;
 use bollard::Docker;
 use futures_util::StreamExt;
 use gitforge_common::{Error, JobId, Result};
@@ -90,9 +90,9 @@ impl DockerSandbox {
             vec!["com.gitforce.managed=true".to_string()],
         );
         let containers = docker
-            .list_containers(Some(bollard::container::ListContainersOptions {
+            .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters,
+                filters: Some(filters),
                 ..Default::default()
             }))
             .await
@@ -199,7 +199,7 @@ impl DockerSandbox {
             // Pull the image - Docker is idempotent, so this works even if image exists
             let mut stream = docker.create_image(
                 Some(CreateImageOptions {
-                    from_image: image,
+                    from_image: Some(image.to_owned()),
                     ..Default::default()
                 }),
                 None,
@@ -292,8 +292,8 @@ impl Sandbox for DockerSandbox {
             let container_name = Self::container_name(job_id);
             let job_label = job_id.to_string();
             let labels = HashMap::from([
-                ("com.gitforce.managed", "true"),
-                ("com.gitforce.job_id", job_label.as_str()),
+                ("com.gitforce.managed".to_owned(), "true".to_owned()),
+                ("com.gitforce.job_id".to_owned(), job_label.clone()),
             ]);
 
             // Build host config with resource limits
@@ -310,17 +310,17 @@ impl Sandbox for DockerSandbox {
             };
 
             // Create container
-            let config = Config {
-                image: Some(image),
-                cmd: Some(vec!["sleep", "3600"]), // Keep container alive
+            let config = ContainerCreateBody {
+                image: Some(image.to_owned()),
+                cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]), // Keep container alive
                 host_config: Some(host_config),
                 labels: Some(labels),
                 ..Default::default()
             };
 
             let options = CreateContainerOptions {
-                name: &container_name,
-                platform: None,
+                name: Some(container_name.clone()),
+                platform: String::new(),
             };
 
             let response = docker
@@ -330,7 +330,7 @@ impl Sandbox for DockerSandbox {
 
             // Start container
             docker
-                .start_container(&response.id, None::<StartContainerOptions<String>>)
+                .start_container(&response.id, None)
                 .await
                 .map_err(|e| Error::sandbox(format!("failed to start container: {}", e)))?;
 
@@ -376,8 +376,8 @@ impl Sandbox for DockerSandbox {
             let container_name = Self::container_name(job_id);
             let job_label = job_id.to_string();
             let labels = HashMap::from([
-                ("com.gitforce.managed", "true"),
-                ("com.gitforce.job_id", job_label.as_str()),
+                ("com.gitforce.managed".to_owned(), "true".to_owned()),
+                ("com.gitforce.job_id".to_owned(), job_label),
             ]);
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
@@ -396,10 +396,10 @@ impl Sandbox for DockerSandbox {
                 binds: Some(vec![format!("{}:/workspace:z", workspace_path)]),
                 ..Default::default()
             };
-            let config = Config {
-                image: Some(image),
-                cmd: Some(vec!["sleep", "3600"]),
-                working_dir: Some("/workspace"),
+            let config = ContainerCreateBody {
+                image: Some(image.to_owned()),
+                cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
+                working_dir: Some("/workspace".to_owned()),
                 host_config: Some(host_config),
                 labels: Some(labels),
                 ..Default::default()
@@ -407,8 +407,8 @@ impl Sandbox for DockerSandbox {
             let response = docker
                 .create_container(
                     Some(CreateContainerOptions {
-                        name: &container_name,
-                        platform: None,
+                        name: Some(container_name.clone()),
+                        platform: String::new(),
                     }),
                     config,
                 )
@@ -417,7 +417,7 @@ impl Sandbox for DockerSandbox {
                     Error::sandbox(format!("failed to create workspace container: {}", e))
                 })?;
             docker
-                .start_container(&response.id, None::<StartContainerOptions<String>>)
+                .start_container(&response.id, None)
                 .await
                 .map_err(|e| {
                     Error::sandbox(format!("failed to start workspace container: {}", e))
@@ -572,7 +572,10 @@ impl Sandbox for DockerSandbox {
 
             // Send SIGTERM for graceful shutdown first
             // Wait up to 10 seconds for container to stop gracefully
-            let stop_options = StopContainerOptions { t: 10 };
+            let stop_options = StopContainerOptions {
+                t: Some(10),
+                ..Default::default()
+            };
 
             if let Err(e) = docker
                 .stop_container(&instance.container_id, Some(stop_options))
