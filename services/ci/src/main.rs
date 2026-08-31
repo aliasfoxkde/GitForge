@@ -343,6 +343,27 @@ fn configured_trigger_token(get_var: impl Fn(&str) -> Option<String>) -> Option<
     .find_map(|name| get_var(name).filter(|token| !token.is_empty()))
 }
 
+/// Compare trigger credentials without leaking the first differing byte or
+/// accepting a token with a different length. The scheduler is an internal
+/// control-plane boundary, so both the dedicated compatibility header and the
+/// standard Bearer form are supported during migration.
+fn trigger_token_matches(expected: &str, supplied: Option<&str>) -> bool {
+    let Some(supplied) = supplied else {
+        return false;
+    };
+    let candidate = supplied.strip_prefix("Bearer ").unwrap_or(supplied);
+    let expected_bytes = expected.as_bytes();
+    let candidate_bytes = candidate.as_bytes();
+    let max_len = expected_bytes.len().max(candidate_bytes.len());
+    let mut difference = expected_bytes.len() ^ candidate_bytes.len();
+    for index in 0..max_len {
+        let expected_byte = expected_bytes.get(index).copied().unwrap_or(0);
+        let candidate_byte = candidate_bytes.get(index).copied().unwrap_or(0);
+        difference |= usize::from(expected_byte ^ candidate_byte);
+    }
+    difference == 0
+}
+
 async fn require_trigger_auth(request: Request, next: Next) -> Response {
     let expected = configured_trigger_token(|name| std::env::var(name).ok());
     let Some(expected) = expected else {
@@ -354,9 +375,10 @@ async fn require_trigger_auth(request: Request, next: Next) -> Response {
     };
     let supplied = request
         .headers()
-        .get(header::AUTHORIZATION)
+        .get("x-gitforge-trigger-token")
+        .or_else(|| request.headers().get(header::AUTHORIZATION))
         .and_then(|value| value.to_str().ok());
-    if supplied == Some(&format!("Bearer {expected}")) {
+    if trigger_token_matches(&expected, supplied) {
         next.run(request).await
     } else {
         (
@@ -1097,6 +1119,35 @@ mod tests {
             _ => None,
         });
         assert_eq!(token.as_deref(), Some("compatibility"));
+    }
+
+    #[test]
+    fn trigger_token_matches_raw_and_bearer_credentials() {
+        assert!(trigger_token_matches(
+            "shared-secret",
+            Some("shared-secret")
+        ));
+        assert!(trigger_token_matches(
+            "shared-secret",
+            Some("Bearer shared-secret")
+        ));
+    }
+
+    #[test]
+    fn trigger_token_rejects_missing_mismatched_and_malformed_credentials() {
+        assert!(!trigger_token_matches("shared-secret", None));
+        assert!(!trigger_token_matches(
+            "shared-secret",
+            Some("wrong-secret")
+        ));
+        assert!(!trigger_token_matches(
+            "shared-secret",
+            Some("Basic shared-secret")
+        ));
+        assert!(!trigger_token_matches(
+            "shared-secret",
+            Some("Bearer shared-secret-extra")
+        ));
     }
 
     async fn run_git<I, S>(args: I, cwd: Option<&std::path::Path>) -> String
