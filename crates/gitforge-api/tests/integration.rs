@@ -1802,7 +1802,8 @@ async fn test_api_webhook_trigger_success() {
         .await
         .unwrap();
 
-    let server = ApiServer::new("test-secret", pool);
+    let scheduler = Arc::new(Scheduler::with_db(pool.clone()));
+    let server = ApiServer::new("test-secret", pool).with_scheduler_extension(scheduler.clone());
     let app = server.into_router();
 
     let auth = ApiAuth::new("test-secret");
@@ -1831,6 +1832,7 @@ async fn test_api_webhook_trigger_success() {
         "webhook response: {}",
         String::from_utf8_lossy(&body)
     );
+    assert_eq!(scheduler.queue_len().await, 1);
 }
 
 #[tokio::test]

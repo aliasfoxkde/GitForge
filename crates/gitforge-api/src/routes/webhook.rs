@@ -48,7 +48,7 @@ pub fn webhook_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 /// Trigger a pipeline via webhook
 async fn trigger_pipeline(
     Extension(pool): Extension<Arc<Pool>>,
-    Extension(scheduler): Extension<Option<Arc<Scheduler>>>,
+    scheduler: Option<Extension<Arc<Scheduler>>>,
     _user: AuthenticatedUser,
     Path(pipeline_id): Path<String>,
     Json(payload): Json<WebhookTriggerPayload>,
@@ -187,7 +187,7 @@ async fn trigger_pipeline(
             let job_id = JobId::new();
 
             // Enqueue the job to the scheduler (if available)
-            if let Some(sched) = &scheduler {
+            if let Some(Extension(sched)) = scheduler {
                 sched
                     .enqueue_with_definition_and_image_and_timeout(
                         job_id,
