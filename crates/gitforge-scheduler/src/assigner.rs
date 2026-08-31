@@ -715,6 +715,28 @@ impl Scheduler {
                     self.cancel(job_id).await;
                 }
             }
+
+            // API-side cancellation can race with assignment. Assigned jobs
+            // are no longer present in the queue, so reconcile that mirror
+            // separately; otherwise a cancelled job remains eligible for the
+            // runner's next assignment poll indefinitely.
+            let assigned_ids = {
+                let state = self.state.read().await;
+                state.assigned_jobs.keys().copied().collect::<Vec<_>>()
+            };
+            for job_id in assigned_ids {
+                let is_cancelled = match gitforge_db::queries::JobQueries::get(pool, job_id).await {
+                    Ok(Some(job)) => job.status == "cancelled",
+                    Ok(None) => false,
+                    Err(error) => {
+                        tracing::error!(%error, %job_id, "failed to reconcile assigned-job cancellation");
+                        return;
+                    }
+                };
+                if is_cancelled {
+                    self.cancel(job_id).await;
+                }
+            }
         }
         let mut state = self.state.write().await;
         let runners = state.list_online_runners();
@@ -1246,7 +1268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_api_cancelled_queued_job_is_not_assigned() {
+    async fn test_api_cancelled_assigned_job_is_not_reassigned() {
         let pool = gitforge_db::Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
         let user = gitforge_db::models::User::new(
@@ -1314,6 +1336,12 @@ mod tests {
                 None,
             )
             .await;
+        scheduler
+            .register_runner(make_runner(RunnerId::new(), "runner", "online", 1))
+            .await;
+        scheduler.process_queue().await;
+        assert!(scheduler.is_assigned(job_id).await.is_some());
+
         let receipt = serde_json::json!({
             "job_id": job_id.to_string(),
             "status": "cancelled",
@@ -1323,9 +1351,6 @@ mod tests {
         gitforge_db::queries::JobQueries::cancel(&pool, job_id, &receipt)
             .await
             .unwrap();
-        scheduler
-            .register_runner(make_runner(RunnerId::new(), "runner", "online", 1))
-            .await;
         scheduler.process_queue().await;
         assert_eq!(scheduler.queue_len().await, 0);
         assert!(scheduler.is_assigned(job_id).await.is_none());
