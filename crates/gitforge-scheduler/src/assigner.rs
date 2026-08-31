@@ -80,7 +80,12 @@ pub struct JobExecutionDefinition {
     pub commands: Vec<String>,
     pub image: String,
     pub working_dir: Option<String>,
+    /// Maximum seconds allowed for each runner step. Older callers that do
+    /// not provide a value retain the safe legacy default.
+    pub timeout_secs: u64,
 }
+
+pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 300;
 
 /// Return the scheduler resource class for jobs that must not overlap on one
 /// runner. Workspace-wide Cargo tests contend for the same checkout and build
@@ -303,6 +308,7 @@ impl Scheduler {
                 commands: commands.clone(),
                 image: image.clone(),
                 working_dir: working_dir.clone(),
+                timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
             },
         );
         tracing::debug!("job {} enqueued", job_id);
@@ -880,6 +886,7 @@ impl Scheduler {
                         commands: db_job.commands,
                         image: db_job.image,
                         working_dir: db_job.working_dir,
+                        timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
                     },
                 );
                 loaded += 1;
