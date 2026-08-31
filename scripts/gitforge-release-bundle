@@ -22,6 +22,24 @@ fi
 
 "$(dirname "$0")/gitforge-release-preflight" "$source_root"
 
+source_commit="${GITFORGE_SOURCE_COMMIT:-}"
+if [[ -z "$source_commit" ]]; then
+  source_commit=$(git -C "$source_root" rev-parse HEAD 2>/dev/null || true)
+fi
+if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'release bundle: exact source commit is required (set GITFORGE_SOURCE_COMMIT or pass a git checkout)\n' >&2
+  exit 1
+fi
+
+toolchain="${GITFORGE_TOOLCHAIN:-}"
+if [[ -z "$toolchain" ]]; then
+  toolchain=$(rustc --version 2>/dev/null || true)
+fi
+if [[ -z "$toolchain" ]]; then
+  printf 'release bundle: build toolchain is required (set GITFORGE_TOOLCHAIN or install rustc)\n' >&2
+  exit 1
+fi
+
 release_dir="$bundle_root/$release_id"
 if [[ -e "$release_dir" ]]; then
   printf 'release bundle: refusing to overwrite existing release: %s\n' "$release_dir" >&2
@@ -42,10 +60,21 @@ for policy in gitforge-resource-limits.conf gitforge-ci-resource-limits.conf git
   install -m 0644 "$(dirname "$0")/../systemd/user/$policy" "$release_dir/systemd/user/$policy"
 done
 
+build_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 (
   cd "$release_dir"
-  sha256sum bin/* systemd/user/* | sort > MANIFEST.sha256
-  touch READY
+  cat > RELEASE_METADATA.txt <<EOF
+release_id=$release_id
+source_commit=$source_commit
+build_timestamp_utc=$build_timestamp
+toolchain=$toolchain
+EOF
+  sha256sum RELEASE_METADATA.txt bin/* systemd/user/* | sort > MANIFEST.sha256
+  cat > READY <<EOF
+release_id=$release_id
+source_commit=$source_commit
+manifest=MANIFEST.sha256
+EOF
 )
 
 printf 'release bundle: assembled %s\n' "$release_dir"

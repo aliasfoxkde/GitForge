@@ -20,8 +20,8 @@ for binary in "${required[@]}"; do
   fi
 done
 
-if [[ ! -f "$release_dir/MANIFEST.sha256" || ! -f "$release_dir/READY" ]]; then
-  echo 'release verify: READY marker and checksum manifest are required' >&2
+if [[ ! -s "$release_dir/MANIFEST.sha256" || ! -s "$release_dir/READY" || ! -s "$release_dir/RELEASE_METADATA.txt" ]]; then
+  echo 'release verify: non-empty READY marker, metadata, and checksum manifest are required' >&2
   exit 1
 fi
 
@@ -29,6 +29,21 @@ fi
   cd "$release_dir"
   sha256sum --check MANIFEST.sha256
 )
+
+metadata_commit=$(sed -n 's/^source_commit=//p' "$release_dir/RELEASE_METADATA.txt")
+metadata_release=$(sed -n 's/^release_id=//p' "$release_dir/RELEASE_METADATA.txt")
+metadata_timestamp=$(sed -n 's/^build_timestamp_utc=//p' "$release_dir/RELEASE_METADATA.txt")
+metadata_toolchain=$(sed -n 's/^toolchain=//p' "$release_dir/RELEASE_METADATA.txt")
+ready_commit=$(sed -n 's/^source_commit=//p' "$release_dir/READY")
+ready_release=$(sed -n 's/^release_id=//p' "$release_dir/READY")
+if [[ ! "$metadata_commit" =~ ^[0-9a-f]{40}$ || "$metadata_commit" != "$ready_commit" ]]; then
+  echo 'release verify: metadata and READY source commits are missing or inconsistent' >&2
+  exit 1
+fi
+if [[ -z "$metadata_release" || "$metadata_release" != "$ready_release" || -z "$metadata_timestamp" || -z "$metadata_toolchain" ]]; then
+  echo 'release verify: release metadata is incomplete or inconsistent' >&2
+  exit 1
+fi
 
 ci_unit="$release_dir/systemd/user/gitforge-ci.service.example"
 runner_unit="$release_dir/systemd/user/gitforge-runner.service.example"
@@ -59,5 +74,5 @@ if grep -Fq 'gitforge-scheduler.service' "$runner_unit"; then
   exit 1
 fi
 
-printf 'release verify: valid bundle=%s binaries=%d scheduler-owner=ci\n' \
-  "$release_dir" "${#required[@]}"
+printf 'release verify: valid bundle=%s source=%s binaries=%d scheduler-owner=ci\n' \
+  "$release_dir" "$metadata_commit" "${#required[@]}"
