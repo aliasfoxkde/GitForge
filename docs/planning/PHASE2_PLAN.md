@@ -56,7 +56,9 @@ Structure:
 
 Current: basic harness + README
 Missing:
-- `runner.sh` — CLI to run E2E tests with browser selection, parallelization, coverage
+- `runner.sh` — CLI to run E2E tests with browser selection, bounded parallelization,
+  report selection, and environment-configured output paths; coverage remains
+  project-specific and is not claimed by this template
 - `ci.yml` — GitHub Actions workflow for E2E on schedule + workflow_dispatch
 - `playwright.config.ts` — full config with trace viewing, screenshot on failure
 
