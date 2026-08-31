@@ -154,6 +154,11 @@ fn hydrate_job(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Job> {
         working_dir: row.try_get("working_dir").map_err(|error| {
             Error::database(format!("invalid job working directory: {}", error))
         })?,
+        timeout_secs: row
+            .try_get::<i64, _>("timeout_secs")
+            .map_err(|error| Error::database(format!("invalid job timeout: {}", error)))?
+            .try_into()
+            .map_err(|_| Error::database("job timeout cannot be negative"))?,
         result_json: row
             .try_get("result_json")
             .map_err(|error| Error::database(format!("invalid job result: {}", error)))?,
@@ -809,8 +814,8 @@ impl JobQueries {
     pub async fn create(pool: &Pool, job: &crate::models::Job) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, result_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, timeout_secs, result_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(job.id.to_string())
@@ -825,6 +830,7 @@ impl JobQueries {
         .bind(serde_json::to_string(&job.commands).unwrap_or_else(|_| "[]".to_string()))
         .bind(&job.image)
         .bind(&job.working_dir)
+        .bind(i64::try_from(job.timeout_secs).unwrap_or(i64::MAX))
         .bind(&job.result_json)
         .execute(pool.pool())
         .await
@@ -884,12 +890,29 @@ impl JobQueries {
         image: &str,
         working_dir: Option<&str>,
     ) -> Result<()> {
+        Self::set_definition_with_image_and_timeout(pool, id, commands, image, working_dir, 300)
+            .await
+    }
+
+    pub async fn set_definition_with_image_and_timeout(
+        pool: &Pool,
+        id: JobId,
+        commands: &[String],
+        image: &str,
+        working_dir: Option<&str>,
+        timeout_secs: u64,
+    ) -> Result<()> {
         let commands_json = serde_json::to_string(commands)
             .map_err(|e| Error::database(format!("failed to encode job commands: {}", e)))?;
-        sqlx::query("UPDATE jobs SET commands = ?, image = ?, working_dir = ? WHERE id = ?")
+        let timeout_secs = i64::try_from(timeout_secs)
+            .map_err(|_| Error::invalid_input("job timeout exceeds database range"))?;
+        sqlx::query(
+            "UPDATE jobs SET commands = ?, image = ?, working_dir = ?, timeout_secs = ? WHERE id = ?",
+        )
             .bind(commands_json)
             .bind(image)
             .bind(working_dir)
+            .bind(timeout_secs)
             .bind(id.to_string())
             .execute(pool.pool())
             .await
@@ -1606,6 +1629,20 @@ mod tests {
         let found = JobQueries::get(&pool, job.id).await.unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "build");
+
+        JobQueries::set_definition_with_image_and_timeout(
+            &pool,
+            job.id,
+            &["cargo test".to_string()],
+            "rust:latest",
+            None,
+            900,
+        )
+        .await
+        .unwrap();
+        let configured = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(configured.commands, vec!["cargo test"]);
+        assert_eq!(configured.timeout_secs, 900);
 
         // Update status
         JobQueries::start(&pool, job.id).await.unwrap();

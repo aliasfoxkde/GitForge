@@ -299,6 +299,30 @@ impl Scheduler {
         image: String,
         working_dir: Option<String>,
     ) {
+        self.enqueue_with_definition_and_image_and_timeout(
+            job_id,
+            pipeline_run_id,
+            repo_id,
+            commands,
+            image,
+            working_dir,
+            DEFAULT_JOB_TIMEOUT_SECS,
+        )
+        .await;
+    }
+
+    /// Enqueue a job with an explicit, bounded execution timeout.
+    pub async fn enqueue_with_definition_and_image_and_timeout(
+        &self,
+        job_id: JobId,
+        pipeline_run_id: PipelineRunId,
+        repo_id: RepoId,
+        commands: Vec<String>,
+        image: String,
+        working_dir: Option<String>,
+        timeout_secs: u64,
+    ) {
+        let timeout_secs = timeout_secs.clamp(5, 24 * 60 * 60);
         let job = QueuedJob::new(job_id, pipeline_run_id, repo_id);
         let mut state = self.state.write().await;
         state.queue.enqueue(job);
@@ -308,7 +332,7 @@ impl Scheduler {
                 commands: commands.clone(),
                 image: image.clone(),
                 working_dir: working_dir.clone(),
-                timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+                timeout_secs,
             },
         );
         tracing::debug!("job {} enqueued", job_id);
@@ -325,12 +349,13 @@ impl Scheduler {
             {
                 tracing::error!("failed to update job status in DB: {}", e);
             }
-            if let Err(e) = gitforge_db::queries::JobQueries::set_definition_with_image(
+            if let Err(e) = gitforge_db::queries::JobQueries::set_definition_with_image_and_timeout(
                 pool,
                 job_id,
                 &commands,
                 &image,
                 working_dir.as_deref(),
+                timeout_secs,
             )
             .await
             {
@@ -886,7 +911,7 @@ impl Scheduler {
                         commands: db_job.commands,
                         image: db_job.image,
                         working_dir: db_job.working_dir,
-                        timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+                        timeout_secs: db_job.timeout_secs,
                     },
                 );
                 loaded += 1;
@@ -1210,13 +1235,14 @@ mod tests {
         let repo_id = RepoId::new();
 
         scheduler
-            .enqueue_with_definition_and_image(
+            .enqueue_with_definition_and_image_and_timeout(
                 job_id,
                 run_id,
                 repo_id,
                 vec!["echo image".to_string()],
                 "node:22".to_string(),
                 Some("/workspace".to_string()),
+                900,
             )
             .await;
 
@@ -1224,6 +1250,7 @@ mod tests {
         let definition = state.job_definitions.get(&job_id).unwrap();
         assert_eq!(definition.image, "node:22");
         assert_eq!(definition.working_dir.as_deref(), Some("/workspace"));
+        assert_eq!(definition.timeout_secs, 900);
     }
 
     #[tokio::test]
