@@ -104,7 +104,9 @@ impl StorageBackend for FileStorageBackend {
 
         // Disable garbage collection for server-side repos
         config.set_bool("gc.autodetach", false).ok();
-        config.set_bool("gc.auto", false).ok();
+        // gc.auto is an integer count, not a boolean. Writing `false` leaves
+        // repositories unreadable to Git clients during push/fetch.
+        config.set_i32("gc.auto", 0).ok();
 
         // Point HEAD at the default branch. init_bare leaves HEAD on an
         // unborn `master`, and clients that push `main` never rewrite it, so
@@ -157,6 +159,7 @@ mod tests {
             String::from_utf8_lossy(&head).trim(),
             "ref: refs/heads/main"
         );
+        assert_eq!(repo.config().unwrap().get_i64("gc.auto").unwrap(), 0);
 
         // Delete repository
         backend.delete(repo_id).await.unwrap();
