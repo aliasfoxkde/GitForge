@@ -257,6 +257,17 @@ impl JobExecutor {
         self.execute_with_output(job, None).await
     }
 
+    /// Best-effort removal of containers left by a failed acquisition.
+    ///
+    /// When acquisition is abandoned (timeout or creation error) the Docker
+    /// daemon may still have materialized the container server-side; without
+    /// reaping, every slow acquisition leaks a container that never starts.
+    async fn reap_attempt_containers(&self, job_id: JobId) {
+        if let Err(error) = self.pool.sandbox.remove_job_containers(job_id).await {
+            tracing::warn!(%job_id, %error, "failed to reap containers after failed acquisition");
+        }
+    }
+
     /// Execute a job and forward sandbox output while each step is running.
     /// The sink is optional so existing callers and local tests retain the
     /// original accumulated-result behavior.
@@ -279,6 +290,7 @@ impl JobExecutor {
         .await
         {
             Err(_) => {
+                self.reap_attempt_containers(job_id).await;
                 let completed_at = chrono::Utc::now();
                 return JobResult {
                     job_id,
@@ -297,6 +309,7 @@ impl JobExecutor {
                 };
             }
             Ok(Err(e)) => {
+                self.reap_attempt_containers(job_id).await;
                 let completed_at = chrono::Utc::now();
                 return JobResult {
                     job_id,

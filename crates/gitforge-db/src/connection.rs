@@ -1,8 +1,12 @@
 //! Database connection pool management with SQLite for MVP
 
 use gitforge_common::{Error, Result};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 use std::path::Path;
+use std::str::FromStr;
+use std::time::Duration;
 
 /// SQLite connection pool wrapper
 #[derive(Clone)]
@@ -24,9 +28,23 @@ impl Pool {
                 "sqlite::memory:".to_string()
             };
 
+        // GitForge serves one SQLite file from several processes (gateway,
+        // scheduler, git server). The default rollback journal takes an
+        // exclusive lock for every write and fails concurrent writers
+        // immediately with SQLITE_BUSY; under job assignment plus log
+        // appends that cascaded into lost leases and dropped log chunks.
+        // WAL keeps readers concurrent, and a busy timeout makes writers
+        // queue instead of erroring.
+        let options = SqliteConnectOptions::from_str(&connect_url)
+            .map_err(|e| Error::database(format!("invalid database URL: {}", e)))?
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5))
+            .foreign_keys(true);
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&connect_url)
+            .connect_with(options)
             .await
             .map_err(|e| Error::database(format!("failed to connect to database: {}", e)))?;
 
@@ -349,6 +367,56 @@ mod tests {
         // Test with explicit memory URL
         let pool = Pool::new("sqlite::memory:").await;
         assert!(pool.is_ok());
+    }
+
+    /// Concurrent writers must queue, not fail: the scheduler (lease sync),
+    /// gateway, and runner log appends all write to one file. Pins WAL mode,
+    /// a busy timeout, and enforced foreign keys on file-backed pools.
+    #[tokio::test]
+    async fn test_file_pool_enables_concurrency_pragmas() {
+        let db_path =
+            std::env::temp_dir().join(format!("gitforge-pragma-test-{}.db", uuid::Uuid::new_v4()));
+        let pool = Pool::new(&db_path.to_string_lossy()).await.unwrap();
+
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(pool.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            journal_mode, "wal",
+            "file pools must use WAL for concurrent readers"
+        );
+
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(pool.pool())
+            .await
+            .unwrap();
+        assert!(
+            busy_timeout > 0,
+            "writers must wait on locks instead of failing"
+        );
+
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(pool.pool())
+            .await
+            .unwrap();
+        assert_eq!(foreign_keys, 1, "foreign keys must be enforced");
+
+        // Two pooled writers inserting concurrently must both succeed.
+        pool.migrate().await.unwrap();
+        let (left, right) = tokio::join!(
+            sqlx::query("INSERT INTO events (id, event_type, payload, created_at) VALUES ('a', 't', '{}', '2026-01-01T00:00:00Z')").execute(pool.pool()),
+            sqlx::query("INSERT INTO events (id, event_type, payload, created_at) VALUES ('b', 't', '{}', '2026-01-01T00:00:00Z')").execute(pool.pool()),
+        );
+        assert!(
+            left.is_ok() && right.is_ok(),
+            "concurrent writes must not fail with SQLITE_BUSY"
+        );
+
+        drop(pool);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
     }
 
     #[test]
