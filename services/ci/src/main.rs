@@ -612,12 +612,84 @@ async fn remove_run_workspace_dir(
         );
         return false;
     }
+    let metadata = match tokio::fs::symlink_metadata(&workspace).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(error) => {
+            tracing::warn!(
+                %run_id,
+                %error,
+                workspace = %workspace.display(),
+                "failed to inspect run workspace"
+            );
+            return false;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        tracing::warn!(
+            %run_id,
+            workspace = %workspace.display(),
+            "refusing to remove non-directory run workspace"
+        );
+        return false;
+    }
     match tokio::fs::remove_dir_all(&workspace).await {
         Ok(()) => {
             tracing::info!(%run_id, workspace = %workspace.display(), "removed run workspace");
             true
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Rootless Podman maps container root to a subordinate host UID.
+            // In that mode the service user cannot remove files created by a
+            // job through the ordinary host namespace. `podman unshare`
+            // re-enters the storage namespace and is given only the exact,
+            // symlink-checked run-owned path.
+            let result = timeout(
+                Duration::from_secs(120),
+                tokio::process::Command::new("podman")
+                    .args(["unshare", "rm", "-rf", "--"])
+                    .arg(&workspace)
+                    .output(),
+            )
+            .await;
+            match result {
+                Ok(Ok(output)) if output.status.success() => {
+                    tracing::info!(
+                        %run_id,
+                        workspace = %workspace.display(),
+                        "removed run workspace through rootless namespace"
+                    );
+                    true
+                }
+                Ok(Ok(output)) => {
+                    tracing::warn!(
+                        %run_id,
+                        workspace = %workspace.display(),
+                        status = ?output.status.code(),
+                        "rootless workspace cleanup failed"
+                    );
+                    false
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        %run_id,
+                        %error,
+                        workspace = %workspace.display(),
+                        "could not start rootless workspace cleanup"
+                    );
+                    false
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        %run_id,
+                        workspace = %workspace.display(),
+                        "rootless workspace cleanup timed out"
+                    );
+                    false
+                }
+            }
+        }
         Err(error) => {
             tracing::warn!(
                 %run_id,
@@ -1646,6 +1718,34 @@ mod tests {
         // Removing an already-gone workspace and an absent path are no-ops.
         assert!(!remove_run_workspace_dir(&root, run_id, Some(owned.to_str().unwrap())).await);
         assert!(!remove_run_workspace_dir(&root, run_id, None).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_run_workspace_refuses_symlink() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-symlink-cleanup-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        let run_id = gitforge_common::PipelineRunId::new();
+        let target = root.join("operator-prepared");
+        let owned = root.join(run_id.to_string());
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        tokio::fs::write(target.join("marker.txt"), "preserve")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&target, &owned).unwrap();
+
+        assert!(!remove_run_workspace_dir(&root, run_id, Some(owned.to_str().unwrap())).await);
+        assert!(tokio::fs::try_exists(&target).await.unwrap());
+        assert!(tokio::fs::try_exists(target.join("marker.txt"))
+            .await
+            .unwrap());
+        tokio::fs::remove_file(&owned).await.unwrap();
+        tokio::fs::remove_dir_all(&root).await.unwrap();
     }
 
     #[tokio::test]
