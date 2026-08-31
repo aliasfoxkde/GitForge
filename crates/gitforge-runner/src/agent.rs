@@ -834,13 +834,32 @@ impl RunnerAgent {
         if let Some(token) = scheduler_token {
             started_request = started_request.bearer_auth(token);
         }
-        let started = started_request
-            .send()
-            .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false);
+        let started = match started_request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    true
+                } else {
+                    let body = response.text().await.unwrap_or_default();
+                    tracing::error!(
+                        job_id = %assignment.job_id,
+                        %status,
+                        response = %body,
+                        "failed to mark job started"
+                    );
+                    false
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    job_id = %assignment.job_id,
+                    error = %error,
+                    "failed to reach scheduler while marking job started"
+                );
+                false
+            }
+        };
         if !started {
-            tracing::error!("failed to mark job {} started", assignment.job_id);
             return;
         }
 
@@ -970,8 +989,12 @@ impl RunnerAgent {
             .map(|sr| {
                 serde_json::json!({
                     "exit_code": sr.exit_code,
-                    "stdout": sr.stdout,
-                    "stderr": sr.stderr,
+                    // Output is already streamed to the durable log ledger.
+                    // Keep the completion receipt bounded so a scanner that
+                    // emits megabytes cannot make the completion request fail
+                    // and leave the assignment eligible for re-execution.
+                    "stdout": bounded_receipt_text(&sr.stdout),
+                    "stderr": bounded_receipt_text(&sr.stderr),
                 })
             })
             .collect();
@@ -1006,6 +1029,40 @@ impl RunnerAgent {
             }
             Err(error) => tracing::error!("failed to report job completion: {}", error),
         }
+    }
+}
+
+const MAX_RECEIPT_STREAM_BYTES: usize = 64 * 1024;
+
+fn bounded_receipt_text(value: &str) -> String {
+    if value.len() <= MAX_RECEIPT_STREAM_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_RECEIPT_STREAM_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[output truncated; full output is available in the job log ledger]",
+        &value[..end]
+    )
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::{bounded_receipt_text, MAX_RECEIPT_STREAM_BYTES};
+
+    #[test]
+    fn receipt_output_is_bounded_and_marked() {
+        let output = "x".repeat(MAX_RECEIPT_STREAM_BYTES + 100);
+        let receipt = bounded_receipt_text(&output);
+        assert!(receipt.len() < MAX_RECEIPT_STREAM_BYTES + 100);
+        assert!(receipt.contains("output truncated"));
+    }
+
+    #[test]
+    fn receipt_output_preserves_small_output() {
+        assert_eq!(bounded_receipt_text("ok"), "ok");
     }
 }
 
