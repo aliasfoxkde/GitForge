@@ -46,11 +46,13 @@ if [[ -e "$release_dir" ]]; then
   exit 1
 fi
 
-mkdir -p "$release_dir/bin" "$release_dir/systemd/user"
+mkdir -p "$release_dir/bin" "$release_dir/scripts" "$release_dir/systemd/user"
 
 for binary in api ci git-server runner; do
   install -m 0755 "$source_root/$binary" "$release_dir/bin/$binary"
 done
+
+install -m 0755 "$source_root/scripts/gitforge-status" "$release_dir/scripts/gitforge-status"
 
 for unit in gitforge-ci.service.example gitforge-runner.service.example; do
   install -m 0644 "$(dirname "$0")/../systemd/user/$unit" "$release_dir/systemd/user/$unit"
@@ -69,7 +71,7 @@ source_commit=$source_commit
 build_timestamp_utc=$build_timestamp
 toolchain=$toolchain
 EOF
-  sha256sum RELEASE_METADATA.txt bin/* systemd/user/* | sort > MANIFEST.sha256
+  sha256sum RELEASE_METADATA.txt bin/* scripts/* systemd/user/* | sort > MANIFEST.sha256
   cat > READY <<EOF
 release_id=$release_id
 source_commit=$source_commit
