@@ -53,11 +53,24 @@ mod tests {
     use super::bootstrap_first_admin;
     use gitforge_common::password::verify_password;
     use gitforge_db::{queries::UserQueries, Pool};
+    use std::{env, path::PathBuf};
+
+    fn test_artifact_directory() -> PathBuf {
+        let directory = env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                env::current_dir()
+                    .expect("test working directory should be available")
+                    .join("target")
+            });
+        directory.join("gitforge-cli-admin-tests")
+    }
 
     #[tokio::test]
     async fn creates_first_admin_and_never_replaces_it() {
-        std::fs::create_dir_all("/nas/Temp/artifacts").unwrap();
-        let directory = tempfile::tempdir_in("/nas/Temp/artifacts").unwrap();
+        let artifact_directory = test_artifact_directory();
+        std::fs::create_dir_all(&artifact_directory).unwrap();
+        let directory = tempfile::tempdir_in(artifact_directory).unwrap();
         let database_url = format!("sqlite:{}/gitforge.db?mode=rwc", directory.path().display());
         let user = bootstrap_first_admin(
             &database_url,
