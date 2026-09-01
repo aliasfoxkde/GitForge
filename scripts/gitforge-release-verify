@@ -25,6 +25,11 @@ if [[ ! -s "$release_dir/MANIFEST.sha256" || ! -s "$release_dir/READY" || ! -s "
   exit 1
 fi
 
+if [[ ! -x "$release_dir/scripts/gitforge-status" ]]; then
+  echo 'release verify: missing or non-executable status helper' >&2
+  exit 1
+fi
+
 (
   cd "$release_dir"
   sha256sum --check MANIFEST.sha256
