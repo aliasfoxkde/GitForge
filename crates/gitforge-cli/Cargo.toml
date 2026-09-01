@@ -7,6 +7,7 @@ authors = ["GitForge Team"]
 
 [dependencies]
 gitforge-common = { path = "../gitforge-common" }
+gitforge-db = { path = "../gitforge-db" }
 
 # CLI framework
 clap = { version = "4.6", features = ["derive"] }

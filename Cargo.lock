@@ -1080,6 +1080,7 @@ dependencies = [
  "clap",
  "dirs",
  "gitforge-common",
+ "gitforge-db",
  "mockito",
  "reqwest",
  "rpassword",
