@@ -72,11 +72,12 @@ mod tests {
         std::fs::create_dir_all(&artifact_directory).unwrap();
         let directory = tempfile::tempdir_in(artifact_directory).unwrap();
         let database_url = format!("sqlite:{}/gitforge.db?mode=rwc", directory.path().display());
+        let password: String = std::iter::repeat_n('x', 32).collect();
         let user = bootstrap_first_admin(
             &database_url,
             "operator",
             "operator@example.test",
-            "a-strong-bootstrap-password",
+            &password,
             true,
         )
         .await
@@ -89,14 +90,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(UserQueries::count_role(&pool, "admin").await.unwrap(), 1);
-        assert!(verify_password("a-strong-bootstrap-password", &stored.password_hash).unwrap());
+        assert!(verify_password(&password, &stored.password_hash).unwrap());
         assert_eq!(stored.id, user.id);
 
+        let replacement_password: String = std::iter::repeat_n('y', 32).collect();
         let second = bootstrap_first_admin(
             &database_url,
             "replacement",
             "replacement@example.test",
-            "another-strong-password",
+            &replacement_password,
             true,
         )
         .await;

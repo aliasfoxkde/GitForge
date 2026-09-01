@@ -298,17 +298,11 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 .as_deref()
                 .context("--email is required with --bootstrap")?;
             let password = rpassword::prompt_password("Administrator password: ")?;
-            let user =
+            let _user =
                 admin::bootstrap_first_admin(&database_url, username, email, &password, *confirm)
                     .await?;
-            println!(
-                "✅ First administrator created: {} ({})",
-                user.username, user.email
-            );
-            println!(
-                "   Run `gitforge auth login --login {}` to obtain a session token.",
-                user.username
-            );
+            println!("✅ First administrator created successfully.");
+            println!("   Run `gitforge auth login --login <username>` to obtain a session token.");
         }
 
         Commands::Repo {
