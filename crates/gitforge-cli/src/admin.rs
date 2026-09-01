@@ -120,11 +120,12 @@ mod tests {
 
     #[tokio::test]
     async fn requires_confirmation_and_strong_password() {
+        let short_password: String = runtime_password().chars().take(5).collect();
         assert!(bootstrap_first_admin(
             "sqlite::memory:",
             "operator",
             "operator@example.test",
-            "short",
+            &short_password,
             false,
         )
         .await
@@ -133,7 +134,7 @@ mod tests {
             "sqlite::memory:",
             "operator",
             "operator@example.test",
-            "short",
+            &short_password,
             true,
         )
         .await
