@@ -2,11 +2,12 @@
 //!
 //! Local-first Git platform client for GitForge.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use clap::Subcommand;
 use std::path::PathBuf;
 
+mod admin;
 mod client;
 mod config;
 mod sync;
@@ -56,6 +57,21 @@ enum Commands {
         /// Show user info
         #[arg(long)]
         whoami: bool,
+    },
+    /// Local first-administrator bootstrap
+    Admin {
+        /// Create the first administrator in DATABASE_URL
+        #[arg(long)]
+        bootstrap: bool,
+        /// Administrator username
+        #[arg(long, requires = "bootstrap")]
+        username: Option<String>,
+        /// Administrator email
+        #[arg(long, requires = "bootstrap")]
+        email: Option<String>,
+        /// Explicitly confirm local first-admin creation
+        #[arg(long, requires = "bootstrap")]
+        confirm: bool,
     },
     /// Repository operations
     Repo {
@@ -260,6 +276,39 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     }
                 }
             }
+        }
+
+        Commands::Admin {
+            bootstrap,
+            username,
+            email,
+            confirm,
+        } => {
+            if !bootstrap {
+                anyhow::bail!(
+                    "select an administrative operation; currently supported: --bootstrap"
+                );
+            }
+            let database_url = std::env::var("DATABASE_URL")
+                .context("DATABASE_URL is required for local administrator bootstrap")?;
+            let username = username
+                .as_deref()
+                .context("--username is required with --bootstrap")?;
+            let email = email
+                .as_deref()
+                .context("--email is required with --bootstrap")?;
+            let password = rpassword::prompt_password("Administrator password: ")?;
+            let user =
+                admin::bootstrap_first_admin(&database_url, username, email, &password, *confirm)
+                    .await?;
+            println!(
+                "✅ First administrator created: {} ({})",
+                user.username, user.email
+            );
+            println!(
+                "   Run `gitforge auth login --login {}` to obtain a session token.",
+                user.username
+            );
         }
 
         Commands::Repo {

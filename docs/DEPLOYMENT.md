@@ -38,6 +38,33 @@ docker-compose up -d
 curl http://localhost:42780/health
 ```
 
+## First administrator bootstrap
+
+GitForge does not expose public user registration. On a fresh database, run
+the local CLI once to create the first administrator:
+
+```bash
+export DATABASE_URL='sqlite:/path/to/gitforge.db?mode=rwc'
+gitforge admin --bootstrap \
+  --username operator \
+  --email operator@example.com \
+  --confirm
+```
+
+The command reads the password without echoing it, requires at least 12
+characters, hashes it with bcrypt, and refuses to run if an administrator
+already exists. It is a local database bootstrap operation; it does not grant
+privileges through the HTTP API or accept a password as a command-line
+argument. Obtain the API session token through the normal login flow:
+
+```bash
+gitforge auth --login operator
+```
+
+Keep `DATABASE_URL` and the database file restricted to the GitForge service
+account. After login, use the authenticated session for repository
+registration and the trigger canary.
+
 ## Services
 
 ### API Gateway (port 42780)

@@ -373,6 +373,39 @@ impl UserQueries {
         Ok(())
     }
 
+    /// Create a user with an explicitly selected least-privilege role.
+    ///
+    /// This is intentionally separate from `create` so existing callers retain
+    /// the schema default while administrative bootstrap can assign `admin`
+    /// atomically with the account insert.
+    pub async fn create_with_role(
+        pool: &Pool,
+        user: &crate::models::User,
+        role: &str,
+    ) -> Result<()> {
+        if !matches!(role, "admin" | "maintainer" | "developer" | "read_only") {
+            return Err(Error::invalid_input(format!(
+                "unsupported user role: {role}"
+            )));
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, username, email, password_hash, role, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(user.id.to_string())
+        .bind(&user.username)
+        .bind(&user.email)
+        .bind(&user.password_hash)
+        .bind(role)
+        .bind(user.created_at.to_rfc3339())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to create user with role: {}", e)))?;
+        Ok(())
+    }
+
     /// Get a user by ID
     pub async fn get(pool: &Pool, id: UserId) -> Result<Option<crate::models::User>> {
         let row = sqlx::query("SELECT * FROM users WHERE id = ?")

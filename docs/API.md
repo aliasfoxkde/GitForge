@@ -53,7 +53,10 @@ GET /auth/status
 `token_type`, and `expires_in`. `GET /auth/status` returns an
 `authenticated` boolean and, for a valid bearer token, the user identity and
 role. User registration is not exposed by the GitForge API; users must be
-provisioned through the supported administrative/bootstrap path.
+provisioned through the supported local CLI bootstrap path on a fresh
+database. Run `gitforge admin --bootstrap --username <name> --email <email>
+--confirm`; the password is read from the terminal and the command refuses to
+run after an administrator exists.
 
 ### Endpoints
 
