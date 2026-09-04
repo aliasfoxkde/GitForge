@@ -1,7 +1,7 @@
 # GitForge Handoff
 
 **Last Updated:** 2026-09-01
-**Evidence boundary (central audit):** branch `main`, HEAD `c74f42411e37c65e3f39496f2401d29ad0d10444`, 0 dirty status entries. This boundary covers the merged first-admin bootstrap, release packaging, and source promotion receipts; numeric ratings below remain historical context, not release gates.
+**Evidence boundary (central audit):** branch `main`, HEAD `186e3eb1fdda0fbc4571002a8807c51efbb40822`, 1 dirty status entries. This boundary covers the merged first-admin bootstrap, release packaging, and source promotion receipts; numeric ratings below remain historical context, not release gates.
 **Status:** 🔄 Active — merged first-admin bootstrap is built and promoted on Fedora; authenticated BigData registration and production operator provisioning remain pending
 **Location:** `/nas/Temp/repos/GitForge`
 **Rating:** 7.5/10 (historical context only)
