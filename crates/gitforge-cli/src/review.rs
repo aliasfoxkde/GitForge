@@ -288,13 +288,240 @@ pub fn print_complexity(changes: &[FileChange]) {
 mod tests {
     use super::*;
 
+    // ─── create_review_request ────────────────────────────────────────────────
+
     #[test]
-    fn test_get_current_branch() {
-        // This test would need a real git repo
-        // Just verify the function exists and is callable
-        let temp_dir = std::env::temp_dir();
-        let result = get_current_branch(temp_dir.as_path());
-        // Will fail in test env but proves the function works
-        assert!(result.is_err() || result.is_ok());
+    fn test_create_review_request_empty_diff() {
+        // Empty diff should return an error indicating no changes found
+        let result = create_review_request("test-repo", "main", None, "", "");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("No file changes found"),
+            "expected 'No file changes found', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_create_review_request_whitespace_only_diff() {
+        // Whitespace-only diff is treated as empty after trimming
+        let result = create_review_request("test-repo", "main", None, "   \n\t  ", "");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("No file changes found"),
+            "expected 'No file changes found', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_create_review_request_valid_diff() {
+        let diff = r#"diff --git a/src/main.rs b/src/main.rs
+index abc123..def456 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
+ fn main() {
+     println!("hello");
++    println!("world");
+ }"#;
+        let result =
+            create_review_request("my-repo", "feature-x", Some("main"), diff, "add greeting");
+        assert!(result.is_ok());
+        let req = result.unwrap();
+        assert_eq!(req.repo_name, "my-repo");
+        assert_eq!(req.branch, "feature-x");
+        assert_eq!(req.base_branch, Some("main".to_string()));
+        assert_eq!(req.context, "add greeting");
+        assert!(!req.files.is_empty());
+    }
+
+    #[test]
+    fn test_create_review_request_no_base_branch() {
+        let diff = r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,3 @@
+ pub fn foo() {}
++pub fn bar() {}
+"#;
+        let result = create_review_request("repo", "HEAD", None, diff, "");
+        assert!(result.is_ok());
+        let req = result.unwrap();
+        assert_eq!(req.base_branch, None);
+        assert!(req.context.is_empty());
+    }
+
+    #[test]
+    fn test_create_review_request_with_context() {
+        let diff = r#"diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,3 +1,4 @@
+ [package]
+ name = "test"
++version = "0.1.0"
+"#;
+        let result = create_review_request("test", "main", None, diff, "Initial version bump");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().context, "Initial version bump");
+    }
+
+    // ─── print_diff_stats ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_print_diff_stats_single_file() {
+        let diff = r#"diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
+ line1
+-line2
++line2 modified
++line3
+ line4"#;
+        let result = print_diff_stats(diff);
+        assert!(result.is_ok());
+
+        let stats = DiffStats::from_diff(diff).unwrap();
+        assert_eq!(stats.files_changed, 1);
+        assert_eq!(stats.files_added, 0);
+        assert_eq!(stats.files_modified, 1);
+        assert_eq!(stats.files_deleted, 0);
+        assert_eq!(stats.insertions, 2);
+        assert_eq!(stats.deletions, 1);
+    }
+
+    #[test]
+    fn test_print_diff_stats_new_and_deleted_files() {
+        let diff = r#"diff --git a/new_file.rs b/new_file.rs
+new file mode 100644
+--- /dev/null
++++ b/new_file.rs
+@@ -0,0 +1,2 @@
++fn new() {}
+diff --git a/old_file.rs b/old_file.rs
+deleted file mode 100644
+--- b/old_file.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-fn old() {}
+"#;
+        let stats = DiffStats::from_diff(diff).unwrap();
+        assert_eq!(stats.files_changed, 2);
+        assert_eq!(stats.files_added, 1);
+        assert_eq!(stats.files_modified, 0);
+        assert_eq!(stats.files_deleted, 1);
+    }
+
+    #[test]
+    fn test_print_diff_stats_binary_file() {
+        let diff = r#"diff --git a/logo.png b/logo.png
+new file mode 100644
+Binary files /dev/null and b/logo.png differ
+"#;
+        let stats = DiffStats::from_diff(diff).unwrap();
+        assert_eq!(stats.files_changed, 1);
+        assert_eq!(stats.files_added, 1);
+        assert_eq!(stats.insertions, 0);
+        assert_eq!(stats.deletions, 0);
+    }
+
+    #[test]
+    fn test_print_diff_stats_empty_string() {
+        let stats = DiffStats::from_diff("").unwrap();
+        assert_eq!(stats.files_changed, 0);
+        assert_eq!(stats.insertions, 0);
+        assert_eq!(stats.deletions, 0);
+    }
+
+    // ─── print_complexity ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_print_complexity_multiple_files() {
+        let changes = vec![
+            FileChange {
+                path: "src/main.rs".to_string(),
+                change_type: gitforge_ai::ChangeType::Modified,
+                diff: "+fn new_fn() {}".to_string(),
+                language: Some("rust".to_string()),
+            },
+            FileChange {
+                path: "src/lib.rs".to_string(),
+                change_type: gitforge_ai::ChangeType::Added,
+                diff: "+pub fn added() {}".to_string(),
+                language: Some("rust".to_string()),
+            },
+        ];
+        print_complexity(&changes); // just ensure it doesn't panic
+    }
+
+    #[test]
+    fn test_print_complexity_detects_test_files() {
+        let changes = vec![
+            FileChange {
+                path: "src/main.rs".to_string(),
+                change_type: gitforge_ai::ChangeType::Modified,
+                diff: "-old\n+new".to_string(),
+                language: Some("rust".to_string()),
+            },
+            FileChange {
+                path: "tests/integration_test.rs".to_string(),
+                change_type: gitforge_ai::ChangeType::Added,
+                diff: "+#[test]".to_string(),
+                language: Some("rust".to_string()),
+            },
+        ];
+        let complexity = ChangeComplexity::analyze(&changes);
+        assert!(complexity.has_test_changes);
+        assert!(!complexity.has_docs_changes);
+        assert_eq!(complexity.files_touched, 2);
+    }
+
+    #[test]
+    fn test_print_complexity_detects_docs() {
+        let changes = vec![FileChange {
+            path: "README.md".to_string(),
+            change_type: gitforge_ai::ChangeType::Modified,
+            diff: "+## New section".to_string(),
+            language: Some("markdown".to_string()),
+        }];
+        let complexity = ChangeComplexity::analyze(&changes);
+        assert!(complexity.has_docs_changes);
+    }
+
+    #[test]
+    fn test_print_complexity_churn_calculation() {
+        // A diff with 3 additions and 2 deletions = 5 churn
+        let changes = vec![FileChange {
+            path: "src/lib.rs".to_string(),
+            change_type: gitforge_ai::ChangeType::Modified,
+            diff: "+line1\n+line2\n+line3\n-old1\n-old2".to_string(),
+            language: Some("rust".to_string()),
+        }];
+        let complexity = ChangeComplexity::analyze(&changes);
+        assert_eq!(complexity.churn, 5);
+    }
+
+    #[test]
+    fn test_print_complexity_empty() {
+        let changes: Vec<FileChange> = vec![];
+        let complexity = ChangeComplexity::analyze(&changes);
+        assert_eq!(complexity.files_touched, 0);
+        assert_eq!(complexity.total_lines, 0);
+        assert_eq!(complexity.churn, 0);
+        assert!(!complexity.has_test_changes);
+        assert!(!complexity.has_docs_changes);
+    }
+
+    // ─── get_current_branch ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_current_branch_fails_on_nonexistent_dir() {
+        let result = get_current_branch(std::path::Path::new("/nonexistent/path/to/repo"));
+        // A non-git directory should produce an error
+        assert!(result.is_err());
     }
 }

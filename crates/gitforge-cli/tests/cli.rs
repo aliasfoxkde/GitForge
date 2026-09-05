@@ -106,6 +106,25 @@ enum TestCommands {
         #[arg(long)]
         init: Option<String>,
     },
+    /// AI code review
+    Review {
+        #[arg(long)]
+        staged: bool,
+        #[arg(long)]
+        diff: bool,
+        #[arg(long)]
+        diff_content: Option<String>,
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        context: Option<String>,
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 #[test]
@@ -564,5 +583,190 @@ fn test_cli_mixed_short_and_long_flags() {
             assert!(status);
         }
         _ => panic!("Expected Sync command"),
+    }
+}
+
+// ─── Review command parsing ─────────────────────────────────────────────────
+
+#[test]
+fn test_cli_review_staged_default() {
+    // `review --staged` (the default) requires no extra args
+    let cli = TestCli::try_parse_from(["gitforge", "review", "--staged"]).unwrap();
+    match cli.command {
+        TestCommands::Review {
+            staged,
+            diff,
+            diff_content,
+            base,
+            target,
+            context,
+            provider,
+            verbose,
+        } => {
+            assert!(staged);
+            assert!(!diff);
+            assert_eq!(diff_content, None);
+            assert_eq!(base, None);
+            assert_eq!(target, None);
+            assert_eq!(context, None);
+            assert_eq!(provider, "anthropic");
+            assert!(!verbose);
+        }
+        _ => panic!("Expected Review command"),
+    }
+}
+
+#[test]
+fn test_cli_review_with_base_and_target() {
+    let cli = TestCli::try_parse_from([
+        "gitforge",
+        "review",
+        "--base",
+        "main",
+        "--target",
+        "feature-x",
+    ])
+    .unwrap();
+    match cli.command {
+        TestCommands::Review { base, target, .. } => {
+            assert_eq!(base, Some("main".to_string()));
+            assert_eq!(target, Some("feature-x".to_string()));
+        }
+        _ => panic!("Expected Review command"),
+    }
+}
+
+#[test]
+fn test_cli_review_with_context() {
+    let cli = TestCli::try_parse_from([
+        "gitforge",
+        "review",
+        "--staged",
+        "--context",
+        "PR #123: Add new feature",
+    ])
+    .unwrap();
+    match cli.command {
+        TestCommands::Review { context, .. } => {
+            assert_eq!(context, Some("PR #123: Add new feature".to_string()));
+        }
+        _ => panic!("Expected Review command"),
+    }
+}
+
+#[test]
+fn test_cli_review_with_explicit_diff_flag() {
+    // --diff requires --diff-content; this only tests that the flags parse
+    let cli = TestCli::try_parse_from([
+        "gitforge",
+        "review",
+        "--diff",
+        "--diff-content",
+        "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-fn old\n+fn new",
+    ])
+    .unwrap();
+    match cli.command {
+        TestCommands::Review {
+            diff,
+            diff_content,
+            staged,
+            ..
+        } => {
+            assert!(diff);
+            // staged is false when only --diff is given (no --staged, --base, or --target)
+            assert!(!staged);
+            assert!(diff_content.is_some());
+        }
+        _ => panic!("Expected Review command"),
+    }
+}
+
+#[test]
+fn test_cli_review_provider_openai() {
+    let cli = TestCli::try_parse_from(["gitforge", "review", "--staged", "--provider", "openai"])
+        .unwrap();
+    match cli.command {
+        TestCommands::Review { provider, .. } => {
+            assert_eq!(provider, "openai");
+        }
+        _ => panic!("Expected Review command"),
+    }
+}
+
+#[test]
+fn test_cli_review_provider_ollama() {
+    let cli = TestCli::try_parse_from(["gitforge", "review", "--staged", "--provider", "ollama"])
+        .unwrap();
+    match cli.command {
+        TestCommands::Review { provider, .. } => {
+            assert_eq!(provider, "ollama");
+        }
+        _ => panic!("Expected Review command"),
+    }
+}
+
+#[test]
+fn test_cli_review_verbose_short_flag() {
+    let cli = TestCli::try_parse_from(["gitforge", "-v", "review", "--staged"]).unwrap();
+    assert!(cli.verbose);
+    match cli.command {
+        TestCommands::Review { verbose, .. } => {
+            assert!(
+                !verbose,
+                "verbose should be false when only global -v is set"
+            );
+        }
+        _ => panic!("Expected Review command"),
+    }
+}
+
+#[test]
+fn test_cli_review_verbose_local_flag() {
+    let cli = TestCli::try_parse_from(["gitforge", "review", "--staged", "-v"]).unwrap();
+    match cli.command {
+        TestCommands::Review { verbose, .. } => {
+            assert!(verbose);
+        }
+        _ => panic!("Expected Review command"),
+    }
+}
+
+#[test]
+fn test_cli_review_all_options() {
+    let cli = TestCli::try_parse_from([
+        "gitforge",
+        "--verbose",
+        "review",
+        "--staged",
+        "--base",
+        "develop",
+        "--target",
+        "feat/new-option",
+        "--context",
+        "Implements option parsing",
+        "--provider",
+        "ollama",
+        "--verbose",
+    ])
+    .unwrap();
+    assert!(cli.verbose);
+    match cli.command {
+        TestCommands::Review {
+            staged,
+            base,
+            target,
+            context,
+            provider,
+            verbose,
+            ..
+        } => {
+            assert!(staged);
+            assert_eq!(base, Some("develop".to_string()));
+            assert_eq!(target, Some("feat/new-option".to_string()));
+            assert_eq!(context, Some("Implements option parsing".to_string()));
+            assert_eq!(provider, "ollama");
+            assert!(verbose);
+        }
+        _ => panic!("Expected Review command"),
     }
 }

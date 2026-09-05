@@ -1260,4 +1260,172 @@ mod tests {
         });
         assert!(run_cli(cli).await.is_ok());
     }
+
+    // ─── Commands::Review error-branch tests ──────────────────────────────────
+
+    fn review_cli(
+        staged: bool,
+        diff: bool,
+        diff_content: Option<String>,
+        base: Option<String>,
+        target: Option<String>,
+        context: Option<String>,
+        provider: &str,
+        verbose: bool,
+    ) -> Cli {
+        test_cli(Commands::Review {
+            staged,
+            diff,
+            diff_content,
+            base,
+            target,
+            context,
+            provider: provider.to_string(),
+            verbose,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_review_unknown_provider_returns_err() {
+        // Unknown provider string should cause run_cli to return an error
+        let cli = review_cli(true, false, None, None, None, None, "not_a_provider", false);
+        let result = run_cli(cli).await;
+        assert!(result.is_err(), "expected error for unknown provider");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Unknown provider") || err_msg.contains("invalid provider"),
+            "expected 'Unknown provider' or 'invalid provider' in error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_diff_flag_requires_diff_content() {
+        // --diff with no --diff-content should error
+        let cli = review_cli(
+            false, // diff=true by not passing staged/base/target
+            true,  // diff flag
+            None,  // no diff_content
+            None,
+            None,
+            None,
+            "anthropic",
+            false,
+        );
+        let result = run_cli(cli).await;
+        assert!(
+            result.is_err(),
+            "expected error when --diff is set but --diff-content is missing"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("--diff") || err_msg.contains("diff_content"),
+            "expected error to mention --diff or diff_content, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_empty_diff_returns_ok() {
+        // When git diff returns no changes, the CLI prints "No changes to review" and returns Ok
+        // We use --diff with empty content to simulate this path
+        let cli = review_cli(
+            false,
+            true,
+            Some(String::new()), // empty diff content
+            None,
+            None,
+            None,
+            "anthropic",
+            false,
+        );
+        // This should NOT error — it should print "No changes to review" and return Ok
+        let result = run_cli(cli).await;
+        // The path checks diff_text.trim().is_empty() and returns Ok if empty
+        assert!(
+            result.is_ok(),
+            "expected Ok for empty diff, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_whitespace_only_diff_returns_ok() {
+        // Whitespace-only diff content is treated as empty
+        let cli = review_cli(
+            false,
+            true,
+            Some("   \n\t  ".to_string()),
+            None,
+            None,
+            None,
+            "anthropic",
+            false,
+        );
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_review_openai_provider_reaches_provider_stage() {
+        // Use --diff with real diff content so the code reaches the provider stage
+        // (empty diff would short-circuit with "No changes to review").
+        // openai is a recognized provider name so it passes the parse check,
+        // then fails at provider-creation time (no API key configured).
+        let cli = review_cli(
+            false, // not staged
+            true,  // diff mode
+            Some(
+                r"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-fn old
++fn new"
+                    .to_string(),
+            ),
+            None,
+            None,
+            None,
+            "openai",
+            false,
+        );
+        let result = run_cli(cli).await;
+        // Must error (provider creation will fail without a real key),
+        // but crucially it must NOT mention "invalid provider" — proving openai IS recognized.
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("invalid provider") && !err_msg.contains("Unknown provider"),
+            "openai should be a recognized provider name (fails at creation, not at parse), got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_ollama_provider_reaches_provider_stage() {
+        let cli = review_cli(
+            false,
+            true,
+            Some(
+                r"diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1 @@
+-fn old
++fn new"
+                    .to_string(),
+            ),
+            None,
+            None,
+            None,
+            "ollama",
+            false,
+        );
+        let result = run_cli(cli).await;
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("invalid provider") && !err_msg.contains("Unknown provider"),
+            "ollama should be a recognized provider name (fails at creation, not at parse), got: {}",
+            err_msg
+        );
+    }
 }
