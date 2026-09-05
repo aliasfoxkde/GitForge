@@ -17,7 +17,6 @@ CREATE TABLE review_runs (
 
 CREATE INDEX idx_review_runs_repo ON review_runs(repo_id);
 CREATE INDEX idx_review_runs_status ON review_runs(status);
-CREATE UNIQUE INDEX idx_review_runs_key_head ON review_runs(idempotency_key, head_sha);
 
 -- Review Findings
 CREATE TABLE review_findings (
@@ -37,6 +36,7 @@ CREATE TABLE review_findings (
     disposition TEXT NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK ((position_status = 'line' AND line IS NOT NULL) OR (position_status <> 'line' AND line IS NULL)),
     UNIQUE (run_id, fingerprint)
 );
 
