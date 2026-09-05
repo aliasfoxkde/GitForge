@@ -1339,10 +1339,7 @@ mod tests {
         // This should NOT error — it should print "No changes to review" and return Ok
         let result = run_cli(cli).await;
         // The path checks diff_text.trim().is_empty() and returns Ok if empty
-        assert!(
-            result.is_ok(),
-            "expected Ok for empty diff"
-        );
+        assert!(result.is_ok(), "expected Ok for empty diff");
     }
 
     #[tokio::test]
