@@ -9,9 +9,7 @@ use axum::{
     Json,
 };
 use std::{
-    collections::hash_map::DefaultHasher,
     collections::HashMap,
-    hash::{Hash, Hasher},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -176,12 +174,10 @@ where
 
             // Check rate limit
             if !limiter.check_rate_limit(&client_id).await {
-                // client_id is an IP address (for unauthenticated) or user
-                // identifier. Fingerprint it before logging so raw IPs never
-                // appear in structured log fields. The fingerprint enables
-                // operator correlation; original IP cannot be recovered from it.
-                let client_fp = fingerprint_client_id(&client_id);
-                tracing::warn!(client_id_fp = %client_fp, "rate limit exceeded");
+                // Log only a static event. No client identifier (raw IP or
+                // hash) is written to application logs, preventing correlation
+                // with operator-visible traffic or third-party telemetry.
+                tracing::warn!("rate limit exceeded");
                 let response = (
                     StatusCode::TOO_MANY_REQUESTS,
                     Json(RateLimitErrorResponse {
@@ -217,21 +213,6 @@ impl<S> Layer<S> for RateLimitLayer {
     fn layer(&self, inner: S) -> Self::Service {
         RateLimitMiddleware::new(inner, self.limiter.clone())
     }
-}
-
-/// Produce a non-reversible fingerprint of a client identifier for logging.
-///
-/// Uses std::collections::hash_map::DefaultHasher (SipHash) — not
-/// cryptographically appropriate for key derivation but sufficient for
-/// log-correlation where reversibility is not required. "unknown" is
-/// returned verbatim as the safe fallback when input is empty.
-fn fingerprint_client_id(client_id: &str) -> String {
-    if client_id.is_empty() || client_id == "unknown" {
-        return "unknown".to_string();
-    }
-    let mut hasher = DefaultHasher::new();
-    client_id.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
 }
 
 /// Extract client identifier from request
@@ -492,61 +473,5 @@ mod tests {
         // Unknown client should get full burst size
         let remaining = limiter.remaining("unknown-client").await;
         assert_eq!(remaining, 3);
-    }
-
-    // Tests for fingerprint_client_id — verifies the IP-fingerprinting behavior
-
-    #[test]
-    fn test_fingerprint_client_id_is_deterministic() {
-        // Same input must always produce the same fingerprint (correlation requirement)
-        let ip = "192.168.1.100";
-        let fp1 = fingerprint_client_id(ip);
-        let fp2 = fingerprint_client_id(ip);
-        assert_eq!(fp1, fp2, "fingerprint must be deterministic");
-    }
-
-    #[test]
-    fn test_fingerprint_client_id_different_ips_different_fingerprints() {
-        // Different inputs should produce different fingerprints with high probability
-        let fp1 = fingerprint_client_id("192.168.1.100");
-        let fp2 = fingerprint_client_id("192.168.1.101");
-        assert_ne!(
-            fp1, fp2,
-            "different IPs must produce different fingerprints"
-        );
-    }
-
-    #[test]
-    fn test_fingerprint_client_id_unknown_passthrough() {
-        // "unknown" is returned verbatim — safe fallback
-        assert_eq!(fingerprint_client_id("unknown"), "unknown");
-    }
-
-    #[test]
-    fn test_fingerprint_client_id_empty_passthrough() {
-        // Empty string returns "unknown" — safe fallback
-        assert_eq!(fingerprint_client_id(""), "unknown");
-    }
-
-    #[test]
-    fn test_fingerprint_client_id_format_is_hex() {
-        // Fingerprint must be a valid 16-character hex string (not raw IP)
-        let fp = fingerprint_client_id("10.0.0.1");
-        assert_eq!(fp.len(), 16, "SipHash-64 produces 16 hex chars");
-        assert!(
-            fp.chars().all(|c| c.is_ascii_hexdigit()),
-            "fingerprint must be hex digits only"
-        );
-    }
-
-    #[test]
-    fn test_fingerprint_client_id_not_reversible() {
-        // Verify the fingerprint does not contain the original IP as a substring
-        let ip = "203.0.113.50";
-        let fp = fingerprint_client_id(ip);
-        assert!(
-            !fp.contains("203"),
-            "fingerprint must not contain raw IP octets"
-        );
     }
 }
