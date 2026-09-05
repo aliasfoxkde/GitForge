@@ -17,16 +17,16 @@ RUN apt-get update && apt-get install -y \
 
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
-COPY crates/gitforce-common ./crates/gitforce-common
-COPY crates/gitforce-db ./crates/gitforce-db
-COPY crates/gitforce-events ./crates/gitforce-events
-COPY crates/gitforce-ci ./crates/gitforce-ci
-COPY crates/gitforce-core ./crates/gitforce-core
-COPY crates/gitforce-runner ./crates/gitforce-runner
-COPY crates/gitforce-sandbox ./crates/gitforce-sandbox
-COPY crates/gitforce-scheduler ./crates/gitforce-scheduler
-COPY crates/gitforce-storage ./crates/gitforce-storage
-COPY crates/gitforce-api ./crates/gitforce-api
+COPY crates/gitforge-common ./crates/gitforge-common
+COPY crates/gitforge-db ./crates/gitforge-db
+COPY crates/gitforge-events ./crates/gitforge-events
+COPY crates/gitforge-ci ./crates/gitforge-ci
+COPY crates/gitforge-core ./crates/gitforge-core
+COPY crates/gitforge-runner ./crates/gitforge-runner
+COPY crates/gitforge-sandbox ./crates/gitforge-sandbox
+COPY crates/gitforge-scheduler ./crates/gitforge-scheduler
+COPY crates/gitforge-storage ./crates/gitforge-storage
+COPY crates/gitforge-api ./crates/gitforge-api
 COPY services/api ./services/api
 COPY services/ci ./services/ci
 COPY services/runner ./services/runner
