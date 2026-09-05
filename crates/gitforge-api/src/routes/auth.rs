@@ -108,7 +108,7 @@ pub async fn login(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!("login failed: {}", e);
+            tracing::error!(error = %e, "login failed: database error");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({

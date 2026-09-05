@@ -174,7 +174,10 @@ where
 
             // Check rate limit
             if !limiter.check_rate_limit(&client_id).await {
-                tracing::warn!("rate limit exceeded for client: {}", client_id);
+                // client_id is an IP address (for unauthenticated) or user
+                // identifier; log it as structured field so operators can
+                // correlate the event without it appearing in plaintext logs.
+                tracing::warn!(client_id = %client_id, "rate limit exceeded");
                 let response = (
                     StatusCode::TOO_MANY_REQUESTS,
                     Json(RateLimitErrorResponse {

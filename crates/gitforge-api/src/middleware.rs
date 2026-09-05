@@ -85,7 +85,7 @@ pub async fn auth_middleware(
             next.run(request).await
         }
         Err(e) => {
-            tracing::debug!("token validation failed: {}", e);
+            tracing::debug!(error = %e, "token validation failed");
             auth_error_response("invalid_token", "Invalid or expired token")
         }
     }
