@@ -108,7 +108,7 @@ impl DockerSandbox {
                 continue;
             }
             if let Some(id) = container.id {
-                docker
+                match docker
                     .remove_container(
                         &id,
                         Some(RemoveContainerOptions {
@@ -117,10 +117,29 @@ impl DockerSandbox {
                         }),
                     )
                     .await
-                    .map_err(|e| {
-                        Error::sandbox(format!("failed to remove stale job container: {}", e))
-                    })?;
-                tracing::info!(%id, %job_id, "Removed stale sandbox container before retry");
+                {
+                    Ok(()) => {
+                        tracing::info!(%id, %job_id, "Removed stale sandbox container before retry");
+                    }
+                    // 404: the container is already gone. 409: a concurrent
+                    // teardown (the job's own destroy path) is removing it
+                    // right now. Either way it is on its way out and the
+                    // create below can proceed; treating the race as fatal
+                    // fails the job with a sandbox-acquisition error for a
+                    // container that no longer exists.
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404 | 409,
+                        ..
+                    }) => {
+                        tracing::info!(%id, %job_id, "Stale sandbox container already being removed");
+                    }
+                    Err(e) => {
+                        return Err(Error::sandbox(format!(
+                            "failed to remove stale job container: {}",
+                            e
+                        )));
+                    }
+                }
             }
         }
         Ok(())
