@@ -106,6 +106,22 @@ pub fn get_current_branch(repo_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Convert a provider name string to a ProviderType.
+///
+/// Returns a stable error for unknown names so callers can present a clear
+/// diagnostic without needing to re-implement the name-to-type mapping.
+pub fn provider_type_from_name(name: &str) -> Result<ProviderType> {
+    match name.to_lowercase().as_str() {
+        "anthropic" => Ok(ProviderType::Anthropic),
+        "openai" => Ok(ProviderType::OpenAI),
+        "ollama" => Ok(ProviderType::Ollama),
+        other => anyhow::bail!(
+            "Unknown provider '{}'. Use: anthropic, openai, or ollama.",
+            other
+        ),
+    }
+}
+
 /// Run a code review using the specified provider
 pub async fn run_review(
     provider_type: ProviderType,
@@ -523,5 +539,75 @@ Binary files /dev/null and b/logo.png differ
         let result = get_current_branch(std::path::Path::new("/nonexistent/path/to/repo"));
         // A non-git directory should produce an error
         assert!(result.is_err());
+    }
+
+    // ─── provider_type_from_name ───────────────────────────────────────────────
+
+    #[test]
+    fn test_provider_type_from_name_anthropic() {
+        let result = provider_type_from_name("anthropic");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ProviderType::Anthropic);
+    }
+
+    #[test]
+    fn test_provider_type_from_name_anthropic_case_insensitive() {
+        assert!(provider_type_from_name("Anthropic").is_ok());
+        assert!(provider_type_from_name("ANTHROPIC").is_ok());
+        assert!(provider_type_from_name("AnThRoPiC").is_ok());
+    }
+
+    #[test]
+    fn test_provider_type_from_name_openai() {
+        let result = provider_type_from_name("openai");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ProviderType::OpenAI);
+    }
+
+    #[test]
+    fn test_provider_type_from_name_openai_case_insensitive() {
+        assert!(provider_type_from_name("OpenAI").is_ok());
+        assert!(provider_type_from_name("OPENAI").is_ok());
+    }
+
+    #[test]
+    fn test_provider_type_from_name_ollama() {
+        let result = provider_type_from_name("ollama");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ProviderType::Ollama);
+    }
+
+    #[test]
+    fn test_provider_type_from_name_ollama_case_insensitive() {
+        assert!(provider_type_from_name("Ollama").is_ok());
+        assert!(provider_type_from_name("OLLAMA").is_ok());
+    }
+
+    #[test]
+    fn test_provider_type_from_name_unknown() {
+        let result = provider_type_from_name("not_a_provider");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Unknown provider"),
+            "expected 'Unknown provider', got: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("not_a_provider"),
+            "expected provider name in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_provider_type_from_name_unknown_includes_suggestions() {
+        let err = provider_type_from_name("openaii").unwrap_err().to_string();
+        // Error should mention the unknown name
+        assert!(err.contains("openaii"), "got: {}", err);
+        // Error should list valid options
+        assert!(err.contains("anthropic"), "got: {}", err);
+        assert!(err.contains("openai"), "got: {}", err);
+        assert!(err.contains("ollama"), "got: {}", err);
     }
 }

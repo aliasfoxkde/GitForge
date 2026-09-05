@@ -701,21 +701,14 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
         } => {
             use crate::review::{
                 create_review_request, get_current_branch, get_git_diff, get_uncommitted_diff,
-                print_complexity, print_diff_stats, print_review_results, run_review,
+                print_complexity, print_diff_stats, print_review_results, provider_type_from_name,
+                run_review,
             };
 
-            let provider_type = match provider.to_lowercase().as_str() {
-                "anthropic" => gitforge_ai::ProviderType::Anthropic,
-                "openai" => gitforge_ai::ProviderType::OpenAI,
-                "ollama" => gitforge_ai::ProviderType::Ollama,
-                other => {
-                    println!(
-                        "❌ Unknown provider '{}'. Use: anthropic, openai, or ollama.",
-                        other
-                    );
-                    anyhow::bail!("invalid provider");
-                }
-            };
+            let provider_type = provider_type_from_name(provider).map_err(|e| {
+                eprintln!("❌ {}", e);
+                anyhow::anyhow!("invalid provider")
+            })?;
 
             let repo_path =
                 std::env::current_dir().context("Could not determine current directory")?;
@@ -1365,67 +1358,48 @@ mod tests {
         assert!(run_cli(cli).await.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_review_openai_provider_reaches_provider_stage() {
-        // Use --diff with real diff content so the code reaches the provider stage
-        // (empty diff would short-circuit with "No changes to review").
-        // openai is a recognized provider name so it passes the parse check,
-        // then fails at provider-creation time (no API key configured).
-        let cli = review_cli(
-            false, // not staged
-            true,  // diff mode
-            Some(
-                r"diff --git a/src/lib.rs b/src/lib.rs
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -1 +1 @@
--fn old
-+fn new"
-                    .to_string(),
-            ),
-            None,
-            None,
-            None,
-            "openai",
-            false,
-        );
-        let result = run_cli(cli).await;
-        // Must error (provider creation will fail without a real key),
-        // but crucially it must NOT mention "invalid provider" — proving openai IS recognized.
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            !err_msg.contains("invalid provider") && !err_msg.contains("Unknown provider"),
-            "openai should be a recognized provider name (fails at creation, not at parse), got: {}",
-            err_msg
+    // ─── provider_type_from_name (pure, no network) ────────────────────────────
+
+    #[test]
+    fn test_provider_type_from_name_anthropic() {
+        use crate::review::provider_type_from_name;
+        assert!(provider_type_from_name("anthropic").is_ok());
+        assert_eq!(
+            provider_type_from_name("anthropic").unwrap(),
+            gitforge_ai::ProviderType::Anthropic
         );
     }
 
-    #[tokio::test]
-    async fn test_review_ollama_provider_reaches_provider_stage() {
-        let cli = review_cli(
-            false,
-            true,
-            Some(
-                r"diff --git a/src/main.rs b/src/main.rs
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -1 +1 @@
--fn old
-+fn new"
-                    .to_string(),
-            ),
-            None,
-            None,
-            None,
-            "ollama",
-            false,
+    #[test]
+    fn test_provider_type_from_name_openai() {
+        use crate::review::provider_type_from_name;
+        assert!(provider_type_from_name("openai").is_ok());
+        assert_eq!(
+            provider_type_from_name("openai").unwrap(),
+            gitforge_ai::ProviderType::OpenAI
         );
-        let result = run_cli(cli).await;
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            !err_msg.contains("invalid provider") && !err_msg.contains("Unknown provider"),
-            "ollama should be a recognized provider name (fails at creation, not at parse), got: {}",
-            err_msg
+    }
+
+    #[test]
+    fn test_provider_type_from_name_ollama() {
+        use crate::review::provider_type_from_name;
+        assert!(provider_type_from_name("ollama").is_ok());
+        assert_eq!(
+            provider_type_from_name("ollama").unwrap(),
+            gitforge_ai::ProviderType::Ollama
         );
+    }
+
+    #[test]
+    fn test_provider_type_from_name_unknown() {
+        use crate::review::provider_type_from_name;
+        let result = provider_type_from_name("not_a_provider");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unknown provider"), "got: {}", err);
+        assert!(err.contains("not_a_provider"), "got: {}", err);
+        assert!(err.contains("anthropic"), "got: {}", err);
+        assert!(err.contains("openai"), "got: {}", err);
+        assert!(err.contains("ollama"), "got: {}", err);
     }
 }
