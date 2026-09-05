@@ -829,7 +829,11 @@ async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
 /// Remove workspaces left behind by runs that are already terminal — for
 /// example after a crash or control-plane restart. Non-terminal and unknown
 /// runs are left untouched: a requeued job still executes in its original
-/// checkout. Returns the number of directories removed.
+/// checkout. Runs whose status is terminal but that still have a
+/// non-terminal job are skipped too — a run can be finalized (for example on
+/// a first job failure) while its remaining jobs are still executing, and
+/// deleting their checkout mid-run leaves the job failing on a half-removed
+/// tree. Returns the number of directories removed.
 async fn sweep_terminal_workspaces(pool: &gitforge_db::Pool) -> usize {
     let root = workspace_root();
     let mut entries = match tokio::fs::read_dir(&root).await {
@@ -866,6 +870,19 @@ async fn sweep_terminal_workspaces(pool: &gitforge_db::Pool) -> usize {
             )
         });
         if !is_terminal {
+            continue;
+        }
+        // A terminal run can still own running jobs (fail-fast finalization);
+        // its workspace is live until every job is done.
+        let jobs = gitforge_db::queries::JobQueries::list_by_run(pool, run_id)
+            .await
+            .unwrap_or_default();
+        let job_running = jobs.iter().any(|job| {
+            gitforge_db::models::JobStatus::from_str(&job.status)
+                .is_some_and(|status| !status.is_terminal())
+        });
+        if job_running {
+            tracing::debug!(run = %run_id, "workspace sweep skipped a run with live jobs");
             continue;
         }
         if remove_run_workspace_dir(&root, run_id, Some(&entry.path().to_string_lossy())).await {
