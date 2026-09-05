@@ -10,6 +10,7 @@ use std::path::PathBuf;
 mod admin;
 mod client;
 mod config;
+mod review;
 mod sync;
 
 pub use client::GitForgeClient;
@@ -177,6 +178,33 @@ enum Commands {
         /// Initialize local storage
         #[arg(long)]
         init: Option<String>,
+    },
+    /// AI code review
+    Review {
+        /// Review staged changes (default)
+        #[arg(long)]
+        staged: bool,
+        /// Use the provided diff text directly (requires --diff)
+        #[arg(long)]
+        diff: bool,
+        /// Diff content (used with --diff flag)
+        #[arg(long)]
+        diff_content: Option<String>,
+        /// Review changes against a specific base (e.g., main, HEAD~1)
+        #[arg(long)]
+        base: Option<String>,
+        /// Git ref to review (branch, tag, SHA)
+        #[arg(long)]
+        target: Option<String>,
+        /// Additional context (commit message, PR description)
+        #[arg(long)]
+        context: Option<String>,
+        /// AI provider to use
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+        /// Include verbose output
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -657,6 +685,92 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     }
                 } else {
                     println!("❌ Not authenticated. Run `gitforge auth login <username>` first.");
+                }
+            }
+        }
+
+        Commands::Review {
+            staged,
+            diff,
+            diff_content,
+            base,
+            target,
+            context,
+            provider,
+            verbose,
+        } => {
+            use crate::review::{
+                create_review_request, get_current_branch, get_git_diff, get_uncommitted_diff,
+                print_complexity, print_diff_stats, print_review_results, run_review,
+            };
+
+            let provider_type = match provider.to_lowercase().as_str() {
+                "anthropic" => gitforge_ai::ProviderType::Anthropic,
+                "openai" => gitforge_ai::ProviderType::OpenAI,
+                "ollama" => gitforge_ai::ProviderType::Ollama,
+                other => {
+                    println!(
+                        "❌ Unknown provider '{}'. Use: anthropic, openai, or ollama.",
+                        other
+                    );
+                    anyhow::bail!("invalid provider");
+                }
+            };
+
+            let repo_path =
+                std::env::current_dir().context("Could not determine current directory")?;
+
+            let diff_text = if *diff {
+                if let Some(ref content) = diff_content {
+                    content.clone()
+                } else {
+                    println!("❌ --diff flag requires --diff-content to be provided.");
+                    anyhow::bail!("--diff requires --diff-content");
+                }
+            } else if *staged || base.is_some() || target.is_some() {
+                get_git_diff(&repo_path, base.as_deref(), target.as_deref())?
+            } else {
+                get_uncommitted_diff(&repo_path)?
+            };
+
+            if diff_text.trim().is_empty() {
+                println!("✅ No changes to review.");
+                return Ok(());
+            }
+
+            let branch = get_current_branch(&repo_path).unwrap_or_else(|_| "unknown".to_string());
+            let repo_name = repo_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let context_str = context.as_deref().unwrap_or("");
+
+            let request = create_review_request(
+                &repo_name,
+                &branch,
+                base.as_deref(),
+                &diff_text,
+                context_str,
+            )?;
+
+            let changes = &request.files;
+            print_diff_stats(&diff_text).ok();
+            print_complexity(changes);
+            println!();
+            println!("🔍 Running {} AI review...", provider);
+
+            match run_review(provider_type, &request).await {
+                Ok(response) => {
+                    print_review_results(&response, *verbose || cli.verbose);
+                    if response.has_critical_findings() {
+                        println!();
+                        println!("⚠️  Review complete — critical findings detected.");
+                    }
+                }
+                Err(e) => {
+                    println!("❌ Review failed: {}", e);
+                    anyhow::bail!("review generation failed: {}", e);
                 }
             }
         }

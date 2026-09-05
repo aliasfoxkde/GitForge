@@ -4,8 +4,8 @@
 
 use anyhow::{Context, Result};
 use gitforge_ai::{
-    AiProviderFactory, FileChange, ProviderConfig, ProviderType, ReviewRequest,
-    ReviewResponse, Severity,
+    AiProviderFactory, FileChange, ProviderConfig, ProviderType, ReviewRequest, ReviewResponse,
+    Severity,
 };
 use gitforge_review::{extract_changes_from_diff, ChangeComplexity, DiffStats};
 use std::path::Path;
@@ -19,8 +19,8 @@ pub fn create_review_request(
     diff_content: &str,
     context: &str,
 ) -> Result<ReviewRequest> {
-    let changes = extract_changes_from_diff(diff_content)
-        .context("Failed to parse diff content")?;
+    let changes =
+        extract_changes_from_diff(diff_content).context("Failed to parse diff content")?;
 
     if changes.is_empty() {
         anyhow::bail!("No file changes found in diff");
@@ -40,14 +40,27 @@ pub fn create_review_request(
 }
 
 /// Get git diff for a repository
-pub fn get_git_diff(repo_path: &Path, base_branch: Option<&str>) -> Result<String> {
+pub fn get_git_diff(
+    repo_path: &Path,
+    base_branch: Option<&str>,
+    target: Option<&str>,
+) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.arg("diff");
 
-    if let Some(base) = base_branch {
-        cmd.arg(format!("{}...HEAD", base));
-    } else {
-        cmd.arg("--staged");
+    match (base_branch, target) {
+        (Some(base), Some(target)) => {
+            cmd.arg(format!("{}...{}", base, target));
+        }
+        (Some(base), None) => {
+            cmd.arg(format!("{}...HEAD", base));
+        }
+        (None, Some(target)) => {
+            cmd.arg(format!("{}...HEAD", target));
+        }
+        (None, None) => {
+            cmd.arg("--staged");
+        }
     }
 
     cmd.current_dir(repo_path);
@@ -129,7 +142,10 @@ pub async fn run_review(
         eprintln!("   Continuing anyway...");
     }
 
-    provider.generate_review(request).await.context("Review generation failed")
+    provider
+        .generate_review(request)
+        .await
+        .context("Review generation failed")
 }
 
 /// Format and print review results
@@ -153,7 +169,10 @@ pub fn print_review_results(response: &ReviewResponse, verbose: bool) {
         "🔴"
     };
 
-    println!("  {} Overall Score: {}/100", score_color, response.overall_score);
+    println!(
+        "  {} Overall Score: {}/100",
+        score_color, response.overall_score
+    );
     println!();
     println!("  ─────────────────────────────────────────────────────────────");
     println!("  📝 Summary:");
@@ -174,13 +193,18 @@ pub fn print_review_results(response: &ReviewResponse, verbose: bool) {
 
         let print_findings = |severity: &str, findings: &[&gitforge_ai::ReviewFinding]| {
             if !findings.is_empty() {
-                println!("  {} {} ({}):", severity, findings.len(), match severity {
-                    "Critical" => "🚨",
-                    "High" => "🔴",
-                    "Medium" => "🟡",
-                    "Low" => "🟢",
-                    _ => "ℹ️",
-                });
+                println!(
+                    "  {} {} ({}):",
+                    severity,
+                    findings.len(),
+                    match severity {
+                        "Critical" => "🚨",
+                        "High" => "🔴",
+                        "Medium" => "🟡",
+                        "Low" => "🟢",
+                        _ => "ℹ️",
+                    }
+                );
                 for (i, f) in findings.iter().enumerate() {
                     println!("    {}. {}", i + 1, f.title);
                     println!("       📁 {}", f.file);
@@ -221,10 +245,14 @@ pub fn print_diff_stats(diff: &str) -> Result<()> {
 
     println!();
     println!("  📊 Change Statistics:");
-    println!("     Files: {} changed ({} added, {} modified, {} deleted)",
-        stats.files_changed, stats.files_added, stats.files_modified, stats.files_deleted);
-    println!("     Changes: +{} insertions, -{} deletions",
-        stats.insertions, stats.deletions);
+    println!(
+        "     Files: {} changed ({} added, {} modified, {} deleted)",
+        stats.files_changed, stats.files_added, stats.files_modified, stats.files_deleted
+    );
+    println!(
+        "     Changes: +{} insertions, -{} deletions",
+        stats.insertions, stats.deletions
+    );
 
     Ok(())
 }
@@ -238,8 +266,22 @@ pub fn print_complexity(changes: &[FileChange]) {
     println!("     Files touched: {}", complexity.files_touched);
     println!("     Total lines: {}", complexity.total_lines);
     println!("     Churn: {}", complexity.churn);
-    println!("     Test changes: {}", if complexity.has_test_changes { "yes" } else { "no" });
-    println!("     Docs changes: {}", if complexity.has_docs_changes { "yes" } else { "no" });
+    println!(
+        "     Test changes: {}",
+        if complexity.has_test_changes {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "     Docs changes: {}",
+        if complexity.has_docs_changes {
+            "yes"
+        } else {
+            "no"
+        }
+    );
 }
 
 #[cfg(test)]
