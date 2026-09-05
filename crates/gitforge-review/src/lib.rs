@@ -2,6 +2,7 @@
 //!
 //! This crate provides diff parsing and analysis for AI-powered code review.
 
+pub mod domain;
 pub mod security;
 
 use gitforge_ai::{ChangeType, FileChange};

@@ -9,6 +9,10 @@ license.workspace = true
 gitforge-ai = { path = "../gitforge-ai" }
 git2 = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 regex = "1.10"
 once_cell = "1.19"
 

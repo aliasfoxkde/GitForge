@@ -1183,8 +1183,12 @@ version = "0.1.0"
 dependencies = [
  "git2",
  "gitforge-ai",
+ "hex",
  "once_cell",
  "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
 ]
