@@ -1256,32 +1256,42 @@ mod tests {
 
     // ─── Commands::Review error-branch tests ──────────────────────────────────
 
-    fn review_cli(
+    /// Test-only options for building a Review command.
+    /// Only covers the parameters that actually vary across test call sites;
+    /// base, target, and context are always None in the existing tests.
+    struct ReviewTestOpts {
         staged: bool,
         diff: bool,
         diff_content: Option<String>,
-        base: Option<String>,
-        target: Option<String>,
-        context: Option<String>,
-        provider: &str,
+        provider: String,
         verbose: bool,
-    ) -> Cli {
+    }
+
+    impl ReviewTestOpts {}
+
+    fn review_cli(opts: ReviewTestOpts) -> Cli {
         test_cli(Commands::Review {
-            staged,
-            diff,
-            diff_content,
-            base,
-            target,
-            context,
-            provider: provider.to_string(),
-            verbose,
+            staged: opts.staged,
+            diff: opts.diff,
+            diff_content: opts.diff_content,
+            base: None,
+            target: None,
+            context: None,
+            provider: opts.provider,
+            verbose: opts.verbose,
         })
     }
 
     #[tokio::test]
     async fn test_review_unknown_provider_returns_err() {
         // Unknown provider string should cause run_cli to return an error
-        let cli = review_cli(true, false, None, None, None, None, "not_a_provider", false);
+        let cli = review_cli(ReviewTestOpts {
+            staged: true,
+            diff: false,
+            diff_content: None,
+            provider: "not_a_provider".into(),
+            verbose: false,
+        });
         let result = run_cli(cli).await;
         assert!(result.is_err(), "expected error for unknown provider");
         let err_msg = result.unwrap_err().to_string();
@@ -1295,16 +1305,13 @@ mod tests {
     #[tokio::test]
     async fn test_review_diff_flag_requires_diff_content() {
         // --diff with no --diff-content should error
-        let cli = review_cli(
-            false, // diff=true by not passing staged/base/target
-            true,  // diff flag
-            None,  // no diff_content
-            None,
-            None,
-            None,
-            "anthropic",
-            false,
-        );
+        let cli = review_cli(ReviewTestOpts {
+            staged: false,
+            diff: true,
+            diff_content: None,
+            provider: "anthropic".into(),
+            verbose: false,
+        });
         let result = run_cli(cli).await;
         assert!(
             result.is_err(),
@@ -1322,16 +1329,13 @@ mod tests {
     async fn test_review_empty_diff_returns_ok() {
         // When git diff returns no changes, the CLI prints "No changes to review" and returns Ok
         // We use --diff with empty content to simulate this path
-        let cli = review_cli(
-            false,
-            true,
-            Some(String::new()), // empty diff content
-            None,
-            None,
-            None,
-            "anthropic",
-            false,
-        );
+        let cli = review_cli(ReviewTestOpts {
+            staged: false,
+            diff: true,
+            diff_content: Some(String::new()),
+            provider: "anthropic".into(),
+            verbose: false,
+        });
         // This should NOT error — it should print "No changes to review" and return Ok
         let result = run_cli(cli).await;
         // The path checks diff_text.trim().is_empty() and returns Ok if empty
@@ -1345,16 +1349,13 @@ mod tests {
     #[tokio::test]
     async fn test_review_whitespace_only_diff_returns_ok() {
         // Whitespace-only diff content is treated as empty
-        let cli = review_cli(
-            false,
-            true,
-            Some("   \n\t  ".to_string()),
-            None,
-            None,
-            None,
-            "anthropic",
-            false,
-        );
+        let cli = review_cli(ReviewTestOpts {
+            staged: false,
+            diff: true,
+            diff_content: Some("   \n\t  ".to_string()),
+            provider: "anthropic".into(),
+            verbose: false,
+        });
         assert!(run_cli(cli).await.is_ok());
     }
 
