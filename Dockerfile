@@ -4,7 +4,7 @@
 # =============================================================================
 # Build stage
 # =============================================================================
-FROM rust:1.80-bookworm AS builder
+FROM rust:1.85-bookworm AS builder
 
 WORKDIR /app
 
@@ -38,7 +38,7 @@ COPY services/runner ./services/runner
 COPY services/git-server ./services/git-server
 
 # Build all binaries
-RUN cargo build --release --bin api --bin ci --bin runner --bin git-server
+RUN cargo build --locked --release --bin api --bin ci --bin runner --bin git-server
 
 # =============================================================================
 # Runner build stage (separate because it needs Docker)
@@ -46,7 +46,7 @@ RUN cargo build --release --bin api --bin ci --bin runner --bin git-server
 FROM builder AS runner-builder
 
 # Build runner
-RUN cargo build --release --bin runner
+RUN cargo build --locked --release --bin runner
 
 # =============================================================================
 # Production stage - API server
