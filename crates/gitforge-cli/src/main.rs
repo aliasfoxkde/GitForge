@@ -10,6 +10,7 @@ use std::path::PathBuf;
 mod admin;
 mod client;
 mod config;
+mod review;
 mod sync;
 
 pub use client::GitForgeClient;
@@ -177,6 +178,33 @@ enum Commands {
         /// Initialize local storage
         #[arg(long)]
         init: Option<String>,
+    },
+    /// AI code review
+    Review {
+        /// Review staged changes (default)
+        #[arg(long)]
+        staged: bool,
+        /// Use the provided diff text directly (requires --diff)
+        #[arg(long)]
+        diff: bool,
+        /// Diff content (used with --diff flag)
+        #[arg(long)]
+        diff_content: Option<String>,
+        /// Review changes against a specific base (e.g., main, HEAD~1)
+        #[arg(long)]
+        base: Option<String>,
+        /// Git ref to review (branch, tag, SHA)
+        #[arg(long)]
+        target: Option<String>,
+        /// Additional context (commit message, PR description)
+        #[arg(long)]
+        context: Option<String>,
+        /// AI provider to use
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+        /// Include verbose output
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -657,6 +685,85 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     }
                 } else {
                     println!("❌ Not authenticated. Run `gitforge auth login <username>` first.");
+                }
+            }
+        }
+
+        Commands::Review {
+            staged,
+            diff,
+            diff_content,
+            base,
+            target,
+            context,
+            provider,
+            verbose,
+        } => {
+            use crate::review::{
+                create_review_request, get_current_branch, get_git_diff, get_uncommitted_diff,
+                print_complexity, print_diff_stats, print_review_results, provider_type_from_name,
+                run_review,
+            };
+
+            let provider_type = provider_type_from_name(provider).map_err(|e| {
+                eprintln!("❌ {}", e);
+                anyhow::anyhow!("invalid provider")
+            })?;
+
+            let repo_path =
+                std::env::current_dir().context("Could not determine current directory")?;
+
+            let diff_text = if *diff {
+                if let Some(ref content) = diff_content {
+                    content.clone()
+                } else {
+                    println!("❌ --diff flag requires --diff-content to be provided.");
+                    anyhow::bail!("--diff requires --diff-content");
+                }
+            } else if *staged || base.is_some() || target.is_some() {
+                get_git_diff(&repo_path, base.as_deref(), target.as_deref())?
+            } else {
+                get_uncommitted_diff(&repo_path)?
+            };
+
+            if diff_text.trim().is_empty() {
+                println!("✅ No changes to review.");
+                return Ok(());
+            }
+
+            let branch = get_current_branch(&repo_path).unwrap_or_else(|_| "unknown".to_string());
+            let repo_name = repo_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let context_str = context.as_deref().unwrap_or("");
+
+            let request = create_review_request(
+                &repo_name,
+                &branch,
+                base.as_deref(),
+                &diff_text,
+                context_str,
+            )?;
+
+            let changes = &request.files;
+            print_diff_stats(&diff_text).ok();
+            print_complexity(changes);
+            println!();
+            println!("🔍 Running {} AI review...", provider);
+
+            match run_review(provider_type, &request).await {
+                Ok(response) => {
+                    print_review_results(&response, *verbose || cli.verbose);
+                    if response.has_critical_findings() {
+                        println!();
+                        println!("⚠️  Review complete — critical findings detected.");
+                    }
+                }
+                Err(e) => {
+                    println!("❌ Review failed: {}", e);
+                    anyhow::bail!("review generation failed: {}", e);
                 }
             }
         }
@@ -1145,5 +1252,151 @@ mod tests {
             whoami: true,
         });
         assert!(run_cli(cli).await.is_ok());
+    }
+
+    // ─── Commands::Review error-branch tests ──────────────────────────────────
+
+    /// Test-only options for building a Review command.
+    /// Only covers the parameters that actually vary across test call sites;
+    /// base, target, and context are always None in the existing tests.
+    struct ReviewTestOpts {
+        staged: bool,
+        diff: bool,
+        diff_content: Option<String>,
+        provider: String,
+        verbose: bool,
+    }
+
+    impl ReviewTestOpts {}
+
+    fn review_cli(opts: ReviewTestOpts) -> Cli {
+        test_cli(Commands::Review {
+            staged: opts.staged,
+            diff: opts.diff,
+            diff_content: opts.diff_content,
+            base: None,
+            target: None,
+            context: None,
+            provider: opts.provider,
+            verbose: opts.verbose,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_review_unknown_provider_returns_err() {
+        // Unknown provider string should cause run_cli to return an error
+        let cli = review_cli(ReviewTestOpts {
+            staged: true,
+            diff: false,
+            diff_content: None,
+            provider: "not_a_provider".into(),
+            verbose: false,
+        });
+        let result = run_cli(cli).await;
+        assert!(result.is_err(), "expected error for unknown provider");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Unknown provider") || err_msg.contains("invalid provider"),
+            "expected 'Unknown provider' or 'invalid provider' in error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_diff_flag_requires_diff_content() {
+        // --diff with no --diff-content should error
+        let cli = review_cli(ReviewTestOpts {
+            staged: false,
+            diff: true,
+            diff_content: None,
+            provider: "anthropic".into(),
+            verbose: false,
+        });
+        let result = run_cli(cli).await;
+        assert!(
+            result.is_err(),
+            "expected error when --diff is set but --diff-content is missing"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("--diff") || err_msg.contains("diff_content"),
+            "expected error to mention --diff or diff_content, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_empty_diff_returns_ok() {
+        // When git diff returns no changes, the CLI prints "No changes to review" and returns Ok
+        // We use --diff with empty content to simulate this path
+        let cli = review_cli(ReviewTestOpts {
+            staged: false,
+            diff: true,
+            diff_content: Some(String::new()),
+            provider: "anthropic".into(),
+            verbose: false,
+        });
+        // This should NOT error — it should print "No changes to review" and return Ok
+        let result = run_cli(cli).await;
+        // The path checks diff_text.trim().is_empty() and returns Ok if empty
+        assert!(result.is_ok(), "expected Ok for empty diff");
+    }
+
+    #[tokio::test]
+    async fn test_review_whitespace_only_diff_returns_ok() {
+        // Whitespace-only diff content is treated as empty
+        let cli = review_cli(ReviewTestOpts {
+            staged: false,
+            diff: true,
+            diff_content: Some("   \n\t  ".to_string()),
+            provider: "anthropic".into(),
+            verbose: false,
+        });
+        assert!(run_cli(cli).await.is_ok());
+    }
+
+    // ─── provider_type_from_name (pure, no network) ────────────────────────────
+
+    #[test]
+    fn test_provider_type_from_name_anthropic() {
+        use crate::review::provider_type_from_name;
+        assert!(provider_type_from_name("anthropic").is_ok());
+        assert_eq!(
+            provider_type_from_name("anthropic").unwrap(),
+            gitforge_ai::ProviderType::Anthropic
+        );
+    }
+
+    #[test]
+    fn test_provider_type_from_name_openai() {
+        use crate::review::provider_type_from_name;
+        assert!(provider_type_from_name("openai").is_ok());
+        assert_eq!(
+            provider_type_from_name("openai").unwrap(),
+            gitforge_ai::ProviderType::OpenAI
+        );
+    }
+
+    #[test]
+    fn test_provider_type_from_name_ollama() {
+        use crate::review::provider_type_from_name;
+        assert!(provider_type_from_name("ollama").is_ok());
+        assert_eq!(
+            provider_type_from_name("ollama").unwrap(),
+            gitforge_ai::ProviderType::Ollama
+        );
+    }
+
+    #[test]
+    fn test_provider_type_from_name_unknown() {
+        use crate::review::provider_type_from_name;
+        let result = provider_type_from_name("not_a_provider");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unknown provider"), "got: {}", err);
+        assert!(err.contains("not_a_provider"), "got: {}", err);
+        assert!(err.contains("anthropic"), "got: {}", err);
+        assert!(err.contains("openai"), "got: {}", err);
+        assert!(err.contains("ollama"), "got: {}", err);
     }
 }
