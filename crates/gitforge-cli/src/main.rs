@@ -1341,8 +1341,7 @@ mod tests {
         // The path checks diff_text.trim().is_empty() and returns Ok if empty
         assert!(
             result.is_ok(),
-            "expected Ok for empty diff, got: {:?}",
-            result
+            "expected Ok for empty diff"
         );
     }
 
