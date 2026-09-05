@@ -148,7 +148,14 @@ async fn list_pipelines(
             }
             Err(e) => {
                 tracing::error!("failed to list pipelines: {}", e);
-                Json(serde_json::Value::Array(vec![])).into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "database_error",
+                        "message": "failed to list pipelines"
+                    })),
+                )
+                    .into_response()
             }
         },
     }
@@ -248,7 +255,14 @@ async fn list_pipeline_runs(
             }
             Err(e) => {
                 tracing::error!("failed to list pipeline runs: {}", e);
-                Json(serde_json::Value::Array(vec![])).into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "database_error",
+                        "message": "failed to list pipeline runs"
+                    })),
+                )
+                    .into_response()
             }
         },
     }

@@ -121,7 +121,14 @@ async fn list_repos(
         }
         Err(e) => {
             tracing::error!("failed to list repos: {}", e);
-            Json(serde_json::Value::Array(vec![])).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "failed to list repositories"
+                })),
+            )
+                .into_response()
         }
     }
 }
