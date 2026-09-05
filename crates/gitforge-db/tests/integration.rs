@@ -696,3 +696,332 @@ async fn review_findings_cascade_delete_with_run() {
         1
     );
 }
+
+// ============================================================================
+// Review run claim (worker hand-off)
+// ============================================================================
+
+/// Insert a row directly with a chosen status and deterministic timestamps
+/// so FIFO ordering tests can build known-good queues without depending on
+/// wall-clock interleaving.
+async fn insert_review_run_with_state(
+    pool: &Pool,
+    repo_id: uuid::Uuid,
+    status: ReviewRunState,
+    created_at: &str,
+    idempotency_key: &str,
+) -> ReviewRun {
+    let new_run = NewReviewRun {
+        repo_id: Some(repo_id),
+        base_sha: format!("base-{idempotency_key}"),
+        head_sha: format!("head-{idempotency_key}"),
+        idempotency_key: idempotency_key.to_string(),
+        attempt: 1,
+    };
+    let run = match ReviewQueries::create_or_get_run(pool, &new_run)
+        .await
+        .unwrap()
+    {
+        CreateOrGetReviewRun::Created(run) => run,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    sqlx::query("UPDATE review_runs SET status = ?, created_at = ?, updated_at = ? WHERE id = ?")
+        .bind(status.to_string())
+        .bind(created_at)
+        .bind(created_at)
+        .bind(run.id.to_string())
+        .execute(pool.pool())
+        .await
+        .unwrap();
+    ReviewQueries::get_run(pool, run.id)
+        .await
+        .unwrap()
+        .expect("review run should be readable after direct status update")
+}
+
+#[tokio::test]
+async fn claim_pending_returns_none_when_queue_is_empty() {
+    let (pool, _) = seeded_pool().await;
+    assert!(ReviewQueries::claim_pending(&pool).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn claim_pending_advances_oldest_pending_to_running_and_bumps_attempt() {
+    let (pool, repo_id) = seeded_pool().await;
+
+    // Build a queue where the second run is the oldest by `created_at`,
+    // so we can prove FIFO ordering selects it.
+    let newer = insert_review_run_with_state(
+        &pool,
+        repo_id,
+        ReviewRunState::Pending,
+        "2026-09-05T10:00:00Z",
+        "claim-key-newer",
+    )
+    .await;
+    let oldest = insert_review_run_with_state(
+        &pool,
+        repo_id,
+        ReviewRunState::Pending,
+        "2026-09-05T09:00:00Z",
+        "claim-key-oldest",
+    )
+    .await;
+
+    let claimed = ReviewQueries::claim_pending(&pool)
+        .await
+        .unwrap()
+        .expect("a pending run should be claimable");
+    assert_eq!(claimed.id, oldest.id);
+    assert_eq!(claimed.status, ReviewRunState::Running);
+    // Attempt semantics: the existing `attempt` counter (the only retry
+    // counter on the schema) is incremented by the claim itself.
+    assert_eq!(claimed.attempt, 2);
+
+    // The remaining pending run is still claimable; a second claim must
+    // advance it to running and bump its own attempt counter.
+    let next = ReviewQueries::claim_pending(&pool)
+        .await
+        .unwrap()
+        .expect("second oldest pending run should also be claimable");
+    assert_eq!(next.id, newer.id);
+    assert_eq!(next.status, ReviewRunState::Running);
+    assert_eq!(next.attempt, 2);
+
+    // The queue is now drained from the worker's perspective.
+    assert!(ReviewQueries::claim_pending(&pool).await.unwrap().is_none());
+
+    let stored = ReviewQueries::get_run(&pool, oldest.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, ReviewRunState::Running);
+    assert_eq!(stored.attempt, 2);
+}
+
+#[tokio::test]
+async fn claim_pending_ignores_running_terminal_and_missing_runs() {
+    let (pool, repo_id) = seeded_pool().await;
+
+    let _running = insert_review_run_with_state(
+        &pool,
+        repo_id,
+        ReviewRunState::Running,
+        "2026-09-05T08:00:00Z",
+        "claim-key-running",
+    )
+    .await;
+    let _succeeded = insert_review_run_with_state(
+        &pool,
+        repo_id,
+        ReviewRunState::Succeeded,
+        "2026-09-05T07:00:00Z",
+        "claim-key-succeeded",
+    )
+    .await;
+    let _failed = insert_review_run_with_state(
+        &pool,
+        repo_id,
+        ReviewRunState::Failed,
+        "2026-09-05T06:00:00Z",
+        "claim-key-failed",
+    )
+    .await;
+    let _cancelled = insert_review_run_with_state(
+        &pool,
+        repo_id,
+        ReviewRunState::Cancelled,
+        "2026-09-05T05:00:00Z",
+        "claim-key-cancelled",
+    )
+    .await;
+
+    // None of the rows above are eligible; FIFO on pending finds nothing.
+    assert!(ReviewQueries::claim_pending(&pool).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn claim_pending_uses_id_as_deterministic_tiebreaker() {
+    let (pool, repo_id) = seeded_pool().await;
+
+    // Two pending runs with identical created_at: the lexicographically
+    // smaller id wins, mirroring the schema's FIFO tiebreak.
+    let a = insert_review_run_with_state(
+        &pool,
+        repo_id,
+        ReviewRunState::Pending,
+        "2026-09-05T11:00:00Z",
+        "claim-tie-a",
+    )
+    .await;
+    let b = insert_review_run_with_state(
+        &pool,
+        repo_id,
+        ReviewRunState::Pending,
+        "2026-09-05T11:00:00Z",
+        "claim-tie-b",
+    )
+    .await;
+    let (first_id, second_id) = if a.id < b.id {
+        (a.id, b.id)
+    } else {
+        (b.id, a.id)
+    };
+
+    let first = ReviewQueries::claim_pending(&pool).await.unwrap().unwrap();
+    assert_eq!(first.id, first_id);
+
+    let second = ReviewQueries::claim_pending(&pool).await.unwrap().unwrap();
+    assert_eq!(second.id, second_id);
+    assert_eq!(second.status, ReviewRunState::Running);
+
+    // The queue is now drained for pending rows.
+    assert!(ReviewQueries::claim_pending(&pool).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn claim_pending_after_terminal_transition_is_a_no_op() {
+    let (pool, _) = seeded_pool().await;
+    let (_, _, new_run) = review_fixture();
+    let created = match ReviewQueries::create_or_get_run(&pool, &new_run)
+        .await
+        .unwrap()
+    {
+        CreateOrGetReviewRun::Created(run) => run,
+        other => panic!("expected Created, got {other:?}"),
+    };
+
+    // Move the run through the lifecycle to a terminal state.
+    ReviewQueries::transition_run(&pool, created.id, ReviewRunState::Running)
+        .await
+        .unwrap();
+    ReviewQueries::transition_run(&pool, created.id, ReviewRunState::Succeeded)
+        .await
+        .unwrap();
+
+    // A terminal run must never become claimable again, even though it is
+    // strictly "older" than any other pending run by created_at.
+    assert!(ReviewQueries::claim_pending(&pool).await.unwrap().is_none());
+    let stored = ReviewQueries::get_run(&pool, created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, ReviewRunState::Succeeded);
+}
+
+#[tokio::test]
+async fn claim_pending_under_concurrent_callers_partitions_unique_rows() {
+    use std::sync::Arc;
+
+    // Concurrent claim tests need a file-backed pool: the in-memory pool uses
+    // private cache mode, so distinct connections observe separate
+    // databases. The claim code is identical either way; the file pool is
+    // what exercises real cross-connection durability.
+    let db_path =
+        std::env::temp_dir().join(format!("gitforge-claim-conc-{}.db", uuid::Uuid::new_v4()));
+    let pool = Pool::new(&db_path.to_string_lossy()).await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let (user_id, repo_id, _) = review_fixture();
+    let user = User::new(
+        "claim-conc-owner".to_string(),
+        "claim-conc-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    let mut user = user;
+    user.id = gitforge_common::UserId::from(user_id);
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "claim-conc-repo".to_string(),
+        user_id.into(),
+        "/git/claim-conc-repo".to_string(),
+    );
+    let mut repo = repo;
+    repo.id = gitforge_common::RepoId::from(repo_id);
+    RepoQueries::create(&pool, &repo).await.unwrap();
+
+    let pool = Arc::new(pool);
+
+    // Insert N pending runs; each concurrent caller must walk away with a
+    // distinct id (no double-claim).
+    let total = 8usize;
+    for i in 0..total {
+        let created_at = format!("2026-09-05T12:00:{i:02}Z");
+        let key = format!("claim-conc-{i:02}");
+        insert_review_run_with_state(&pool, repo_id, ReviewRunState::Pending, &created_at, &key)
+            .await;
+    }
+
+    let mut handles = Vec::with_capacity(total);
+    for _ in 0..total {
+        let pool = Arc::clone(&pool);
+        handles.push(tokio::spawn(async move {
+            ReviewQueries::claim_pending(&pool).await
+        }));
+    }
+
+    let mut claimed_ids = Vec::with_capacity(total);
+    let mut races = 0usize;
+    for handle in handles {
+        match handle.await.unwrap().unwrap() {
+            Some(run) => claimed_ids.push(run.id),
+            None => races += 1,
+        }
+    }
+
+    let unique = {
+        let mut sorted = claimed_ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        sorted.len()
+    };
+    assert_eq!(
+        unique,
+        claimed_ids.len(),
+        "every concurrent claim must yield a distinct review run id"
+    );
+    assert_eq!(
+        claimed_ids.len() + races,
+        total,
+        "claim counts plus races must cover the full pending queue"
+    );
+
+    // After draining, the queue is empty from the worker perspective.
+    assert!(ReviewQueries::claim_pending(&pool).await.unwrap().is_none());
+
+    drop(pool);
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+#[tokio::test]
+async fn claim_pending_repeated_call_after_success_does_not_double_claim() {
+    let (pool, repo_id) = seeded_pool().await;
+    let _ = insert_review_run_with_state(
+        &pool,
+        repo_id,
+        ReviewRunState::Pending,
+        "2026-09-05T13:00:00Z",
+        "claim-repeat-1",
+    )
+    .await;
+
+    let first = ReviewQueries::claim_pending(&pool)
+        .await
+        .unwrap()
+        .expect("first claim must succeed");
+    let second = ReviewQueries::claim_pending(&pool).await.unwrap();
+    assert!(
+        second.is_none(),
+        "a second claim must not re-claim the same row"
+    );
+
+    // attempt must have been incremented exactly once across both calls.
+    let stored = ReviewQueries::get_run(&pool, first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, ReviewRunState::Running);
+    assert_eq!(stored.attempt, 2);
+}

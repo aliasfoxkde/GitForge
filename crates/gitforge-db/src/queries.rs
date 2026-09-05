@@ -1701,6 +1701,115 @@ impl ReviewQueries {
         Self::get_run(pool, id).await
     }
 
+    /// Atomically claim the oldest pending review run for a worker.
+    ///
+    /// The claim is the durable hand-off between the submission control plane
+    /// and the review workers. It must be safe when many workers poll the
+    /// queue concurrently and must preserve the ADR R3 monotonic lifecycle
+    /// (`pending` may only advance forward). Because the existing schema does
+    /// not carry a `runner_id`/`lease_token` column on `review_runs`, the
+    /// claim is encoded purely in the lifecycle state: the row is selected in
+    /// deterministic FIFO order, then conditionally advanced from `pending`
+    /// to `running` inside a single guarded UPDATE so a racing worker cannot
+    /// silently create a second ownership record for the same row.
+    ///
+    /// Semantics:
+    /// - Only `pending` rows are eligible. Terminal rows (`succeeded`,
+    ///   `failed`, `cancelled`) and an already-`running` row stay untouched.
+    /// - FIFO ordering uses `(created_at ASC, id ASC)`, matching the schema's
+    ///   existing index strategy so the queue drains deterministically.
+    /// - The `attempt` counter on the run is incremented as part of the
+    ///   guarded update. The schema's `attempt` column is the only retry
+    ///   counter available; this preserves the existing "attempt is bumped
+    ///   when a worker picks up the run" invariant callers can rely on.
+    /// - A repeated call after a successful claim yields `None` until a new
+    ///   run is submitted (the queue is empty from the worker's view); no
+    ///   silent duplicate ownership can be created.
+    /// - A racing claim that loses to a concurrent winner returns `None`
+    ///   rather than retrying: the scheduler polls, and the next claim will
+    ///   find the now-oldest pending row.
+    ///
+    /// The claim uses `BEGIN IMMEDIATE` to acquire the write lock at
+    /// transaction start. This is what keeps the SELECT-and-UPDATE pair
+    /// atomic across pooled connections: without `IMMEDIATE`, two
+    /// concurrent transactions can each read the same candidate row
+    /// without contention and only race when they try to upgrade to a
+    /// write lock at UPDATE time, where SQLite returns `SQLITE_BUSY`
+    /// instead of queueing under the configured busy timeout. With
+    /// `IMMEDIATE`, claimers serialize at `BEGIN`, so the second claimer
+    /// waits for the first to commit and then sees the candidate row
+    /// already advanced out of `pending`.
+    pub async fn claim_pending(pool: &Pool) -> Result<Option<ReviewRun>> {
+        let mut tx = pool
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::database(format!("failed to begin review claim: {}", e)))?;
+
+        // FIFO candidate selection. Held under the IMMEDIATE write lock so
+        // no concurrent claimer can advance the same row before the
+        // matching UPDATE below commits.
+        let candidate: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM review_runs
+            WHERE status = 'pending'
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to select pending run: {}", e)))?;
+
+        let Some(candidate_id) = candidate else {
+            tx.rollback().await.map_err(|e| {
+                Error::database(format!("failed to roll back empty review claim: {}", e))
+            })?;
+            return Ok(None);
+        };
+
+        // Conditional advance inside the same transaction. The
+        // `status = 'pending'` guard is what makes the claim
+        // double-claim-safe: if a parallel claimer had already won (which
+        // cannot happen under BEGIN IMMEDIATE serialization, but is the
+        // correct invariant to assert regardless), this UPDATE matches
+        // zero rows and we surface `None` to the caller.
+        let updated = sqlx::query(
+            r#"
+            UPDATE review_runs
+            SET status = 'running',
+                attempt = attempt + 1,
+                updated_at = ?
+            WHERE id = ?
+              AND status = 'pending'
+            "#,
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(&candidate_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to claim review run: {}", e)))?;
+
+        if updated.rows_affected() != 1 {
+            tx.rollback().await.map_err(|e| {
+                Error::database(format!("failed to roll back review claim race: {}", e))
+            })?;
+            return Ok(None);
+        }
+
+        let row = sqlx::query("SELECT * FROM review_runs WHERE id = ?")
+            .bind(&candidate_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| Error::database(format!("failed to read claimed review run: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit review claim: {}", e)))?;
+
+        hydrate_review_run(row).map(Some)
+    }
+
     /// Insert a finding for a run, idempotently: a retried insertion of the
     /// same content (same ADR R4 fingerprint) returns the already-stored row
     /// instead of failing. The database CHECK constraint enforces the
