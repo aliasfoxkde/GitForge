@@ -35,3 +35,4 @@ prometheus = "0.14"
 [dev-dependencies]
 hyper = "1.5"
 tempfile = "3"
+gitforge-review = { path = "../gitforge-review" }

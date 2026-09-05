@@ -1012,6 +1012,7 @@ dependencies = [
  "gitforge-core",
  "gitforge-db",
  "gitforge-events",
+ "gitforge-review",
  "gitforge-scheduler",
  "gitforge-storage",
  "hyper",

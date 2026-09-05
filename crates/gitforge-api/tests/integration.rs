@@ -2294,3 +2294,529 @@ async fn test_api_get_pipeline_with_invalid_id_format() {
         response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::NOT_FOUND
     );
 }
+
+// ============================================================================
+// Code review run API (persisted review domain, ADR 20260905)
+// ============================================================================
+
+use gitforge_db::queries::{NewReviewFinding, NewReviewRun, ReviewQueries};
+
+/// Deterministic fixture: two users, one repository owned by the first user,
+/// and a freshly migrated in-memory pool. Returns the router, the pool for
+/// direct seeding, the repository id, and both bearer tokens.
+async fn review_fixture() -> (axum::Router, Pool, gitforge_common::RepoId, String, String) {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let owner = gitforge_db::models::User::new(
+        "review-owner".to_string(),
+        "review-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &owner)
+        .await
+        .unwrap();
+    let other = gitforge_db::models::User::new(
+        "review-other".to_string(),
+        "review-other@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &other)
+        .await
+        .unwrap();
+    let repo = gitforge_db::models::Repository::new(
+        "review-repo".to_string(),
+        owner.id,
+        "/git/review-repo".to_string(),
+    );
+    let repo_id = repo.id;
+    gitforge_db::queries::RepoQueries::create(&pool, &repo)
+        .await
+        .unwrap();
+    let auth = ApiAuth::new("test-secret");
+    let owner_token = auth
+        .generate_token(owner.id, "review-owner", "developer")
+        .unwrap();
+    let other_token = auth
+        .generate_token(other.id, "review-other", "developer")
+        .unwrap();
+    (
+        ApiServer::new("test-secret", pool.clone()).into_router(),
+        pool,
+        repo_id,
+        owner_token,
+        other_token,
+    )
+}
+
+async fn review_post_json(
+    app: axum::Router,
+    token: Option<&str>,
+    uri: &str,
+    body: serde_json::Value,
+) -> axum::http::Response<axum::body::Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {}", token));
+    }
+    app.oneshot(
+        builder
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn review_get(
+    app: axum::Router,
+    token: Option<&str>,
+    uri: &str,
+) -> axum::http::Response<axum::body::Body> {
+    let mut builder = Request::builder().method("GET").uri(uri);
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {}", token));
+    }
+    app.oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+fn review_submit_body(
+    repo_id: &gitforge_common::RepoId,
+    head: &str,
+    key: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "repo_id": repo_id.to_string(),
+        "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "head_sha": head,
+        "idempotency_key": key,
+        "attempt": 1,
+    })
+}
+
+#[tokio::test]
+async fn test_review_run_submit_created_then_idempotent_retry() {
+    let (app, _pool, repo_id, owner_token, _other_token) = review_fixture().await;
+    let body = review_submit_body(
+        &repo_id,
+        "1111111111111111111111111111111111111111",
+        "run-key-1",
+    );
+
+    let response = review_post_json(
+        app.clone(),
+        Some(&owner_token),
+        "/api/review-runs",
+        body.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(created["status"], "created");
+    assert_eq!(created["run"]["status"], "pending");
+    assert_eq!(
+        created["run"]["head_sha"],
+        "1111111111111111111111111111111111111111"
+    );
+    let run_id = created["run"]["id"].as_str().unwrap().to_string();
+
+    // Same key, same head SHA: idempotent retry returns the same run.
+    let response =
+        review_post_json(app.clone(), Some(&owner_token), "/api/review-runs", body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let retried: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(retried["status"], "already_exists");
+    assert_eq!(retried["run"]["id"], created["run"]["id"]);
+
+    // get-run returns the persisted run.
+    let response = review_get(
+        app,
+        Some(&owner_token),
+        &format!("/api/review-runs/{}", run_id),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let run: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(run["id"], run_id.as_str());
+    assert_eq!(run["idempotency_key"], "run-key-1");
+}
+
+#[tokio::test]
+async fn test_review_run_submit_head_conflict() {
+    let (app, _pool, repo_id, owner_token, _other_token) = review_fixture().await;
+    let first = review_post_json(
+        app.clone(),
+        Some(&owner_token),
+        "/api/review-runs",
+        review_submit_body(
+            &repo_id,
+            "2222222222222222222222222222222222222222",
+            "conflict-key",
+        ),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    // Same key, different head SHA: typed conflict, not silent reuse.
+    let response = review_post_json(
+        app.clone(),
+        Some(&owner_token),
+        "/api/review-runs",
+        review_submit_body(
+            &repo_id,
+            "3333333333333333333333333333333333333333",
+            "conflict-key",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let conflict: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(conflict["error"], "idempotency_key_head_conflict");
+    assert!(conflict["existing_run_id"].as_str().is_some());
+
+    // The original run is unchanged.
+    let existing_run_id = conflict["existing_run_id"].as_str().unwrap().to_string();
+    let response = review_get(
+        app,
+        Some(&owner_token),
+        &format!("/api/review-runs/{}", existing_run_id),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let run: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(run["head_sha"], "2222222222222222222222222222222222222222");
+}
+
+#[tokio::test]
+async fn test_review_run_submit_rejects_malformed_input() {
+    let (app, _pool, repo_id, owner_token, _other_token) = review_fixture().await;
+
+    let cases: Vec<serde_json::Value> = vec![
+        // Empty head SHA.
+        serde_json::json!({
+            "repo_id": repo_id.to_string(),
+            "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "head_sha": "",
+            "idempotency_key": "k-empty-head",
+            "attempt": 1
+        }),
+        // Oversized idempotency key (database CHECK allows at most 128).
+        serde_json::json!({
+            "repo_id": repo_id.to_string(),
+            "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "head_sha": "4444444444444444444444444444444444444444",
+            "idempotency_key": "k".repeat(129),
+            "attempt": 1
+        }),
+        // Non-positive attempt.
+        serde_json::json!({
+            "repo_id": repo_id.to_string(),
+            "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "head_sha": "5555555555555555555555555555555555555555",
+            "idempotency_key": "k-attempt",
+            "attempt": 0
+        }),
+        // Ambiguous repository identity.
+        serde_json::json!({
+            "repo_id": repo_id.to_string(),
+            "owner": "review-owner",
+            "name": "review-repo",
+            "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "head_sha": "6666666666666666666666666666666666666666",
+            "idempotency_key": "k-ambiguous",
+            "attempt": 1
+        }),
+        // Missing repository identity entirely.
+        serde_json::json!({
+            "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "head_sha": "7777777777777777777777777777777777777777",
+            "idempotency_key": "k-missing-repo",
+            "attempt": 1
+        }),
+        // Malformed repo_id (not a UUID).
+        serde_json::json!({
+            "repo_id": "not-a-uuid",
+            "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "head_sha": "8888888888888888888888888888888888888888",
+            "idempotency_key": "k-bad-uuid",
+            "attempt": 1
+        }),
+    ];
+
+    for body in cases {
+        let case_label = body.to_string();
+        let response =
+            review_post_json(app.clone(), Some(&owner_token), "/api/review-runs", body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 for case {}",
+            case_label
+        );
+    }
+
+    // Structurally malformed JSON body.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/review-runs")
+                .header("authorization", format!("Bearer {}", owner_token))
+                .header("content-type", "application/json")
+                .body(Body::from("{not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_review_run_submit_unknown_repository() {
+    let (app, _pool, _repo_id, owner_token, _other_token) = review_fixture().await;
+    let unknown = gitforge_common::RepoId::new();
+    let response = review_post_json(
+        app,
+        Some(&owner_token),
+        "/api/review-runs",
+        review_submit_body(
+            &unknown,
+            "9999999999999999999999999999999999999999",
+            "unknown-repo-key",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"], "repository_not_found");
+}
+
+#[tokio::test]
+async fn test_review_run_requires_authentication() {
+    let (app, _pool, repo_id, _owner_token, _other_token) = review_fixture().await;
+    let response = review_post_json(
+        app,
+        None,
+        "/api/review-runs",
+        review_submit_body(
+            &repo_id,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "no-auth-key",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_review_run_access_is_owner_scoped() {
+    let (app, pool, repo_id, owner_token, other_token) = review_fixture().await;
+
+    // A non-owner cannot submit against someone else's repository.
+    let response = review_post_json(
+        app.clone(),
+        Some(&other_token),
+        "/api/review-runs",
+        review_submit_body(
+            &repo_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "scoped-key",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // The owner creates a run; the non-owner cannot see it.
+    let response = review_post_json(
+        app.clone(),
+        Some(&owner_token),
+        "/api/review-runs",
+        review_submit_body(
+            &repo_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "scoped-key",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let run_id = created["run"]["id"].as_str().unwrap().to_string();
+
+    for uri in [
+        format!("/api/review-runs/{}", run_id),
+        format!("/api/review-runs/{}/findings", run_id),
+    ] {
+        let response = review_get(app.clone(), Some(&other_token), &uri).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "non-owner must not observe run via {}",
+            uri
+        );
+    }
+
+    // A repo-less run is invisible to non-administrators.
+    let orphan = ReviewQueries::create_or_get_run(
+        &pool,
+        &NewReviewRun {
+            repo_id: None,
+            base_sha: "cccccccccccccccccccccccccccccccccccccccc".to_string(),
+            head_sha: "dddddddddddddddddddddddddddddddddddddddd".to_string(),
+            idempotency_key: "orphan-key".to_string(),
+            attempt: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let orphan_id = match orphan {
+        gitforge_db::queries::CreateOrGetReviewRun::Created(run) => run.id,
+        _ => panic!("expected created orphan run"),
+    };
+    let response = review_get(
+        app,
+        Some(&owner_token),
+        &format!("/api/review-runs/{}", orphan_id),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_review_run_missing_returns_404() {
+    let (app, _pool, _repo_id, owner_token, _other_token) = review_fixture().await;
+    let missing = uuid::Uuid::new_v4();
+    let response = review_get(
+        app,
+        Some(&owner_token),
+        &format!("/api/review-runs/{}", missing),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_review_findings_are_ordered_deterministic_and_bounded() {
+    let (app, pool, repo_id, owner_token, _other_token) = review_fixture().await;
+
+    let run = match ReviewQueries::create_or_get_run(
+        &pool,
+        &NewReviewRun {
+            repo_id: Some(repo_id.into()),
+            base_sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string(),
+            head_sha: "ffff0000ffff0000ffff0000ffff0000ffff0000".to_string(),
+            idempotency_key: "findings-key".to_string(),
+            attempt: 1,
+        },
+    )
+    .await
+    .unwrap()
+    {
+        gitforge_db::queries::CreateOrGetReviewRun::Created(run) => run,
+        _ => panic!("expected created findings run"),
+    };
+
+    let finding = |file: &str, line: Option<u32>, category: &str| NewReviewFinding {
+        run_id: run.id,
+        source: "static-analysis".to_string(),
+        file: file.to_string(),
+        line,
+        severity: "warning".to_string(),
+        category: category.to_string(),
+        title: format!("finding {}", category),
+        message: format!("message {}", category),
+        evidence: None,
+        confidence: "high".to_string(),
+        position_status: if line.is_some() {
+            gitforge_review::domain::PositionStatus::Line
+        } else {
+            gitforge_review::domain::PositionStatus::File
+        },
+    };
+
+    // Insert out of order, plus a duplicate fingerprint and a NULL-line file
+    // finding in the same path as line findings.
+    for request in [
+        finding("src/zeta.rs", Some(10), "zeta"),
+        finding("src/alpha.rs", Some(2), "alpha-2"),
+        finding("src/alpha.rs", Some(1), "alpha-1"),
+        finding("src/alpha.rs", None, "alpha-file"),
+        finding("src/zeta.rs", Some(10), "zeta"), // duplicate fingerprint
+    ] {
+        ReviewQueries::insert_finding(&pool, &request)
+            .await
+            .unwrap();
+    }
+
+    let uri = format!("/api/review-runs/{}/findings", run.id);
+    let response = review_get(app.clone(), Some(&owner_token), &uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["total"], 4, "duplicate fingerprint must not duplicate");
+    let findings = body["findings"].as_array().unwrap();
+    let order: Vec<String> = findings
+        .iter()
+        .map(|f| format!("{}|{}", f["path"].as_str().unwrap(), f["line"]))
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            "src/alpha.rs|null",
+            "src/alpha.rs|1",
+            "src/alpha.rs|2",
+            "src/zeta.rs|10",
+        ],
+        "findings must be ordered by path, then line with NULL lines first"
+    );
+
+    // Bounded output via pagination.
+    let response = review_get(
+        app.clone(),
+        Some(&owner_token),
+        &format!("{}?limit=2&offset=1", uri),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["total"], 4);
+    assert_eq!(body["findings"].as_array().unwrap().len(), 2);
+    assert_eq!(body["findings"][0]["line"], 1);
+    assert_eq!(body["findings"][1]["line"], 2);
+
+    // Invalid pagination is rejected.
+    for query in ["limit=0", "limit=501"] {
+        let response = review_get(
+            app.clone(),
+            Some(&owner_token),
+            &format!("{}?{}", uri, query),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "query {}",
+            query
+        );
+    }
+
+    // Malformed run id.
+    let response = review_get(
+        app,
+        Some(&owner_token),
+        "/api/review-runs/not-a-uuid/findings",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

@@ -35,7 +35,8 @@ pub fn get_openapi_spec() -> serde_json::Value {
             {"name": "ci", "description": "CI/CD pipelines"},
             {"name": "users", "description": "Administrative user management"},
             {"name": "runners", "description": "Runner management"},
-            {"name": "artifacts", "description": "Artifact management"}
+            {"name": "artifacts", "description": "Artifact management"},
+            {"name": "review", "description": "AI code review runs and findings"}
         ],
         "paths": {
             "/auth/login": {
@@ -492,6 +493,92 @@ pub fn get_openapi_spec() -> serde_json::Value {
                         "200": {"description": "List of job artifacts"}
                     }
                 }
+            },
+            "/review-runs": {
+                "post": {
+                    "tags": ["review"],
+                    "summary": "Submit a code review run",
+                    "description": "Creates a persisted review run for a repository head. The idempotency key makes retries safe: the same key against the same head SHA returns the existing run (200), while the same key against a different head SHA is a 409 conflict.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/SubmitReviewRunRequest"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Review run created",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ReviewRunSubmissionResponse"}
+                                }
+                            }
+                        },
+                        "200": {
+                            "description": "Idempotent retry: existing run for the same key and head SHA",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ReviewRunSubmissionResponse"}
+                                }
+                            }
+                        },
+                        "400": {"description": "Invalid submission fields"},
+                        "401": {"description": "Missing or invalid bearer token"},
+                        "403": {"description": "Caller does not own the repository"},
+                        "404": {"description": "Repository not found"},
+                        "409": {"description": "Idempotency key reused against a different head SHA"}
+                    }
+                }
+            },
+            "/review-runs/{id}": {
+                "get": {
+                    "tags": ["review"],
+                    "summary": "Read a review run",
+                    "description": "Returns the persisted review run. Runs the caller is not authorized to see are reported as not-found.",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Review run",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ReviewRunResponse"}
+                                }
+                            }
+                        },
+                        "400": {"description": "Invalid run ID"},
+                        "401": {"description": "Missing or invalid bearer token"},
+                        "404": {"description": "Run not found or not visible to the caller"}
+                    }
+                }
+            },
+            "/review-runs/{id}/findings": {
+                "get": {
+                    "tags": ["review"],
+                    "summary": "List findings for a review run",
+                    "description": "Returns findings in deterministic order (path, then line with NULL lines first, then fingerprint) with bounded pagination.",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+                        {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}},
+                        {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0, "default": 0}}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Paginated findings",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ReviewFindingsResponse"}
+                                }
+                            }
+                        },
+                        "400": {"description": "Invalid run ID or pagination"},
+                        "401": {"description": "Missing or invalid bearer token"},
+                        "404": {"description": "Run not found or not visible to the caller"}
+                    }
+                }
             }
         },
         "components": {
@@ -576,6 +663,76 @@ pub fn get_openapi_spec() -> serde_json::Value {
                         "checksum": {"type": "string"},
                         "size_bytes": {"type": "integer", "format": "int64"},
                         "created_at": {"type": "string"}
+                    }
+                },
+                "SubmitReviewRunRequest": {
+                    "type": "object",
+                    "required": ["base_sha", "head_sha", "idempotency_key", "attempt"],
+                    "properties": {
+                        "repo_id": {"type": "string", "format": "uuid", "description": "Repository UUID; mutually exclusive with owner+name"},
+                        "owner": {"type": "string", "description": "Repository owner username; used with name"},
+                        "name": {"type": "string", "description": "Repository name; used with owner"},
+                        "base_sha": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "head_sha": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "attempt": {"type": "integer", "minimum": 1, "maximum": 10000}
+                    }
+                },
+                "ReviewRunResponse": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "format": "uuid"},
+                        "repo_id": {"type": "string", "format": "uuid", "nullable": true},
+                        "base_sha": {"type": "string"},
+                        "head_sha": {"type": "string"},
+                        "idempotency_key": {"type": "string"},
+                        "status": {"type": "string", "enum": ["pending", "running", "succeeded", "failed", "cancelled"]},
+                        "attempt": {"type": "integer"},
+                        "receipt_id": {"type": "string", "nullable": true},
+                        "created_at": {"type": "string"},
+                        "updated_at": {"type": "string"}
+                    }
+                },
+                "ReviewRunSubmissionResponse": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string", "enum": ["created", "already_exists"]},
+                        "run": {"$ref": "#/components/schemas/ReviewRunResponse"}
+                    }
+                },
+                "ReviewFindingResponse": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "format": "uuid"},
+                        "run_id": {"type": "string", "format": "uuid"},
+                        "source": {"type": "string"},
+                        "fingerprint": {"type": "string"},
+                        "path": {"type": "string"},
+                        "line": {"type": "integer", "nullable": true},
+                        "severity": {"type": "string"},
+                        "category": {"type": "string"},
+                        "title": {"type": "string"},
+                        "message": {"type": "string"},
+                        "evidence": {"type": "string", "nullable": true},
+                        "confidence": {"type": "string"},
+                        "position_status": {"type": "string", "enum": ["line", "file", "deleted", "unavailable"]},
+                        "disposition": {"type": "string"},
+                        "created_at": {"type": "string"},
+                        "updated_at": {"type": "string"}
+                    }
+                },
+                "ReviewFindingsResponse": {
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string", "format": "uuid"},
+                        "run_status": {"type": "string"},
+                        "total": {"type": "integer"},
+                        "limit": {"type": "integer"},
+                        "offset": {"type": "integer"},
+                        "findings": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/ReviewFindingResponse"}
+                        }
                     }
                 }
             }
@@ -667,6 +824,9 @@ mod tests {
         assert!(paths.contains_key("/pipelines"));
         assert!(paths.contains_key("/runners"));
         assert!(paths.contains_key("/artifacts"));
+        assert!(paths.contains_key("/review-runs"));
+        assert!(paths.contains_key("/review-runs/{id}"));
+        assert!(paths.contains_key("/review-runs/{id}/findings"));
     }
 
     #[test]
