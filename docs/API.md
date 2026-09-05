@@ -192,6 +192,94 @@ scheduler and runner observe it safely.
 }
 ```
 
+#### Code Review Runs
+
+```
+POST /review-runs
+GET /review-runs/{id}
+GET /review-runs/{id}/findings
+```
+
+Review run submission persists an AI code-review run for a repository head
+(the review provider itself executes in a separate worker; runs stay `pending`
+until dispatch). Submission requires the repository to be owned by the
+authenticated user (or an admin/maintainer role) and validates bounded
+`base_sha`, `head_sha`, `idempotency_key`, and a positive `attempt`. The
+repository is identified by `repo_id`, or by `owner` plus `name` (exactly one
+form must be supplied); unknown repositories return `404` before any run is
+created.
+
+Idempotency follows the review contract: the first submission creates the run
+(`201`), a retry with the same key against the same head SHA returns the
+existing run (`200`), and reuse of the same key against a different head SHA
+is a `409` conflict that never silently re-points the run.
+
+Findings are read back in deterministic order (path, then line with NULL lines
+first, then fingerprint) and bounded pagination (`limit` 1-500, default 100;
+`offset` >= 0). Runs the caller is not authorized to see are reported as
+`404`, never `403`, to avoid leaking private review activity.
+
+**Submit Review Run Request:**
+```json
+{
+  "repo_id": "repo-uuid",
+  "base_sha": "base-commit-sha",
+  "head_sha": "head-commit-sha",
+  "idempotency_key": "client-generated-key",
+  "attempt": 1
+}
+```
+
+**Submission Response (201 created / 200 idempotent retry):**
+```json
+{
+  "status": "created",
+  "run": {
+    "id": "run-uuid",
+    "repo_id": "repo-uuid",
+    "base_sha": "base-commit-sha",
+    "head_sha": "head-commit-sha",
+    "idempotency_key": "client-generated-key",
+    "status": "pending",
+    "attempt": 1,
+    "receipt_id": null,
+    "created_at": "2026-09-05T00:00:00+00:00",
+    "updated_at": "2026-09-05T00:00:00+00:00"
+  }
+}
+```
+
+**Findings Response:**
+```json
+{
+  "run_id": "run-uuid",
+  "run_status": "succeeded",
+  "total": 4,
+  "limit": 100,
+  "offset": 0,
+  "findings": [
+    {
+      "id": "finding-uuid",
+      "run_id": "run-uuid",
+      "source": "static-analysis",
+      "fingerprint": "16-hex-digest",
+      "path": "src/main.rs",
+      "line": 42,
+      "severity": "warning",
+      "category": "logic",
+      "title": "Off-by-one",
+      "message": "Loop excludes the final element.",
+      "evidence": null,
+      "confidence": "high",
+      "position_status": "line",
+      "disposition": "pending",
+      "created_at": "2026-09-05T00:00:00+00:00",
+      "updated_at": "2026-09-05T00:00:00+00:00"
+    }
+  ]
+}
+```
+
 #### Runners
 
 ```

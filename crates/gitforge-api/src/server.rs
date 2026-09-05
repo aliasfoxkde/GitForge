@@ -4,8 +4,8 @@ use crate::auth::ApiAuth;
 use crate::metrics::Metrics;
 use crate::metrics_middleware::MetricsLayer;
 use crate::routes::{
-    artifact_routes, ci_routes, public_runner_routes, repo_routes, runner_routes, user_routes,
-    webhook_routes,
+    artifact_routes, ci_routes, public_runner_routes, repo_routes, review_routes, runner_routes,
+    user_routes, webhook_routes,
 };
 use axum::{
     extract::Extension,
@@ -104,6 +104,7 @@ impl ApiServer {
             .merge(user_routes())
             .merge(artifact_routes())
             .merge(webhook_routes())
+            .merge(review_routes())
             // Authenticate once at the protected-route boundary. Individual
             // handlers may still apply resource authorization, but token
             // parsing and validation must not depend on every handler
