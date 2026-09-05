@@ -4,7 +4,7 @@
 # =============================================================================
 # Build stage
 # =============================================================================
-FROM rust:1.80-bookworm as builder
+FROM rust:1.80-bookworm AS builder
 
 WORKDIR /app
 
@@ -22,11 +22,16 @@ COPY crates/gitforge-db ./crates/gitforge-db
 COPY crates/gitforge-events ./crates/gitforge-events
 COPY crates/gitforge-ci ./crates/gitforge-ci
 COPY crates/gitforge-core ./crates/gitforge-core
+COPY crates/gitforge-process ./crates/gitforge-process
+COPY crates/gitforge-build ./crates/gitforge-build
 COPY crates/gitforge-runner ./crates/gitforge-runner
 COPY crates/gitforge-sandbox ./crates/gitforge-sandbox
 COPY crates/gitforge-scheduler ./crates/gitforge-scheduler
 COPY crates/gitforge-storage ./crates/gitforge-storage
 COPY crates/gitforge-api ./crates/gitforge-api
+COPY crates/gitforge-cli ./crates/gitforge-cli
+COPY crates/gitforge-ai ./crates/gitforge-ai
+COPY crates/gitforge-review ./crates/gitforge-review
 COPY services/api ./services/api
 COPY services/ci ./services/ci
 COPY services/runner ./services/runner
@@ -38,7 +43,7 @@ RUN cargo build --release --bin api --bin ci --bin runner --bin git-server
 # =============================================================================
 # Runner build stage (separate because it needs Docker)
 # =============================================================================
-FROM builder as runner-builder
+FROM builder AS runner-builder
 
 # Build runner
 RUN cargo build --release --bin runner
@@ -46,7 +51,7 @@ RUN cargo build --release --bin runner
 # =============================================================================
 # Production stage - API server
 # =============================================================================
-FROM debian:bookworm-slim as api-prod
+FROM debian:bookworm-slim AS api-prod
 
 WORKDIR /app
 
@@ -80,7 +85,7 @@ ENTRYPOINT ["/app/api"]
 # =============================================================================
 # Production stage - CI service
 # =============================================================================
-FROM debian:bookworm-slim as ci-prod
+FROM debian:bookworm-slim AS ci-prod
 
 WORKDIR /app
 
@@ -108,7 +113,7 @@ ENTRYPOINT ["/app/ci"]
 # =============================================================================
 # Production stage - Runner
 # =============================================================================
-FROM debian:bookworm-slim as runner-prod
+FROM debian:bookworm-slim AS runner-prod
 
 WORKDIR /app
 
@@ -136,7 +141,7 @@ ENTRYPOINT ["/app/runner"]
 # =============================================================================
 # Production stage - Git server
 # =============================================================================
-FROM debian:bookworm-slim as git-server-prod
+FROM debian:bookworm-slim AS git-server-prod
 
 WORKDIR /app
 
