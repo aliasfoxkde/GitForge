@@ -107,8 +107,14 @@ pub async fn login(
             )
                 .into_response()
         }
-        Err(e) => {
-            tracing::error!("login failed: {}", e);
+        Err(_e) => {
+            // Log only a static message. The Error Display impl renders as
+            // "{kind}: {message}" where message includes raw database state
+            // (paths, constraint names, SQL text); that payload must not enter
+            // structured log fields. The error kind (Database) is intentionally
+            // not forwarded — client-facing response already returns only
+            // "internal_error" / "Login failed".
+            tracing::error!("login failed: database error");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
