@@ -1343,6 +1343,487 @@ impl EventQueries {
 }
 
 // ============================================================================
+// Review queries (ADR 20260905 code review contract)
+// ============================================================================
+
+/// A persisted review run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewRun {
+    pub id: Uuid,
+    pub repo_id: Option<Uuid>,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub idempotency_key: String,
+    pub status: gitforge_review::domain::ReviewRunState,
+    pub attempt: i64,
+    pub receipt_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A persisted review finding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewFinding {
+    pub id: Uuid,
+    pub run_id: Uuid,
+    pub source: String,
+    pub fingerprint: String,
+    pub path: String,
+    pub line: Option<i64>,
+    pub severity: String,
+    pub category: String,
+    pub title: String,
+    pub message: String,
+    pub evidence: Option<String>,
+    pub confidence: String,
+    pub position_status: gitforge_review::domain::PositionStatus,
+    pub disposition: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Input for [`ReviewQueries::create_or_get_run`].
+#[derive(Debug, Clone)]
+pub struct NewReviewRun {
+    pub repo_id: Option<Uuid>,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub idempotency_key: String,
+    pub attempt: i64,
+}
+
+/// Input for [`ReviewQueries::insert_finding`]. The fingerprint is derived
+/// from these fields via [`gitforge_review::domain::finding_fingerprint`] (ADR R4).
+#[derive(Debug, Clone)]
+pub struct NewReviewFinding {
+    pub run_id: Uuid,
+    pub source: String,
+    pub file: String,
+    pub line: Option<u32>,
+    pub severity: String,
+    pub category: String,
+    pub title: String,
+    pub message: String,
+    pub evidence: Option<String>,
+    pub confidence: String,
+    pub position_status: gitforge_review::domain::PositionStatus,
+}
+
+/// Outcome of [`ReviewQueries::create_or_get_run`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum CreateOrGetReviewRun {
+    /// A new run was created for this idempotency key.
+    Created(ReviewRun),
+    /// The key already existed with the same head SHA; the existing run is
+    /// returned unchanged.
+    Existing(ReviewRun),
+    /// The key already existed against a different head SHA. This is a typed
+    /// conflict: idempotency keys must never silently reuse another commit.
+    HeadConflict {
+        existing: ReviewRun,
+        requested_head_sha: String,
+    },
+}
+
+/// Outcome of [`ReviewQueries::insert_finding`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum FindingInsertOutcome {
+    /// The finding was newly inserted.
+    Inserted(ReviewFinding),
+    /// A finding with the same `(run_id, fingerprint)` already existed; the
+    /// stored row is returned and no write occurred.
+    Duplicate(ReviewFinding),
+}
+
+fn parse_review_run_state(value: String) -> Result<gitforge_review::domain::ReviewRunState> {
+    value
+        .parse()
+        .map_err(|e: String| Error::database(format!("invalid review run status: {}", e)))
+}
+
+fn parse_position_status(value: String) -> Result<gitforge_review::domain::PositionStatus> {
+    value
+        .parse()
+        .map_err(|e: String| Error::database(format!("invalid position status: {}", e)))
+}
+
+fn hydrate_review_run(row: sqlx::sqlite::SqliteRow) -> Result<ReviewRun> {
+    Ok(ReviewRun {
+        id: parse_uuid_column(&row, "id")?,
+        repo_id: row
+            .try_get::<Option<String>, _>("repo_id")
+            .map_err(|error| Error::database(format!("invalid review run repo_id: {}", error)))?
+            .map(|value| {
+                Uuid::parse_str(&value).map_err(|error| {
+                    Error::database(format!("invalid review run repo_id: {}", error))
+                })
+            })
+            .transpose()?,
+        base_sha: row
+            .try_get("base_sha")
+            .map_err(|error| Error::database(format!("invalid review run base SHA: {}", error)))?,
+        head_sha: row
+            .try_get("head_sha")
+            .map_err(|error| Error::database(format!("invalid review run head SHA: {}", error)))?,
+        idempotency_key: row.try_get("idempotency_key").map_err(|error| {
+            Error::database(format!("invalid review run idempotency key: {}", error))
+        })?,
+        status: parse_review_run_state(
+            row.try_get("status").map_err(|error| {
+                Error::database(format!("invalid review run status: {}", error))
+            })?,
+        )?,
+        attempt: row
+            .try_get("attempt")
+            .map_err(|error| Error::database(format!("invalid review run attempt: {}", error)))?,
+        receipt_id: row
+            .try_get("receipt_id")
+            .map_err(|error| Error::database(format!("invalid review run receipt: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+        updated_at: parse_timestamp_column(&row, "updated_at")?,
+    })
+}
+
+fn hydrate_review_finding(row: sqlx::sqlite::SqliteRow) -> Result<ReviewFinding> {
+    Ok(ReviewFinding {
+        id: parse_uuid_column(&row, "id")?,
+        run_id: parse_uuid_column(&row, "run_id")?,
+        source: row
+            .try_get("source")
+            .map_err(|error| Error::database(format!("invalid finding source: {}", error)))?,
+        fingerprint: row
+            .try_get("fingerprint")
+            .map_err(|error| Error::database(format!("invalid finding fingerprint: {}", error)))?,
+        path: row
+            .try_get("path")
+            .map_err(|error| Error::database(format!("invalid finding path: {}", error)))?,
+        line: row
+            .try_get("line")
+            .map_err(|error| Error::database(format!("invalid finding line: {}", error)))?,
+        severity: row
+            .try_get("severity")
+            .map_err(|error| Error::database(format!("invalid finding severity: {}", error)))?,
+        category: row
+            .try_get("category")
+            .map_err(|error| Error::database(format!("invalid finding category: {}", error)))?,
+        title: row
+            .try_get("title")
+            .map_err(|error| Error::database(format!("invalid finding title: {}", error)))?,
+        message: row
+            .try_get("message")
+            .map_err(|error| Error::database(format!("invalid finding message: {}", error)))?,
+        evidence: row
+            .try_get("evidence")
+            .map_err(|error| Error::database(format!("invalid finding evidence: {}", error)))?,
+        confidence: row
+            .try_get("confidence")
+            .map_err(|error| Error::database(format!("invalid finding confidence: {}", error)))?,
+        position_status: parse_position_status(row.try_get("position_status").map_err(
+            |error| Error::database(format!("invalid finding position status: {}", error)),
+        )?)?,
+        disposition: row
+            .try_get("disposition")
+            .map_err(|error| Error::database(format!("invalid finding disposition: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+        updated_at: parse_timestamp_column(&row, "updated_at")?,
+    })
+}
+
+pub struct ReviewQueries;
+
+impl ReviewQueries {
+    /// Create a review run, or return the existing run for the same
+    /// idempotency key. A matching key against a different head SHA yields
+    /// [`CreateOrGetReviewRun::HeadConflict`] rather than a silent reuse.
+    pub async fn create_or_get_run(
+        pool: &Pool,
+        new_run: &NewReviewRun,
+    ) -> Result<CreateOrGetReviewRun> {
+        let now = Utc::now().to_rfc3339();
+        let id = Uuid::new_v4();
+        let insert = sqlx::query(
+            r#"
+            INSERT INTO review_runs
+                (id, repo_id, base_sha, head_sha, idempotency_key, status, attempt,
+                 receipt_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?)
+            "#,
+        )
+        .bind(id.to_string())
+        .bind(new_run.repo_id.map(|r| r.to_string()))
+        .bind(&new_run.base_sha)
+        .bind(&new_run.head_sha)
+        .bind(&new_run.idempotency_key)
+        .bind(new_run.attempt)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool.pool())
+        .await;
+
+        match insert {
+            Ok(_) => {
+                let run = Self::get_run(pool, id)
+                    .await?
+                    .expect("run row just inserted must be readable");
+                Ok(CreateOrGetReviewRun::Created(run))
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("UNIQUE constraint failed") {
+                    return Err(Error::database(format!(
+                        "failed to create review run: {}",
+                        error
+                    )));
+                }
+                let existing = Self::get_run_by_idempotency_key(pool, &new_run.idempotency_key)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::database(format!(
+                            "idempotency conflict for key {:?} but no existing run found",
+                            new_run.idempotency_key
+                        ))
+                    })?;
+                if existing.head_sha == new_run.head_sha {
+                    Ok(CreateOrGetReviewRun::Existing(existing))
+                } else {
+                    Ok(CreateOrGetReviewRun::HeadConflict {
+                        existing,
+                        requested_head_sha: new_run.head_sha.clone(),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Read a review run by ID.
+    pub async fn get_run(pool: &Pool, id: Uuid) -> Result<Option<ReviewRun>> {
+        let row = sqlx::query("SELECT * FROM review_runs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get review run: {}", e)))?;
+        match row {
+            Some(row) => hydrate_review_run(row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Read a review run by idempotency key.
+    pub async fn get_run_by_idempotency_key(
+        pool: &Pool,
+        idempotency_key: &str,
+    ) -> Result<Option<ReviewRun>> {
+        let row = sqlx::query("SELECT * FROM review_runs WHERE idempotency_key = ?")
+            .bind(idempotency_key)
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get review run by key: {}", e)))?;
+        match row {
+            Some(row) => hydrate_review_run(row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Conditionally advance a run's lifecycle state (ADR R3). The update
+    /// only applies when the current stored state permits the transition, so
+    /// terminal runs can never re-enter a non-terminal state and concurrent
+    /// writers cannot move a run backward. Returns the updated run, `None`
+    /// when the run does not exist, and an error when the transition is
+    /// invalid for the current state.
+    pub async fn transition_run(
+        pool: &Pool,
+        id: Uuid,
+        next: gitforge_review::domain::ReviewRunState,
+    ) -> Result<Option<ReviewRun>> {
+        let mut tx =
+            pool.pool().begin().await.map_err(|e| {
+                Error::database(format!("failed to begin review transition: {}", e))
+            })?;
+
+        let current = sqlx::query("SELECT status FROM review_runs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Error::database(format!("failed to read review run status: {}", e)))?;
+
+        let current = match current {
+            Some(row) => {
+                let value: String = row
+                    .try_get("status")
+                    .map_err(|e| Error::database(format!("missing status column: {}", e)))?;
+                parse_review_run_state(value)?
+            }
+            None => {
+                tx.rollback().await.map_err(|e| {
+                    Error::database(format!("failed to roll back review transition: {}", e))
+                })?;
+                return Ok(None);
+            }
+        };
+
+        if !current.can_transition_to(next) {
+            tx.rollback().await.map_err(|e| {
+                Error::database(format!("failed to roll back review transition: {}", e))
+            })?;
+            return Err(Error::new(
+                gitforge_common::ErrorKind::InvalidInput,
+                format!("invalid review run transition: {} → {}", current, next),
+            ));
+        }
+
+        let result = sqlx::query(
+            "UPDATE review_runs SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+        )
+        .bind(next.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .bind(id.to_string())
+        .bind(current.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to update review run status: {}", e)))?;
+
+        if result.rows_affected() != 1 {
+            // A concurrent writer moved the row between the read and the
+            // guarded update; treat as a failed transition.
+            tx.rollback().await.map_err(|e| {
+                Error::database(format!("failed to roll back review transition: {}", e))
+            })?;
+            return Err(Error::new(
+                gitforge_common::ErrorKind::InvalidInput,
+                format!("review run transition lost a race: {} → {}", current, next),
+            ));
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit review transition: {}", e)))?;
+
+        Ok(Self::get_run(pool, id).await?.filter(|_| true))
+    }
+
+    /// Insert a finding for a run, idempotently: a retried insertion of the
+    /// same content (same ADR R4 fingerprint) returns the already-stored row
+    /// instead of failing. The database CHECK constraint enforces the
+    /// line-position invariant (ADR R5) independently of this API.
+    pub async fn insert_finding(
+        pool: &Pool,
+        finding: &NewReviewFinding,
+    ) -> Result<FindingInsertOutcome> {
+        if !finding.position_status.is_line_position() && finding.line.is_some() {
+            return Err(Error::invalid_input(format!(
+                "finding with position status '{}' must not carry a line",
+                finding.position_status
+            )));
+        }
+        let fingerprint = gitforge_review::domain::finding_fingerprint(
+            &finding.file,
+            finding.line,
+            &finding.category,
+            &finding.message,
+        );
+        let now = Utc::now().to_rfc3339();
+        let id = Uuid::new_v4();
+        let insert = sqlx::query(
+            r#"
+            INSERT INTO review_findings
+                (id, run_id, source, fingerprint, path, line, severity, category,
+                 title, message, evidence, confidence, position_status, disposition,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            "#,
+        )
+        .bind(id.to_string())
+        .bind(finding.run_id.to_string())
+        .bind(&finding.source)
+        .bind(&fingerprint)
+        .bind(&finding.file)
+        .bind(finding.line.map(i64::from))
+        .bind(&finding.severity)
+        .bind(&finding.category)
+        .bind(&finding.title)
+        .bind(&finding.message)
+        .bind(&finding.evidence)
+        .bind(&finding.confidence)
+        .bind(finding.position_status.to_string())
+        .bind(&now)
+        .bind(&now)
+        .execute(pool.pool())
+        .await;
+
+        match insert {
+            Ok(_) => {
+                let stored = Self::get_finding(pool, id)
+                    .await?
+                    .expect("finding row just inserted must be readable");
+                Ok(FindingInsertOutcome::Inserted(stored))
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("UNIQUE constraint failed") && message.contains("fingerprint") {
+                    let existing =
+                        Self::get_finding_by_fingerprint(pool, finding.run_id, &fingerprint)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::database(format!(
+                                    "fingerprint conflict for run {} but no existing finding found",
+                                    finding.run_id
+                                ))
+                            })?;
+                    Ok(FindingInsertOutcome::Duplicate(existing))
+                } else {
+                    Err(Error::database(format!(
+                        "failed to insert finding: {}",
+                        error
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Read a finding by ID.
+    pub async fn get_finding(pool: &Pool, id: Uuid) -> Result<Option<ReviewFinding>> {
+        let row = sqlx::query("SELECT * FROM review_findings WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get review finding: {}", e)))?;
+        match row {
+            Some(row) => hydrate_review_finding(row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Read a finding by its run and fingerprint.
+    pub async fn get_finding_by_fingerprint(
+        pool: &Pool,
+        run_id: Uuid,
+        fingerprint: &str,
+    ) -> Result<Option<ReviewFinding>> {
+        let row = sqlx::query("SELECT * FROM review_findings WHERE run_id = ? AND fingerprint = ?")
+            .bind(run_id.to_string())
+            .bind(fingerprint)
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get review finding: {}", e)))?;
+        match row {
+            Some(row) => hydrate_review_finding(row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// List all findings for a run, ordered by path then line.
+    pub async fn list_findings(pool: &Pool, run_id: Uuid) -> Result<Vec<ReviewFinding>> {
+        let rows =
+            sqlx::query("SELECT * FROM review_findings WHERE run_id = ? ORDER BY path, line")
+                .bind(run_id.to_string())
+                .fetch_all(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to list review findings: {}", e)))?;
+        rows.into_iter().map(hydrate_review_finding).collect()
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
