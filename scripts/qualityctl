@@ -95,7 +95,7 @@ manifest = {
     "environment": {
         "docker_available": shutil.which("docker") is not None,
         "aegis_available": shutil.which("aegis") is not None,
-        "aegis_commit": "5a5c742919c078005b2835c38b368b65745e8d6f",
+        "aegis_commit": "04685c76c5488569b447fd8c1aefbedd01343459",
         "coverage_floor_lines": 79.9,
     },
     "stages": [],

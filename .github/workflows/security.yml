@@ -97,7 +97,9 @@ jobs:
 
       - name: Build pinned Aegis scanner
         env:
-          AEGIS_COMMIT: 5a5c742919c078005b2835c38b368b65745e8d6f
+          # Pin the source-qualified Aegis revision; update only after the
+          # Platform-Architecture Fedora qualification receipt is green.
+          AEGIS_COMMIT: 04685c76c5488569b447fd8c1aefbedd01343459
         run: |
           set -euo pipefail
           git clone --filter=blob:none --no-checkout https://github.com/aliasfoxkde/aegis.git "$RUNNER_TEMP/aegis"
