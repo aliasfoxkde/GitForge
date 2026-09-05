@@ -440,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn test_http_webhook_sender_signature_uses_sha256() {
+    fn test_webhook_sender_signature_uses_sha256() {
         // Regression: verify signature generation uses SHA-256 (SHA2 family)
         // and produces deterministic output for a known (secret, payload) pair.
         // Uses the named test fixture constant to avoid hard-coded value finding.
@@ -470,6 +470,34 @@ mod tests {
         // Deterministic: same (secret, payload) always produces same signature
         let sig2 = sender.generate_signature(payload).unwrap();
         assert_eq!(sig, sig2, "signature should be deterministic");
+    }
+
+    #[test]
+    fn test_webhook_signature_secret_sensitivity() {
+        // Prove that the secret actually contributes to the HMAC output.
+        // A different secret for the same payload must produce a different
+        // signature — this guards against a broken implementation that ignores
+        // the secret (e.g., computes a raw hash of the payload only).
+        let sender_a =
+            HttpWebhookSender::new("http://example.com/webhook", Some(TEST_WEBHOOK_SECRET));
+        let sender_b = HttpWebhookSender::new(
+            "http://example.com/webhook",
+            Some("different-secret-for-sensitivity-test"),
+        );
+        let payload = b"secret-sensitivity-test-payload";
+
+        let sig_a = sender_a.generate_signature(payload);
+        let sig_b = sender_b.generate_signature(payload);
+
+        assert!(
+            sig_a.is_some() && sig_b.is_some(),
+            "both senders should produce a signature"
+        );
+        assert_ne!(
+            sig_a.unwrap(),
+            sig_b.unwrap(),
+            "different secrets must produce different signatures"
+        );
     }
 
     #[test]
