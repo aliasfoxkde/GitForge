@@ -1137,6 +1137,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "gitforge-common",
+ "gitforge-review",
  "serde",
  "serde_json",
  "sqlx",

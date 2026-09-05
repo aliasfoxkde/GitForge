@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 gitforge-common = { path = "../gitforge-common" }
+gitforge-review = { path = "../gitforge-review" }
 uuid = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }

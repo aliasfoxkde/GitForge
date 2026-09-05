@@ -298,6 +298,92 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create job idempotency table: {}", e)))?;
 
+        // Review runs (ADR 20260905 code review contract, R3). Mirrors the
+        // PostgreSQL migration in migrations/002_review_domain.sql using this
+        // file's SQLite conventions: TEXT ids, RFC3339 TEXT timestamps, and
+        // enforced foreign keys. The idempotency key is UNIQUE so retries can
+        // create-or-get a single run per key; a matching key against a
+        // different head SHA is a typed conflict handled in ReviewQueries.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS review_runs (
+                id TEXT PRIMARY KEY,
+                repo_id TEXT REFERENCES repositories(id) ON DELETE SET NULL,
+                base_sha TEXT NOT NULL,
+                head_sha TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE
+                    CHECK (length(idempotency_key) > 0 AND length(idempotency_key) <= 128),
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')),
+                attempt INTEGER NOT NULL DEFAULT 1,
+                receipt_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create review_runs table: {}", e)))?;
+
+        // Review findings (ADR R4/R5). Content-addressed fingerprints are
+        // unique per run so retried ingestion is idempotent, and the
+        // line-position invariant is enforced in the database: a `line`
+        // position must carry a 1-based line; every other status must carry
+        // no line.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS review_findings (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES review_runs(id) ON DELETE CASCADE,
+                source TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                path TEXT NOT NULL,
+                line INTEGER,
+                severity TEXT NOT NULL,
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                evidence TEXT,
+                confidence TEXT NOT NULL,
+                position_status TEXT NOT NULL
+                    CHECK (position_status IN ('line', 'file', 'deleted', 'unavailable')),
+                disposition TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (
+                    (position_status = 'line' AND line IS NOT NULL AND line >= 1)
+                    OR (position_status <> 'line' AND line IS NULL)
+                ),
+                UNIQUE (run_id, fingerprint)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create review_findings table: {}", e)))?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_review_runs_repo ON review_runs(repo_id)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                Error::database(format!("failed to create idx_review_runs_repo: {}", e))
+            })?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_review_runs_status ON review_runs(status)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                Error::database(format!("failed to create idx_review_runs_status: {}", e))
+            })?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_review_findings_run ON review_findings(run_id)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create idx_review_findings_run: {}", e)))?;
+
         // Create indexes for performance
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
             .execute(&self.pool)
