@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use clap::Subcommand;
 use std::path::PathBuf;
+use std::process::Command;
 
 mod admin;
 mod client;
@@ -442,14 +443,17 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("   - HTTPS cloning via GitForge API");
                 println!("   - SSH cloning via git-server service");
             } else if *status {
-                println!("📊 Git Status:");
-                println!();
-                println!("  On branch: main");
-                println!("  Your branch is up to date with 'origin/main'.");
-                println!();
-                println!("  nothing to commit, working tree clean");
-                println!();
-                println!("  (This is a demo - actual git status would show real state)");
+                let output = Command::new("git")
+                    .args(["status", "--short", "--branch"])
+                    .output()
+                    .context("failed to execute git status")?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "git status failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                print!("{}", String::from_utf8_lossy(&output.stdout));
             } else if *push {
                 println!("⬆️  Pushing to remote...");
                 println!("   (Actual git push would be performed here)");
