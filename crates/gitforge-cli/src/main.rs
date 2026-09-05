@@ -209,6 +209,21 @@ enum Commands {
     },
 }
 
+fn run_git(args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .context("failed to execute git")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Run the CLI command handler (extracted for testing)
 pub async fn run_cli(cli: Cli) -> Result<()> {
     let config = Config::load().unwrap_or_default();
@@ -443,17 +458,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("   - HTTPS cloning via GitForge API");
                 println!("   - SSH cloning via git-server service");
             } else if *status {
-                let output = Command::new("git")
-                    .args(["status", "--short", "--branch"])
-                    .output()
-                    .context("failed to execute git status")?;
-                if !output.status.success() {
-                    anyhow::bail!(
-                        "git status failed: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
-                }
-                print!("{}", String::from_utf8_lossy(&output.stdout));
+                print!("{}", run_git(&["status", "--short", "--branch"])?);
             } else if *push {
                 println!("⬆️  Pushing to remote...");
                 println!("   (Actual git push would be performed here)");
@@ -472,20 +477,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("   Message: {}", msg);
                 println!("   (Actual git commit would be performed here)");
             } else if *log {
-                println!("📜 Commit History:");
-                println!();
-                println!("  commit abc123 (HEAD -> main)");
-                println!("  Author: User <user@example.com>");
-                println!("  Date:   2026-07-22");
-                println!();
-                println!("      Initial commit");
-                println!();
-                println!("  (This is a demo - actual git log would show real history)");
+                print!("{}", run_git(&["log", "-5", "--oneline", "--decorate"])?);
             } else if *remote {
-                println!("🔗 Git Remotes:");
-                println!();
-                println!("  origin  {} (fetch)", server);
-                println!("  origin  {} (push)", server);
+                print!("{}", run_git(&["remote", "-v"])?);
             }
         }
 
