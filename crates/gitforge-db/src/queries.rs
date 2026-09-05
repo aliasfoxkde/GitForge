@@ -1564,7 +1564,7 @@ impl ReviewQueries {
             Ok(_) => {
                 let run = Self::get_run(pool, id)
                     .await?
-                    .expect("run row just inserted must be readable");
+                    .ok_or_else(|| Error::database("review run disappeared after insert"))?;
                 Ok(CreateOrGetReviewRun::Created(run))
             }
             Err(error) => {
@@ -1698,7 +1698,7 @@ impl ReviewQueries {
             .await
             .map_err(|e| Error::database(format!("failed to commit review transition: {}", e)))?;
 
-        Ok(Self::get_run(pool, id).await?.filter(|_| true))
+        Self::get_run(pool, id).await
     }
 
     /// Insert a finding for a run, idempotently: a retried insertion of the
@@ -1754,7 +1754,7 @@ impl ReviewQueries {
             Ok(_) => {
                 let stored = Self::get_finding(pool, id)
                     .await?
-                    .expect("finding row just inserted must be readable");
+                    .ok_or_else(|| Error::database("review finding disappeared after insert"))?;
                 Ok(FindingInsertOutcome::Inserted(stored))
             }
             Err(error) => {
