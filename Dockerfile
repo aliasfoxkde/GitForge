@@ -4,7 +4,7 @@
 # =============================================================================
 # Build stage
 # =============================================================================
-FROM rust:1.80-bookworm as builder
+FROM rust:1.98-bookworm AS builder
 
 WORKDIR /app
 
@@ -17,36 +17,41 @@ RUN apt-get update && apt-get install -y \
 
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
-COPY crates/gitforce-common ./crates/gitforce-common
-COPY crates/gitforce-db ./crates/gitforce-db
-COPY crates/gitforce-events ./crates/gitforce-events
-COPY crates/gitforce-ci ./crates/gitforce-ci
-COPY crates/gitforce-core ./crates/gitforce-core
-COPY crates/gitforce-runner ./crates/gitforce-runner
-COPY crates/gitforce-sandbox ./crates/gitforce-sandbox
-COPY crates/gitforce-scheduler ./crates/gitforce-scheduler
-COPY crates/gitforce-storage ./crates/gitforce-storage
-COPY crates/gitforce-api ./crates/gitforce-api
+COPY crates/gitforge-common ./crates/gitforge-common
+COPY crates/gitforge-db ./crates/gitforge-db
+COPY crates/gitforge-events ./crates/gitforge-events
+COPY crates/gitforge-ci ./crates/gitforge-ci
+COPY crates/gitforge-core ./crates/gitforge-core
+COPY crates/gitforge-process ./crates/gitforge-process
+COPY crates/gitforge-build ./crates/gitforge-build
+COPY crates/gitforge-runner ./crates/gitforge-runner
+COPY crates/gitforge-sandbox ./crates/gitforge-sandbox
+COPY crates/gitforge-scheduler ./crates/gitforge-scheduler
+COPY crates/gitforge-storage ./crates/gitforge-storage
+COPY crates/gitforge-api ./crates/gitforge-api
+COPY crates/gitforge-cli ./crates/gitforge-cli
+COPY crates/gitforge-ai ./crates/gitforge-ai
+COPY crates/gitforge-review ./crates/gitforge-review
 COPY services/api ./services/api
 COPY services/ci ./services/ci
 COPY services/runner ./services/runner
 COPY services/git-server ./services/git-server
 
 # Build all binaries
-RUN cargo build --release --bin api --bin ci --bin runner --bin git-server
+RUN cargo build --locked --release --bin api --bin ci --bin runner --bin git-server
 
 # =============================================================================
 # Runner build stage (separate because it needs Docker)
 # =============================================================================
-FROM builder as runner-builder
+FROM builder AS runner-builder
 
 # Build runner
-RUN cargo build --release --bin runner
+RUN cargo build --locked --release --bin runner
 
 # =============================================================================
 # Production stage - API server
 # =============================================================================
-FROM debian:bookworm-slim as api-prod
+FROM debian:bookworm-slim AS api-prod
 
 WORKDIR /app
 
@@ -54,6 +59,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -79,7 +85,7 @@ ENTRYPOINT ["/app/api"]
 # =============================================================================
 # Production stage - CI service
 # =============================================================================
-FROM debian:bookworm-slim as ci-prod
+FROM debian:bookworm-slim AS ci-prod
 
 WORKDIR /app
 
@@ -107,7 +113,7 @@ ENTRYPOINT ["/app/ci"]
 # =============================================================================
 # Production stage - Runner
 # =============================================================================
-FROM debian:bookworm-slim as runner-prod
+FROM debian:bookworm-slim AS runner-prod
 
 WORKDIR /app
 
@@ -135,7 +141,7 @@ ENTRYPOINT ["/app/runner"]
 # =============================================================================
 # Production stage - Git server
 # =============================================================================
-FROM debian:bookworm-slim as git-server-prod
+FROM debian:bookworm-slim AS git-server-prod
 
 WORKDIR /app
 
