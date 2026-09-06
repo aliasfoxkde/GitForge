@@ -586,7 +586,7 @@ async fn enqueue_ci_event(
         "old_hash": update.old_hash,
         "new_hash": update.new_hash,
     });
-    sqlx::query("INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO events (id, event_type, payload, created_at, delivery_attempts) VALUES (?, ?, ?, ?, 0)")
         .bind(uuid::Uuid::new_v4().to_string())
         .bind("ci.trigger.pending")
         .bind(payload.to_string())
@@ -604,16 +604,31 @@ async fn deliver_pending_ci_events(state: &AppState) -> anyhow::Result<()> {
     ) else {
         return Ok(());
     };
+    const LEASE_SECONDS: i64 = 120;
+    let now = Utc::now();
+    let now_text = now.to_rfc3339();
+    let lease_until = (now + chrono::Duration::seconds(LEASE_SECONDS)).to_rfc3339();
     let events = sqlx::query_as::<_, (String, String)>(
-        "SELECT id, payload FROM events WHERE event_type = 'ci.trigger.pending' ORDER BY created_at LIMIT 50",
+        "SELECT id, payload FROM events
+         WHERE event_type = 'ci.trigger.pending'
+            OR (event_type = 'ci.trigger.delivering' AND delivery_until IS NOT NULL AND delivery_until <= ?)
+         ORDER BY created_at LIMIT 50",
     )
+    .bind(&now_text)
     .fetch_all(pool.pool())
     .await?;
     for (id, payload) in events {
+        let delivery_token = uuid::Uuid::new_v4().to_string();
         let claimed = sqlx::query(
-            "UPDATE events SET event_type = 'ci.trigger.delivering' WHERE id = ? AND event_type = 'ci.trigger.pending'",
+            "UPDATE events SET event_type = 'ci.trigger.delivering', delivery_token = ?,
+             delivery_until = ?, delivery_attempts = delivery_attempts + 1
+             WHERE id = ? AND (event_type = 'ci.trigger.pending'
+                OR (event_type = 'ci.trigger.delivering' AND delivery_until IS NOT NULL AND delivery_until <= ?))",
         )
+        .bind(&delivery_token)
+        .bind(&lease_until)
         .bind(&id)
+        .bind(&now_text)
         .execute(pool.pool())
         .await?
         .rows_affected();
@@ -629,21 +644,24 @@ async fn deliver_pending_ci_events(state: &AppState) -> anyhow::Result<()> {
             .await;
         match response {
             Ok(response) if response.status().is_success() => {
-                sqlx::query("UPDATE events SET event_type = 'ci.trigger.delivered' WHERE id = ?")
+                sqlx::query("UPDATE events SET event_type = 'ci.trigger.delivered', delivery_token = NULL, delivery_until = NULL WHERE id = ? AND event_type = 'ci.trigger.delivering' AND delivery_token = ?")
                     .bind(&id)
+                    .bind(&delivery_token)
                     .execute(pool.pool())
                     .await?;
             }
             Ok(response) => {
-                sqlx::query("UPDATE events SET event_type = 'ci.trigger.pending' WHERE id = ?")
+                sqlx::query("UPDATE events SET event_type = 'ci.trigger.pending', delivery_token = NULL, delivery_until = NULL WHERE id = ? AND event_type = 'ci.trigger.delivering' AND delivery_token = ?")
                     .bind(&id)
+                    .bind(&delivery_token)
                     .execute(pool.pool())
                     .await?;
                 anyhow::bail!("CI trigger returned HTTP {}", response.status());
             }
             Err(error) => {
-                sqlx::query("UPDATE events SET event_type = 'ci.trigger.pending' WHERE id = ?")
+                sqlx::query("UPDATE events SET event_type = 'ci.trigger.pending', delivery_token = NULL, delivery_until = NULL WHERE id = ? AND event_type = 'ci.trigger.delivering' AND delivery_token = ?")
                     .bind(&id)
+                    .bind(&delivery_token)
                     .execute(pool.pool())
                     .await?;
                 anyhow::bail!("CI trigger request failed: {error}");
