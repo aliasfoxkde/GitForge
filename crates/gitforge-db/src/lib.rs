@@ -4,6 +4,7 @@
 
 pub mod connection;
 pub mod models;
+pub mod publication_outbox;
 pub mod queries;
 
 pub use connection::Pool;

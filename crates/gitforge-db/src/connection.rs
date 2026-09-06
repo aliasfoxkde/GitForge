@@ -298,6 +298,31 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create job idempotency table: {}", e)))?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS publication_outbox (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('pending', 'in_flight', 'published', 'retryable', 'permanent_failure')),
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                next_attempt_at TEXT NOT NULL,
+                claim_token TEXT,
+                claim_until TEXT,
+                external_id TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (job_id, provider, kind)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create publication outbox: {}", e)))?;
+
         // Review runs (ADR 20260905 code review contract, R3). Mirrors the
         // PostgreSQL migration in migrations/002_review_domain.sql using this
         // file's SQLite conventions: TEXT ids, RFC3339 TEXT timestamps, and
