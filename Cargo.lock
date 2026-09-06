@@ -1268,11 +1268,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "bytes",
  "chrono",
  "futures",
  "gitforge-common",
  "hex",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
