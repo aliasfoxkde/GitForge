@@ -1073,6 +1073,80 @@ impl JobQueries {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Complete a leased job and enqueue its external publication atomically.
+    /// Both writes share one SQLite transaction, so a publication enqueue
+    /// failure cannot leave a terminal job without durable publication work.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_with_lease_and_publication(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        status: &str,
+        result_json: &str,
+        provider: &str,
+        kind: &str,
+        payload: &str,
+    ) -> Result<bool> {
+        if provider.is_empty() || kind.is_empty() || payload.is_empty() {
+            return Err(Error::invalid_input("publication fields must not be empty"));
+        }
+        let mut tx = pool
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| Error::database(format!("failed to begin completion: {}", e)))?;
+        let updated = sqlx::query(
+            "UPDATE jobs SET status = ?, finished_at = ?, result_json = ?, lease_token = NULL WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
+        )
+        .bind(status)
+        .bind(Utc::now().to_rfc3339())
+        .bind(result_json)
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to complete job: {}", e)))?;
+        if updated.rows_affected() != 1 {
+            return Ok(false);
+        }
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT OR IGNORE INTO publication_outbox (id, job_id, provider, kind, payload, state, attempts, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(id.to_string())
+        .bind(provider)
+        .bind(kind)
+        .bind(payload)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to enqueue publication: {}", e)))?;
+        let stored: String = sqlx::query_scalar(
+            "SELECT payload FROM publication_outbox WHERE job_id = ? AND provider = ? AND kind = ?",
+        )
+        .bind(id.to_string())
+        .bind(provider)
+        .bind(kind)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to verify publication: {}", e)))?;
+        if stored != payload {
+            return Err(Error::invalid_input(
+                "publication already exists with a conflicting payload",
+            ));
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit completion: {}", e)))?;
+        Ok(true)
+    }
+
     /// Persist an operator cancellation as a terminal job transition.
     pub async fn cancel(pool: &Pool, id: JobId, result_json: &str) -> Result<()> {
         let existing = Self::get(pool, id).await?;
