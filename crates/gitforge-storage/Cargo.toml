@@ -7,6 +7,7 @@ license.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
+axum = { workspace = true }
 
 [dependencies]
 gitforge-common = { path = "../gitforge-common" }
@@ -22,4 +23,5 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 sha2 = { workspace = true }
+reqwest = { workspace = true }
 hex = { workspace = true }

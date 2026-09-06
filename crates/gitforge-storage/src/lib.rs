@@ -6,6 +6,7 @@ pub mod artifact;
 pub mod cache;
 pub mod filesystem;
 pub mod job_logs;
+pub mod publication;
 pub mod receipt;
 pub mod receipt_store;
 
