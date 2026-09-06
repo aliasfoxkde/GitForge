@@ -121,9 +121,15 @@ impl PublicationOutboxQueries {
         .execute(pool.pool())
         .await
         .map_err(|error| Error::database(format!("failed to enqueue publication: {}", error)))?;
-        Self::get(pool, job_id, provider, kind)
+        let existing = Self::get(pool, job_id, provider, kind)
             .await?
-            .ok_or_else(|| Error::database("publication disappeared immediately after enqueue"))
+            .ok_or_else(|| Error::database("publication disappeared immediately after enqueue"))?;
+        if existing.payload != payload {
+            return Err(Error::database(
+                "publication already exists with a conflicting payload",
+            ));
+        }
+        Ok(existing)
     }
 
     pub async fn get(
@@ -372,5 +378,20 @@ mod tests {
                 .attempts,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_conflicting_payload() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let job_id = JobId::new();
+        PublicationOutboxQueries::enqueue(&pool, job_id, "github", "check_run", "first")
+            .await
+            .unwrap();
+        let error =
+            PublicationOutboxQueries::enqueue(&pool, job_id, "github", "check_run", "second")
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("conflicting payload"));
     }
 }
