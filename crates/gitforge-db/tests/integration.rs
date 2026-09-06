@@ -6,6 +6,7 @@ use gitforge_common::PipelineId;
 use gitforge_db::models::{
     Event, Job, Pipeline, PipelineRun, Repository, Runner, RunnerType, User,
 };
+use gitforge_db::publication_outbox::PublicationOutboxQueries;
 use gitforge_db::queries::{
     EventQueries, JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries, RunnerQueries,
     UserQueries,
@@ -322,16 +323,24 @@ async fn test_database_durable_job_lease_fences_replay() {
     )
     .await
     .unwrap());
-    assert!(JobQueries::complete_with_lease(
+    assert!(JobQueries::complete_with_lease_and_publication(
         &pool,
         job.id,
         runner.id,
         "lease-a",
         "succeeded",
         "{\"ok\":true}",
+        "github",
+        "check_run",
+        "{\"status\":\"success\"}",
     )
     .await
     .unwrap());
+    let publication = PublicationOutboxQueries::get(&pool, job.id, "github", "check_run")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(publication.payload, "{\"status\":\"success\"}");
 }
 
 #[tokio::test]
