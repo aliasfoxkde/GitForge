@@ -67,7 +67,7 @@ pub struct PublicationResponse {
     pub provider_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GithubPublisher {
     client: reqwest::Client,
     base_url: String,
