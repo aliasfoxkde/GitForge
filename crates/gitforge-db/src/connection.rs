@@ -272,13 +272,33 @@ impl Pool {
                 id TEXT PRIMARY KEY,
                 event_type TEXT NOT NULL,
                 payload TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                delivery_token TEXT,
+                delivery_until TEXT,
+                delivery_attempts INTEGER NOT NULL DEFAULT 0
             )
             "#,
         )
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create events table: {}", e)))?;
+
+        // Durable CI event delivery claims must survive a process restart.
+        // Older databases predate the lease columns, so add them idempotently.
+        for statement in [
+            "ALTER TABLE events ADD COLUMN delivery_token TEXT",
+            "ALTER TABLE events ADD COLUMN delivery_until TEXT",
+            "ALTER TABLE events ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0",
+        ] {
+            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
+                if !error.to_string().contains("duplicate column name") {
+                    return Err(Error::database(format!(
+                        "failed to migrate events table: {}",
+                        error
+                    )));
+                }
+            }
+        }
 
         // Operator submissions use a durable idempotency record so retries
         // after a client timeout cannot create a second executable job.
@@ -453,6 +473,7 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Row;
 
     #[tokio::test]
     async fn test_memory_pool_creation() {
@@ -465,6 +486,26 @@ mod tests {
         let pool = Pool::memory().await.unwrap();
         let result = pool.migrate().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_event_delivery_lease_columns_are_idempotently_migrated() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        // A restart runs the migration path again. It must tolerate the
+        // already-present lease columns rather than failing startup.
+        pool.migrate().await.unwrap();
+        let columns = sqlx::query("PRAGMA table_info(events)")
+            .fetch_all(pool.pool())
+            .await
+            .unwrap();
+        let names = columns
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "delivery_token"));
+        assert!(names.iter().any(|name| name == "delivery_until"));
+        assert!(names.iter().any(|name| name == "delivery_attempts"));
     }
 
     #[tokio::test]
