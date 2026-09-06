@@ -1087,12 +1087,15 @@ impl Scheduler {
         }
         if let Some(pool) = &self.db_pool {
             let status = if success { "succeeded" } else { "failed" };
-            let accepted = gitforge_db::queries::JobQueries::complete_with_lease(
+            let accepted = gitforge_db::queries::JobQueries::complete_with_lease_and_publication(
                 pool,
                 job_id,
                 runner_id,
                 lease_token,
                 status,
+                &result_json,
+                "github",
+                "job_receipt",
                 &result_json,
             )
             .await
@@ -2059,6 +2062,16 @@ mod tests {
             .unwrap();
         assert_eq!(completed.status, "succeeded");
         assert!(scheduler.is_assigned(job_id).await.is_none());
+        let publication = gitforge_db::publication_outbox::PublicationOutboxQueries::get(
+            &pool,
+            job_id,
+            "github",
+            "job_receipt",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(publication.payload, "{\"durable\":true}");
     }
 
     #[tokio::test]
