@@ -243,8 +243,12 @@ impl CiEngine {
         if let Some(job_state) = state.jobs.get_mut(&job_id) {
             job_state.fail(exit_code, error)?;
 
-            // Pipeline fails if any job fails
-            if !state.failed_jobs().is_empty() {
+            // A failed job dooms the pipeline, but the terminal status waits
+            // for every job to finish: siblings may still be executing in
+            // the run workspace, and finalizing here would fence off their
+            // completions ("unknown pipeline run") and delete the checkout
+            // out from under their containers.
+            if state.all_jobs_finished() {
                 state.status = PipelineStatus::Failed;
                 state.finished_at = Some(chrono::Utc::now());
             }
@@ -257,10 +261,10 @@ impl CiEngine {
         let mut state = self.state.write().await;
         if let Some(job_state) = state.jobs.get_mut(&job_id) {
             job_state.timeout()?;
-            let timed_out = job_state.status() == JobStatus::TimedOut;
 
-            // Pipeline fails if any job times out or fails
-            if !state.failed_jobs().is_empty() || timed_out {
+            // Same reasoning as `fail_job`: wait for all jobs to finish
+            // before declaring the pipeline failed.
+            if state.all_jobs_finished() {
                 state.status = PipelineStatus::Failed;
                 state.finished_at = Some(chrono::Utc::now());
             }
@@ -354,6 +358,33 @@ mod tests {
         }
     }
 
+    /// Two independent entry jobs, so a test can have one fail while the
+    /// other is still in flight.
+    fn make_parallel_pipeline() -> PipelineDefinition {
+        let entry_job = |name: &str| JobDefinition {
+            name: name.to_string(),
+            image: "rust:latest".to_string(),
+            needs: vec![],
+            env: HashMap::new(),
+            steps: vec![StepDefinition {
+                name: "run".to_string(),
+                run: "true".to_string(),
+                env: None,
+                working_directory: None,
+                condition: None,
+            }],
+            timeout: None,
+            retry: None,
+        };
+        PipelineDefinition {
+            name: "test-parallel".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![entry_job("a"), entry_job("b")],
+        }
+    }
+
     #[tokio::test]
     async fn test_engine_lifecycle() {
         let event = PipelineTriggerEvent::new(
@@ -407,17 +438,32 @@ mod tests {
             TriggerType::Push,
         );
 
-        let engine = CiEngine::new(event, make_pipeline()).await.unwrap();
+        let engine = CiEngine::new(event, make_parallel_pipeline()).await.unwrap();
         engine.start().await.unwrap();
 
         let ready = engine.ready_jobs().await;
-        let build_job = ready[0];
+        assert_eq!(ready.len(), 2);
         let runner_id = gitforge_common::RunnerId::new();
+        for job in &ready {
+            engine.assign_job(*job, runner_id).await.unwrap();
+            engine.start_job(*job).await.unwrap();
+        }
 
-        engine.assign_job(build_job, runner_id).await.unwrap();
-        engine.start_job(build_job).await.unwrap();
+        // The first job fails while its sibling is still running: the run is
+        // doomed but must stay non-terminal so the sibling's completion is
+        // still accepted and the workspace keeps existing for it.
         engine
-            .fail_job(build_job, 1, "build failed".to_string())
+            .fail_job(ready[0], 1, "step failed".to_string())
+            .await
+            .unwrap();
+
+        let state = engine.state().await;
+        assert_eq!(state.status, PipelineStatus::Running);
+        assert!(state.finished_at.is_none());
+
+        // The last in-flight job finishing settles the pipeline as failed.
+        engine
+            .fail_job(ready[1], 0, "cancelled after sibling failure".to_string())
             .await
             .unwrap();
 
