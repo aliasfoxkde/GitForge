@@ -102,9 +102,15 @@ The following require a running integration environment:
 
 Ordered by value; each item states the concrete blocker.
 
-1. **cargo-vet audits** — `supply-chain/` currently exempts 364 transitive
-   crates. Run `cargo vet suggest`/`cargo vet fetch` incrementally to move
-   high-risk deps from exemption to audited.
+1. **cargo-vet audits** — the exemption backlog is 377 crates, dominated by
+   the russh/RustCrypto tree from the SSH transport rewrite; the RustCrypto
+   0.9/0.10-rc and russh 0.63 versions have no audits in any peer registry
+   yet because they are too new. Incremental path: `cargo vet suggest` for
+   the smallest diffs, `cargo vet inspect` + `certify` for honest
+   first-party reviews, and re-run `import` + `prune` as peer registries
+   pick the new versions up. Five applicable peer registries are now
+   registered and pinned (see the resolved item below), so pruning is
+   automatic once coverage exists.
 2. **Service entry-point coverage** — `main()` functions require TCP
    listeners, DB pools, and daemon connections; realistic aggregate ceiling
    with integration harnesses is ~85-90%, not 99%.
@@ -125,7 +131,18 @@ Ordered by value; each item states the concrete blocker.
    standalone fallback still requires `GITFORGE_RUNNER_STANDALONE=allow`.
    Covered by real-socket tests: 503/503/201 retry-then-succeed with
    connection counting, single-attempt auth rejection, exhausted transport
-   errors, and the policy-rejection allow/deny matrix. Accepted fingerprints are logged today.
+   errors, and the policy-rejection allow/deny matrix.
+2. **cargo-vet: registries + CI enforcement** — partially done. The vet
+   gate had gone red when the SSH rewrite landed 80+ new dependencies with
+   no audit coverage: the five applicable public audit registries (isrg,
+   google, mozilla, bytecode-alliance, embark-studios) are now registered
+   and pinned in `supply-chain/imports.lock`, the new tree is recorded as
+   tracked exemptions via `cargo vet regenerate exemptions`
+   (`cargo vet` is green again: 64 fully audited, 2 partially audited, 377
+   exempted), and a `supply-chain` job now enforces `cargo vet` in
+   rust-ci.yml so future dependency changes that lose coverage fail CI
+   instead of silently drifting. Mass-certifying the backlog was rejected
+   as dishonest: an audit entry asserts a human reviewed the source. Accepted fingerprints are logged today.
 
 ## Resolved from the Compose Smoke (2026-09-08)
 

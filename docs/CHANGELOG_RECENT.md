@@ -46,6 +46,13 @@ All notable changes to GitForge will be documented in this file.
   instead of exiting; auth rejections (401/403) are never retried
 - ShellCheck and actionlint gates in Rust CI and `make lint`
 - cargo-vet supply chain (`supply-chain/`) behind `make lint`
+- cargo-vet enforcement in Rust CI: a `supply-chain` job runs `cargo vet`
+  so dependency changes that lose audit coverage fail CI. Five public
+  audit registries (isrg, google, mozilla, bytecode-alliance,
+  embark-studios) are registered and pinned in `imports.lock`, and the
+  dependencies introduced by the SSH transport rewrite are recorded as
+  tracked exemptions so the gate is green without pretending they were
+  audited
 
 ### Changed
 

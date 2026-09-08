@@ -9,6 +9,7 @@ on:
       - '**.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'supply-chain/**'
       - '.github/workflows/rust-ci.yml'
 
 concurrency:
@@ -178,6 +179,25 @@ jobs:
         uses: taiki-e/install-action@4b8992af23a2be34fd58f8d9b50d3f4939ad1891 # cargo-audit
       - name: Run security audit
         run: cargo audit
+
+  # ─── Supply Chain ───────────────────────────────────────────────────────────
+  # Fails when a dependency version loses audit coverage: exemptions must be
+  # consciously regenerated (supply-chain/config.toml) rather than drifting.
+  supply-chain:
+    name: Supply Chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - name: Install cargo-vet
+        uses: taiki-e/install-action@562f912bf8a1174eb1007c4afe216a9187a8d722 # cargo-vet
+        with:
+          tools: cargo-vet
+      - name: Verify supply chain
+        run: cargo vet
 
   # ─── Build ──────────────────────────────────────────────────────────────────
   build:
