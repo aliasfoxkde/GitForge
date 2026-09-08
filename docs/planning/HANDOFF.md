@@ -194,9 +194,11 @@ Resolution status of the previously confirmed production gaps:
    scheduling policy. `POST /jobs/{id}/complete` now requires lease proof for
    any existing job and returns 404 for unknown jobs; the anonymous completion
    path is gone.
-3. **Compose DATABASE_URL mismatch — RESOLVED** (CI entry corrected to
-   `GITFORGE_DATABASE_URL=sqlite:/data/gitforge.db`); compose parsing and a
-   disposable restart/persistence probe are still outstanding.
+3. **Compose DATABASE_URL mismatch — RESOLVED (2026-09-08, validated live).**
+   api, ci, and git-server now share one `gitforge-data` volume with
+   `sqlite:/data/gitforge.db?mode=rwc` (bare `sqlite:` URLs open an existing
+   file only — `?mode=rwc` is what lets first boot create it), and git-server
+   gained `DATABASE_URL` plus the CI trigger URL/token.
 4. **Scheduler listener on `0.0.0.0` — OPEN (deployment concern).**
    Deployment must keep the listener on the private GitForge network or add an
    explicit service boundary before external exposure. `docker-compose.yml`
@@ -204,9 +206,43 @@ Resolution status of the previously confirmed production gaps:
    the CI and runner services so the fail-closed credential cannot be silently
    absent.
 
-Required next packet: run one disposable queued-job smoke with durable
-completion and restart recovery, and a compose config/restart/persistence
-probe. Do not mark GitForge operational based on unit tests alone.
+### Compose-stack queued-job smoke — COMPLETE (2026-09-08)
+
+Disposable project `gitforge-smoke` (api + ci + runner + git-server, shared
+SQLite/git volumes, host ports shifted to avoid native dev processes).
+Validated end to end:
+
+- Real `git push` through the compose git-server resolved owner/repo from the
+  shared database, found the API-provisioned bare repo in the shared `/git`
+  volume, and enqueued a durable `ci.trigger.pending` event; the delivery
+  loop posted it to CI with the shared bearer token.
+- CI loaded `.gitforce.yml` committed at the pushed revision, started the
+  pipeline, enqueued the job, and the runner claimed it with a lease, ran it
+  in a busybox container bind-mounted from the CI checkout, and completed it
+  with lease proof; the run finalized `succeeded` and the persisted log
+  chunk (with the step's marker) was retrievable through the authenticated
+  API.
+- Cross-process durable queue: `POST /api/jobs` returned 201 `queued`, the
+  CI scheduler reloaded the row on its next tick and executed it
+  (`rust:latest`), and resubmitting the same idempotency key returned 200
+  `already_queued` with the same job id.
+- Restart recovery: a mid-flight scheduler restart requeued the two in-flight
+  jobs (`requeued jobs left in-flight by scheduler restart count=2`);
+  stale-lease completions were rejected fail-closed (409
+  `completion_persistence_failed`); the next startup reconciliation finalized
+  the orphaned run as `failed`.
+
+Compose/image defects found and fixed by this smoke (see CHANGELOG 0.4.0
+"Fixed"): split control-plane databases, missing git-server `DATABASE_URL`,
+wrong git-server port mappings, missing `GIT_ROOT` on api, missing `/git`
+mount on ci, root-owned volume mountpoints in all four images, missing git
+binary in the ci image, root Docker socket inaccessible to the non-root
+runner (`DOCKER_GID` group mapping), and workspace bind paths that must be
+host-identical (`GITFORGE_WORKSPACE_HOST_DIR`).
+
+Follow-up product gaps recorded in IMPROVEMENTS.md: orphaned-run
+reconciliation runs only at startup, and post-restart requeued jobs complete
+without lease proof and are marked failed despite successful execution.
 
 ---
 

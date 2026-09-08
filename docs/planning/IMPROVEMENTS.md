@@ -60,6 +60,7 @@ The following require a running integration environment:
 | Docker sandbox integration tests | 3/3 `#[ignore]` tests pass against live Docker 26.1.5 (`cargo test -- --ignored`) |
 | Runner executor timeout reaping | Real-container test passes: hung job reaped at timeout |
 | Git-server protocol tests | NEW `services/git-server/tests/git_http_protocol.rs`: real `git push`, `git clone`, `fetch`, and `ls-remote` against the spawned binary + SQLite DB |
+| Compose-stack queued-job smoke | Disposable api+ci+runner+git-server run: push → trigger → pipeline → lease-fenced execution → durable completion → logs via API; cross-process durable queue with idempotency; restart requeue + reconciliation observed (see HANDOFF) |
 
 ### Not Applicable
 | Item | Reason |
@@ -101,21 +102,28 @@ The following require a running integration environment:
 
 Ordered by value; each item states the concrete blocker.
 
-1. **Compose-stack smoke with a queued job** — the HANDOFF "required next
-   packet". Docker is available, so `docker compose config` validation and a
-   disposable api+ci+runner+git-server run with one queued job (durable
-   completion + restart recovery) is the next executable step. It is a
-   multi-container orchestration effort, not blocked by missing tooling.
-2. **git-server SSH protocol test** — the new protocol test covers Smart
+1. **Periodic orphaned-run reconciliation** — `reconcile_orphaned_runs`
+   (services/ci/src/main.rs) runs once at startup. A run whose jobs all turn
+   terminal while the control plane is up (for example completions rejected
+   after a scheduler restart) stays `running` until the next restart; the
+   compose smoke confirmed both the gap and that the reconciliation itself
+   finalizes correctly when invoked. Run it on the scheduler tick instead.
+2. **Post-restart requeued completions lack lease proof** — after a scheduler
+   restart requeues in-flight jobs, the runner re-executes them but its
+   completion POST arrives without `runner_id`/`lease_token` and is rejected
+   (409 `completion_persistence_failed`), so successfully re-executed work is
+   marked failed. Investigate lease propagation on the requeue→assignment
+   path in `gitforge-scheduler`.
+3. **git-server SSH protocol test** — the protocol test covers Smart
    HTTP only. The SSH path needs host-key/authorized-key fixtures for
    `run_ssh_server`; candidate extension of `tests/git_http_protocol.rs`.
-3. **Runner registration retry/backoff** — fail-closed currently exits the
+4. **Runner registration retry/backoff** — fail-closed currently exits the
    process; bounded retry with backoff before exiting would tolerate a
    scheduler that is briefly unavailable at runner start.
-4. **cargo-vet audits** — `supply-chain/` currently exempts 364 transitive
+5. **cargo-vet audits** — `supply-chain/` currently exempts 364 transitive
    crates. Run `cargo vet suggest`/`cargo vet fetch` incrementally to move
    high-risk deps from exemption to audited.
-5. **Service entry-point coverage** — `main()` functions require TCP
+6. **Service entry-point coverage** — `main()` functions require TCP
    listeners, DB pools, and daemon connections; realistic aggregate ceiling
    with integration harnesses is ~85-90%, not 99%.
 
@@ -134,6 +142,7 @@ Ordered by value; each item states the concrete blocker.
 - [x] Coverage ≥80% (CI floor: 79.9%)
 - [x] Docker-gated tests validated against a live daemon (4/4)
 - [x] Git Smart HTTP protocol validated end-to-end (push/clone/fetch)
+- [x] Compose-stack queued-job smoke validated (push → pipeline → durable completion → restart recovery)
 - [x] CHANGELOG updated
 - [x] GitHub release created (v0.3.3)
 

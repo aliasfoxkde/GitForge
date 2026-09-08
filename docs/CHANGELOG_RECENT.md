@@ -30,6 +30,28 @@ All notable changes to GitForge will be documented in this file.
 - ai-review.yml passed review outputs as action inputs instead of step
   env vars, so the PR comment always used its fallback text
 - ShellCheck SC2012/SC2034/SC2155 findings in scripts/
+- Compose stack could not run a pipeline end to end (found by a live
+  queued-job smoke, all fixed and validated):
+  - api, ci, and git-server used separate SQLite volumes and git-server
+    had no `DATABASE_URL`, so pushes and pipeline triggers could not
+    resolve repositories; they now share one `gitforge-data` volume
+  - `sqlite:` database URLs open an existing file only; compose now uses
+    `?mode=rwc` so first boot creates the database
+  - git-server port mappings pointed at ports the server does not bind
+    (in-container ports are 42022/42782)
+  - api provisioned repositories outside the shared git volume (no
+    `GIT_ROOT`) and ci could not read them (no `/git` mount)
+  - images lacked the volume mountpoints, so Docker seeded fresh volumes
+    root-owned and the non-root services could not write; the Dockerfile
+    now creates `/data` and `/git` with `gitforge` ownership
+  - the ci image had no `git` binary, so loading `.gitforce.yml` from a
+    pushed revision failed with ENOENT
+  - the non-root runner could not open the mounted Docker socket; compose
+    now maps the host docker group via `DOCKER_GID`
+  - run workspaces are bind-mounted at a host-identical absolute path
+    (`GITFORGE_WORKSPACE_HOST_DIR`): the runner passes workspace paths to
+    the host Docker daemon as bind sources, so a container-only path made
+    every job see an empty auto-created directory
 
 ## [0.3.2] - 2026-08-28
 

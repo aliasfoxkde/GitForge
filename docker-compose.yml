@@ -13,10 +13,18 @@ services:
     ports:
       - "42780:42780"
     volumes:
-      - api-data:/data
+      # Shared control-plane SQLite: api, ci, and git-server must observe the
+      # same repositories for pushes and pipeline triggers to resolve.
+      - gitforge-data:/data
+      - git-data:/git
       - ./config.toml.example:/config.toml:ro
     environment:
-      - DATABASE_URL=sqlite:/data/gitforge.db
+      # mode=rwc lets the gateway create the database file on first boot;
+      # bare sqlite: URLs are opened verbatim and require an existing file.
+      - DATABASE_URL=sqlite:/data/gitforge.db?mode=rwc
+      # Repos are provisioned here so git-server serves them from the same
+      # volume (<GIT_ROOT>/<repo_id> is the StorageBackend layout).
+      - GIT_ROOT=/git
       - RUST_LOG=info
       - JWT_SECRET=${JWT_SECRET:-changeme-in-production}
     healthcheck:
@@ -40,10 +48,20 @@ services:
     ports:
       - "42781:42781"
     volumes:
-      - ci-data:/data
+      - gitforge-data:/data
+      # CI loads the committed .gitforce.yml from the pushed revision, so it
+      # needs read access to the bare repositories.
+      - git-data:/git:ro
+      # Run workspaces must be a HOST directory bind-mounted at its own
+      # absolute path: the runner's sandbox passes each job's working_dir to
+      # the host Docker daemon as a bind source, and the daemon resolves it
+      # against the HOST filesystem. The in-container path must therefore
+      # equal the host path or jobs see an empty auto-created directory.
+      - ${GITFORGE_WORKSPACE_HOST_DIR:?set GITFORGE_WORKSPACE_HOST_DIR to a host directory for CI checkouts in .env}:${GITFORGE_WORKSPACE_HOST_DIR:?set GITFORGE_WORKSPACE_HOST_DIR to a host directory for CI checkouts in .env}
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      - GITFORGE_DATABASE_URL=sqlite:/data/gitforge.db
+      - GITFORGE_DATABASE_URL=sqlite:/data/gitforge.db?mode=rwc
+      - GITFORGE_WORKSPACE_ROOT=${GITFORGE_WORKSPACE_HOST_DIR:?set GITFORGE_WORKSPACE_HOST_DIR to a host directory for CI checkouts in .env}
       - RUST_LOG=info
       # Scheduler API auth is fail-closed: runners cannot register, fetch, or
       # complete jobs unless this shared credential is configured.
@@ -65,6 +83,14 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner-data:/data
+      # Same host workspace directory as ci, at the same absolute path, so
+      # job working_dir binds resolve on the host daemon (see ci service).
+      - ${GITFORGE_WORKSPACE_HOST_DIR:?set GITFORGE_WORKSPACE_HOST_DIR to a host directory for CI checkouts in .env}:${GITFORGE_WORKSPACE_HOST_DIR:?set GITFORGE_WORKSPACE_HOST_DIR to a host directory for CI checkouts in .env}
+    # The image runs as non-root (uid 1000); joining the host docker group
+    # grants read/write on the mounted socket. Find yours with:
+    #   stat -c %g /var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID to your host docker gid (stat -c %g /var/run/docker.sock) in .env}"
     environment:
       - RUST_LOG=info
       - GITFORGE_SCHEDULER_URL=http://ci:42781
@@ -85,15 +111,22 @@ services:
       target: git-server-prod
     container_name: gitforge-git-server
     ports:
-      - "42022:2222"
-      - "42782:8082"  # Git HTTP
+      - "42022:42022"  # Git SSH
+      - "42782:42782"  # Git Smart HTTP
     volumes:
       - git-data:/git
+      - gitforge-data:/data
       - ssh-data:/home/gitforge/.ssh
     environment:
       - RUST_LOG=info
       - SSH_PORT=42022
       - HTTP_PORT=42782
+      - GIT_ROOT=/git
+      - DATABASE_URL=sqlite:/data/gitforge.db?mode=rwc
+      # Pushes enqueue durable ci.trigger events; delivery posts them to the
+      # CI orchestrator with the shared scheduler credential.
+      - GITFORGE_CI_TRIGGER_URL=http://ci:42781/pipelines/trigger
+      - GITFORGE_CI_TRIGGER_TOKEN=${GITFORGE_SCHEDULER_TOKEN:?set GITFORGE_SCHEDULER_TOKEN in .env}
     networks:
       - gitforge
 
@@ -109,6 +142,9 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner2-data:/data
+      - ${GITFORGE_WORKSPACE_HOST_DIR:?set GITFORGE_WORKSPACE_HOST_DIR to a host directory for CI checkouts in .env}:${GITFORGE_WORKSPACE_HOST_DIR:?set GITFORGE_WORKSPACE_HOST_DIR to a host directory for CI checkouts in .env}
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID to your host docker gid (stat -c %g /var/run/docker.sock) in .env}"
     environment:
       - RUST_LOG=info
       - GITFORGE_SCHEDULER_URL=http://ci:42781
@@ -126,9 +162,7 @@ services:
 # Volumes
 # =============================================================================
 volumes:
-  api-data:
-    driver: local
-  ci-data:
+  gitforge-data:
     driver: local
   runner-data:
     driver: local

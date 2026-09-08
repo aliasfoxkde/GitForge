@@ -134,6 +134,15 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 
 ## Docker Compose
 
+Before `docker compose up`, set the required deployment variables in `.env`
+(see `.env.example`):
+
+| Variable | Why it is required |
+|----------|--------------------|
+| `GITFORGE_SCHEDULER_TOKEN` | Shared scheduler/trigger credential; scheduler auth is fail-closed without it |
+| `DOCKER_GID` | Host group id of `/var/run/docker.sock` (`stat -c %g /var/run/docker.sock`) so the non-root runner can use the mounted socket |
+| `GITFORGE_WORKSPACE_HOST_DIR` | Host directory (create it first) where CI checks out run workspaces; bind-mounted at the same absolute path in ci and runner because the runner passes workspace paths to the host Docker daemon as bind sources |
+
 ```bash
 # Start all services
 docker-compose up -d
