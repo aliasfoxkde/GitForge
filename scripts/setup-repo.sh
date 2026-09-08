@@ -106,7 +106,7 @@ gh workflow run setup-repo.yml \
 
 # ─── Step 4: Configure Dependabot ────────────────────────────────────────────
 STEP "Configuring Dependabot..."
-gh api repos/$FULL_REPO/variables --method POST \
+gh api "repos/$FULL_REPO/variables" --method POST \
     -f name="DEPENDABOT_SCHEDULE" -f value="weekly" 2>/dev/null || true
 
 # ─── Step 5: Summary ─────────────────────────────────────────────────────────

@@ -23,7 +23,7 @@ jobs:
         id: check-go
         run: |
           HAS_GO=$(find . -name "*.go" -not -path "./.git/*" | head -1 | wc -l)
-          echo "has_go=$HAS_GO" >> $GITHUB_OUTPUT
+          echo "has_go=$HAS_GO" >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
         if: steps.check-go.outputs.has_go == '1'
@@ -50,7 +50,7 @@ jobs:
         id: check-go
         run: |
           HAS_GO=$(find . -name "*.go" -not -path "./.git/*" | head -1 | wc -l)
-          echo "has_go=$HAS_GO" >> $GITHUB_OUTPUT
+          echo "has_go=$HAS_GO" >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
         if: steps.check-go.outputs.has_go == '1'

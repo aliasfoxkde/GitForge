@@ -90,8 +90,8 @@ jobs:
           if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
             RUN_ID=$(echo "$BODY" | jq -r '.pipeline_run_id // empty')
             if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
-              echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
-              echo "status=enqueued" >> $GITHUB_OUTPUT
+              echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+              echo "status=enqueued" >> "$GITHUB_OUTPUT"
               echo "Successfully enqueued pipeline run $RUN_ID"
               exit 0
             fi

@@ -56,8 +56,8 @@ jobs:
         id: pr-diff
         run: |
           # Get the diff between the PR branch and main
-          BASE_BRANCH=${{ github.base_ref || 'main' }}
-          echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+          BASE_BRANCH="${{ github.base_ref || 'main' }}"
+          echo "base_branch=$BASE_BRANCH" >> "$GITHUB_OUTPUT"
 
           # The checkout is on the PR head; fetch the base ref explicitly
           # instead of assuming a local branch named after the base exists.
@@ -65,11 +65,11 @@ jobs:
 
           # Generate diff
           git diff "origin/$BASE_BRANCH"...HEAD > pr.diff
-          echo "diff_file=pr.diff" >> $GITHUB_OUTPUT
+          echo "diff_file=pr.diff" >> "$GITHUB_OUTPUT"
 
           # Count files changed
           FILES_CHANGED=$(git diff --name-only "origin/$BASE_BRANCH"...HEAD | wc -l)
-          echo "files_changed=$FILES_CHANGED" >> $GITHUB_OUTPUT
+          echo "files_changed=$FILES_CHANGED" >> "$GITHUB_OUTPUT"
 
       - name: Run AI Review
         id: review
@@ -90,24 +90,24 @@ jobs:
 
           # Extract summary for GitHub comment
           SUMMARY=$(echo "$OUTPUT" | grep -A 20 "CODE REVIEW RESULTS" | head -30 | tr '\n' ' ' || echo "Review completed")
-          echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
+          echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
 
           # Check for critical findings
           if echo "$OUTPUT" | grep -q "Critical"; then
-            echo "critical_findings=true" >> $GITHUB_OUTPUT
+            echo "critical_findings=true" >> "$GITHUB_OUTPUT"
           else
-            echo "critical_findings=false" >> $GITHUB_OUTPUT
+            echo "critical_findings=false" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "review_status=$REVIEW_STATUS" >> $GITHUB_OUTPUT
+          echo "review_status=$REVIEW_STATUS" >> "$GITHUB_OUTPUT"
 
       - name: Post review comment
         if: github.event_name == 'pull_request'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REVIEW_SUMMARY: ${{ steps.review.outputs.summary }}
+          CRITICAL_FINDINGS: ${{ steps.review.outputs.critical_findings }}
         with:
-          env:
-            REVIEW_SUMMARY: ${{ steps.review.outputs.summary }}
-            CRITICAL_FINDINGS: ${{ steps.review.outputs.critical_findings }}
           script: |
             const summary = process.env.REVIEW_SUMMARY || 'Review completed';
             const hasCritical = process.env.CRITICAL_FINDINGS === 'true';

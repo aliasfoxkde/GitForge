@@ -24,7 +24,6 @@ CURRENT_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 
 # Parse arguments
 TARGET_OS="${1:-all}"
-BUILD_TYPE="${2:-release}"
 
 # Targets for each platform
 LINUX_TARGETS=("x86_64-unknown-linux-musl" "aarch64-unknown-linux-musl")
@@ -36,7 +35,8 @@ BINARIES=("api" "ci" "git-server" "runner" "gitforge")
 
 build_target() {
     local target=$1
-    local os=$(echo $target | cut -d'-' -f3)
+    local os
+    os=$(echo "$target" | cut -d'-' -f3)
 
     echo ""
     echo "Building for $target..."

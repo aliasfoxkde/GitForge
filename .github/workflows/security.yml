@@ -198,7 +198,7 @@ jobs:
       - name: Check for unsafe code
         run: |
           # Report any unsafe code blocks (requires review)
-          UNSAFE_COUNT=$(grep -r "unsafe" --include="*.rs" crates/ services/ 2>/dev/null | grep -v "unsafe_impl" | grep -v "// safe" | wc -l || true)
+          UNSAFE_COUNT=$(grep -r "unsafe" --include="*.rs" crates/ services/ 2>/dev/null | grep -v "unsafe_impl" | grep -v "// safe" | grep -c . || true)
           echo "Found $UNSAFE_COUNT unsafe code blocks"
           if [ "$UNSAFE_COUNT" -gt 0 ]; then
             echo "Note: Unsafe code blocks require security review"

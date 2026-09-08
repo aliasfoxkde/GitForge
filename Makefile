@@ -45,7 +45,7 @@ coverage: test
 	cargo llvm-cov report --all --html --open || true
 
 # ─── Lint ─────────────────────────────────────────────────────────────────────
-lint: fmt vet clippy
+lint: fmt vet clippy shellcheck
 
 fmt:
 	cargo fmt --check
@@ -55,6 +55,9 @@ vet:
 
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
+
+shellcheck:
+	shellcheck scripts/*.sh systemd/*.sh
 
 # ─── Clean ─────────────────────────────────────────────────────────────────────
 clean:
