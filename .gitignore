@@ -53,6 +53,7 @@ temp/logs/
 temp/data/
 *.log
 data/
+artifacts/
 
 # ─── Environment ───────────────────────────────────────────────────────────────
 .env
