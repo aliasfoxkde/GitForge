@@ -466,7 +466,9 @@ mod tests {
             TriggerType::Push,
         );
 
-        let engine = CiEngine::new(event, make_parallel_pipeline()).await.unwrap();
+        let engine = CiEngine::new(event, make_parallel_pipeline())
+            .await
+            .unwrap();
         engine.start().await.unwrap();
 
         let ready = engine.ready_jobs().await;
@@ -546,7 +548,11 @@ mod tests {
         assert!(state.finished_at.is_some());
         assert_eq!(state.jobs.len(), 3);
         for job in state.jobs.values() {
-            assert!(job.is_terminal(), "job {:?} left non-terminal", job.status());
+            assert!(
+                job.is_terminal(),
+                "job {:?} left non-terminal",
+                job.status()
+            );
         }
     }
 

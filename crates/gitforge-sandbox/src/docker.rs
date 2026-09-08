@@ -9,8 +9,8 @@ use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, ListContainersOptions, RemoveContainerOptions,
     StopContainerOptions,
 };
-use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
+use bollard::API_DEFAULT_VERSION;
 use futures_util::StreamExt;
 use gitforge_common::{Error, JobId, Result};
 use std::collections::HashMap;
@@ -159,9 +159,9 @@ impl DockerSandbox {
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|secs| *secs > 0)
             .unwrap_or(120); // bollard's DEFAULT_TIMEOUT
-        // Same socket selection as `connect_with_local_defaults`: an explicit
-        // unix:// DOCKER_HOST wins, otherwise the well-known socket path
-        // (bollard's DEFAULT_SOCKET; the constant is not re-exported).
+                             // Same socket selection as `connect_with_local_defaults`: an explicit
+                             // unix:// DOCKER_HOST wins, otherwise the well-known socket path
+                             // (bollard's DEFAULT_SOCKET; the constant is not re-exported).
         let socket = std::env::var("DOCKER_HOST")
             .ok()
             .filter(|host| host.starts_with("unix://"))
