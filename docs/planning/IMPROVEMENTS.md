@@ -15,7 +15,7 @@ Repository state after audit:
 - **Dependency vetting**: cargo-vet initialized (`supply-chain/`); `make
   lint` no longer fails on a missing `cargo vet`
 - **Race Detection**: Fixed storage durability issue with `sync_all()` calls
-- **Coverage**: ~80% lines (CI floor: 79.9%)
+- **Coverage**: 83.01% lines (`cargo llvm-cov --all`; CI floor: 79.9%)
 - **Aegis**: Integrated into CI (already present in security.yml)
 - **E2E**: Template framework exists in template-parts; GitForge has no web frontend
 
@@ -89,14 +89,15 @@ The following require a running integration environment:
 ### Low Coverage (<70%) - Entry Points
 | Crate | Lines | Issue |
 |-------|-------|-------|
-| services/ci | ~35% | main() entry point requires infra |
-| services/git-server | ~20% | Git protocol requires Docker |
-| gitforge-runner/executor | ~35% | Container execution requires Docker |
-|-------|-------|-------|
-| gitforge-runner/executor | 5.53% | Requires Docker integration |
-| services/git-server | 20.48% | Git protocol integration tests |
-| gitforge-ai | 7-58% | API mocking needed |
+| services/ci | 64.08% | main() loop exercised only by the compose smoke |
+| gitforge-runner/executor | 32.45% | Container execution requires Docker (`#[ignore]` tests) |
 | gitforge-build/daemon | 21.82% | Integration-only code |
+| gitforge-ai | 7-58% | API mocking needed |
+
+(2026-09-08 re-measurement, `cargo llvm-cov --all`: workspace total
+83.01% lines. services/git-server left this table's sub-30% bucket after
+its protocol harnesses were made coverage-visible: main.rs 69.43%,
+ssh_server.rs 85.64%.)
 
 ## Remaining Gaps and Next Steps (2026-09-08)
 
@@ -116,9 +117,17 @@ Ordered by value; each item states the concrete blocker.
    and `cargo vet inspect` + `certify` only for diffs a human actually
    reviewed. Six peer registries are registered and pinned in
    `imports.lock`, so pruning is automatic once coverage exists.
-2. **Service entry-point coverage** — `main()` functions require TCP
-   listeners, DB pools, and daemon connections; realistic aggregate ceiling
-   with integration harnesses is ~85-90%, not 99%.
+2. **Service entry-point coverage** — largely measured now (see the
+   resolved ledger below): the git-server protocol harnesses always
+   exercised the entry point, but the coverage tool discarded their data
+   because the tests stopped the spawned server with SIGKILL, which never
+   flushes the child's LLVM profile. Stopping it with SIGTERM (the real
+   graceful-shutdown path) made the measurement honest: git-server went
+   from ~24% to 75.81% lines (main.rs 69.43%, ssh_server.rs 85.64%), and
+   the workspace from 81.19% to 83.01%. What remains is services/ci
+   (`main.rs`, 64.08% lines — exercised only by the out-of-band compose
+   smoke) and gitforge-runner/executor (32.45% — Docker-gated, covered by
+   the `#[ignore]` live-daemon tests that CI does not run).
 
 ## Resolved from the Remaining-Gaps Ledger (2026-09-08)
 
@@ -161,6 +170,18 @@ Ordered by value; each item states the concrete blocker.
    duplicate rejection, ownership-fenced deletion), and the API parsing
    tests (valid ed25519, comment-insensitive fingerprints, garbage
    rejection).
+4. **Service entry-point coverage, measurement side** — done for
+   git-server. The HTTP and SSH protocol harnesses spawn the real
+   `git-server` binary, but they stopped it with `start_kill()`, so the
+   child never flushed its LLVM profile and `cargo llvm-cov` reported the
+   entry point at ~20-26% despite the suites driving push/clone/fetch and
+   full SSH handshakes through it. Both suites now stop the server with
+   SIGTERM via `tests/common/mod.rs::shutdown_gracefully` — the real
+   graceful-shutdown path, with a SIGKILL fallback after 10s so tests
+   never hang — which counts the child's coverage: main.rs 22.51% →
+   69.43% lines, ssh_server.rs 26.44% → 85.64%, workspace 81.19% →
+   83.01% lines. Lesson recorded: a spawned-instrumented binary only
+   reports coverage on a clean exit.
 
 ## Resolved from the Compose Smoke (2026-09-08)
 

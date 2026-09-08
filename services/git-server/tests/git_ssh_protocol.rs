@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use gitforge_common::{RepoId, UserId};
 
+mod common;
+
 /// Environment for a spawned git-server instance.
 struct TestServer {
     child: tokio::process::Child,
@@ -302,7 +304,7 @@ async fn test_git_push_and_clone_over_ssh() {
     run_git(&["push", "origin", "main"], &work, &[], ssh);
     run_git(&["fetch", "origin"], &clone_parent.join("cloned"), &[], ssh);
 
-    let _ = server.child.start_kill();
+    common::shutdown_gracefully(&mut server.child).await;
 }
 
 #[tokio::test]
@@ -341,7 +343,7 @@ async fn test_ls_remote_over_ssh_lists_pushed_refs() {
         "ls-remote must list pushed refs, got: {stdout}"
     );
 
-    let _ = server.child.start_kill();
+    common::shutdown_gracefully(&mut server.child).await;
 }
 
 #[tokio::test]
@@ -391,7 +393,7 @@ async fn test_ssh_unregistered_key_is_rejected() {
         "expected public-key denial, got: {stderr}"
     );
 
-    let _ = server.child.start_kill();
+    common::shutdown_gracefully(&mut server.child).await;
 }
 
 #[tokio::test]
@@ -422,7 +424,7 @@ async fn test_ssh_without_client_key_is_rejected() {
         String::from_utf8_lossy(&output.stdout)
     );
 
-    let _ = server.child.start_kill();
+    common::shutdown_gracefully(&mut server.child).await;
 }
 
 #[tokio::test]
@@ -448,5 +450,5 @@ async fn test_ssh_unknown_repository_fails() {
         "expected repository-not-found diagnostics, got: {stderr}"
     );
 
-    let _ = server.child.start_kill();
+    common::shutdown_gracefully(&mut server.child).await;
 }

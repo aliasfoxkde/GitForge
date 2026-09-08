@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use gitforge_common::{RepoId, UserId};
 
+mod common;
+
 /// Environment for a spawned git-server instance.
 struct TestServer {
     child: tokio::process::Child,
@@ -190,7 +192,7 @@ async fn test_git_push_and_clone_over_smart_http() {
         &[],
     );
 
-    let _ = server.child.start_kill();
+    common::shutdown_gracefully(&mut server.child).await;
 }
 
 #[tokio::test]
@@ -219,5 +221,5 @@ async fn test_ls_remote_unknown_repository_fails() {
         "expected repository-not-found diagnostics, got: {stderr}"
     );
 
-    let _ = server.child.start_kill();
+    common::shutdown_gracefully(&mut server.child).await;
 }
