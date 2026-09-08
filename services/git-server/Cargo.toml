@@ -30,4 +30,7 @@ futures = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
-ssh2 = "0.9"
+russh = "0.63.2"
+# Host key generation (ThreadRng implements CryptoRng for rand_core 0.10).
+rand = "0.10"
+tempfile = { workspace = true }

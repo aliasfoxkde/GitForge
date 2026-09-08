@@ -12,11 +12,14 @@ use axum::{
 };
 use chrono::Utc;
 use gitforge_common::RepoId;
-use gitforge_core::git_protocol::{http::HttpGitHandler, ssh::SshGitHandler, GitProtocolHandler};
+use gitforge_core::git_protocol::{http::HttpGitHandler, GitProtocolHandler};
+
+mod ssh_server;
 use gitforge_core::{FileStorageBackend, RepoService, StorageBackend};
 use gitforge_db::Pool;
 use gitforge_events::{EventBus, InMemoryEventBus};
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
+use ssh_server::{run_ssh_server, SshServerConfig};
 #[allow(unused_imports)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -33,13 +36,6 @@ struct AppState {
     ci_trigger_url: Option<String>,
     ci_trigger_token: Option<String>,
     http_client: reqwest::Client,
-}
-
-/// SSH server configuration
-struct SshServerConfig {
-    port: u16,
-    storage: Arc<FileStorageBackend>,
-    db_pool: Option<Arc<Pool>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -179,11 +175,13 @@ async fn main() -> anyhow::Result<()> {
         axum::serve(http_listener, app).await.unwrap();
     });
 
-    // Start SSH server for Git operations
+    // Start SSH server for Git operations. The host key is generated on
+    // first boot and reused afterwards; mount its directory on a volume.
     let ssh_config = SshServerConfig {
         port: ssh_port,
         storage: storage.clone(),
         db_pool: saved_db_pool.clone(),
+        host_key_path: ssh_server::default_host_key_path(),
     };
     let shutdown = create_shutdown_flag();
     let shutdown_flag = shutdown.clone();
@@ -715,236 +713,6 @@ pub async fn graceful_shutdown_delay() {
     })
     .await
     .ok();
-}
-
-/// Run the SSH server for Git operations
-async fn run_ssh_server(config: SshServerConfig, shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
-    use std::net::SocketAddr;
-
-    tracing::info!("starting Git SSH server on port {}", config.port);
-
-    // Create TCP listener
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("Git SSH server listening on {}", addr);
-
-    // Create SSH handler wrapped in Arc for sharing across connections
-    let ssh_handler = Arc::new(SshGitHandler::new((*config.storage).clone()));
-
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            tracing::info!("SSH server shutting down");
-            break;
-        }
-
-        // Accept connection with timeout to allow checking shutdown flag
-        let accept_result = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
-
-        match accept_result {
-            Ok(Ok((stream, peer_addr))) => {
-                tracing::debug!("SSH connection from {}", peer_addr);
-
-                // Clone handler and storage for this connection
-                let handler = ssh_handler.clone();
-                let storage = config.storage.clone();
-                let db_pool = config.db_pool.clone();
-
-                // Handle connection in blocking task since ssh2 is sync
-                tokio::task::spawn_blocking(move || {
-                    handle_ssh_connection(stream, handler, storage, db_pool);
-                });
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("SSH accept error: {}", e);
-            }
-            Err(_) => {
-                // Timeout - continue loop to check shutdown flag
-                continue;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Handle a single SSH connection
-#[allow(clippy::too_many_lines)]
-fn handle_ssh_connection(
-    stream: tokio::net::TcpStream,
-    handler: Arc<SshGitHandler<FileStorageBackend>>,
-    storage: Arc<FileStorageBackend>,
-    db_pool: Option<Arc<Pool>>,
-) {
-    use std::io::{Read, Write};
-
-    // Convert tokio TcpStream to blocking TcpStream
-    let mut stream = match stream.into_std() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("failed to convert TcpStream: {}", e);
-            return;
-        }
-    };
-
-    // Create ssh2 session
-    let mut session = match ssh2::Session::new() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("failed to create SSH session: {}", e);
-            return;
-        }
-    };
-
-    // Set blocking mode for ssh2
-    session.set_blocking(true);
-
-    // Handshake
-    if let Err(e) = session.handshake() {
-        tracing::error!("SSH handshake failed: {}", e);
-        return;
-    }
-
-    // Check if peer is authenticated - Git over SSH typically uses public-key auth
-    // For MVP, we'll accept None auth and skip detailed auth verification
-    let authenticated = session.authenticated();
-    if !authenticated {
-        tracing::warn!("SSH session not authenticated - Git operations may fail");
-    }
-
-    // Accept a single channel for git command
-    match session.channel_session() {
-        Ok(mut channel) => {
-            // Request exec to run the git command
-            // Read the command that was passed
-            let mut cmd_buf = [0u8; 4096];
-            let cmd_len = match channel.read(&mut cmd_buf) {
-                Ok(len) => len,
-                Err(e) => {
-                    tracing::error!("failed to read from channel: {}", e);
-                    return;
-                }
-            };
-
-            if cmd_len == 0 {
-                return;
-            }
-
-            let cmd = String::from_utf8_lossy(&cmd_buf[..cmd_len]).to_string();
-            tracing::debug!("received SSH command: {}", cmd);
-
-            // Parse the git command (e.g., "git-upload-pack /owner/repo.git" or just "git-upload-pack")
-            let parts: Vec<&str> = cmd.split_whitespace().collect();
-            if parts.is_empty() {
-                tracing::warn!("empty SSH command");
-                let _ = channel.write_all(b"empty command\n");
-                channel.wait_close().ok();
-                return;
-            }
-
-            let git_cmd = parts[0];
-            let repo_path = if parts.len() > 1 {
-                parts[1].trim_start_matches('/')
-            } else {
-                ""
-            };
-
-            // Parse owner/repo from path
-            let path_parts: Vec<&str> = repo_path.split('/').collect();
-            if path_parts.len() < 2 {
-                tracing::warn!("invalid repo path: {}", repo_path);
-                let _ = channel.write_all(b"invalid repository path\n");
-                channel.wait_close().ok();
-                return;
-            }
-
-            let owner = path_parts[0];
-            let repo = path_parts[1].trim_end_matches(".git").trim_end_matches("/");
-
-            // Look up repo ID from database if available
-            let repo_id = if let Some(ref pool) = db_pool {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(gitforge_db::queries::RepoQueries::get_by_owner_and_name(
-                        pool, owner, repo,
-                    )) {
-                    Ok(Some(repo)) => repo.id,
-                    Ok(None) => {
-                        tracing::warn!("repository not found in DB: {}/{}", owner, repo);
-                        let _ = channel.write_all(b"repository not found\n");
-                        channel.wait_close().ok();
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::error!("DB lookup failed: {}", e);
-                        let _ = channel.write_all(b"database error\n");
-                        channel.wait_close().ok();
-                        return;
-                    }
-                }
-            } else {
-                tracing::warn!("database not available for SSH connection");
-                let _ = channel.write_all(b"database not available\n");
-                channel.wait_close().ok();
-                return;
-            };
-
-            // Check if repository exists in storage
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            if rt.block_on(storage.exists(repo_id)) {
-                tracing::debug!("repository found in storage: {:?}", repo_id);
-            } else {
-                tracing::warn!("repository not found in storage: {}/{}", owner, repo);
-                let _ = channel.write_all(b"repository not found\n");
-                channel.wait_close().ok();
-                return;
-            }
-
-            // Process based on command
-            let response = match git_cmd {
-                "git-upload-pack" => tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(handler.upload_pack(repo_id, vec![])),
-                "git-receive-pack" => {
-                    // For receive-pack, we need to read the request body
-                    let mut input = Vec::new();
-                    std::io::Read::read_to_end(&mut stream, &mut input).ok();
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap()
-                        .block_on(handler.receive_pack(repo_id, input))
-                }
-                _ => Err(gitforge_common::Error::git(format!(
-                    "unsupported command: {}",
-                    git_cmd
-                ))),
-            };
-
-            match response {
-                Ok(data) => {
-                    let _ = channel.write_all(&data);
-                }
-                Err(e) => {
-                    tracing::error!("git command failed: {}", e);
-                    let _ = channel.write_all(format!("error: {}\n", e).as_bytes());
-                }
-            }
-
-            channel.wait_close().ok();
-        }
-        Err(e) => {
-            tracing::error!("failed to open channel: {}", e);
-        }
-    }
-
-    let _ = session.disconnect(None, "closing", None);
 }
 
 #[cfg(test)]

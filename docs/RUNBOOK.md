@@ -83,6 +83,17 @@ cargo run -p git-server
 - SSH: 42022
 - HTTP: 42782
 
+**Git over SSH:** the server runs an in-process SSH transport (russh) that
+requires public-key authentication. On first boot it generates an ed25519
+host key at `GITFORGE_SSH_HOST_KEY` (default `$HOME/.ssh/gitforge_host_ed25519`)
+and publishes the public half as `<path>.pub` for `known_hosts` pinning.
+In compose the key lives on the `ssh-data` volume, so it survives restarts.
+
+```bash
+# Clone over SSH after pinning the host key
+git clone "ssh://gitforge@localhost:42022/<owner>/<repo>.git"
+```
+
 ### 3. CI Orchestrator (includes Scheduler)
 
 The CI orchestrator manages pipeline execution and job scheduling. The scheduler HTTP API runs within this service on port 42781.
@@ -292,6 +303,7 @@ capacity = 4
 | `GITFORGE_RUNNER_STANDALONE` | runner | `deny` | `deny` exits the runner when scheduler registration fails; `allow` falls back to standalone execution |
 | `SSH_PORT` | git-server | 42022 | SSH port |
 | `HTTP_PORT` | git-server | 42782 | HTTP port |
+| `GITFORGE_SSH_HOST_KEY` | git-server | `$HOME/.ssh/gitforge_host_ed25519` | ed25519 host key path; generated on first boot, persisted on the `ssh-data` volume, published as `.pub` for `known_hosts` pinning |
 
 ## Logging
 

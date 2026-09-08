@@ -6,6 +6,14 @@ All notable changes to GitForge will be documented in this file.
 
 ### Security
 
+- Git over SSH now works and authenticates: the transport was rewritten
+  from ssh2/libssh2 (client-only library — the old listener could never
+  complete a handshake, so the port served nothing) to a russh server that
+  pipes authenticated channels to real `git upload-pack`/`git receive-pack`
+  child processes. Public-key auth is required; accepted fingerprints are
+  logged. The ed25519 host key is generated on first boot, persisted under
+  the ssh volume (override path with `GITFORGE_SSH_HOST_KEY`), and
+  published as `.pub` for `known_hosts` pinning
 - Scheduler job completion requires lease proof: anonymous completion of a
   known job is rejected (409), unknown jobs return 404
 - Removed the `POST /jobs/{id}/assign` no-op stub that acknowledged
@@ -20,8 +28,24 @@ All notable changes to GitForge will be documented in this file.
 
 - Git Smart HTTP protocol integration tests: real `git push`, `clone`,
   `fetch`, and `ls-remote` against the spawned git-server binary
+- Git over SSH protocol integration tests: real `ssh-keygen` client
+  keypairs and host-key pinning; `push`, `clone`, `fetch`, and `ls-remote`
+  over the `ssh://` transport, plus rejection of key-less clients and
+  unknown repositories
+- Periodic orphaned-run reconciliation in CI (60s loop, 120s run-age grace,
+  live-engine guard); startup still sweeps once
+- Restart recovery stops orphaned executions: the scheduler's cancellation
+  probe reports every terminal durable status, the runner skips log,
+  artifact, and completion reporting once its outcome was decided
+  mid-execution, and credentialed completions for unassigned jobs are
+  rejected 409 with an explicit orphaned-outcome message
 - ShellCheck and actionlint gates in Rust CI and `make lint`
 - cargo-vet supply chain (`supply-chain/`) behind `make lint`
+
+### Changed
+
+- The git-server image no longer ships `openssh-server`: SSH is served
+  in-process, so the container carries no sshd
 
 ### Fixed
 

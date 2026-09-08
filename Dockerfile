@@ -150,11 +150,12 @@ FROM debian:bookworm-slim AS git-server-prod
 
 WORKDIR /app
 
-# Install runtime dependencies and OpenSSH
+# Install runtime dependencies. Git over SSH is served in-process by the
+# binary (russh), so there is no sshd in the container; git is required to
+# serve upload-pack/receive-pack child processes.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
-    openssh-server \
     git \
     && rm -rf /var/lib/apt/lists/*
 

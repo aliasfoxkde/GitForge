@@ -102,18 +102,20 @@ The following require a running integration environment:
 
 Ordered by value; each item states the concrete blocker.
 
-1. **git-server SSH protocol test** — the protocol test covers Smart
-   HTTP only. The SSH path needs host-key/authorized-key fixtures for
-   `run_ssh_server`; candidate extension of `tests/git_http_protocol.rs`.
-2. **Runner registration retry/backoff** — fail-closed currently exits the
+1. **Runner registration retry/backoff** — fail-closed currently exits the
    process; bounded retry with backoff before exiting would tolerate a
    scheduler that is briefly unavailable at runner start.
-3. **cargo-vet audits** — `supply-chain/` currently exempts 364 transitive
+2. **cargo-vet audits** — `supply-chain/` currently exempts 364 transitive
    crates. Run `cargo vet suggest`/`cargo vet fetch` incrementally to move
    high-risk deps from exemption to audited.
-4. **Service entry-point coverage** — `main()` functions require TCP
+3. **Service entry-point coverage** — `main()` functions require TCP
    listeners, DB pools, and daemon connections; realistic aggregate ceiling
    with integration harnesses is ~85-90%, not 99%.
+4. **Per-user SSH key authorization** — SSH public keys are accepted by
+   possession (any key authenticates), matching the unauthenticated Smart
+   HTTP transport. A per-user key registry (schema + API + enforcement in
+   `GitSshSession::auth_publickey`) would make SSH strictly
+   stronger than HTTP. Accepted fingerprints are logged today.
 
 ## Resolved from the Compose Smoke (2026-09-08)
 
@@ -135,6 +137,18 @@ Ordered by value; each item states the concrete blocker.
      without this completion" instead of the malformed-request message.
    - Covered by `test_job_cancelled_probe_reports_terminal_durable_status`
      and `test_complete_job_unassigned_reports_orphaned_outcome`.
+3. **git-server SSH protocol** — done, and the finding was bigger than a
+   missing test: the ssh2/libssh2 listener could never complete a handshake
+   (libssh2 is a client-side library and the socket was never attached to
+   the session), and the `SshGitHandler` behind it was advertisement-only
+   with a receive-pack that never moved refs. The transport is now a russh
+   server (`services/git-server/src/ssh_server.rs`) that pipes
+   authenticated channels to real `git upload-pack`/`git receive-pack`
+   child processes, with a persisted ed25519 host key and required
+   public-key auth. `tests/git_ssh_protocol.rs` drives real `push`, `clone`,
+   `fetch`, and `ls-remote` over `ssh://` with generated keypairs and
+   host-key pinning, and asserts key-less clients and unknown repositories
+   are rejected.
 
 ### Not Applicable
 - Browser/WCAG e2e: GitForge has no web frontend; template-parts are
