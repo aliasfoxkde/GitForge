@@ -114,11 +114,6 @@ Ordered by value; each item states the concrete blocker.
 2. **Service entry-point coverage** — `main()` functions require TCP
    listeners, DB pools, and daemon connections; realistic aggregate ceiling
    with integration harnesses is ~85-90%, not 99%.
-3. **Per-user SSH key authorization** — SSH public keys are accepted by
-   possession (any key authenticates), matching the unauthenticated Smart
-   HTTP transport. A per-user key registry (schema + API + enforcement in
-   `GitSshSession::auth_publickey`) would make SSH strictly
-   stronger than HTTP. Accepted fingerprints are logged today.
 
 ## Resolved from the Remaining-Gaps Ledger (2026-09-08)
 
@@ -142,7 +137,25 @@ Ordered by value; each item states the concrete blocker.
    exempted), and a `supply-chain` job now enforces `cargo vet` in
    rust-ci.yml so future dependency changes that lose coverage fail CI
    instead of silently drifting. Mass-certifying the backlog was rejected
-   as dishonest: an audit entry asserts a human reviewed the source. Accepted fingerprints are logged today.
+   as dishonest: an audit entry asserts a human reviewed the source.
+3. **Per-user SSH key authorization** — done. SSH no longer authenticates
+   any key on possession. Public keys are registered to accounts through
+   `POST /api/ssh-keys` (name + OpenSSH public-key line, parsed and
+   validated at registration, stored with the `SHA256:` fingerprint),
+   listed with `GET /api/ssh-keys`, and removed with
+   `DELETE /api/ssh-keys/{id}` (ownership-fenced; 409 on a fingerprint
+   already registered to any account, enforced by a UNIQUE column and a
+   pre-check). `GitSshSession::auth_publickey` resolves the presented
+   key's fingerprint against the `ssh_keys` table, logs accepted
+   fingerprints with the owning account, and fails closed on all three
+   failure modes: no database, unregistered key, and registry lookup
+   error. This makes SSH strictly stronger than the unauthenticated Smart
+   HTTP transport. Covered by `test_ssh_unregistered_key_is_rejected`
+   (a real second keypair is denied with `Permission denied`),
+   `test_database_ssh_key_registry` (fingerprint resolution, scoping,
+   duplicate rejection, ownership-fenced deletion), and the API parsing
+   tests (valid ed25519, comment-insensitive fingerprints, garbage
+   rejection).
 
 ## Resolved from the Compose Smoke (2026-09-08)
 

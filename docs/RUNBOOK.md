@@ -84,13 +84,23 @@ cargo run -p git-server
 - HTTP: 42782
 
 **Git over SSH:** the server runs an in-process SSH transport (russh) that
-requires public-key authentication. On first boot it generates an ed25519
-host key at `GITFORGE_SSH_HOST_KEY` (default `$HOME/.ssh/gitforge_host_ed25519`)
-and publishes the public half as `<path>.pub` for `known_hosts` pinning.
-In compose the key lives on the `ssh-data` volume, so it survives restarts.
+requires public-key authentication against a per-user key registry. On
+first boot it generates an ed25519 host key at `GITFORGE_SSH_HOST_KEY`
+(default `$HOME/.ssh/gitforge_host_ed25519`) and publishes the public half
+as `<path>.pub` for `known_hosts` pinning. In compose the key lives on the
+`ssh-data` volume, so it survives restarts.
+
+A client key must be registered to an account before it can connect
+(`POST /api/ssh-keys` with `name` and the OpenSSH `public_key` line; the
+transport matches the presented key's `SHA256:` fingerprint against the
+registry and rejects everything else). List your keys with
+`GET /api/ssh-keys` and remove one with `DELETE /api/ssh-keys/{id}`.
 
 ```bash
-# Clone over SSH after pinning the host key
+# Register a key, then clone over SSH after pinning the host key
+curl -X POST http://localhost:42780/api/ssh-keys \
+  -H "Authorization: Bearer $JWT" -H 'Content-Type: application/json' \
+  -d '{"name":"laptop","public_key":"ssh-ed25519 AAAA... you@host"}'
 git clone "ssh://gitforge@localhost:42022/<owner>/<repo>.git"
 ```
 
@@ -311,6 +321,13 @@ capacity = 4
 | `SSH_PORT` | git-server | 42022 | SSH port |
 | `HTTP_PORT` | git-server | 42782 | HTTP port |
 | `GITFORGE_SSH_HOST_KEY` | git-server | `$HOME/.ssh/gitforge_host_ed25519` | ed25519 host key path; generated on first boot, persisted on the `ssh-data` volume, published as `.pub` for `known_hosts` pinning |
+
+**SSH key registry:** git-over-SSH accepts only public keys registered to
+an account through `POST /api/ssh-keys` (JWT required). Authentication
+matches the presented key's OpenSSH fingerprint; unregistered keys are
+rejected and the connection fails with `Permission denied (publickey)`.
+If the registry is unreachable, connections are refused rather than
+allowed through.
 
 ## Logging
 

@@ -251,6 +251,41 @@ impl From<UserId> for Uuid {
     }
 }
 
+/// SSH public key identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SshKeyId(pub Uuid);
+
+impl SshKeyId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for SshKeyId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for SshKeyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<Uuid> for SshKeyId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl From<SshKeyId> for Uuid {
+    fn from(id: SshKeyId) -> Self {
+        id.0
+    }
+}
+
 /// Job status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {

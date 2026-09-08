@@ -14,6 +14,7 @@ pub mod time;
 
 pub use error::{Error, ErrorKind, Result};
 pub use ids::{
-    JobId, JobStatus, PipelineId, PipelineRunId, PipelineStatus, RepoId, RunnerId, StepId, UserId,
+    JobId, JobStatus, PipelineId, PipelineRunId, PipelineStatus, RepoId, RunnerId, SshKeyId,
+    StepId, UserId,
 };
 pub use time::DateTime;

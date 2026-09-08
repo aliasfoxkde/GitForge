@@ -381,3 +381,90 @@ async fn test_database_pipeline_run_status_updates() {
         assert_eq!(found.unwrap().status, *status);
     }
 }
+
+#[tokio::test]
+async fn test_database_ssh_key_registry() {
+    use gitforge_common::SshKeyId;
+    use gitforge_db::models::SshKey;
+    use gitforge_db::queries::SshKeyQueries;
+
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let owner = User::new(
+        "keyowner".to_string(),
+        "keys@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &owner).await.unwrap();
+    let other = User::new(
+        "otheruser".to_string(),
+        "other@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &other).await.unwrap();
+
+    let laptop = SshKey::new(
+        owner.id,
+        "laptop".to_string(),
+        "SHA256:aaaa".to_string(),
+        "ssh-ed25519 AAAA1 laptop".to_string(),
+    );
+    SshKeyQueries::create(&pool, &laptop).await.unwrap();
+    let server_key = SshKey::new(
+        owner.id,
+        "server".to_string(),
+        "SHA256:bbbb".to_string(),
+        "ssh-ed25519 AAAA2 server".to_string(),
+    );
+    SshKeyQueries::create(&pool, &server_key).await.unwrap();
+
+    // Fingerprints resolve to their owning account.
+    let found = SshKeyQueries::find_by_fingerprint(&pool, "SHA256:aaaa")
+        .await
+        .unwrap()
+        .expect("registered fingerprint resolves");
+    assert_eq!(found.user_id, owner.id);
+    assert_eq!(found.name, "laptop");
+    assert!(SshKeyQueries::find_by_fingerprint(&pool, "SHA256:missing")
+        .await
+        .unwrap()
+        .is_none());
+
+    // Listing is scoped to one account.
+    let listed = SshKeyQueries::list_by_user(&pool, owner.id).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(SshKeyQueries::list_by_user(&pool, other.id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The same public key can never belong to a second account.
+    let duplicate = SshKey::new(
+        other.id,
+        "stolen".to_string(),
+        "SHA256:aaaa".to_string(),
+        "ssh-ed25519 AAAA1 laptop".to_string(),
+    );
+    let error = SshKeyQueries::create(&pool, &duplicate)
+        .await
+        .expect_err("duplicate fingerprint must be rejected");
+    assert_eq!(error.kind, gitforge_common::ErrorKind::InvalidInput);
+
+    // Deletion is fenced by ownership.
+    assert!(
+        !SshKeyQueries::delete_owned(&pool, laptop.id, other.id)
+            .await
+            .unwrap(),
+        "another account must not delete someone else's key"
+    );
+    assert!(SshKeyQueries::delete_owned(&pool, laptop.id, owner.id)
+        .await
+        .unwrap());
+    assert!(
+        SshKeyQueries::get(&pool, SshKeyId::from(uuid::Uuid::new_v4()))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

@@ -21,6 +21,12 @@ All notable changes to GitForge will be documented in this file.
 - Runner registration is fail-closed by default
   (`GITFORGE_RUNNER_STANDALONE=deny`); standalone fallback requires explicit
   opt-in
+- Git over SSH authenticates against a per-user key registry instead of
+  accepting any key on possession: public keys are registered to accounts
+  via `POST /api/ssh-keys` (validated OpenSSH parsing, `SHA256:`
+  fingerprint, globally unique), the transport resolves presented keys
+  against that registry and rejects unregistered ones, and a broken
+  registry fails closed rather than letting connections through
 - docker-compose requires `GITFORGE_SCHEDULER_TOKEN` for CI and runners,
   matching the fail-closed scheduler auth boundary
 
@@ -30,8 +36,8 @@ All notable changes to GitForge will be documented in this file.
   `fetch`, and `ls-remote` against the spawned git-server binary
 - Git over SSH protocol integration tests: real `ssh-keygen` client
   keypairs and host-key pinning; `push`, `clone`, `fetch`, and `ls-remote`
-  over the `ssh://` transport, plus rejection of key-less clients and
-  unknown repositories
+  over the `ssh://` transport, plus rejection of key-less clients,
+  unregistered keys, and unknown repositories
 - Periodic orphaned-run reconciliation in CI (60s loop, 120s run-age grace,
   live-engine guard); startup still sweeps once
 - Restart recovery stops orphaned executions: the scheduler's cancellation

@@ -5,6 +5,7 @@ pub mod auth;
 pub mod ci;
 pub mod repo;
 pub mod runners;
+pub mod ssh_keys;
 pub mod users;
 pub mod webhook;
 
@@ -13,5 +14,6 @@ pub use auth::*;
 pub use ci::*;
 pub use repo::*;
 pub use runners::*;
+pub use ssh_keys::*;
 pub use users::*;
 pub use webhook::*;

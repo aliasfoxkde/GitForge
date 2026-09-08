@@ -126,22 +126,6 @@ async fn spawn_server() -> TestServer {
     gitforge_db::queries::RepoQueries::create(&pool, &repository)
         .await
         .expect("create repository");
-    drop(pool);
-
-    // The server resolves owner/repo to <GIT_ROOT>/<repo_id>, so the bare
-    // repository must exist there.
-    let bare_repo = git_root.join(repo_id.to_string());
-    run_git(
-        &[
-            "init",
-            "--bare",
-            "--initial-branch=main",
-            bare_repo.to_str().unwrap(),
-        ],
-        &base,
-        &[],
-        None,
-    );
 
     // Generate the ed25519 client keypair the tests will authenticate with.
     let client_key = ssh_dir.join("client_ed25519");
@@ -162,6 +146,42 @@ async fn spawn_server() -> TestServer {
         keygen.status.success(),
         "ssh-keygen failed: {}",
         String::from_utf8_lossy(&keygen.stderr)
+    );
+
+    // Register the generated client key to the owner account before the
+    // server starts (as a user would through the API), because the
+    // transport rejects unregistered fingerprints.
+    let client_public =
+        std::fs::read_to_string(client_key.with_extension("pub")).expect("read client public key");
+    let parsed_client_key = russh::keys::ssh_key::PublicKey::from_openssh(&client_public)
+        .expect("parse client public key");
+    let key_record = gitforge_db::models::SshKey::new(
+        user_id,
+        "test-client-key".to_string(),
+        parsed_client_key
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string(),
+        client_public.trim().to_string(),
+    );
+    gitforge_db::queries::SshKeyQueries::create(&pool, &key_record)
+        .await
+        .expect("register client ssh key");
+
+    drop(pool);
+
+    // The server resolves owner/repo to <GIT_ROOT>/<repo_id>, so the bare
+    // repository must exist there.
+    let bare_repo = git_root.join(repo_id.to_string());
+    run_git(
+        &[
+            "init",
+            "--bare",
+            "--initial-branch=main",
+            bare_repo.to_str().unwrap(),
+        ],
+        &base,
+        &[],
+        None,
     );
 
     let host_key_path = ssh_dir.join("host_ed25519");
@@ -319,6 +339,56 @@ async fn test_ls_remote_over_ssh_lists_pushed_refs() {
     assert!(
         stdout.contains("refs/heads/main"),
         "ls-remote must list pushed refs, got: {stdout}"
+    );
+
+    let _ = server.child.start_kill();
+}
+
+#[tokio::test]
+async fn test_ssh_unregistered_key_is_rejected() {
+    let mut server = spawn_server().await;
+    let base = server.git_root.parent().unwrap().to_path_buf();
+    let origin_url = ssh_url(server.ssh_port, "testowner/proto.git");
+    let known_hosts = base.join("known_hosts");
+
+    // A second, real keypair that was never registered to any account.
+    // The transport must not authenticate it on possession alone.
+    let stranger_key = base.join("stranger_ed25519");
+    let keygen = Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-f",
+            stranger_key.to_str().unwrap(),
+            "-C",
+            "unregistered-stranger",
+        ])
+        .output()
+        .expect("spawn ssh-keygen");
+    assert!(
+        keygen.status.success(),
+        "ssh-keygen failed: {}",
+        String::from_utf8_lossy(&keygen.stderr)
+    );
+
+    let stranger_command = ssh_options(&stranger_key, &known_hosts);
+    let output = Command::new("git")
+        .args(["ls-remote", &origin_url])
+        .current_dir(&base)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", &stranger_command)
+        .output()
+        .expect("spawn git ls-remote");
+    assert!(
+        !output.status.success(),
+        "an unregistered key must not authenticate"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Permission denied"),
+        "expected public-key denial, got: {stderr}"
     );
 
     let _ = server.child.start_kill();

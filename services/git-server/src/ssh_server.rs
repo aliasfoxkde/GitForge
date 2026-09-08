@@ -7,9 +7,10 @@
 //! (ref advertisement, want/have, pack transfer, status report) is handled
 //! by git itself, and refs move exactly as they do over Smart HTTP.
 //!
-//! Authentication requires a public key. Keys are accepted by possession —
-//! there is no per-user key registry yet, matching the unauthenticated
-//! Smart HTTP transport — and every accepted fingerprint is logged.
+//! Authentication requires a public key registered to a user account via
+//! the `/api/ssh-keys` endpoints. The presented key's OpenSSH fingerprint
+//! is looked up in the `ssh_keys` table; unregistered keys are rejected,
+//! and every accepted fingerprint is logged with the owning account.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -19,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gitforge_core::{FileStorageBackend, StorageBackend};
-use gitforge_db::Pool;
+use gitforge_db::{queries::SshKeyQueries, Pool};
 use russh::keys::{ssh_key::LineEnding, Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, Handler, Msg, Server, Session};
 use russh::{Channel, MethodKind, MethodSet};
@@ -111,6 +112,7 @@ impl Server for GitSshServer {
         tracing::debug!(?peer_addr, "new SSH connection");
         GitSshSession {
             context: self.context.clone(),
+            authenticated_user: None,
             processes: HashMap::new(),
         }
     }
@@ -126,6 +128,8 @@ struct ChannelProcess {
 /// Per-connection handler.
 pub struct GitSshSession {
     context: Arc<SshContext>,
+    /// Account the client authenticated as, set by public-key acceptance.
+    authenticated_user: Option<gitforge_common::UserId>,
     /// Running git processes keyed by channel id.
     processes: HashMap<russh::ChannelId, ChannelProcess>,
 }
@@ -141,12 +145,44 @@ impl Handler for GitSshSession {
     }
 
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        tracing::info!(
-            user,
-            fingerprint = %key.fingerprint(HashAlg::Sha256),
-            "SSH public key accepted"
-        );
-        Ok(Auth::Accept)
+        let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+        let reject = || Auth::Reject {
+            proceed_with_methods: Some(MethodSet::from(&[MethodKind::PublicKey][..])),
+            partial_success: false,
+        };
+
+        let Some(pool) = self.context.db_pool.as_ref() else {
+            tracing::warn!(
+                user,
+                %fingerprint,
+                "SSH public key rejected: the key registry is unavailable"
+            );
+            return Ok(reject());
+        };
+
+        match SshKeyQueries::find_by_fingerprint(pool, &fingerprint).await {
+            Ok(Some(record)) => {
+                self.authenticated_user = Some(record.user_id);
+                tracing::info!(
+                    user,
+                    %fingerprint,
+                    user_id = %record.user_id,
+                    key_name = %record.name,
+                    "SSH public key accepted"
+                );
+                Ok(Auth::Accept)
+            }
+            Ok(None) => {
+                tracing::warn!(user, %fingerprint, "SSH public key rejected: key is not registered to any account");
+                Ok(reject())
+            }
+            Err(error) => {
+                // Fail closed: an unusable registry must not fall back to
+                // accepting possession.
+                tracing::error!(%error, %fingerprint, "SSH key registry lookup failed");
+                Ok(reject())
+            }
+        }
     }
 
     async fn channel_open_session(
@@ -279,7 +315,12 @@ impl GitSshSession {
 
         let handle = session.handle();
         tokio::spawn(pump_until_exit(handle, channel, child, stdout, stderr));
-        tracing::info!(command = %command.trim(), %repo_path, "git process started");
+        tracing::info!(
+            command = %command.trim(),
+            %repo_path,
+            user_id = ?self.authenticated_user,
+            "git process started"
+        );
         Ok(())
     }
 

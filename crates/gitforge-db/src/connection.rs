@@ -116,6 +116,26 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create repositories table: {}", e)))?;
 
+        // Create ssh_keys table. A key's fingerprint is globally unique:
+        // the same public key may never authenticate as two different
+        // accounts.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS ssh_keys (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL UNIQUE,
+                public_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create ssh_keys table: {}", e)))?;
+
         // Create pipelines table
         sqlx::query(
             r#"
