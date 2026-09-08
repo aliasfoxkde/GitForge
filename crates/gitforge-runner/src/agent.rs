@@ -33,6 +33,10 @@ pub struct RunnerConfig {
     pub fetch_interval_secs: u64,
     /// Bearer token used for scheduler service authentication.
     pub scheduler_token: Option<String>,
+    /// Whether registration failure may fall back to standalone execution.
+    /// Defaults to `false`: a runner that cannot register exits instead of
+    /// appearing healthy while it can never receive scheduler jobs.
+    pub allow_standalone: bool,
 }
 
 impl fmt::Debug for RunnerConfig {
@@ -49,6 +53,7 @@ impl fmt::Debug for RunnerConfig {
                 "scheduler_token",
                 &self.scheduler_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("allow_standalone", &self.allow_standalone)
             .finish()
     }
 }
@@ -65,6 +70,7 @@ impl Default for RunnerConfig {
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
             scheduler_token: None,
+            allow_standalone: false,
         }
     }
 }
@@ -98,6 +104,7 @@ impl RunnerConfig {
         let mut heartbeat_interval_secs: Option<u64> = None;
         let mut fetch_interval_secs: Option<u64> = None;
         let mut scheduler_token: Option<Option<String>> = None;
+        let mut allow_standalone: Option<bool> = None;
 
         for (key, value) in iter {
             let key = key.as_ref();
@@ -170,6 +177,21 @@ impl RunnerConfig {
                         Some(v.to_string())
                     });
                 }
+                "GITFORGE_RUNNER_STANDALONE" => {
+                    let v = value.trim().to_ascii_lowercase();
+                    if !v.is_empty() {
+                        allow_standalone = Some(match v.as_str() {
+                            "allow" | "true" | "1" => true,
+                            "deny" | "false" | "0" => false,
+                            other => {
+                                return Err(Error::invalid_input(format!(
+                                    "GITFORGE_RUNNER_STANDALONE must be allow or deny (got {})",
+                                    other
+                                )))
+                            }
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -190,6 +212,7 @@ impl RunnerConfig {
             heartbeat_interval_secs: heartbeat_interval_secs.unwrap_or(30),
             fetch_interval_secs: fetch_interval_secs.unwrap_or(5),
             scheduler_token: scheduler_token.unwrap_or(None),
+            allow_standalone: allow_standalone.unwrap_or(false),
         })
     }
 
@@ -207,6 +230,12 @@ impl RunnerConfig {
     ///
     /// **Optional credentials** (no default — runner runs unauthenticated if unset):
     /// - `GITFORGE_SCHEDULER_TOKEN`  — bearer token for scheduler API
+    ///
+    /// **Optional policy:**
+    /// - `GITFORGE_RUNNER_STANDALONE` — `deny` (default) makes registration
+    ///   failure fatal at startup; `allow` restores legacy standalone
+    ///   fallback where an unreachable scheduler still permits local
+    ///   execution.
     ///
     /// # Errors
     ///
@@ -451,6 +480,60 @@ mod config_tests {
         assert_eq!(cfg.fetch_interval_secs, 5);
         assert!(cfg.scheduler_token.is_none());
     }
+
+    #[test]
+    fn test_standalone_policy_defaults_to_fail_closed() {
+        let cfg = RunnerConfig::parse_from_iter(env(vec![
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+        ]))
+        .unwrap();
+        assert!(!cfg.allow_standalone, "standalone fallback must be opt-in");
+    }
+
+    #[test]
+    fn test_standalone_policy_accepts_allow_and_deny() {
+        for (raw, expected) in [
+            ("allow", true),
+            ("ALLOW", true),
+            ("true", true),
+            ("1", true),
+            ("deny", false),
+            ("false", false),
+            ("0", false),
+        ] {
+            let cfg = RunnerConfig::parse_from_iter(vec![
+                (
+                    "GITFORGE_SCHEDULER_URL".to_string(),
+                    "http://localhost:42781".to_string(),
+                ),
+                (
+                    "GITFORGE_RUNNER_STANDALONE".to_string(),
+                    raw.to_string(),
+                ),
+            ])
+            .unwrap_or_else(|err| panic!("valid value {raw} rejected: {err}"));
+            assert_eq!(cfg.allow_standalone, expected, "value {raw}");
+        }
+    }
+
+    #[test]
+    fn test_standalone_policy_rejects_unknown_values() {
+        let err = RunnerConfig::parse_from_iter(vec![
+            (
+                "GITFORGE_SCHEDULER_URL".to_string(),
+                "http://localhost:42781".to_string(),
+            ),
+            (
+                "GITFORGE_RUNNER_STANDALONE".to_string(),
+                "maybe".to_string(),
+            ),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("GITFORGE_RUNNER_STANDALONE"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 /// Job assignment from scheduler
@@ -556,6 +639,14 @@ impl RunnerAgent {
                             response.status()
                         )));
                     }
+                    if !self.config.allow_standalone {
+                        return Err(Error::internal(format!(
+                            "scheduler rejected registration with status {}; \
+                             refusing to run standalone (set GITFORGE_RUNNER_STANDALONE=allow \
+                             to override)",
+                            response.status()
+                        )));
+                    }
                     tracing::warn!(
                         "scheduler returned {} for registration, running in standalone mode",
                         response.status()
@@ -563,6 +654,13 @@ impl RunnerAgent {
                 }
             }
             Err(e) => {
+                if !self.config.allow_standalone {
+                    return Err(Error::internal(format!(
+                        "failed to register with scheduler: {}; refusing to run \
+                         standalone (set GITFORGE_RUNNER_STANDALONE=allow to override)",
+                        e
+                    )));
+                }
                 tracing::warn!(
                     "failed to register with scheduler: {}. Running in standalone mode.",
                     e
@@ -1306,9 +1404,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_register_no_scheduler() {
-        // Test that register doesn't panic when scheduler is unavailable
+        // Registration failure is fatal by default: a runner must not appear
+        // healthy when it cannot reach the scheduler that assigns it work.
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(), // Invalid URL
+            ..Default::default()
+        };
+        let mut agent = RunnerAgent::new(config).await.unwrap();
+        let result = agent.register().await;
+        assert!(result.is_err(), "fail-closed default must reject standalone");
+        assert!(agent.runner.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_runner_register_unreachable_scheduler_allows_standalone() {
+        // Legacy standalone fallback remains available behind an explicit
+        // policy opt-in.
+        let config = RunnerConfig {
+            scheduler_url: "http://localhost:99999".to_string(),
+            allow_standalone: true,
             ..Default::default()
         };
         let mut agent = RunnerAgent::new(config).await.unwrap();
@@ -1335,6 +1449,7 @@ mod tests {
             heartbeat_interval_secs: 60,
             fetch_interval_secs: 10,
             scheduler_token: None,
+            allow_standalone: false,
         };
         assert_eq!(config.name, "custom-runner");
         assert_eq!(config.capacity, 5);
@@ -1501,6 +1616,7 @@ mod tests {
     async fn test_runner_register_sets_runner() {
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
+            allow_standalone: true,
             ..Default::default()
         };
         let mut agent = RunnerAgent::new(config).await.unwrap();
@@ -1525,6 +1641,7 @@ mod tests {
             heartbeat_interval_secs: 15,
             fetch_interval_secs: 3,
             scheduler_token: None,
+            allow_standalone: false,
         };
 
         assert_eq!(config.scheduler_url, "http://example.com:8081");
@@ -1614,6 +1731,7 @@ mod tests {
     async fn test_runner_stop_after_registration() {
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
+            allow_standalone: true,
             ..Default::default()
         };
         let mut agent = RunnerAgent::new(config).await.unwrap();
@@ -1644,6 +1762,7 @@ mod tests {
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
             scheduler_token: None,
+            allow_standalone: false,
         };
         assert_eq!(config.capacity, 0);
     }
@@ -1721,6 +1840,7 @@ mod tests {
             heartbeat_interval_secs: 45,
             fetch_interval_secs: 10,
             scheduler_token: None,
+            allow_standalone: false,
         };
         assert!(config.scheduler_url.contains("user:pass"));
     }
@@ -1749,6 +1869,7 @@ mod tests {
             heartbeat_interval_secs: 60,
             fetch_interval_secs: 15,
             scheduler_token: None,
+            allow_standalone: false,
         };
         let agent = RunnerAgent::new(config).await.unwrap();
         assert!(agent.runner.is_none());
@@ -1787,6 +1908,7 @@ mod tests {
     async fn test_runner_run_and_stop() {
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
+            allow_standalone: true,
             ..Default::default()
         };
 
