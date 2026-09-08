@@ -102,30 +102,39 @@ The following require a running integration environment:
 
 Ordered by value; each item states the concrete blocker.
 
-1. **Periodic orphaned-run reconciliation** — `reconcile_orphaned_runs`
-   (services/ci/src/main.rs) runs once at startup. A run whose jobs all turn
-   terminal while the control plane is up (for example completions rejected
-   after a scheduler restart) stays `running` until the next restart; the
-   compose smoke confirmed both the gap and that the reconciliation itself
-   finalizes correctly when invoked. Run it on the scheduler tick instead.
-2. **Post-restart requeued completions lack lease proof** — after a scheduler
-   restart requeues in-flight jobs, the runner re-executes them but its
-   completion POST arrives without `runner_id`/`lease_token` and is rejected
-   (409 `completion_persistence_failed`), so successfully re-executed work is
-   marked failed. Investigate lease propagation on the requeue→assignment
-   path in `gitforge-scheduler`.
-3. **git-server SSH protocol test** — the protocol test covers Smart
+1. **git-server SSH protocol test** — the protocol test covers Smart
    HTTP only. The SSH path needs host-key/authorized-key fixtures for
    `run_ssh_server`; candidate extension of `tests/git_http_protocol.rs`.
-4. **Runner registration retry/backoff** — fail-closed currently exits the
+2. **Runner registration retry/backoff** — fail-closed currently exits the
    process; bounded retry with backoff before exiting would tolerate a
    scheduler that is briefly unavailable at runner start.
-5. **cargo-vet audits** — `supply-chain/` currently exempts 364 transitive
+3. **cargo-vet audits** — `supply-chain/` currently exempts 364 transitive
    crates. Run `cargo vet suggest`/`cargo vet fetch` incrementally to move
    high-risk deps from exemption to audited.
-6. **Service entry-point coverage** — `main()` functions require TCP
+4. **Service entry-point coverage** — `main()` functions require TCP
    listeners, DB pools, and daemon connections; realistic aggregate ceiling
    with integration harnesses is ~85-90%, not 99%.
+
+## Resolved from the Compose Smoke (2026-09-08)
+
+1. **Periodic orphaned-run reconciliation** — done. `reconcile_orphaned_runs`
+   (services/ci/src/main.rs) now runs on a 60s loop with a 120s run-age grace
+   window and a live-engine guard; startup still sweeps once with no guards.
+2. **Post-restart requeued completions lack lease proof** — done. Root cause
+   was not lease propagation: `requeue_inflight` deliberately clears leases
+   (receipts cannot be trusted across a restart), so a still-running
+   execution is orphaned by design. The fix makes orphaning explicit and
+   prompt end to end:
+   - `Scheduler::is_cancelled` reports every terminal durable status, so the
+     runner's cancellation probe stops a sandbox whose row was failed or
+     requeued by restart recovery, not only operator cancellations.
+   - The runner skips log, artifact, and completion reporting once its probe
+     says the outcome was decided mid-execution; no doomed 409s.
+   - A credentialed completion for an unassigned job is rejected 409 with
+     "job is no longer assigned to a runner; its durable outcome was decided
+     without this completion" instead of the malformed-request message.
+   - Covered by `test_job_cancelled_probe_reports_terminal_durable_status`
+     and `test_complete_job_unassigned_reports_orphaned_outcome`.
 
 ### Not Applicable
 - Browser/WCAG e2e: GitForge has no web frontend; template-parts are
