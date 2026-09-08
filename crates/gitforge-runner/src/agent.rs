@@ -483,9 +483,10 @@ mod config_tests {
 
     #[test]
     fn test_standalone_policy_defaults_to_fail_closed() {
-        let cfg = RunnerConfig::parse_from_iter(env(vec![
-            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
-        ]))
+        let cfg = RunnerConfig::parse_from_iter(env(vec![(
+            "GITFORGE_SCHEDULER_URL",
+            Some("http://localhost:42781"),
+        )]))
         .unwrap();
         assert!(!cfg.allow_standalone, "standalone fallback must be opt-in");
     }
@@ -506,10 +507,7 @@ mod config_tests {
                     "GITFORGE_SCHEDULER_URL".to_string(),
                     "http://localhost:42781".to_string(),
                 ),
-                (
-                    "GITFORGE_RUNNER_STANDALONE".to_string(),
-                    raw.to_string(),
-                ),
+                ("GITFORGE_RUNNER_STANDALONE".to_string(), raw.to_string()),
             ])
             .unwrap_or_else(|err| panic!("valid value {raw} rejected: {err}"));
             assert_eq!(cfg.allow_standalone, expected, "value {raw}");
@@ -1412,7 +1410,10 @@ mod tests {
         };
         let mut agent = RunnerAgent::new(config).await.unwrap();
         let result = agent.register().await;
-        assert!(result.is_err(), "fail-closed default must reject standalone");
+        assert!(
+            result.is_err(),
+            "fail-closed default must reject standalone"
+        );
         assert!(agent.runner.is_none());
     }
 

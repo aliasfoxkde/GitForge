@@ -2,6 +2,35 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [0.4.0] - 2026-09-08
+
+### Security
+
+- Scheduler job completion requires lease proof: anonymous completion of a
+  known job is rejected (409), unknown jobs return 404
+- Removed the `POST /jobs/{id}/assign` no-op stub that acknowledged
+  assignments without performing any
+- Runner registration is fail-closed by default
+  (`GITFORGE_RUNNER_STANDALONE=deny`); standalone fallback requires explicit
+  opt-in
+- docker-compose requires `GITFORGE_SCHEDULER_TOKEN` for CI and runners,
+  matching the fail-closed scheduler auth boundary
+
+### Added
+
+- Git Smart HTTP protocol integration tests: real `git push`, `clone`,
+  `fetch`, and `ls-remote` against the spawned git-server binary
+- ShellCheck and actionlint gates in Rust CI and `make lint`
+- cargo-vet supply chain (`supply-chain/`) behind `make lint`
+
+### Fixed
+
+- API list endpoints return 500 `database_error` instead of masking
+  storage failures as empty 200 responses
+- ai-review.yml passed review outputs as action inputs instead of step
+  env vars, so the PR comment always used its fallback text
+- ShellCheck SC2012/SC2034/SC2155 findings in scripts/
+
 ## [0.3.2] - 2026-08-28
 
 ### Added

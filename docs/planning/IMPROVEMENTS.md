@@ -1,22 +1,45 @@
 # GitForge Improvement Plan
 
 Date: 2026-08-28
+Updated: 2026-09-08
 Status: Active
 
 ## Summary
 
 Repository state after audit:
 - **Tests**: All passing (300+ tests across workspace)
-- **Linting**: Clippy passes with `-D warnings`
+- **Linting**: Clippy passes with `-D warnings`; ShellCheck clean on all
+  repo scripts; actionlint clean on all workflows; both gates added to
+  Rust CI and the Makefile
 - **Formatting**: `cargo fmt --check` passes
+- **Dependency vetting**: cargo-vet initialized (`supply-chain/`); `make
+  lint` no longer fails on a missing `cargo vet`
 - **Race Detection**: Fixed storage durability issue with `sync_all()` calls
-- **Coverage**: 80.12% lines, 81.59% regions, 81.38% functions (CI floor: 79.9%)
+- **Coverage**: ~80% lines (CI floor: 79.9%)
 - **Aegis**: Integrated into CI (already present in security.yml)
 - **E2E**: Template framework exists in template-parts; GitForge has no web frontend
 
+## Resolved Security Gaps (2026-09-08)
+
+1. **Scheduler completion without lease proof** — `POST /jobs/{id}/complete`
+   accepted anonymous completions for any known job. Completion now requires
+   the assigning runner identity and lease token; unknown jobs return 404.
+2. **`/jobs/{id}/assign` no-op stub removed** — the route acknowledged
+   assignments without performing any; a client-selectable assignment path
+   would also have bypassed scheduler policy.
+3. **Runner registration fail-open** — `RunnerAgent::register()` now fails
+   closed by default (`GITFORGE_RUNNER_STANDALONE=deny`); legacy standalone
+   fallback requires an explicit `allow`.
+4. **Compose credentials** — `docker-compose.yml` requires
+   `GITFORGE_SCHEDULER_TOKEN` for CI and runners, matching the fail-closed
+   scheduler auth that was already enforced at the HTTP boundary.
+5. **ai-review.yml env bug** — review summary/critical findings were passed
+   as action inputs instead of step env vars, so `process.env` lookups in
+   the comment script always hit their fallback.
+
 ## Honest Assessment: What's Achievable
 
-### Achieved This Session
+### Achieved Previously
 1. **Storage Durability Fix**: `sync_all()` calls prevent race conditions
 2. **MockAiProvider**: Full mock implementation for testing AI providers
 3. **Executor Unit Tests**: 7 new tests for JobResult, ExecutableJob
@@ -27,10 +50,16 @@ The following require a running integration environment:
 
 | Item | Blocked By | Workaround |
 |------|------------|------------|
-| Docker integration tests | Docker daemon | Use stub sandbox in tests |
-| Git-server protocol tests | Git protocol handshake | Mock at higher layer |
 | Service entry point coverage | TCP listeners, DB pools | Integration test suite |
 | 99% coverage on main.rs | Full infra required | Not achievable in unit tests |
+
+### Previously Blocked, Now Passing (2026-09-08)
+
+| Item | Status |
+|------|--------|
+| Docker sandbox integration tests | 3/3 `#[ignore]` tests pass against live Docker 26.1.5 (`cargo test -- --ignored`) |
+| Runner executor timeout reaping | Real-container test passes: hung job reaped at timeout |
+| Git-server protocol tests | NEW `services/git-server/tests/git_http_protocol.rs`: real `git push`, `git clone`, `fetch`, and `ls-remote` against the spawned binary + SQLite DB |
 
 ### Not Applicable
 | Item | Reason |
@@ -68,38 +97,43 @@ The following require a running integration environment:
 | gitforge-ai | 7-58% | API mocking needed |
 | gitforge-build/daemon | 21.82% | Integration-only code |
 
-## Technical Debt Identified
+## Remaining Gaps and Next Steps (2026-09-08)
 
-### High Priority
-1. **Storage**: Race condition fixed, needs stress testing
-2. **Runner Executor**: 95% untested - needs Docker test harness
-3. **Git Server**: 80% untested - needs integration test environment
+Ordered by value; each item states the concrete blocker.
 
-### Medium Priority
-4. **AI Provider mocking**: Anthropic/OpenAI/Ollama need test doubles
-## Integration Testing Path
+1. **Compose-stack smoke with a queued job** — the HANDOFF "required next
+   packet". Docker is available, so `docker compose config` validation and a
+   disposable api+ci+runner+git-server run with one queued job (durable
+   completion + restart recovery) is the next executable step. It is a
+   multi-container orchestration effort, not blocked by missing tooling.
+2. **git-server SSH protocol test** — the new protocol test covers Smart
+   HTTP only. The SSH path needs host-key/authorized-key fixtures for
+   `run_ssh_server`; candidate extension of `tests/git_http_protocol.rs`.
+3. **Runner registration retry/backoff** — fail-closed currently exits the
+   process; bounded retry with backoff before exiting would tolerate a
+   scheduler that is briefly unavailable at runner start.
+4. **cargo-vet audits** — `supply-chain/` currently exempts 364 transitive
+   crates. Run `cargo vet suggest`/`cargo vet fetch` incrementally to move
+   high-risk deps from exemption to audited.
+5. **Service entry-point coverage** — `main()` functions require TCP
+   listeners, DB pools, and daemon connections; realistic aggregate ceiling
+   with integration harnesses is ~85-90%, not 99%.
 
-### What's Needed for True 99% Coverage
-To cover the 20% gap in service entry points, you need:
-
-1. **Docker-based integration tests**: Spin up real containers
-2. **Test database**: PostgreSQL or SQLite test instances
-3. **HTTP test harness**: Start services on test ports
-4. **Git protocol test fixtures**: Actual git repos for protocol tests
-
-### Realistic Target: 85-90%
-With unit tests only (no Docker), realistic coverage is:
-- Core business logic: 95%+
-- API handlers: 90%+
-- Service entry points: 50-60% (require integration tests)
+### Not Applicable
+- Browser/WCAG e2e: GitForge has no web frontend; template-parts are
+  scaffolding templates, not GitForge UI.
 
 ## Release Checklist
 
-- [x] All tests pass (`cargo test --workspace`) - 300+ tests passing
-- [x] Clippy clean (`cargo clippy --workspace -- -D warnings`) - Pass
-- [x] Format check (`cargo fmt -- --check`) - Pass
-- [x] Coverage ≥80% (80.12% achieved; CI floor: 79.9%)
-- [x] No race conditions (storage sync fix applied)
+- [x] All tests pass (`cargo test --workspace`)
+- [x] Clippy clean (`cargo clippy --workspace -- -D warnings`)
+- [x] Format check (`cargo fmt -- --check`)
+- [x] ShellCheck clean (scripts/ + systemd/)
+- [x] actionlint clean (.github/workflows/)
+- [x] `cargo vet` gate initialized and passing
+- [x] Coverage ≥80% (CI floor: 79.9%)
+- [x] Docker-gated tests validated against a live daemon (4/4)
+- [x] Git Smart HTTP protocol validated end-to-end (push/clone/fetch)
 - [x] CHANGELOG updated
 - [x] GitHub release created (v0.3.3)
 
