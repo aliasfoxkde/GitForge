@@ -102,15 +102,20 @@ The following require a running integration environment:
 
 Ordered by value; each item states the concrete blocker.
 
-1. **cargo-vet audits** — the exemption backlog is 377 crates, dominated by
-   the russh/RustCrypto tree from the SSH transport rewrite; the RustCrypto
-   0.9/0.10-rc and russh 0.63 versions have no audits in any peer registry
-   yet because they are too new. Incremental path: `cargo vet suggest` for
-   the smallest diffs, `cargo vet inspect` + `certify` for honest
-   first-party reviews, and re-run `import` + `prune` as peer registries
-   pick the new versions up. Five applicable peer registries are now
-   registered and pinned (see the resolved item below), so pruning is
-   automatic once coverage exists.
+1. **cargo-vet audits** — the exemption backlog stands at 362 crates (79
+   fully audited), down from 377 after importing the zcash peer registry
+   and recording three publisher trusts our existing imports already vouch
+   for (dtolnay for proc-macro2 via isrg/mozilla/bytecode-alliance;
+   Manishearth for potential_utf and icu_normalizer_data via mozilla). The
+   remainder is dominated by the russh/RustCrypto tree from the SSH
+   transport rewrite; the RustCrypto 0.9/0.10-rc and russh 0.63 versions
+   have no audits in any peer registry yet because they are too new.
+   Incremental path: re-run `cargo vet suggest` (it names both
+   small-diff audits and trust candidates grounded in existing imports),
+   re-run `import` + `prune` as peer registries pick the new versions up,
+   and `cargo vet inspect` + `certify` only for diffs a human actually
+   reviewed. Six peer registries are registered and pinned in
+   `imports.lock`, so pruning is automatic once coverage exists.
 2. **Service entry-point coverage** — `main()` functions require TCP
    listeners, DB pools, and daemon connections; realistic aggregate ceiling
    with integration harnesses is ~85-90%, not 99%.
