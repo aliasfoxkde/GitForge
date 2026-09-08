@@ -186,7 +186,7 @@ async fn test_git_push_and_clone_over_smart_http() {
     run_git(&["push", "origin", "main"], &work, &[]);
     run_git(
         &["fetch", "origin"],
-        &clone_parent.join("cloned").as_path(),
+        clone_parent.join("cloned").as_path(),
         &[],
     );
 
