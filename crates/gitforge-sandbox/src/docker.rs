@@ -500,6 +500,11 @@ impl Sandbox for DockerSandbox {
                 } else {
                     None
                 },
+                env: if instance.workspace_path.is_some() {
+                    Some(workspace_git_env())
+                } else {
+                    None
+                },
                 ..Default::default()
             };
 
@@ -678,6 +683,21 @@ fn resolve_runner_uid_gid() -> Result<(u32, u32)> {
         .ok_or_else(|| Error::sandbox(format!("invalid GITFORGE_RUNNER_GID: {}", gid_raw)))?;
 
     Ok((uid, gid))
+}
+
+/// Git environment for workspace execs. The checkout is created on the host
+/// by the runner user but execs run as the container's root, so git refuses
+/// every operation with "detected dubious ownership in repository at
+/// '/workspace'" — which silently turned any pipeline step guarding with
+/// `|| true` (tag probes, version detection) into a no-op. Tell git this
+/// one mount is trusted; scoped to `/workspace` rather than `*` so it
+/// cannot leak meaning into repositories steps create themselves.
+fn workspace_git_env() -> Vec<&'static str> {
+    vec![
+        "GIT_CONFIG_COUNT=1",
+        "GIT_CONFIG_KEY_0=safe.directory",
+        "GIT_CONFIG_VALUE_0=/workspace",
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1419,6 +1439,18 @@ mod tests {
         let debug_str = format!("{:?}", instance);
         assert!(!debug_str.is_empty());
         sandbox.destroy(instance).await.unwrap();
+    }
+
+    /// Workspace execs must carry the git safe.directory config for the
+    /// `/workspace` mount, or git's dubious-ownership refusal silently
+    /// disables tag probes and other `|| true`-guarded git steps.
+    #[test]
+    fn workspace_git_env_marks_the_mount_trusted() {
+        let env = super::workspace_git_env();
+        assert!(env.contains(&"GIT_CONFIG_COUNT=1"));
+        assert!(env.contains(&"GIT_CONFIG_KEY_0=safe.directory"));
+        assert!(env.contains(&"GIT_CONFIG_VALUE_0=/workspace"));
+        assert_eq!(env.len(), 3);
     }
 
     /// Verify that `create_with_workspace` called with no path also produces
