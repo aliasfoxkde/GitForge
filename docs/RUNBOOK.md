@@ -279,7 +279,8 @@ capacity = 4
 | `GITFORGE_RUNNER_CAPACITY` | runner | 2 | Max concurrent jobs |
 | `GITFORGE_HEARTBEAT_INTERVAL` | runner | 30 | Heartbeat interval in seconds |
 | `GITFORGE_FETCH_INTERVAL` | runner | 5 | Job-poll interval in seconds |
-| `GITFORGE_SCHEDULER_TOKEN` | runner | _(none)_ | Bearer token for scheduler API |
+| `GITFORGE_SCHEDULER_TOKEN` | runner | _(none)_ | Bearer token for scheduler API. Required in compose: the scheduler rejects runner/operator requests when unset |
+| `GITFORGE_RUNNER_STANDALONE` | runner | `deny` | `deny` exits the runner when scheduler registration fails; `allow` falls back to standalone execution |
 | `SSH_PORT` | git-server | 42022 | SSH port |
 | `HTTP_PORT` | git-server | 42782 | HTTP port |
 

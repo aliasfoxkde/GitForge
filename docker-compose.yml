@@ -45,6 +45,9 @@ services:
     environment:
       - GITFORGE_DATABASE_URL=sqlite:/data/gitforge.db
       - RUST_LOG=info
+      # Scheduler API auth is fail-closed: runners cannot register, fetch, or
+      # complete jobs unless this shared credential is configured.
+      - GITFORGE_SCHEDULER_TOKEN=${GITFORGE_SCHEDULER_TOKEN:?set GITFORGE_SCHEDULER_TOKEN in .env}
     depends_on:
       - git-server
     networks:
@@ -67,6 +70,7 @@ services:
       - GITFORGE_SCHEDULER_URL=http://ci:42781
       - GITFORGE_RUNNER_NAME=docker-runner-1
       - GITFORGE_RUNNER_CAPACITY=4
+      - GITFORGE_SCHEDULER_TOKEN=${GITFORGE_SCHEDULER_TOKEN:?set GITFORGE_SCHEDULER_TOKEN in .env}
     depends_on:
       - ci
     networks:
@@ -110,6 +114,7 @@ services:
       - GITFORGE_SCHEDULER_URL=http://ci:42781
       - GITFORGE_RUNNER_NAME=docker-runner-2
       - GITFORGE_RUNNER_CAPACITY=2
+      - GITFORGE_SCHEDULER_TOKEN=${GITFORGE_SCHEDULER_TOKEN:?set GITFORGE_SCHEDULER_TOKEN in .env}
     depends_on:
       - ci
     networks:
