@@ -15,7 +15,7 @@ Repository state after audit:
 - **Dependency vetting**: cargo-vet initialized (`supply-chain/`); `make
   lint` no longer fails on a missing `cargo vet`
 - **Race Detection**: Fixed storage durability issue with `sync_all()` calls
-- **Coverage**: 83.01% lines (`cargo llvm-cov --all`; CI floor: 79.9%)
+- **Coverage**: 82.90% lines (`cargo llvm-cov --all`; CI floor: 79.9%)
 - **Aegis**: Integrated into CI (already present in security.yml)
 - **E2E**: Template framework exists in template-parts; GitForge has no web frontend
 
@@ -50,8 +50,8 @@ The following require a running integration environment:
 
 | Item | Blocked By | Workaround |
 |------|------------|------------|
-| Service entry point coverage | TCP listeners, DB pools | Integration test suite |
-| 99% coverage on main.rs | Full infra required | Not achievable in unit tests |
+| gitforge-runner/executor coverage | Live Docker daemon required | `#[ignore]` integration tests pass against a live daemon (see below) |
+| 99% coverage on main.rs | Full infra required | Not achievable; the spawned-binary harnesses for git-server and ci lifted main.rs to 69%/83.5% lines respectively |
 
 ### Previously Blocked, Now Passing (2026-09-08)
 
@@ -89,15 +89,15 @@ The following require a running integration environment:
 ### Low Coverage (<70%) - Entry Points
 | Crate | Lines | Issue |
 |-------|-------|-------|
-| services/ci | 64.08% | main() loop exercised only by the compose smoke |
 | gitforge-runner/executor | 32.45% | Container execution requires Docker (`#[ignore]` tests) |
 | gitforge-build/daemon | 21.82% | Integration-only code |
 | gitforge-ai | 7-58% | API mocking needed |
 
 (2026-09-08 re-measurement, `cargo llvm-cov --all`: workspace total
-83.01% lines. services/git-server left this table's sub-30% bucket after
+82.90% lines. services/git-server left this table's sub-30% bucket after
 its protocol harnesses were made coverage-visible: main.rs 69.43%,
-ssh_server.rs 85.64%.)
+ssh_server.rs 85.64%; services/ci followed at 83.54% once its
+spawned-binary trigger harness landed.)
 
 ## Remaining Gaps and Next Steps (2026-09-08)
 
@@ -117,17 +117,6 @@ Ordered by value; each item states the concrete blocker.
    and `cargo vet inspect` + `certify` only for diffs a human actually
    reviewed. Six peer registries are registered and pinned in
    `imports.lock`, so pruning is automatic once coverage exists.
-2. **Service entry-point coverage** — largely measured now (see the
-   resolved ledger below): the git-server protocol harnesses always
-   exercised the entry point, but the coverage tool discarded their data
-   because the tests stopped the spawned server with SIGKILL, which never
-   flushes the child's LLVM profile. Stopping it with SIGTERM (the real
-   graceful-shutdown path) made the measurement honest: git-server went
-   from ~24% to 75.81% lines (main.rs 69.43%, ssh_server.rs 85.64%), and
-   the workspace from 81.19% to 83.01%. What remains is services/ci
-   (`main.rs`, 64.08% lines — exercised only by the out-of-band compose
-   smoke) and gitforge-runner/executor (32.45% — Docker-gated, covered by
-   the `#[ignore]` live-daemon tests that CI does not run).
 
 ## Resolved from the Remaining-Gaps Ledger (2026-09-08)
 
@@ -178,10 +167,27 @@ Ordered by value; each item states the concrete blocker.
    full SSH handshakes through it. Both suites now stop the server with
    SIGTERM via `tests/common/mod.rs::shutdown_gracefully` — the real
    graceful-shutdown path, with a SIGKILL fallback after 10s so tests
-   never hang — which counts the child's coverage: main.rs 22.51% →
-   69.43% lines, ssh_server.rs 26.44% → 85.64%, workspace 81.19% →
-   83.01% lines. Lesson recorded: a spawned-instrumented binary only
-   reports coverage on a clean exit.
+   never hang — which counts the child's coverage: main.rs 23.83% →
+   69.43% lines, ssh_server.rs 22.07% → 85.64%. Lesson recorded: a
+   spawned-instrumented binary only reports coverage on a clean exit.
+5. **Service entry-point coverage, ci** — done. A new spawned-binary
+   harness (`services/ci/tests/ci_trigger_flow.rs`) boots the real `ci`
+   service against a temporary SQLite database, bare git repository with
+   a committed `.gitforce.yml`, workspace root, and artifact root, then
+   drives the same HTTP trigger endpoint the git-server calls after a
+   push: it asserts the trigger token is required (401 without), the run
+   is created and reported synchronously (202 `accepted` with the run
+   id), the run and job rows are durable in the database the service
+   wrote, the job's commands and image come from the committed
+   definition rather than a substituted default, and the workspace is a
+   real clone checked out at the pushed commit. The service is stopped
+   with the same SIGTERM graceful-shutdown helper, so the consumer loops
+   and startup path are counted. services/ci `main.rs` went from
+   64.08% to 83.54% lines, and the workspace from 79.63% to 82.90%
+   lines. What remains below the CI floor's reach is inherent:
+   gitforge-runner/executor (32.45% lines) executes containers and is
+   covered by the `#[ignore]` tests that pass against a live Docker
+   daemon.
 
 ## Resolved from the Compose Smoke (2026-09-08)
 

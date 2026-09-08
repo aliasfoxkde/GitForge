@@ -511,6 +511,7 @@ dependencies = [
  "gitforge-process",
  "gitforge-scheduler",
  "gitforge-storage",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
