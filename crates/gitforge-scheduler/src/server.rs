@@ -149,7 +149,6 @@ pub fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
         .route("/jobs/{id}/artifacts", post(upload_job_artifact))
         .layer(DefaultBodyLimit::max(MAX_ARTIFACT_BYTES as usize))
         .route("/jobs/{id}/cancelled", get(job_cancelled))
-        .route("/jobs/{id}/assign", post(assign_job))
         .route("/jobs/{id}/complete", post(complete_job))
         .layer(middleware::from_fn(move |request, next: Next| {
             require_scheduler_auth(request, next, runner_auth_token.clone(), "runner")
@@ -825,44 +824,10 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Assign a job to a runner (runner claims a job)
-async fn assign_job(
-    State(_state): State<SchedulerServerState>,
-    Path(job_id): Path<String>,
-    Json(request): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let job_id: JobId = match Uuid::parse_str(&job_id) {
-        Ok(id) => JobId::from(id),
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid_job_id",
-                    "message": "Invalid job ID format"
-                })),
-            )
-        }
-    };
-
-    let runner_id: Option<RunnerId> = request["runner_id"]
-        .as_str()
-        .and_then(|s| Uuid::parse_str(s).ok().map(RunnerId::from));
-
-    if let Some(r_id) = runner_id {
-        // In real impl, mark job as assigned to this runner
-        tracing::info!("job {} assigned to runner {} via HTTP", job_id, r_id);
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "assigned",
-            "job_id": job_id.to_string()
-        })),
-    )
-}
-
-/// Complete a job
+/// Complete a job. Completion requires lease proof: the runner identity and
+/// the lease token issued when the scheduler assigned the job. There is no
+/// anonymous completion path — an unauthenticated completion would let any
+/// runner finalize a job it was never assigned.
 async fn complete_job(
     State(state): State<SchedulerServerState>,
     Path(job_id): Path<String>,
@@ -890,13 +855,6 @@ async fn complete_job(
         .map(RunnerId::from);
     let lease_token = request["lease_token"].as_str();
 
-    tracing::info!(
-        "job {} completed via HTTP: success={}, exit_code={}",
-        job_id,
-        success,
-        exit_code
-    );
-
     let receipt = serde_json::json!({
         "job_id": job_id.to_string(),
         "success": success,
@@ -907,6 +865,13 @@ async fn complete_job(
     })
     .to_string();
 
+    if !state.scheduler.job_exists(job_id).await {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "job_not_found", "job_id": job_id.to_string()})),
+        );
+    }
+
     let assigned_runner = state.scheduler.is_assigned(job_id).await;
     let completion = match (runner_id, lease_token, assigned_runner) {
         (Some(runner_id), Some(lease_token), Some(_)) => {
@@ -914,11 +879,6 @@ async fn complete_job(
                 .scheduler
                 .complete_job_with_lease(job_id, runner_id, lease_token, success, receipt)
                 .await
-        }
-        (None, None, None) => {
-            // Preserve the synthetic no-database handler behavior used by
-            // legacy callers/tests. Real assigned jobs must use a lease.
-            state.scheduler.complete_job(job_id, success, receipt).await
         }
         _ => Err(anyhow::anyhow!("runner_id and lease_token are required")),
     };
@@ -932,6 +892,13 @@ async fn complete_job(
             })),
         );
     }
+
+    tracing::info!(
+        "job {} completed via HTTP: success={}, exit_code={}",
+        job_id,
+        success,
+        exit_code
+    );
 
     (
         StatusCode::OK,
@@ -1289,77 +1256,92 @@ mod tests {
         assert_status(response, StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn test_assign_job_valid_uuid() {
+    /// Register a runner, enqueue one job, and drive scheduler assignment so
+    /// the job carries a live lease. Returns everything needed to complete it.
+    async fn assigned_job_with_lease(
+        name: &str,
+    ) -> (SchedulerServerState, JobId, RunnerId, String) {
         let scheduler = crate::Scheduler::new();
-        let state = create_state(scheduler);
-        let job_id = uuid::Uuid::new_v4();
-        let runner_id = uuid::Uuid::new_v4();
-
-        let response = assign_job(
-            axum::extract::State(state),
-            axum::extract::Path(job_id.to_string()),
-            axum::Json(serde_json::json!({
-                "runner_id": runner_id.to_string()
-            })),
-        )
-        .await;
-
-        assert_status(response.into_response(), StatusCode::OK);
+        let runner = Runner::new(name.to_string(), RunnerType::Docker, 1);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                gitforge_common::PipelineRunId::new(),
+                gitforge_common::RepoId::new(),
+                vec!["/bin/true".to_string()],
+                None,
+            )
+            .await;
+        scheduler.process_queue().await;
+        let lease_token = scheduler
+            .ensure_job_lease(job_id)
+            .await
+            .expect("assigned job must have a lease");
+        (create_state(scheduler), job_id, runner_id, lease_token)
     }
 
     #[tokio::test]
-    async fn test_assign_job_invalid_uuid() {
-        let scheduler = crate::Scheduler::new();
-        let state = create_state(scheduler);
-
-        let response = assign_job(
+    async fn test_complete_job_unknown_job_is_not_found() {
+        let state = create_state(crate::Scheduler::new());
+        let response = complete_job(
             axum::extract::State(state),
-            axum::extract::Path("not-a-uuid".to_string()),
-            axum::Json(serde_json::json!({
-                "runner_id": "something"
-            })),
+            axum::extract::Path(JobId::new().to_string()),
+            axum::Json(serde_json::json!({"success": true})),
         )
         .await;
+        assert_status(response.into_response(), StatusCode::NOT_FOUND);
+    }
 
-        assert_status(response.into_response(), StatusCode::BAD_REQUEST);
+    #[tokio::test]
+    async fn test_complete_job_without_lease_proof_is_rejected() {
+        let (state, job_id, _runner_id, _lease) = assigned_job_with_lease("no-lease-runner").await;
+        // Assigned job, but the completion carries no runner identity or
+        // lease: this must never finalize the job.
+        let response = complete_job(
+            axum::extract::State(state),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(serde_json::json!({"success": true})),
+        )
+        .await;
+        assert_status(response.into_response(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
     async fn test_complete_job_success_handler() {
-        let scheduler = crate::Scheduler::new();
-        let state = create_state(scheduler);
-        let job_id = uuid::Uuid::new_v4();
-
+        let (state, job_id, runner_id, lease) = assigned_job_with_lease("success-runner").await;
         let response = complete_job(
-            axum::extract::State(state),
+            axum::extract::State(state.clone()),
             axum::extract::Path(job_id.to_string()),
             axum::Json(serde_json::json!({
+                "runner_id": runner_id.to_string(),
+                "lease_token": lease,
                 "success": true
             })),
         )
         .await;
-
         assert_status(response.into_response(), StatusCode::OK);
+        assert_eq!(state.scheduler.is_assigned(job_id).await, None);
     }
 
     #[tokio::test]
     async fn test_complete_job_failure_handler() {
-        let scheduler = crate::Scheduler::new();
-        let state = create_state(scheduler);
-        let job_id = uuid::Uuid::new_v4();
-
+        let (state, job_id, runner_id, lease) = assigned_job_with_lease("failure-runner").await;
         let response = complete_job(
-            axum::extract::State(state),
+            axum::extract::State(state.clone()),
             axum::extract::Path(job_id.to_string()),
             axum::Json(serde_json::json!({
+                "runner_id": runner_id.to_string(),
+                "lease_token": lease,
                 "success": false,
                 "error": "test error"
             })),
         )
         .await;
-
         assert_status(response.into_response(), StatusCode::OK);
+        assert_eq!(state.scheduler.is_assigned(job_id).await, None);
     }
 
     #[tokio::test]
