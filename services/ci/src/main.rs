@@ -26,7 +26,7 @@ use gitforge_scheduler::{
     create_state_with_artifact_storage, scheduler_routes, Scheduler, SchedulerEvent,
 };
 use gitforge_storage::FileStorage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,24 +83,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("GITFORGE_DATABASE_URL is unset; scheduler state is in-memory only");
         (Scheduler::new(), None)
     };
-
-    // Recover runs stranded non-terminal by a previous process lifetime, then
-    // reclaim workspaces of already-terminal runs. Spawned so a large sweep
-    // cannot delay startup; it only ever touches run-owned directories of
-    // terminal runs, never the checkout of a run the scheduler may requeue.
-    if let Some(pool) = &scheduler_db {
-        let sweep_pool = pool.clone();
-        tokio::spawn(async move {
-            let finalized = reconcile_orphaned_runs(&sweep_pool).await;
-            if finalized > 0 {
-                tracing::info!(finalized, "startup run reconciliation complete");
-            }
-            let removed = sweep_terminal_workspaces(&sweep_pool).await;
-            if removed > 0 {
-                tracing::info!(removed, "startup workspace sweep complete");
-            }
-        });
-    }
 
     // Start scheduler HTTP API server on port 42781
     let scheduler_port: u16 = std::env::var("SCHEDULER_PORT")
@@ -163,6 +145,29 @@ async fn main() -> anyhow::Result<()> {
     let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let pipeline_registry_clone = pipeline_registry.clone();
+
+    // Recover runs stranded non-terminal by a previous process lifetime,
+    // reclaim workspaces of already-terminal runs, then keep reconciling
+    // periodically so runs stranded while running are finalized without
+    // waiting for the next restart. Spawned so a large sweep cannot delay
+    // startup; reconciliation only touches runs no live engine owns, and
+    // the sweep only ever touches run-owned directories of terminal runs,
+    // never the checkout of a run the scheduler may requeue.
+    if let Some(pool) = &scheduler_db {
+        let sweep_pool = pool.clone();
+        let reconcile_registry = pipeline_registry.clone();
+        tokio::spawn(async move {
+            let finalized = reconcile_orphaned_runs(&sweep_pool).await;
+            if finalized > 0 {
+                tracing::info!(finalized, "startup run reconciliation complete");
+            }
+            let removed = sweep_terminal_workspaces(&sweep_pool).await;
+            if removed > 0 {
+                tracing::info!(removed, "startup workspace sweep complete");
+            }
+            run_reconciliation_loop(sweep_pool, reconcile_registry).await;
+        });
+    }
 
     // Shared shutdown flag
     let shutdown = create_shutdown_flag();
@@ -778,7 +783,30 @@ async fn remove_run_workspace_dir(
 /// exists to observe their completion. Runs with unfinished jobs are left
 /// alone — scheduler recovery still owns those. Returns the number of runs
 /// finalized.
-async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
+/// How often the control plane re-runs orphaned-run reconciliation while
+/// running. The startup pass handles damage from a previous process
+/// lifetime; this loop handles runs stranded while the process is up, for
+/// example when a scheduler restart invalidates leases and completions are
+/// rejected until every job of the run turns terminal.
+const RECONCILE_INTERVAL_SECS: u64 = 60;
+
+/// Grace window for the periodic reconciliation. The push handler creates
+/// the durable run row before it prepares the workspace, registers the
+/// engine, and enqueues jobs, so a freshly created jobless run is not
+/// orphaned yet and must not be cancelled by a concurrent pass.
+const RECONCILE_MIN_RUN_AGE_SECS: i64 = 120;
+
+/// Finalize non-terminal runs whose jobs are all terminal. `live_run_ids`
+/// and `min_age` guard the periodic pass against racing the push handler:
+/// a run with a registered engine still belongs to that engine, and a run
+/// younger than the grace window may not have its engine registered yet.
+/// The startup pass passes an empty set and a zero window because nothing
+/// can be mid-trigger while the process is starting.
+async fn reconcile_orphaned_runs_filtered(
+    pool: &gitforge_db::Pool,
+    live_run_ids: &HashSet<gitforge_common::PipelineRunId>,
+    min_age: chrono::Duration,
+) -> usize {
     let runs = match gitforge_db::queries::PipelineRunQueries::list(pool).await {
         Ok(runs) => runs,
         Err(error) => {
@@ -793,6 +821,12 @@ async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
             run.status.as_str(),
             "succeeded" | "failed" | "cancelled" | "timed_out" | "timeout" | "timed-out"
         ) {
+            continue;
+        }
+        if live_run_ids.contains(&run.id) {
+            continue;
+        }
+        if Utc::now() - run.created_at < min_age {
             continue;
         }
         let jobs = gitforge_db::queries::JobQueries::list_by_run(pool, run.id)
@@ -824,6 +858,36 @@ async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
         }
     }
     finalized
+}
+
+async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
+    reconcile_orphaned_runs_filtered(pool, &HashSet::new(), chrono::Duration::zero()).await
+}
+
+/// Re-run reconciliation on an interval so runs stranded while the control
+/// plane is up are finalized without waiting for the next restart. Runs
+/// owned by a live engine and runs still inside the creation grace window
+/// are never touched.
+async fn run_reconciliation_loop(
+    pool: gitforge_db::Pool,
+    pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(RECONCILE_INTERVAL_SECS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let live_run_ids: HashSet<gitforge_common::PipelineRunId> =
+            pipeline_registry.read().await.keys().copied().collect();
+        let finalized = reconcile_orphaned_runs_filtered(
+            &pool,
+            &live_run_ids,
+            chrono::Duration::seconds(RECONCILE_MIN_RUN_AGE_SECS),
+        )
+        .await;
+        if finalized > 0 {
+            tracing::info!(finalized, "periodic run reconciliation complete");
+        }
+    }
 }
 
 /// Remove workspaces left behind by runs that are already terminal — for
@@ -1963,6 +2027,55 @@ mod tests {
 
         // Reconciliation is idempotent: a second pass finds nothing stranded.
         assert_eq!(reconcile_orphaned_runs(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_periodic_reconciliation_skips_live_and_fresh_runs() {
+        // Each guard gets its own pool so scenarios cannot observe each
+        // other's runs.
+
+        // Grace guard: a jobless run inside the creation window belongs to a
+        // push handler that has not registered its engine or enqueued yet.
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        let fresh_run = seed_run(&pool, repo_id, pipeline_id, "queued").await;
+        let finalized = reconcile_orphaned_runs_filtered(
+            &pool,
+            &HashSet::new(),
+            chrono::Duration::seconds(RECONCILE_MIN_RUN_AGE_SECS),
+        )
+        .await;
+        assert_eq!(
+            finalized, 0,
+            "runs inside the grace window are not orphaned"
+        );
+        assert_eq!(run_status(&pool, fresh_run).await, "queued");
+        drop(pool);
+
+        // Live-engine guard: a run whose engine is registered is never
+        // touched, even when all of its jobs are already terminal.
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        let live_run = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, live_run, "lint", "succeeded").await;
+        let live: HashSet<gitforge_common::PipelineRunId> = [live_run].into_iter().collect();
+        let finalized =
+            reconcile_orphaned_runs_filtered(&pool, &live, chrono::Duration::zero()).await;
+        assert_eq!(finalized, 0, "runs with a live engine are not orphaned");
+        assert_eq!(run_status(&pool, live_run).await, "running");
+        drop(pool);
+
+        // Outside both guards the periodic pass finalizes the orphan.
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        let stale_run = seed_run(&pool, repo_id, pipeline_id, "queued").await;
+        let finalized = reconcile_orphaned_runs_filtered(
+            &pool,
+            &HashSet::new(),
+            // A negative window treats every run as older than the grace
+            // period, standing in for a run created long before this pass.
+            chrono::Duration::seconds(-1),
+        )
+        .await;
+        assert_eq!(finalized, 1, "the stale jobless orphan is cancelled");
+        assert_eq!(run_status(&pool, stale_run).await, "cancelled");
     }
 
     #[tokio::test]
