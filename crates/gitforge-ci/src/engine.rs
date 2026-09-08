@@ -242,16 +242,19 @@ impl CiEngine {
         let mut state = self.state.write().await;
         if let Some(job_state) = state.jobs.get_mut(&job_id) {
             job_state.fail(exit_code, error)?;
-
-            // A failed job dooms the pipeline, but the terminal status waits
-            // for every job to finish: siblings may still be executing in
-            // the run workspace, and finalizing here would fence off their
-            // completions ("unknown pipeline run") and delete the checkout
-            // out from under their containers.
-            if state.all_jobs_finished() {
-                state.status = PipelineStatus::Failed;
-                state.finished_at = Some(chrono::Utc::now());
-            }
+        }
+        // Everything downstream of the failure can never run; cancelling it
+        // keeps the run able to reach a terminal state (see
+        // `cancel_descendants`).
+        self.cancel_descendants(&mut state, job_id);
+        // A failed job dooms the pipeline, but the terminal status waits
+        // for every job to finish: siblings may still be executing in
+        // the run workspace, and finalizing here would fence off their
+        // completions ("unknown pipeline run") and delete the checkout
+        // out from under their containers.
+        if state.all_jobs_finished() {
+            state.status = PipelineStatus::Failed;
+            state.finished_at = Some(chrono::Utc::now());
         }
         Ok(())
     }
@@ -261,15 +264,40 @@ impl CiEngine {
         let mut state = self.state.write().await;
         if let Some(job_state) = state.jobs.get_mut(&job_id) {
             job_state.timeout()?;
-
-            // Same reasoning as `fail_job`: wait for all jobs to finish
-            // before declaring the pipeline failed.
-            if state.all_jobs_finished() {
-                state.status = PipelineStatus::Failed;
-                state.finished_at = Some(chrono::Utc::now());
-            }
+        }
+        self.cancel_descendants(&mut state, job_id);
+        // Same reasoning as `fail_job`: wait for all jobs to finish
+        // before declaring the pipeline failed.
+        if state.all_jobs_finished() {
+            state.status = PipelineStatus::Failed;
+            state.finished_at = Some(chrono::Utc::now());
         }
         Ok(())
+    }
+
+    /// Cancel every job that transitively depends on `failed`. They can
+    /// never be scheduled (`ready_jobs` requires succeeded dependencies),
+    /// and leaving them `Pending` would keep the pipeline non-terminal
+    /// forever — never failed, never finalized, workspace never freed.
+    /// Unrelated branches of the DAG are untouched and still run.
+    fn cancel_descendants(&self, state: &mut CiEngineState, failed: JobId) {
+        let mut doomed: Vec<JobId> = Vec::new();
+        let mut frontier = vec![failed];
+        while let Some(id) = frontier.pop() {
+            for node in &self.graph.nodes {
+                if node.dependencies.contains(&id) && !doomed.contains(&node.id) {
+                    doomed.push(node.id);
+                    frontier.push(node.id);
+                }
+            }
+        }
+        for id in doomed {
+            if let Some(job_state) = state.jobs.get_mut(&id) {
+                if !job_state.is_terminal() {
+                    job_state.cancel().ok();
+                }
+            }
+        }
     }
 
     /// Cancel a specific job
@@ -470,6 +498,56 @@ mod tests {
         let state = engine.state().await;
         assert_eq!(state.status, PipelineStatus::Failed);
         assert!(state.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_engine_fail_cancels_descendants() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+
+        // build -> test: failing build must cancel test, otherwise the run
+        // can never reach a terminal state and its workspace leaks.
+        let mut chain = make_pipeline();
+        chain.jobs.push(JobDefinition {
+            name: "deploy".to_string(),
+            image: "rust:latest".to_string(),
+            needs: vec!["test".to_string()],
+            env: HashMap::new(),
+            steps: vec![StepDefinition {
+                name: "deploy".to_string(),
+                run: "echo deploy".to_string(),
+                env: None,
+                working_directory: None,
+                condition: None,
+            }],
+            timeout: None,
+            retry: None,
+        });
+
+        let engine = CiEngine::new(event, chain).await.unwrap();
+        engine.start().await.unwrap();
+
+        let ready = engine.ready_jobs().await;
+        assert_eq!(ready.len(), 1);
+        let runner_id = gitforge_common::RunnerId::new();
+        engine.assign_job(ready[0], runner_id).await.unwrap();
+        engine.start_job(ready[0]).await.unwrap();
+        engine
+            .fail_job(ready[0], 1, "build exploded".to_string())
+            .await
+            .unwrap();
+
+        let state = engine.state().await;
+        assert_eq!(state.status, PipelineStatus::Failed);
+        assert!(state.finished_at.is_some());
+        assert_eq!(state.jobs.len(), 3);
+        for job in state.jobs.values() {
+            assert!(job.is_terminal(), "job {:?} left non-terminal", job.status());
+        }
     }
 
     #[tokio::test]
