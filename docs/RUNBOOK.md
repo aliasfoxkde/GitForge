@@ -138,10 +138,15 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 | `GITFORGE_HEARTBEAT_INTERVAL` | No | `30` | Heartbeat interval in seconds |
 | `GITFORGE_FETCH_INTERVAL` | No | `5` | Job-poll interval in seconds |
 | `GITFORGE_SCHEDULER_TOKEN` | No | _(none)_ | Bearer token for scheduler API authentication |
+| `GITFORGE_REGISTER_ATTEMPTS` | No | `6` | Registration attempts before giving up when the scheduler is unreachable |
+| `GITFORGE_REGISTER_BACKOFF_SECS` | No | `1` | Initial registration retry delay; doubles per attempt up to 30s |
 
 > **Startup behavior**: If `GITFORGE_SCHEDULER_URL` is missing or empty, the runner exits immediately
 > with a clear error message. Invalid values for numeric variables (non-integer) also cause a fast
-> failure. Safe defaults apply to all optional variables when they are unset.
+> failure. Safe defaults apply to all optional variables when they are unset. When the scheduler is
+> merely unreachable or answering 503, registration retries up to `GITFORGE_REGISTER_ATTEMPTS`
+> times with exponential backoff before the fail-closed exit; credential rejections (401/403) are
+> never retried.
 
 ## Docker Compose
 
@@ -301,6 +306,8 @@ capacity = 4
 | `GITFORGE_FETCH_INTERVAL` | runner | 5 | Job-poll interval in seconds |
 | `GITFORGE_SCHEDULER_TOKEN` | runner | _(none)_ | Bearer token for scheduler API. Required in compose: the scheduler rejects runner/operator requests when unset |
 | `GITFORGE_RUNNER_STANDALONE` | runner | `deny` | `deny` exits the runner when scheduler registration fails; `allow` falls back to standalone execution |
+| `GITFORGE_REGISTER_ATTEMPTS` | runner | `6` | Registration attempts against an unreachable scheduler before giving up |
+| `GITFORGE_REGISTER_BACKOFF_SECS` | runner | `1` | Initial registration backoff; doubles per failed attempt up to a 30s cap. Auth rejections (401/403) are never retried |
 | `SSH_PORT` | git-server | 42022 | SSH port |
 | `HTTP_PORT` | git-server | 42782 | HTTP port |
 | `GITFORGE_SSH_HOST_KEY` | git-server | `$HOME/.ssh/gitforge_host_ed25519` | ed25519 host key path; generated on first boot, persisted on the `ssh-data` volume, published as `.pub` for `known_hosts` pinning |

@@ -39,6 +39,11 @@ All notable changes to GitForge will be documented in this file.
   artifact, and completion reporting once its outcome was decided
   mid-execution, and credentialed completions for unassigned jobs are
   rejected 409 with an explicit orphaned-outcome message
+- Runner registration retries an unreachable or not-ready scheduler with
+  bounded exponential backoff (`GITFORGE_REGISTER_ATTEMPTS`, default 6;
+  `GITFORGE_REGISTER_BACKOFF_SECS`, default 1s, doubling to a 30s cap) so a
+  runner started beside a restarting control plane survives the compose race
+  instead of exiting; auth rejections (401/403) are never retried
 - ShellCheck and actionlint gates in Rust CI and `make lint`
 - cargo-vet supply chain (`supply-chain/`) behind `make lint`
 

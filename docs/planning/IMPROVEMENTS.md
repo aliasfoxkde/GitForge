@@ -102,20 +102,30 @@ The following require a running integration environment:
 
 Ordered by value; each item states the concrete blocker.
 
-1. **Runner registration retry/backoff** — fail-closed currently exits the
-   process; bounded retry with backoff before exiting would tolerate a
-   scheduler that is briefly unavailable at runner start.
-2. **cargo-vet audits** — `supply-chain/` currently exempts 364 transitive
+1. **cargo-vet audits** — `supply-chain/` currently exempts 364 transitive
    crates. Run `cargo vet suggest`/`cargo vet fetch` incrementally to move
    high-risk deps from exemption to audited.
-3. **Service entry-point coverage** — `main()` functions require TCP
+2. **Service entry-point coverage** — `main()` functions require TCP
    listeners, DB pools, and daemon connections; realistic aggregate ceiling
    with integration harnesses is ~85-90%, not 99%.
-4. **Per-user SSH key authorization** — SSH public keys are accepted by
+3. **Per-user SSH key authorization** — SSH public keys are accepted by
    possession (any key authenticates), matching the unauthenticated Smart
    HTTP transport. A per-user key registry (schema + API + enforcement in
    `GitSshSession::auth_publickey`) would make SSH strictly
    stronger than HTTP. Accepted fingerprints are logged today.
+
+## Resolved from the Remaining-Gaps Ledger (2026-09-08)
+
+1. **Runner registration retry/backoff** — done. `RunnerAgent::register`
+   retries an unreachable or 503-answering scheduler with bounded
+   exponential backoff (`GITFORGE_REGISTER_ATTEMPTS`, default 6;
+   `GITFORGE_REGISTER_BACKOFF_SECS`, default 1s, doubling to a 30s cap)
+   before honoring the fail-closed exit. Auth rejections (401/403) are
+   fatal on the first attempt and other non-503 statuses are never retried;
+   standalone fallback still requires `GITFORGE_RUNNER_STANDALONE=allow`.
+   Covered by real-socket tests: 503/503/201 retry-then-succeed with
+   connection counting, single-attempt auth rejection, exhausted transport
+   errors, and the policy-rejection allow/deny matrix. Accepted fingerprints are logged today.
 
 ## Resolved from the Compose Smoke (2026-09-08)
 

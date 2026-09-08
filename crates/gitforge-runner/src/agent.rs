@@ -33,10 +33,33 @@ pub struct RunnerConfig {
     pub fetch_interval_secs: u64,
     /// Bearer token used for scheduler service authentication.
     pub scheduler_token: Option<String>,
+    /// Registration attempts against an unreachable scheduler before giving
+    /// up. Covers the compose race where a runner starts before the
+    /// scheduler's listener is up.
+    pub register_attempts: u32,
+    /// Initial delay in seconds between registration attempts. Doubles after
+    /// every failed attempt up to [`REGISTER_BACKOFF_CAP_SECS`].
+    pub register_backoff_secs: u64,
     /// Whether registration failure may fall back to standalone execution.
     /// Defaults to `false`: a runner that cannot register exits instead of
     /// appearing healthy while it can never receive scheduler jobs.
     pub allow_standalone: bool,
+}
+
+/// Upper bound for the exponential registration backoff.
+const REGISTER_BACKOFF_CAP_SECS: u64 = 30;
+
+/// Sleep out one registration backoff step, doubling the delay for the next
+/// attempt. A zero delay (used by tests) stays zero.
+async fn wait_registration_backoff(backoff: &mut u64) {
+    tokio::time::sleep(Duration::from_secs(*backoff)).await;
+    *backoff = next_registration_backoff(*backoff);
+}
+
+/// Compute the next registration backoff step: double the current delay,
+/// capped at [`REGISTER_BACKOFF_CAP_SECS`].
+fn next_registration_backoff(current: u64) -> u64 {
+    current.saturating_mul(2).min(REGISTER_BACKOFF_CAP_SECS)
 }
 
 impl fmt::Debug for RunnerConfig {
@@ -53,6 +76,8 @@ impl fmt::Debug for RunnerConfig {
                 "scheduler_token",
                 &self.scheduler_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("register_attempts", &self.register_attempts)
+            .field("register_backoff_secs", &self.register_backoff_secs)
             .field("allow_standalone", &self.allow_standalone)
             .finish()
     }
@@ -70,6 +95,8 @@ impl Default for RunnerConfig {
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
             scheduler_token: None,
+            register_attempts: 6,
+            register_backoff_secs: 1,
             allow_standalone: false,
         }
     }
@@ -87,6 +114,8 @@ impl RunnerConfig {
     /// - `GITFORGE_HEARTBEAT_INTERVAL` (optional, default: `30`)
     /// - `GITFORGE_FETCH_INTERVAL` (optional, default: `5`)
     /// - `GITFORGE_SCHEDULER_TOKEN` (optional, default: `None`)
+    /// - `GITFORGE_REGISTER_ATTEMPTS` (optional, default: `6`)
+    /// - `GITFORGE_REGISTER_BACKOFF_SECS` (optional, default: `1`)
     ///
     /// # Errors
     ///
@@ -104,6 +133,8 @@ impl RunnerConfig {
         let mut heartbeat_interval_secs: Option<u64> = None;
         let mut fetch_interval_secs: Option<u64> = None;
         let mut scheduler_token: Option<Option<String>> = None;
+        let mut register_attempts: Option<u32> = None;
+        let mut register_backoff_secs: Option<u64> = None;
         let mut allow_standalone: Option<bool> = None;
 
         for (key, value) in iter {
@@ -177,6 +208,40 @@ impl RunnerConfig {
                         Some(v.to_string())
                     });
                 }
+                "GITFORGE_REGISTER_ATTEMPTS" => {
+                    let v = value.trim();
+                    if !v.is_empty() {
+                        let parsed: i64 = v.parse().map_err(|_| {
+                            Error::invalid_input(
+                                "GITFORGE_REGISTER_ATTEMPTS must be a valid integer",
+                            )
+                        })?;
+                        if parsed <= 0 {
+                            return Err(Error::invalid_input(format!(
+                                "GITFORGE_REGISTER_ATTEMPTS must be a positive integer (got {})",
+                                parsed
+                            )));
+                        }
+                        register_attempts = Some(parsed as u32);
+                    }
+                }
+                "GITFORGE_REGISTER_BACKOFF_SECS" => {
+                    let v = value.trim();
+                    if !v.is_empty() {
+                        let parsed: i64 = v.parse().map_err(|_| {
+                            Error::invalid_input(
+                                "GITFORGE_REGISTER_BACKOFF_SECS must be a valid integer",
+                            )
+                        })?;
+                        if parsed < 0 {
+                            return Err(Error::invalid_input(format!(
+                                "GITFORGE_REGISTER_BACKOFF_SECS must not be negative (got {})",
+                                parsed
+                            )));
+                        }
+                        register_backoff_secs = Some(parsed as u64);
+                    }
+                }
                 "GITFORGE_RUNNER_STANDALONE" => {
                     let v = value.trim().to_ascii_lowercase();
                     if !v.is_empty() {
@@ -212,6 +277,8 @@ impl RunnerConfig {
             heartbeat_interval_secs: heartbeat_interval_secs.unwrap_or(30),
             fetch_interval_secs: fetch_interval_secs.unwrap_or(5),
             scheduler_token: scheduler_token.unwrap_or(None),
+            register_attempts: register_attempts.unwrap_or(6),
+            register_backoff_secs: register_backoff_secs.unwrap_or(1),
             allow_standalone: allow_standalone.unwrap_or(false),
         })
     }
@@ -532,6 +599,98 @@ mod config_tests {
             "unexpected error: {err}"
         );
     }
+
+    // ── GITFORGE_REGISTER_ATTEMPTS / GITFORGE_REGISTER_BACKOFF_SECS ─────────
+
+    #[test]
+    fn test_parse_registration_retry_defaults() {
+        let cfg = RunnerConfig::parse_from_iter(env([(
+            "GITFORGE_SCHEDULER_URL",
+            Some("http://localhost:42781"),
+        )]))
+        .unwrap();
+        assert_eq!(cfg.register_attempts, 6);
+        assert_eq!(cfg.register_backoff_secs, 1);
+    }
+
+    #[test]
+    fn test_parse_registration_retry_overrides() {
+        let cfg = RunnerConfig::parse_from_iter(env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_REGISTER_ATTEMPTS", Some("10")),
+            ("GITFORGE_REGISTER_BACKOFF_SECS", Some("4")),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.register_attempts, 10);
+        assert_eq!(cfg.register_backoff_secs, 4);
+    }
+
+    #[test]
+    fn test_parse_registration_attempts_rejects_zero_and_negative() {
+        for bad in ["0", "-1"] {
+            let err = RunnerConfig::parse_from_iter(env([
+                ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+                ("GITFORGE_REGISTER_ATTEMPTS", Some(bad)),
+            ]))
+            .expect_err("non-positive attempts must fail");
+            assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+            assert!(err_contains(&err, "GITFORGE_REGISTER_ATTEMPTS"), "{err}");
+            assert!(err_contains(&err, "positive integer"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_registration_attempts_rejects_non_numeric() {
+        let err = RunnerConfig::parse_from_iter(env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_REGISTER_ATTEMPTS", Some("many")),
+        ]))
+        .expect_err("non-numeric attempts must fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+        assert!(err_contains(&err, "GITFORGE_REGISTER_ATTEMPTS"), "{err}");
+        assert!(err_contains(&err, "valid integer"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_registration_backoff_rejects_negative_and_non_numeric() {
+        for (bad, needle) in [("-3", "must not be negative"), ("soon", "valid integer")] {
+            let err = RunnerConfig::parse_from_iter(env([
+                ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+                ("GITFORGE_REGISTER_BACKOFF_SECS", Some(bad)),
+            ]))
+            .expect_err("invalid backoff must fail");
+            assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+            assert!(
+                err_contains(&err, "GITFORGE_REGISTER_BACKOFF_SECS"),
+                "{err}"
+            );
+            assert!(err_contains(&err, needle), "value {bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_registration_backoff_allows_zero() {
+        // Zero backoff is meaningful: it retries immediately and is what the
+        // retry tests use to stay fast.
+        let cfg = RunnerConfig::parse_from_iter(env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_REGISTER_BACKOFF_SECS", Some("0")),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.register_backoff_secs, 0);
+    }
+
+    #[test]
+    fn test_parse_registration_blank_values_use_defaults() {
+        let cfg = RunnerConfig::parse_from_iter(env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_REGISTER_ATTEMPTS", Some("  ")),
+            ("GITFORGE_REGISTER_BACKOFF_SECS", Some("  ")),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.register_attempts, 6);
+        assert_eq!(cfg.register_backoff_secs, 1);
+    }
 }
 
 /// Job assignment from scheduler
@@ -596,7 +755,13 @@ impl RunnerAgent {
         })
     }
 
-    /// Register with the scheduler via HTTP
+    /// Register with the scheduler via HTTP.
+    ///
+    /// An unreachable scheduler is retried with exponential backoff — a
+    /// runner started alongside a restarting control plane (compose race)
+    /// must tolerate a listener that is not up yet. Credential and policy
+    /// rejections are never retried: a bad token or a refused registration
+    /// does not heal by asking again.
     pub async fn register(&mut self) -> Result<RunnerId> {
         let mut runner = Runner::new(
             self.config.name.clone(),
@@ -604,7 +769,6 @@ impl RunnerAgent {
             self.config.capacity,
         );
 
-        // Try to register with scheduler via HTTP
         let register_url = format!("{}/runners", self.config.scheduler_url);
         let request = serde_json::json!({
             "name": runner.name,
@@ -612,13 +776,16 @@ impl RunnerAgent {
             "capacity": runner.capacity,
         });
 
-        let mut register_request = self.client.post(&register_url).json(&request);
-        if let Some(token) = &self.config.scheduler_token {
-            register_request = register_request.bearer_auth(token);
-        }
-        match register_request.send().await {
-            Ok(response) => {
-                if response.status().is_success() {
+        let attempts = self.config.register_attempts.max(1);
+        let mut backoff = self.config.register_backoff_secs;
+
+        for attempt in 1..=attempts {
+            let mut register_request = self.client.post(&register_url).json(&request);
+            if let Some(token) = &self.config.scheduler_token {
+                register_request = register_request.bearer_auth(token);
+            }
+            match register_request.send().await {
+                Ok(response) if response.status().is_success() => {
                     if let Ok(payload) = response.json::<serde_json::Value>().await {
                         if let Some(id) = payload["id"]
                             .as_str()
@@ -628,41 +795,68 @@ impl RunnerAgent {
                         }
                     }
                     tracing::info!("registered runner {} with scheduler", runner.id);
-                } else {
-                    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                        || response.status() == reqwest::StatusCode::UNAUTHORIZED
+                    self.runner = Some(runner.clone());
+                    return Ok(runner.id);
+                }
+                Ok(response) => {
+                    let status = response.status();
+                    // Credentials do not heal by retrying.
+                    if status == reqwest::StatusCode::UNAUTHORIZED
+                        || status == reqwest::StatusCode::FORBIDDEN
                     {
                         return Err(Error::internal(format!(
-                            "scheduler authentication rejected registration: {}",
-                            response.status()
+                            "scheduler authentication rejected registration: {status}"
                         )));
+                    }
+                    // SERVICE_UNAVAILABLE means the scheduler is not ready to
+                    // answer, which is exactly the transient case.
+                    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && attempt < attempts {
+                        tracing::warn!(
+                            attempt,
+                            attempts,
+                            retry_in_secs = backoff,
+                            %status,
+                            "scheduler not ready; retrying registration"
+                        );
+                        wait_registration_backoff(&mut backoff).await;
+                        continue;
                     }
                     if !self.config.allow_standalone {
                         return Err(Error::internal(format!(
-                            "scheduler rejected registration with status {}; \
+                            "scheduler rejected registration with status {status}; \
                              refusing to run standalone (set GITFORGE_RUNNER_STANDALONE=allow \
-                             to override)",
-                            response.status()
+                             to override)"
                         )));
                     }
                     tracing::warn!(
-                        "scheduler returned {} for registration, running in standalone mode",
-                        response.status()
+                        "scheduler returned {status} for registration, running in standalone mode"
                     );
+                    break;
                 }
-            }
-            Err(e) => {
-                if !self.config.allow_standalone {
-                    return Err(Error::internal(format!(
-                        "failed to register with scheduler: {}; refusing to run \
-                         standalone (set GITFORGE_RUNNER_STANDALONE=allow to override)",
-                        e
-                    )));
+                Err(error) => {
+                    if attempt == attempts {
+                        if !self.config.allow_standalone {
+                            return Err(Error::internal(format!(
+                                "failed to register with scheduler after {attempt} attempts: \
+                                 {error}; refusing to run standalone \
+                                 (set GITFORGE_RUNNER_STANDALONE=allow to override)"
+                            )));
+                        }
+                        tracing::warn!(
+                            "failed to register with scheduler after {attempt} attempts: {error}. \
+                             Running in standalone mode."
+                        );
+                        break;
+                    }
+                    tracing::warn!(
+                        attempt,
+                        attempts,
+                        retry_in_secs = backoff,
+                        %error,
+                        "scheduler unreachable; retrying registration"
+                    );
+                    wait_registration_backoff(&mut backoff).await;
                 }
-                tracing::warn!(
-                    "failed to register with scheduler: {}. Running in standalone mode.",
-                    e
-                );
             }
         }
 
@@ -1428,6 +1622,7 @@ mod tests {
         // healthy when it cannot reach the scheduler that assigns it work.
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(), // Invalid URL
+            register_attempts: 1, // no retries: keeps this test instantaneous
             ..Default::default()
         };
         let mut agent = RunnerAgent::new(config).await.unwrap();
@@ -1445,6 +1640,7 @@ mod tests {
         // policy opt-in.
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
+            register_attempts: 1, // no retries: keeps this test instantaneous
             allow_standalone: true,
             ..Default::default()
         };
@@ -1452,6 +1648,185 @@ mod tests {
         let result = agent.register().await;
         assert!(result.is_ok());
         assert!(agent.runner.is_some());
+    }
+
+    // ── Registration retry/backoff ──────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Reason phrases for the statuses served by [`spawn_status_server`].
+    /// reqwest parses the numeric status only, but a well-formed response
+    /// needs a phrase.
+    fn reason_phrase(status: u16) -> &'static str {
+        match status {
+            201 => "Created",
+            401 => "Unauthorized",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            _ => "Status",
+        }
+    }
+
+    /// Serve a scripted sequence of HTTP statuses from a local listener and
+    /// count accepted connections. The last status repeats for any further
+    /// connections. Every response body is `{"id":"<uuid>"}` so a success
+    /// status also exercises runner-id adoption.
+    async fn spawn_status_server(statuses: &[u16]) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let addr = listener.local_addr().expect("local addr");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        let statuses = statuses.to_vec();
+        assert!(!statuses.is_empty(), "at least one status is required");
+        tokio::spawn(async move {
+            let mut served = 0usize;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let status = statuses[served.min(statuses.len() - 1)];
+                served += 1;
+                counter.fetch_add(1, Ordering::Relaxed);
+                // Drain the request head before answering so the client's
+                // write never races our response.
+                let mut head = [0u8; 2048];
+                let _ = socket.read(&mut head).await;
+                let body = format!("{{\"id\":\"{}\"}}", uuid::Uuid::new_v4());
+                let response = format!(
+                    "HTTP/1.1 {status} {}\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\
+                     \r\n{body}",
+                    reason_phrase(status),
+                    body.len(),
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), connections)
+    }
+
+    #[tokio::test]
+    async fn test_registration_retries_unavailable_scheduler_then_succeeds() {
+        // The compose race: the scheduler is up but not ready (503) while the
+        // runner is already registering. Registration must retry with backoff
+        // and adopt the runner id once the scheduler accepts.
+        let (url, connections) = spawn_status_server(&[503, 503, 201]).await;
+        let config = RunnerConfig {
+            scheduler_url: url,
+            register_attempts: 5,
+            register_backoff_secs: 0,
+            ..Default::default()
+        };
+        let mut agent = RunnerAgent::new(config).await.unwrap();
+        let runner_id = agent
+            .register()
+            .await
+            .expect("registration must outlive 503s");
+        assert!(agent.runner.is_some());
+        assert_eq!(connections.load(Ordering::Relaxed), 3);
+        assert_eq!(agent.runner.as_ref().map(|r| r.id), Some(runner_id));
+    }
+
+    #[tokio::test]
+    async fn test_registration_auth_rejection_is_not_retried() {
+        // A rejected token does not heal by asking again: exactly one attempt
+        // is made and the error names the authentication failure.
+        let (url, connections) = spawn_status_server(&[401]).await;
+        let config = RunnerConfig {
+            scheduler_url: url,
+            register_attempts: 5,
+            register_backoff_secs: 0,
+            ..Default::default()
+        };
+        let mut agent = RunnerAgent::new(config).await.unwrap();
+        let error = agent
+            .register()
+            .await
+            .expect_err("auth rejection must fail closed");
+        assert!(
+            error.to_string().contains("authentication rejected"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_registration_exhausts_transport_retries() {
+        // Nothing listens on the reserved port, so every attempt is a
+        // transport error; the surfaced error must report the exhausted
+        // attempt count.
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve a port");
+        let port = reserved.local_addr().expect("local addr").port();
+        drop(reserved);
+
+        let config = RunnerConfig {
+            scheduler_url: format!("http://127.0.0.1:{port}"),
+            register_attempts: 3,
+            register_backoff_secs: 0,
+            ..Default::default()
+        };
+        let mut agent = RunnerAgent::new(config).await.unwrap();
+        let error = agent
+            .register()
+            .await
+            .expect_err("unreachable scheduler must exhaust retries");
+        assert!(
+            error.to_string().contains("after 3 attempts"),
+            "unexpected error: {error}"
+        );
+        assert!(agent.runner.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_registration_policy_rejection_falls_back_only_when_allowed() {
+        // A 500 is a scheduler refusal, not "not ready yet": it is never
+        // retried, it fails closed by default, and standalone fallback
+        // requires the explicit opt-in.
+        let (url, connections) = spawn_status_server(&[500]).await;
+
+        let deny = RunnerConfig {
+            scheduler_url: url.clone(),
+            register_attempts: 5,
+            register_backoff_secs: 0,
+            ..Default::default()
+        };
+        let mut agent = RunnerAgent::new(deny).await.unwrap();
+        let error = agent.register().await.expect_err("500 must fail closed");
+        assert!(
+            error.to_string().contains("refusing to run standalone"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+
+        let allow = RunnerConfig {
+            scheduler_url: url,
+            register_attempts: 5,
+            register_backoff_secs: 0,
+            allow_standalone: true,
+            ..Default::default()
+        };
+        let mut agent = RunnerAgent::new(allow).await.unwrap();
+        agent
+            .register()
+            .await
+            .expect("standalone opt-in tolerates a rejected registration");
+        assert!(agent.runner.is_some());
+        assert_eq!(connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_next_registration_backoff_doubles_and_caps() {
+        assert_eq!(next_registration_backoff(0), 0);
+        assert_eq!(next_registration_backoff(1), 2);
+        assert_eq!(next_registration_backoff(2), 4);
+        assert_eq!(next_registration_backoff(25), 30);
+        assert_eq!(next_registration_backoff(30), 30);
+        assert_eq!(next_registration_backoff(u64::MAX), 30);
     }
 
     #[tokio::test]
@@ -1472,12 +1847,16 @@ mod tests {
             heartbeat_interval_secs: 60,
             fetch_interval_secs: 10,
             scheduler_token: None,
+            register_attempts: 3,
+            register_backoff_secs: 2,
             allow_standalone: false,
         };
         assert_eq!(config.name, "custom-runner");
         assert_eq!(config.capacity, 5);
         assert_eq!(config.heartbeat_interval_secs, 60);
         assert_eq!(config.fetch_interval_secs, 10);
+        assert_eq!(config.register_attempts, 3);
+        assert_eq!(config.register_backoff_secs, 2);
     }
 
     #[test]
@@ -1664,6 +2043,8 @@ mod tests {
             heartbeat_interval_secs: 15,
             fetch_interval_secs: 3,
             scheduler_token: None,
+            register_attempts: 2,
+            register_backoff_secs: 1,
             allow_standalone: false,
         };
 
@@ -1785,6 +2166,8 @@ mod tests {
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
             scheduler_token: None,
+            register_attempts: 2,
+            register_backoff_secs: 1,
             allow_standalone: false,
         };
         assert_eq!(config.capacity, 0);
@@ -1863,6 +2246,8 @@ mod tests {
             heartbeat_interval_secs: 45,
             fetch_interval_secs: 10,
             scheduler_token: None,
+            register_attempts: 2,
+            register_backoff_secs: 1,
             allow_standalone: false,
         };
         assert!(config.scheduler_url.contains("user:pass"));
@@ -1892,6 +2277,8 @@ mod tests {
             heartbeat_interval_secs: 60,
             fetch_interval_secs: 15,
             scheduler_token: None,
+            register_attempts: 2,
+            register_backoff_secs: 1,
             allow_standalone: false,
         };
         let agent = RunnerAgent::new(config).await.unwrap();
