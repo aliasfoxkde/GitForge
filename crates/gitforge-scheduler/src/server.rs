@@ -880,6 +880,14 @@ async fn complete_job(
                 .complete_job_with_lease(job_id, runner_id, lease_token, success, receipt)
                 .await
         }
+        // Credentialed completions for an unassigned job are the signature of
+        // an orphaned execution: restart recovery finalized the job while the
+        // runner was still executing it. Say so instead of implying the
+        // runner sent a malformed request.
+        (Some(_), Some(_), None) => Err(anyhow::anyhow!(
+            "job is no longer assigned to a runner; its durable outcome was \
+             decided without this completion"
+        )),
         _ => Err(anyhow::anyhow!("runner_id and lease_token are required")),
     };
     if let Err(error) = completion {
@@ -1254,6 +1262,116 @@ mod tests {
         .await
         .into_response();
         assert_status(response, StatusCode::OK);
+    }
+
+    /// Seed user/repo/pipeline/run rows plus two jobs in `pool`, returning
+    /// the job ids so tests can drive each job's durable status.
+    async fn seed_restart_scenario(pool: &gitforge_db::Pool, name: &str) -> (JobId, JobId) {
+        let user = gitforge_db::models::User::new(
+            format!("{name}-owner"),
+            format!("{name}-owner@example.com"),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            format!("{name}-repo"),
+            user.id,
+            format!("/git/{name}-repo"),
+        );
+        gitforge_db::queries::RepoQueries::create(pool, &repo)
+            .await
+            .unwrap();
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: format!("{name}-pipeline"),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            format!("{name}-owner"),
+            format!("{name}-commit"),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(pool, &run)
+            .await
+            .unwrap();
+        let first = gitforge_db::models::Job::new(run.id, format!("{name}-first"));
+        let second = gitforge_db::models::Job::new(run.id, format!("{name}-second"));
+        gitforge_db::queries::JobQueries::create(pool, &first)
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::create(pool, &second)
+            .await
+            .unwrap();
+        (first.id, second.id)
+    }
+
+    /// After a scheduler restart, recovery fails in-flight rows: a live
+    /// execution is orphaned the moment its durable row goes terminal. The
+    /// read-only cancellation probe is how the runner learns this.
+    #[tokio::test]
+    async fn test_job_cancelled_probe_reports_terminal_durable_status() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (orphaned_job, live_job) = seed_restart_scenario(&pool, "probe-terminal").await;
+        // Mirror what requeue_inflight writes for a running row on restart.
+        gitforge_db::queries::JobQueries::update_status(&pool, orphaned_job, "failed")
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::update_status(&pool, live_job, "running")
+            .await
+            .unwrap();
+
+        let scheduler = crate::Scheduler::with_db(pool);
+        assert!(!scheduler.is_cancelled(live_job).await);
+        assert!(scheduler.is_cancelled(orphaned_job).await);
+    }
+
+    /// A credentialed completion for a job the restarted scheduler no longer
+    /// has assigned must be rejected, and the rejection must name the
+    /// orphaned execution instead of implying a malformed request.
+    #[tokio::test]
+    async fn test_complete_job_unassigned_reports_orphaned_outcome() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (orphaned_job, _) = seed_restart_scenario(&pool, "complete-orphan").await;
+        gitforge_db::queries::JobQueries::update_status(&pool, orphaned_job, "failed")
+            .await
+            .unwrap();
+
+        let scheduler = crate::Scheduler::with_db(pool);
+        let state = create_state(scheduler);
+        let response = complete_job(
+            axum::extract::State(state),
+            axum::extract::Path(orphaned_job.to_string()),
+            axum::Json(serde_json::json!({
+                "runner_id": uuid::Uuid::new_v4().to_string(),
+                "lease_token": "pre-restart-lease",
+                "success": true,
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "completion_persistence_failed");
+        assert!(
+            payload["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("no longer assigned")),
+            "unexpected rejection: {payload}"
+        );
     }
 
     /// Register a runner, enqueue one job, and drive scheduler assignment so

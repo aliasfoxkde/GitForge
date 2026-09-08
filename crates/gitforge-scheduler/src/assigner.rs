@@ -930,9 +930,15 @@ impl Scheduler {
         Ok(loaded)
     }
 
-    /// Return whether an operator has cancelled a job. This endpoint is
-    /// intentionally read-only and lets a runner terminate its local
-    /// sandbox without granting the runner authority to cancel jobs.
+    /// Return whether the runner must stop executing this job. This probe is
+    /// intentionally read-only and lets a runner terminate its local sandbox
+    /// without granting the runner authority to cancel jobs.
+    ///
+    /// Every terminal durable status stops the runner, not only an explicit
+    /// operator cancellation: restart recovery fails in-flight rows because
+    /// their receipts cannot be trusted across the restart, so a live
+    /// execution is orphaned the moment the durable outcome is decided and
+    /// finishing it only produces a completion the scheduler must reject.
     pub async fn is_cancelled(&self, job_id: JobId) -> bool {
         {
             let state = self.state.read().await;
@@ -945,7 +951,10 @@ impl Scheduler {
                 .await
                 .ok()
                 .flatten()
-                .map(|job| job.status == "cancelled")
+                .map(|job| {
+                    gitforge_db::models::JobStatus::from_str(&job.status)
+                        .is_some_and(|status| status.is_terminal())
+                })
                 .unwrap_or(false);
         }
         false

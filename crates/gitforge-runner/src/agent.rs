@@ -972,6 +972,13 @@ impl RunnerAgent {
         let cancellation_job_id = assignment.job_id.clone();
         let cancellation_executor = executor.clone();
         let cancellation_token = scheduler_token.map(ToOwned::to_owned);
+        // Set when the scheduler says the job's durable outcome was already
+        // decided while this execution was still running: an operator
+        // cancellation, or restart recovery failing the in-flight row. The
+        // lease is gone in both cases, so post-execution reporting can only
+        // produce rejected requests.
+        let orphaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let orphaned_watch = orphaned.clone();
         let cancellation_watch = tokio::spawn(async move {
             let endpoint = format!(
                 "{}/jobs/{}/cancelled",
@@ -994,6 +1001,7 @@ impl RunnerAgent {
                             .and_then(|payload| payload["cancelled"].as_bool())
                             .unwrap_or(false);
                         if cancelled {
+                            orphaned_watch.store(true, std::sync::atomic::Ordering::Relaxed);
                             if let Ok(job_id) = uuid::Uuid::parse_str(&cancellation_job_id) {
                                 let job_id = JobId::from(job_id);
                                 if let Err(error) = cancellation_executor.cancel(&job_id).await {
@@ -1046,6 +1054,20 @@ impl RunnerAgent {
             result.success,
             result.exit_code
         );
+
+        if orphaned.load(std::sync::atomic::Ordering::Relaxed) {
+            // The scheduler finalized this job while we were executing it
+            // (operator cancellation, or restart recovery re-queuing the
+            // row and failing the in-flight execution). The lease no longer
+            // exists, so log chunks, artifacts, and a completion POST would
+            // all be rejected 409; stop here instead of writing noise.
+            tracing::warn!(
+                job_id = %assignment.job_id,
+                "job outcome was decided by the scheduler mid-execution; \
+                 skipping log, artifact, and completion reporting"
+            );
+            return;
+        }
 
         let protocol = RunnerProtocol {
             client,
