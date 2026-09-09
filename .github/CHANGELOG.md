@@ -4,6 +4,9 @@ All notable GitForge changes are recorded here by release or merged change.
 
 ## Unreleased
 
+- Make runner registration restart-safe by refreshing the durable identity for
+  a stable `GITFORGE_RUNNER_NAME` instead of inserting a new UUID on every
+  process restart. Existing stale rows remain available for audited retirement.
 - Reject duplicate job names and unresolved `needs` references while building
   pipeline DAGs, preventing invalid definitions from becoming runnable.
 - Preserve the `gitforge-current` symlink pathname during release promotion so

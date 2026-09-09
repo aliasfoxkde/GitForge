@@ -122,7 +122,7 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `GITFORGE_SCHEDULER_URL` | **Yes** | — | Scheduler HTTP endpoint (e.g. `http://localhost:42781`). Startup fails without this. |
-| `GITFORGE_RUNNER_NAME` | No | `runner` | Display name for this runner instance |
+| `GITFORGE_RUNNER_NAME` | Recommended | `runner` | Stable unique identity; restarts refresh this row instead of creating another one |
 | `GITFORGE_RUNNER_CAPACITY` | No | `2` | Maximum concurrent jobs |
 | `GITFORGE_HEARTBEAT_INTERVAL` | No | `30` | Heartbeat interval in seconds |
 | `GITFORGE_FETCH_INTERVAL` | No | `5` | Job-poll interval in seconds |
@@ -131,6 +131,13 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 > **Startup behavior**: If `GITFORGE_SCHEDULER_URL` is missing or empty, the runner exits immediately
 > with a clear error message. Invalid values for numeric variables (non-integer) also cause a fast
 > failure. Safe defaults apply to all optional variables when they are unset.
+
+Runner names are durable identities. Set a distinct name for every concurrently
+running runner (for example, `remote-podman-runner-01`); leaving the default
+`runner` name on multiple instances makes them contend for one registry row.
+Historical stale rows are retained for audit and can be retired through the
+authenticated runner-retirement operation after confirming that they own no
+active jobs.
 
 ## Docker Compose
 
@@ -274,7 +281,7 @@ capacity = 4
 |----------|---------|---------|-------------|
 | `JWT_SECRET` | api | - | JWT signing secret (required) |
 | `DATABASE_URL` | api | sqlite:/data/gitforge.db | Database URL |
-| `GITFORGE_RUNNER_NAME` | runner | runner | Runner identifier |
+| `GITFORGE_RUNNER_NAME` | runner | runner | Stable unique runner identifier; distinct for concurrent instances |
 | `GITFORGE_SCHEDULER_URL` | runner | — | Scheduler endpoint (required) |
 | `GITFORGE_RUNNER_CAPACITY` | runner | 2 | Max concurrent jobs |
 | `GITFORGE_HEARTBEAT_INTERVAL` | runner | 30 | Heartbeat interval in seconds |

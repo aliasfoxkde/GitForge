@@ -512,19 +512,24 @@ impl Scheduler {
     }
 
     /// Register a runner
-    pub async fn register_runner(&self, runner: Runner) {
-        let mut state = self.state.write().await;
-        let runner_id = runner.id;
-        state.add_runner(runner);
+    pub async fn register_runner(&self, mut runner: Runner) -> Runner {
         if let Some(pool) = &self.db_pool {
-            if let Some(runner) = state.runners.get(&runner_id) {
-                if let Err(error) = gitforge_db::queries::RunnerQueries::create(pool, runner).await
-                {
-                    tracing::error!("failed to persist runner {}: {}", runner_id, error);
+            match gitforge_db::queries::RunnerQueries::register_or_refresh(pool, &runner).await {
+                Ok(persisted) => runner = persisted,
+                Err(error) => {
+                    tracing::error!("failed to persist runner {}: {}", runner.id, error);
                 }
             }
         }
+
+        let runner_id = runner.id;
+        let mut state = self.state.write().await;
+        state
+            .runners
+            .retain(|id, existing| existing.name != runner.name || *id == runner_id);
+        state.add_runner(runner.clone());
         tracing::info!("runner {} registered", runner_id);
+        runner
     }
 
     /// Handle runner heartbeat
