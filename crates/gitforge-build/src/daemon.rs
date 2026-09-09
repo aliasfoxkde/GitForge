@@ -287,4 +287,232 @@ mod tests {
         flag.store(true, Ordering::SeqCst);
         assert!(flag.load(Ordering::SeqCst));
     }
+
+    // ─── Connection handler over a real unix socket ─────────────────────
+
+    use std::time::Duration;
+
+    use gitforge_build::{decode_response, encode_request};
+
+    /// Drive one request through `handle_connection` on a socket pair and
+    /// return the decoded response, or `None` when the handler closed the
+    /// connection without answering (its error paths). Like the real
+    /// daemon, connections are per-request while the coordinator — and
+    /// therefore the job table — is shared across them.
+    async fn exchange_with(
+        coordinator: &Arc<BuildCoordinator>,
+        request: &Request,
+    ) -> Option<Response> {
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("unix socket pair");
+        let handler = tokio::spawn(handle_connection(
+            server,
+            coordinator.clone(),
+            create_shutdown_flag(),
+        ));
+
+        client
+            .write_all(&encode_request(request).expect("encode request"))
+            .await
+            .expect("write request");
+
+        let mut raw = Vec::new();
+        let read = client.read_to_end(&mut raw).await;
+        // The handler must not hang on any well-formed exchange.
+        let _ = tokio::time::timeout(Duration::from_secs(10), handler).await;
+        read.expect("read response");
+
+        if raw.is_empty() {
+            None
+        } else {
+            Some(decode_response(&raw).expect("decode response"))
+        }
+    }
+
+    async fn exchange(request: &Request) -> Option<Response> {
+        exchange_with(&Arc::new(BuildCoordinator::new()), request).await
+    }
+
+    async fn expect_error_response(request: &Request, message: &str) {
+        match exchange(request).await {
+            Some(Response::Error { message: got }) => assert_eq!(got, message),
+            other => panic!("expected Error({message}), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_status_rejects_invalid_and_unknown_job_ids() {
+        expect_error_response(
+            &Request::Status {
+                job_id: "not-a-uuid".to_string(),
+            },
+            "invalid job id",
+        )
+        .await;
+        expect_error_response(
+            &Request::Status {
+                job_id: uuid::Uuid::new_v4().to_string(),
+            },
+            "job not found",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_cancel_rejects_invalid_and_unknown_job_ids() {
+        expect_error_response(
+            &Request::Cancel {
+                job_id: "not-a-uuid".to_string(),
+            },
+            "invalid job id",
+        )
+        .await;
+        expect_error_response(
+            &Request::Cancel {
+                job_id: uuid::Uuid::new_v4().to_string(),
+            },
+            "job not found or already terminal",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_list_and_stats_on_empty_daemon() {
+        match exchange(&Request::List).await {
+            Some(Response::JobList { jobs }) => assert!(jobs.is_empty()),
+            other => panic!("expected an empty JobList, got {other:?}"),
+        }
+        match exchange(&Request::Stats).await {
+            Some(Response::Stats {
+                running_count,
+                queued_count,
+                completed_count,
+                max_concurrent,
+            }) => {
+                assert_eq!(running_count, 0);
+                assert_eq!(queued_count, 0);
+                assert_eq!(completed_count, 0);
+                assert_eq!(max_concurrent, MAX_CONCURRENT_JOBS);
+            }
+            other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_request_sets_the_shared_flag() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let shutdown = create_shutdown_flag();
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("unix socket pair");
+        let handler = tokio::spawn(handle_connection(server, coordinator, shutdown.clone()));
+
+        client
+            .write_all(&encode_request(&Request::Shutdown).expect("encode request"))
+            .await
+            .expect("write request");
+        let mut raw = Vec::new();
+        client.read_to_end(&mut raw).await.expect("read response");
+        let _ = tokio::time::timeout(Duration::from_secs(10), handler).await;
+
+        match decode_response(&raw).expect("decode response") {
+            Response::Shutdown => {}
+            other => panic!("expected Shutdown, got {other:?}"),
+        }
+        assert!(
+            shutdown.load(Ordering::SeqCst),
+            "socket shutdown must raise the shared flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oversized_and_malformed_requests_get_no_response() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let (client, server) = tokio::net::UnixStream::pair().expect("unix socket pair");
+        let handler = tokio::spawn(handle_connection(
+            server,
+            coordinator,
+            create_shutdown_flag(),
+        ));
+
+        let mut client = client;
+        // A length prefix beyond the protocol maximum is refused unread.
+        client
+            .write_all(&((MAX_MESSAGE_SIZE as u32) + 1).to_le_bytes())
+            .await
+            .expect("write oversized prefix");
+        let mut raw = Vec::new();
+        client.read_to_end(&mut raw).await.expect("read to eof");
+        assert!(raw.is_empty(), "oversized request must not be answered");
+        let _ = tokio::time::timeout(Duration::from_secs(10), handler).await;
+
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("unix socket pair");
+        let handler = tokio::spawn(handle_connection(
+            server,
+            coordinator,
+            create_shutdown_flag(),
+        ));
+        // A well-sized prefix over undecodable bytes is refused too.
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(8u32).to_le_bytes());
+        framed.extend_from_slice(b"not json");
+        client.write_all(&framed).await.expect("write garbage");
+        let mut raw = Vec::new();
+        client.read_to_end(&mut raw).await.expect("read to eof");
+        assert!(raw.is_empty(), "malformed request must not be answered");
+        let _ = tokio::time::timeout(Duration::from_secs(10), handler).await;
+    }
+
+    #[tokio::test]
+    async fn test_submitted_job_runs_real_cargo_and_becomes_listed() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+
+        // A real, side-effect-free cargo invocation through the whole
+        // daemon path: submit on one connection, then poll status and list
+        // on separate connections that share the coordinator's job table.
+        let job_id = match exchange_with(
+            &coordinator,
+            &Request::Submit {
+                cargo_args: vec!["--version".to_string()],
+                working_dir: Some(std::env::temp_dir().display().to_string()),
+            },
+        )
+        .await
+        {
+            Some(Response::Submitted { job_id }) => job_id,
+            other => panic!("expected Submitted, got {other:?}"),
+        };
+
+        let uuid = uuid::Uuid::parse_str(&job_id).expect("submitted job id is a uuid");
+        let mut status = String::new();
+        for _ in 0..100 {
+            match exchange_with(
+                &coordinator,
+                &Request::Status {
+                    job_id: job_id.clone(),
+                },
+            )
+            .await
+            {
+                Some(Response::Status { status: got, .. }) => {
+                    if got.starts_with("completed") || got.starts_with("failed") {
+                        status = got;
+                        break;
+                    }
+                }
+                other => panic!("status poll for a submitted job failed: {other:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(status, "completed(0)", "cargo --version must succeed");
+
+        match exchange_with(&coordinator, &Request::List).await {
+            Some(Response::JobList { jobs }) => {
+                assert_eq!(jobs.len(), 1, "the finished job must be listed");
+                assert_eq!(jobs[0].job_id, uuid.to_string());
+                assert_eq!(jobs[0].cargo_args, vec!["--version"]);
+            }
+            other => panic!("expected JobList, got {other:?}"),
+        }
+
+        coordinator.shutdown(Duration::from_secs(5)).await;
+    }
 }

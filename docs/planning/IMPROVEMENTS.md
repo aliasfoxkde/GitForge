@@ -85,13 +85,12 @@ The following require a running integration environment:
 |-------|-------|-------|
 | gitforge-api | ~80% | API routes need error path tests |
 | gitforge-cli | ~81% | CLI integration tests |
-| gitforge-build | ~67% | Daemon mode hard to unit test |
+| gitforge-build | 80.62% | daemon.rs went from 19.78% to 77.92% lines once its unix-socket protocol loop was tested over real socket pairs (2026-09-09) |
 
 ### Low Coverage (<70%) - Entry Points
 | Crate | Lines | Issue |
 |-------|-------|-------|
 | gitforge-runner/executor | 62.09%* | Container execution requires Docker; *measured with the `#[ignore]` tests included (`cargo llvm-cov -p gitforge-runner -- --include-ignored`, 81/81 pass against live Docker 26.1.5); the CI floor sees 35.23% |
-| gitforge-build/daemon | 21.82% | Integration-only code |
 
 (2026-09-08 re-measurement, `cargo llvm-cov --all`: workspace total
 82.90% lines. services/git-server left this table's sub-30% bucket after
@@ -99,7 +98,9 @@ its protocol harnesses were made coverage-visible: main.rs 69.43%,
 ssh_server.rs 85.64%; services/ci followed at 83.54% once its
 spawned-binary trigger harness landed. gitforge-ai left the table on
 2026-09-09 at 90.16% lines once its providers were tested against a
-scripted HTTP server.)
+scripted HTTP server; gitforge-build left it the same day at 80.62%
+lines once the build daemon's connection handler was driven over real
+unix socket pairs.)
 
 ## Remaining Gaps and Next Steps (2026-09-08)
 
@@ -224,6 +225,21 @@ Ordered by value; each item states the concrete blocker.
    check had masked it because it never reads the body. Fixed with
    `#[serde(rename = "type")]`. The health check had masked the bug
    because it only reads the status code, never the body.
+
+2. **gitforge-build daemon protocol loop** — done. `daemon.rs` sat at
+   19.78% lines because only its shutdown-flag helpers were tested; the
+   entire `handle_connection` request/response path was dark. The crate's
+   test module now drives the handler over real `UnixStream` pairs with
+   the same one-connection-per-request, shared-coordinator shape as the
+   live daemon: invalid and unknown job ids on status and cancel, empty
+   List/Stats, the socket Shutdown request raising the shared shutdown
+   flag, and oversized or undecodable requests being refused without a
+   response. A round-trip test submits a real `cargo --version` through
+   the framed protocol, polls it to `completed(0)` across separate
+   connections, and asserts the finished job appears in List with its
+   original arguments. daemon.rs stands at 77.92% lines (crate 80.62%),
+   and the remaining dark lines are the `main()` supervision path already
+   exercised by the compose smoke.
 
 ## Resolved from the Compose Smoke (2026-09-08)
 
