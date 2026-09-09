@@ -48,6 +48,13 @@ All notable changes to GitForge will be documented in this file.
   asserting auth headers, status-to-error mapping (429/401/5xx), finding
   parsing with severity/category fallback, and cost/token accounting.
   gitforge-ai went from 57.86% to 90.16% lines
+- Build daemon protocol tests: the request/response connection handler
+  is driven over real unix socket pairs — invalid and unknown job ids,
+  empty list/stats, the socket shutdown request raising the shared
+  flag, and oversized or undecodable requests refused without a
+  response — plus a round trip that submits a real `cargo --version`,
+  polls it to completion across connections, and lists the finished
+  job. daemon.rs went from 19.78% to 77.92% lines
 - Protocol and trigger test harnesses stop their spawned services with
   SIGTERM (the real graceful-shutdown path), so `cargo llvm-cov` now
   counts the entry-point code they exercise; workspace line coverage
