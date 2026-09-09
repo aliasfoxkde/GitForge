@@ -136,9 +136,12 @@ dependencies = [
  "gitforge-events",
  "gitforge-process",
  "gitforge-storage",
+ "reqwest",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -103,20 +103,21 @@ spawned-binary trigger harness landed.)
 
 Ordered by value; each item states the concrete blocker.
 
-1. **cargo-vet audits** — the exemption backlog stands at 362 crates (79
+1. **cargo-vet audits** — the exemption backlog stands at 355 crates (86
    fully audited), down from 377 after importing the zcash peer registry
-   and recording three publisher trusts our existing imports already vouch
-   for (dtolnay for proc-macro2 via isrg/mozilla/bytecode-alliance;
-   Manishearth for potential_utf and icu_normalizer_data via mozilla). The
-   remainder is dominated by the russh/RustCrypto tree from the SSH
-   transport rewrite; the RustCrypto 0.9/0.10-rc and russh 0.63 versions
-   have no audits in any peer registry yet because they are too new.
-   Incremental path: re-run `cargo vet suggest` (it names both
-   small-diff audits and trust candidates grounded in existing imports),
-   re-run `import` + `prune` as peer registries pick the new versions up,
-   and `cargo vet inspect` + `certify` only for diffs a human actually
-   reviewed. Six peer registries are registered and pinned in
-   `imports.lock`, so pruning is automatic once coverage exists.
+   and recording ten publisher trusts the tool derives from our existing
+   imports (dtolnay for proc-macro2/serde/serde_core/rustversion, epage
+   for toml_writer, Manishearth for potential_utf/icu_normalizer_data/
+   url/zerofrom/zerofrom-derive). The remainder is dominated by the
+   russh/RustCrypto tree from the SSH transport rewrite; the RustCrypto
+   0.9/0.10-rc and russh 0.63 versions have no audits in any peer
+   registry yet because they are too new. Incremental path: re-run
+   `cargo vet suggest` (it names both small-diff audits and trust
+   candidates grounded in existing imports), re-run `import` + `prune`
+   as peer registries pick the new versions up, and `cargo vet inspect`
+   + `certify` only for diffs a human actually reviewed. Six peer
+   registries are registered and pinned in `imports.lock`, so pruning is
+   automatic once coverage exists.
 
 ## Resolved from the Remaining-Gaps Ledger (2026-09-08)
 
