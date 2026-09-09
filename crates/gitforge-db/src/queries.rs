@@ -263,11 +263,33 @@ impl RepoQueries {
 
     /// Delete a repository
     pub async fn delete(pool: &Pool, id: RepoId) -> Result<()> {
-        sqlx::query("DELETE FROM repositories WHERE id = ?")
-            .bind(id.to_string())
-            .execute(pool.pool())
+        // Repository deletion is an explicit destructive operation. Remove
+        // all dependent execution history in one transaction so a repository
+        // with completed or failed CI runs can be deleted just like an empty
+        // repository. The schema intentionally keeps these foreign keys
+        // restrictive to protect history during ordinary mutations.
+        let mut tx =
+            pool.pool().begin().await.map_err(|e| {
+                Error::database(format!("failed to begin repository delete: {}", e))
+            })?;
+        let repo_id = id.to_string();
+        for statement in [
+            "DELETE FROM artifacts WHERE job_id IN (SELECT id FROM jobs WHERE pipeline_run_id IN (SELECT id FROM pipeline_runs WHERE repo_id = ?))",
+            "DELETE FROM job_log_chunks WHERE job_id IN (SELECT id FROM jobs WHERE pipeline_run_id IN (SELECT id FROM pipeline_runs WHERE repo_id = ?))",
+            "DELETE FROM jobs WHERE pipeline_run_id IN (SELECT id FROM pipeline_runs WHERE repo_id = ?)",
+            "DELETE FROM pipeline_runs WHERE repo_id = ?",
+            "DELETE FROM pipelines WHERE repo_id = ?",
+            "DELETE FROM repositories WHERE id = ?",
+        ] {
+            sqlx::query(statement)
+                .bind(&repo_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::database(format!("failed to delete repository: {}", e)))?;
+        }
+        tx.commit()
             .await
-            .map_err(|e| Error::database(format!("failed to delete repository: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to commit repository delete: {}", e)))?;
         Ok(())
     }
 
