@@ -15,7 +15,7 @@ Repository state after audit:
 - **Dependency vetting**: cargo-vet initialized (`supply-chain/`); `make
   lint` no longer fails on a missing `cargo vet`
 - **Race Detection**: Fixed storage durability issue with `sync_all()` calls
-- **Coverage**: 82.90% lines (`cargo llvm-cov --all`; CI floor: 79.9%)
+- **Coverage**: 83.40% lines / 84.94% regions (`cargo llvm-cov --all`; CI floor: 79.9%)
 - **Aegis**: Integrated into CI (already present in security.yml)
 - **E2E**: Template framework exists in template-parts; GitForge has no web frontend
 
@@ -89,7 +89,7 @@ The following require a running integration environment:
 ### Low Coverage (<70%) - Entry Points
 | Crate | Lines | Issue |
 |-------|-------|-------|
-| gitforge-runner/executor | 32.45% | Container execution requires Docker (`#[ignore]` tests) |
+| gitforge-runner/executor | 62.09%* | Container execution requires Docker; *measured with the `#[ignore]` tests included (`cargo llvm-cov -p gitforge-runner -- --include-ignored`, 81/81 pass against live Docker 26.1.5); the CI floor sees 35.23% |
 | gitforge-build/daemon | 21.82% | Integration-only code |
 | gitforge-ai | 7-58% | API mocking needed |
 
@@ -183,11 +183,23 @@ Ordered by value; each item states the concrete blocker.
    real clone checked out at the pushed commit. The service is stopped
    with the same SIGTERM graceful-shutdown helper, so the consumer loops
    and startup path are counted. services/ci `main.rs` went from
-   64.08% to 83.54% lines, and the workspace from 79.63% to 82.90%
-   lines. What remains below the CI floor's reach is inherent:
-   gitforge-runner/executor (32.45% lines) executes containers and is
-   covered by the `#[ignore]` tests that pass against a live Docker
-   daemon.
+   64.08% to 83.54% lines.
+6. **Service entry-point coverage, api** — done. A spawned-binary
+   harness (`services/api/tests/api_gateway_flow.rs`) boots the real
+   `api` binary against a temporary database with a seeded
+   bcrypt-hashed account, then drives it like a genuine client:
+   protected routes reject anonymous callers, login rejects a wrong
+   password and returns a real bearer token otherwise, a repository
+   create/list round trip succeeds through the JWT middleware, and the
+   SSH key registry endpoints work over HTTP (register, duplicate 409,
+   list, delete) with the rows asserted in the service's own database.
+   services/api `main.rs` went from 72.46% regions to 91.07%
+   (95.11% lines). With all three harnesses in place the workspace
+   stands at 84.94% regions / 83.40% lines, up from 81.19%/79.63% at
+   the start of this ledger. What remains below that is inherent:
+   gitforge-runner/executor executes containers (62.09% lines measured
+   with the `#[ignore]` tests included against a live Docker daemon,
+   35.23% on the CI floor).
 
 ## Resolved from the Compose Smoke (2026-09-08)
 

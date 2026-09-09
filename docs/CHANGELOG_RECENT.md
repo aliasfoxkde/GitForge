@@ -34,6 +34,10 @@ All notable changes to GitForge will be documented in this file.
 
 - Git Smart HTTP protocol integration tests: real `git push`, `clone`,
   `fetch`, and `ls-remote` against the spawned git-server binary
+- API gateway flow integration test: boots the real `api` binary against
+  a temporary database, logs in with a seeded bcrypt-hashed account,
+  and drives authenticated repository creation and the SSH key registry
+  over HTTP, asserting the rows in the service's own database
 - CI trigger flow integration test: boots the real `ci` service against
   a temporary database and bare repository, requires the trigger token,
   and asserts the run, job commands, image, and workspace clone all come
@@ -41,7 +45,7 @@ All notable changes to GitForge will be documented in this file.
 - Protocol and trigger test harnesses stop their spawned services with
   SIGTERM (the real graceful-shutdown path), so `cargo llvm-cov` now
   counts the entry-point code they exercise; workspace line coverage
-  rose from 79.63% to 82.90% with no production changes
+  rose from 79.63% to 83.40% with no production changes
 - Git over SSH protocol integration tests: real `ssh-keygen` client
   keypairs and host-key pinning; `push`, `clone`, `fetch`, and `ls-remote`
   over the `ssh://` transport, plus rejection of key-less clients,
