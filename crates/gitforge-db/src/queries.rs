@@ -1332,6 +1332,51 @@ impl RunnerQueries {
         Ok(())
     }
 
+    /// Register a runner by its stable operator-facing name.
+    ///
+    /// Runner processes are routinely restarted by systemd. Registration must
+    /// therefore refresh the existing identity instead of inserting a new UUID
+    /// on every restart, otherwise the registry accumulates stale capacity.
+    pub async fn register_or_refresh(
+        pool: &Pool,
+        runner: &crate::models::Runner,
+    ) -> Result<crate::models::Runner> {
+        let existing = sqlx::query(
+            "SELECT * FROM runners WHERE name = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+        )
+            .bind(&runner.name)
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|error| Error::database(format!("failed to find runner by name: {}", error)))?
+            .map(hydrate_runner)
+            .transpose()?;
+
+        let Some(mut existing) = existing else {
+            Self::create(pool, runner).await?;
+            return Ok(runner.clone());
+        };
+
+        sqlx::query(
+            "UPDATE runners SET runner_type = ?, status = ?, capacity = ?, labels = ?, last_heartbeat = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(&runner.runner_type)
+        .bind(&runner.status)
+        .bind(runner.capacity)
+        .bind("[]")
+        .bind(runner.last_heartbeat.map(|date| date.to_rfc3339()))
+        .bind(Utc::now().to_rfc3339())
+        .bind(existing.id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|error| Error::database(format!("failed to refresh runner: {}", error)))?;
+
+        existing.runner_type = runner.runner_type.clone();
+        existing.status = runner.status.clone();
+        existing.capacity = runner.capacity;
+        existing.last_heartbeat = runner.last_heartbeat;
+        Ok(existing)
+    }
+
     /// Get a runner by ID
     pub async fn get(pool: &Pool, id: RunnerId) -> Result<Option<crate::models::Runner>> {
         let row = sqlx::query("SELECT * FROM runners WHERE id = ?")
@@ -2302,6 +2347,36 @@ mod tests {
                 .unwrap(),
             RunnerRetirement::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn test_runner_registration_refreshes_existing_name() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let first = crate::models::Runner::new(
+            "stable-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            2,
+        );
+        let registered = RunnerQueries::register_or_refresh(&pool, &first)
+            .await
+            .unwrap();
+
+        let mut restarted = crate::models::Runner::new(
+            "stable-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            4,
+        );
+        restarted.set_busy();
+        let refreshed = RunnerQueries::register_or_refresh(&pool, &restarted)
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed.id, registered.id);
+        assert_eq!(refreshed.capacity, 4);
+        assert_eq!(refreshed.status, "busy");
+        assert_eq!(RunnerQueries::list(&pool).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

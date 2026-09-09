@@ -258,7 +258,7 @@ async fn register_runner(
 
     let runner = Runner::new(request.name, runner_type, request.capacity);
 
-    state.scheduler.register_runner(runner.clone()).await;
+    let runner = state.scheduler.register_runner(runner).await;
 
     tracing::info!("runner {} registered via HTTP", runner.id);
 
