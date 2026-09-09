@@ -511,11 +511,20 @@ fn validate_workspace_path(path: &str) -> Result<String, String> {
     if !workspace.is_dir() {
         return Err("workspace must be a directory".to_string());
     }
-    let root_path = workspace_root();
-    let root = std::fs::canonicalize(&root_path)
-        .map_err(|error| format!("workspace root is not accessible: {}", error))?;
-    if !workspace.starts_with(&root) {
-        return Err(format!("workspace must be inside {}", root.display()));
+    let roots = workspace_roots()
+        .into_iter()
+        .map(|root_path| {
+            std::fs::canonicalize(&root_path)
+                .map_err(|error| format!("workspace root is not accessible: {}", error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !roots.iter().any(|root| workspace.starts_with(root)) {
+        let allowed = roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!("workspace must be inside one of: {allowed}"));
     }
     Ok(workspace.to_string_lossy().into_owned())
 }
@@ -594,6 +603,28 @@ fn workspace_root() -> std::path::PathBuf {
         std::env::var("GITFORGE_WORKSPACE_ROOT")
             .unwrap_or_else(|_| "/var/lib/gitforge/workspaces".to_string()),
     )
+}
+
+/// Return all trusted workspace roots accepted for caller-supplied checkouts.
+///
+/// `GITFORGE_WORKSPACE_ROOT` remains the canonical run-workspace root used by
+/// GitForge itself. `GITFORGE_WORKSPACE_ROOTS` is an explicit, comma-separated
+/// allowlist for integrations such as Control Center that own their checkout
+/// lifecycle. Keeping the two settings separate prevents an integration from
+/// silently changing GitForge's cleanup root.
+fn workspace_roots() -> Vec<std::path::PathBuf> {
+    if let Ok(value) = std::env::var("GITFORGE_WORKSPACE_ROOTS") {
+        let roots = value
+            .split(',')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        if !roots.is_empty() {
+            return roots;
+        }
+    }
+    vec![workspace_root()]
 }
 
 /// Delete a run's workspace directory. Only directories GitForge itself
@@ -2245,6 +2276,36 @@ mod tests {
         let error = validate_workspace_path(outside.to_str().unwrap()).unwrap_err();
         assert!(error.contains("workspace must be inside"));
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_validate_workspace_path_accepts_explicit_integration_root() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-integration-root")
+            .join(gitforge_common::RepoId::new().to_string());
+        let inside = root.join("inside");
+        let outside = root.parent().unwrap().join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::env::set_var(
+            "GITFORGE_WORKSPACE_ROOT",
+            root.parent().unwrap().join("run-workspaces"),
+        );
+        std::env::set_var("GITFORGE_WORKSPACE_ROOTS", &root);
+
+        assert_eq!(
+            validate_workspace_path(inside.to_str().unwrap()).unwrap(),
+            inside.canonicalize().unwrap().to_string_lossy()
+        );
+        let error = validate_workspace_path(outside.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("workspace must be inside one of"));
+
+        std::env::remove_var("GITFORGE_WORKSPACE_ROOTS");
         std::fs::remove_dir_all(root).unwrap();
     }
 
