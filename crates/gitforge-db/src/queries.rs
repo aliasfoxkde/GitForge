@@ -635,6 +635,14 @@ pub const MAX_JOB_LOG_CHUNK_BYTES: usize = 64 * 1024;
 /// Maximum durable log volume retained for one job.
 pub const MAX_JOB_LOG_BYTES: i64 = 16 * 1024 * 1024;
 
+fn is_retryable_log_append_error(error: &Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("database is deadlocked")
+        || message.contains("unique constraint failed: job_log_chunks")
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct JobLogChunk {
     pub sequence: i64,
@@ -646,6 +654,35 @@ impl JobQueries {
     /// Append a log chunk only when the runner still owns the active lease.
     /// `None` means the job is missing, terminal, or fenced by another lease.
     pub async fn append_log_with_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        chunk: &str,
+    ) -> Result<Option<i64>> {
+        // Runner output can arrive concurrently for stdout and stderr. SQLite
+        // transactions are deferred by default, so concurrent writers can
+        // both observe the same MAX(sequence) and one loses on the composite
+        // primary key. Retry only the two transient write races; lease and
+        // validation errors must remain immediate and observable.
+        const MAX_APPEND_ATTEMPTS: usize = 5;
+        for attempt in 0..MAX_APPEND_ATTEMPTS {
+            match Self::append_log_with_lease_once(pool, id, runner_id, lease_token, chunk).await {
+                Ok(result) => return Ok(result),
+                Err(error)
+                    if attempt + 1 < MAX_APPEND_ATTEMPTS
+                        && is_retryable_log_append_error(&error) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5 * (attempt as u64 + 1)))
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("log append retry loop must return")
+    }
+
+    async fn append_log_with_lease_once(
         pool: &Pool,
         id: JobId,
         runner_id: RunnerId,

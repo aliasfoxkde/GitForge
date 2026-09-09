@@ -313,6 +313,29 @@ async fn test_database_durable_job_lease_fences_replay() {
         JobQueries::list_logs(&pool, job.id).await.unwrap()[0].chunk,
         "hello\n"
     );
+
+    // stdout and stderr delivery can call the append endpoint concurrently.
+    // Every accepted chunk must receive a unique sequence number rather than
+    // surfacing a transient SQLite primary-key collision to the runner.
+    let (a, b, c, d, e, f, g, h) = tokio::join!(
+        JobQueries::append_log_with_lease(&pool, job.id, runner.id, "lease-a", "a"),
+        JobQueries::append_log_with_lease(&pool, job.id, runner.id, "lease-a", "b"),
+        JobQueries::append_log_with_lease(&pool, job.id, runner.id, "lease-a", "c"),
+        JobQueries::append_log_with_lease(&pool, job.id, runner.id, "lease-a", "d"),
+        JobQueries::append_log_with_lease(&pool, job.id, runner.id, "lease-a", "e"),
+        JobQueries::append_log_with_lease(&pool, job.id, runner.id, "lease-a", "f"),
+        JobQueries::append_log_with_lease(&pool, job.id, runner.id, "lease-a", "g"),
+        JobQueries::append_log_with_lease(&pool, job.id, runner.id, "lease-a", "h"),
+    );
+    for result in [a, b, c, d, e, f, g, h] {
+        assert!(result.unwrap().is_some());
+    }
+    let logs = JobQueries::list_logs(&pool, job.id).await.unwrap();
+    assert_eq!(logs.len(), 9);
+    assert_eq!(
+        logs.iter().map(|entry| entry.sequence).collect::<Vec<_>>(),
+        (0..9).collect::<Vec<_>>()
+    );
     assert!(!JobQueries::complete_with_lease(
         &pool,
         job.id,
