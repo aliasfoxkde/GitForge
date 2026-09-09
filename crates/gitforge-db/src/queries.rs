@@ -931,9 +931,14 @@ impl JobQueries {
     }
 
     /// Requeue an assigned job and clear its runner fencing token.
+    ///
+    /// A scheduler may have already persisted `queued` while retaining a
+    /// stale runner assignment (for example, after a runner-loss recovery
+    /// race). Treat that state as requeueable too; leaving `runner_id` set
+    /// prevents the next scheduler tick from assigning the job elsewhere.
     pub async fn requeue(pool: &Pool, id: JobId) -> Result<()> {
         sqlx::query(
-            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE id = ? AND status IN ('assigned', 'running')",
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE id = ? AND status IN ('pending', 'queued', 'assigned', 'running') AND runner_id IS NOT NULL",
         )
         .bind(id.to_string())
         .execute(pool.pool())
@@ -2737,6 +2742,24 @@ mod tests {
         let job = crate::models::Job::new(run.id, "build".to_string());
         JobQueries::create(&pool, &job).await.unwrap();
         JobQueries::start(&pool, job.id).await.unwrap();
+
+        // A runner-loss race can leave a durable row queued while retaining
+        // the offline runner identity. Requeue must clear that identity too,
+        // otherwise the replacement runner cannot claim the job.
+        let stale_runner_id = RunnerId::new();
+        let mut stale_runner = crate::models::Runner::new(
+            "stale-requeue-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        stale_runner.id = stale_runner_id;
+        RunnerQueries::create(&pool, &stale_runner).await.unwrap();
+        JobQueries::assign(&pool, job.id, stale_runner_id)
+            .await
+            .unwrap();
+        JobQueries::update_status(&pool, job.id, "queued")
+            .await
+            .unwrap();
 
         // Runner-loss recovery must clear an already-running lease, not only
         // jobs that were assigned but had not started execution yet.
