@@ -79,11 +79,15 @@ jobs:
           # Build the CLI first
           cargo build --package gitforge-cli --release --locked
 
-          REVIEW_CMD="./target/release/gitforge review --diff --provider $PROVIDER --verbose"
+          REVIEW_CMD=(./target/release/gitforge review --diff --provider "$PROVIDER" --verbose)
 
           # Run the review and capture output
           set +e
-          OUTPUT=$($REVIEW_CMD 2>&1)
+          # The CLI deliberately requires explicit diff content in --diff
+          # mode. Keep the generated PR diff as the source of truth instead
+          # of accidentally reviewing an empty working tree.
+          DIFF_CONTENT="$(cat pr.diff)"
+          OUTPUT=$("${REVIEW_CMD[@]}" --diff-content "$DIFF_CONTENT" 2>&1)
           REVIEW_STATUS=$?
           set -e
           echo "$OUTPUT"
