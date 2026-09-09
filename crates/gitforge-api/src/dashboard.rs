@@ -146,7 +146,8 @@ const DASHBOARD_HTML: &str = r#"
                 <span class="method get">GET</span> /api/pipelines - List pipelines
             </div>
             <div class="api-endpoint">
-                <span class="method get">GET</span> /api/runners - List runners
+                <span class="method get">GET</span> /api/runners - List runners<br>
+                <span class="method delete">DELETE</span> /api/runners/:id - Retire an idle runner
             </div>
             <div class="api-endpoint">
                 <span class="method get">GET</span> /api/artifacts - List artifacts
