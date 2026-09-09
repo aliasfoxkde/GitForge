@@ -78,6 +78,7 @@ The following require a running integration environment:
 | gitforge-db/models | 90%+ | 95%+ |
 | gitforge-scheduler | 88%+ | 87%+ |
 | gitforge-process | 86%+ | 93%+ |
+| gitforge-ai | 90.16% | providers exercise their full HTTP boundary against a scripted server |
 
 ### Moderate Coverage (70-85%)
 | Crate | Lines | Issue |
@@ -91,13 +92,14 @@ The following require a running integration environment:
 |-------|-------|-------|
 | gitforge-runner/executor | 62.09%* | Container execution requires Docker; *measured with the `#[ignore]` tests included (`cargo llvm-cov -p gitforge-runner -- --include-ignored`, 81/81 pass against live Docker 26.1.5); the CI floor sees 35.23% |
 | gitforge-build/daemon | 21.82% | Integration-only code |
-| gitforge-ai | 7-58% | API mocking needed |
 
 (2026-09-08 re-measurement, `cargo llvm-cov --all`: workspace total
 82.90% lines. services/git-server left this table's sub-30% bucket after
 its protocol harnesses were made coverage-visible: main.rs 69.43%,
 ssh_server.rs 85.64%; services/ci followed at 83.54% once its
-spawned-binary trigger harness landed.)
+spawned-binary trigger harness landed. gitforge-ai left the table on
+2026-09-09 at 90.16% lines once its providers were tested against a
+scripted HTTP server.)
 
 ## Remaining Gaps and Next Steps (2026-09-08)
 
@@ -201,6 +203,27 @@ Ordered by value; each item states the concrete blocker.
    gitforge-runner/executor executes containers (62.09% lines measured
    with the `#[ignore]` tests included against a live Docker daemon,
    35.23% on the CI floor).
+
+## Resolved from the Remaining-Gaps Ledger (2026-09-09)
+
+1. **gitforge-ai HTTP boundary** — done. The providers were the worst
+   covered code in the workspace (openai.rs 7.03% lines, ollama.rs
+   51.48%, anthropic.rs 58.80%) because every path behind the HTTP call
+   was untested. A new harness (`crates/gitforge-ai/tests/provider_http.rs`)
+   points each provider at a local scripted HTTP server via
+   `ProviderConfig::base_url` and serves realistic wire-format responses,
+   asserting the request envelopes (auth headers, model, max_tokens,
+   temperature), the status-to-error mapping (429 → RateLimit, 401 →
+   Auth, 5xx → Api), the response parsing (message content → findings
+   with severity/category mapping and safe fallback for unknown labels,
+   token and cost accounting), and the failure modes (unparsable content,
+   empty choices, missing API-key env var). The crate stands at 90.16%
+   lines. The Anthropic test immediately caught a real bug: the response
+   struct expected a JSON key literally named `type_`, so every real
+   Anthropic API response failed to parse (`AiError::Parse`) — the health
+   check had masked it because it never reads the body. Fixed with
+   `#[serde(rename = "type")]`. The health check had masked the bug
+   because it only reads the status code, never the body.
 
 ## Resolved from the Compose Smoke (2026-09-08)
 

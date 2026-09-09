@@ -42,6 +42,12 @@ All notable changes to GitForge will be documented in this file.
   a temporary database and bare repository, requires the trigger token,
   and asserts the run, job commands, image, and workspace clone all come
   from the committed `.gitforce.yml` at the pushed revision
+- AI provider HTTP boundary tests: each provider (OpenAI, Anthropic,
+  Ollama) is pointed at a local scripted HTTP server and driven through
+  health checks and reviews with realistic wire-format responses,
+  asserting auth headers, status-to-error mapping (429/401/5xx), finding
+  parsing with severity/category fallback, and cost/token accounting.
+  gitforge-ai went from 57.86% to 90.16% lines
 - Protocol and trigger test harnesses stop their spawned services with
   SIGTERM (the real graceful-shutdown path), so `cargo llvm-cov` now
   counts the entry-point code they exercise; workspace line coverage
@@ -79,6 +85,10 @@ All notable changes to GitForge will be documented in this file.
 
 ### Fixed
 
+- Anthropic reviews always failed to parse: the response struct expected
+  a JSON key literally named `type_` while the API sends `"type"`, so
+  every real `generate_review` call returned a parse error. The health
+  check had masked it because it only reads the status code
 - API list endpoints return 500 `database_error` instead of masking
   storage failures as empty 200 responses
 - ai-review.yml passed review outputs as action inputs instead of step

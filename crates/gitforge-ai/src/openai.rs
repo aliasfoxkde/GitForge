@@ -384,4 +384,19 @@ mod tests {
         assert!(cost >= 1);
         assert!(cost <= 2);
     }
+
+    #[test]
+    fn test_cost_calculation_mini_turbo_and_fallback_tiers() {
+        // 1M input + 100k output tokens per tier.
+        assert_eq!(calculate_openai_cost("gpt-4o-mini", 1_000_000, 100_000), 21);
+        assert_eq!(
+            calculate_openai_cost("gpt-4-turbo", 1_000_000, 100_000),
+            1300
+        );
+        // Unrecognized models fall back to the default pricing tier.
+        assert_eq!(
+            calculate_openai_cost("gpt-3.5-turbo", 1_000_000, 100_000),
+            65
+        );
+    }
 }

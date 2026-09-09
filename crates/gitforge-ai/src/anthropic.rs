@@ -307,6 +307,9 @@ struct Message {
 #[allow(dead_code)]
 struct AnthropicResponse {
     id: String,
+    // The API sends `"type": "message"`; without the rename, serde would
+    // look for a key literally named `type_` and reject every response.
+    #[serde(rename = "type")]
     type_: String,
     role: String,
     content: Vec<ContentBlock>,
@@ -393,6 +396,21 @@ mod tests {
         // (0.001 * 3.0) + (0.0005 * 15.0) = 0.003 + 0.0075 = 0.0105 dollars = ~1 cent
         assert!(cost >= 1);
         assert!(cost <= 2);
+    }
+
+    #[test]
+    fn test_cost_calculation_haiku_and_opus_tiers() {
+        // 1M input + 100k output: haiku (0.25 + 0.125 dollars) = 37.5 cents.
+        assert_eq!(
+            calculate_anthropic_cost("claude-3-haiku", 1_000_000, 100_000),
+            37
+        );
+        // Opus tier, which is also the fallback for unrecognized model
+        // names: (15.0 + 7.5 dollars) = 2250 cents.
+        assert_eq!(
+            calculate_anthropic_cost("claude-3-opus", 1_000_000, 100_000),
+            2250
+        );
     }
 
     #[test]
