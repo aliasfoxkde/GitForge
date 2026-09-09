@@ -1262,6 +1262,15 @@ impl JobQueries {
 
 pub struct RunnerQueries;
 
+/// Result of an operator-requested runner retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerRetirement {
+    Retired,
+    AlreadyRetired,
+    ActiveJobs(i64),
+    NotFound,
+}
+
 impl RunnerQueries {
     /// Create a new runner
     pub async fn create(pool: &Pool, runner: &crate::models::Runner) -> Result<()> {
@@ -1317,6 +1326,61 @@ impl RunnerQueries {
             .await
             .map_err(|e| Error::database(format!("failed to update runner status: {}", e)))?;
         Ok(())
+    }
+
+    /// Retire a runner without removing its audit record.
+    ///
+    /// Retirement is refused while the runner owns an assigned or running
+    /// job. The check and status transition share one transaction so an
+    /// operator cannot accidentally hide a live worker between the two
+    /// operations. Retired runners are already excluded by scheduler
+    /// policies that select only `online` runners.
+    pub async fn retire_if_idle(pool: &Pool, id: RunnerId) -> Result<RunnerRetirement> {
+        let mut transaction =
+            pool.pool().begin().await.map_err(|e| {
+                Error::database(format!("failed to begin runner retirement: {}", e))
+            })?;
+
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM runners WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|e| Error::database(format!("failed to load runner for retirement: {}", e)))?;
+
+        let Some(status) = status else {
+            transaction.rollback().await.ok();
+            return Ok(RunnerRetirement::NotFound);
+        };
+        if status == "retired" {
+            transaction.rollback().await.ok();
+            return Ok(RunnerRetirement::AlreadyRetired);
+        }
+
+        let active_jobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM jobs WHERE runner_id = ? AND status IN ('assigned', 'running')",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to inspect runner jobs: {}", e)))?;
+
+        if active_jobs > 0 {
+            transaction.rollback().await.ok();
+            return Ok(RunnerRetirement::ActiveJobs(active_jobs));
+        }
+
+        sqlx::query("UPDATE runners SET status = 'retired', updated_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| Error::database(format!("failed to retire runner: {}", e)))?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit runner retirement: {}", e)))?;
+        Ok(RunnerRetirement::Retired)
     }
 
     /// List all runners
@@ -2133,6 +2197,74 @@ mod tests {
             .unwrap();
         let found = RunnerQueries::get(&pool, runner.id).await.unwrap();
         assert_eq!(found.unwrap().status, "offline");
+
+        let user = crate::models::User::new(
+            "runner-owner".to_string(),
+            "runner-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "runner-repo".to_string(),
+            user.id,
+            "/git/runner-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "runner-pipeline".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            user.username.clone(),
+            "runner-commit".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+        let job = crate::models::Job::new(run.id, "runner-job".to_string());
+        JobQueries::create(&pool, &job).await.unwrap();
+        JobQueries::assign(&pool, job.id, runner.id).await.unwrap();
+        assert_eq!(
+            RunnerQueries::retire_if_idle(&pool, runner.id)
+                .await
+                .unwrap(),
+            RunnerRetirement::ActiveJobs(1)
+        );
+        JobQueries::complete(&pool, job.id, "succeeded", "{}")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            RunnerQueries::retire_if_idle(&pool, runner.id)
+                .await
+                .unwrap(),
+            RunnerRetirement::Retired
+        );
+        assert_eq!(
+            RunnerQueries::get(&pool, runner.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "retired"
+        );
+        assert_eq!(
+            RunnerQueries::retire_if_idle(&pool, runner.id)
+                .await
+                .unwrap(),
+            RunnerRetirement::AlreadyRetired
+        );
+        assert_eq!(
+            RunnerQueries::retire_if_idle(&pool, RunnerId::new())
+                .await
+                .unwrap(),
+            RunnerRetirement::NotFound
+        );
     }
 
     #[tokio::test]

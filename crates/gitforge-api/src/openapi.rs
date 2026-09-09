@@ -426,6 +426,21 @@ pub fn get_openapi_spec() -> serde_json::Value {
                         },
                         "404": {"description": "Runner not found"}
                     }
+                },
+                "delete": {
+                    "tags": ["runners"],
+                    "summary": "Retire an idle runner",
+                    "description": "Marks a runner retired without deleting its audit record. Requires admin or maintainer role and refuses while assigned or running jobs exist.",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+                    ],
+                    "responses": {
+                        "204": {"description": "Runner retired"},
+                        "400": {"description": "Invalid runner ID"},
+                        "403": {"description": "Administrator or maintainer role required"},
+                        "404": {"description": "Runner not found"},
+                        "409": {"description": "Runner has active jobs"}
+                    }
                 }
             },
             "/artifacts": {

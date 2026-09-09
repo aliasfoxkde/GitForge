@@ -79,11 +79,33 @@ jobs:
           # Build the CLI first
           cargo build --package gitforge-cli --release --locked
 
-          REVIEW_CMD="./target/release/gitforge review --diff --provider $PROVIDER --verbose"
+          # AI review is an optional enhancement until a provider credential
+          # is configured for this repository. Never claim a review happened
+          # when the provider is unavailable; deterministic checks remain the
+          # required gate in that case.
+          case "$PROVIDER" in
+            anthropic) REVIEW_KEY="$ANTHROPIC_API_KEY" ;;
+            openai) REVIEW_KEY="$OPENAI_API_KEY" ;;
+            ollama) REVIEW_KEY="configured-locally" ;;
+            *) REVIEW_KEY="" ;;
+          esac
+          if [[ -z "$REVIEW_KEY" ]]; then
+            echo "AI review skipped: no credential configured for provider '$PROVIDER'."
+            echo "summary=AI review skipped: provider '$PROVIDER' is not configured; deterministic gates remain authoritative." >> "$GITHUB_OUTPUT"
+            echo "critical_findings=false" >> "$GITHUB_OUTPUT"
+            echo "review_status=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          REVIEW_CMD=(./target/release/gitforge review --diff --provider "$PROVIDER" --verbose)
 
           # Run the review and capture output
           set +e
-          OUTPUT=$($REVIEW_CMD 2>&1)
+          # The CLI deliberately requires explicit diff content in --diff
+          # mode. Keep the generated PR diff as the source of truth instead
+          # of accidentally reviewing an empty working tree.
+          DIFF_CONTENT="$(cat pr.diff)"
+          OUTPUT=$("${REVIEW_CMD[@]}" --diff-content "$DIFF_CONTENT" 2>&1)
           REVIEW_STATUS=$?
           set -e
           echo "$OUTPUT"

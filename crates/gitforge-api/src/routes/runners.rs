@@ -9,7 +9,11 @@ use axum::{
     Json, Router,
 };
 use gitforge_common::RunnerId;
-use gitforge_db::{models::RunnerType, queries::RunnerQueries, Pool};
+use gitforge_db::{
+    models::RunnerType,
+    queries::{RunnerQueries, RunnerRetirement},
+    Pool,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -30,7 +34,7 @@ pub struct RunnerResponse {
 pub fn runner_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/runners", get(list_runners))
-        .route("/runners/{id}", get(get_runner))
+        .route("/runners/{id}", get(get_runner).delete(retire_runner))
 }
 
 /// Runner registration is a bootstrap endpoint used before a runner has a
@@ -169,6 +173,74 @@ async fn get_runner(
             })),
         )
             .into_response(),
+    }
+}
+
+/// Retire an idle runner while preserving its database record for audit and
+/// historical pipeline visibility. Only administrators and maintainers may
+/// perform this operation.
+async fn retire_runner(
+    user: AuthenticatedUser,
+    Extension(pool): Extension<Arc<Pool>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !matches!(user.claims.role.as_str(), "admin" | "maintainer") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "forbidden",
+                "message": "Only administrators and maintainers may retire runners"
+            })),
+        )
+            .into_response();
+    }
+
+    let runner_id = match Uuid::parse_str(&id) {
+        Ok(uuid) => RunnerId::from(uuid),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_id",
+                    "message": "Invalid runner ID format"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match RunnerQueries::retire_if_idle(&pool, runner_id).await {
+        Ok(RunnerRetirement::Retired | RunnerRetirement::AlreadyRetired) => {
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(RunnerRetirement::ActiveJobs(count)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "runner_busy",
+                "message": "Runner has active jobs; wait for completion before retiring it",
+                "active_jobs": count
+            })),
+        )
+            .into_response(),
+        Ok(RunnerRetirement::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "message": "Runner not found"
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, %runner_id, "failed to retire runner");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "Failed to retire runner"
+                })),
+            )
+                .into_response()
+        }
     }
 }
 

@@ -600,10 +600,11 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("   Server: {}", server);
                 println!("   Capacity: {} concurrent jobs", cap);
                 println!("   (Runner registration not yet implemented)");
-            } else if deregister.is_some() {
-                let _id = deregister.clone().unwrap_or_default();
-                println!("🤖 Deregistering runner...");
-                println!("   (Runner deregistration not yet implemented)");
+            } else if let Some(id) = deregister {
+                match api_client.retire_runner(id).await {
+                    Ok(()) => println!("✅ Runner {} retired (audit record preserved)", id),
+                    Err(e) => println!("❌ Failed to retire runner: {}", e),
+                }
             } else if let Some(cap) = capacity {
                 println!("🤖 Updating runner capacity to: {}", cap);
                 println!("   (Runner capacity update not yet implemented)");

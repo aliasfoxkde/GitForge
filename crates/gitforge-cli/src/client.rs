@@ -351,6 +351,24 @@ impl ApiClient {
         let runner: RunnerResponse = resp.json().await?;
         Ok(runner)
     }
+
+    /// Retire an idle runner while preserving its audit record.
+    pub async fn retire_runner(&self, id: &str) -> Result<()> {
+        let url = format!("{}/api/runners/{}", self.base_url, id);
+        let mut req = self.http.delete(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to retire runner: {} - {}", status, body);
+        }
+        Ok(())
+    }
 }
 
 pub use ApiClient as GitForgeClient;
