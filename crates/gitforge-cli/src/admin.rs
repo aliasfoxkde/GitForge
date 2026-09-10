@@ -48,9 +48,50 @@ pub async fn bootstrap_first_admin(
     Ok(user)
 }
 
+/// Create a subsequent local user with an explicit least-privilege role.
+///
+/// This remains a local database operation and requires explicit confirmation;
+/// it is not an HTTP privilege-escalation endpoint.
+pub async fn create_local_user(
+    database_url: &str,
+    username: &str,
+    email: &str,
+    role: &str,
+    password: &str,
+    confirmed: bool,
+) -> Result<User> {
+    if !confirmed {
+        bail!("refusing local user creation without --confirm");
+    }
+    let username = username.trim();
+    let email = email.trim();
+    if username.is_empty() || email.is_empty() {
+        bail!("username and email must not be empty");
+    }
+    if !matches!(role, "admin" | "maintainer" | "developer" | "read_only") {
+        bail!("unsupported user role: {role}");
+    }
+    if password.chars().count() < MIN_PASSWORD_LENGTH {
+        bail!("password must be at least {MIN_PASSWORD_LENGTH} characters");
+    }
+    let pool = Pool::new(database_url)
+        .await
+        .context("failed to open GitForge database")?;
+    pool.migrate()
+        .await
+        .context("failed to migrate GitForge database")?;
+    let user = User::new(
+        username.to_string(),
+        email.to_string(),
+        hash_password(password).context("failed to hash password")?,
+    );
+    UserQueries::create_with_role(&pool, &user, role).await?;
+    Ok(user)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::bootstrap_first_admin;
+    use super::{bootstrap_first_admin, create_local_user};
     use gitforge_common::password::verify_password;
     use gitforge_db::{queries::UserQueries, Pool};
     use std::{
@@ -139,5 +180,40 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn creates_a_least_privilege_user_after_bootstrap() {
+        let artifact_directory = test_artifact_directory();
+        std::fs::create_dir_all(&artifact_directory).unwrap();
+        let directory = tempfile::tempdir_in(artifact_directory).unwrap();
+        let database_url = format!("sqlite:{}/gitforge.db?mode=rwc", directory.path().display());
+        let admin_password = runtime_password();
+        bootstrap_first_admin(
+            &database_url,
+            "operator",
+            "operator@example.test",
+            &admin_password,
+            true,
+        )
+        .await
+        .unwrap();
+        let user_password = runtime_password();
+        let user = create_local_user(
+            &database_url,
+            "validation",
+            "validation@example.test",
+            "developer",
+            &user_password,
+            true,
+        )
+        .await
+        .unwrap();
+        let pool = Pool::new(&database_url).await.unwrap();
+        assert_eq!(
+            UserQueries::get_role(&pool, user.id).await.unwrap(),
+            Some("developer".into())
+        );
+        assert_eq!(UserQueries::count_role(&pool, "admin").await.unwrap(), 1);
     }
 }

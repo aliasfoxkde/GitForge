@@ -63,14 +63,20 @@ enum Commands {
         /// Create the first administrator in DATABASE_URL
         #[arg(long)]
         bootstrap: bool,
+        /// Create a subsequent least-privilege local user in DATABASE_URL
+        #[arg(long)]
+        create_user: bool,
         /// Administrator username
-        #[arg(long, requires = "bootstrap")]
+        #[arg(long)]
         username: Option<String>,
         /// Administrator email
-        #[arg(long, requires = "bootstrap")]
+        #[arg(long)]
         email: Option<String>,
+        /// Role for a subsequent user
+        #[arg(long, default_value = "developer")]
+        role: String,
         /// Explicitly confirm local first-admin creation
-        #[arg(long, requires = "bootstrap")]
+        #[arg(long)]
         confirm: bool,
     },
     /// Repository operations
@@ -280,28 +286,53 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
 
         Commands::Admin {
             bootstrap,
+            create_user,
             username,
             email,
+            role,
             confirm,
         } => {
-            if !bootstrap {
-                anyhow::bail!(
-                    "select an administrative operation; currently supported: --bootstrap"
-                );
+            if *bootstrap && *create_user {
+                anyhow::bail!("choose only one of --bootstrap or --create-user");
+            }
+            if !*bootstrap && !*create_user {
+                anyhow::bail!("select an administrative operation: --bootstrap or --create-user");
             }
             let database_url = std::env::var("DATABASE_URL")
-                .context("DATABASE_URL is required for local administrator bootstrap")?;
+                .context("DATABASE_URL is required for local admin operations")?;
             let username = username
                 .as_deref()
-                .context("--username is required with --bootstrap")?;
+                .context("--username is required with --bootstrap or --create-user")?;
             let email = email
                 .as_deref()
-                .context("--email is required with --bootstrap")?;
-            let password = rpassword::prompt_password("Administrator password: ")?;
-            let _user =
-                admin::bootstrap_first_admin(&database_url, username, email, &password, *confirm)
-                    .await?;
-            println!("✅ First administrator created successfully.");
+                .context("--email is required with --bootstrap or --create-user")?;
+            let password = rpassword::prompt_password(if *bootstrap {
+                "Administrator password: "
+            } else {
+                "New user password: "
+            })?;
+            if *bootstrap {
+                let _user = admin::bootstrap_first_admin(
+                    &database_url,
+                    username,
+                    email,
+                    &password,
+                    *confirm,
+                )
+                .await?;
+                println!("✅ First administrator created successfully.");
+            } else {
+                let user = admin::create_local_user(
+                    &database_url,
+                    username,
+                    email,
+                    &role,
+                    &password,
+                    *confirm,
+                )
+                .await?;
+                println!("✅ Local user created: {} ({})", user.username, role);
+            }
             println!("   Run `gitforge auth login --login <username>` to obtain a session token.");
         }
 
