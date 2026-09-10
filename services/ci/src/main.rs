@@ -27,6 +27,7 @@ use gitforge_scheduler::{
     assigner::DEFAULT_JOB_TIMEOUT_SECS, create_state_with_artifact_storage, scheduler_routes,
     Scheduler, SchedulerEvent,
 };
+use gitforge_scheduler::assigner::JobExecutionDefinition;
 use gitforge_storage::FileStorage;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
