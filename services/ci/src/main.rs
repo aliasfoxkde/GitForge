@@ -23,8 +23,10 @@ use gitforge_events::{
 };
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
 use gitforge_scheduler::{
-    create_state_with_artifact_storage, scheduler_routes, Scheduler, SchedulerEvent,
+    assigner::DEFAULT_JOB_TIMEOUT_SECS, create_state_with_artifact_storage, scheduler_routes,
+    Scheduler, SchedulerEvent,
 };
+use gitforge_scheduler::assigner::JobExecutionDefinition;
 use gitforge_storage::FileStorage;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1311,14 +1313,24 @@ async fn handle_push_event(
                 .iter()
                 .find_map(|step| step.working_directory.clone());
             let working_dir = working_dir.or_else(|| workspace_path.clone());
+            // Honor the pipeline job's timeout instead of silently applying
+            // the legacy per-command default: long suites (a full pytest run
+            // easily exceeds 300 s) would otherwise time out mid-step even
+            // though the definition asked for more.
+            let timeout_secs = definition
+                .timeout_secs()
+                .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
             scheduler
-                .enqueue_with_definition_and_image(
+                .enqueue_with_definition_and_image_and_timeout(
                     job_id,
                     state.run_id,
                     repo_id,
-                    commands,
-                    definition.image.clone(),
-                    working_dir,
+                    JobExecutionDefinition {
+                        commands,
+                        image: definition.image.clone(),
+                        working_dir,
+                        timeout_secs,
+                    },
                 )
                 .await;
             tracing::debug!("enqueued job {} for pipeline run {}", job_id, state.run_id);
