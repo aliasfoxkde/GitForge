@@ -1421,14 +1421,24 @@ async fn run_scheduler_event_consumer(
                     .iter()
                     .find_map(|step| step.working_directory.clone())
                     .or_else(|| workspace_path.clone());
+                // Same contract as the initial enqueue: chained jobs keep
+                // the pipeline's per-job timeout. The legacy enqueue below
+                // silently applied a 300 s default — a 45 m test job queued
+                // after its neighbor finished was killed five minutes in.
+                let timeout_secs = definition
+                    .timeout_secs()
+                    .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
                 scheduler
-                    .enqueue_with_definition_and_image(
+                    .enqueue_with_definition_and_image_and_timeout(
                         next_job_id,
                         state.run_id,
                         state.repo_id,
-                        commands,
-                        definition.image.clone(),
-                        working_dir,
+                        JobExecutionDefinition {
+                            commands,
+                            image: definition.image.clone(),
+                            working_dir,
+                            timeout_secs,
+                        },
                     )
                     .await;
             }
