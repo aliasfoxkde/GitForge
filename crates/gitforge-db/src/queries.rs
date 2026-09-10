@@ -721,17 +721,27 @@ impl JobQueries {
             )));
         }
 
-        let mut tx = pool
-            .pool()
-            .begin()
+        // Take SQLite's write lock before the authorization and sequence
+        // reads. A deferred transaction lets concurrent appenders all read
+        // the same MAX(sequence), then contend while upgrading to a writer;
+        // SQLite can report that upgrade as `database is deadlocked` even
+        // with a busy timeout. BEGIN IMMEDIATE serializes only this short
+        // append transaction and keeps the lease check plus sequence
+        // allocation atomic.
+        let mut conn = pool.pool().acquire().await.map_err(|e| {
+            Error::database(format!("failed to acquire log append connection: {}", e))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
             .await
             .map_err(|e| Error::database(format!("failed to begin log append: {}", e)))?;
         let Some(job) = sqlx::query("SELECT runner_id, lease_token, status FROM jobs WHERE id = ?")
             .bind(id.to_string())
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(|e| Error::database(format!("failed to authorize log append: {}", e)))?
         else {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
             return Ok(None);
         };
 
@@ -742,6 +752,7 @@ impl JobQueries {
             || current_token.as_deref() != Some(lease_token)
             || !matches!(status.as_str(), "assigned" | "running")
         {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
             return Ok(None);
         }
 
@@ -749,10 +760,11 @@ impl JobQueries {
             "SELECT COALESCE(SUM(length(chunk)), 0) FROM job_log_chunks WHERE job_id = ?",
         )
         .bind(id.to_string())
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| Error::database(format!("failed to measure job logs: {}", e)))?;
         if total + chunk.len() as i64 > MAX_JOB_LOG_BYTES {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
             return Err(Error::invalid_input(format!(
                 "job logs exceed {} bytes",
                 MAX_JOB_LOG_BYTES
@@ -763,7 +775,7 @@ impl JobQueries {
             "SELECT COALESCE(MAX(sequence), -1) + 1 FROM job_log_chunks WHERE job_id = ?",
         )
         .bind(id.to_string())
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| Error::database(format!("failed to allocate log sequence: {}", e)))?;
         sqlx::query(
@@ -773,10 +785,11 @@ impl JobQueries {
         .bind(sequence)
         .bind(chunk)
         .bind(Utc::now().to_rfc3339())
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await
         .map_err(|e| Error::database(format!("failed to append job log: {}", e)))?;
-        tx.commit()
+        sqlx::query("COMMIT")
+            .execute(&mut *conn)
             .await
             .map_err(|e| Error::database(format!("failed to commit log append: {}", e)))?;
         Ok(Some(sequence))

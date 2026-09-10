@@ -468,7 +468,15 @@ async fn trigger_pipeline(
 
     match trigger_state.event_bus.publish(event.clone()).await {
         Ok(()) => {
-            let pipeline_run_id = tokio::time::timeout(Duration::from_secs(3), run_rx)
+            // Pipeline creation includes event delivery, config loading, and
+            // durable run/job persistence.  Three seconds was shorter than
+            // the observed cold-path on the Fedora runner, causing a valid
+            // accepted event to be returned as `queued` without a run ID;
+            // consumers that require a correlated run then failed with a
+            // false 500. Keep the synchronous correlation window generous
+            // while retaining the explicit queued response for a genuinely
+            // slow scheduler.
+            let pipeline_run_id = tokio::time::timeout(Duration::from_secs(15), run_rx)
                 .await
                 .ok()
                 .and_then(|result| result.ok());
