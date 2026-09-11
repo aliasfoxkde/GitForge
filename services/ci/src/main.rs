@@ -22,6 +22,7 @@ use gitforge_events::{
     PushReceivedPayload,
 };
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
+use gitforge_scheduler::assigner::JobExecutionDefinition;
 use gitforge_scheduler::{
     create_state_with_artifact_storage, scheduler_routes, Scheduler, SchedulerEvent,
 };
@@ -1195,6 +1196,12 @@ async fn handle_push_event(
             config: serde_json::to_value(&pipeline)?,
             created_at: Utc::now(),
         };
+        // Only one active pipeline version per (repo, name) is allowed by
+        // idx_pipelines_active_repo_name — retire the predecessor before
+        // recording this push's version, or every push after the first
+        // fails run creation with a constraint violation.
+        gitforge_db::queries::PipelineQueries::deactivate_active(pool, repo_id, &pipeline.name)
+            .await?;
         gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
 
         let mut db_run = DbPipelineRun::new(
