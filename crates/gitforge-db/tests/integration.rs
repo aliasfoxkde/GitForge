@@ -139,6 +139,66 @@ async fn test_database_pipeline_with_dependencies() {
 }
 
 #[tokio::test]
+async fn test_pipeline_versioning_active_uniqueness() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = User::new(
+        "versioner".to_string(),
+        "versioner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+
+    let repo = Repository::new(
+        "versioned-repo".to_string(),
+        user.id,
+        "/git/versioned-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+
+    let pipeline = |id: PipelineId| Pipeline {
+        id,
+        repo_id: repo.id,
+        name: "gates".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+
+    // The partial UNIQUE index admits only one active version per
+    // (repo, name): a second insert without retiring the predecessor must
+    // be rejected...
+    PipelineQueries::create(&pool, &pipeline(PipelineId::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        PipelineQueries::count_active(&pool, repo.id, "gates")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(PipelineQueries::create(&pool, &pipeline(PipelineId::new()))
+        .await
+        .is_err());
+
+    // ...and the push path retires the predecessor before recording the
+    // new version, leaving exactly one active row again.
+    PipelineQueries::deactivate_active(&pool, repo.id, "gates")
+        .await
+        .unwrap();
+    PipelineQueries::create(&pool, &pipeline(PipelineId::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        PipelineQueries::count_active(&pool, repo.id, "gates")
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn test_database_event_storage() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();

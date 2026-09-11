@@ -604,6 +604,39 @@ impl PipelineQueries {
         Ok(())
     }
 
+    /// Retire the currently active pipeline version for (repo_id, name).
+    ///
+    /// The partial UNIQUE index `idx_pipelines_active_repo_name` admits only
+    /// one active row per repository and name, so a newly pushed version
+    /// must deactivate its predecessor or every push after the first fails
+    /// run creation with a constraint violation. Superseded rows stay as
+    /// history with active = 0.
+    pub async fn deactivate_active(pool: &Pool, repo_id: RepoId, name: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE pipelines SET active = 0 WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind(repo_id.to_string())
+        .bind(name)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to deactivate pipeline: {}", e)))?;
+        Ok(())
+    }
+
+    /// Number of active pipeline versions for (repo_id, name) — at most one
+    /// by the partial UNIQUE index; lets callers verify deactivation.
+    pub async fn count_active(pool: &Pool, repo_id: RepoId, name: &str) -> Result<i64> {
+        let (count,) = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM pipelines WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind(repo_id.to_string())
+        .bind(name)
+        .fetch_one(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to count active pipelines: {}", e)))?;
+        Ok(count)
+    }
+
     /// Get a pipeline by ID
     pub async fn get(pool: &Pool, id: PipelineId) -> Result<Option<crate::models::Pipeline>> {
         let row = sqlx::query("SELECT * FROM pipelines WHERE id = ?")
