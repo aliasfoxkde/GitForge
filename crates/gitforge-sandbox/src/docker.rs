@@ -607,9 +607,12 @@ impl Sandbox for DockerSandbox {
                 );
             }
 
-            // Now remove the stopped container
+            // Remove the container even when the graceful stop reported an
+            // already-stopped or inconsistent rootless-Podman state. The
+            // container is owned by this exact job instance; force removal
+            // prevents its conmon helper from surviving the sandbox lifecycle.
             let remove_options = RemoveContainerOptions {
-                force: false,
+                force: true,
                 ..Default::default()
             };
 
