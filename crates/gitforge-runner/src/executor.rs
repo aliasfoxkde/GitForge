@@ -405,30 +405,28 @@ impl JobExecutor {
         // inside the container has exited.  Tear down the exact container
         // immediately on timeout, before artifact/log collection, so timed-out
         // jobs cannot leave an active exec or conmon helper behind.
-        if timed_out {
-            if timeout(
+        let teardown_timed_out = timed_out
+            && timeout(
                 Duration::from_secs(15),
                 self.pool.sandbox.destroy(instance.clone()),
             )
             .await
-            .is_err()
+            .is_err();
+        if teardown_timed_out {
+            tracing::error!(%job_id, "timed-out sandbox teardown exceeded 15 seconds");
+            // The graceful destroy future may have been cancelled while
+            // Docker was stopping the container. Re-list by ownership label
+            // and force-remove only this job's containers. Bound the fallback
+            // as well so a broken daemon cannot wedge the runner indefinitely.
+            match timeout(
+                Duration::from_secs(15),
+                self.reap_attempt_containers(job_id),
+            )
+            .await
             {
-                tracing::error!(%job_id, "timed-out sandbox teardown exceeded 15 seconds");
-                // The graceful destroy future may have been cancelled while
-                // Docker was stopping the container. Re-list by ownership
-                // label and force-remove only this job's containers. Bound
-                // the fallback as well so a broken daemon cannot wedge the
-                // runner indefinitely.
-                match timeout(
-                    Duration::from_secs(15),
-                    self.reap_attempt_containers(job_id),
-                )
-                .await
-                {
-                    Ok(()) => tracing::info!(%job_id, "timed-out sandbox force-reap completed"),
-                    Err(_) => {
-                        tracing::error!(%job_id, "timed-out sandbox force-reap exceeded 15 seconds")
-                    }
+                Ok(()) => tracing::info!(%job_id, "timed-out sandbox force-reap completed"),
+                Err(_) => {
+                    tracing::error!(%job_id, "timed-out sandbox force-reap exceeded 15 seconds")
                 }
             }
         }
