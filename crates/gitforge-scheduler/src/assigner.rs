@@ -233,6 +233,28 @@ impl Scheduler {
             || state.queue.contains(job_id)
     }
 
+    /// Return the working directory persisted for a job assignment.
+    ///
+    /// Completion consumers use this as a durable fallback when their
+    /// process-local pipeline workspace map has been lost across a restart.
+    /// The value is read by job identity and never inferred from a global
+    /// `/workspace` default.
+    pub async fn job_working_dir(&self, job_id: JobId) -> Option<String> {
+        if let Some(pool) = &self.db_pool {
+            return gitforge_db::queries::JobQueries::get(pool, job_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|job| job.working_dir);
+        }
+        self.state
+            .read()
+            .await
+            .job_definitions
+            .get(&job_id)
+            .and_then(|definition| definition.working_dir.clone())
+    }
+
     /// Read a durable pipeline run for the CI status adapter.
     pub async fn get_pipeline_run(
         &self,
@@ -1269,6 +1291,11 @@ mod tests {
         assert_eq!(definition.image, "node:22");
         assert_eq!(definition.working_dir.as_deref(), Some("/workspace"));
         assert_eq!(definition.timeout_secs, 900);
+        drop(state);
+        assert_eq!(
+            scheduler.job_working_dir(job_id).await.as_deref(),
+            Some("/workspace")
+        );
     }
 
     #[tokio::test]

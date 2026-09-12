@@ -1469,6 +1469,12 @@ async fn run_scheduler_event_consumer(
         };
 
         let state = engine.state().await;
+        // A process-local run workspace map is an optimization, not the
+        // source of truth. If the CI service restarted after the parent was
+        // enqueued, inherit the parent's persisted directory before falling
+        // back to the run map. This prevents dependency-unblocked jobs from
+        // silently executing in an empty `/workspace`.
+        let inherited_working_dir = scheduler.job_working_dir(job_id).await;
         let workspace_path = run_workspace_paths
             .lock()
             .expect("workspace cache lock poisoned")
@@ -1491,6 +1497,7 @@ async fn run_scheduler_event_consumer(
                     .steps
                     .iter()
                     .find_map(|step| step.working_directory.clone())
+                    .or_else(|| inherited_working_dir.clone())
                     .or_else(|| workspace_path.clone());
                 scheduler
                     .enqueue_with_definition_and_image(
