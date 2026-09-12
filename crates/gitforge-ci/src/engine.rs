@@ -243,8 +243,23 @@ impl CiEngine {
         if let Some(job_state) = state.jobs.get_mut(&job_id) {
             job_state.fail(exit_code, error)?;
 
-            // Pipeline fails if any job fails
-            if !state.failed_jobs().is_empty() {
+            // Fail-fast stops work that has not started, but running siblings
+            // must finish before the pipeline becomes terminal. The shared
+            // workspace is owned by the run, so cleaning it on the first
+            // failure would race active jobs and make later steps lose their
+            // repository files.
+            let pending_jobs: Vec<JobId> = state
+                .jobs
+                .iter()
+                .filter(|(_, job)| matches!(job.status(), JobStatus::Pending | JobStatus::Queued))
+                .map(|(id, _)| *id)
+                .collect();
+            for pending_id in pending_jobs {
+                if let Some(pending) = state.jobs.get_mut(&pending_id) {
+                    let _ = pending.cancel();
+                }
+            }
+            if !state.failed_jobs().is_empty() && state.all_jobs_finished() {
                 state.status = PipelineStatus::Failed;
                 state.finished_at = Some(chrono::Utc::now());
             }
@@ -259,8 +274,20 @@ impl CiEngine {
             job_state.timeout()?;
             let timed_out = job_state.status() == JobStatus::TimedOut;
 
-            // Pipeline fails if any job times out or fails
-            if !state.failed_jobs().is_empty() || timed_out {
+            // As with ordinary failure, leave running siblings alone and
+            // defer terminal projection until every job is terminal.
+            let pending_jobs: Vec<JobId> = state
+                .jobs
+                .iter()
+                .filter(|(_, job)| matches!(job.status(), JobStatus::Pending | JobStatus::Queued))
+                .map(|(id, _)| *id)
+                .collect();
+            for pending_id in pending_jobs {
+                if let Some(pending) = state.jobs.get_mut(&pending_id) {
+                    let _ = pending.cancel();
+                }
+            }
+            if (!state.failed_jobs().is_empty() || timed_out) && state.all_jobs_finished() {
                 state.status = PipelineStatus::Failed;
                 state.finished_at = Some(chrono::Utc::now());
             }
