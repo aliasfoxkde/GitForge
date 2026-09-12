@@ -211,6 +211,25 @@ async fn test_pipeline_versioning_migrates_legacy_table() {
     .await
     .unwrap();
 
+    sqlx::query(
+        "INSERT INTO pipelines (id, repo_id, name, trigger_type, config, created_at) VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("00000000-0000-0000-0000-000000000001")
+    .bind("00000000-0000-0000-0000-000000000010")
+    .bind("gates")
+    .bind("push")
+    .bind("{}")
+    .bind("2026-09-11T00:00:00Z")
+    .bind("00000000-0000-0000-0000-000000000002")
+    .bind("00000000-0000-0000-0000-000000000010")
+    .bind("gates")
+    .bind("push")
+    .bind("{}")
+    .bind("2026-09-12T00:00:00Z")
+    .execute(pool.pool())
+    .await
+    .unwrap();
+
     pool.migrate().await.unwrap();
 
     let columns = sqlx::query_scalar::<_, String>(
@@ -220,6 +239,17 @@ async fn test_pipeline_versioning_migrates_legacy_table() {
     .await
     .unwrap();
     assert_eq!(columns.as_deref(), Some("active"));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pipelines WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind("00000000-0000-0000-0000-000000000010")
+        .bind("gates")
+        .fetch_one(pool.pool())
+        .await
+        .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]

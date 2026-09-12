@@ -152,6 +152,31 @@ impl Pool {
             }
         }
 
+        // A pre-versioning database may contain several historical rows for
+        // the same repository/name. Keep the newest row active and retire the
+        // older rows before adding the uniqueness index. This is idempotent
+        // and preserves every row for audit/history queries.
+        sqlx::query(
+            r#"
+            UPDATE pipelines
+            SET active = 0
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY repo_id, name
+                               ORDER BY created_at DESC, id DESC
+                           ) AS version_rank
+                    FROM pipelines
+                )
+                WHERE version_rank > 1
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to reconcile pipeline versions: {}", e)))?;
+
         // One active pipeline version per repository and name; superseded
         // versions stay as history with active = 0.
         sqlx::query(
