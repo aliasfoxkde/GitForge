@@ -33,6 +33,73 @@ async fn test_database_in_memory_pool() {
 }
 
 #[tokio::test]
+async fn test_pipeline_status_stays_non_terminal_until_all_jobs_finish() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = User::new(
+        "status-owner".to_string(),
+        "status-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "status-repo".to_string(),
+        user.id,
+        "/git/status-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+    let pipeline = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "status-pipeline".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    PipelineQueries::create(&pool, &pipeline).await.unwrap();
+    let run = PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "status-owner".to_string(),
+        "status-commit".to_string(),
+    );
+    PipelineRunQueries::create(&pool, &run).await.unwrap();
+    let running = Job::new(run.id, "running-sibling".to_string());
+    JobQueries::create(&pool, &running).await.unwrap();
+    JobQueries::update_status(&pool, running.id, "running")
+        .await
+        .unwrap();
+    PipelineRunQueries::update_status(&pool, run.id, "running")
+        .await
+        .unwrap();
+
+    PipelineRunQueries::update_status(&pool, run.id, "failed")
+        .await
+        .unwrap();
+
+    let persisted = PipelineRunQueries::get(&pool, run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.status, "running");
+    assert!(persisted.finished_at.is_none());
+
+    JobQueries::update_status(&pool, running.id, "failed")
+        .await
+        .unwrap();
+    PipelineRunQueries::update_status(&pool, run.id, "failed")
+        .await
+        .unwrap();
+    let persisted = PipelineRunQueries::get(&pool, run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.status, "failed");
+    assert!(persisted.finished_at.is_some());
+}
+
+#[tokio::test]
 async fn test_database_repository_crud() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();

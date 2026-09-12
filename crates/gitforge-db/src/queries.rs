@@ -625,19 +625,37 @@ impl PipelineRunQueries {
 
     /// Update pipeline run status
     pub async fn update_status(pool: &Pool, id: PipelineRunId, status: &str) -> Result<()> {
-        let finished_at = matches!(
+        let terminal = matches!(
             status,
             "succeeded" | "failed" | "cancelled" | "timed_out" | "timeout" | "timed-out"
-        )
-        .then(|| Utc::now().to_rfc3339());
-        sqlx::query(
-            "UPDATE pipeline_runs SET status = ?, finished_at = COALESCE(?, finished_at) WHERE id = ?",
-        )
+        );
+        let finished_at = terminal.then(|| Utc::now().to_rfc3339());
+        let run_id = id.to_string();
+        let result = if terminal {
+            // The parent status is shared durable state. Guard the terminal
+            // transition in the same UPDATE that performs it so every caller
+            // (scheduler, CI, reconciliation, and API) obeys the invariant:
+            // a run cannot be terminal while one of its jobs is still active.
+            sqlx::query(
+                "UPDATE pipeline_runs SET status = ?, finished_at = COALESCE(?, finished_at) WHERE id = ? AND NOT EXISTS (SELECT 1 FROM jobs WHERE pipeline_run_id = ? AND status NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out'))",
+            )
             .bind(status)
             .bind(finished_at)
-            .bind(id.to_string())
+            .bind(&run_id)
+            .bind(&run_id)
             .execute(pool.pool())
             .await
+        } else {
+            sqlx::query(
+                "UPDATE pipeline_runs SET status = ?, finished_at = COALESCE(?, finished_at) WHERE id = ?",
+            )
+            .bind(status)
+            .bind(finished_at)
+            .bind(&run_id)
+            .execute(pool.pool())
+            .await
+        };
+        result
             .map_err(|e| Error::database(format!("failed to update pipeline run status: {}", e)))?;
         Ok(())
     }
