@@ -135,6 +135,23 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create pipelines table: {}", e)))?;
 
+        // Additive migration for databases created before pipeline versioning.
+        // `CREATE TABLE IF NOT EXISTS` does not alter an existing table, so
+        // add the column before creating the partial uniqueness index below.
+        if let Err(error) =
+            sqlx::query("ALTER TABLE pipelines ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(Error::database(format!(
+                    "failed to migrate pipelines table: {}",
+                    error
+                )));
+            }
+        }
+
         // One active pipeline version per repository and name; superseded
         // versions stay as history with active = 0.
         sqlx::query(

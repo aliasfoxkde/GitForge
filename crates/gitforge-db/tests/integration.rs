@@ -200,6 +200,29 @@ async fn test_pipeline_versioning_active_uniqueness() {
 }
 
 #[tokio::test]
+async fn test_pipeline_versioning_migrates_legacy_table() {
+    let pool = Pool::memory().await.unwrap();
+
+    // Simulate a database created before the active-version column existed.
+    sqlx::query(
+        "CREATE TABLE pipelines (id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, name TEXT NOT NULL, trigger_type TEXT NOT NULL, config TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)",
+    )
+    .execute(pool.pool())
+    .await
+    .unwrap();
+
+    pool.migrate().await.unwrap();
+
+    let columns = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM pragma_table_info('pipelines') WHERE name = 'active'",
+    )
+    .fetch_optional(pool.pool())
+    .await
+    .unwrap();
+    assert_eq!(columns.as_deref(), Some("active"));
+}
+
+#[tokio::test]
 async fn test_database_event_storage() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();
