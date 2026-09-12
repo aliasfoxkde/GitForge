@@ -241,11 +241,11 @@ impl Scheduler {
     /// `/workspace` default.
     pub async fn job_working_dir(&self, job_id: JobId) -> Option<String> {
         if let Some(pool) = &self.db_pool {
-            return gitforge_db::queries::JobQueries::get(pool, job_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|job| job.working_dir);
+            if let Ok(Some(job)) = gitforge_db::queries::JobQueries::get(pool, job_id).await {
+                if job.working_dir.is_some() {
+                    return job.working_dir;
+                }
+            }
         }
         self.state
             .read()
