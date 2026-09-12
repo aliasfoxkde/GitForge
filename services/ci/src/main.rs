@@ -29,6 +29,7 @@ use gitforge_scheduler::{
 };
 use gitforge_storage::FileStorage;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -629,6 +630,98 @@ fn workspace_roots() -> Vec<std::path::PathBuf> {
     vec![workspace_root()]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerBackend {
+    Docker,
+    Podman,
+}
+
+fn container_backend_from_env() -> Result<ContainerBackend, String> {
+    match std::env::var("GITFORGE_CONTAINER_BACKEND") {
+        Ok(value) if value.eq_ignore_ascii_case("docker") => Ok(ContainerBackend::Docker),
+        Ok(value) if value.eq_ignore_ascii_case("podman") => Ok(ContainerBackend::Podman),
+        Ok(value) => Err(format!(
+            "GITFORGE_CONTAINER_BACKEND must be `docker` or `podman`, got `{value}`"
+        )),
+        Err(std::env::VarError::NotPresent) => Err(
+            "GITFORGE_CONTAINER_BACKEND is unset; refusing container-assisted workspace cleanup"
+                .to_string(),
+        ),
+        Err(std::env::VarError::NotUnicode(_)) => Err(
+            "GITFORGE_CONTAINER_BACKEND is not valid UTF-8; refusing container-assisted workspace cleanup"
+                .to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CleanupCommand {
+    program: &'static str,
+    args: Vec<OsString>,
+}
+
+fn cleanup_command(backend: ContainerBackend, workspace: &std::path::Path) -> CleanupCommand {
+    match backend {
+        ContainerBackend::Podman => CleanupCommand {
+            program: "podman",
+            args: ["unshare", "rm", "-rf", "--"]
+                .into_iter()
+                .map(OsString::from)
+                .chain(std::iter::once(workspace.as_os_str().to_os_string()))
+                .collect(),
+        },
+        ContainerBackend::Docker => {
+            // Mount the trusted parent and remove only the validated run
+            // directory from inside the container. No shell is involved, and
+            // the container cannot follow a path outside this bind mount.
+            let parent = workspace
+                .parent()
+                .expect("validated run workspace always has a parent");
+            let name = workspace
+                .file_name()
+                .expect("validated run workspace always has a name");
+            CleanupCommand {
+                program: "docker",
+                args: [
+                    "run",
+                    "--rm",
+                    "--user",
+                    "0:0",
+                    "--mount",
+                    &format!(
+                        "type=bind,src={},dst=/gitforge-cleanup-parent",
+                        parent.display()
+                    ),
+                    "alpine",
+                    "rm",
+                    "-rf",
+                    "--",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .chain(std::iter::once(
+                    std::path::Path::new("/gitforge-cleanup-parent")
+                        .join(name)
+                        .into_os_string(),
+                ))
+                .collect(),
+            }
+        }
+    }
+}
+
+async fn run_cleanup_command(command: CleanupCommand) -> Option<std::process::Output> {
+    timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new(command.program)
+            .args(command.args)
+            .output(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+}
+
 /// Delete a run's workspace directory. Only directories GitForge itself
 /// created — `<root>/<run id>` — are ever removed. A caller-supplied working
 /// directory inside the root may share the tree and must survive the run.
@@ -678,123 +771,153 @@ async fn remove_run_workspace_dir(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            // Rootless Podman maps container root to a subordinate host UID.
-            // A hardened systemd service may be unable to create the nested
-            // user namespace itself, so try the direct path first and then
-            // delegate the exact validated path to a transient user service.
-            let direct = timeout(
-                Duration::from_secs(120),
-                tokio::process::Command::new("podman")
-                    .args(["unshare", "rm", "-rf", "--"])
-                    .arg(&workspace)
-                    .output(),
-            )
-            .await;
-            let direct_failed = match direct {
-                Ok(Ok(output)) if output.status.success() => {
-                    tracing::info!(
-                        %run_id,
-                        workspace = %workspace.display(),
-                        "removed run workspace through rootless namespace"
-                    );
-                    return true;
-                }
-                Ok(Ok(output)) => {
-                    let diagnostic = String::from_utf8_lossy(&output.stderr)
-                        .trim()
-                        .chars()
-                        .take(512)
-                        .collect::<String>();
+            let backend = match container_backend_from_env() {
+                Ok(backend) => backend,
+                Err(diagnostic) => {
                     tracing::warn!(
                         %run_id,
                         workspace = %workspace.display(),
-                        status = ?output.status.code(),
-                        stderr = %diagnostic,
-                        "direct rootless workspace cleanup failed; trying transient service"
+                        %diagnostic,
+                        "refusing container-assisted workspace cleanup"
                     );
-                    true
-                }
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        %run_id,
-                        %error,
-                        workspace = %workspace.display(),
-                        "could not start direct rootless workspace cleanup; trying transient service"
-                    );
-                    true
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        %run_id,
-                        workspace = %workspace.display(),
-                        "direct rootless workspace cleanup timed out; trying transient service"
-                    );
-                    true
+                    return false;
                 }
             };
-            if !direct_failed {
-                return false;
-            }
 
-            let delegated = timeout(
-                Duration::from_secs(120),
-                tokio::process::Command::new("systemd-run")
-                    .args([
-                        "--user",
-                        "--quiet",
-                        "--wait",
-                        "--pipe",
-                        "--collect",
-                        "/usr/bin/podman",
-                        "unshare",
-                        "rm",
-                        "-rf",
-                        "--",
-                    ])
-                    .arg(&workspace)
-                    .output(),
-            )
-            .await;
-            match delegated {
-                Ok(Ok(output)) if output.status.success() => {
-                    tracing::info!(
-                        %run_id,
-                        workspace = %workspace.display(),
-                        "removed run workspace through transient rootless service"
-                    );
-                    true
+            match backend {
+                ContainerBackend::Docker => {
+                    match run_cleanup_command(cleanup_command(backend, &workspace)).await {
+                        Some(output) if output.status.success() => {
+                            tracing::info!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                "removed run workspace through Docker"
+                            );
+                            true
+                        }
+                        Some(output) => {
+                            let diagnostic = String::from_utf8_lossy(&output.stderr)
+                                .trim()
+                                .chars()
+                                .take(512)
+                                .collect::<String>();
+                            tracing::warn!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                status = ?output.status.code(),
+                                stderr = %diagnostic,
+                                "Docker workspace cleanup failed"
+                            );
+                            false
+                        }
+                        None => {
+                            tracing::warn!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                "could not start or complete Docker workspace cleanup"
+                            );
+                            false
+                        }
+                    }
                 }
-                Ok(Ok(output)) => {
-                    let diagnostic = String::from_utf8_lossy(&output.stderr)
-                        .trim()
-                        .chars()
-                        .take(512)
-                        .collect::<String>();
-                    tracing::warn!(
-                        %run_id,
-                        workspace = %workspace.display(),
-                        status = ?output.status.code(),
-                        stderr = %diagnostic,
-                        "transient rootless workspace cleanup failed"
-                    );
-                    false
-                }
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        %run_id,
-                        %error,
-                        workspace = %workspace.display(),
-                        "could not start transient rootless workspace cleanup"
-                    );
-                    false
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        %run_id,
-                        workspace = %workspace.display(),
-                        "transient rootless workspace cleanup timed out"
-                    );
-                    false
+                ContainerBackend::Podman => {
+                    // Rootless Podman maps container root to a subordinate host
+                    // UID. A hardened systemd service may be unable to create
+                    // the nested user namespace itself, so try the direct path
+                    // first and then delegate the exact validated path to a
+                    // transient user service.
+                    if let Some(output) =
+                        run_cleanup_command(cleanup_command(backend, &workspace)).await
+                    {
+                        if output.status.success() {
+                            tracing::info!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                "removed run workspace through rootless namespace"
+                            );
+                            return true;
+                        }
+                        let diagnostic = String::from_utf8_lossy(&output.stderr)
+                            .trim()
+                            .chars()
+                            .take(512)
+                            .collect::<String>();
+                        tracing::warn!(
+                            %run_id,
+                            workspace = %workspace.display(),
+                            status = ?output.status.code(),
+                            stderr = %diagnostic,
+                            "direct rootless workspace cleanup failed; trying transient service"
+                        );
+                    } else {
+                        tracing::warn!(
+                            %run_id,
+                            workspace = %workspace.display(),
+                            "could not start direct rootless workspace cleanup; trying transient service"
+                        );
+                    }
+
+                    let delegated = timeout(
+                        Duration::from_secs(120),
+                        tokio::process::Command::new("systemd-run")
+                            .args([
+                                "--user",
+                                "--quiet",
+                                "--wait",
+                                "--pipe",
+                                "--collect",
+                                "/usr/bin/podman",
+                                "unshare",
+                                "rm",
+                                "-rf",
+                                "--",
+                            ])
+                            .arg(&workspace)
+                            .output(),
+                    )
+                    .await;
+                    match delegated {
+                        Ok(Ok(output)) if output.status.success() => {
+                            tracing::info!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                "removed run workspace through transient rootless service"
+                            );
+                            true
+                        }
+                        Ok(Ok(output)) => {
+                            let diagnostic = String::from_utf8_lossy(&output.stderr)
+                                .trim()
+                                .chars()
+                                .take(512)
+                                .collect::<String>();
+                            tracing::warn!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                status = ?output.status.code(),
+                                stderr = %diagnostic,
+                                "transient rootless workspace cleanup failed"
+                            );
+                            false
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                %run_id,
+                                %error,
+                                workspace = %workspace.display(),
+                                "could not start transient rootless workspace cleanup"
+                            );
+                            false
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                "transient rootless workspace cleanup timed out"
+                            );
+                            false
+                        }
+                    }
                 }
             }
         }
@@ -1930,6 +2053,66 @@ mod tests {
         // Removing an already-gone workspace and an absent path are no-ops.
         assert!(!remove_run_workspace_dir(&root, run_id, Some(owned.to_str().unwrap())).await);
         assert!(!remove_run_workspace_dir(&root, run_id, None).await);
+    }
+
+    #[test]
+    fn test_container_backend_selection_is_explicit() {
+        let _guard = WORKSPACE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+        let _guard = _guard.blocking_lock();
+
+        std::env::set_var("GITFORGE_CONTAINER_BACKEND", "podman");
+        assert_eq!(container_backend_from_env(), Ok(ContainerBackend::Podman));
+        std::env::set_var("GITFORGE_CONTAINER_BACKEND", "docker");
+        assert_eq!(container_backend_from_env(), Ok(ContainerBackend::Docker));
+        std::env::set_var("GITFORGE_CONTAINER_BACKEND", "unknown");
+        assert!(container_backend_from_env().is_err());
+        std::env::remove_var("GITFORGE_CONTAINER_BACKEND");
+        assert!(container_backend_from_env().is_err());
+    }
+
+    #[test]
+    fn test_cleanup_command_selects_backend_without_fallback() {
+        let workspace = std::path::Path::new("/var/lib/gitforge/workspaces/run-123");
+
+        let podman = cleanup_command(ContainerBackend::Podman, workspace);
+        assert_eq!(podman.program, "podman");
+        assert_eq!(
+            podman.args,
+            [
+                "unshare",
+                "rm",
+                "-rf",
+                "--",
+                "/var/lib/gitforge/workspaces/run-123"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+
+        let docker = cleanup_command(ContainerBackend::Docker, workspace);
+        assert_eq!(docker.program, "docker");
+        assert_eq!(
+            docker.args[0..10],
+            [
+                "run",
+                "--rm",
+                "--user",
+                "0:0",
+                "--mount",
+                "type=bind,src=/var/lib/gitforge/workspaces,dst=/gitforge-cleanup-parent",
+                "alpine",
+                "rm",
+                "-rf",
+                "--"
+            ]
+            .map(OsString::from)
+        );
+        assert_eq!(
+            docker.args[10],
+            OsString::from("/gitforge-cleanup-parent/run-123")
+        );
+        assert!(!docker.args.iter().any(|arg| arg == "podman"));
     }
 
     #[cfg(unix)]
