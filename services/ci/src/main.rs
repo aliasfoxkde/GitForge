@@ -1324,13 +1324,17 @@ async fn run_scheduler_event_consumer(
             tracing::error!(%job_id, %error, "failed to mark completed job running");
             continue;
         }
-        if success {
+        let newly_ready_jobs = if success {
             if let Err(error) = engine.succeed_job(job_id, 0).await {
                 tracing::error!(%job_id, %error, "failed to mark job succeeded");
                 continue;
             }
-            if let Err(error) = engine.queue_ready_jobs().await {
-                tracing::error!(%pipeline_run_id, %error, "failed to queue downstream jobs");
+            match engine.queue_ready_jobs().await {
+                Ok(job_ids) => job_ids,
+                Err(error) => {
+                    tracing::error!(%pipeline_run_id, %error, "failed to queue downstream jobs");
+                    Vec::new()
+                }
             }
         } else {
             if let Err(error) = engine
@@ -1339,7 +1343,8 @@ async fn run_scheduler_event_consumer(
             {
                 tracing::error!(%job_id, %error, "failed to mark job failed");
             }
-        }
+            Vec::new()
+        };
 
         let state = engine.state().await;
         let workspace_path = run_workspace_paths
@@ -1348,7 +1353,12 @@ async fn run_scheduler_event_consumer(
             .get(&state.run_id)
             .cloned()
             .flatten();
-        for next_job_id in engine.ready_jobs().await {
+        // Use only the IDs transitioned from Pending to Queued by this
+        // completion. Re-reading every ready job here races when multiple
+        // predecessors complete concurrently: each handler can otherwise
+        // enqueue the same downstream ID repeatedly before assignment,
+        // violating the durable jobs primary key.
+        for next_job_id in newly_ready_jobs {
             if let Some(definition) = engine.job_definition(next_job_id) {
                 let commands = definition
                     .steps
