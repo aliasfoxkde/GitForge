@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
-const CI_TRIGGER_URL: &str = "http://127.0.0.1:42781/pipelines/trigger";
+const CI_TRIGGER_PATH: &str = "/pipelines/trigger";
 
 /// Webhook payload for triggering a pipeline
 #[derive(Debug, Deserialize, Serialize)]
@@ -53,6 +53,7 @@ pub struct WebhookTriggerResponse {
 #[derive(Clone)]
 pub struct CiTriggerClient {
     token: String,
+    url: reqwest::Url,
     client: reqwest::Client,
 }
 
@@ -60,15 +61,24 @@ impl CiTriggerClient {
     pub fn new(url: impl Into<String>, token: impl Into<String>) -> Result<Self, String> {
         let url = reqwest::Url::parse(&url.into())
             .map_err(|error| format!("invalid CI trigger URL: {error}"))?;
-        if url.as_str().trim_end_matches('/') != CI_TRIGGER_URL {
+        let is_loopback_trigger = url.scheme() == "http"
+            && url.host_str() == Some("127.0.0.1")
+            && url.port().is_some()
+            && url.path().trim_end_matches('/') == CI_TRIGGER_PATH
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none();
+        if !is_loopback_trigger {
             return Err(
-                "CI trigger URL must be the fixed loopback endpoint http://127.0.0.1:42781/pipelines/trigger"
+                "CI trigger URL must be an HTTP 127.0.0.1 endpoint with an explicit port and /pipelines/trigger path"
                     .to_string(),
             );
         }
 
         Ok(Self {
             token: token.into(),
+            url,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none())
@@ -89,9 +99,7 @@ impl CiTriggerClient {
             .unwrap_or("0000000000000000000000000000000000000000");
         let response = self
             .client
-            // The configured value is validated at startup, but never reaches
-            // this request sink; the deployed CI endpoint is fixed.
-            .post(CI_TRIGGER_URL)
+            .post(self.url.clone())
             .header("x-gitforge-trigger-token", &self.token)
             .json(&serde_json::json!({
                 "repo_id": repo_id.to_string(),
@@ -516,6 +524,11 @@ mod ci_trigger_client_tests {
     }
 
     #[test]
+    fn accepts_disposable_loopback_port() {
+        assert!(CiTriggerClient::new("http://127.0.0.1:43181/pipelines/trigger", "token").is_ok());
+    }
+
+    #[test]
     fn rejects_invalid_ci_trigger_url() {
         assert!(CiTriggerClient::new("not a URL", "token").is_err());
     }
@@ -534,8 +547,18 @@ mod ci_trigger_client_tests {
 
     #[test]
     fn rejects_wrong_ci_trigger_port_or_path() {
-        assert!(CiTriggerClient::new("http://127.0.0.1:42780/pipelines/trigger", "token").is_err());
+        assert!(CiTriggerClient::new("http://127.0.0.1/pipelines/trigger", "token").is_err());
         assert!(CiTriggerClient::new("http://127.0.0.1:42781/other", "token").is_err());
+    }
+
+    #[test]
+    fn rejects_query_fragment_and_trailing_data() {
+        assert!(
+            CiTriggerClient::new("http://127.0.0.1:42781/pipelines/trigger?x=1", "token").is_err()
+        );
+        assert!(
+            CiTriggerClient::new("http://127.0.0.1:42781/pipelines/trigger#x", "token").is_err()
+        );
     }
 
     #[test]
