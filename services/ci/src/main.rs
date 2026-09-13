@@ -1403,14 +1403,6 @@ async fn handle_push_event(
             config: serde_json::to_value(&pipeline)?,
             created_at: Utc::now(),
         };
-        // Only one active pipeline version per (repo, name) is allowed by
-        // idx_pipelines_active_repo_name — retire the predecessor before
-        // recording this push's version, or every push after the first
-        // fails run creation with a constraint violation.
-        gitforge_db::queries::PipelineQueries::deactivate_active(pool, repo_id, &pipeline.name)
-            .await?;
-        gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
-
         let mut db_run = DbPipelineRun::new(
             pipeline_id,
             repo_id,
@@ -1419,7 +1411,12 @@ async fn handle_push_event(
         );
         db_run.id = state.run_id;
         db_run.start();
-        gitforge_db::queries::PipelineRunQueries::create(pool, &db_run).await?;
+        gitforge_db::queries::PipelineQueries::replace_active_and_create_run(
+            pool,
+            &db_pipeline,
+            &db_run,
+        )
+        .await?;
     }
 
     let workspace_path = match requested_workspace {
