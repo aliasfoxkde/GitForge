@@ -1346,6 +1346,51 @@ mod tests {
         assert!(scheduler.is_cancelled(orphaned_job).await);
     }
 
+    #[tokio::test]
+    async fn test_restart_reload_preserves_pipeline_commit_sha_in_assignment() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (_first_job, second_job) = seed_restart_scenario(&pool, "sha-restart").await;
+
+        // A fresh scheduler represents the post-restart process. It must
+        // reconstruct pending work from durable rows, not from the old
+        // in-memory assignment map.
+        let scheduler = crate::Scheduler::with_db(pool);
+        let runner = Runner::new("sha-restart-runner".to_string(), RunnerType::Docker, 2);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+        assert_eq!(scheduler.load_pending_jobs().await.unwrap(), 2);
+        scheduler.process_queue().await;
+
+        let state = create_state(scheduler);
+        let response = scheduler_routes_with_tokens(
+            state,
+            Some(Arc::from("runner-token")),
+            Some(Arc::from("operator-token")),
+        )
+        .oneshot(
+            Request::builder()
+                .uri(format!("/jobs/pending?runner_id={runner_id}"))
+                .header("Authorization", "Bearer runner-token")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let assignments: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(assignments.len(), 2);
+        assert!(assignments.iter().all(|assignment| {
+            assignment["commit_sha"] == "sha-restart-commit"
+        }));
+        assert!(assignments.iter().any(|assignment| {
+            assignment["job_id"] == second_job.to_string()
+        }));
+    }
+
     /// A credentialed completion for a job the restarted scheduler no longer
     /// has assigned must be rejected, and the rejection must name the
     /// orphaned execution instead of implying a malformed request.
