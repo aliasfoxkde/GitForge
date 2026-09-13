@@ -712,6 +712,10 @@ pub struct JobAssignment {
     /// responses are applied during deserialization.
     #[serde(default = "default_job_timeout_secs")]
     pub timeout_secs: u64,
+    /// Source revision supplied by GitForge for archive-independent evidence.
+    /// Optional for compatibility with older scheduler responses.
+    #[serde(default)]
+    pub commit_sha: Option<String>,
 }
 
 fn default_job_timeout_secs() -> u64 {
@@ -1101,6 +1105,10 @@ impl RunnerAgent {
             .map(PipelineRunId::from)
             .unwrap_or_else(|_| PipelineRunId::new());
 
+        let mut environment = std::collections::HashMap::new();
+        if let Some(commit_sha) = assignment.commit_sha.as_deref() {
+            environment.insert("GIT_COMMIT_SHA".to_string(), commit_sha.to_string());
+        }
         let executable = ExecutableJob {
             job_id,
             pipeline_run_id,
@@ -1117,7 +1125,7 @@ impl RunnerAgent {
                     working_directory: assignment.working_dir.clone(),
                 })
                 .collect(),
-            env: std::collections::HashMap::new(),
+            env: environment,
             working_dir: assignment.working_dir.clone(),
             timeout_secs: assignment.timeout_secs.clamp(5, 24 * 60 * 60),
         };
@@ -1869,6 +1877,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
             timeout_secs: 300,
+            commit_sha: None,
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
@@ -1904,6 +1913,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            commit_sha: None,
         };
         assert!(assignment.working_dir.is_none());
     }
@@ -1925,6 +1935,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            commit_sha: None,
         };
         let debug_str = format!("{:?}", assignment);
         assert!(debug_str.contains("job-123"));
@@ -1956,6 +1967,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
             timeout_secs: 300,
+            commit_sha: None,
         };
 
         // Test JSON serialization
@@ -1981,6 +1993,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            commit_sha: None,
         };
         assert!(assignment.commands.is_empty());
         assert!(assignment.working_dir.is_none());
@@ -2002,6 +2015,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: Some("/project".to_string()),
             timeout_secs: 300,
+            commit_sha: None,
         };
         assert_eq!(assignment.commands.len(), 4);
     }
@@ -2089,6 +2103,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            commit_sha: None,
         };
         let assignment2 = JobAssignment {
             job_id: "job-1".to_string(),
@@ -2098,6 +2113,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            commit_sha: None,
         };
         // JobAssignment should implement PartialEq if we add it
         // For now just verify individual field equality
@@ -2115,6 +2131,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            commit_sha: None,
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
@@ -2184,6 +2201,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            commit_sha: None,
         };
         assert_eq!(assignment.commands.len(), 100);
     }
@@ -2198,6 +2216,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            commit_sha: None,
         };
         let cloned = assignment.clone();
         assert_eq!(cloned.job_id, assignment.job_id);
@@ -2214,6 +2233,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            commit_sha: None,
         };
         assert_eq!(assignment.name, "测试任务");
     }
@@ -2232,6 +2252,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            commit_sha: None,
         };
         assert_eq!(assignment.commands.len(), 3);
     }
@@ -2303,6 +2324,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: Some("".to_string()),
             timeout_secs: 300,
+            commit_sha: None,
         };
         assert!(assignment.working_dir.is_some());
     }

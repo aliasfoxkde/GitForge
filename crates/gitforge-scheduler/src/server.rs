@@ -48,6 +48,9 @@ pub struct PendingJobInfo {
     pub image: String,
     pub working_dir: Option<String>,
     pub timeout_secs: u64,
+    /// Immutable source revision from the durable pipeline run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
     pub runner_id: String,
     pub lease_token: String,
 }
@@ -521,6 +524,13 @@ async fn get_pending_jobs(
                     image: definition.image,
                     working_dir: definition.working_dir,
                     timeout_secs: definition.timeout_secs,
+                    commit_sha: state
+                        .scheduler
+                        .get_pipeline_run(pipeline_run_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|run| run.commit_hash),
                     runner_id: runner_id.to_string(),
                     lease_token,
                 });
@@ -1499,6 +1509,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
             timeout_secs: 300,
+            commit_sha: None,
             runner_id: "runner-123".to_string(),
             lease_token: "lease-123".to_string(),
         };
