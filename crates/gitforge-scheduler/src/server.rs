@@ -1118,6 +1118,7 @@ mod tests {
             .unwrap();
         let assignments: Vec<serde_json::Value> = serde_json::from_slice(&pending_body).unwrap();
         assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0]["commit_sha"], "http-lease-commit");
         let lease_token = assignments[0]["lease_token"].as_str().unwrap();
 
         let started = app
