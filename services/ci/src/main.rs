@@ -24,8 +24,7 @@ use gitforge_events::{
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
 use gitforge_scheduler::assigner::JobExecutionDefinition;
 use gitforge_scheduler::{
-    assigner::JobExecutionDefinition, create_state_with_artifact_storage, scheduler_routes,
-    Scheduler, SchedulerEvent,
+    create_state_with_artifact_storage, scheduler_routes, Scheduler, SchedulerEvent,
 };
 use gitforge_storage::FileStorage;
 use std::collections::HashMap;
