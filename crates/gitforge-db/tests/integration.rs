@@ -200,6 +200,81 @@ async fn test_pipeline_versioning_active_uniqueness() {
 }
 
 #[tokio::test]
+async fn test_pipeline_replacement_rolls_back_when_run_insert_fails() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = User::new(
+        "transactioner".to_string(),
+        "transactioner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "transactional-repo".to_string(),
+        user.id,
+        "/git/transactional-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+
+    let first = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "gates".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({"version": 1}),
+        created_at: chrono::Utc::now(),
+    };
+    PipelineQueries::create(&pool, &first).await.unwrap();
+
+    let existing_run = PipelineRun::new(
+        first.id,
+        repo.id,
+        "push".to_string(),
+        "first-commit".to_string(),
+    );
+    PipelineRunQueries::create(&pool, &existing_run)
+        .await
+        .unwrap();
+
+    let replacement = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "gates".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({"version": 2}),
+        created_at: chrono::Utc::now(),
+    };
+    let mut conflicting_run = PipelineRun::new(
+        replacement.id,
+        repo.id,
+        "push".to_string(),
+        "second-commit".to_string(),
+    );
+    conflicting_run.id = existing_run.id;
+
+    assert!(
+        PipelineQueries::replace_active_and_create_run(&pool, &replacement, &conflicting_run,)
+            .await
+            .is_err()
+    );
+
+    let active_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM pipelines WHERE repo_id = ? AND name = ? AND active = 1",
+    )
+    .bind(repo.id.to_string())
+    .bind("gates")
+    .fetch_one(pool.pool())
+    .await
+    .unwrap();
+    assert_eq!(active_id, first.id.to_string());
+    assert!(PipelineQueries::get(&pool, replacement.id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn test_pipeline_versioning_migrates_legacy_table() {
     let pool = Pool::memory().await.unwrap();
 
