@@ -309,6 +309,20 @@ pub trait Sandbox: Send + Sync {
         Ok(result)
     }
 
+    /// Execute a command with runner-controlled environment variables.
+    /// Implementations without per-command environment support retain
+    /// compatibility by delegating to `execute_with_output`.
+    async fn execute_with_environment(
+        &self,
+        instance: &SandboxInstance,
+        command: &[&str],
+        environment: Option<&HashMap<String, String>>,
+        sink: Option<Arc<dyn OutputSink>>,
+    ) -> Result<StepResult> {
+        let _ = environment;
+        self.execute_with_output(instance, command, sink).await
+    }
+
     /// Destroy a sandbox instance
     async fn destroy(&self, instance: SandboxInstance) -> Result<()>;
 }
@@ -485,7 +499,30 @@ impl Sandbox for DockerSandbox {
         command: &[&str],
         sink: Option<Arc<dyn OutputSink>>,
     ) -> Result<StepResult> {
+        self.execute_with_environment(instance, command, None, sink)
+            .await
+    }
+
+    async fn execute_with_environment(
+        &self,
+        instance: &SandboxInstance,
+        command: &[&str],
+        environment: Option<&HashMap<String, String>>,
+        sink: Option<Arc<dyn OutputSink>>,
+    ) -> Result<StepResult> {
         if let Some(ref docker) = self.docker {
+            let mut env_values = workspace_git_env()
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if let Some(environment) = environment {
+                env_values.extend(
+                    environment
+                        .iter()
+                        .map(|(key, value)| format!("{key}={value}")),
+                );
+            }
+            let env = env_values.iter().map(String::as_str).collect::<Vec<_>>();
             // Create exec instance
             let config = CreateExecOptions {
                 attach_stdout: Some(true),
@@ -500,11 +537,7 @@ impl Sandbox for DockerSandbox {
                 } else {
                     None
                 },
-                env: if instance.workspace_path.is_some() {
-                    Some(workspace_git_env())
-                } else {
-                    None
-                },
+                env: Some(env),
                 ..Default::default()
             };
 

@@ -378,9 +378,12 @@ impl JobExecutor {
             } else {
                 timeout(
                     remaining,
-                    self.pool
-                        .sandbox
-                        .execute_with_output(&instance, &cmd, output_sink.clone()),
+                    self.pool.sandbox.execute_with_environment(
+                        &instance,
+                        &cmd,
+                        Some(&job.env),
+                        output_sink.clone(),
+                    ),
                 )
                 .await
                 .map_err(|_| gitforge_common::Error::timeout("job timed out"))
