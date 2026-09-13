@@ -19,6 +19,19 @@ fn parse_uuid_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<Uuid
         .map_err(|error| Error::database(format!("invalid UUID in {}: {}", column, error)))
 }
 
+/// Grace window (in seconds) during which a fenced runner's lease is
+/// still considered live. Once the window expires the lease is logically
+/// dead: late completions, log appends, and artifact uploads are all
+/// rejected even though `runner_id`/`lease_token` remain populated on the
+/// row.
+///
+/// The value is intentionally generous so a network-delayed completion
+/// from a runner that legitimately held the lease can still land, but
+/// small enough that an offline runner cannot rewrite history days later.
+/// Five minutes matches the runner's default heartbeat budget; operators
+/// who run jobs longer than that should explicitly increase the value.
+pub const LEASE_GRACE_WINDOW_SECS: i64 = 300;
+
 fn parse_timestamp_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<DateTime<Utc>> {
     let value: String = row
         .try_get(column)
@@ -181,6 +194,10 @@ fn hydrate_job(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Job> {
         result_json: row
             .try_get("result_json")
             .map_err(|error| Error::database(format!("invalid job result: {}", error)))?,
+        lease_expires_at: parse_optional_timestamp_column(&row, "lease_expires_at")
+            .map_err(|error| Error::database(format!("invalid lease expiry: {}", error)))?,
+        fenced_at: parse_optional_timestamp_column(&row, "fenced_at")
+            .map_err(|error| Error::database(format!("invalid fenced_at: {}", error)))?,
     })
 }
 
@@ -1159,6 +1176,10 @@ impl JobQueries {
 
     /// Atomically assign a queued job and advance its durable fencing
     /// generation. A false result means another scheduler won the race.
+    ///
+    /// The lease columns are reset to a fresh state: `lease_expires_at` and
+    /// `fenced_at` are cleared because a freshly assigned job has no
+    /// outstanding grace window.
     pub async fn assign_with_lease(
         pool: &Pool,
         id: JobId,
@@ -1166,7 +1187,7 @@ impl JobQueries {
         lease_token: &str,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE jobs SET runner_id = ?, status = 'assigned', lease_token = ?, lease_generation = lease_generation + 1 WHERE id = ? AND status IN ('pending', 'queued') AND runner_id IS NULL",
+            "UPDATE jobs SET runner_id = ?, status = 'assigned', lease_token = ?, lease_generation = lease_generation + 1, lease_expires_at = NULL, fenced_at = NULL WHERE id = ? AND status IN ('pending', 'queued') AND runner_id IS NULL",
         )
         .bind(runner_id.to_string())
         .bind(lease_token)
@@ -1191,6 +1212,15 @@ impl JobQueries {
     }
 
     /// Start a job only when the durable runner lease still matches.
+    ///
+    /// The bounded-reconciliation grace columns (`lease_expires_at`,
+    /// `fenced_at`) are cleared on the assigned → running transition so a
+    /// freshly started job leaves the row in the same shape the active
+    /// completion path expects. Without this clear, a row whose previous
+    /// attempt was fenced and then requeued for a new lease would carry
+    /// a stale grace deadline forward, and the `lease_matches_within_grace`
+    /// artifact gate would later misclassify that row as still inside a
+    /// (no-longer-relevant) grace window.
     pub async fn start_with_lease(
         pool: &Pool,
         id: JobId,
@@ -1198,7 +1228,7 @@ impl JobQueries {
         lease_token: &str,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, ?) WHERE id = ? AND runner_id = ? AND lease_token = ? AND status = 'assigned'",
+            "UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, ?), lease_expires_at = NULL, fenced_at = NULL WHERE id = ? AND runner_id = ? AND lease_token = ? AND status = 'assigned'",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(id.to_string())
@@ -1213,6 +1243,11 @@ impl JobQueries {
     /// Complete a job only when the durable runner lease still matches. The
     /// lease is cleared as part of the same conditional update, fencing late
     /// completion messages after reassignment or terminal transition.
+    ///
+    /// `lease_expires_at` and `fenced_at` are also cleared: a successful
+    /// active-lease completion is indistinguishable from one that came in
+    /// through the late path, so the row leaves the grace window in the
+    /// same shape regardless of which path produced it.
     pub async fn complete_with_lease(
         pool: &Pool,
         id: JobId,
@@ -1222,7 +1257,7 @@ impl JobQueries {
         result_json: &str,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE jobs SET status = ?, finished_at = ?, result_json = ?, lease_token = NULL WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
+            "UPDATE jobs SET status = ?, finished_at = ?, result_json = ?, lease_token = NULL, lease_expires_at = NULL, fenced_at = NULL WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
         )
         .bind(status)
         .bind(Utc::now().to_rfc3339())
@@ -1297,11 +1332,30 @@ impl JobQueries {
         Ok(jobs)
     }
 
-    /// Recover jobs that were in flight when the scheduler stopped. Assigned
-    /// jobs have not started execution and are safe to requeue. Running jobs
-    /// are fenced as failed instead of being re-run automatically: the old
-    /// runner may still be alive, and requeueing would permit duplicate side
-    /// effects without a durable runner-generation lease.
+    /// Recover jobs that were in flight when the scheduler stopped.
+    ///
+    /// **Assigned** jobs have not started execution and are safe to requeue.
+    /// The scheduler has no durable assignment yet, so we simply clear the
+    /// lease and bump the row back to `queued`.
+    ///
+    /// **Running** jobs are fenced as failed (the old runner may still be
+    /// alive; requeueing would permit duplicate side effects without a
+    /// durable lease). The fence deliberately preserves `runner_id`,
+    /// `lease_token`, and `lease_generation` so a late completion or log
+    /// append from the original runner can still authenticate within the
+    /// bounded grace window. We stamp `fenced_at` (audit trail) and
+    /// `lease_expires_at` (reconciliation deadline). Once the deadline
+    /// passes the lease is logically dead and any further mutations are
+    /// rejected — the old runner cannot rewrite a terminal row forever.
+    ///
+    /// A repeated sweep on an already-fenced row is a no-op for the
+    /// grace/fence columns: `fenced_at` and `lease_expires_at` are only
+    /// written when the row transitions from `running` to `failed`, never
+    /// when a sweep hits an already-fenced row. This is the bounded
+    /// reconciliation contract — the original deadline is preserved
+    /// because extending the window indefinitely would let an old runner
+    /// rewrite terminal history long after the original grace should have
+    /// expired.
     pub async fn requeue_inflight(pool: &Pool) -> Result<u64> {
         let mut transaction = pool
             .pool()
@@ -1309,16 +1363,36 @@ impl JobQueries {
             .await
             .map_err(|e| Error::database(format!("failed to begin recovery: {}", e)))?;
         let assigned = sqlx::query(
-            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE status = 'assigned'",
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL, lease_expires_at = NULL, fenced_at = NULL WHERE status = 'assigned'",
         )
         .execute(&mut *transaction)
         .await
         .map_err(|e| Error::database(format!("failed to requeue assigned jobs: {}", e)))?;
+        let now = Utc::now();
+        let grace_deadline =
+            now + chrono::Duration::seconds(crate::queries::LEASE_GRACE_WINDOW_SECS);
+        // The fence row is only written when transitioning from a live
+        // `running` row into the fenced state. A repeated sweep cannot
+        // extend `lease_expires_at` past the original deadline: the
+        // predicate guarantees the row is fenced exactly once per
+        // execution, so the bounded reconciliation window is preserved
+        // even under restarts that race against the same job.
         let running = sqlx::query(
-            "UPDATE jobs SET status = 'failed', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE status = 'running'",
+            r#"
+            UPDATE jobs
+            SET status = 'failed',
+                finished_at = ?,
+                result_json = ?,
+                fenced_at = ?,
+                lease_expires_at = ?
+            WHERE status = 'running'
+              AND fenced_at IS NULL
+            "#,
         )
-        .bind(Utc::now().to_rfc3339())
+        .bind(now.to_rfc3339())
         .bind(r#"{"status":"failed","reason":"scheduler_restart_fenced_running_job"}"#)
+        .bind(now.to_rfc3339())
+        .bind(grace_deadline.to_rfc3339())
         .execute(&mut *transaction)
         .await
         .map_err(|e| Error::database(format!("failed to fence running jobs: {}", e)))?;
@@ -1327,6 +1401,211 @@ impl JobQueries {
             .await
             .map_err(|e| Error::database(format!("failed to commit recovery: {}", e)))?;
         Ok(assigned.rows_affected() + running.rows_affected())
+    }
+
+    /// Late completion that survives a restart fence.
+    ///
+    /// The recovery sweep preserves `runner_id`/`lease_token` for a bounded
+    /// grace window so an old runner can still publish its terminal
+    /// receipt. We deliberately require four things, all enforced as a
+    /// single atomic conditional UPDATE — there is no read-then-write
+    /// window in which two concurrent same-token completions can both
+    /// rewrite the fence marker, finish_at, or grace columns:
+    ///
+    /// 1. The presented lease matches the durable row (a foreign lease is
+    ///    silently rejected — the durable column is the source of truth).
+    /// 2. The lease is still within its grace window
+    ///    (`lease_expires_at > now`). After the window expires the lease is
+    ///    logically dead and the row is final.
+    /// 3. The existing `result_json` matches the synthetic fence marker so
+    ///    we never overwrite an operator cancel, a watchdog timeout, or a
+    ///    future reassignment that has already moved past the fence.
+    /// 4. The fenced row is still visibly failed (the recovery sweep set
+    ///    it that way). If a future scheduler tick has already moved it
+    ///    elsewhere, refuse the rewrite.
+    ///
+    /// `finished_at` is set inside the same UPDATE so a successful apply
+    /// always lands a coherent (status, finished_at, result_json) tuple.
+    /// `lease_expires_at` and `fenced_at` are cleared on success so the
+    /// terminal row is indistinguishable from one that completed through
+    /// the active-lease path.
+    pub async fn complete_late_with_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        status: &str,
+        result_json: &str,
+    ) -> Result<bool> {
+        // Single conditional UPDATE: the predicate carries the fence
+        // marker, the failed status, the lease match, and a parsed grace
+        // deadline. SQLite evaluates this row-locally, so two concurrent
+        // same-token completions race on the write lock and exactly one
+        // observes `rows_affected() == 1`. There is no read-then-write
+        // window in which both reads see the synthetic marker and both
+        // UPDATEs apply.
+        let fence_marker = r#"{"status":"failed","reason":"scheduler_restart_fenced_running_job"}"#;
+        let now = Utc::now();
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs SET
+                status = ?,
+                result_json = ?,
+                finished_at = ?,
+                lease_expires_at = NULL,
+                fenced_at = NULL
+            WHERE id = ?
+              AND runner_id = ?
+              AND lease_token = ?
+              AND status = 'failed'
+              AND result_json = ?
+              AND lease_expires_at IS NOT NULL
+              AND datetime(lease_expires_at) > datetime(?)
+            "#,
+        )
+        .bind(status)
+        .bind(result_json)
+        .bind(now.to_rfc3339())
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .bind(fence_marker)
+        .bind(now.to_rfc3339())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to apply late completion: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Append a log chunk for a fenced job whose lease is still within its
+    /// grace window. Foreign leases, expired leases, and missing rows all
+    /// resolve to `None`; oversize chunks return a structured error so
+    /// upstream code can surface them.
+    pub async fn append_log_with_lease_late(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        chunk: &str,
+    ) -> Result<Option<i64>> {
+        if chunk.is_empty() {
+            return Ok(None);
+        }
+        if chunk.len() > MAX_JOB_LOG_CHUNK_BYTES {
+            return Err(Error::invalid_input(format!(
+                "job log chunk exceeds {} bytes",
+                MAX_JOB_LOG_CHUNK_BYTES
+            )));
+        }
+        let mut tx = pool
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| Error::database(format!("failed to begin late log append: {}", e)))?;
+        let Some(row) = sqlx::query(
+            "SELECT runner_id, lease_token, lease_expires_at, status FROM jobs WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to fetch fenced job: {}", e)))?
+        else {
+            return Ok(None);
+        };
+        let stored_runner: Option<String> = row.get("runner_id");
+        let stored_token: Option<String> = row.get("lease_token");
+        let stored_expires: Option<String> = row.get("lease_expires_at");
+        let stored_status: String = row.get("status");
+        if stored_runner.as_deref() != Some(&runner_id.to_string())
+            || stored_token.as_deref() != Some(lease_token)
+        {
+            return Ok(None);
+        }
+        let Some(deadline_str) = stored_expires else {
+            return Ok(None);
+        };
+        let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(&deadline_str) else {
+            return Ok(None);
+        };
+        if deadline <= Utc::now() {
+            return Ok(None);
+        }
+        // The fence transitions the row to `failed`. Late log appends are
+        // only useful while the row is still visibly fenced; if a future
+        // scheduler tick already moved it elsewhere, drop the chunk.
+        if stored_status != "failed" {
+            return Ok(None);
+        }
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(length(chunk)), 0) FROM job_log_chunks WHERE job_id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to measure job logs: {}", e)))?;
+        if total + chunk.len() as i64 > MAX_JOB_LOG_BYTES {
+            return Err(Error::invalid_input(format!(
+                "job logs exceed {} bytes",
+                MAX_JOB_LOG_BYTES
+            )));
+        }
+
+        let next_sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM job_log_chunks WHERE job_id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to allocate log sequence: {}", e)))?;
+        sqlx::query(
+            "INSERT INTO job_log_chunks (job_id, sequence, chunk, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(next_sequence)
+        .bind(chunk)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to append late log chunk: {}", e)))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit late log append: {}", e)))?;
+        Ok(Some(next_sequence))
+    }
+
+    /// Check whether a lease is still considered live for a fenced row.
+    ///
+    /// Returns `true` when the durable lease matches **and** the lease is
+    /// still inside its grace window. The runner can use this gate to
+    /// decide whether a late artifact upload is still allowed without
+    /// surfacing a 409 to the consumer.
+    pub async fn lease_matches_within_grace(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT lease_expires_at FROM jobs WHERE id = ? AND runner_id = ? AND lease_token = ?",
+        )
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to check lease grace: {}", e)))?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let stored_expires: Option<String> = row.get("lease_expires_at");
+        let Some(deadline_str) = stored_expires else {
+            return Ok(false);
+        };
+        let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(&deadline_str) else {
+            return Ok(false);
+        };
+        Ok(deadline > Utc::now())
     }
 
     /// Mark running jobs whose persisted deadline has elapsed as timed out.
@@ -1342,6 +1621,88 @@ impl JobQueries {
         .await
         .map_err(|e| Error::database(format!("failed to reconcile expired jobs: {}", e)))?;
         Ok(result.rows_affected())
+    }
+
+    /// Force `lease_expires_at` to an explicit timestamp. Used by tests
+    /// to drive the bounded-reconciliation expiry branch without
+    /// sleeping for the full grace window. Production code never calls
+    /// this helper.
+    #[doc(hidden)]
+    pub async fn _set_lease_expires_at_for_tests(
+        pool: &Pool,
+        id: JobId,
+        when: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE jobs SET lease_expires_at = ? WHERE id = ?")
+            .bind(when.to_rfc3339())
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to set lease_expires_at: {}", e)))?;
+        Ok(())
+    }
+
+    /// Force the row into a terminal state without nullifying the
+    /// runner lease. Used by tests that need to verify the late path
+    /// refuses to overwrite a row that has already moved past the
+    /// synthetic fence marker.
+    #[doc(hidden)]
+    pub async fn _override_status_for_tests(
+        pool: &Pool,
+        id: JobId,
+        status: &str,
+        result_json: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE jobs SET status = ?, result_json = ? WHERE id = ?")
+            .bind(status)
+            .bind(result_json)
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to override job status: {}", e)))?;
+        Ok(())
+    }
+
+    /// Force `fenced_at` and `lease_expires_at` so tests can assert the
+    /// active-lease completion clears them.
+    #[doc(hidden)]
+    pub async fn _stamp_grace_for_tests(
+        pool: &Pool,
+        id: JobId,
+        fenced_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE jobs SET fenced_at = ?, lease_expires_at = ? WHERE id = ?")
+            .bind(fenced_at.to_rfc3339())
+            .bind(expires_at.to_rfc3339())
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to stamp grace: {}", e)))?;
+        Ok(())
+    }
+
+    /// Force a row into the `assigned` state with a chosen lease token and
+    /// runner id, bypassing the `runner_id IS NULL` predicate of the public
+    /// assigner. Tests that want to exercise the assigned → running
+    /// transition in isolation use this helper.
+    #[doc(hidden)]
+    pub async fn _assign_for_tests(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE jobs SET status = 'assigned', runner_id = ?, lease_token = ?, lease_generation = lease_generation + 1 WHERE id = ?",
+        )
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to force-assign lease for test: {}", e)))?;
+        Ok(())
     }
 }
 

@@ -1074,6 +1074,21 @@ impl Scheduler {
     }
 
     /// Complete a job only when the active runner lease is presented.
+    ///
+    /// Three outcomes:
+    ///
+    /// 1. **In-memory mirror agrees and the durable lease is still active**:
+    ///    the standard atomic completion path runs and `complete_job`
+    ///    records the receipt, fires the pipeline event, and enforces the
+    ///    idempotency contract.
+    /// 2. **In-memory mirror disagrees but the durable lease is still
+    ///    inside its grace window** (the scheduler fenced the row on
+    ///    startup): the late path authenticates the lease against the
+    ///    durable row, then `complete_job` runs so every side effect of
+    ///    normal completion is preserved.
+    /// 3. **Lease no longer matches or has expired**: the completion is
+    ///    rejected with `invalid job lease or runner assignment`. The old
+    ///    runner cannot rewrite a terminal row forever.
     pub async fn complete_job_with_lease(
         &self,
         job_id: JobId,
@@ -1082,38 +1097,129 @@ impl Scheduler {
         success: bool,
         result_json: String,
     ) -> anyhow::Result<()> {
-        {
+        let in_memory_matches = {
             let state = self.state.read().await;
             let assigned_runner = state
                 .assigned_jobs
                 .get(&job_id)
                 .map(|(runner, _, _)| *runner);
-            if assigned_runner != Some(runner_id)
-                || state.job_leases.get(&job_id).map(String::as_str) != Some(lease_token)
-            {
-                anyhow::bail!("invalid job lease or runner assignment");
+            assigned_runner == Some(runner_id)
+                && state.job_leases.get(&job_id).map(String::as_str) == Some(lease_token)
+        };
+        if in_memory_matches {
+            if let Some(pool) = &self.db_pool {
+                let status = if success { "succeeded" } else { "failed" };
+                let accepted = gitforge_db::queries::JobQueries::complete_with_lease(
+                    pool,
+                    job_id,
+                    runner_id,
+                    lease_token,
+                    status,
+                    &result_json,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                if !accepted {
+                    // Mirror said the lease was active but the durable row
+                    // disagrees — most likely the scheduler fenced this job
+                    // while the runner was already publishing a receipt.
+                    // Fall through to the late path which authoritatively
+                    // checks the durable lease and grace window.
+                    return self
+                        .complete_job_with_late_lease(
+                            job_id,
+                            runner_id,
+                            lease_token,
+                            success,
+                            result_json,
+                        )
+                        .await;
+                }
             }
+            return self.complete_job(job_id, success, result_json).await;
         }
-        if let Some(pool) = &self.db_pool {
-            let status = if success { "succeeded" } else { "failed" };
-            let accepted = gitforge_db::queries::JobQueries::complete_with_lease(
-                pool,
-                job_id,
-                runner_id,
-                lease_token,
-                status,
-                &result_json,
-            )
+        self.complete_job_with_late_lease(job_id, runner_id, lease_token, success, result_json)
             .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            if !accepted {
-                anyhow::bail!("durable job lease is no longer active");
-            }
+    }
+
+    /// Apply a late completion from a runner whose durable lease was
+    /// preserved by the recovery sweep. The durable lease is the source of
+    /// truth: if the presented token matches and the grace window has not
+    /// yet expired, the row is updated and `complete_job` runs so the
+    /// pipeline event, idempotency check, and receipt publication all
+    /// execute. After that, the in-memory mirror is updated to match.
+    async fn complete_job_with_late_lease(
+        &self,
+        job_id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        success: bool,
+        result_json: String,
+    ) -> anyhow::Result<()> {
+        let Some(pool) = &self.db_pool else {
+            anyhow::bail!("durable_scheduler_database_required");
+        };
+        let status = if success { "succeeded" } else { "failed" };
+        let accepted = gitforge_db::queries::JobQueries::complete_late_with_lease(
+            pool,
+            job_id,
+            runner_id,
+            lease_token,
+            status,
+            &result_json,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if !accepted {
+            anyhow::bail!("invalid job lease or runner assignment");
         }
+        // The in-memory mirror was cleared by the simulated restart.
+        // Restore it from the durable row so `complete_job` can fire the
+        // standard pipeline event with the correct `pipeline_run_id`.
+        // Without this, the late completion would skip pipeline event
+        // publication — losing the side effect that downstream
+        // consumers (Control Center, webhooks, outbox) depend on.
+        let durable = gitforge_db::queries::JobQueries::get(pool, job_id)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("late completion lost durable row"))?;
+        {
+            let mut state = self.state.write().await;
+            // The pipeline_run_id is authoritative on the durable row.
+            // The repo_id is not preserved in `Job`, so we use the
+            // existing mirror value when present and otherwise store
+            // None for the third tuple slot — the completion path only
+            // reads `runner_id` and `pipeline_run_id`.
+            let repo_id = state
+                .assigned_jobs
+                .get(&job_id)
+                .map(|(_, _, repo)| *repo)
+                .unwrap_or_else(RepoId::new);
+            state.job_assignments.insert(job_id, runner_id);
+            state
+                .assigned_jobs
+                .insert(job_id, (runner_id, durable.pipeline_run_id, repo_id));
+            state.job_leases.insert(job_id, lease_token.to_string());
+        }
+        // Now that the mirror agrees with the durable row, run the
+        // standard completion so every side effect of a normal
+        // completion fires: pipeline-run aggregation, idempotency check
+        // via `completed_receipts`, and event publication.
         self.complete_job(job_id, success, result_json).await
     }
 
     /// Append runner output to the durable log ledger under the active lease.
+    ///
+    /// Two paths are accepted:
+    ///
+    /// 1. **Active lease** — the standard `append_log_with_lease` query
+    ///    validates that the job is still in `assigned`/`running` under the
+    ///    presented lease.
+    /// 2. **Late lease after a restart fence** — the durable lease was
+    ///    preserved by `requeue_inflight`. The runner's late log chunk lands
+    ///    only while the lease is still inside its grace window; once the
+    ///    deadline passes the chunk is silently rejected (mirroring the
+    ///    active-lease behavior).
     pub async fn append_log_with_lease(
         &self,
         job_id: JobId,
@@ -1124,7 +1230,27 @@ impl Scheduler {
         let Some(pool) = &self.db_pool else {
             anyhow::bail!("durable job logs require a scheduler database");
         };
-        gitforge_db::queries::JobQueries::append_log_with_lease(
+        let in_memory_matches = {
+            let state = self.state.read().await;
+            let assigned_runner = state
+                .assigned_jobs
+                .get(&job_id)
+                .map(|(runner, _, _)| *runner);
+            assigned_runner == Some(runner_id)
+                && state.job_leases.get(&job_id).map(String::as_str) == Some(lease_token)
+        };
+        if in_memory_matches {
+            return gitforge_db::queries::JobQueries::append_log_with_lease(
+                pool,
+                job_id,
+                runner_id,
+                lease_token,
+                chunk,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
+        }
+        gitforge_db::queries::JobQueries::append_log_with_lease_late(
             pool,
             job_id,
             runner_id,
@@ -1136,18 +1262,40 @@ impl Scheduler {
     }
 
     /// Check whether a runner may upload output for a live job lease.
+    ///
+    /// Returns `true` for an in-memory active lease **or** a durable lease
+    /// that survived a restart fence and is still inside its grace window.
+    /// This is what allows late artifact uploads to succeed instead of
+    /// returning 409 to the consumer.
     pub async fn job_lease_active(
         &self,
         job_id: JobId,
         runner_id: RunnerId,
         lease_token: &str,
     ) -> bool {
+        {
+            let state = self.state.read().await;
+            let assigned_runner = state
+                .assigned_jobs
+                .get(&job_id)
+                .map(|(runner, _, _)| *runner);
+            if assigned_runner == Some(runner_id)
+                && state.job_leases.get(&job_id).map(String::as_str) == Some(lease_token)
+            {
+                return true;
+            }
+        }
         let Some(pool) = &self.db_pool else {
             return false;
         };
-        gitforge_db::queries::JobQueries::lease_is_active(pool, job_id, runner_id, lease_token)
-            .await
-            .unwrap_or(false)
+        gitforge_db::queries::JobQueries::lease_matches_within_grace(
+            pool,
+            job_id,
+            runner_id,
+            lease_token,
+        )
+        .await
+        .unwrap_or(false)
     }
 
     /// Read durable runner log chunks for the operator/API adapter.
@@ -1213,6 +1361,7 @@ impl Default for Scheduler {
 mod tests {
     use super::*;
     use gitforge_db::models::RunnerType;
+    use std::time::Duration;
 
     fn make_runner(id: RunnerId, name: &str, status: &str, capacity: i32) -> Runner {
         Runner {
@@ -2130,5 +2279,306 @@ mod tests {
             .unwrap();
         assert_eq!(finalized.status, "cancelled");
         assert!(finalized.finished_at.is_some());
+    }
+
+    // ---------------------------------------------------------------
+    // P0-GF-RESTART-20260913 scheduler-level late-event tests
+    // ---------------------------------------------------------------
+
+    /// Seed a pipeline, run, job, and runner, then enqueue and dispatch a
+    /// job so the test fixture looks identical to a runner that just
+    /// polled `/jobs/pending`.
+    async fn seed_assigned_job(
+        pool: &gitforge_db::Pool,
+        scheduler: &Scheduler,
+        runner_id: RunnerId,
+        repo_name: &str,
+    ) -> (gitforge_common::PipelineRunId, RepoId, JobId) {
+        let user = gitforge_db::models::User::new(
+            format!("restart-{}-owner", repo_name),
+            format!("restart-{}-owner@example.com", repo_name),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            repo_name.to_string(),
+            user.id,
+            format!("/git/{}", repo_name),
+        );
+        gitforge_db::queries::RepoQueries::create(pool, &repo)
+            .await
+            .unwrap();
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: format!("restart-{}-pipeline", repo_name),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            user.username.clone(),
+            "restart-commit".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(pool, &run)
+            .await
+            .unwrap();
+        let job = gitforge_db::models::Job::new(run.id, format!("restart-{}-job", repo_name));
+        let job_id = job.id;
+        gitforge_db::queries::JobQueries::create(pool, &job)
+            .await
+            .unwrap();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                run.id,
+                repo.id,
+                vec!["cargo test --workspace".to_string()],
+                Some("/workspace".to_string()),
+            )
+            .await;
+        scheduler.process_queue().await;
+        assert_eq!(
+            scheduler.is_assigned(job_id).await,
+            Some(runner_id),
+            "scheduler must assign the job to the seeded runner"
+        );
+        (run.id, repo.id, job_id)
+    }
+
+    /// Reproduce the incident: a scheduler restart between `claim` and
+    /// `complete` fences the row. The original runner's late completion
+    /// must still authenticate, finalize the job, and emit the standard
+    /// pipeline event so downstream consumers see the same side effects
+    /// as a normal completion.
+    #[tokio::test]
+    async fn test_late_completion_after_restart_fence_emits_pipeline_event() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let runner_id = RunnerId::new();
+        let scheduler = Scheduler::with_db(pool.clone());
+        scheduler
+            .register_runner(make_runner(
+                runner_id,
+                "restart-scheduler-runner",
+                "online",
+                1,
+            ))
+            .await;
+        let (run_id, _repo_id, job_id) =
+            seed_assigned_job(&pool, &scheduler, runner_id, "late-event").await;
+
+        let lease = scheduler
+            .ensure_job_lease(job_id)
+            .await
+            .expect("lease must be available for an assigned job");
+        scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .expect("start_job must succeed under the active lease");
+
+        // Subscribe to the event channel so we can assert the pipeline
+        // event is emitted when the late completion runs.
+        let mut events = scheduler.event_tx.subscribe();
+
+        // Restart: drop the in-memory mirror as a fresh process would.
+        {
+            let mut state = scheduler.state.write().await;
+            state.job_assignments.remove(&job_id);
+            state.assigned_jobs.remove(&job_id);
+            state.job_leases.remove(&job_id);
+        }
+        gitforge_db::queries::JobQueries::requeue_inflight(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            gitforge_db::queries::JobQueries::get(&pool, job_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed",
+            "fenced row must be visibly failed before late completion"
+        );
+
+        scheduler
+            .complete_job_with_lease(
+                job_id,
+                runner_id,
+                &lease,
+                true,
+                r#"{"success":true,"exit_code":0}"#.to_string(),
+            )
+            .await
+            .expect("late completion under the preserved lease must succeed");
+
+        // Pipeline event must fire so downstream consumers observe the
+        // same side effect as a normal completion.
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("pipeline event must fire")
+            .expect("event channel must deliver");
+        match event {
+            SchedulerEvent::JobCompleted {
+                job_id: emitted_id,
+                pipeline_run_id,
+                runner_id: emitted_runner,
+                success,
+            } => {
+                assert_eq!(emitted_id, job_id);
+                assert_eq!(pipeline_run_id, run_id);
+                assert_eq!(emitted_runner, runner_id);
+                assert!(success);
+            }
+            other => panic!("expected JobCompleted event, got {:?}", other),
+        }
+
+        // Idempotency: a replay must not rewrite state.
+        let replayed = scheduler
+            .complete_job_with_lease(
+                job_id,
+                runner_id,
+                &lease,
+                true,
+                r#"{"success":true,"exit_code":0}"#.to_string(),
+            )
+            .await;
+        assert!(
+            replayed.is_err(),
+            "a replayed late completion after success must be rejected"
+        );
+    }
+
+    /// A late log chunk from the original runner must still land after a
+    /// restart fence. Without the late path the scheduler returns 409 and
+    /// the runner's live-log stream is silently truncated.
+    #[tokio::test]
+    async fn test_late_log_after_restart_fence_lands() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let runner_id = RunnerId::new();
+        let scheduler = Scheduler::with_db(pool.clone());
+        scheduler
+            .register_runner(make_runner(runner_id, "restart-log-runner", "online", 1))
+            .await;
+        let (_run_id, _repo_id, job_id) =
+            seed_assigned_job(&pool, &scheduler, runner_id, "restart-log").await;
+        let lease = scheduler
+            .ensure_job_lease(job_id)
+            .await
+            .expect("lease must be available");
+        scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .expect("start_job must succeed");
+
+        // Restart: drop mirror, fence durably.
+        {
+            let mut state = scheduler.state.write().await;
+            state.job_assignments.remove(&job_id);
+            state.assigned_jobs.remove(&job_id);
+            state.job_leases.remove(&job_id);
+        }
+        gitforge_db::queries::JobQueries::requeue_inflight(&pool)
+            .await
+            .unwrap();
+
+        let sequence = scheduler
+            .append_log_with_lease(job_id, runner_id, &lease, "late stdout\n")
+            .await
+            .expect("late log append must succeed")
+            .expect("late log append must return a stable sequence number");
+        let logs = scheduler
+            .list_logs(job_id)
+            .await
+            .expect("list_logs must succeed against the durable ledger");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].chunk, "late stdout\n");
+        assert_eq!(logs[0].sequence, sequence);
+
+        // A foreign lease must NOT land any chunk.
+        let other_runner_id = RunnerId::new();
+        let result = scheduler
+            .append_log_with_lease(job_id, other_runner_id, &lease, "foreign\n")
+            .await
+            .expect("foreign lease is silently rejected, not an error");
+        assert_eq!(
+            result, None,
+            "foreign lease must not return a sequence number"
+        );
+    }
+
+    /// The artifact-upload gate must permit late uploads for fenced jobs
+    /// because the runner still holds a valid durable lease, and must
+    /// reject expired leases because the bounded reconciliation window
+    /// has elapsed.
+    #[tokio::test]
+    async fn test_artifact_upload_gate_handles_fence_and_expiry() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let runner_id = RunnerId::new();
+        let scheduler = Scheduler::with_db(pool.clone());
+        scheduler
+            .register_runner(make_runner(
+                runner_id,
+                "restart-artifact-runner",
+                "online",
+                1,
+            ))
+            .await;
+        let (_run_id, _repo_id, job_id) =
+            seed_assigned_job(&pool, &scheduler, runner_id, "restart-artifact").await;
+        let lease = scheduler
+            .ensure_job_lease(job_id)
+            .await
+            .expect("lease must be available");
+        scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .expect("start_job must succeed");
+
+        // Restart: drop mirror, fence durably.
+        {
+            let mut state = scheduler.state.write().await;
+            state.job_assignments.remove(&job_id);
+            state.assigned_jobs.remove(&job_id);
+            state.job_leases.remove(&job_id);
+        }
+        gitforge_db::queries::JobQueries::requeue_inflight(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            scheduler.job_lease_active(job_id, runner_id, &lease).await,
+            "artifact gate must accept the durable lease for a fenced row inside grace"
+        );
+        let other_runner_id = RunnerId::new();
+        assert!(
+            !scheduler
+                .job_lease_active(job_id, other_runner_id, &lease)
+                .await,
+            "a foreign runner must not pass the artifact gate"
+        );
+
+        // Force the grace window into the past and confirm the gate
+        // closes again. This is the bounded reconciliation safety net.
+        gitforge_db::queries::JobQueries::_set_lease_expires_at_for_tests(
+            &pool,
+            job_id,
+            chrono::Utc::now() - chrono::Duration::seconds(60),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !scheduler.job_lease_active(job_id, runner_id, &lease).await,
+            "an expired lease must NOT pass the artifact gate"
+        );
     }
 }

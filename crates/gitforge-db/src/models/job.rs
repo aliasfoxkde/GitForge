@@ -76,6 +76,22 @@ pub struct Job {
     pub timeout_secs: u64,
     /// JSON-encoded bounded execution receipt, when the job is terminal.
     pub result_json: Option<String>,
+    /// Wall-clock instant at which the durable lease expires. The value is
+    /// populated by the post-restart fence (`requeue_inflight`) and cleared
+    /// when the runner transitions the row to a terminal state. A row with
+    /// `lease_expires_at` already past `now()` rejects every late event.
+    ///
+    /// This is the bounded reconciliation grace window described in
+    /// P0-GF-RESTART-20260913: late events are accepted only while the
+    /// lease still binds, never indefinitely.
+    #[serde(default)]
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    /// Wall-clock instant at which the recovery sweep fenced this row.
+    /// Cleared when the row transitions out of the fenced status. Operators
+    /// can inspect this column to distinguish a recovery fence from any
+    /// other terminal transition.
+    #[serde(default)]
+    pub fenced_at: Option<DateTime<Utc>>,
 }
 
 impl Job {
@@ -96,6 +112,8 @@ impl Job {
             working_dir: None,
             timeout_secs: 300,
             result_json: None,
+            lease_expires_at: None,
+            fenced_at: None,
         }
     }
 

@@ -43,6 +43,24 @@ pub enum OutputStream {
     Stderr,
 }
 
+/// Snapshot of the container fields the runner needs for resource
+/// classification. The Docker daemon populates these on every inspect
+/// response, so a probe is cheap and side-effect free.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerStateProbe {
+    /// Whether the kernel OOM-killer terminated a process in this
+    /// container. Reported by Docker when the cgroup memory limit is
+    /// exceeded or the host hits reclaim pressure.
+    pub oom_killed: Option<bool>,
+    /// Last exit code reported by the container.
+    pub exit_code: Option<i64>,
+    /// Container error string set when the daemon forcibly stops the
+    /// container (for example, an eviction).
+    pub error: Option<String>,
+    /// Whether the container is currently running.
+    pub running: Option<bool>,
+}
+
 /// Receives bounded output chunks while a sandbox command is running.
 ///
 /// Implementations may apply backpressure by awaiting durable delivery. The
@@ -217,6 +235,33 @@ impl DockerSandbox {
     /// Check if Docker is available
     pub fn is_available(&self) -> bool {
         self.docker.is_some()
+    }
+
+    /// Probe a container's runtime state without mutating it. Used by the
+    /// runner executor to classify a signal-derived exit code (most often
+    /// 137 / SIGKILL from the OOM killer) so operators can distinguish a
+    /// cgroup memory-limit violation from a runner-side timeout.
+    ///
+    /// In stub mode the probe returns an all-`None` snapshot so unit tests
+    /// can drive the classification branch without Docker. Production code
+    /// never observes this branch; the call site only acts on `Some(true)`.
+    pub async fn inspect_container_state(&self, container_id: &str) -> Result<ContainerStateProbe> {
+        let Some(ref docker) = self.docker else {
+            return Ok(ContainerStateProbe::default());
+        };
+        let inspect = docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|error| {
+                Error::sandbox(format!("failed to inspect container state: {}", error))
+            })?;
+        let state = inspect.state.unwrap_or_default();
+        Ok(ContainerStateProbe {
+            oom_killed: state.oom_killed,
+            exit_code: state.exit_code,
+            error: state.error,
+            running: state.running,
+        })
     }
 
     /// Pull an image if not present
@@ -595,25 +640,10 @@ impl Sandbox for DockerSandbox {
 
     async fn destroy(&self, instance: SandboxInstance) -> Result<()> {
         if let Some(ref docker) = self.docker {
-            // If this sandbox had a workspace mount, chown the workspace tree to
-            // the runner's UID/GID before shutting down.  Inside the container
-            // we run as root, so chown is always permitted.  After this succeeds
-            // the runner user on the host can delete the artifact files without
-            // requiring privileged escalation.
-            if let Some(ref workspace) = instance.workspace_path {
-                if let Err(e) = cleanup_workspace(docker, &instance.container_id, workspace).await {
-                    tracing::warn!(
-                        "workspace ownership cleanup failed for {}: {} \
-                         (artifact files may require privileged deletion)",
-                        workspace,
-                        e
-                    );
-                    // Proceed to container teardown even if chown fails
-                }
-            }
-
-            // Send SIGTERM for graceful shutdown first
-            // Wait up to 10 seconds for container to stop gracefully
+            // Phase 1: SIGTERM graceful stop. The 10-second grace window
+            // matches Docker's own stop semantics and the existing
+            // operator-facing timeout budget; processes that ignore
+            // SIGTERM for that long are pathological.
             let stop_options = StopContainerOptions {
                 t: Some(10),
                 ..Default::default()
@@ -623,14 +653,77 @@ impl Sandbox for DockerSandbox {
                 .stop_container(&instance.container_id, Some(stop_options))
                 .await
             {
-                // Container might already be stopped or not exist - that's OK
                 tracing::debug!(
                     "stop_container returned error (container may already be stopped): {}",
                     e
                 );
             }
 
-            // Now remove the stopped container
+            // Phase 2: bounded poll for the container to actually exit. We
+            // cannot mutate the workspace while the cgroup still has a
+            // reference to the mount, so this barrier is mandatory before
+            // any chown step. The corrected implementation is fail-safe
+            // on **two** failure modes:
+            //
+            //   1. The bounded wait elapses with the container still
+            //      running. Refusing to claim quiescence prevents chown
+            //      from racing against an active mount.
+            //   2. Docker inspect itself fails (network blip, daemon
+            //      restart, daemon unreachable). The previous optimistic
+            //      branch — "the container is gone" — silently let
+            //      teardown proceed against a workspace whose state is
+            //      unknown. We now fail closed: an inspect error must
+            //      not authorize any further mutation of the workspace.
+            match wait_for_container_exit(docker, &instance.container_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(Error::sandbox(format!(
+                        "container {} failed to exit within {} seconds; workspace not quiesced, teardown refuses to claim success",
+                        instance.container_id, MAX_WAIT_CONTAINER_EXIT_SECS
+                    )));
+                }
+                Err(inspect_error) => {
+                    return Err(Error::sandbox(format!(
+                        "container {} docker state unknown ({}); workspace teardown refuses to claim success",
+                        instance.container_id, inspect_error
+                    )));
+                }
+            }
+
+            // Phase 3: workspace ownership transfer. The container is
+            // exited and the mount is safe to mutate; chown to the
+            // runner UID/GID so the host process can delete artifact
+            // files without privileged escalation.
+            if let Some(ref workspace) = instance.workspace_path {
+                if let Err(e) = cleanup_workspace(docker, &instance.container_id, workspace).await {
+                    tracing::warn!(
+                        "workspace ownership cleanup failed for {}: {} \
+                         (artifact files may require privileged deletion)",
+                        workspace,
+                        e
+                    );
+                }
+            }
+
+            // Phase 4: process-group aware kill of any straggler init
+            // process. By this point the Docker daemon has reported the
+            // container exited, but in rare cases the cgroup init can
+            // outlive its parent (e.g., a zombie child whose parent has
+            // already exited). `kill_container` with SIGKILL ensures the
+            // process group is reaped before the container is removed.
+            // Failure here is logged but non-fatal — the remove step
+            // would catch a still-running container as a hard error.
+            if let Err(error) = docker.kill_container(&instance.container_id, None).await {
+                tracing::debug!(
+                    container_id = %instance.container_id,
+                    error = %error,
+                    "kill_container returned error (container is already exited)"
+                );
+            }
+
+            // Phase 5: container removal. `force = false` lets Docker
+            // refuse to remove a running container; combined with phase
+            // 2's bounded wait this enforces fail-safe semantics.
             let remove_options = RemoveContainerOptions {
                 force: false,
                 ..Default::default()
@@ -648,6 +741,73 @@ impl Sandbox for DockerSandbox {
             );
         }
         Ok(())
+    }
+}
+
+/// Maximum bounded poll time used by `wait_for_container_exit`.
+const MAX_WAIT_CONTAINER_EXIT_SECS: u64 = 10;
+
+/// Poll Docker until the container reports a terminal state or the
+/// bounded wait elapses. Returns `Ok(true)` when the container is
+/// confirmed exited and `Ok(false)` when the bounded wait elapses with
+/// the container still running. Returns `Err(...)` when Docker inspect
+/// itself fails — the caller's teardown must refuse to mutate the
+/// workspace when the container's state is unknown.
+///
+/// Implementation notes:
+///
+/// - A `404 Not Found` from inspect means the container is already gone
+///   (a parallel teardown, manual `docker rm`, or eviction). The cgroup
+///   no longer references the workspace mount, so this branch is safe
+///   to treat as a clean exit.
+/// - Any other inspect failure is propagated to the caller as an error.
+///   The previous optimistic branch silently treated every error as
+///   "container is gone" — that hid transient daemon problems behind a
+///   chown step that races against a possibly-live mount.
+/// - The 50 ms poll cadence is a balance between Docker daemon load
+///   and stop responsiveness on a healthy host.
+async fn wait_for_container_exit(
+    docker: &Docker,
+    container_id: &str,
+) -> std::result::Result<bool, bollard::errors::Error> {
+    use bollard::errors::Error;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(MAX_WAIT_CONTAINER_EXIT_SECS);
+    loop {
+        match docker.inspect_container(container_id, None).await {
+            Ok(inspect) => {
+                let running = inspect
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.running)
+                    .unwrap_or(false);
+                if !running {
+                    return Ok(true);
+                }
+            }
+            // 404: the container is already gone. The mount has been
+            // released; treat as a clean exit so chown can proceed.
+            Err(Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(true),
+            Err(error) => {
+                tracing::warn!(
+                    container_id,
+                    %error,
+                    "docker inspect failed during container-exit poll; refusing to claim workspace quiescence"
+                );
+                return Err(error);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                container_id,
+                "container did not reach exited state within {}s; refusing to claim workspace quiescence",
+                MAX_WAIT_CONTAINER_EXIT_SECS
+            );
+            return Ok(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
@@ -1733,6 +1893,85 @@ mod tests {
         assert!(
             result.is_ok(),
             "stub destroy must not fail even with workspace_path set"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // P0-GF-RESTART-20260913 sandbox-state probe tests
+    // -----------------------------------------------------------------
+
+    /// `inspect_container_state` is the data source for the executor's
+    /// OOM/signal classifier. In stub mode it must return an empty
+    /// snapshot so callers can distinguish a missing daemon from a real
+    /// probe failure.
+    #[tokio::test]
+    async fn test_inspect_container_state_stub_is_empty() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let probe = sandbox
+            .inspect_container_state("missing-container")
+            .await
+            .expect("stub probe must succeed");
+        assert!(probe.oom_killed.is_none());
+        assert!(probe.exit_code.is_none());
+        assert!(probe.error.is_none());
+        assert!(probe.running.is_none());
+    }
+
+    /// `ContainerStateProbe` must be constructible without Docker so
+    /// downstream code can carry the snapshot across an await boundary
+    /// without an extra clone path.
+    #[test]
+    fn test_container_state_probe_default_is_none() {
+        let probe = ContainerStateProbe::default();
+        assert!(probe.oom_killed.is_none());
+        assert!(probe.exit_code.is_none());
+        assert!(probe.error.is_none());
+        assert!(probe.running.is_none());
+    }
+
+    /// Document the bounded wait used by `wait_for_container_exit`. The
+    /// constant is referenced from the destroy path so any change must be
+    /// intentional; this test catches accidental edits that would let a
+    /// stuck container delay chown for minutes at a time.
+    #[test]
+    fn test_wait_for_container_exit_bound_is_bounded() {
+        assert!(
+            MAX_WAIT_CONTAINER_EXIT_SECS >= 1 && MAX_WAIT_CONTAINER_EXIT_SECS <= 30,
+            "wait_for_container_exit must remain bounded (got {}s)",
+            MAX_WAIT_CONTAINER_EXIT_SECS
+        );
+    }
+
+    /// When the Docker daemon is unreachable, `wait_for_container_exit`
+    /// must surface the inspect error rather than silently treating the
+    /// container as gone. The destroy path is then expected to fail closed
+    /// and refuse to chown a workspace whose Docker state is unknown.
+    /// The previous optimistic branch silently proceeded with chown under
+    /// those conditions.
+    ///
+    /// We connect via TCP to localhost on a port that nothing is listening
+    /// on. The bollard client constructs lazily — it does not probe the
+    /// endpoint at construction — so the first `inspect_container` call
+    /// surfaces a connection-refused error, exercising the fail-closed
+    /// branch without needing a Docker daemon or a UNIX socket file.
+    #[tokio::test]
+    async fn test_wait_for_container_exit_returns_error_on_inspect_failure() {
+        // bollard's HTTP client constructs lazily: the URL parse is the
+        // only work done up front. Pointing it at a closed port means
+        // every request fails at the transport layer without needing a
+        // real Docker daemon or a UNIX socket file present.
+        let client = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
+            1,
+            &bollard::API_DEFAULT_VERSION,
+        )
+        .expect("bollard accepts a syntactically valid http URL even when the port is closed");
+
+        let outcome = wait_for_container_exit(&client, "any-container-id").await;
+        assert!(
+            outcome.is_err(),
+            "wait_for_container_exit must fail closed on inspect errors, got {:?}",
+            outcome
         );
     }
 }

@@ -239,6 +239,14 @@ impl Pool {
         // Additive migration for databases created before job definitions and
         // receipts were persisted. SQLite has no portable IF NOT EXISTS form
         // for ADD COLUMN, so tolerate only the known duplicate-column case.
+        //
+        // `lease_expires_at` and `fenced_at` were added by P0-GF-RESTART-
+        // 20260913 so the durable recovery sweep can preserve a runner's
+        // lease for a bounded grace window instead of either clearing it
+        // immediately (which made late completions return 409) or holding it
+        // forever (which let an old runner mutate a terminal row
+        // indefinitely). Both columns are NULL by default and ignored by the
+        // pre-restart code paths, so existing rows keep their semantics.
         for statement in [
             "ALTER TABLE jobs ADD COLUMN commands TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE jobs ADD COLUMN image TEXT NOT NULL DEFAULT 'rust:latest'",
@@ -247,6 +255,8 @@ impl Pool {
             "ALTER TABLE jobs ADD COLUMN result_json TEXT",
             "ALTER TABLE jobs ADD COLUMN lease_token TEXT",
             "ALTER TABLE jobs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN lease_expires_at TEXT",
+            "ALTER TABLE jobs ADD COLUMN fenced_at TEXT",
         ] {
             if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
                 let message = error.to_string();

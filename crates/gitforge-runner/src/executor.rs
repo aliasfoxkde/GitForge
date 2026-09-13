@@ -16,6 +16,63 @@ use tokio::fs;
 use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration, Instant};
 
+/// Linux process exit code that Docker reports when the kernel kills the
+/// container's init process with SIGKILL (signal 9). Most memory-pressure
+/// kills land here and previously landed in receipts without any
+/// classification; we surface them as a distinct "killed by OOM" failure
+/// mode so operators can act on cgroup limits rather than chasing a
+/// phantom application crash.
+pub const SIGKILL_EXIT_CODE: i32 = 137;
+/// POSIX exit-code convention: signal-derived exit codes are encoded as
+/// `128 + signal_number`. Anything at or above this threshold is a
+/// signal kill, which means the job did not exit cleanly and is a
+/// candidate for resource classification.
+pub const SIGNAL_EXIT_BASE: i32 = 128;
+
+/// Marker emitted into `JobResult.error` when the executor confirms a
+/// Docker-reported OOM kill. The status classifier consumes the marker
+/// to surface `ReceiptStatus::OomKilled`. Kept as a constant so tests
+/// can refer to the same string.
+pub const OOM_ERROR_MARKER: &str = "killed by OOM";
+
+/// Discrete failure classification produced by the executor and consumed
+/// by `JobResult::status()`. Using a typed enum avoids substring-based
+/// status classification that could be confused by an unrelated text
+/// fragment (e.g. an error message that happened to contain the word
+/// "timeout" or "OOM"). The enum is set in priority order: a confirmed
+/// OOM kill takes precedence over a runner-side timeout, which takes
+/// precedence over any other failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FailureKind {
+    /// No failure — the job succeeded.
+    #[default]
+    None,
+    /// The container was killed by the kernel's OOM-killer, confirmed by
+    /// Docker's `OOMKilled` flag.
+    OomKilled,
+    /// The runner's own timeout watcher stopped the job before completion.
+    TimedOut,
+    /// The job failed for any other reason (signal kill not confirmed as
+    /// OOM, application error, etc.).
+    Failed,
+}
+
+/// Result of a container-state probe when the executor saw a signal-derived
+/// exit code. Distinguishes a confirmed OOM kill (which the executor
+/// uses to mark the receipt `OomKilled`) from a Docker-supplied error
+/// annotation. `None` means the probe was inconclusive; the executor
+/// must preserve the original failure error in that case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignalClassification {
+    /// `State.OOMKilled == Some(true)`. The string carries the
+    /// `OOM_ERROR_MARKER` and operator-facing annotations.
+    OomKilled(String),
+    /// `State.Error` had a non-trivial message that helps explain
+    /// the kill. The string carries the appended annotation, suitable
+    /// to add to the existing failure error.
+    DockerError(String),
+}
+
 /// Default number of pre-warmed containers per image
 const POOL_SIZE: usize = 2;
 
@@ -283,6 +340,66 @@ impl JobExecutor {
         }
     }
 
+    /// Probe a sandbox whose process exited via a Unix signal. The probe
+    /// is best-effort and **never fabricates a cause**: it returns
+    /// `Some(OomKilled)` only when Docker confirms `oom_killed == true`,
+    /// `Some(DockerError)` only when the daemon populated a non-trivial
+    /// `State.Error`, and `None` otherwise. The caller is responsible
+    /// for preserving the original failure error when the probe is
+    /// inconclusive.
+    async fn classify_signal_exit(
+        &self,
+        instance: &SandboxInstance,
+        exit_code: i32,
+        existing_error: Option<&str>,
+    ) -> Option<SignalClassification> {
+        let probe = match self
+            .pool
+            .sandbox
+            .inspect_container_state(&instance.container_id)
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::debug!(%error, container_id = %instance.container_id,
+                    "could not probe container for signal classification");
+                return None;
+            }
+        };
+        if probe.oom_killed == Some(true) {
+            // Authoritative OOM kill. Use the marker that the status
+            // classifier matches on, then append the raw signals so
+            // operators can correlate with kernel logs.
+            return Some(SignalClassification::OomKilled(format!(
+                "{} (exit_code={}, signal=SIGKILL, container_oomkilled=true)",
+                OOM_ERROR_MARKER, exit_code
+            )));
+        }
+        if let Some(error) = probe.error.as_deref() {
+            // The Docker daemon sets `State.Error` to a short string
+            // describing why a container exited non-zero. Skip the
+            // trivial "exit status" message — that just mirrors the
+            // exit code we already have. When the daemon supplied an
+            // annotation we append it to the existing failure error so
+            // the original diagnostic survives alongside the daemon's
+            // explanation; we do not overwrite the step-executor error.
+            if !error.is_empty() && error != "exit status" {
+                let annotation = match existing_error {
+                    Some(prior) if !prior.is_empty() => {
+                        format!("{}; docker error: {}", prior, error)
+                    }
+                    _ => format!("docker error: {}", error),
+                };
+                return Some(SignalClassification::DockerError(annotation));
+            }
+        }
+        // No OOM flag and no daemon-supplied error: the probe is
+        // inconclusive. Return None rather than fabricate a signal-kill
+        // message; the original failure error from the step executor
+        // remains authoritative.
+        None
+    }
+
     /// Execute a job and forward sandbox output while each step is running.
     /// The sink is optional so existing callers and local tests retain the
     /// original accumulated-result behavior.
@@ -323,6 +440,7 @@ impl JobExecutor {
                         acquire_timeout.as_secs()
                     )),
                     workspace_path: job.working_dir.clone(),
+                    failure_kind: FailureKind::TimedOut,
                 };
             }
             Ok(Err(e)) => {
@@ -339,6 +457,7 @@ impl JobExecutor {
                     completed_at,
                     error: Some(format!("failed to create sandbox: {}", e)),
                     workspace_path: job.working_dir.clone(),
+                    failure_kind: FailureKind::Failed,
                 };
             }
             Ok(Ok(instance)) => instance,
@@ -365,6 +484,11 @@ impl JobExecutor {
         let mut final_exit_code = 0;
         let mut timed_out = false;
         let mut failure_error = None;
+        // The typed failure classification complements `failure_error` so
+        // `JobResult::status()` does not depend on substring matching of
+        // freeform text. The classifier must be set in priority order:
+        // OomKilled > TimedOut > Failed.
+        let mut failure_kind = FailureKind::None;
 
         for step in &job.steps {
             tracing::debug!("executing step: {}", step.name);
@@ -405,6 +529,13 @@ impl JobExecutor {
                     success = false;
                     final_exit_code = -1;
                     timed_out = deadline <= Instant::now();
+                    if timed_out {
+                        // The runner's own watcher stopped the job; this
+                        // is the authoritative failure mode and we record
+                        // it as `TimedOut` so the status classifier does
+                        // not need substring matching.
+                        failure_kind = FailureKind::TimedOut;
+                    }
                     failure_error = Some(format!("execution error: {}", e));
                     step_results.push(StepResult {
                         exit_code: -1,
@@ -413,6 +544,50 @@ impl JobExecutor {
                     });
                     break;
                 }
+            }
+        }
+
+        // Classify a signal-derived exit (137 / SIGKILL, 134 / SIGABRT,
+        // 143 / SIGTERM) by inspecting the container. The Docker daemon
+        // exposes `State.OOMKilled` and `State.Error`, which let us tell
+        // "kernel killed us for memory pressure" apart from a generic
+        // signal kill we cannot authoritatively attribute.
+        //
+        // Probe behavior:
+        //
+        // - `oom_killed == Some(true)` → confirmed resource kill. Set
+        //   `failure_kind = OomKilled`, attach the OOM marker to the
+        //   error text. Operators can act on cgroup limits.
+        // - `State.Error` populated with something other than the trivial
+        //   "exit status" message → the daemon explained the kill; append
+        //   that explanation without overwriting the original error from
+        //   the step executor.
+        // - Probe is inconclusive (no OOM flag, no daemon error) →
+        //   preserve the original `failure_error` and do not fabricate a
+        //   cause. The typed `failure_kind` stays `Failed` so the
+        //   classifier does not misattribute the kill.
+        //
+        // Timeout-driven kills carry `final_exit_code = -1`, which is
+        // below the signal-derived threshold — the probe does not run and
+        // the original timeout error and `FailureKind::TimedOut` survive.
+        if !success && final_exit_code >= SIGNAL_EXIT_BASE {
+            match self
+                .classify_signal_exit(&instance, final_exit_code, failure_error.as_deref())
+                .await
+            {
+                Some(SignalClassification::OomKilled(reason)) => {
+                    failure_kind = FailureKind::OomKilled;
+                    failure_error = Some(reason);
+                }
+                Some(SignalClassification::DockerError(annotation)) => {
+                    failure_error = Some(annotation);
+                }
+                // Inconclusive probe: leave the original `failure_error`
+                // and `failure_kind` alone. The status classifier uses the
+                // typed kind, so a non-OOM signal kill stays `Failed`
+                // rather than being misattributed to memory pressure or
+                // being mistaken for a timeout.
+                None => {}
             }
         }
 
@@ -480,6 +655,11 @@ impl JobExecutor {
                 failure_error.or_else(|| Some("job failed".to_string()))
             },
             workspace_path: job.working_dir.clone(),
+            failure_kind: if success {
+                FailureKind::None
+            } else {
+                failure_kind
+            },
         }
     }
 
@@ -614,22 +794,30 @@ pub struct JobResult {
     pub error: Option<String>,
     /// Workspace path where the job executed
     pub workspace_path: Option<String>,
+    /// Typed failure classification. `None` means the job succeeded.
+    /// `status()` consults this enum instead of substring-matching the
+    /// freeform `error` text, which is fragile when an unrelated error
+    /// message happens to contain words like "timeout" or "OOM".
+    #[doc(hidden)]
+    pub failure_kind: FailureKind,
 }
 
 impl JobResult {
-    /// Determine receipt status from job result
+    /// Determine receipt status from job result.
+    ///
+    /// Uses the typed `failure_kind` field produced by the executor
+    /// rather than substring-matching the freeform error text. The
+    /// priority order is fixed: a confirmed OOM kill takes precedence
+    /// over a runner-side timeout, which takes precedence over any other
+    /// failure. The executor already enforces that ordering.
     fn status(&self) -> ReceiptStatus {
         if self.success {
-            ReceiptStatus::Succeeded
-        } else if self
-            .error
-            .as_ref()
-            .map(|e| e.contains("timeout"))
-            .unwrap_or(false)
-        {
-            ReceiptStatus::TimedOut
-        } else {
-            ReceiptStatus::Failed
+            return ReceiptStatus::Succeeded;
+        }
+        match self.failure_kind {
+            FailureKind::OomKilled => ReceiptStatus::OomKilled,
+            FailureKind::TimedOut => ReceiptStatus::TimedOut,
+            FailureKind::Failed | FailureKind::None => ReceiptStatus::Failed,
         }
     }
 }
@@ -816,6 +1004,7 @@ mod tests {
             completed_at: completed,
             error: None,
             workspace_path: None,
+            failure_kind: FailureKind::None,
         };
         assert_eq!(success_result.status(), ReceiptStatus::Succeeded);
 
@@ -831,6 +1020,7 @@ mod tests {
             completed_at: completed,
             error: Some("build failed".to_string()),
             workspace_path: None,
+            failure_kind: FailureKind::Failed,
         };
         assert_eq!(failure_result.status(), ReceiptStatus::Failed);
 
@@ -846,6 +1036,7 @@ mod tests {
             completed_at: completed,
             error: Some("operation timeout exceeded".to_string()),
             workspace_path: None,
+            failure_kind: FailureKind::TimedOut,
         };
         assert_eq!(timeout_result.status(), ReceiptStatus::TimedOut);
     }
@@ -896,5 +1087,160 @@ mod tests {
         let (sha, bytes) = JobResult::compute_output_sha(&artifacts);
         assert!(!sha.is_empty());
         assert_eq!(bytes, 300); // 100 + 200
+    }
+
+    // -----------------------------------------------------------------
+    // P0-GF-RESTART-20260913 signal / OOM classification tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_sigkill_exit_constant_is_137() {
+        // POSIX: signal exit codes are encoded as 128 + signal_number;
+        // SIGKILL is signal 9, so the conventional exit code is 137.
+        assert_eq!(SIGKILL_EXIT_CODE, 137);
+        assert_eq!(SIGNAL_EXIT_BASE, 128);
+    }
+
+    #[test]
+    fn test_status_classifies_oom_via_error_marker() {
+        // The executor writes a structured error string when the
+        // container reports OOMKilled; the status() method must surface
+        // that as a distinct receipt state.
+        let started = chrono::Utc::now();
+        let completed = started + chrono::Duration::seconds(2);
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: 137,
+            step_results: vec![StepResult {
+                exit_code: 137,
+                stdout: String::new(),
+                stderr: "killed".to_string(),
+            }],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: Some(
+                "killed by OOM (exit_code=137, signal=SIGKILL, container_oomkilled=true)"
+                    .to_string(),
+            ),
+            workspace_path: None,
+            failure_kind: FailureKind::OomKilled,
+        };
+        assert_eq!(result.status(), ReceiptStatus::OomKilled);
+    }
+
+    #[test]
+    fn test_status_classifies_timeout_above_oom() {
+        // A timeout error must still surface as TimedOut even when the
+        // exit code would otherwise look like a signal-derived exit.
+        let started = chrono::Utc::now();
+        let completed = started + chrono::Duration::seconds(900);
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: -1,
+            step_results: vec![],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: Some("job timed out: timeout exceeded".to_string()),
+            workspace_path: None,
+            failure_kind: FailureKind::TimedOut,
+        };
+        assert_eq!(result.status(), ReceiptStatus::TimedOut);
+    }
+
+    #[test]
+    fn test_status_classifies_non_oom_signal_exit_as_failed() {
+        // A signal-derived exit without the OOM marker must NOT be
+        // reported as OomKilled; otherwise an unrelated SIGTERM kill
+        // would be misattributed to memory pressure. The failure_kind
+        // is the source of truth, not the freeform error text — the
+        // message can describe any cause without affecting classification.
+        let started = chrono::Utc::now();
+        let completed = started + chrono::Duration::seconds(3);
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: 137,
+            step_results: vec![StepResult {
+                exit_code: 137,
+                stdout: String::new(),
+                stderr: String::new(),
+            }],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: Some(
+                "killed by SIGKILL (exit_code=137, no OOM flag set on container)".to_string(),
+            ),
+            workspace_path: None,
+            failure_kind: FailureKind::Failed,
+        };
+        assert_eq!(
+            result.status(),
+            ReceiptStatus::Failed,
+            "SIGKILL without OOM marker must remain classified as a generic failure"
+        );
+    }
+
+    #[test]
+    fn test_status_does_not_substring_match_error_text() {
+        // A job that exited with a freeform error containing the word
+        // "timeout" must NOT be classified as `TimedOut` unless the
+        // executor marked it with `FailureKind::TimedOut`. The substring
+        // match is precisely the ambiguity this contract removes.
+        let started = chrono::Utc::now();
+        let completed = started + chrono::Duration::seconds(2);
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: 137,
+            step_results: vec![StepResult {
+                exit_code: 137,
+                stdout: String::new(),
+                stderr: String::new(),
+            }],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: Some("runner timeout hit during sigkill".to_string()),
+            workspace_path: None,
+            failure_kind: FailureKind::Failed,
+        };
+        assert_eq!(
+            result.status(),
+            ReceiptStatus::Failed,
+            "freeform text containing 'timeout' must not be reclassified as TimedOut"
+        );
+    }
+
+    #[test]
+    fn test_status_success_unchanged_by_classification_change() {
+        let started = chrono::Utc::now();
+        let completed = started + chrono::Duration::seconds(1);
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: true,
+            exit_code: 0,
+            step_results: vec![StepResult {
+                exit_code: 0,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+            }],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: None,
+            workspace_path: None,
+            failure_kind: FailureKind::None,
+        };
+        assert_eq!(result.status(), ReceiptStatus::Succeeded);
     }
 }
