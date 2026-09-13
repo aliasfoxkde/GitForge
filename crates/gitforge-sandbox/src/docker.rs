@@ -911,6 +911,42 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Docker and is slow - run manually with --ignored"]
+    async fn test_docker_sandbox_passes_execution_environment() {
+        let sandbox = match DockerSandbox::connect_required().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let job_id = JobId::new();
+        let instance = match sandbox
+            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .await
+        {
+            Ok(instance) => instance,
+            Err(_) => return,
+        };
+        let mut environment = HashMap::new();
+        environment.insert(
+            "GIT_COMMIT_SHA".to_string(),
+            "0123456789abcdef0123456789abcdef01234567".to_string(),
+        );
+        let result = sandbox
+            .execute_with_environment(
+                &instance,
+                &["sh", "-c", "printf %s \"$GIT_COMMIT_SHA\""],
+                Some(&environment),
+                None,
+            )
+            .await;
+        let result = result.expect("sandbox must pass the execution environment");
+        assert_eq!(
+            result.stdout,
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        let _ = sandbox.destroy(instance).await;
+    }
+
+    #[tokio::test]
     #[ignore] // Requires Docker and is slow - run manually with `cargo test -- --ignored`
     async fn test_docker_sandbox_real_with_longer_command() {
         // Try to connect - if Docker not available, skip
