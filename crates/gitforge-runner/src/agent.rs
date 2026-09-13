@@ -1887,6 +1887,27 @@ mod tests {
     }
 
     #[test]
+    fn test_job_assignment_preserves_commit_sha() {
+        let assignment: JobAssignment = serde_json::from_str(
+            r#"{
+                "job_id":"sha-job",
+                "name":"evidence",
+                "pipeline_run_id":"run-sha",
+                "commands":["printf %s $GIT_COMMIT_SHA"],
+                "image":"rust:latest",
+                "working_dir":"/workspace",
+                "commit_sha":"0123456789abcdef0123456789abcdef01234567"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            assignment.commit_sha.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+    }
+
+    #[test]
     fn test_legacy_job_assignment_defaults_timeout() {
         let assignment: JobAssignment = serde_json::from_str(
             r#"{
