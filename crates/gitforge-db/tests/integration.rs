@@ -199,6 +199,107 @@ async fn test_pipeline_versioning_active_uniqueness() {
 }
 
 #[tokio::test]
+async fn test_pipeline_find_active_supports_config_gated_reuse() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = User::new(
+        "reuser".to_string(),
+        "reuser@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+
+    let repo = Repository::new(
+        "reuse-repo".to_string(),
+        user.id,
+        "/git/reuse-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+
+    let config_v1 = serde_json::json!({"jobs": ["build"]});
+    let config_v2 = serde_json::json!({"jobs": ["build", "test"]});
+
+    let pipeline = |id: PipelineId, config: serde_json::Value| Pipeline {
+        id,
+        repo_id: repo.id,
+        name: "gates".to_string(),
+        trigger_type: "push".to_string(),
+        config,
+        created_at: chrono::Utc::now(),
+    };
+
+    // No version recorded yet — a push has nothing to reuse and must
+    // record the first one.
+    assert!(PipelineQueries::find_active(&pool, repo.id, "gates")
+        .await
+        .unwrap()
+        .is_none());
+
+    // First push records v1; find_active returns exactly that row.
+    let v1_id = PipelineId::new();
+    PipelineQueries::create(&pool, &pipeline(v1_id, config_v1.clone()))
+        .await
+        .unwrap();
+    let active = PipelineQueries::find_active(&pool, repo.id, "gates")
+        .await
+        .unwrap()
+        .expect("active version after first push");
+    assert_eq!(active.id, v1_id);
+    assert_eq!(active.config, config_v1);
+
+    // An unchanged push (v1 again) reuses the active row via find_active's
+    // config comparison: no deactivate, no insert — still one row total and
+    // one active version.
+    let reused = PipelineQueries::find_active(&pool, repo.id, "gates")
+        .await
+        .unwrap()
+        .filter(|active| active.config == config_v1)
+        .expect("unchanged config reuses the active version");
+    assert_eq!(reused.id, v1_id);
+    assert_eq!(
+        PipelineQueries::count_active(&pool, repo.id, "gates")
+            .await
+            .unwrap(),
+        1
+    );
+
+    // A changed push (v2) must not match the active row...
+    assert!(PipelineQueries::find_active(&pool, repo.id, "gates")
+        .await
+        .unwrap()
+        .filter(|active| active.config == config_v2)
+        .is_none());
+
+    // ...so the caller retires v1 and records v2; v1 remains as history.
+    PipelineQueries::deactivate_active(&pool, repo.id, "gates")
+        .await
+        .unwrap();
+    let v2_id = PipelineId::new();
+    PipelineQueries::create(&pool, &pipeline(v2_id, config_v2.clone()))
+        .await
+        .unwrap();
+    let active = PipelineQueries::find_active(&pool, repo.id, "gates")
+        .await
+        .unwrap()
+        .expect("active version after configuration change");
+    assert_eq!(active.id, v2_id);
+    assert_eq!(
+        PipelineQueries::count_active(&pool, repo.id, "gates")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        PipelineQueries::list_by_repo(&pool, repo.id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn test_database_event_storage() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();

@@ -1348,9 +1348,30 @@ async fn handle_push_event(
         .cloned()
         .flatten();
 
+    // Resolve the durable pipeline version up front: when the pushed
+    // configuration is identical to the repository's active version, reuse
+    // that row and its id so the pipelines table records configuration
+    // versions rather than accumulating a row per push.
+    let reusable_pipeline = match scheduler_db {
+        Some(pool) => Some(reusable_active_pipeline(pool, repo_id, &pipeline).await?),
+        None => None,
+    }
+    .flatten();
+    let pipeline_id = match &reusable_pipeline {
+        Some(active) => {
+            tracing::info!(
+                "reusing active pipeline version {} for repo {} (configuration unchanged)",
+                active.id,
+                repo_id
+            );
+            active.id
+        }
+        None => gitforge_common::PipelineId::new(),
+    };
+
     // Create trigger event
-    let trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
-    let pipeline_id = trigger_event.pipeline_id;
+    let trigger_event =
+        create_trigger_event_for_pipeline(pipeline_id, repo_id, &payload.new_hash, ref_name);
 
     // Create and start the CI engine
     let engine = Arc::new(CiEngine::new(trigger_event, pipeline.clone()).await?);
@@ -1368,21 +1389,26 @@ async fn handle_push_event(
 
     let state = engine.state().await;
     if let Some(pool) = scheduler_db {
-        let db_pipeline = DbPipeline {
-            id: pipeline_id,
-            repo_id,
-            name: pipeline.name.clone(),
-            trigger_type: "push".to_string(),
-            config: serde_json::to_value(&pipeline)?,
-            created_at: Utc::now(),
-        };
-        // Only one active pipeline version per (repo, name) is allowed by
-        // idx_pipelines_active_repo_name — retire the predecessor before
-        // recording this push's version, or every push after the first
-        // fails run creation with a constraint violation.
-        gitforge_db::queries::PipelineQueries::deactivate_active(pool, repo_id, &pipeline.name)
-            .await?;
-        gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
+        // Record a new version only when the configuration actually changed;
+        // an unchanged push keeps the active row and its id (resolved above),
+        // while the run row below still captures this push's commit.
+        if reusable_pipeline.is_none() {
+            let db_pipeline = DbPipeline {
+                id: pipeline_id,
+                repo_id,
+                name: pipeline.name.clone(),
+                trigger_type: "push".to_string(),
+                config: serde_json::to_value(&pipeline)?,
+                created_at: Utc::now(),
+            };
+            // Only one active pipeline version per (repo, name) is allowed by
+            // idx_pipelines_active_repo_name — retire the predecessor before
+            // recording this push's version, or every push after the first
+            // fails run creation with a constraint violation.
+            gitforge_db::queries::PipelineQueries::deactivate_active(pool, repo_id, &pipeline.name)
+                .await?;
+            gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
+        }
 
         let mut db_run = DbPipelineRun::new(
             pipeline_id,
@@ -1612,13 +1638,49 @@ pub fn create_trigger_event(
     commit_hash: &str,
     ref_name: &str,
 ) -> gitforge_ci::PipelineTriggerEvent {
-    PipelineTriggerEvent::new(
+    create_trigger_event_for_pipeline(
         gitforge_common::PipelineId::new(),
+        repo_id,
+        commit_hash,
+        ref_name,
+    )
+}
+
+/// Create a trigger event bound to a specific pipeline version id — the push
+/// path passes an id resolved by [`reusable_active_pipeline`] so an unchanged
+/// configuration reuses the active version instead of minting a new one.
+pub fn create_trigger_event_for_pipeline(
+    pipeline_id: gitforge_common::PipelineId,
+    repo_id: gitforge_common::RepoId,
+    commit_hash: &str,
+    ref_name: &str,
+) -> gitforge_ci::PipelineTriggerEvent {
+    PipelineTriggerEvent::new(
+        pipeline_id,
         repo_id,
         commit_hash.to_string(),
         TriggerType::Push,
     )
     .with_ref(ref_name.to_string())
+}
+
+/// Resolve the active pipeline version a push can reuse.
+///
+/// Returns the repository's active pipeline version when its stored
+/// configuration is identical to `pipeline`'s; the caller then reuses that
+/// row (and its id) for this push's run instead of recording a new version.
+/// `None` means the caller must retire the predecessor, if any, and insert
+/// a new version — the configuration changed, or no version exists yet.
+async fn reusable_active_pipeline(
+    pool: &gitforge_db::Pool,
+    repo_id: gitforge_common::RepoId,
+    pipeline: &PipelineDefinition,
+) -> anyhow::Result<Option<DbPipeline>> {
+    let config = serde_json::to_value(pipeline)?;
+    let active = gitforge_db::queries::PipelineQueries::find_active(pool, repo_id, &pipeline.name)
+        .await?
+        .filter(|active| active.config == config);
+    Ok(active)
 }
 
 /// Create a default pipeline definition
@@ -2721,6 +2783,83 @@ mod tests {
 
         assert_eq!(event.commit_hash, "");
         assert_eq!(event.ref_name.as_deref(), Some("refs/heads/main"));
+    }
+
+    #[test]
+    fn test_create_trigger_event_for_pipeline_binds_resolved_id() {
+        let repo_id = gitforge_common::RepoId::new();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let event =
+            create_trigger_event_for_pipeline(pipeline_id, repo_id, "abc123", "refs/heads/main");
+
+        // The push path passes an id resolved from the active pipeline
+        // version; the trigger event must carry it unchanged so the engine,
+        // the run row, and the reused pipeline row all agree.
+        assert_eq!(event.pipeline_id, pipeline_id);
+        assert_eq!(event.repo_id, repo_id);
+    }
+
+    #[tokio::test]
+    async fn test_reusable_active_pipeline_reuses_identical_config_only() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = gitforge_db::models::User::new(
+            "reuse-user".to_string(),
+            "reuse@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            "reuse-repo".to_string(),
+            user.id,
+            "/git/reuse-repo".to_string(),
+        );
+        gitforge_db::queries::RepoQueries::create(&pool, &repo)
+            .await
+            .unwrap();
+
+        let definition = create_default_pipeline("reuse-repo");
+
+        // No version recorded yet: nothing to reuse, the caller inserts the
+        // first one.
+        assert!(reusable_active_pipeline(&pool, repo.id, &definition)
+            .await
+            .unwrap()
+            .is_none());
+
+        let first_id = gitforge_common::PipelineId::new();
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &DbPipeline {
+                id: first_id,
+                repo_id: repo.id,
+                name: definition.name.clone(),
+                trigger_type: "push".to_string(),
+                config: serde_json::to_value(&definition).unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Identical configuration reuses the active row...
+        let reused = reusable_active_pipeline(&pool, repo.id, &definition)
+            .await
+            .unwrap()
+            .expect("unchanged configuration is reusable");
+        assert_eq!(reused.id, first_id);
+
+        // ...a changed configuration must not, so the caller retires the
+        // predecessor and records a new version.
+        let mut changed = definition.clone();
+        changed.version = "2.0".to_string();
+        assert!(reusable_active_pipeline(&pool, repo.id, &changed)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[test]

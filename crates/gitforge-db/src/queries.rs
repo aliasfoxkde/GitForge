@@ -623,6 +623,29 @@ impl PipelineQueries {
         Ok(())
     }
 
+    /// Fetch the currently active pipeline version for (repo_id, name), if
+    /// any — at most one by the partial UNIQUE index. Callers comparing a
+    /// pushed configuration against the stored row use this to decide
+    /// whether a new version must be recorded at all.
+    pub async fn find_active(
+        pool: &Pool,
+        repo_id: RepoId,
+        name: &str,
+    ) -> Result<Option<crate::models::Pipeline>> {
+        let row =
+            sqlx::query("SELECT * FROM pipelines WHERE repo_id = ? AND name = ? AND active = 1")
+                .bind(repo_id.to_string())
+                .bind(name)
+                .fetch_optional(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to find active pipeline: {}", e)))?;
+
+        match row {
+            Some(row) => hydrate_pipeline(row).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Number of active pipeline versions for (repo_id, name) — at most one
     /// by the partial UNIQUE index; lets callers verify deactivation.
     pub async fn count_active(pool: &Pool, repo_id: RepoId, name: &str) -> Result<i64> {
