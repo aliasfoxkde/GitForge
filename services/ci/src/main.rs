@@ -23,8 +23,8 @@ use gitforge_events::{
 };
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
 use gitforge_scheduler::{
-    assigner::JobExecutionDefinition,
-    create_state_with_artifact_storage, scheduler_routes, Scheduler, SchedulerEvent,
+    assigner::JobExecutionDefinition, create_state_with_artifact_storage, scheduler_routes,
+    Scheduler, SchedulerEvent,
 };
 use gitforge_storage::FileStorage;
 use std::collections::HashMap;
@@ -631,32 +631,6 @@ fn workspace_roots() -> Vec<std::path::PathBuf> {
     vec![workspace_root()]
 }
 
-<<<<<<< HEAD
-=======
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContainerBackend {
-    Docker,
-    Podman,
-}
-
-fn container_backend_from_env() -> Result<ContainerBackend, String> {
-    match std::env::var("GITFORGE_CONTAINER_BACKEND") {
-        Ok(value) if value.eq_ignore_ascii_case("docker") => Ok(ContainerBackend::Docker),
-        Ok(value) if value.eq_ignore_ascii_case("podman") => Ok(ContainerBackend::Podman),
-        Ok(value) => Err(format!(
-            "GITFORGE_CONTAINER_BACKEND must be `docker` or `podman`, got `{value}`"
-        )),
-        Err(std::env::VarError::NotPresent) => Err(
-            "GITFORGE_CONTAINER_BACKEND is unset; refusing container-assisted workspace cleanup"
-                .to_string(),
-        ),
-        Err(std::env::VarError::NotUnicode(_)) => Err(
-            "GITFORGE_CONTAINER_BACKEND is not valid UTF-8; refusing container-assisted workspace cleanup"
-                .to_string(),
-        ),
-    }
-}
-
 fn validate_pipeline_timeouts(pipeline: &PipelineDefinition) -> anyhow::Result<()> {
     for job in &pipeline.jobs {
         job.timeout_secs()
@@ -665,104 +639,6 @@ fn validate_pipeline_timeouts(pipeline: &PipelineDefinition) -> anyhow::Result<(
     Ok(())
 }
 
-fn backend_program(backend: ContainerBackend) -> &'static str {
-    match backend {
-        ContainerBackend::Docker => "docker",
-        ContainerBackend::Podman => "podman",
-    }
-}
-
-fn find_executable(program: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    let candidate = Path::new(program);
-    if candidate.components().count() > 1 {
-        return candidate.is_file().then(|| candidate.to_path_buf());
-    }
-    path?.to_string_lossy().split(':').find_map(|directory| {
-        let candidate = Path::new(directory).join(program);
-        candidate.is_file().then_some(candidate)
-    })
-}
-
-fn configured_cleanup_backend() -> Result<ContainerBackend, String> {
-    let backend = container_backend_from_env()?;
-    let program = backend_program(backend);
-    if find_executable(program, std::env::var_os("PATH").as_deref()).is_none() {
-        return Err(format!(
-            "configured cleanup backend `{program}` is unavailable on PATH; install it or select the installed backend"
-        ));
-    }
-    Ok(backend)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct CleanupCommand {
-    program: &'static str,
-    args: Vec<OsString>,
-}
-
-fn cleanup_command(backend: ContainerBackend, workspace: &std::path::Path) -> CleanupCommand {
-    match backend {
-        ContainerBackend::Podman => CleanupCommand {
-            program: "podman",
-            args: ["unshare", "rm", "-rf", "--"]
-                .into_iter()
-                .map(OsString::from)
-                .chain(std::iter::once(workspace.as_os_str().to_os_string()))
-                .collect(),
-        },
-        ContainerBackend::Docker => {
-            // Mount the trusted parent and remove only the validated run
-            // directory from inside the container. No shell is involved, and
-            // the container cannot follow a path outside this bind mount.
-            let parent = workspace
-                .parent()
-                .expect("validated run workspace always has a parent");
-            let name = workspace
-                .file_name()
-                .expect("validated run workspace always has a name");
-            CleanupCommand {
-                program: "docker",
-                args: [
-                    "run",
-                    "--rm",
-                    "--user",
-                    "0:0",
-                    "--mount",
-                    &format!(
-                        "type=bind,src={},dst=/gitforge-cleanup-parent",
-                        parent.display()
-                    ),
-                    "alpine",
-                    "rm",
-                    "-rf",
-                    "--",
-                ]
-                .into_iter()
-                .map(OsString::from)
-                .chain(std::iter::once(
-                    std::path::Path::new("/gitforge-cleanup-parent")
-                        .join(name)
-                        .into_os_string(),
-                ))
-                .collect(),
-            }
-        }
-    }
-}
-
-async fn run_cleanup_command(command: CleanupCommand) -> Option<std::process::Output> {
-    timeout(
-        Duration::from_secs(120),
-        tokio::process::Command::new(command.program)
-            .args(command.args)
-            .output(),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok)
-}
-
->>>>>>> 40056012 (fix(ci): reject invalid pipeline timeouts)
 /// Delete a run's workspace directory. Only directories GitForge itself
 /// created — `<root>/<run id>` — are ever removed. A caller-supplied working
 /// directory inside the root may share the tree and must survive the run.
