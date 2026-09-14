@@ -786,6 +786,14 @@ fn handle_ssh_connection(
         }
     };
 
+    // Tokio returns a nonblocking standard socket. libssh2 performs blocking
+    // handshake I/O in this task, so restore blocking mode before associating
+    // the stream with the session.
+    if let Err(e) = stream.set_nonblocking(false) {
+        tracing::error!("failed to set SSH stream blocking: {}", e);
+        return;
+    }
+
     // Create ssh2 session
     let mut session = match ssh2::Session::new() {
         Ok(s) => s,
@@ -797,6 +805,11 @@ fn handle_ssh_connection(
 
     // Set blocking mode for ssh2
     session.set_blocking(true);
+
+    // libssh2 does not use the socket until it is explicitly associated with
+    // the session. Omitting this call makes every handshake fail with
+    // "use set_tcp_stream() to associate with a TcpStream".
+    session.set_tcp_stream(stream);
 
     // Handshake
     if let Err(e) = session.handshake() {
