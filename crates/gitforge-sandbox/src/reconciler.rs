@@ -827,4 +827,19 @@ mod tests {
         assert!(json.contains("active_jobs_hash"));
         assert!(json.contains("policy_grace_secs"));
     }
+
+    #[tokio::test]
+    async fn docker_runtime_census_canary_is_read_only() {
+        if std::env::var("GITFORGE_RECONCILER_DOCKER_CANARY").as_deref() != Ok("1") {
+            return;
+        }
+        let source = DockerContainerSource::connect_with_timeout(Duration::from_secs(5)).unwrap();
+        let records = source.list_containers().await.unwrap();
+        assert!(records.iter().all(|record| {
+            record.labels.get(MANAGED_LABEL).map(String::as_str) == Some("true")
+        }));
+        assert!(records
+            .iter()
+            .all(|record| !record.running || record.exited_at_ms.is_none()));
+    }
 }
