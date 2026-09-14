@@ -603,4 +603,16 @@ mod tests {
             reloaded.to_openssh(LineEnding::LF).unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn test_reap_cancelled_child_kills_and_waits() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .unwrap();
+
+        reap_cancelled_child(&mut child).await;
+
+        assert!(child.try_wait().unwrap().is_some());
+    }
 }
