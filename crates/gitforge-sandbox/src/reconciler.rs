@@ -353,19 +353,40 @@ impl<S: ContainerSource> Reconciler<S> {
 /// efficiency measure only — [`classify`] re-verifies ownership).
 pub struct DockerContainerSource {
     docker: bollard::Docker,
+    call_timeout: Duration,
 }
 
 impl DockerContainerSource {
     /// Connect to the local Docker daemon. Fails if Docker is not
     /// reachable — the reconciler never runs against a stub.
     pub fn connect() -> Result<Self> {
+        Self::connect_with_timeout(Duration::from_secs(10))
+    }
+
+    /// Connect with a bounded timeout applied to every Docker API operation.
+    pub fn connect_with_timeout(call_timeout: Duration) -> Result<Self> {
+        if call_timeout.is_zero() {
+            return Err(Error::sandbox(
+                "reconciler Docker call timeout must be positive",
+            ));
+        }
         let docker = bollard::Docker::connect_with_local_defaults()
             .map_err(|e| Error::sandbox(format!("reconciler docker connect failed: {}", e)))?;
-        Ok(Self { docker })
+        Ok(Self {
+            docker,
+            call_timeout,
+        })
     }
 
     pub fn new(docker: bollard::Docker) -> Self {
-        Self { docker }
+        Self::new_with_timeout(docker, Duration::from_secs(10))
+    }
+
+    pub fn new_with_timeout(docker: bollard::Docker, call_timeout: Duration) -> Self {
+        Self {
+            docker,
+            call_timeout,
+        }
     }
 }
 
@@ -374,15 +395,17 @@ impl ContainerSource for DockerContainerSource {
     async fn list_containers(&self) -> Result<Vec<ContainerRecord>> {
         let mut filters = HashMap::new();
         filters.insert("label".to_string(), vec![format!("{MANAGED_LABEL}=true")]);
-        let containers = self
-            .docker
-            .list_containers(Some(ListContainersOptions {
+        let containers = tokio::time::timeout(
+            self.call_timeout,
+            self.docker.list_containers(Some(ListContainersOptions {
                 all: true,
                 filters: Some(filters),
                 ..Default::default()
-            }))
-            .await
-            .map_err(|e| Error::sandbox(format!("reconciler list failed: {}", e)))?;
+            })),
+        )
+        .await
+        .map_err(|_| Error::sandbox("reconciler list timed out"))?
+        .map_err(|e| Error::sandbox(format!("reconciler list failed: {}", e)))?;
 
         let mut records = Vec::with_capacity(containers.len());
         for c in containers {
@@ -399,15 +422,19 @@ impl ContainerSource for DockerContainerSource {
                 // have exited moments ago. Missing or malformed state is
                 // intentionally retained by the classifier.
                 match c.id.as_deref() {
-                    Some(id) => self
-                        .docker
-                        .inspect_container(id, None)
-                        .await
-                        .ok()
-                        .and_then(|details| details.state)
-                        .and_then(|state| state.finished_at)
-                        .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
-                        .map(|timestamp| timestamp.timestamp_millis()),
+                    Some(id) => match tokio::time::timeout(
+                        self.call_timeout,
+                        self.docker.inspect_container(id, None),
+                    )
+                    .await
+                    {
+                        Ok(Ok(details)) => details
+                            .state
+                            .and_then(|state| state.finished_at)
+                            .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
+                            .map(|timestamp| timestamp.timestamp_millis()),
+                        _ => None,
+                    },
                     None => None,
                 }
             };
@@ -423,23 +450,25 @@ impl ContainerSource for DockerContainerSource {
     }
 
     async fn remove_container(&self, id: &str) -> Result<RemovalOutcome> {
-        match self
-            .docker
-            .remove_container(
+        match tokio::time::timeout(
+            self.call_timeout,
+            self.docker.remove_container(
                 id,
                 Some(RemoveContainerOptions {
                     force: true,
                     ..Default::default()
                 }),
-            )
-            .await
+            ),
+        )
+        .await
         {
-            Ok(()) => Ok(RemovalOutcome::Removed),
-            Err(bollard::errors::Error::DockerResponseServerError {
+            Err(_) => Ok(RemovalOutcome::Failed),
+            Ok(Ok(())) => Ok(RemovalOutcome::Removed),
+            Ok(Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404 | 409,
                 ..
-            }) => Ok(RemovalOutcome::AlreadyGone),
-            Err(e) => {
+            })) => Ok(RemovalOutcome::AlreadyGone),
+            Ok(Err(e)) => {
                 tracing::warn!(%id, "reconciler remove failed: {}", e);
                 Ok(RemovalOutcome::Failed)
             }

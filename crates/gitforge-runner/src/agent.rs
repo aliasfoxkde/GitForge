@@ -784,7 +784,7 @@ impl RunnerAgent {
         }
 
         tokio::spawn(async move {
-            let source = match DockerContainerSource::connect() {
+            let source = match DockerContainerSource::connect_with_timeout(policy.call_timeout) {
                 Ok(source) => Arc::new(source),
                 Err(e) => {
                     tracing::warn!("abandoned-container reconciler unavailable: {}", e);
