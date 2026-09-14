@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
@@ -770,7 +770,16 @@ impl RunnerAgent {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
-        let receipt_path = std::env::var("GITFORGE_RECONCILE_RECEIPT").ok();
+        let receipt_path = match std::env::var("GITFORGE_RECONCILE_RECEIPT") {
+            Ok(raw) => match validate_reconciler_receipt_path(&raw) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    tracing::error!(%error, "abandoned-container reconciler NOT started: invalid receipt path");
+                    return;
+                }
+            },
+            Err(_) => None,
+        };
 
         let policy = ReconcilerPolicy {
             deletion_enabled,
@@ -816,23 +825,23 @@ impl RunnerAgent {
                         if let Some(path) = &receipt_path {
                             match serde_json::to_string_pretty(&report) {
                                 Ok(json) => {
-                                    let tmp = format!("{}.tmp", path);
+                                    let tmp = path.with_extension("json.tmp");
                                     match fs::write(&tmp, json).await {
                                         Ok(()) => match fs::rename(&tmp, path).await {
                                             Ok(()) => tracing::debug!(
                                                 "reconciler receipt written to {}",
-                                                path
+                                                path.display()
                                             ),
                                             Err(error) => tracing::warn!(
                                                 %error,
                                                 "reconciler receipt rename failed for {}",
-                                                path
+                                                path.display()
                                             ),
                                         },
                                         Err(error) => tracing::warn!(
                                             %error,
                                             "reconciler receipt write failed for {}",
-                                            path
+                                            path.display()
                                         ),
                                     }
                                 }
@@ -1167,6 +1176,42 @@ impl RunnerAgent {
     }
 }
 
+/// Validate the optional reconciler receipt destination before starting the
+/// background task.  Receipt paths are operator configuration, but accepting
+/// arbitrary relative paths or symlinked parents would let a typo redirect
+/// writes outside the service's artifact area.  The parent must already exist
+/// so startup does not create directories as a side effect.
+fn validate_reconciler_receipt_path(raw: &str) -> std::result::Result<PathBuf, String> {
+    let path = PathBuf::from(raw.trim());
+    if !path.is_absolute() {
+        return Err("path must be absolute".to_string());
+    }
+    if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+        return Err("path must have a .json extension".to_string());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("path must not contain parent-directory components".to_string());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "path must have a parent directory".to_string())?;
+    let metadata = std::fs::symlink_metadata(parent)
+        .map_err(|error| format!("receipt parent is not accessible: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("receipt parent must be an existing real directory".to_string());
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() {
+            return Err("receipt destination must not be a symlink".to_string());
+        }
+    }
+    Ok(path)
+}
+
 const MAX_RECEIPT_STREAM_BYTES: usize = 64 * 1024;
 
 fn bounded_receipt_text(value: &str) -> String {
@@ -1185,7 +1230,7 @@ fn bounded_receipt_text(value: &str) -> String {
 
 #[cfg(test)]
 mod receipt_tests {
-    use super::{bounded_receipt_text, MAX_RECEIPT_STREAM_BYTES};
+    use super::{bounded_receipt_text, validate_reconciler_receipt_path, MAX_RECEIPT_STREAM_BYTES};
 
     #[test]
     fn receipt_output_is_bounded_and_marked() {
@@ -1198,6 +1243,29 @@ mod receipt_tests {
     #[test]
     fn receipt_output_preserves_small_output() {
         assert_eq!(bounded_receipt_text("ok"), "ok");
+    }
+
+    #[test]
+    fn receipt_path_rejects_relative_traversal_and_wrong_extension() {
+        for path in [
+            "receipt.json",
+            "/var/lib/gitforge/../escape.json",
+            "/var/lib/gitforge/receipt",
+        ] {
+            assert!(
+                validate_reconciler_receipt_path(path).is_err(),
+                "accepted {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_path_requires_existing_real_parent() {
+        let path = format!(
+            "/nas/Temp/work/reconciler-receipt-test-{}/receipt.json",
+            std::process::id()
+        );
+        assert!(validate_reconciler_receipt_path(&path).is_err());
     }
 }
 
