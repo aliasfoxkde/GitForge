@@ -778,7 +778,7 @@ fn handle_ssh_connection(
     use std::io::{Read, Write};
 
     // Convert tokio TcpStream to blocking TcpStream
-    let mut stream = match stream.into_std() {
+    let stream = match stream.into_std() {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("failed to convert TcpStream: {}", e);
@@ -927,7 +927,10 @@ fn handle_ssh_connection(
                 "git-receive-pack" => {
                     // For receive-pack, we need to read the request body
                     let mut input = Vec::new();
-                    std::io::Read::read_to_end(&mut stream, &mut input).ok();
+                    // The ssh2 session owns the socket after set_tcp_stream;
+                    // receive-pack data must be read from the SSH channel,
+                    // not from the moved raw stream.
+                    channel.read_to_end(&mut input).ok();
                     tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
