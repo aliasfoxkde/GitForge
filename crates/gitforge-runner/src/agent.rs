@@ -814,13 +814,32 @@ impl RunnerAgent {
                             "abandoned-container reconcile pass complete"
                         );
                         if let Some(path) = &receipt_path {
-                            if let Ok(json) = serde_json::to_string_pretty(&report) {
-                                let tmp = format!("{}.tmp", path);
-                                if fs::write(&tmp, json).await.is_ok()
-                                    && fs::rename(&tmp, path).await.is_ok()
-                                {
-                                    tracing::debug!("reconciler receipt written to {}", path);
+                            match serde_json::to_string_pretty(&report) {
+                                Ok(json) => {
+                                    let tmp = format!("{}.tmp", path);
+                                    match fs::write(&tmp, json).await {
+                                        Ok(()) => match fs::rename(&tmp, path).await {
+                                            Ok(()) => tracing::debug!(
+                                                "reconciler receipt written to {}",
+                                                path
+                                            ),
+                                            Err(error) => tracing::warn!(
+                                                %error,
+                                                "reconciler receipt rename failed for {}",
+                                                path
+                                            ),
+                                        },
+                                        Err(error) => tracing::warn!(
+                                            %error,
+                                            "reconciler receipt write failed for {}",
+                                            path
+                                        ),
+                                    }
                                 }
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    "reconciler receipt serialization failed"
+                                ),
                             }
                         }
                     }
