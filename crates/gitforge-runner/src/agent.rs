@@ -495,6 +495,7 @@ pub struct RunnerAgent {
     sandbox: Arc<DockerSandbox>,
     executor: Arc<JobExecutor>,
     is_running: Arc<RwLock<bool>>,
+    reconciler_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl RunnerAgent {
@@ -515,6 +516,7 @@ impl RunnerAgent {
             sandbox: Arc::new(sandbox),
             executor: Arc::new(executor),
             is_running: Arc::new(RwLock::new(false)),
+            reconciler_task: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -625,7 +627,7 @@ impl RunnerAgent {
         // (covers a supervisor interruption/restart) plus a bounded
         // periodic schedule. Startup behavior is census-only unless the
         // service explicitly enables deletion via GITFORGE_RECONCILE_DELETE.
-        Self::spawn_reconciler(active_jobs.clone());
+        self.spawn_reconciler(active_jobs.clone()).await;
 
         // Start job fetch loop
         let fetch_interval = self.config.fetch_interval_secs;
@@ -756,7 +758,7 @@ impl RunnerAgent {
     /// set, so a container belonging to a job this runner is executing is
     /// always retained. A policy failure is logged and the loop is not
     /// started: the reconciler must never guess.
-    fn spawn_reconciler(active_jobs: Arc<Mutex<HashSet<String>>>) {
+    async fn spawn_reconciler(&self, active_jobs: Arc<Mutex<HashSet<String>>>) {
         let deletion_enabled = std::env::var("GITFORGE_RECONCILE_DELETE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -783,7 +785,7 @@ impl RunnerAgent {
             return;
         }
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let source = match DockerContainerSource::connect_with_timeout(policy.call_timeout) {
                 Ok(source) => Arc::new(source),
                 Err(e) => {
@@ -828,6 +830,7 @@ impl RunnerAgent {
                 }
             }
         });
+        *self.reconciler_task.lock().await = Some(handle);
     }
 
     /// Stop the runner agent
@@ -835,6 +838,12 @@ impl RunnerAgent {
     /// Otherwise, wait for jobs to complete gracefully.
     pub async fn stop(&self, force: bool) {
         *self.is_running.write().await = false;
+
+        if let Some(handle) = self.reconciler_task.lock().await.take() {
+            handle.abort();
+            let _ = handle.await;
+            tracing::debug!("abandoned-container reconciler stopped");
+        }
 
         if force {
             tracing::info!("force stopping - cancelling all active jobs");
