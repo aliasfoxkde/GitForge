@@ -3,7 +3,10 @@
 use crate::executor::{ExecutableJob, JobExecutor, JobStep};
 use gitforge_common::{Error, JobId, PipelineRunId, Result, RunnerId};
 use gitforge_db::models::Runner;
-use gitforge_sandbox::{DockerSandbox, OutputSink, OutputStream, StepResult};
+use gitforge_sandbox::{
+    DockerContainerSource, DockerSandbox, OutputSink, OutputStream, Reconciler, ReconcilerPolicy,
+    StepResult,
+};
 use gitforge_storage::ArtifactReceipt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -616,6 +619,14 @@ impl RunnerAgent {
             }
         });
 
+        let active_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        // Spawn the abandoned-container reconciler: one pass at startup
+        // (covers a supervisor interruption/restart) plus a bounded
+        // periodic schedule. Startup behavior is census-only unless the
+        // service explicitly enables deletion via GITFORGE_RECONCILE_DELETE.
+        Self::spawn_reconciler(active_jobs.clone());
+
         // Start job fetch loop
         let fetch_interval = self.config.fetch_interval_secs;
         let fetch_client = self.client.clone();
@@ -624,7 +635,6 @@ impl RunnerAgent {
         let fetch_token = self.config.scheduler_token.clone();
         let is_running = self.is_running.clone();
         let executor = self.executor.clone();
-        let active_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let active_jobs_for_loop = active_jobs.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(fetch_interval));
@@ -729,6 +739,95 @@ impl RunnerAgent {
         }
 
         Ok(())
+    }
+
+    /// Spawn the background abandoned-container reconciler loop.
+    ///
+    /// Env policy (documented defaults keep startup safe):
+    /// - `GITFORGE_RECONCILE_DELETE`: `1`/`true` enables removal; anything
+    ///   else keeps the reconciler census-only (default).
+    /// - `GITFORGE_RECONCILE_GRACE_SECS`: minimum non-running age before a
+    ///   candidate is eligible (default 3600; must be positive).
+    /// - `GITFORGE_RECONCILE_INTERVAL_SECS`: periodic pass interval
+    ///   (default 300).
+    /// - `GITFORGE_RECONCILE_RECEIPT`: optional path for a JSON receipt.
+    ///
+    /// Every pass correlates against the authoritative local active-job
+    /// set, so a container belonging to a job this runner is executing is
+    /// always retained. A policy failure is logged and the loop is not
+    /// started: the reconciler must never guess.
+    fn spawn_reconciler(active_jobs: Arc<Mutex<HashSet<String>>>) {
+        let deletion_enabled = std::env::var("GITFORGE_RECONCILE_DELETE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let grace_secs: u64 = std::env::var("GITFORGE_RECONCILE_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600);
+        let interval_secs: u64 = std::env::var("GITFORGE_RECONCILE_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let receipt_path = std::env::var("GITFORGE_RECONCILE_RECEIPT").ok();
+
+        let policy = ReconcilerPolicy {
+            deletion_enabled,
+            grace: Duration::from_secs(grace_secs),
+            ..ReconcilerPolicy::default()
+        };
+        if let Err(e) = policy.validate() {
+            tracing::error!(
+                "abandoned-container reconciler NOT started: {} (census-only remains off)",
+                e
+            );
+            return;
+        }
+
+        tokio::spawn(async move {
+            let source = match DockerContainerSource::connect() {
+                Ok(source) => Arc::new(source),
+                Err(e) => {
+                    tracing::warn!("abandoned-container reconciler unavailable: {}", e);
+                    return;
+                }
+            };
+            let reconciler = Reconciler::new(source, policy);
+            let mut ticker = interval(Duration::from_secs(interval_secs.max(30)));
+            loop {
+                // Startup pass runs immediately, then bounded periodic.
+                ticker.tick().await;
+                let active = active_jobs.lock().await.clone();
+                let now = gitforge_sandbox::reconciler::Now {
+                    now_ms: chrono::Utc::now().timestamp_millis(),
+                };
+                match reconciler.reconcile(&active, now).await {
+                    Ok(report) => {
+                        tracing::info!(
+                            candidates = report.candidates_seen,
+                            eligible = report.eligible,
+                            removed = report.removed,
+                            already_gone = report.already_gone,
+                            failed = report.failed,
+                            deletion_enabled = report.policy_deletion_enabled,
+                            "abandoned-container reconcile pass complete"
+                        );
+                        if let Some(path) = &receipt_path {
+                            if let Ok(json) = serde_json::to_string_pretty(&report) {
+                                let tmp = format!("{}.tmp", path);
+                                if fs::write(&tmp, json).await.is_ok()
+                                    && fs::rename(&tmp, path).await.is_ok()
+                                {
+                                    tracing::debug!("reconciler receipt written to {}", path);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("abandoned-container reconcile pass failed: {}", e);
+                    }
+                }
+            }
+        });
     }
 
     /// Stop the runner agent

@@ -1232,6 +1232,7 @@ dependencies = [
  "futures-util",
  "gitforge-common",
  "serde",
+ "serde_json",
  "serial_test",
  "thiserror 2.0.20",
  "tokio",
