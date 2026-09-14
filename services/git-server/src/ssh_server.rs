@@ -125,7 +125,7 @@ impl Server for GitSshServer {
 /// gives channel lifecycle callbacks an explicit way to terminate and reap
 /// that child when a client disconnects before git exits.
 struct ChannelProcess {
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     cancel: Option<oneshot::Sender<()>>,
 }
 
@@ -235,7 +235,10 @@ impl Handler for GitSshSession {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if let Some(process) = self.processes.get_mut(&channel) {
-            if let Err(error) = process.stdin.write_all(data).await {
+            let Some(stdin) = process.stdin.as_mut() else {
+                return Ok(());
+            };
+            if let Err(error) = stdin.write_all(data).await {
                 tracing::warn!(
                     ?channel,
                     %error,
@@ -252,7 +255,12 @@ impl Handler for GitSshSession {
         channel: russh::ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.stop_process(channel);
+        // EOF is the normal end of the client's request stream. Git needs to
+        // observe stdin closing and then finish the receive/upload operation;
+        // it is not a disconnect and must not cancel the child.
+        if let Some(process) = self.processes.get_mut(&channel) {
+            process.stdin.take();
+        }
         Ok(())
     }
 
@@ -270,7 +278,7 @@ impl GitSshSession {
     /// Close the child's stdin and signal the pump task to kill and reap it.
     fn stop_process(&mut self, channel: russh::ChannelId) {
         if let Some(mut process) = self.processes.remove(&channel) {
-            drop(process.stdin);
+            drop(process.stdin.take());
             if let Some(cancel) = process.cancel.take() {
                 let _ = cancel.send(());
             }
@@ -325,7 +333,7 @@ impl GitSshSession {
         self.processes.insert(
             channel,
             ChannelProcess {
-                stdin,
+                stdin: Some(stdin),
                 cancel: Some(cancel),
             },
         );
