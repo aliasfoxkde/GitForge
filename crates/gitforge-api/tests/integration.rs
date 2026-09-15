@@ -1840,6 +1840,31 @@ async fn test_api_webhook_trigger_success() {
 }
 
 #[tokio::test]
+async fn test_api_webhook_trigger_concurrent_duplicate_is_idempotent() {
+    let config = webhook_definition(webhook_job(vec![], Some("30s")));
+    let (app, pipeline_id, repo_id, token) = webhook_fixture(config).await;
+    let uri = format!("/api/webhook/trigger/{pipeline_id}");
+    let body = format!(r#"{{"repo_id":"{repo_id}","commit_hash":"same-sha","branch":"main"}}"#);
+
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
+
+    let (first, second) = tokio::join!(app.clone().oneshot(request()), app.oneshot(request()));
+    let first = first.unwrap();
+    let second = second.unwrap();
+
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_api_webhook_trigger_rejects_invalid_stored_definition() {
     let (app, pipeline_id, repo_id, token) = webhook_fixture(serde_json::json!({})).await;
     let response = app
