@@ -35,7 +35,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: ["go", "rust"]
+        # The repository product is Rust. Go files are scaffolding templates
+        # and intentionally do not form a root Go module, so CodeQL's Go
+        # autobuilder cannot analyze them in this workflow.
+        language: ["rust"]
 
     steps:
       - name: Checkout repository
@@ -52,10 +55,6 @@ jobs:
               - '**/*_test.go'
               - '**/*_test.rs'
               - 'template-parts/**'
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
-        if: matrix.language == 'go'
 
       - name: Build Rust
         if: matrix.language == 'rust'
