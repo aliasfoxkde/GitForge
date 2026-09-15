@@ -35,10 +35,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The repository product is Rust. Go files are scaffolding templates
-        # and intentionally do not form a root Go module, so CodeQL's Go
-        # autobuilder cannot analyze them in this workflow.
-        language: ["rust"]
+        # Keep the language set aligned with the default branch so GitHub can
+        # compute pull-request alert deltas. Go sources are scaffolding and
+        # remain excluded by the CodeQL paths-ignore configuration, but the
+        # category must still be analyzed for baseline compatibility.
+        language: ["go", "rust"]
 
     steps:
       - name: Checkout repository
@@ -64,6 +65,10 @@ jobs:
           # optimizations. Debug mode keeps analysis bounded and avoids
           # duplicating the release-build gate in Rust CI.
           cargo build --workspace --locked
+
+      - name: Build Go
+        if: matrix.language == 'go'
+        uses: github/codeql-action/autobuild@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
