@@ -1392,6 +1392,51 @@ impl RunnerQueries {
         pool: &Pool,
         runner: &crate::models::Runner,
     ) -> Result<crate::models::Runner> {
+        if let Some(identity) = &runner.identity {
+            // `identity` has a database-level UNIQUE constraint (SQLite allows
+            // multiple NULLs for legacy rows). The single-statement upsert is
+            // atomic across concurrent first registrations and returns one
+            // durable runner identity to every caller.
+            sqlx::query(
+                r#"
+                INSERT INTO runners
+                    (id, name, identity, runner_type, status, capacity, labels,
+                     last_heartbeat, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(identity) DO UPDATE SET
+                    name = excluded.name,
+                    runner_type = excluded.runner_type,
+                    status = excluded.status,
+                    capacity = excluded.capacity,
+                    labels = excluded.labels,
+                    last_heartbeat = excluded.last_heartbeat,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(runner.id.to_string())
+            .bind(&runner.name)
+            .bind(identity)
+            .bind(&runner.runner_type)
+            .bind(&runner.status)
+            .bind(runner.capacity)
+            .bind("[]")
+            .bind(runner.last_heartbeat.map(|date| date.to_rfc3339()))
+            .bind(runner.created_at.to_rfc3339())
+            .bind(runner.created_at.to_rfc3339())
+            .execute(pool.pool())
+            .await
+            .map_err(|error| Error::database(format!("failed to register runner: {}", error)))?;
+
+            return sqlx::query("SELECT * FROM runners WHERE identity = ? LIMIT 1")
+                .bind(identity)
+                .fetch_one(pool.pool())
+                .await
+                .map_err(|error| {
+                    Error::database(format!("failed to read registered runner: {}", error))
+                })
+                .and_then(hydrate_runner);
+        }
+
         let existing = match &runner.identity {
             Some(identity) => sqlx::query("SELECT * FROM runners WHERE identity = ? LIMIT 1")
                 .bind(identity)
@@ -2479,6 +2524,34 @@ mod tests {
         assert_eq!(refreshed.id, first_registered.id);
         assert_eq!(refreshed.capacity, 4);
         assert_eq!(RunnerQueries::list(&pool).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_runner_registration_concurrent_same_identity_returns_one_row() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let pool = Pool::new(database.path().to_str().unwrap()).await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let first = crate::models::Runner::new_with_identity(
+            "race-runner".to_string(),
+            "race-service".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        let second = crate::models::Runner::new_with_identity(
+            "race-runner".to_string(),
+            "race-service".to_string(),
+            crate::models::RunnerType::Docker,
+            2,
+        );
+        let (left, right) = tokio::join!(
+            RunnerQueries::register_or_refresh(&pool, &first),
+            RunnerQueries::register_or_refresh(&pool, &second)
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_eq!(left.id, right.id);
+        assert_eq!(RunnerQueries::list(&pool).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

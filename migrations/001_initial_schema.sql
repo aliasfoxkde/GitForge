@@ -96,7 +96,7 @@ CREATE TABLE runners (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE UNIQUE INDEX idx_runners_identity ON runners(identity) WHERE identity IS NOT NULL;
+CREATE UNIQUE INDEX idx_runners_identity ON runners(identity);
 
 CREATE INDEX idx_runners_status ON runners(status);
 
