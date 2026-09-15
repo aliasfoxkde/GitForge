@@ -476,6 +476,74 @@ impl UserQueries {
 pub struct PipelineQueries;
 
 impl PipelineQueries {
+    /// Atomically replace the active pipeline version and create its run.
+    ///
+    /// A push must not leave the previous version retired when the new
+    /// pipeline or run cannot be persisted. Keeping all three writes in one
+    /// transaction makes replacement recoverable on constraint and shutdown
+    /// failures while preserving superseded history.
+    pub async fn replace_active_and_create_run(
+        pool: &Pool,
+        pipeline: &crate::models::Pipeline,
+        run: &crate::models::PipelineRun,
+    ) -> Result<()> {
+        let mut transaction =
+            pool.pool().begin().await.map_err(|e| {
+                Error::database(format!("failed to begin pipeline replacement: {}", e))
+            })?;
+
+        sqlx::query(
+            "UPDATE pipelines SET active = 0 WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind(pipeline.repo_id.to_string())
+        .bind(&pipeline.name)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to retire pipeline version: {}", e)))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO pipelines (id, repo_id, name, trigger_type, config, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(pipeline.id.to_string())
+        .bind(pipeline.repo_id.to_string())
+        .bind(&pipeline.name)
+        .bind(&pipeline.trigger_type)
+        .bind(pipeline.config.to_string())
+        .bind(pipeline.created_at.to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to create pipeline version: {}", e)))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO pipeline_runs
+                (id, pipeline_id, repo_id, status, triggered_by, commit_hash,
+                 started_at, finished_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(run.id.to_string())
+        .bind(run.pipeline_id.to_string())
+        .bind(run.repo_id.to_string())
+        .bind(&run.status)
+        .bind(&run.triggered_by)
+        .bind(&run.commit_hash)
+        .bind(run.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.finished_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.created_at.to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to create pipeline run: {}", e)))?;
+
+        transaction.commit().await.map_err(|e| {
+            Error::database(format!("failed to commit pipeline replacement: {}", e))
+        })?;
+        Ok(())
+    }
+
     /// Create a new pipeline
     pub async fn create(pool: &Pool, pipeline: &crate::models::Pipeline) -> Result<()> {
         sqlx::query(
@@ -494,6 +562,39 @@ impl PipelineQueries {
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline: {}", e)))?;
         Ok(())
+    }
+
+    /// Retire the currently active pipeline version for (repo_id, name).
+    ///
+    /// The partial UNIQUE index `idx_pipelines_active_repo_name` admits only
+    /// one active row per repository and name, so a newly pushed version
+    /// must deactivate its predecessor or every push after the first fails
+    /// run creation with a constraint violation. Superseded rows stay as
+    /// history with active = 0.
+    pub async fn deactivate_active(pool: &Pool, repo_id: RepoId, name: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE pipelines SET active = 0 WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind(repo_id.to_string())
+        .bind(name)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to deactivate pipeline: {}", e)))?;
+        Ok(())
+    }
+
+    /// Number of active pipeline versions for (repo_id, name) — at most one
+    /// by the partial UNIQUE index; lets callers verify deactivation.
+    pub async fn count_active(pool: &Pool, repo_id: RepoId, name: &str) -> Result<i64> {
+        let (count,) = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM pipelines WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind(repo_id.to_string())
+        .bind(name)
+        .fetch_one(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to count active pipelines: {}", e)))?;
+        Ok(count)
     }
 
     /// Get a pipeline by ID

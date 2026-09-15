@@ -126,6 +126,7 @@ impl Pool {
                 trigger_type TEXT NOT NULL,
                 config TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
                 FOREIGN KEY (repo_id) REFERENCES repositories(id)
             )
             "#,
@@ -133,6 +134,60 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create pipelines table: {}", e)))?;
+
+        // Additive migration for databases created before pipeline versioning.
+        // `CREATE TABLE IF NOT EXISTS` does not alter an existing table, so
+        // add the column before creating the partial uniqueness index below.
+        if let Err(error) =
+            sqlx::query("ALTER TABLE pipelines ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(Error::database(format!(
+                    "failed to migrate pipelines table: {}",
+                    error
+                )));
+            }
+        }
+
+        // A pre-versioning database may contain several historical rows for
+        // the same repository/name. Keep the newest row active and retire the
+        // older rows before adding the uniqueness index. This is idempotent
+        // and preserves every row for audit/history queries.
+        sqlx::query(
+            r#"
+            UPDATE pipelines
+            SET active = 0
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY repo_id, name
+                               ORDER BY created_at DESC, id DESC
+                           ) AS version_rank
+                    FROM pipelines
+                )
+                WHERE version_rank > 1
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to reconcile pipeline versions: {}", e)))?;
+
+        // One active pipeline version per repository and name; superseded
+        // versions stay as history with active = 0.
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pipelines_active_repo_name
+            ON pipelines(repo_id, name) WHERE active = 1
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create pipelines active index: {}", e)))?;
 
         // Create pipeline_runs table
         sqlx::query(

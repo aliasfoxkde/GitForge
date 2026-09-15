@@ -140,6 +140,194 @@ async fn test_database_pipeline_with_dependencies() {
 }
 
 #[tokio::test]
+async fn test_pipeline_versioning_active_uniqueness() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = User::new(
+        "versioner".to_string(),
+        "versioner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+
+    let repo = Repository::new(
+        "versioned-repo".to_string(),
+        user.id,
+        "/git/versioned-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+
+    let pipeline = |id: PipelineId| Pipeline {
+        id,
+        repo_id: repo.id,
+        name: "gates".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+
+    // The partial UNIQUE index admits only one active version per
+    // (repo, name): a second insert without retiring the predecessor must
+    // be rejected...
+    PipelineQueries::create(&pool, &pipeline(PipelineId::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        PipelineQueries::count_active(&pool, repo.id, "gates")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(PipelineQueries::create(&pool, &pipeline(PipelineId::new()))
+        .await
+        .is_err());
+
+    // ...and the push path retires the predecessor before recording the
+    // new version, leaving exactly one active row again.
+    PipelineQueries::deactivate_active(&pool, repo.id, "gates")
+        .await
+        .unwrap();
+    PipelineQueries::create(&pool, &pipeline(PipelineId::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        PipelineQueries::count_active(&pool, repo.id, "gates")
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_pipeline_replacement_rolls_back_when_run_insert_fails() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = User::new(
+        "transactioner".to_string(),
+        "transactioner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "transactional-repo".to_string(),
+        user.id,
+        "/git/transactional-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+
+    let first = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "gates".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({"version": 1}),
+        created_at: chrono::Utc::now(),
+    };
+    PipelineQueries::create(&pool, &first).await.unwrap();
+
+    let existing_run = PipelineRun::new(
+        first.id,
+        repo.id,
+        "push".to_string(),
+        "first-commit".to_string(),
+    );
+    PipelineRunQueries::create(&pool, &existing_run)
+        .await
+        .unwrap();
+
+    let replacement = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "gates".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({"version": 2}),
+        created_at: chrono::Utc::now(),
+    };
+    let mut conflicting_run = PipelineRun::new(
+        replacement.id,
+        repo.id,
+        "push".to_string(),
+        "second-commit".to_string(),
+    );
+    conflicting_run.id = existing_run.id;
+
+    assert!(
+        PipelineQueries::replace_active_and_create_run(&pool, &replacement, &conflicting_run,)
+            .await
+            .is_err()
+    );
+
+    let active_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM pipelines WHERE repo_id = ? AND name = ? AND active = 1",
+    )
+    .bind(repo.id.to_string())
+    .bind("gates")
+    .fetch_one(pool.pool())
+    .await
+    .unwrap();
+    assert_eq!(active_id, first.id.to_string());
+    assert!(PipelineQueries::get(&pool, replacement.id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn test_pipeline_versioning_migrates_legacy_table() {
+    let pool = Pool::memory().await.unwrap();
+
+    // Simulate a database created before the active-version column existed.
+    sqlx::query(
+        "CREATE TABLE pipelines (id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, name TEXT NOT NULL, trigger_type TEXT NOT NULL, config TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)",
+    )
+    .execute(pool.pool())
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO pipelines (id, repo_id, name, trigger_type, config, created_at) VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("00000000-0000-0000-0000-000000000001")
+    .bind("00000000-0000-0000-0000-000000000010")
+    .bind("gates")
+    .bind("push")
+    .bind("{}")
+    .bind("2026-09-11T00:00:00Z")
+    .bind("00000000-0000-0000-0000-000000000002")
+    .bind("00000000-0000-0000-0000-000000000010")
+    .bind("gates")
+    .bind("push")
+    .bind("{}")
+    .bind("2026-09-12T00:00:00Z")
+    .execute(pool.pool())
+    .await
+    .unwrap();
+
+    pool.migrate().await.unwrap();
+
+    let columns = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM pragma_table_info('pipelines') WHERE name = 'active'",
+    )
+    .fetch_optional(pool.pool())
+    .await
+    .unwrap();
+    assert_eq!(columns.as_deref(), Some("active"));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pipelines WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind("00000000-0000-0000-0000-000000000010")
+        .bind("gates")
+        .fetch_one(pool.pool())
+        .await
+        .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn test_database_event_storage() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();

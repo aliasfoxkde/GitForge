@@ -22,6 +22,7 @@ use gitforge_events::{
     PushReceivedPayload,
 };
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
+use gitforge_scheduler::assigner::JobExecutionDefinition;
 use gitforge_scheduler::{
     create_state_with_artifact_storage, scheduler_routes, Scheduler, SchedulerEvent,
 };
@@ -630,6 +631,14 @@ fn workspace_roots() -> Vec<std::path::PathBuf> {
     vec![workspace_root()]
 }
 
+fn validate_pipeline_timeouts(pipeline: &PipelineDefinition) -> anyhow::Result<()> {
+    for job in &pipeline.jobs {
+        job.timeout_secs()
+            .map_err(|error| anyhow::anyhow!("invalid timeout for job {}: {}", job.name, error))?;
+    }
+    Ok(())
+}
+
 /// Delete a run's workspace directory. Only directories GitForge itself
 /// created — `<root>/<run id>` — are ever removed. A caller-supplied working
 /// directory inside the root may share the tree and must survive the run.
@@ -1156,6 +1165,7 @@ async fn handle_push_event(
             persisted.unwrap_or_else(|| create_default_pipeline(&repo_id.to_string()))
         }
     };
+    validate_pipeline_timeouts(&pipeline)?;
     pipeline_cache
         .lock()
         .unwrap()
@@ -1195,8 +1205,6 @@ async fn handle_push_event(
             config: serde_json::to_value(&pipeline)?,
             created_at: Utc::now(),
         };
-        gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
-
         let mut db_run = DbPipelineRun::new(
             pipeline_id,
             repo_id,
@@ -1205,7 +1213,12 @@ async fn handle_push_event(
         );
         db_run.id = state.run_id;
         db_run.start();
-        gitforge_db::queries::PipelineRunQueries::create(pool, &db_run).await?;
+        gitforge_db::queries::PipelineQueries::replace_active_and_create_run(
+            pool,
+            &db_pipeline,
+            &db_run,
+        )
+        .await?;
     }
 
     let workspace_path = match requested_workspace {
@@ -1255,14 +1268,24 @@ async fn handle_push_event(
                 .iter()
                 .find_map(|step| step.working_directory.clone());
             let working_dir = working_dir.or_else(|| workspace_path.clone());
+            // Honor the pipeline job's timeout instead of silently applying
+            // the legacy per-command default: long suites (a full pytest run
+            // easily exceeds 300 s) would otherwise time out mid-step even
+            // though the definition asked for more.
+            let timeout_secs = definition.timeout_secs().map_err(|error| {
+                anyhow::anyhow!("invalid timeout for job {}: {}", definition.name, error)
+            })?;
             scheduler
-                .enqueue_with_definition_and_image(
+                .enqueue_with_definition_and_image_and_timeout(
                     job_id,
                     state.run_id,
                     repo_id,
-                    commands,
-                    definition.image.clone(),
-                    working_dir,
+                    JobExecutionDefinition {
+                        commands,
+                        image: definition.image.clone(),
+                        working_dir,
+                        timeout_secs,
+                    },
                 )
                 .await;
             tracing::debug!("enqueued job {} for pipeline run {}", job_id, state.run_id);
@@ -1353,14 +1376,33 @@ async fn run_scheduler_event_consumer(
                     .iter()
                     .find_map(|step| step.working_directory.clone())
                     .or_else(|| workspace_path.clone());
+                // Same contract as the initial enqueue: chained jobs keep
+                // the pipeline's per-job timeout. The legacy enqueue below
+                // silently applied a 300 s default — a 45 m test job queued
+                // after its neighbor finished was killed five minutes in.
+                let timeout_secs = match definition.timeout_secs() {
+                    Ok(timeout_secs) => timeout_secs,
+                    Err(error) => {
+                        tracing::error!(
+                            %pipeline_run_id,
+                            job = %definition.name,
+                            %error,
+                            "refusing to enqueue job with invalid timeout"
+                        );
+                        continue;
+                    }
+                };
                 scheduler
-                    .enqueue_with_definition_and_image(
+                    .enqueue_with_definition_and_image_and_timeout(
                         next_job_id,
                         state.run_id,
                         state.repo_id,
-                        commands,
-                        definition.image.clone(),
-                        working_dir,
+                        JobExecutionDefinition {
+                            commands,
+                            image: definition.image.clone(),
+                            working_dir,
+                            timeout_secs,
+                        },
                     )
                     .await;
             }
@@ -2266,6 +2308,21 @@ mod tests {
             assert!(job.timeout.is_some());
             assert_eq!(job.timeout.as_ref().unwrap(), "30m");
         }
+    }
+
+    #[test]
+    fn test_pipeline_timeout_validation_rejects_invalid_values() {
+        let mut pipeline = create_default_pipeline("my-repo");
+        pipeline.jobs[0].timeout = Some("2s".to_string());
+        let error = validate_pipeline_timeouts(&pipeline).unwrap_err();
+        assert!(error.to_string().contains("invalid timeout for job build"));
+    }
+
+    #[test]
+    fn test_pipeline_timeout_validation_accepts_minimum_value() {
+        let mut pipeline = create_default_pipeline("my-repo");
+        pipeline.jobs[0].timeout = Some("5s".to_string());
+        assert!(validate_pipeline_timeouts(&pipeline).is_ok());
     }
 
     #[test]
