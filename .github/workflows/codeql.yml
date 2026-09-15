@@ -23,6 +23,10 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
+      # Match the dedicated runner's 12 GiB memory cap and avoid CodeQL's
+      # host-sized defaults exhausting the runner during database finalization.
+      CODEQL_THREADS: 2
+      CODEQL_RAM: 8192
     permissions:
       actions: read
       contents: read
