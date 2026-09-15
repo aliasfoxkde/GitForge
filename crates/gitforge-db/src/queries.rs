@@ -982,7 +982,7 @@ impl JobQueries {
     pub async fn create(pool: &Pool, job: &crate::models::Job) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, timeout_secs, result_json)
+            INSERT OR IGNORE INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, timeout_secs, result_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
@@ -2840,6 +2840,9 @@ mod tests {
         let job = crate::models::Job::new(run.id, "build".to_string());
 
         // Create
+        JobQueries::create(&pool, &job).await.unwrap();
+        // Replaying a completion/requeue after a scheduler restart must not
+        // turn an already durable job into a persistence error.
         JobQueries::create(&pool, &job).await.unwrap();
 
         // Get
