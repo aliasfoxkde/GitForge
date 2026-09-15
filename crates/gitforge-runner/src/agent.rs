@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{interval, Duration};
 
 /// Runner configuration
@@ -732,6 +733,8 @@ pub struct RunnerAgent {
     sandbox: Arc<DockerSandbox>,
     executor: Arc<JobExecutor>,
     is_running: Arc<RwLock<bool>>,
+    background_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    control_task_abort_handles: Arc<Mutex<Vec<AbortHandle>>>,
 }
 
 impl RunnerAgent {
@@ -752,6 +755,8 @@ impl RunnerAgent {
             sandbox: Arc::new(sandbox),
             executor: Arc::new(executor),
             is_running: Arc::new(RwLock::new(false)),
+            background_tasks: Arc::new(Mutex::new(Vec::new())),
+            control_task_abort_handles: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -883,7 +888,7 @@ impl RunnerAgent {
         let heartbeat_url = self.config.scheduler_url.clone();
         let heartbeat_token = self.config.scheduler_token.clone();
         let is_running = self.is_running.clone();
-        tokio::spawn(async move {
+        let heartbeat_handle = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(heartbeat_interval));
             loop {
                 ticker.tick().await;
@@ -905,6 +910,11 @@ impl RunnerAgent {
                 }
             }
         });
+        self.control_task_abort_handles
+            .lock()
+            .await
+            .push(heartbeat_handle.abort_handle());
+        self.background_tasks.lock().await.push(heartbeat_handle);
 
         // Start job fetch loop
         let fetch_interval = self.config.fetch_interval_secs;
@@ -916,7 +926,8 @@ impl RunnerAgent {
         let executor = self.executor.clone();
         let active_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let active_jobs_for_loop = active_jobs.clone();
-        tokio::spawn(async move {
+        let background_tasks = self.background_tasks.clone();
+        let fetch_handle = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(fetch_interval));
             loop {
                 ticker.tick().await;
@@ -989,7 +1000,7 @@ impl RunnerAgent {
                                     let token = fetch_token.clone();
                                     let active_jobs = active_jobs_for_loop.clone();
                                     let active_job_id = job.job_id.clone();
-                                    tokio::spawn(async move {
+                                    let job_handle = tokio::spawn(async move {
                                         Self::execute_job(
                                             &executor,
                                             &job,
@@ -1002,6 +1013,7 @@ impl RunnerAgent {
                                         .await;
                                         active_jobs.lock().await.remove(&active_job_id);
                                     });
+                                    background_tasks.lock().await.push(job_handle);
                                 }
                             }
                         }
@@ -1012,6 +1024,11 @@ impl RunnerAgent {
                 }
             }
         });
+        self.control_task_abort_handles
+            .lock()
+            .await
+            .push(fetch_handle.abort_handle());
+        self.background_tasks.lock().await.push(fetch_handle);
 
         // Keep running until stopped
         while *self.is_running.read().await {
@@ -1026,11 +1043,14 @@ impl RunnerAgent {
     /// Otherwise, wait for jobs to complete gracefully.
     pub async fn stop(&self, force: bool) {
         *self.is_running.write().await = false;
+        self.abort_control_tasks().await;
 
         if force {
             tracing::info!("force stopping - cancelling all active jobs");
             self.executor.cancel_all_jobs().await;
         }
+
+        self.join_background_tasks().await;
 
         let runner_id = self
             .runner
@@ -1038,6 +1058,38 @@ impl RunnerAgent {
             .map(|r| r.id.to_string())
             .unwrap_or_default();
         tracing::info!("runner {} stopped", runner_id);
+    }
+
+    /// Join every task owned by this runner, including tasks raced in during
+    /// fetch-loop shutdown. Handles are drained in rounds so the fetch loop
+    /// can settle before its final job handles are joined.
+    async fn join_background_tasks(&self) {
+        loop {
+            let handles = {
+                let mut owned = self.background_tasks.lock().await;
+                std::mem::take(&mut *owned)
+            };
+            if handles.is_empty() {
+                return;
+            }
+            for handle in handles {
+                if let Err(error) = handle.await {
+                    tracing::warn!("owned runner task failed during shutdown: {}", error);
+                }
+            }
+        }
+    }
+
+    /// Abort only the control loops. Job tasks remain joinable so their
+    /// cleanup and active-job accounting can settle normally.
+    async fn abort_control_tasks(&self) {
+        let handles = {
+            let mut owned = self.control_task_abort_handles.lock().await;
+            std::mem::take(&mut *owned)
+        };
+        for handle in handles {
+            handle.abort();
+        }
     }
 
     /// Wait for all active jobs to complete within the given timeout
