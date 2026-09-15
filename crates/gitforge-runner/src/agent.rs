@@ -78,6 +78,7 @@ impl RunnerConfig {
     /// The following keys are read; all others are ignored:
     /// - `GITFORGE_SCHEDULER_URL` (required)
     /// - `GITFORGE_RUNNER_NAME` (optional, default: `"runner"`)
+    /// - `GITFORGE_RUNNER_IDENTITY` (optional, stable service/process identity)
     /// - `GITFORGE_RUNNER_CAPACITY` (optional, default: `2`)
     /// - `GITFORGE_HEARTBEAT_INTERVAL` (optional, default: `30`)
     /// - `GITFORGE_FETCH_INTERVAL` (optional, default: `5`)
@@ -527,11 +528,19 @@ impl RunnerAgent {
             gitforge_db::models::RunnerType::Docker,
             self.config.capacity,
         );
+        // The display name is operator-facing and may be shared. A supervised
+        // runner should provide a stable identity so restarts refresh one
+        // durable row instead of creating stale capacity records.
+        runner.identity = std::env::var("GITFORGE_RUNNER_IDENTITY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
 
         // Try to register with scheduler via HTTP
         let register_url = format!("{}/runners", self.config.scheduler_url);
         let request = serde_json::json!({
             "name": runner.name,
+            "identity": runner.identity,
             "type": runner.runner_type,
             "capacity": runner.capacity,
         });
