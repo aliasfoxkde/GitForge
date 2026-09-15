@@ -76,9 +76,10 @@ jobs:
         with:
           toolchain: stable
           components: rust-src
-      - name: Install libudev
+      - name: Verify native build dependencies
         run: |
-          sudo dnf install -y systemd-devel pkgconf-pkg-config openssl-devel
+          pkg-config --exists systemd libudev openssl
+          echo "native development dependencies are available on the managed runner"
       - name: Run serialized tests
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
@@ -95,9 +96,10 @@ jobs:
         with:
           toolchain: stable
           components: rust-src
-      - name: Install libudev
+      - name: Verify native build dependencies
         run: |
-          sudo dnf install -y systemd-devel pkgconf-pkg-config openssl-devel
+          pkg-config --exists systemd libudev openssl
+          echo "native development dependencies are available on the managed runner"
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@562f912bf8a1174eb1007c4afe216a9187a8d722 # cargo-llvm-cov
       - name: Generate coverage report
