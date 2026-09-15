@@ -16,7 +16,7 @@ concurrency:
 jobs:
   analyze:
     name: Analyze
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, gitforge]
     # Rust query evaluation can exceed the default job budget on this
     # multi-crate workspace; keep the guard bounded but allow completion.
     timeout-minutes: 45
