@@ -501,7 +501,11 @@ impl JobExecutor {
         true
     }
 
-    /// Cancel all active jobs and drain active_instances
+    /// Request cancellation for all active jobs.
+    ///
+    /// Execution tasks own the active-job counter and decrement it only after
+    /// their cleanup path settles. Destroying sandboxes here must not reset
+    /// that counter while detached tasks can still be running.
     pub async fn cancel_all_jobs(&self) {
         let instances = {
             let mut instances = self.active_instances.write().await;
@@ -513,9 +517,6 @@ impl JobExecutor {
                 tracing::warn!("failed to destroy sandbox during cancel_all_jobs: {}", e);
             }
         }
-
-        let mut count = self.active_job_count.write().await;
-        *count = 0;
     }
 }
 
