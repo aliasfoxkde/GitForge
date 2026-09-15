@@ -783,6 +783,73 @@ mod tests {
         assert_ne!(job1, job2, "duplicate submits should produce unique IDs");
     }
 
+    #[tokio::test]
+    async fn test_cancel_queued_job_before_capacity_is_available() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let mut permits = Vec::with_capacity(MAX_CONCURRENT_JOBS);
+        for _ in 0..MAX_CONCURRENT_JOBS {
+            permits.push(
+                coordinator
+                    .semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("coordinator semaphore should remain open"),
+            );
+        }
+
+        let job_id = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+        tokio::task::yield_now().await;
+
+        assert!(coordinator.cancel(job_id).await);
+        assert_eq!(
+            coordinator.get_status(&job_id).await.unwrap().0,
+            "cancelled"
+        );
+
+        drop(permits);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(coordinator.active_pids.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_returns_bounded_for_queued_job() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let mut permits = Vec::with_capacity(MAX_CONCURRENT_JOBS);
+        for _ in 0..MAX_CONCURRENT_JOBS {
+            permits.push(
+                coordinator
+                    .semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("coordinator semaphore should remain open"),
+            );
+        }
+
+        let job_id = coordinator
+            .submit(vec!["--version".to_string()], None)
+            .await;
+        tokio::task::yield_now().await;
+
+        let start = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            coordinator.shutdown(Duration::from_millis(50)),
+        )
+        .await
+        .expect("shutdown must return within the external safety bound");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            coordinator.get_status(&job_id).await.unwrap().0,
+            "cancelled"
+        );
+
+        drop(permits);
+    }
+
     /// Test: Job with working directory that doesn't exist still executes
     /// (sandbox/escape prevention is at a different layer)
     #[tokio::test]
