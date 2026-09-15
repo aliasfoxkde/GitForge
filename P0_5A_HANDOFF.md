@@ -1,8 +1,8 @@
 # GitForge reconciler P0-5a worker handoff
 
-**Repository/worktree:** `/nas/Temp/work/gitforge-container-reconciler-20260914`  
-**Branch:** `codex/container-reconciler-20260914`  
-**Base:** `origin/main` at `235292df`  
+**Repository/worktree:** `/nas/Temp/work/gitforge-container-reconciler-20260914`
+**Branch:** `codex/container-reconciler-20260914`
+**Base:** `origin/main` at `235292df`
 **Execution:** Fedora `192.168.0.201`, via the durable worker dispatcher
 
 ## One objective

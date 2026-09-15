@@ -1,10 +1,10 @@
 # GitForge abandoned-container reconciler handoff
 
-**Priority:** P0  
-**Repository:** `/nas/Temp/repos/GitForge`  
-**Execution host:** Fedora `mkinney@192.168.0.201`  
-**Base observed:** `origin/main` = `235292df`  
-**Candidate branch:** `codex/container-reconciler-20260914`  
+**Priority:** P0
+**Repository:** `/nas/Temp/repos/GitForge`
+**Execution host:** Fedora `mkinney@192.168.0.201`
+**Base observed:** `origin/main` = `235292df`
+**Candidate branch:** `codex/container-reconciler-20260914`
 **Status:** implementation exists in a preserved worktree but is not accepted
 
 ## Objective
