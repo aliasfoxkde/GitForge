@@ -171,6 +171,26 @@ async fn main() -> anyhow::Result<()> {
     // Spawn graceful shutdown handler
     spawn_shutdown_handler(shutdown_flag);
 
+    // Startup reconciliation can run before in-flight jobs finish. Repeat it
+    // on a bounded interval so a restart-stranded run is finalized after its
+    // scheduler-owned jobs become terminal, instead of remaining `running`
+    // forever after the completion consumer has lost its in-memory engine.
+    if let Some(pool) = &scheduler_db {
+        let reconcile_pool = pool.clone();
+        let reconcile_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            ticker.tick().await;
+            while !reconcile_shutdown.load(Ordering::SeqCst) {
+                ticker.tick().await;
+                let finalized = reconcile_orphaned_runs(&reconcile_pool).await;
+                if finalized > 0 {
+                    tracing::info!(finalized, "periodic run reconciliation complete");
+                }
+            }
+        });
+    }
+
     // Start event consumer loop
     let shutdown_consumer = shutdown.clone();
     let _consumer_handle = tokio::spawn(async move {
