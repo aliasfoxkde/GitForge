@@ -23,7 +23,7 @@ anyhow = "1"
 
 # UI
 rpassword = "7"
-dirs = "6"
+dirs = "7"
 toml = "1.1"
 
 # Time
