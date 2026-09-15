@@ -301,7 +301,14 @@ impl ReceiptStore for FileReceiptStore {
         let meta_path = self.meta_path(&job_id);
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| Error::storage(format!("failed to serialize meta: {}", e)))?;
-        Self::write_atomic(&meta_path, meta_json.as_bytes()).await?;
+        if let Err(error) = Self::write_atomic(&meta_path, meta_json.as_bytes()).await {
+            // A receipt without its metadata is not a durable, indexable
+            // terminal record. Roll back the first publication when the
+            // second publication fails so callers never observe that split
+            // state as a successful write.
+            let _ = fs::remove_file(&receipt_path).await;
+            return Err(error);
+        }
 
         tracing::debug!("persisted receipt for job {}", job_id);
         Ok(())
@@ -519,6 +526,29 @@ mod tests {
         let retrieved = store.get(&job_id).await.unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().job_id, job_id);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_rolls_back_receipt_when_metadata_publish_fails() {
+        let root = tempfile::tempdir().expect("receipt store root should be created");
+        let store = FileReceiptStore::new(root.path()).await.unwrap();
+        let job_id = JobId::new();
+        let receipt = make_test_receipt(job_id);
+
+        // Make the metadata destination a directory. Receipt publication can
+        // succeed, but metadata rename must fail, exercising the rollback
+        // path without permissions, root privileges, or timing assumptions.
+        tokio::fs::create_dir(store.meta_path(&job_id))
+            .await
+            .expect("metadata failure fixture should be created");
+
+        let result = store.put(&receipt).await;
+        assert!(result.is_err(), "metadata publication should fail");
+        assert!(
+            !store.receipt_path(&job_id).exists(),
+            "failed metadata publication must not leave an orphan receipt"
+        );
+        assert!(store.meta_path(&job_id).is_dir());
     }
 
     #[tokio::test]
