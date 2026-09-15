@@ -2441,6 +2441,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_runner_registration_is_idempotent_by_identity_and_allows_same_name() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let first = crate::models::Runner::new_with_identity(
+            "shared-name".to_string(),
+            "fedora-service-a".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        let first_registered = RunnerQueries::register_or_refresh(&pool, &first)
+            .await
+            .unwrap();
+
+        let second = crate::models::Runner::new_with_identity(
+            "shared-name".to_string(),
+            "fedora-service-b".to_string(),
+            crate::models::RunnerType::Docker,
+            2,
+        );
+        let second_registered = RunnerQueries::register_or_refresh(&pool, &second)
+            .await
+            .unwrap();
+        assert_ne!(first_registered.id, second_registered.id);
+        assert_eq!(RunnerQueries::list(&pool).await.unwrap().len(), 2);
+
+        let restarted = crate::models::Runner::new_with_identity(
+            "shared-name".to_string(),
+            "fedora-service-a".to_string(),
+            crate::models::RunnerType::Docker,
+            4,
+        );
+        let refreshed = RunnerQueries::register_or_refresh(&pool, &restarted)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.id, first_registered.id);
+        assert_eq!(refreshed.capacity, 4);
+        assert_eq!(RunnerQueries::list(&pool).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_pipeline_queries() {
         let pool = Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
