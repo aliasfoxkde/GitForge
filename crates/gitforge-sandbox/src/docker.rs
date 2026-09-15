@@ -62,6 +62,46 @@ pub struct DockerSandbox {
 }
 
 impl DockerSandbox {
+    /// Remove an owned container with bounded retries. Rootless Podman can
+    /// transiently return HTTP 500 while netavark tears down a namespace
+    /// after an abruptly terminated runner.
+    async fn remove_container_with_retry(docker: &Docker, container_id: &str) -> Result<()> {
+        for attempt in 0..3 {
+            match docker
+                .remove_container(
+                    container_id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404 | 409,
+                    ..
+                }) => return Ok(()),
+                Err(error) if attempt < 2 => {
+                    tracing::warn!(
+                        %container_id,
+                        attempt = attempt + 1,
+                        %error,
+                        "container removal failed; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+                }
+                Err(error) => {
+                    return Err(Error::sandbox(format!(
+                        "failed to remove container after retries: {}",
+                        error
+                    )))
+                }
+            }
+        }
+        unreachable!("container removal loop always returns")
+    }
+
     /// Build a unique container name for one execution attempt.
     ///
     /// A runner can be terminated after creating a container but before it
@@ -108,16 +148,7 @@ impl DockerSandbox {
                 continue;
             }
             if let Some(id) = container.id {
-                match docker
-                    .remove_container(
-                        &id,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                {
+                match Self::remove_container_with_retry(docker, &id).await {
                     Ok(()) => {
                         tracing::info!(%id, %job_id, "Removed stale sandbox container before retry");
                     }
@@ -127,12 +158,6 @@ impl DockerSandbox {
                     // create below can proceed; treating the race as fatal
                     // fails the job with a sandbox-acquisition error for a
                     // container that no longer exists.
-                    Err(bollard::errors::Error::DockerResponseServerError {
-                        status_code: 404 | 409,
-                        ..
-                    }) => {
-                        tracing::info!(%id, %job_id, "Stale sandbox container already being removed");
-                    }
                     Err(e) => {
                         return Err(Error::sandbox(format!(
                             "failed to remove stale job container: {}",
@@ -611,15 +636,7 @@ impl Sandbox for DockerSandbox {
             // already-stopped or inconsistent rootless-Podman state. The
             // container is owned by this exact job instance; force removal
             // prevents its conmon helper from surviving the sandbox lifecycle.
-            let remove_options = RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            };
-
-            docker
-                .remove_container(&instance.container_id, Some(remove_options))
-                .await
-                .map_err(|e| Error::sandbox(format!("failed to remove container: {}", e)))?;
+            Self::remove_container_with_retry(docker, &instance.container_id).await?;
 
             tracing::info!(
                 "Destroyed container {} for job {}",
