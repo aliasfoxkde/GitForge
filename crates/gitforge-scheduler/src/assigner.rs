@@ -524,9 +524,13 @@ impl Scheduler {
 
         let runner_id = runner.id;
         let mut state = self.state.write().await;
-        state
-            .runners
-            .retain(|id, existing| existing.name != runner.name || *id == runner_id);
+        state.runners.retain(|id, existing| {
+            let same_identity = match (&runner.identity, &existing.identity) {
+                (Some(left), Some(right)) => left == right,
+                _ => existing.name == runner.name,
+            };
+            !same_identity || *id == runner_id
+        });
         state.add_runner(runner.clone());
         tracing::info!("runner {} registered", runner_id);
         runner
@@ -1217,6 +1221,7 @@ mod tests {
         Runner {
             id,
             name: name.to_string(),
+            identity: None,
             runner_type: RunnerType::Docker.as_str().to_string(),
             status: status.to_string(),
             capacity,

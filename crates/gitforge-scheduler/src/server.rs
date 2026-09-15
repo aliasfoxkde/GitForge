@@ -32,6 +32,7 @@ pub struct SchedulerServerState {
 #[derive(Debug, Deserialize)]
 pub struct RegisterRunnerRequest {
     pub name: String,
+    pub identity: Option<String>,
     #[serde(rename = "type")]
     pub runner_type: String,
     pub capacity: i32,
@@ -256,7 +257,12 @@ async fn register_runner(
         _ => RunnerType::Docker,
     };
 
-    let runner = Runner::new(request.name, runner_type, request.capacity);
+    let runner = match request.identity {
+        Some(identity) => {
+            Runner::new_with_identity(request.name, identity, runner_type, request.capacity)
+        }
+        None => Runner::new(request.name, runner_type, request.capacity),
+    };
 
     let runner = state.scheduler.register_runner(runner).await;
 
@@ -267,6 +273,7 @@ async fn register_runner(
         Json(serde_json::json!({
             "id": runner.id.to_string(),
             "name": runner.name,
+            "identity": runner.identity,
             "type": runner.runner_type,
             "status": runner.status,
             "capacity": runner.capacity,
@@ -965,6 +972,7 @@ mod tests {
 
         let request = RegisterRunnerRequest {
             name: "test-runner".to_string(),
+            identity: None,
             runner_type: "docker".to_string(),
             capacity: 4,
         };
@@ -981,6 +989,7 @@ mod tests {
 
         let request = RegisterRunnerRequest {
             name: "bare-runner".to_string(),
+            identity: None,
             runner_type: "bare-metal".to_string(),
             capacity: 8,
         };
@@ -1428,6 +1437,7 @@ mod tests {
 
         let request = RegisterRunnerRequest {
             name: "fire-runner".to_string(),
+            identity: None,
             runner_type: "firecracker".to_string(),
             capacity: 2,
         };

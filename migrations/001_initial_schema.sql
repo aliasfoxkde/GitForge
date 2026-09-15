@@ -88,12 +88,15 @@ CREATE INDEX idx_jobs_runner ON jobs(runner_id);
 CREATE TABLE runners (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name TEXT NOT NULL,
+    identity TEXT,
     type TEXT NOT NULL CHECK (type IN ('docker', 'firecracker', 'bare_metal')),
     status TEXT NOT NULL DEFAULT 'online' CHECK (status IN ('online', 'busy', 'offline')),
     last_heartbeat TIMESTAMPTZ,
     capacity INT NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE UNIQUE INDEX idx_runners_identity ON runners(identity) WHERE identity IS NOT NULL;
 
 CREATE INDEX idx_runners_status ON runners(status);
 

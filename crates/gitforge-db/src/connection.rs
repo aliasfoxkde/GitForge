@@ -176,6 +176,28 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create runners table: {}", e)))?;
 
+        // Stable runner identity is additive so existing registries remain
+        // readable. NULL keeps legacy rows distinguishable until an operator
+        // explicitly reconciles them; new identities are unique.
+        if let Err(error) = sqlx::query("ALTER TABLE runners ADD COLUMN identity TEXT")
+            .execute(&self.pool)
+            .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(Error::database(format!(
+                    "failed to migrate runners identity: {}",
+                    error
+                )));
+            }
+        }
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_runners_identity ON runners(identity) WHERE identity IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create runner identity index: {}", e)))?;
+
         // Create jobs table
         sqlx::query(
             r#"

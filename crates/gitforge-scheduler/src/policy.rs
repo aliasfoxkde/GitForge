@@ -80,6 +80,7 @@ mod tests {
         Runner {
             id,
             name: name.to_string(),
+            identity: None,
             runner_type: "docker".to_string(),
             status: status.to_string(),
             capacity,

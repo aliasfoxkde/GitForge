@@ -45,6 +45,9 @@ impl RunnerStatus {
 pub struct Runner {
     pub id: RunnerId,
     pub name: String,
+    /// Stable process/service identity. This is distinct from the display name
+    /// and survives restarts; legacy callers may omit it.
+    pub identity: Option<String>,
     pub runner_type: String,
     pub status: String,
     pub last_heartbeat: Option<DateTime<Utc>>,
@@ -58,12 +61,25 @@ impl Runner {
         Self {
             id: RunnerId::new(),
             name,
+            identity: None,
             runner_type: runner_type.as_str().to_string(),
             status: RunnerStatus::Online.as_str().to_string(),
             last_heartbeat: Some(Utc::now()),
             capacity,
             created_at: Utc::now(),
         }
+    }
+
+    /// Create a runner with an explicit stable process/service identity.
+    pub fn new_with_identity(
+        name: String,
+        identity: String,
+        runner_type: RunnerType,
+        capacity: i32,
+    ) -> Self {
+        let mut runner = Self::new(name, runner_type, capacity);
+        runner.identity = Some(identity);
+        runner
     }
 
     /// Update heartbeat

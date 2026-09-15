@@ -171,6 +171,9 @@ fn hydrate_runner(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Runner>
         name: row
             .try_get("name")
             .map_err(|error| Error::database(format!("invalid runner name: {}", error)))?,
+        identity: row
+            .try_get("identity")
+            .map_err(|error| Error::database(format!("invalid runner identity: {}", error)))?,
         runner_type: row
             .try_get("runner_type")
             .map_err(|error| Error::database(format!("invalid runner type: {}", error)))?,
@@ -1359,12 +1362,13 @@ impl RunnerQueries {
     pub async fn create(pool: &Pool, runner: &crate::models::Runner) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO runners (id, name, runner_type, status, capacity, labels, last_heartbeat, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO runners (id, name, identity, runner_type, status, capacity, labels, last_heartbeat, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(runner.id.to_string())
         .bind(&runner.name)
+        .bind(&runner.identity)
         .bind(&runner.runner_type)
         .bind(&runner.status)
         .bind(runner.capacity)
@@ -1378,7 +1382,8 @@ impl RunnerQueries {
         Ok(())
     }
 
-    /// Register a runner by its stable operator-facing name.
+    /// Register a runner by stable process identity, with name fallback for
+    /// legacy callers that do not provide one.
     ///
     /// Runner processes are routinely restarted by systemd. Registration must
     /// therefore refresh the existing identity instead of inserting a new UUID
@@ -1387,12 +1392,18 @@ impl RunnerQueries {
         pool: &Pool,
         runner: &crate::models::Runner,
     ) -> Result<crate::models::Runner> {
-        let existing = sqlx::query(
-            "SELECT * FROM runners WHERE name = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
-        )
+        let existing = match &runner.identity {
+            Some(identity) => sqlx::query("SELECT * FROM runners WHERE identity = ? LIMIT 1")
+                .bind(identity)
+                .fetch_optional(pool.pool())
+                .await,
+            None => sqlx::query(
+                "SELECT * FROM runners WHERE identity IS NULL AND name = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+            )
             .bind(&runner.name)
             .fetch_optional(pool.pool())
-            .await
+            .await,
+        }
             .map_err(|error| Error::database(format!("failed to find runner by name: {}", error)))?
             .map(hydrate_runner)
             .transpose()?;
@@ -1403,8 +1414,10 @@ impl RunnerQueries {
         };
 
         sqlx::query(
-            "UPDATE runners SET runner_type = ?, status = ?, capacity = ?, labels = ?, last_heartbeat = ?, updated_at = ? WHERE id = ?",
+            "UPDATE runners SET name = ?, identity = ?, runner_type = ?, status = ?, capacity = ?, labels = ?, last_heartbeat = ?, updated_at = ? WHERE id = ?",
         )
+        .bind(&runner.name)
+        .bind(&runner.identity)
         .bind(&runner.runner_type)
         .bind(&runner.status)
         .bind(runner.capacity)
@@ -1417,6 +1430,8 @@ impl RunnerQueries {
         .map_err(|error| Error::database(format!("failed to refresh runner: {}", error)))?;
 
         existing.runner_type = runner.runner_type.clone();
+        existing.name = runner.name.clone();
+        existing.identity = runner.identity.clone();
         existing.status = runner.status.clone();
         existing.capacity = runner.capacity;
         existing.last_heartbeat = runner.last_heartbeat;
