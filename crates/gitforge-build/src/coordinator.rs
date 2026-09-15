@@ -855,6 +855,7 @@ mod tests {
         let coordinator = Arc::new(BuildCoordinator::new());
         let fixture = tempfile::tempdir().expect("fixture directory should be created");
         let marker = fixture.path().join("ready");
+        let child_marker = fixture.path().join("child-pid");
         std::fs::write(
             fixture.path().join("Cargo.toml"),
             "[package]\nname = \"gitforge-cancel-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
@@ -862,12 +863,14 @@ mod tests {
         .expect("fixture manifest should be written");
         let marker_literal = serde_json::to_string(marker.to_str().unwrap())
             .expect("fixture marker path should serialize");
+        let child_marker_literal = serde_json::to_string(child_marker.to_str().unwrap())
+            .expect("fixture child marker path should serialize");
         std::fs::create_dir(fixture.path().join("src"))
             .expect("fixture source directory should be created");
         std::fs::write(
             fixture.path().join("src/lib.rs"),
             format!(
-                "#[test]\nfn hold_until_cancelled() {{ std::fs::write({marker_literal}, \"ready\").unwrap(); std::thread::sleep(std::time::Duration::from_secs(60)); }}\n"
+                "#[test]\nfn hold_until_cancelled() {{ let child = std::process::Command::new(\"sleep\").arg(\"60\").spawn().unwrap(); std::fs::write({child_marker_literal}, child.id().to_string()).unwrap(); std::fs::write({marker_literal}, \"ready\").unwrap(); std::thread::sleep(std::time::Duration::from_secs(60)); }}\n"
             ),
         )
         .expect("fixture source should be written");
@@ -893,6 +896,11 @@ mod tests {
             marker.exists(),
             "fixture test process should reach readiness"
         );
+        let child_pid: i32 = std::fs::read_to_string(&child_marker)
+            .expect("fixture child PID should be written")
+            .trim()
+            .parse()
+            .expect("fixture child PID should be numeric");
 
         let pid_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !coordinator.active_pids.lock().await.contains_key(&job_id)
@@ -913,6 +921,17 @@ mod tests {
         assert_eq!(
             coordinator.get_status(&job_id).await.unwrap().0,
             "cancelled"
+        );
+
+        let descendant_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&format!("/proc/{child_pid}")).exists()
+            && tokio::time::Instant::now() < descendant_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !std::path::Path::new(&format!("/proc/{child_pid}")).exists(),
+            "process-group descendant {child_pid} should not remain after cancellation"
         );
     }
 
