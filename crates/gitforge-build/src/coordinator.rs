@@ -935,6 +935,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_shutdown_force_kills_term_resistant_process_group() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let fixture = tempfile::tempdir().expect("fixture directory should be created");
+        let marker = fixture.path().join("ready");
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            "[package]\nname = \"gitforge-shutdown-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("fixture manifest should be written");
+        let marker_literal = serde_json::to_string(marker.to_str().unwrap())
+            .expect("fixture marker path should serialize");
+        std::fs::create_dir(fixture.path().join("src"))
+            .expect("fixture source directory should be created");
+        std::fs::write(
+            fixture.path().join("src/lib.rs"),
+            format!(
+                "#[test]\nfn ignore_term_until_forced() {{ let _child = std::process::Command::new(\"sh\").args([\"-c\", \"trap '' TERM; sleep 60\"]).spawn().unwrap(); std::fs::write({marker_literal}, \"ready\").unwrap(); std::thread::sleep(std::time::Duration::from_secs(60)); }}\n"
+            ),
+        )
+        .expect("fixture source should be written");
+
+        let job_id = coordinator
+            .submit(
+                vec![
+                    "test".to_string(),
+                    "--manifest-path".to_string(),
+                    fixture.path().join("Cargo.toml").display().to_string(),
+                    "--".to_string(),
+                    "--nocapture".to_string(),
+                ],
+                None,
+            )
+            .await;
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !marker.exists() && tokio::time::Instant::now() < ready_deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            marker.exists(),
+            "fixture test process should reach readiness"
+        );
+        assert!(coordinator.active_pids.lock().await.contains_key(&job_id));
+
+        let start = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            coordinator.shutdown(Duration::from_millis(100)),
+        )
+        .await
+        .expect("forced shutdown must return within the safety bound");
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(coordinator.active_pids.lock().await.is_empty());
+        assert_eq!(
+            coordinator.get_status(&job_id).await.unwrap().0,
+            "cancelled"
+        );
+    }
+
     /// Test: Job with working directory that doesn't exist still executes
     /// (sandbox/escape prevention is at a different layer)
     #[tokio::test]
