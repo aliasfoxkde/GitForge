@@ -2528,8 +2528,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_registration_concurrent_same_identity_returns_one_row() {
-        let database = tempfile::NamedTempFile::new().unwrap();
-        let pool = Pool::new(database.path().to_str().unwrap()).await.unwrap();
+        let database = std::env::temp_dir().join(format!(
+            "gitforge-runner-identity-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = Pool::new(database.to_str().unwrap()).await.unwrap();
         pool.migrate().await.unwrap();
 
         let first = crate::models::Runner::new_with_identity(
@@ -2552,6 +2555,8 @@ mod tests {
         let right = right.unwrap();
         assert_eq!(left.id, right.id);
         assert_eq!(RunnerQueries::list(&pool).await.unwrap().len(), 1);
+        drop(pool);
+        let _ = std::fs::remove_file(database);
     }
 
     #[tokio::test]
