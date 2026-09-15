@@ -850,6 +850,72 @@ mod tests {
         drop(permits);
     }
 
+    #[tokio::test]
+    async fn test_cancel_running_job_reaps_tracked_process_group() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let fixture = tempfile::tempdir().expect("fixture directory should be created");
+        let marker = fixture.path().join("ready");
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            "[package]\nname = \"gitforge-cancel-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("fixture manifest should be written");
+        let marker_literal = serde_json::to_string(marker.to_str().unwrap())
+            .expect("fixture marker path should serialize");
+        std::fs::create_dir(fixture.path().join("src"))
+            .expect("fixture source directory should be created");
+        std::fs::write(
+            fixture.path().join("src/lib.rs"),
+            format!(
+                "#[test]\nfn hold_until_cancelled() {{ std::fs::write({marker_literal}, \"ready\").unwrap(); std::thread::sleep(std::time::Duration::from_secs(60)); }}\n"
+            ),
+        )
+        .expect("fixture source should be written");
+
+        let job_id = coordinator
+            .submit(
+                vec![
+                    "test".to_string(),
+                    "--manifest-path".to_string(),
+                    fixture.path().join("Cargo.toml").display().to_string(),
+                    "--".to_string(),
+                    "--nocapture".to_string(),
+                ],
+                None,
+            )
+            .await;
+
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !marker.exists() && tokio::time::Instant::now() < ready_deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            marker.exists(),
+            "fixture test process should reach readiness"
+        );
+
+        let pid_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !coordinator.active_pids.lock().await.contains_key(&job_id)
+            && tokio::time::Instant::now() < pid_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(coordinator.active_pids.lock().await.contains_key(&job_id));
+
+        assert!(coordinator.cancel(job_id).await);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !coordinator.active_pids.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("cancelled process group should be reaped within the safety bound");
+        assert_eq!(
+            coordinator.get_status(&job_id).await.unwrap().0,
+            "cancelled"
+        );
+    }
+
     /// Test: Job with working directory that doesn't exist still executes
     /// (sandbox/escape prevention is at a different layer)
     #[tokio::test]
