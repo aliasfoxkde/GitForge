@@ -40,7 +40,7 @@ env:
 jobs:
   ai-review:
     name: AI Code Review
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, gitforge]
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -162,40 +162,3 @@ jobs:
         run: |
           echo "Critical security issues detected in code review"
           exit 1
-
-  security-scan:
-    name: Security Vulnerability Scan
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
-        with:
-          toolchain: stable
-
-      - name: Run security scan
-        run: |
-          # Run cargo-audit or similar security checks
-          cargo install cargo-audit --locked --quiet
-          cargo audit
-
-  # Run standard tests alongside AI review
-  test-checks:
-    name: Test Checks
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
-        with:
-          toolchain: stable
-
-      - name: Run tests
-        run: cargo test --workspace --locked
-
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings

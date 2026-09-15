@@ -25,7 +25,7 @@ jobs:
   # ─── Code Formatting ─────────────────────────────────────────────────────────
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, gitforge]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -39,7 +39,7 @@ jobs:
   # ─── Linting ────────────────────────────────────────────────────────────────
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, gitforge]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -53,7 +53,7 @@ jobs:
   # ─── Testing ────────────────────────────────────────────────────────────────
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, gitforge]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -68,7 +68,7 @@ jobs:
   # race detector requires a separate supported toolchain/target strategy.
   test-serialized:
     name: Test (Serialized)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, gitforge]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -76,17 +76,17 @@ jobs:
         with:
           toolchain: stable
           components: rust-src
-      - name: Install libudev
+      - name: Verify native build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev pkg-config libssl-dev
+          pkg-config --exists systemd libudev openssl
+          echo "native development dependencies are available on the managed runner"
       - name: Run serialized tests
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
   # ─── Coverage ───────────────────────────────────────────────────────────────
   coverage:
     name: Coverage
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, gitforge]
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
@@ -96,10 +96,10 @@ jobs:
         with:
           toolchain: stable
           components: rust-src
-      - name: Install libudev
+      - name: Verify native build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev pkg-config libssl-dev
+          pkg-config --exists systemd libudev openssl
+          echo "native development dependencies are available on the managed runner"
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@562f912bf8a1174eb1007c4afe216a9187a8d722 # cargo-llvm-cov
       - name: Generate coverage report
@@ -122,6 +122,10 @@ jobs:
 
       - name: Upload coverage report
         if: ${{ always() && hashFiles('cobertura.xml') != '' }}
+        # Coverage generation and the threshold above are the required gate.
+        # Artifact retention is diagnostic and must not block a valid build
+        # when the repository-level Actions artifact quota is exhausted.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: rust-coverage-${{ github.run_id }}
@@ -143,7 +147,7 @@ jobs:
   # ─── Security Audit ─────────────────────────────────────────────────────────
   security:
     name: Security Audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, gitforge]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -158,7 +162,7 @@ jobs:
   # ─── Build ──────────────────────────────────────────────────────────────────
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, gitforge]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust

@@ -38,7 +38,7 @@ jobs:
   enqueue-build:
     name: Enqueue Build to GitForge
     if: vars.GITFORGE_ENABLED == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, gitforge]
     outputs:
       run_id: ${{ steps.enqueue.outputs.run_id }}
       build_status: ${{ steps.enqueue.outputs.status }}
@@ -105,7 +105,7 @@ jobs:
     name: Poll GitForge Build Status
     needs: enqueue-build
     if: needs.enqueue-build.outputs.build_status == 'enqueued'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, gitforge]
     outputs:
       terminal_status: ${{ steps.poll.outputs.terminal_status }}
     steps:
@@ -151,7 +151,7 @@ jobs:
     name: Report Build Status
     needs: [enqueue-build, poll-build]
     if: always() && vars.GITFORGE_ENABLED == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, gitforge]
     steps:
       - name: Report completion
         run: |

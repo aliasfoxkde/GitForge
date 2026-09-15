@@ -3,14 +3,16 @@
 use crate::executor::{ExecutableJob, JobExecutor, JobStep};
 use gitforge_common::{Error, JobId, PipelineRunId, Result, RunnerId};
 use gitforge_db::models::Runner;
-use gitforge_sandbox::{DockerSandbox, OutputSink, OutputStream, StepResult};
+use gitforge_sandbox::{
+    ActiveJobRegistry, DockerContainerSource, DockerSandbox, OutputSink, OutputStream,
+    ReconcileReport, Reconciler, ReconcilerPolicy, StepResult,
+};
 use gitforge_storage::ArtifactReceipt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
@@ -492,6 +494,11 @@ pub struct RunnerAgent {
     sandbox: Arc<DockerSandbox>,
     executor: Arc<JobExecutor>,
     is_running: Arc<RwLock<bool>>,
+    reconciler_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Authoritative active-job set shared with the reconciler. The reconciler
+    /// holds this registry's lock across its Docker calls so admission cannot
+    /// interleave between the snapshot and a remove decision.
+    active_jobs: ActiveJobRegistry,
 }
 
 impl RunnerAgent {
@@ -512,6 +519,8 @@ impl RunnerAgent {
             sandbox: Arc::new(sandbox),
             executor: Arc::new(executor),
             is_running: Arc::new(RwLock::new(false)),
+            reconciler_task: Arc::new(Mutex::new(None)),
+            active_jobs: ActiveJobRegistry::new(),
         })
     }
 
@@ -616,6 +625,14 @@ impl RunnerAgent {
             }
         });
 
+        let active_jobs = self.active_jobs.clone();
+
+        // Spawn the abandoned-container reconciler: one pass at startup
+        // (covers a supervisor interruption/restart) plus a bounded
+        // periodic schedule. Startup behavior is census-only unless the
+        // service explicitly enables deletion via GITFORGE_RECONCILE_DELETE.
+        self.spawn_reconciler(active_jobs.clone()).await;
+
         // Start job fetch loop
         let fetch_interval = self.config.fetch_interval_secs;
         let fetch_client = self.client.clone();
@@ -624,7 +641,6 @@ impl RunnerAgent {
         let fetch_token = self.config.scheduler_token.clone();
         let is_running = self.is_running.clone();
         let executor = self.executor.clone();
-        let active_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let active_jobs_for_loop = active_jobs.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(fetch_interval));
@@ -656,15 +672,12 @@ impl RunnerAgent {
                                     // rotate the durable lease and fence the
                                     // original execution, causing its live-log
                                     // and completion requests to return 409.
-                                    {
-                                        let active = active_jobs_for_loop.lock().await;
-                                        if active.contains(&job.job_id) {
-                                            tracing::debug!(
-                                                "job {} is already executing locally; ignoring duplicate assignment",
-                                                job.job_id
-                                            );
-                                            continue;
-                                        }
+                                    if active_jobs_for_loop.is_active(&job.job_id).await {
+                                        tracing::debug!(
+                                            "job {} is already executing locally; ignoring duplicate assignment",
+                                            job.job_id
+                                        );
+                                        continue;
                                     }
                                     let Some(lease_token) = Self::claim_job(
                                         &fetch_client,
@@ -678,12 +691,9 @@ impl RunnerAgent {
                                         tracing::warn!("unable to claim job {}", job.job_id);
                                         continue;
                                     };
-                                    {
-                                        let mut active = active_jobs_for_loop.lock().await;
-                                        if !active.insert(job.job_id.clone()) {
-                                            tracing::warn!("job {} is already executing locally; skipping duplicate assignment", job.job_id);
-                                            continue;
-                                        }
+                                    if !active_jobs_for_loop.try_claim(&job.job_id).await {
+                                        tracing::warn!("job {} is already executing locally; skipping duplicate assignment", job.job_id);
+                                        continue;
                                     }
                                     tracing::info!(
                                         "accepted job assignment: {} ({})",
@@ -710,7 +720,7 @@ impl RunnerAgent {
                                             token.as_deref(),
                                         )
                                         .await;
-                                        active_jobs.lock().await.remove(&active_job_id);
+                                        active_jobs.release(&active_job_id).await;
                                     });
                                 }
                             }
@@ -731,11 +741,44 @@ impl RunnerAgent {
         Ok(())
     }
 
+    /// Spawn the background abandoned-container reconciler loop.
+    ///
+    /// Env policy (documented defaults keep startup safe):
+    /// - `GITFORGE_RECONCILE_DELETE`: `1`/`true` enables removal; anything
+    ///   else keeps the reconciler census-only (default).
+    /// - `GITFORGE_RECONCILE_GRACE_SECS`: minimum non-running age before a
+    ///   candidate is eligible (default 3600; must be positive).
+    /// - `GITFORGE_RECONCILE_INTERVAL_SECS`: periodic pass interval
+    ///   (default 300).
+    /// - `GITFORGE_RECONCILE_RECEIPT`: optional path for a JSON receipt.
+    ///
+    /// Every pass correlates against the authoritative local active-job
+    /// set, so a container belonging to a job this runner is executing is
+    /// always retained. A policy failure is logged and the loop is not
+    /// started: the reconciler must never guess.
+    async fn spawn_reconciler(&self, active_jobs: ActiveJobRegistry) {
+        let config = match load_reconciler_config_from_env() {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::error!(%error, "abandoned-container reconciler NOT started");
+                return;
+            }
+        };
+        let handle = tokio::spawn(run_reconciler_loop(active_jobs, config));
+        *self.reconciler_task.lock().await = Some(handle);
+    }
+
     /// Stop the runner agent
     /// If force is true, cancel all running jobs immediately.
     /// Otherwise, wait for jobs to complete gracefully.
     pub async fn stop(&self, force: bool) {
         *self.is_running.write().await = false;
+
+        if let Some(handle) = self.reconciler_task.lock().await.take() {
+            handle.abort();
+            let _ = handle.await;
+            tracing::debug!("abandoned-container reconciler stopped");
+        }
 
         if force {
             tracing::info!("force stopping - cancelling all active jobs");
@@ -1040,6 +1083,184 @@ impl RunnerAgent {
     }
 }
 
+/// Resolved configuration for the reconciler background loop. Pulled out of
+/// `spawn_reconciler` so it is fully unit-testable without touching the
+/// process environment.
+#[derive(Debug, Clone)]
+pub(crate) struct ReconcilerLoopConfig {
+    policy: ReconcilerPolicy,
+    interval: Duration,
+    receipt_path: Option<PathBuf>,
+}
+
+/// Outcome of a single receipt write. Used by tests and the production loop
+/// to record the result of each persistence attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReceiptWriteOutcome {
+    Written,
+    WriteFailed(String),
+    RenameFailed(String),
+    SerializeFailed(String),
+}
+
+/// Read the reconciler env-var configuration and validate it.
+fn load_reconciler_config_from_env() -> std::result::Result<ReconcilerLoopConfig, String> {
+    let deletion_enabled = std::env::var("GITFORGE_RECONCILE_DELETE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let grace_secs: u64 = std::env::var("GITFORGE_RECONCILE_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    let interval_secs: u64 = std::env::var("GITFORGE_RECONCILE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let receipt_path = match std::env::var("GITFORGE_RECONCILE_RECEIPT") {
+        Ok(raw) => match validate_reconciler_receipt_path(&raw) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                return Err(format!("invalid receipt path: {error}"));
+            }
+        },
+        Err(_) => None,
+    };
+
+    if deletion_enabled && receipt_path.is_none() {
+        return Err("deletion requires a receipt path".to_string());
+    }
+
+    let policy = ReconcilerPolicy {
+        deletion_enabled,
+        grace: Duration::from_secs(grace_secs),
+        ..ReconcilerPolicy::default()
+    };
+    policy
+        .validate()
+        .map_err(|e| format!("policy validation failed: {e}"))?;
+    Ok(ReconcilerLoopConfig {
+        policy,
+        interval: Duration::from_secs(interval_secs.max(30)),
+        receipt_path,
+    })
+}
+
+/// Persist a reconcile receipt atomically: write to `<path>.tmp` then rename
+/// onto the configured destination. Failures are observable — every error
+/// path is returned as [`ReceiptWriteOutcome`] so callers can log and tests
+/// can assert.
+pub(crate) async fn write_reconciler_receipt(
+    report: &ReconcileReport,
+    path: &Path,
+) -> ReceiptWriteOutcome {
+    let json = match serde_json::to_string_pretty(report) {
+        Ok(json) => json,
+        Err(error) => return ReceiptWriteOutcome::SerializeFailed(error.to_string()),
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(error) = fs::write(&tmp, json).await {
+        return ReceiptWriteOutcome::WriteFailed(error.to_string());
+    }
+    if let Err(error) = fs::rename(&tmp, path).await {
+        return ReceiptWriteOutcome::RenameFailed(error.to_string());
+    }
+    ReceiptWriteOutcome::Written
+}
+
+/// Background loop body. Extracted from `spawn_reconciler` so the
+/// cancellation/restart lifecycle can be exercised in tests without
+/// touching the process environment.
+pub(crate) async fn run_reconciler_loop(
+    active_jobs: ActiveJobRegistry,
+    config: ReconcilerLoopConfig,
+) {
+    let source = match DockerContainerSource::connect_with_timeout(config.policy.call_timeout) {
+        Ok(source) => Arc::new(source),
+        Err(e) => {
+            tracing::warn!("abandoned-container reconciler unavailable: {}", e);
+            return;
+        }
+    };
+    let reconciler = Reconciler::new(source, config.policy);
+    let mut ticker = interval(config.interval);
+    loop {
+        // Startup pass runs immediately, then bounded periodic.
+        ticker.tick().await;
+        let now = gitforge_sandbox::reconciler::Now {
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        match reconciler.reconcile(&active_jobs, now).await {
+            Ok(report) => {
+                tracing::info!(
+                    candidates = report.candidates_seen,
+                    eligible = report.eligible,
+                    removed = report.removed,
+                    already_gone = report.already_gone,
+                    failed = report.failed,
+                    deletion_enabled = report.policy_deletion_enabled,
+                    "abandoned-container reconcile pass complete"
+                );
+                if let Some(path) = &config.receipt_path {
+                    let outcome = write_reconciler_receipt(&report, path).await;
+                    match outcome {
+                        ReceiptWriteOutcome::Written => {
+                            tracing::debug!("reconciler receipt written to {}", path.display())
+                        }
+                        ReceiptWriteOutcome::WriteFailed(error)
+                        | ReceiptWriteOutcome::RenameFailed(error) => tracing::warn!(
+                            %error,
+                            "reconciler receipt write failed for {}",
+                            path.display()
+                        ),
+                        ReceiptWriteOutcome::SerializeFailed(error) => {
+                            tracing::warn!(%error, "reconciler receipt serialization failed")
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("abandoned-container reconcile pass failed: {}", e);
+            }
+        }
+    }
+}
+
+/// Validate the optional reconciler receipt destination before starting the
+/// background task.  Receipt paths are operator configuration, but accepting
+/// arbitrary relative paths or symlinked parents would let a typo redirect
+/// writes outside the service's artifact area.  The parent must already exist
+/// so startup does not create directories as a side effect.
+fn validate_reconciler_receipt_path(raw: &str) -> std::result::Result<PathBuf, String> {
+    let path = PathBuf::from(raw.trim());
+    if !path.is_absolute() {
+        return Err("path must be absolute".to_string());
+    }
+    if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+        return Err("path must have a .json extension".to_string());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("path must not contain parent-directory components".to_string());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "path must have a parent directory".to_string())?;
+    let metadata = std::fs::symlink_metadata(parent)
+        .map_err(|error| format!("receipt parent is not accessible: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("receipt parent must be an existing real directory".to_string());
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() {
+            return Err("receipt destination must not be a symlink".to_string());
+        }
+    }
+    Ok(path)
+}
+
 const MAX_RECEIPT_STREAM_BYTES: usize = 64 * 1024;
 
 fn bounded_receipt_text(value: &str) -> String {
@@ -1058,7 +1279,7 @@ fn bounded_receipt_text(value: &str) -> String {
 
 #[cfg(test)]
 mod receipt_tests {
-    use super::{bounded_receipt_text, MAX_RECEIPT_STREAM_BYTES};
+    use super::{bounded_receipt_text, validate_reconciler_receipt_path, MAX_RECEIPT_STREAM_BYTES};
 
     #[test]
     fn receipt_output_is_bounded_and_marked() {
@@ -1071,6 +1292,159 @@ mod receipt_tests {
     #[test]
     fn receipt_output_preserves_small_output() {
         assert_eq!(bounded_receipt_text("ok"), "ok");
+    }
+
+    #[test]
+    fn receipt_path_rejects_relative_traversal_and_wrong_extension() {
+        for path in [
+            "receipt.json",
+            "/var/lib/gitforge/../escape.json",
+            "/var/lib/gitforge/receipt",
+        ] {
+            assert!(
+                validate_reconciler_receipt_path(path).is_err(),
+                "accepted {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_path_requires_existing_real_parent() {
+        let path = format!(
+            "/nas/Temp/work/reconciler-receipt-test-{}/receipt.json",
+            std::process::id()
+        );
+        assert!(validate_reconciler_receipt_path(&path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod reconciler_loop_tests {
+    use super::*;
+    use gitforge_sandbox::ReconcileReport;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn tempdir() -> TempDir {
+        tempfile::tempdir().expect("tempdir must succeed")
+    }
+
+    #[tokio::test]
+    async fn receipt_write_succeeds_into_existing_parent() {
+        let dir = tempdir();
+        let path = dir.path().join("receipt.json");
+        let report = ReconcileReport {
+            runtime: "docker".into(),
+            policy_deletion_enabled: true,
+            policy_grace_secs: 60,
+            active_job_count: 0,
+            active_jobs_hash: "0000000000000000".into(),
+            candidates_seen: 2,
+            eligible: 1,
+            removed: 1,
+            already_gone: 0,
+            failed: 0,
+            entries: Vec::new(),
+        };
+
+        let outcome = write_reconciler_receipt(&report, &path).await;
+        assert_eq!(outcome, ReceiptWriteOutcome::Written);
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(written.contains("\"runtime\": \"docker\""));
+        assert!(written.contains("\"removed\": 1"));
+        // No `.tmp` sibling left behind on success.
+        assert!(!dir.path().join("receipt.json.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn receipt_write_failure_is_observable_for_missing_parent() {
+        let dir = tempdir();
+        let path = dir.path().join("does-not-exist").join("receipt.json");
+        let report = ReconcileReport::default();
+        let outcome = write_reconciler_receipt(&report, &path).await;
+        match outcome {
+            ReceiptWriteOutcome::WriteFailed(_) => {}
+            other => panic!("expected WriteFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn receipt_overwrite_is_atomic_via_rename() {
+        let dir = tempdir();
+        let path = dir.path().join("receipt.json");
+        let first = ReconcileReport {
+            runtime: "docker".into(),
+            policy_deletion_enabled: false,
+            candidates_seen: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            write_reconciler_receipt(&first, &path).await,
+            ReceiptWriteOutcome::Written
+        );
+        let second = ReconcileReport {
+            runtime: "docker".into(),
+            policy_deletion_enabled: true,
+            candidates_seen: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            write_reconciler_receipt(&second, &path).await,
+            ReceiptWriteOutcome::Written
+        );
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(written.contains("\"candidates_seen\": 7"));
+    }
+
+    /// Restart reconciliation seam: spawning the reconciler twice must
+    /// produce two independent tasks, not a single running instance
+    /// observed twice. This is the lightweight proof that `stop()` then a
+    /// fresh `spawn_reconciler` does not leak the original task handle.
+    #[tokio::test]
+    async fn reconciler_task_field_supports_stop_and_restart_without_leak() {
+        let slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        let registry = ActiveJobRegistry::new();
+
+        // First incarnation.
+        let config = ReconcilerLoopConfig {
+            policy: ReconcilerPolicy {
+                deletion_enabled: false,
+                ..ReconcilerPolicy::default()
+            },
+            interval: Duration::from_secs(60),
+            receipt_path: None,
+        };
+        let registry_one = registry.clone();
+        let first = tokio::spawn(run_reconciler_loop(registry_one, config.clone()));
+        {
+            let mut guard = slot.lock().await;
+            *guard = Some(first);
+        }
+        // Stop the first task by aborting and joining.
+        let first_handle = slot.lock().await.take().expect("first handle");
+        first_handle.abort();
+        let _ = first_handle.await;
+
+        // Restart: spawn a second task and store it in the same slot. The
+        // slot must not still hold the aborted handle.
+        assert!(slot.lock().await.is_none());
+        let registry_two = registry.clone();
+        let second = tokio::spawn(run_reconciler_loop(registry_two, config));
+        *slot.lock().await = Some(second);
+
+        // Only one task is currently tracked.
+        let handle = slot.lock().await.take().expect("second handle");
+        assert!(!handle.is_finished(), "second task must be live");
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn receipt_path_validation_accepts_tmpdir_parent() {
+        let dir = tempdir();
+        let path: PathBuf = dir.path().join("nested").join("receipt.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(validate_reconciler_receipt_path(path.to_str().unwrap()).is_ok());
     }
 }
 

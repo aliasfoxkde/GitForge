@@ -968,9 +968,20 @@ fn handle_ssh_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    // Tests below mutate the process-wide `GIT_ROOT` environment variable,
+    // which races across parallel test threads. A dedicated mutex scopes the
+    // serialization to this narrow group only, leaving the rest of the
+    // workspace's parallelism untouched.
+    fn git_root_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn test_get_git_root_default() {
+        let _guard = git_root_env_lock().lock().unwrap();
         std::env::remove_var("GIT_ROOT");
         let root = get_git_root();
         assert_eq!(root, "target/gitforge-repos");
@@ -978,6 +989,7 @@ mod tests {
 
     #[test]
     fn test_get_git_root_from_env() {
+        let _guard = git_root_env_lock().lock().unwrap();
         std::env::set_var("GIT_ROOT", "/custom/path");
         let root = get_git_root();
         assert_eq!(root, "/custom/path");
@@ -1077,6 +1089,7 @@ mod tests {
 
     #[test]
     fn test_get_git_root_empty_string() {
+        let _guard = git_root_env_lock().lock().unwrap();
         std::env::set_var("GIT_ROOT", "");
         let _root = get_git_root();
         std::env::remove_var("GIT_ROOT");
