@@ -510,32 +510,43 @@ impl PipelineQueries {
         pool: &Pool,
         pipeline: &crate::models::Pipeline,
     ) -> Result<crate::models::Pipeline> {
-        sqlx::query(
-            "UPDATE pipelines SET trigger_type = ?, config = ? WHERE repo_id = ? AND name = ?",
+        let existing = sqlx::query(
+            "SELECT id FROM pipelines WHERE repo_id = ? AND name = ? ORDER BY created_at ASC LIMIT 1",
         )
-        .bind(&pipeline.trigger_type)
-        .bind(pipeline.config.to_string())
         .bind(pipeline.repo_id.to_string())
         .bind(&pipeline.name)
-        .execute(pool.pool())
+        .fetch_optional(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to update pipeline: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to find existing pipeline: {}", e)))?;
 
-        sqlx::query(
-            r#"
-            INSERT OR IGNORE INTO pipelines (id, repo_id, name, trigger_type, config, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(pipeline.id.to_string())
-        .bind(pipeline.repo_id.to_string())
-        .bind(&pipeline.name)
-        .bind(&pipeline.trigger_type)
-        .bind(pipeline.config.to_string())
-        .bind(pipeline.created_at.to_rfc3339())
-        .execute(pool.pool())
-        .await
-        .map_err(|e| Error::database(format!("failed to persist pipeline: {}", e)))?;
+        if let Some(existing) = existing {
+            let id: String = existing
+                .try_get("id")
+                .map_err(|e| Error::database(format!("failed to read pipeline ID: {}", e)))?;
+            sqlx::query("UPDATE pipelines SET trigger_type = ?, config = ? WHERE id = ?")
+                .bind(&pipeline.trigger_type)
+                .bind(pipeline.config.to_string())
+                .bind(id)
+                .execute(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to update pipeline: {}", e)))?;
+        } else {
+            sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO pipelines (id, repo_id, name, trigger_type, config, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(pipeline.id.to_string())
+            .bind(pipeline.repo_id.to_string())
+            .bind(&pipeline.name)
+            .bind(&pipeline.trigger_type)
+            .bind(pipeline.config.to_string())
+            .bind(pipeline.created_at.to_rfc3339())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to persist pipeline: {}", e)))?;
+        }
 
         sqlx::query(
             "SELECT * FROM pipelines WHERE repo_id = ? AND name = ? ORDER BY created_at ASC LIMIT 1",
