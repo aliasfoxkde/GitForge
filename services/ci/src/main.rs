@@ -1167,8 +1167,26 @@ async fn handle_push_event(
         .cloned()
         .flatten();
 
-    // Create trigger event
-    let trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
+    // Persist the named pipeline before creating the run. A push reuses the
+    // repository's pipeline definition; creating a fresh row per push races
+    // the database uniqueness constraint and can orphan the in-memory engine.
+    let mut trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
+    if let Some(pool) = scheduler_db {
+        let db_pipeline = DbPipeline {
+            id: trigger_event.pipeline_id,
+            repo_id,
+            name: pipeline.name.clone(),
+            trigger_type: "push".to_string(),
+            config: serde_json::to_value(&pipeline)?,
+            created_at: Utc::now(),
+        };
+        let persisted = gitforge_db::queries::PipelineQueries::create_or_update_by_repo_name(
+            pool,
+            &db_pipeline,
+        )
+        .await?;
+        trigger_event.pipeline_id = persisted.id;
+    }
     let pipeline_id = trigger_event.pipeline_id;
 
     // Create and start the CI engine
@@ -1187,16 +1205,6 @@ async fn handle_push_event(
 
     let state = engine.state().await;
     if let Some(pool) = scheduler_db {
-        let db_pipeline = DbPipeline {
-            id: pipeline_id,
-            repo_id,
-            name: pipeline.name.clone(),
-            trigger_type: "push".to_string(),
-            config: serde_json::to_value(&pipeline)?,
-            created_at: Utc::now(),
-        };
-        gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
-
         let mut db_run = DbPipelineRun::new(
             pipeline_id,
             repo_id,

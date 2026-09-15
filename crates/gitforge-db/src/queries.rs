@@ -499,6 +499,55 @@ impl PipelineQueries {
         Ok(())
     }
 
+    /// Persist the repository's named pipeline without creating duplicates.
+    ///
+    /// A push creates a run, not a new pipeline definition. The live database
+    /// enforces `(repo_id, name)` uniqueness, so this operation updates the
+    /// existing definition and returns its durable ID when a definition is
+    /// already present. `INSERT OR IGNORE` also makes the create/read path
+    /// safe when two event consumers race on the first push.
+    pub async fn create_or_update_by_repo_name(
+        pool: &Pool,
+        pipeline: &crate::models::Pipeline,
+    ) -> Result<crate::models::Pipeline> {
+        sqlx::query(
+            "UPDATE pipelines SET trigger_type = ?, config = ? WHERE repo_id = ? AND name = ?",
+        )
+        .bind(&pipeline.trigger_type)
+        .bind(pipeline.config.to_string())
+        .bind(pipeline.repo_id.to_string())
+        .bind(&pipeline.name)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to update pipeline: {}", e)))?;
+
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO pipelines (id, repo_id, name, trigger_type, config, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(pipeline.id.to_string())
+        .bind(pipeline.repo_id.to_string())
+        .bind(&pipeline.name)
+        .bind(&pipeline.trigger_type)
+        .bind(pipeline.config.to_string())
+        .bind(pipeline.created_at.to_rfc3339())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to persist pipeline: {}", e)))?;
+
+        sqlx::query(
+            "SELECT * FROM pipelines WHERE repo_id = ? AND name = ? ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(pipeline.repo_id.to_string())
+        .bind(&pipeline.name)
+        .fetch_one(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to read persisted pipeline: {}", e)))
+        .and_then(hydrate_pipeline)
+    }
+
     /// Get a pipeline by ID
     pub async fn get(pool: &Pool, id: PipelineId) -> Result<Option<crate::models::Pipeline>> {
         let row = sqlx::query("SELECT * FROM pipelines WHERE id = ?")
@@ -2603,6 +2652,27 @@ mod tests {
         // List all
         let all_pipelines = PipelineQueries::list(&pool).await.unwrap();
         assert_eq!(all_pipelines.len(), 1);
+
+        let replacement = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "Test Pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({"revision": 2}),
+            created_at: chrono::Utc::now(),
+        };
+        let persisted = PipelineQueries::create_or_update_by_repo_name(&pool, &replacement)
+            .await
+            .unwrap();
+        assert_eq!(persisted.id, pipeline.id);
+        assert_eq!(persisted.config, serde_json::json!({"revision": 2}));
+        assert_eq!(
+            PipelineQueries::list_by_repo(&pool, repo.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
