@@ -532,7 +532,6 @@ impl JobExecutor {
                 tracing::warn!("failed to destroy sandbox during cancel_all_jobs: {}", e);
             }
         }
-
     }
 }
 
