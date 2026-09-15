@@ -3053,6 +3053,64 @@ mod tests {
             .unwrap();
         assert_eq!(queued_recovered.status, "queued");
         assert!(queued_recovered.runner_id.is_none());
+
+        let first_runner = crate::models::Runner::new(
+            "lease-fence-first".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        let second_runner = crate::models::Runner::new(
+            "lease-fence-second".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        RunnerQueries::create(&pool, &first_runner).await.unwrap();
+        RunnerQueries::create(&pool, &second_runner).await.unwrap();
+        let lease_job = crate::models::Job::new(run.id, "lease-fenced".to_string());
+        JobQueries::create(&pool, &lease_job).await.unwrap();
+        assert!(
+            JobQueries::assign_with_lease(&pool, lease_job.id, first_runner.id, "first-lease")
+                .await
+                .unwrap()
+        );
+        assert!(!JobQueries::assign_with_lease(
+            &pool,
+            lease_job.id,
+            second_runner.id,
+            "second-lease"
+        )
+        .await
+        .unwrap());
+        assert!(!JobQueries::complete_with_lease(
+            &pool,
+            lease_job.id,
+            second_runner.id,
+            "second-lease",
+            "succeeded",
+            "{}"
+        )
+        .await
+        .unwrap());
+        assert!(JobQueries::complete_with_lease(
+            &pool,
+            lease_job.id,
+            first_runner.id,
+            "first-lease",
+            "succeeded",
+            "{}"
+        )
+        .await
+        .unwrap());
+        assert!(!JobQueries::complete_with_lease(
+            &pool,
+            lease_job.id,
+            first_runner.id,
+            "first-lease",
+            "succeeded",
+            "{}"
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]
