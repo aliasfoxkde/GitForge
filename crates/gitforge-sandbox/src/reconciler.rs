@@ -125,7 +125,8 @@ impl Default for ReconcilerPolicy {
 }
 
 impl ReconcilerPolicy {
-    /// Fail-closed validation: grace must be positive.
+    /// Fail-closed validation: all timing and blast-radius limits must be
+    /// positive.
     pub fn validate(&self) -> Result<()> {
         if self.grace.is_zero() {
             return Err(Error::sandbox(
@@ -135,6 +136,11 @@ impl ReconcilerPolicy {
         if self.max_removals == 0 {
             return Err(Error::sandbox(
                 "reconciler policy rejected: max_removals must be positive",
+            ));
+        }
+        if self.call_timeout.is_zero() {
+            return Err(Error::sandbox(
+                "reconciler policy rejected: call timeout must be positive",
             ));
         }
         Ok(())
@@ -749,6 +755,15 @@ mod tests {
         assert_eq!(report.removed, 0);
         assert_eq!(report.eligible, 0);
         assert!(source.removed_ids().is_empty());
+    }
+
+    #[test]
+    fn policy_rejects_zero_call_timeout() {
+        let policy = ReconcilerPolicy {
+            call_timeout: Duration::ZERO,
+            ..policy()
+        };
+        assert!(policy.validate().is_err());
     }
 
     #[tokio::test]

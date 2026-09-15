@@ -50,9 +50,14 @@ Safely discover and, only under explicit policy, remove GitForge-owned Docker co
 | Receipt safety | JSON schema/path/error tests and secret scan |
 | Full quality | Fedora GitForge lane, strict lint, Aegis, and independent review green |
 
-## Known candidate defects
+## Review findings still requiring closure
 
-The preserved candidate initially failed compilation and had a mutex deadlock in its mock; those were repaired for review. It still substitutes creation time for exit time, declares but does not enforce `call_timeout`, lacks clearly owned task cancellation, and suppresses receipt write errors. These are acceptance blockers, not tasks to waive.
+The candidate's initial compilation, mock deadlock, exit-time, timeout, task
+ownership, and receipt-observability defects have been repaired in the current
+branch. Independent review still requires explicit CI execution of the runtime
+canary, persisted-receipt and restart-recovery coverage, rejection of a zero
+`call_timeout`, a deletion-enabled receipt guard, and a race-safe active-job
+snapshot. These are acceptance blockers, not tasks to waive.
 
 ## Resource and rollback policy
 

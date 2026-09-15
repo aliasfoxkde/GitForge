@@ -781,6 +781,13 @@ impl RunnerAgent {
             Err(_) => None,
         };
 
+        if deletion_enabled && receipt_path.is_none() {
+            tracing::error!(
+                "abandoned-container reconciler NOT started: deletion requires a receipt path"
+            );
+            return;
+        }
+
         let policy = ReconcilerPolicy {
             deletion_enabled,
             grace: Duration::from_secs(grace_secs),
