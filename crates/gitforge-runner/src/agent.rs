@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::{AbortHandle, JoinHandle};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, Instant};
 
 /// Runner configuration
 #[derive(Clone)]
@@ -752,6 +752,15 @@ impl RunnerAgent {
     /// If force is true, cancel all running jobs immediately.
     /// Otherwise, wait for jobs to complete gracefully.
     pub async fn stop(&self, force: bool) {
+        let _ = self.stop_with_timeout(force, Duration::from_secs(30)).await;
+    }
+
+    /// Stop the runner and bound how long shutdown may wait for owned tasks.
+    ///
+    /// Returns `true` only when every owned task settled before the deadline.
+    /// When the deadline expires, remaining handles are explicitly aborted and
+    /// observed so they are never silently detached.
+    pub async fn stop_with_timeout(&self, force: bool, timeout: Duration) -> bool {
         *self.is_running.write().await = false;
         self.abort_control_tasks().await;
 
@@ -760,31 +769,58 @@ impl RunnerAgent {
             self.executor.cancel_all_jobs().await;
         }
 
-        self.join_background_tasks().await;
+        let settled = self.join_background_tasks_until(timeout).await;
 
         let runner_id = self
             .runner
             .as_ref()
             .map(|r| r.id.to_string())
             .unwrap_or_default();
-        tracing::info!("runner {} stopped", runner_id);
+        tracing::info!(runner_id = %runner_id, settled, "runner stopped");
+        settled
     }
 
-    /// Join every task owned by this runner, including tasks raced in during
-    /// fetch-loop shutdown. Handles are drained in rounds so the fetch loop
-    /// can settle before its final job handles are joined.
-    async fn join_background_tasks(&self) {
+    /// Join every task owned by this runner until the monotonic deadline.
+    async fn join_background_tasks_until(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut settled = true;
         loop {
             let handles = {
                 let mut owned = self.background_tasks.lock().await;
                 std::mem::take(&mut *owned)
             };
             if handles.is_empty() {
-                return;
+                return settled;
             }
-            for handle in handles {
-                if let Err(error) = handle.await {
-                    tracing::warn!("owned runner task failed during shutdown: {}", error);
+            for mut handle in handles {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    handle.abort();
+                    let _ = handle.await;
+                    settled = false;
+                    continue;
+                }
+                tokio::select! {
+                    result = &mut handle => {
+                        if let Err(error) = result {
+                            tracing::warn!("owned runner task failed during shutdown: {}", error);
+                        }
+                    }
+                    _ = tokio::time::sleep(remaining) => {
+                        handle.abort();
+                        let _ = handle.await;
+                        settled = false;
+                    }
+                }
+                if !settled {
+                    tracing::warn!(
+                        "runner shutdown deadline reached; remaining tasks are being aborted"
+                    );
+                }
+                if !settled {
+                    // The current handle was aborted above; subsequent
+                    // handles are also explicitly aborted without waiting.
+                    continue;
                 }
             }
         }
