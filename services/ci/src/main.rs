@@ -41,6 +41,11 @@ type PipelineRegistry = HashMap<gitforge_common::PipelineRunId, Arc<CiEngine>>;
 /// Path of the pipeline definition inside a repository checkout.
 const PIPELINE_CONFIG_PATH: &str = ".gitforce.yml";
 
+/// How often the job timeout watchdog sweeps the durable rows for jobs whose
+/// `started_at + timeout_secs` deadline has elapsed, and drives the matching
+/// live engines to the same terminal state.
+const JOB_TIMEOUT_SWEEP_SECS: u64 = 60;
+
 struct TriggerState {
     event_bus: Arc<dyn EventBus>,
     workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
@@ -224,94 +229,97 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Start runner-loss detection loop: check for stale runners and re-enqueue their jobs
-    let runner_loss_scheduler = scheduler_arc.clone();
-    let runner_loss_shutdown = shutdown.clone();
-    let _runner_loss_handle = tokio::spawn(async move {
-        // Runner is considered stale if no heartbeat for 90 seconds (3x the 30s interval)
-        let stale_threshold_secs: i64 = 90;
-        let check_interval = Duration::from_secs(30);
+    // NOTE on runner loss: no dedicated detection loop is needed here.
+    // `Scheduler::process_queue` (the 5 s tick above) already calls
+    // `mark_stale_runners_offline`, which both marks heartbeats-lost runners
+    // offline and re-enqueues their jobs for other runners. A second loop
+    // previously duplicated the mark step around a requeue branch that was
+    // hardcoded to never fire.
 
-        let mut ticker = tokio::time::interval(check_interval);
+    // Job timeout watchdog. The durable rows are the expiry authority:
+    // `reconcile_expired` reaps `running` rows whose started_at + timeout_secs
+    // has elapsed, then each live engine is driven to the same terminal truth
+    // and finalized exactly like a reported completion. Without this sweep a
+    // hung job is stuck forever — a runner whose container died can hold a
+    // healthy heartbeat for hours while its job never reports, the recovery
+    // path only reconciles once at startup, and the orphan-run finalizer
+    // skips any run that still has unfinished jobs.
+    let watchdog_db = scheduler_db.clone();
+    let watchdog_registry = pipeline_registry.clone();
+    let watchdog_workspaces = run_workspace_paths.clone();
+    let watchdog_shutdown = shutdown.clone();
+    let _timeout_handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(JOB_TIMEOUT_SWEEP_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if runner_loss_shutdown.load(Ordering::SeqCst) {
+                    if watchdog_shutdown.load(Ordering::SeqCst) {
                         break;
                     }
+                    let Some(pool) = &watchdog_db else { continue };
 
-                    // Mark stale runners as offline
-                    let marked = runner_loss_scheduler.mark_stale_runners_offline(stale_threshold_secs).await;
-                    if marked > 0 {
-                        tracing::info!("marked {} stale runners as offline", marked);
-                    }
-
-                    // Get list of offline runners and re-enqueue their jobs
-                    // We need to check which runners are now offline and requeue
-                    let assigned_jobs = runner_loss_scheduler.get_assigned_jobs().await;
-                    for (_job_id, runner_id, _pipeline_run_id) in assigned_jobs {
-                        // Check if the runner for this job assignment is now offline
-                        // by looking at the runner's current status
-                        let runner_offline = {
-                            // This is a simplified check - in production we'd track this properly
-                            // For now we rely on mark_stale_runners_offline having already
-                            // updated runner statuses
-                            false // Will be handled via the scheduler's internal tracking
-                        };
-                        if runner_offline {
-                            let requeued = runner_loss_scheduler.requeue_jobs_for_offline_runner(runner_id).await;
-                            tracing::warn!("re-enqueued {} jobs after runner {} went offline", requeued, runner_id);
+                    match gitforge_db::queries::JobQueries::reconcile_expired(pool).await {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            tracing::warn!(count, "watchdog reaped jobs past their timeout");
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "watchdog failed to reconcile expired jobs");
+                            continue;
                         }
                     }
-                }
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if runner_loss_shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-                }
-            }
-        }
-        tracing::info!("runner-loss detection loop shutting down");
-    });
 
-    // Start job timeout monitoring loop
-    let timeout_registry = pipeline_registry.clone();
-    let timeout_shutdown = shutdown.clone();
-    let _timeout_handle = tokio::spawn(async move {
-        // Check for stale running jobs every 60 seconds
-        let check_interval = Duration::from_secs(60);
-        let mut ticker = tokio::time::interval(check_interval);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    if timeout_shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    let registry = timeout_registry.read().await;
-                    for (run_id, engine) in registry.iter() {
-                        let state = engine.state().await;
-                        for (job_id, job_state) in state.jobs.iter() {
-                            if job_state.status() == gitforge_common::JobStatus::Running {
-                                // Check if job has been running too long
-                                // Note: we'd need started_at in the job state to do this properly
-                                // For now, this is a placeholder that would need the full job tracking
-                                tracing::debug!(
-                                    "job {} in pipeline {} has been running since state capture",
-                                    job_id, run_id
-                                );
+                    let live_run_ids: Vec<gitforge_common::PipelineRunId> =
+                        watchdog_registry.read().await.keys().copied().collect();
+                    for run_id in live_run_ids {
+                        let engine = watchdog_registry.read().await.get(&run_id).cloned();
+                        let Some(engine) = engine else { continue };
+                        let jobs = match gitforge_db::queries::JobQueries::list_by_run(pool, run_id)
+                            .await
+                        {
+                            Ok(jobs) => jobs,
+                            Err(error) => {
+                                tracing::error!(%error, run = %run_id, "watchdog failed to list run jobs");
+                                continue;
+                            }
+                        };
+                        for job in jobs.iter().filter(|job| job.status == "timed_out") {
+                            // Only drive the engine mirror forward; re-running
+                            // against an already-terminal job would log a
+                            // spurious invalid-transition error every sweep.
+                            if engine
+                                .get_job(job.id)
+                                .await
+                                .is_some_and(|state| !state.is_terminal())
+                            {
+                                if let Err(error) = engine.timeout_job(job.id).await {
+                                    tracing::error!(
+                                        %error,
+                                        job = %job.id,
+                                        run = %run_id,
+                                        "watchdog failed to time out job"
+                                    );
+                                }
                             }
                         }
+                        finalize_run_if_terminal(
+                            &engine,
+                            Some(pool),
+                            &watchdog_workspaces,
+                            &watchdog_registry,
+                        )
+                        .await;
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if timeout_shutdown.load(Ordering::SeqCst) {
+                    if watchdog_shutdown.load(Ordering::SeqCst) {
                         break;
                     }
                 }
             }
         }
-        tracing::info!("job timeout monitoring loop shutting down");
+        tracing::info!("job timeout watchdog shutting down");
     });
 
     tracing::info!("CI Orchestrator initialized successfully");
@@ -851,7 +859,13 @@ async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
             "cancelled"
         } else if jobs.iter().any(|job| job.status == "cancelled") {
             "cancelled"
-        } else if jobs.iter().any(|job| job.status == "failed") {
+        } else if jobs
+            .iter()
+            .any(|job| job.status == "failed" || job.status == "timed_out")
+        {
+            // A watchdog-reaped job dooms the run just like a reported
+            // failure; grading it `succeeded` here would publish a green
+            // run whose job never finished.
             "failed"
         } else {
             "succeeded"
@@ -1388,37 +1402,60 @@ async fn run_scheduler_event_consumer(
             }
         }
 
-        let terminal_status = match state.status {
-            PipelineStatus::Succeeded => Some("succeeded"),
-            PipelineStatus::Failed => Some("failed"),
-            PipelineStatus::Cancelled => Some("cancelled"),
-            _ => None,
-        };
-        if let Some(terminal_status) = terminal_status {
-            if let Some(pool) = &scheduler_db {
-                let _ = gitforge_db::queries::PipelineRunQueries::update_status(
-                    pool,
-                    state.run_id,
-                    terminal_status,
-                )
-                .await;
-            }
-            let workspace_path = run_workspace_paths
-                .lock()
-                .expect("workspace cache lock poisoned")
-                .remove(&state.run_id)
-                .flatten();
-            // Free the checkout once nothing references it. Spawned so a
-            // large delete cannot stall completion processing for other
-            // runs; removal only ever targets the run-owned directory.
-            let root = workspace_root();
-            let run_id = state.run_id;
-            tokio::spawn(async move {
-                remove_run_workspace_dir(&root, run_id, workspace_path.as_deref()).await;
-            });
-            pipeline_registry.write().await.remove(&state.run_id);
-        }
+        // No-op until every job in the run is terminal; see
+        // `finalize_run_if_terminal`.
+        finalize_run_if_terminal(
+            &engine,
+            scheduler_db.as_ref(),
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await;
     }
+}
+
+/// Finalize `engine`'s run once it has reached a terminal status: persist the
+/// status, free the run's workspace, and evict the engine from the registry.
+/// Shared by the completion consumer and the timeout watchdog so a job reaped
+/// by the watchdog finalizes exactly like one reported by a runner. Runs that
+/// are not terminal yet are left untouched.
+async fn finalize_run_if_terminal(
+    engine: &CiEngine,
+    scheduler_db: Option<&gitforge_db::Pool>,
+    run_workspace_paths: &Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
+    pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
+) {
+    let state = engine.state().await;
+    let terminal_status = match state.status {
+        PipelineStatus::Succeeded => Some("succeeded"),
+        PipelineStatus::Failed => Some("failed"),
+        PipelineStatus::Cancelled => Some("cancelled"),
+        _ => return,
+    };
+    if let Some(pool) = scheduler_db {
+        let _ = gitforge_db::queries::PipelineRunQueries::update_status(
+            pool,
+            state.run_id,
+            terminal_status,
+        )
+        .await;
+    }
+    let workspace_path = run_workspace_paths
+        .lock()
+        .expect("workspace cache lock poisoned")
+        .remove(&state.run_id)
+        .flatten();
+    // Free the checkout once nothing references it. Spawned so a large delete
+    // cannot stall completion processing for other runs; removal only ever
+    // targets the run-owned directory.
+    let root = workspace_root();
+    let run_id = state.run_id;
+    tokio::spawn(async move {
+        remove_run_workspace_dir(&root, run_id, workspace_path.as_deref()).await;
+    });
+    pipeline_registry.write().await.remove(&state.run_id);
 }
 
 /// Create a trigger event from push payload (extracted for testability)
@@ -1985,6 +2022,9 @@ mod tests {
         seed_job(&pool, mixed_failed, "lint", "succeeded").await;
         seed_job(&pool, mixed_failed, "test", "failed").await;
 
+        let watchdog_reaped = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, watchdog_reaped, "lint", "timed_out").await;
+
         let cancelled_job = seed_run(&pool, repo_id, pipeline_id, "running").await;
         seed_job(&pool, cancelled_job, "lint", "cancelled").await;
 
@@ -2006,6 +2046,11 @@ mod tests {
             "any failed job must finalize the run as failed"
         );
         assert_eq!(
+            run_status(&pool, watchdog_reaped).await,
+            "failed",
+            "a watchdog-reaped job dooms the run; it must not grade succeeded"
+        );
+        assert_eq!(
             run_status(&pool, cancelled_job).await,
             "cancelled",
             "a cancelled job must finalize the run as cancelled"
@@ -2020,7 +2065,7 @@ mod tests {
             "running",
             "runs with unfinished jobs belong to scheduler recovery, not reconciliation"
         );
-        assert_eq!(finalized, 4, "only the orphaned runs are finalized");
+        assert_eq!(finalized, 5, "only the orphaned runs are finalized");
 
         // Reconciliation is idempotent: a second pass finds nothing stranded.
         assert_eq!(reconcile_orphaned_runs(&pool).await, 0);
