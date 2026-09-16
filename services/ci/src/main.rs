@@ -22,11 +22,11 @@ use gitforge_events::{
     PushReceivedPayload,
 };
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
+use gitforge_scheduler::assigner::JobExecutionDefinition;
 use gitforge_scheduler::{
     assigner::DEFAULT_JOB_TIMEOUT_SECS, create_state_with_artifact_storage, scheduler_routes,
     Scheduler, SchedulerEvent,
 };
-use gitforge_scheduler::assigner::JobExecutionDefinition;
 use gitforge_storage::FileStorage;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1493,9 +1493,9 @@ async fn finalize_run_if_terminal(
 ) {
     let state = engine.state().await;
     let terminal_status = match state.status {
-        PipelineStatus::Succeeded => Some("succeeded"),
-        PipelineStatus::Failed => Some("failed"),
-        PipelineStatus::Cancelled => Some("cancelled"),
+        PipelineStatus::Succeeded => "succeeded",
+        PipelineStatus::Failed => "failed",
+        PipelineStatus::Cancelled => "cancelled",
         _ => return,
     };
     if let Some(pool) = scheduler_db {
