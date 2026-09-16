@@ -1015,6 +1015,28 @@ impl JobQueries {
         Ok(())
     }
 
+    /// Grade a running job as failed after its runner was lost.
+    ///
+    /// Runner-loss handling must never requeue a `running` row: the original
+    /// sandbox may still be executing, and a second execution of the same job
+    /// would race it (duplicate containers, duelling log appends, rejected
+    /// completions). Fencing the row as failed matches the recovery contract
+    /// of `requeue_inflight` for running rows and lets the pipeline finalize
+    /// deterministically; the abandoned-container reconciler collects the
+    /// orphaned sandbox after its grace period.
+    pub async fn fail_lost(pool: &Pool, id: JobId) -> Result<()> {
+        sqlx::query(
+            "UPDATE jobs SET status = 'failed', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE id = ? AND status = 'running'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(r#"{"status":"failed","reason":"runner_lost_while_running"}"#)
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to fence lost job: {}", e)))?;
+        Ok(())
+    }
+
     /// Persist the executable definition for a job. This is intentionally
     /// separate from status transitions so queueing remains idempotent.
     pub async fn set_definition(
