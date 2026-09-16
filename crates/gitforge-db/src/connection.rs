@@ -154,6 +154,30 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create pipelines table: {}", e)))?;
 
+        // Older installations created pipelines before revision history was
+        // modeled. Add the column idempotently so the current schema and the
+        // active-revision uniqueness rule work on both fresh and upgraded DBs.
+        if let Err(error) =
+            sqlx::query("ALTER TABLE pipelines ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(Error::database(format!(
+                    "failed to migrate pipelines table: {}",
+                    error
+                )));
+            }
+        }
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pipelines_active_repo_name ON pipelines(repo_id, name) WHERE active = 1",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create active pipeline index: {}", e)))?;
+
         // Create pipeline_runs table
         sqlx::query(
             r#"

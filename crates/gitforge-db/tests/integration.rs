@@ -139,6 +139,115 @@ async fn test_database_pipeline_with_dependencies() {
 }
 
 #[tokio::test]
+async fn test_database_pipeline_replacement_retains_history() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let user = User::new(
+        "replace-owner".to_string(),
+        "replace@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "replace-repo".to_string(),
+        user.id,
+        "/git/replace-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+    let pipeline = |id: PipelineId| Pipeline {
+        id,
+        repo_id: repo.id,
+        name: "gates".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+
+    PipelineQueries::replace_active(&pool, &pipeline(PipelineId::new()))
+        .await
+        .unwrap();
+    PipelineQueries::replace_active(&pool, &pipeline(PipelineId::new()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        PipelineQueries::count_active(&pool, repo.id, "gates")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        PipelineQueries::list_by_repo(&pool, repo.id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn test_database_pipeline_replacement_serializes_concurrent_writes() {
+    let db_path = format!(
+        "/nas/Temp/work/gitforge-db-concurrency-{}.db",
+        PipelineId::new()
+    );
+    let pool_one = Pool::new(&format!("sqlite:{}?mode=rwc", db_path))
+        .await
+        .unwrap();
+    pool_one.migrate().await.unwrap();
+    let pool_two = Pool::new(&format!("sqlite:{}?mode=rwc", db_path))
+        .await
+        .unwrap();
+
+    let user = User::new(
+        "concurrent-owner".to_string(),
+        "concurrent@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool_one, &user).await.unwrap();
+    let repo = Repository::new(
+        "concurrent-repo".to_string(),
+        user.id,
+        "/git/concurrent-repo".to_string(),
+    );
+    RepoQueries::create(&pool_one, &repo).await.unwrap();
+    let pipeline = |id: PipelineId| Pipeline {
+        id,
+        repo_id: repo.id,
+        name: "gates".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+
+    let first_pipeline = pipeline(PipelineId::new());
+    let second_pipeline = pipeline(PipelineId::new());
+    let (first, second) = tokio::join!(
+        PipelineQueries::replace_active(&pool_one, &first_pipeline),
+        PipelineQueries::replace_active(&pool_two, &second_pipeline),
+    );
+    first.unwrap();
+    second.unwrap();
+
+    assert_eq!(
+        PipelineQueries::count_active(&pool_one, repo.id, "gates")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        PipelineQueries::list_by_repo(&pool_one, repo.id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    drop(pool_two);
+    drop(pool_one);
+    std::fs::remove_file(db_path).unwrap();
+}
+
+#[tokio::test]
 async fn test_database_event_storage() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();

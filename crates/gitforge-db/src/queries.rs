@@ -604,6 +604,63 @@ impl PipelineQueries {
         Ok(())
     }
 
+    /// Replace the active pipeline revision atomically while retaining history.
+    /// Concurrent push handlers must not both retire the predecessor and then
+    /// race to insert an active revision under the partial unique index.
+    pub async fn replace_active(pool: &Pool, pipeline: &crate::models::Pipeline) -> Result<()> {
+        let mut connection = pool.pool().acquire().await.map_err(|error| {
+            Error::database(format!("failed to acquire pipeline connection: {}", error))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| {
+                Error::database(format!("failed to begin pipeline replacement: {}", error))
+            })?;
+
+        let replacement = async {
+            sqlx::query(
+                "UPDATE pipelines SET active = 0 WHERE repo_id = ? AND name = ? AND active = 1",
+            )
+            .bind(pipeline.repo_id.to_string())
+            .bind(&pipeline.name)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "INSERT INTO pipelines (id, repo_id, name, trigger_type, config, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(pipeline.id.to_string())
+            .bind(pipeline.repo_id.to_string())
+            .bind(&pipeline.name)
+            .bind(&pipeline.trigger_type)
+            .bind(pipeline.config.to_string())
+            .bind(pipeline.created_at.to_rfc3339())
+            .execute(&mut *connection)
+            .await?;
+            Ok::<(), sqlx::Error>(())
+        }
+        .await;
+
+        match replacement {
+            Ok(()) => {
+                sqlx::query("COMMIT")
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(|error| {
+                        Error::database(format!("failed to commit pipeline replacement: {}", error))
+                    })?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(Error::database(format!(
+                    "failed to replace active pipeline: {}",
+                    error
+                )))
+            }
+        }
+    }
+
     /// Get a pipeline by ID
     pub async fn get(pool: &Pool, id: PipelineId) -> Result<Option<crate::models::Pipeline>> {
         let row = sqlx::query("SELECT * FROM pipelines WHERE id = ?")
@@ -636,6 +693,19 @@ impl PipelineQueries {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(pipelines)
+    }
+
+    /// Count active revisions for a repository and pipeline name.
+    pub async fn count_active(pool: &Pool, repo_id: RepoId, name: &str) -> Result<i64> {
+        let (count,) = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM pipelines WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind(repo_id.to_string())
+        .bind(name)
+        .fetch_one(pool.pool())
+        .await
+        .map_err(|error| Error::database(format!("failed to count active pipelines: {}", error)))?;
+        Ok(count)
     }
 
     /// List all pipelines

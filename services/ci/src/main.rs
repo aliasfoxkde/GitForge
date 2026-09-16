@@ -22,11 +22,11 @@ use gitforge_events::{
     PushReceivedPayload,
 };
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
+use gitforge_scheduler::assigner::JobExecutionDefinition;
 use gitforge_scheduler::{
     assigner::DEFAULT_JOB_TIMEOUT_SECS, create_state_with_artifact_storage, scheduler_routes,
     Scheduler, SchedulerEvent,
 };
-use gitforge_scheduler::assigner::JobExecutionDefinition;
 use gitforge_storage::FileStorage;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1253,7 +1253,10 @@ async fn handle_push_event(
             config: serde_json::to_value(&pipeline)?,
             created_at: Utc::now(),
         };
-        gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
+        // Push delivery can overlap. Replace the active revision and retain
+        // superseded history in one SQLite critical section so concurrent
+        // handlers cannot race on the active-pipeline index.
+        gitforge_db::queries::PipelineQueries::replace_active(pool, &db_pipeline).await?;
 
         let mut db_run = DbPipelineRun::new(
             pipeline_id,
