@@ -22,11 +22,14 @@ use gitforge_events::{
     PushReceivedPayload,
 };
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
+use gitforge_scheduler::assigner::JobExecutionDefinition;
 use gitforge_scheduler::{
-    create_state_with_artifact_storage, scheduler_routes, Scheduler, SchedulerEvent,
+    assigner::DEFAULT_JOB_TIMEOUT_SECS, create_state_with_artifact_storage, scheduler_routes,
+    Scheduler, SchedulerEvent,
 };
 use gitforge_storage::FileStorage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +41,11 @@ type PipelineRegistry = HashMap<gitforge_common::PipelineRunId, Arc<CiEngine>>;
 
 /// Path of the pipeline definition inside a repository checkout.
 const PIPELINE_CONFIG_PATH: &str = ".gitforce.yml";
+
+/// How often the job timeout watchdog sweeps the durable rows for jobs whose
+/// `started_at + timeout_secs` deadline has elapsed, and drives the matching
+/// live engines to the same terminal state.
+const JOB_TIMEOUT_SWEEP_SECS: u64 = 60;
 
 struct TriggerState {
     event_bus: Arc<dyn EventBus>,
@@ -83,24 +91,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("GITFORGE_DATABASE_URL is unset; scheduler state is in-memory only");
         (Scheduler::new(), None)
     };
-
-    // Recover runs stranded non-terminal by a previous process lifetime, then
-    // reclaim workspaces of already-terminal runs. Spawned so a large sweep
-    // cannot delay startup; it only ever touches run-owned directories of
-    // terminal runs, never the checkout of a run the scheduler may requeue.
-    if let Some(pool) = &scheduler_db {
-        let sweep_pool = pool.clone();
-        tokio::spawn(async move {
-            let finalized = reconcile_orphaned_runs(&sweep_pool).await;
-            if finalized > 0 {
-                tracing::info!(finalized, "startup run reconciliation complete");
-            }
-            let removed = sweep_terminal_workspaces(&sweep_pool).await;
-            if removed > 0 {
-                tracing::info!(removed, "startup workspace sweep complete");
-            }
-        });
-    }
 
     // Start scheduler HTTP API server on port 42781
     let scheduler_port: u16 = std::env::var("SCHEDULER_PORT")
@@ -164,6 +154,29 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let pipeline_registry_clone = pipeline_registry.clone();
 
+    // Recover runs stranded non-terminal by a previous process lifetime,
+    // reclaim workspaces of already-terminal runs, then keep reconciling
+    // periodically so runs stranded while running are finalized without
+    // waiting for the next restart. Spawned so a large sweep cannot delay
+    // startup; reconciliation only touches runs no live engine owns, and
+    // the sweep only ever touches run-owned directories of terminal runs,
+    // never the checkout of a run the scheduler may requeue.
+    if let Some(pool) = &scheduler_db {
+        let sweep_pool = pool.clone();
+        let reconcile_registry = pipeline_registry.clone();
+        tokio::spawn(async move {
+            let finalized = reconcile_orphaned_runs(&sweep_pool).await;
+            if finalized > 0 {
+                tracing::info!(finalized, "startup run reconciliation complete");
+            }
+            let removed = sweep_terminal_workspaces(&sweep_pool).await;
+            if removed > 0 {
+                tracing::info!(removed, "startup workspace sweep complete");
+            }
+            run_reconciliation_loop(sweep_pool, reconcile_registry).await;
+        });
+    }
+
     // Shared shutdown flag
     let shutdown = create_shutdown_flag();
     let shutdown_flag = shutdown.clone();
@@ -222,94 +235,97 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Start runner-loss detection loop: check for stale runners and re-enqueue their jobs
-    let runner_loss_scheduler = scheduler_arc.clone();
-    let runner_loss_shutdown = shutdown.clone();
-    let _runner_loss_handle = tokio::spawn(async move {
-        // Runner is considered stale if no heartbeat for 90 seconds (3x the 30s interval)
-        let stale_threshold_secs: i64 = 90;
-        let check_interval = Duration::from_secs(30);
+    // NOTE on runner loss: no dedicated detection loop is needed here.
+    // `Scheduler::process_queue` (the 5 s tick above) already calls
+    // `mark_stale_runners_offline`, which both marks heartbeats-lost runners
+    // offline and re-enqueues their jobs for other runners. A second loop
+    // previously duplicated the mark step around a requeue branch that was
+    // hardcoded to never fire.
 
-        let mut ticker = tokio::time::interval(check_interval);
+    // Job timeout watchdog. The durable rows are the expiry authority:
+    // `reconcile_expired` reaps `running` rows whose started_at + timeout_secs
+    // has elapsed, then each live engine is driven to the same terminal truth
+    // and finalized exactly like a reported completion. Without this sweep a
+    // hung job is stuck forever — a runner whose container died can hold a
+    // healthy heartbeat for hours while its job never reports, the recovery
+    // path only reconciles once at startup, and the orphan-run finalizer
+    // skips any run that still has unfinished jobs.
+    let watchdog_db = scheduler_db.clone();
+    let watchdog_registry = pipeline_registry.clone();
+    let watchdog_workspaces = run_workspace_paths.clone();
+    let watchdog_shutdown = shutdown.clone();
+    let _timeout_handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(JOB_TIMEOUT_SWEEP_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if runner_loss_shutdown.load(Ordering::SeqCst) {
+                    if watchdog_shutdown.load(Ordering::SeqCst) {
                         break;
                     }
+                    let Some(pool) = &watchdog_db else { continue };
 
-                    // Mark stale runners as offline
-                    let marked = runner_loss_scheduler.mark_stale_runners_offline(stale_threshold_secs).await;
-                    if marked > 0 {
-                        tracing::info!("marked {} stale runners as offline", marked);
-                    }
-
-                    // Get list of offline runners and re-enqueue their jobs
-                    // We need to check which runners are now offline and requeue
-                    let assigned_jobs = runner_loss_scheduler.get_assigned_jobs().await;
-                    for (_job_id, runner_id, _pipeline_run_id) in assigned_jobs {
-                        // Check if the runner for this job assignment is now offline
-                        // by looking at the runner's current status
-                        let runner_offline = {
-                            // This is a simplified check - in production we'd track this properly
-                            // For now we rely on mark_stale_runners_offline having already
-                            // updated runner statuses
-                            false // Will be handled via the scheduler's internal tracking
-                        };
-                        if runner_offline {
-                            let requeued = runner_loss_scheduler.requeue_jobs_for_offline_runner(runner_id).await;
-                            tracing::warn!("re-enqueued {} jobs after runner {} went offline", requeued, runner_id);
+                    match gitforge_db::queries::JobQueries::reconcile_expired(pool).await {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            tracing::warn!(count, "watchdog reaped jobs past their timeout");
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "watchdog failed to reconcile expired jobs");
+                            continue;
                         }
                     }
-                }
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if runner_loss_shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-                }
-            }
-        }
-        tracing::info!("runner-loss detection loop shutting down");
-    });
 
-    // Start job timeout monitoring loop
-    let timeout_registry = pipeline_registry.clone();
-    let timeout_shutdown = shutdown.clone();
-    let _timeout_handle = tokio::spawn(async move {
-        // Check for stale running jobs every 60 seconds
-        let check_interval = Duration::from_secs(60);
-        let mut ticker = tokio::time::interval(check_interval);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    if timeout_shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    let registry = timeout_registry.read().await;
-                    for (run_id, engine) in registry.iter() {
-                        let state = engine.state().await;
-                        for (job_id, job_state) in state.jobs.iter() {
-                            if job_state.status() == gitforge_common::JobStatus::Running {
-                                // Check if job has been running too long
-                                // Note: we'd need started_at in the job state to do this properly
-                                // For now, this is a placeholder that would need the full job tracking
-                                tracing::debug!(
-                                    "job {} in pipeline {} has been running since state capture",
-                                    job_id, run_id
-                                );
+                    let live_run_ids: Vec<gitforge_common::PipelineRunId> =
+                        watchdog_registry.read().await.keys().copied().collect();
+                    for run_id in live_run_ids {
+                        let engine = watchdog_registry.read().await.get(&run_id).cloned();
+                        let Some(engine) = engine else { continue };
+                        let jobs = match gitforge_db::queries::JobQueries::list_by_run(pool, run_id)
+                            .await
+                        {
+                            Ok(jobs) => jobs,
+                            Err(error) => {
+                                tracing::error!(%error, run = %run_id, "watchdog failed to list run jobs");
+                                continue;
+                            }
+                        };
+                        for job in jobs.iter().filter(|job| job.status == "timed_out") {
+                            // Only drive the engine mirror forward; re-running
+                            // against an already-terminal job would log a
+                            // spurious invalid-transition error every sweep.
+                            if engine
+                                .get_job(job.id)
+                                .await
+                                .is_some_and(|state| !state.is_terminal())
+                            {
+                                if let Err(error) = engine.timeout_job(job.id).await {
+                                    tracing::error!(
+                                        %error,
+                                        job = %job.id,
+                                        run = %run_id,
+                                        "watchdog failed to time out job"
+                                    );
+                                }
                             }
                         }
+                        finalize_run_if_terminal(
+                            &engine,
+                            Some(pool),
+                            &watchdog_workspaces,
+                            &watchdog_registry,
+                        )
+                        .await;
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if timeout_shutdown.load(Ordering::SeqCst) {
+                    if watchdog_shutdown.load(Ordering::SeqCst) {
                         break;
                     }
                 }
             }
         }
-        tracing::info!("job timeout monitoring loop shutting down");
+        tracing::info!("job timeout watchdog shutting down");
     });
 
     tracing::info!("CI Orchestrator initialized successfully");
@@ -630,6 +646,98 @@ fn workspace_roots() -> Vec<std::path::PathBuf> {
     vec![workspace_root()]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerBackend {
+    Docker,
+    Podman,
+}
+
+fn container_backend_from_env() -> Result<ContainerBackend, String> {
+    match std::env::var("GITFORGE_CONTAINER_BACKEND") {
+        Ok(value) if value.eq_ignore_ascii_case("docker") => Ok(ContainerBackend::Docker),
+        Ok(value) if value.eq_ignore_ascii_case("podman") => Ok(ContainerBackend::Podman),
+        Ok(value) => Err(format!(
+            "GITFORGE_CONTAINER_BACKEND must be `docker` or `podman`, got `{value}`"
+        )),
+        Err(std::env::VarError::NotPresent) => Err(
+            "GITFORGE_CONTAINER_BACKEND is unset; refusing container-assisted workspace cleanup"
+                .to_string(),
+        ),
+        Err(std::env::VarError::NotUnicode(_)) => Err(
+            "GITFORGE_CONTAINER_BACKEND is not valid UTF-8; refusing container-assisted workspace cleanup"
+                .to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CleanupCommand {
+    program: &'static str,
+    args: Vec<OsString>,
+}
+
+fn cleanup_command(backend: ContainerBackend, workspace: &std::path::Path) -> CleanupCommand {
+    match backend {
+        ContainerBackend::Podman => CleanupCommand {
+            program: "podman",
+            args: ["unshare", "rm", "-rf", "--"]
+                .into_iter()
+                .map(OsString::from)
+                .chain(std::iter::once(workspace.as_os_str().to_os_string()))
+                .collect(),
+        },
+        ContainerBackend::Docker => {
+            // Mount the trusted parent and remove only the validated run
+            // directory from inside the container. No shell is involved, and
+            // the container cannot follow a path outside this bind mount.
+            let parent = workspace
+                .parent()
+                .expect("validated run workspace always has a parent");
+            let name = workspace
+                .file_name()
+                .expect("validated run workspace always has a name");
+            CleanupCommand {
+                program: "docker",
+                args: [
+                    "run",
+                    "--rm",
+                    "--user",
+                    "0:0",
+                    "--mount",
+                    &format!(
+                        "type=bind,src={},dst=/gitforge-cleanup-parent",
+                        parent.display()
+                    ),
+                    "alpine",
+                    "rm",
+                    "-rf",
+                    "--",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .chain(std::iter::once(
+                    std::path::Path::new("/gitforge-cleanup-parent")
+                        .join(name)
+                        .into_os_string(),
+                ))
+                .collect(),
+            }
+        }
+    }
+}
+
+async fn run_cleanup_command(command: CleanupCommand) -> Option<std::process::Output> {
+    timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new(command.program)
+            .args(command.args)
+            .output(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+}
+
 /// Delete a run's workspace directory. Only directories GitForge itself
 /// created — `<root>/<run id>` — are ever removed. A caller-supplied working
 /// directory inside the root may share the tree and must survive the run.
@@ -679,123 +787,153 @@ async fn remove_run_workspace_dir(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            // Rootless Podman maps container root to a subordinate host UID.
-            // A hardened systemd service may be unable to create the nested
-            // user namespace itself, so try the direct path first and then
-            // delegate the exact validated path to a transient user service.
-            let direct = timeout(
-                Duration::from_secs(120),
-                tokio::process::Command::new("podman")
-                    .args(["unshare", "rm", "-rf", "--"])
-                    .arg(&workspace)
-                    .output(),
-            )
-            .await;
-            let direct_failed = match direct {
-                Ok(Ok(output)) if output.status.success() => {
-                    tracing::info!(
-                        %run_id,
-                        workspace = %workspace.display(),
-                        "removed run workspace through rootless namespace"
-                    );
-                    return true;
-                }
-                Ok(Ok(output)) => {
-                    let diagnostic = String::from_utf8_lossy(&output.stderr)
-                        .trim()
-                        .chars()
-                        .take(512)
-                        .collect::<String>();
+            let backend = match container_backend_from_env() {
+                Ok(backend) => backend,
+                Err(diagnostic) => {
                     tracing::warn!(
                         %run_id,
                         workspace = %workspace.display(),
-                        status = ?output.status.code(),
-                        stderr = %diagnostic,
-                        "direct rootless workspace cleanup failed; trying transient service"
+                        %diagnostic,
+                        "refusing container-assisted workspace cleanup"
                     );
-                    true
-                }
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        %run_id,
-                        %error,
-                        workspace = %workspace.display(),
-                        "could not start direct rootless workspace cleanup; trying transient service"
-                    );
-                    true
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        %run_id,
-                        workspace = %workspace.display(),
-                        "direct rootless workspace cleanup timed out; trying transient service"
-                    );
-                    true
+                    return false;
                 }
             };
-            if !direct_failed {
-                return false;
-            }
 
-            let delegated = timeout(
-                Duration::from_secs(120),
-                tokio::process::Command::new("systemd-run")
-                    .args([
-                        "--user",
-                        "--quiet",
-                        "--wait",
-                        "--pipe",
-                        "--collect",
-                        "/usr/bin/podman",
-                        "unshare",
-                        "rm",
-                        "-rf",
-                        "--",
-                    ])
-                    .arg(&workspace)
-                    .output(),
-            )
-            .await;
-            match delegated {
-                Ok(Ok(output)) if output.status.success() => {
-                    tracing::info!(
-                        %run_id,
-                        workspace = %workspace.display(),
-                        "removed run workspace through transient rootless service"
-                    );
-                    true
+            match backend {
+                ContainerBackend::Docker => {
+                    match run_cleanup_command(cleanup_command(backend, &workspace)).await {
+                        Some(output) if output.status.success() => {
+                            tracing::info!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                "removed run workspace through Docker"
+                            );
+                            true
+                        }
+                        Some(output) => {
+                            let diagnostic = String::from_utf8_lossy(&output.stderr)
+                                .trim()
+                                .chars()
+                                .take(512)
+                                .collect::<String>();
+                            tracing::warn!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                status = ?output.status.code(),
+                                stderr = %diagnostic,
+                                "Docker workspace cleanup failed"
+                            );
+                            false
+                        }
+                        None => {
+                            tracing::warn!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                "could not start or complete Docker workspace cleanup"
+                            );
+                            false
+                        }
+                    }
                 }
-                Ok(Ok(output)) => {
-                    let diagnostic = String::from_utf8_lossy(&output.stderr)
-                        .trim()
-                        .chars()
-                        .take(512)
-                        .collect::<String>();
-                    tracing::warn!(
-                        %run_id,
-                        workspace = %workspace.display(),
-                        status = ?output.status.code(),
-                        stderr = %diagnostic,
-                        "transient rootless workspace cleanup failed"
-                    );
-                    false
-                }
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        %run_id,
-                        %error,
-                        workspace = %workspace.display(),
-                        "could not start transient rootless workspace cleanup"
-                    );
-                    false
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        %run_id,
-                        workspace = %workspace.display(),
-                        "transient rootless workspace cleanup timed out"
-                    );
-                    false
+                ContainerBackend::Podman => {
+                    // Rootless Podman maps container root to a subordinate host
+                    // UID. A hardened systemd service may be unable to create
+                    // the nested user namespace itself, so try the direct path
+                    // first and then delegate the exact validated path to a
+                    // transient user service.
+                    if let Some(output) =
+                        run_cleanup_command(cleanup_command(backend, &workspace)).await
+                    {
+                        if output.status.success() {
+                            tracing::info!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                "removed run workspace through rootless namespace"
+                            );
+                            return true;
+                        }
+                        let diagnostic = String::from_utf8_lossy(&output.stderr)
+                            .trim()
+                            .chars()
+                            .take(512)
+                            .collect::<String>();
+                        tracing::warn!(
+                            %run_id,
+                            workspace = %workspace.display(),
+                            status = ?output.status.code(),
+                            stderr = %diagnostic,
+                            "direct rootless workspace cleanup failed; trying transient service"
+                        );
+                    } else {
+                        tracing::warn!(
+                            %run_id,
+                            workspace = %workspace.display(),
+                            "could not start direct rootless workspace cleanup; trying transient service"
+                        );
+                    }
+
+                    let delegated = timeout(
+                        Duration::from_secs(120),
+                        tokio::process::Command::new("systemd-run")
+                            .args([
+                                "--user",
+                                "--quiet",
+                                "--wait",
+                                "--pipe",
+                                "--collect",
+                                "/usr/bin/podman",
+                                "unshare",
+                                "rm",
+                                "-rf",
+                                "--",
+                            ])
+                            .arg(&workspace)
+                            .output(),
+                    )
+                    .await;
+                    match delegated {
+                        Ok(Ok(output)) if output.status.success() => {
+                            tracing::info!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                "removed run workspace through transient rootless service"
+                            );
+                            true
+                        }
+                        Ok(Ok(output)) => {
+                            let diagnostic = String::from_utf8_lossy(&output.stderr)
+                                .trim()
+                                .chars()
+                                .take(512)
+                                .collect::<String>();
+                            tracing::warn!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                status = ?output.status.code(),
+                                stderr = %diagnostic,
+                                "transient rootless workspace cleanup failed"
+                            );
+                            false
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                %run_id,
+                                %error,
+                                workspace = %workspace.display(),
+                                "could not start transient rootless workspace cleanup"
+                            );
+                            false
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                %run_id,
+                                workspace = %workspace.display(),
+                                "transient rootless workspace cleanup timed out"
+                            );
+                            false
+                        }
+                    }
                 }
             }
         }
@@ -817,7 +955,30 @@ async fn remove_run_workspace_dir(
 /// exists to observe their completion. Runs with unfinished jobs are left
 /// alone — scheduler recovery still owns those. Returns the number of runs
 /// finalized.
-async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
+/// How often the control plane re-runs orphaned-run reconciliation while
+/// running. The startup pass handles damage from a previous process
+/// lifetime; this loop handles runs stranded while the process is up, for
+/// example when a scheduler restart invalidates leases and completions are
+/// rejected until every job of the run turns terminal.
+const RECONCILE_INTERVAL_SECS: u64 = 60;
+
+/// Grace window for the periodic reconciliation. The push handler creates
+/// the durable run row before it prepares the workspace, registers the
+/// engine, and enqueues jobs, so a freshly created jobless run is not
+/// orphaned yet and must not be cancelled by a concurrent pass.
+const RECONCILE_MIN_RUN_AGE_SECS: i64 = 120;
+
+/// Finalize non-terminal runs whose jobs are all terminal. `live_run_ids`
+/// and `min_age` guard the periodic pass against racing the push handler:
+/// a run with a registered engine still belongs to that engine, and a run
+/// younger than the grace window may not have its engine registered yet.
+/// The startup pass passes an empty set and a zero window because nothing
+/// can be mid-trigger while the process is starting.
+async fn reconcile_orphaned_runs_filtered(
+    pool: &gitforge_db::Pool,
+    live_run_ids: &HashSet<gitforge_common::PipelineRunId>,
+    min_age: chrono::Duration,
+) -> usize {
     let runs = match gitforge_db::queries::PipelineRunQueries::list(pool).await {
         Ok(runs) => runs,
         Err(error) => {
@@ -834,9 +995,30 @@ async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
         ) {
             continue;
         }
-        let jobs = gitforge_db::queries::JobQueries::list_by_run(pool, run.id)
-            .await
-            .unwrap_or_default();
+        if live_run_ids.contains(&run.id) {
+            continue;
+        }
+        if Utc::now() - run.created_at < min_age {
+            continue;
+        }
+        // An unreadable job list must NOT be read as a jobless run: under a
+        // transient database error (e.g. a lock timeout while a long append
+        // transaction holds the write lock) `list_by_run` fails, and grading
+        // the run here would cancel a perfectly healthy run whose queued jobs
+        // are merely waiting for runner capacity (observed 2026-09-16: a run
+        // created 2m02s earlier was cancelled mid-flight by this pass). Skip
+        // the run and let the next periodic pass re-read it.
+        let jobs = match gitforge_db::queries::JobQueries::list_by_run(pool, run.id).await {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    run = %run.id,
+                    "run reconciliation skipped: job list unreadable"
+                );
+                continue;
+            }
+        };
         let unfinished = jobs.iter().any(|job| {
             gitforge_db::models::JobStatus::from_str(&job.status)
                 .is_some_and(|status| !status.is_terminal())
@@ -849,7 +1031,13 @@ async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
             "cancelled"
         } else if jobs.iter().any(|job| job.status == "cancelled") {
             "cancelled"
-        } else if jobs.iter().any(|job| job.status == "failed") {
+        } else if jobs
+            .iter()
+            .any(|job| job.status == "failed" || job.status == "timed_out")
+        {
+            // A watchdog-reaped job dooms the run just like a reported
+            // failure; grading it `succeeded` here would publish a green
+            // run whose job never finished.
             "failed"
         } else {
             "succeeded"
@@ -863,6 +1051,36 @@ async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
         }
     }
     finalized
+}
+
+async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
+    reconcile_orphaned_runs_filtered(pool, &HashSet::new(), chrono::Duration::zero()).await
+}
+
+/// Re-run reconciliation on an interval so runs stranded while the control
+/// plane is up are finalized without waiting for the next restart. Runs
+/// owned by a live engine and runs still inside the creation grace window
+/// are never touched.
+async fn run_reconciliation_loop(
+    pool: gitforge_db::Pool,
+    pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(RECONCILE_INTERVAL_SECS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let live_run_ids: HashSet<gitforge_common::PipelineRunId> =
+            pipeline_registry.read().await.keys().copied().collect();
+        let finalized = reconcile_orphaned_runs_filtered(
+            &pool,
+            &live_run_ids,
+            chrono::Duration::seconds(RECONCILE_MIN_RUN_AGE_SECS),
+        )
+        .await;
+        if finalized > 0 {
+            tracing::info!(finalized, "periodic run reconciliation complete");
+        }
+    }
 }
 
 /// Remove workspaces left behind by runs that are already terminal — for
@@ -1195,6 +1413,12 @@ async fn handle_push_event(
             config: serde_json::to_value(&pipeline)?,
             created_at: Utc::now(),
         };
+        // Only one active pipeline version per (repo, name) is allowed by
+        // idx_pipelines_active_repo_name — retire the predecessor before
+        // recording this push's version, or every push after the first
+        // fails run creation with a constraint violation.
+        gitforge_db::queries::PipelineQueries::deactivate_active(pool, repo_id, &pipeline.name)
+            .await?;
         gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
 
         let mut db_run = DbPipelineRun::new(
@@ -1255,14 +1479,24 @@ async fn handle_push_event(
                 .iter()
                 .find_map(|step| step.working_directory.clone());
             let working_dir = working_dir.or_else(|| workspace_path.clone());
+            // Honor the pipeline job's timeout instead of silently applying
+            // the legacy per-command default: long suites (a full pytest run
+            // easily exceeds 300 s) would otherwise time out mid-step even
+            // though the definition asked for more.
+            let timeout_secs = definition
+                .timeout_secs()
+                .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
             scheduler
-                .enqueue_with_definition_and_image(
+                .enqueue_with_definition_and_image_and_timeout(
                     job_id,
                     state.run_id,
                     repo_id,
-                    commands,
-                    definition.image.clone(),
-                    working_dir,
+                    JobExecutionDefinition {
+                        commands,
+                        image: definition.image.clone(),
+                        working_dir,
+                        timeout_secs,
+                    },
                 )
                 .await;
             tracing::debug!("enqueued job {} for pipeline run {}", job_id, state.run_id);
@@ -1353,50 +1587,83 @@ async fn run_scheduler_event_consumer(
                     .iter()
                     .find_map(|step| step.working_directory.clone())
                     .or_else(|| workspace_path.clone());
+                // Same contract as the initial enqueue: chained jobs keep
+                // the pipeline's per-job timeout. The legacy enqueue below
+                // silently applied a 300 s default — a 45 m test job queued
+                // after its neighbor finished was killed five minutes in.
+                let timeout_secs = definition
+                    .timeout_secs()
+                    .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
                 scheduler
-                    .enqueue_with_definition_and_image(
+                    .enqueue_with_definition_and_image_and_timeout(
                         next_job_id,
                         state.run_id,
                         state.repo_id,
-                        commands,
-                        definition.image.clone(),
-                        working_dir,
+                        JobExecutionDefinition {
+                            commands,
+                            image: definition.image.clone(),
+                            working_dir,
+                            timeout_secs,
+                        },
                     )
                     .await;
             }
         }
 
-        let terminal_status = match state.status {
-            PipelineStatus::Succeeded => Some("succeeded"),
-            PipelineStatus::Failed => Some("failed"),
-            PipelineStatus::Cancelled => Some("cancelled"),
-            _ => None,
-        };
-        if let Some(terminal_status) = terminal_status {
-            if let Some(pool) = &scheduler_db {
-                let _ = gitforge_db::queries::PipelineRunQueries::update_status(
-                    pool,
-                    state.run_id,
-                    terminal_status,
-                )
-                .await;
-            }
-            let workspace_path = run_workspace_paths
-                .lock()
-                .expect("workspace cache lock poisoned")
-                .remove(&state.run_id)
-                .flatten();
-            // Free the checkout once nothing references it. Spawned so a
-            // large delete cannot stall completion processing for other
-            // runs; removal only ever targets the run-owned directory.
-            let root = workspace_root();
-            let run_id = state.run_id;
-            tokio::spawn(async move {
-                remove_run_workspace_dir(&root, run_id, workspace_path.as_deref()).await;
-            });
-            pipeline_registry.write().await.remove(&state.run_id);
-        }
+        // No-op until every job in the run is terminal; see
+        // `finalize_run_if_terminal`.
+        finalize_run_if_terminal(
+            &engine,
+            scheduler_db.as_ref(),
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await;
     }
+}
+
+/// Finalize `engine`'s run once it has reached a terminal status: persist the
+/// status, free the run's workspace, and evict the engine from the registry.
+/// Shared by the completion consumer and the timeout watchdog so a job reaped
+/// by the watchdog finalizes exactly like one reported by a runner. Runs that
+/// are not terminal yet are left untouched.
+async fn finalize_run_if_terminal(
+    engine: &CiEngine,
+    scheduler_db: Option<&gitforge_db::Pool>,
+    run_workspace_paths: &Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
+    pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
+) {
+    let state = engine.state().await;
+    let terminal_status = match state.status {
+        PipelineStatus::Succeeded => "succeeded",
+        PipelineStatus::Failed => "failed",
+        PipelineStatus::Cancelled => "cancelled",
+        _ => return,
+    };
+    if let Some(pool) = scheduler_db {
+        let _ = gitforge_db::queries::PipelineRunQueries::update_status(
+            pool,
+            state.run_id,
+            terminal_status,
+        )
+        .await;
+    }
+    let workspace_path = run_workspace_paths
+        .lock()
+        .expect("workspace cache lock poisoned")
+        .remove(&state.run_id)
+        .flatten();
+    // Free the checkout once nothing references it. Spawned so a large delete
+    // cannot stall completion processing for other runs; removal only ever
+    // targets the run-owned directory.
+    let root = workspace_root();
+    let run_id = state.run_id;
+    tokio::spawn(async move {
+        remove_run_workspace_dir(&root, run_id, workspace_path.as_deref()).await;
+    });
+    pipeline_registry.write().await.remove(&state.run_id);
 }
 
 /// Create a trigger event from push payload (extracted for testability)
@@ -1848,6 +2115,66 @@ mod tests {
         assert!(!remove_run_workspace_dir(&root, run_id, None).await);
     }
 
+    #[test]
+    fn test_container_backend_selection_is_explicit() {
+        let _guard = WORKSPACE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+        let _guard = _guard.blocking_lock();
+
+        std::env::set_var("GITFORGE_CONTAINER_BACKEND", "podman");
+        assert_eq!(container_backend_from_env(), Ok(ContainerBackend::Podman));
+        std::env::set_var("GITFORGE_CONTAINER_BACKEND", "docker");
+        assert_eq!(container_backend_from_env(), Ok(ContainerBackend::Docker));
+        std::env::set_var("GITFORGE_CONTAINER_BACKEND", "unknown");
+        assert!(container_backend_from_env().is_err());
+        std::env::remove_var("GITFORGE_CONTAINER_BACKEND");
+        assert!(container_backend_from_env().is_err());
+    }
+
+    #[test]
+    fn test_cleanup_command_selects_backend_without_fallback() {
+        let workspace = std::path::Path::new("/var/lib/gitforge/workspaces/run-123");
+
+        let podman = cleanup_command(ContainerBackend::Podman, workspace);
+        assert_eq!(podman.program, "podman");
+        assert_eq!(
+            podman.args,
+            [
+                "unshare",
+                "rm",
+                "-rf",
+                "--",
+                "/var/lib/gitforge/workspaces/run-123"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+
+        let docker = cleanup_command(ContainerBackend::Docker, workspace);
+        assert_eq!(docker.program, "docker");
+        assert_eq!(
+            docker.args[0..10],
+            [
+                "run",
+                "--rm",
+                "--user",
+                "0:0",
+                "--mount",
+                "type=bind,src=/var/lib/gitforge/workspaces,dst=/gitforge-cleanup-parent",
+                "alpine",
+                "rm",
+                "-rf",
+                "--"
+            ]
+            .map(OsString::from)
+        );
+        assert_eq!(
+            docker.args[10],
+            OsString::from("/gitforge-cleanup-parent/run-123")
+        );
+        assert!(!docker.args.iter().any(|arg| arg == "podman"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn test_remove_run_workspace_refuses_symlink() {
@@ -1963,6 +2290,9 @@ mod tests {
         seed_job(&pool, mixed_failed, "lint", "succeeded").await;
         seed_job(&pool, mixed_failed, "test", "failed").await;
 
+        let watchdog_reaped = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, watchdog_reaped, "lint", "timed_out").await;
+
         let cancelled_job = seed_run(&pool, repo_id, pipeline_id, "running").await;
         seed_job(&pool, cancelled_job, "lint", "cancelled").await;
 
@@ -1984,6 +2314,11 @@ mod tests {
             "any failed job must finalize the run as failed"
         );
         assert_eq!(
+            run_status(&pool, watchdog_reaped).await,
+            "failed",
+            "a watchdog-reaped job dooms the run; it must not grade succeeded"
+        );
+        assert_eq!(
             run_status(&pool, cancelled_job).await,
             "cancelled",
             "a cancelled job must finalize the run as cancelled"
@@ -1998,10 +2333,59 @@ mod tests {
             "running",
             "runs with unfinished jobs belong to scheduler recovery, not reconciliation"
         );
-        assert_eq!(finalized, 4, "only the orphaned runs are finalized");
+        assert_eq!(finalized, 5, "only the orphaned runs are finalized");
 
         // Reconciliation is idempotent: a second pass finds nothing stranded.
         assert_eq!(reconcile_orphaned_runs(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_periodic_reconciliation_skips_live_and_fresh_runs() {
+        // Each guard gets its own pool so scenarios cannot observe each
+        // other's runs.
+
+        // Grace guard: a jobless run inside the creation window belongs to a
+        // push handler that has not registered its engine or enqueued yet.
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        let fresh_run = seed_run(&pool, repo_id, pipeline_id, "queued").await;
+        let finalized = reconcile_orphaned_runs_filtered(
+            &pool,
+            &HashSet::new(),
+            chrono::Duration::seconds(RECONCILE_MIN_RUN_AGE_SECS),
+        )
+        .await;
+        assert_eq!(
+            finalized, 0,
+            "runs inside the grace window are not orphaned"
+        );
+        assert_eq!(run_status(&pool, fresh_run).await, "queued");
+        drop(pool);
+
+        // Live-engine guard: a run whose engine is registered is never
+        // touched, even when all of its jobs are already terminal.
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        let live_run = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, live_run, "lint", "succeeded").await;
+        let live: HashSet<gitforge_common::PipelineRunId> = [live_run].into_iter().collect();
+        let finalized =
+            reconcile_orphaned_runs_filtered(&pool, &live, chrono::Duration::zero()).await;
+        assert_eq!(finalized, 0, "runs with a live engine are not orphaned");
+        assert_eq!(run_status(&pool, live_run).await, "running");
+        drop(pool);
+
+        // Outside both guards the periodic pass finalizes the orphan.
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        let stale_run = seed_run(&pool, repo_id, pipeline_id, "queued").await;
+        let finalized = reconcile_orphaned_runs_filtered(
+            &pool,
+            &HashSet::new(),
+            // A negative window treats every run as older than the grace
+            // period, standing in for a run created long before this pass.
+            chrono::Duration::seconds(-1),
+        )
+        .await;
+        assert_eq!(finalized, 1, "the stale jobless orphan is cancelled");
+        assert_eq!(run_status(&pool, stale_run).await, "cancelled");
     }
 
     #[tokio::test]

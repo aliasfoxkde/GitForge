@@ -496,6 +496,39 @@ impl PipelineQueries {
         Ok(())
     }
 
+    /// Retire the currently active pipeline version for (repo_id, name).
+    ///
+    /// The partial UNIQUE index `idx_pipelines_active_repo_name` admits only
+    /// one active row per repository and name, so a newly pushed version
+    /// must deactivate its predecessor or every push after the first fails
+    /// run creation with a constraint violation. Superseded rows stay as
+    /// history with active = 0.
+    pub async fn deactivate_active(pool: &Pool, repo_id: RepoId, name: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE pipelines SET active = 0 WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind(repo_id.to_string())
+        .bind(name)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to deactivate pipeline: {}", e)))?;
+        Ok(())
+    }
+
+    /// Number of active pipeline versions for (repo_id, name) — at most one
+    /// by the partial UNIQUE index; lets callers verify deactivation.
+    pub async fn count_active(pool: &Pool, repo_id: RepoId, name: &str) -> Result<i64> {
+        let (count,) = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM pipelines WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind(repo_id.to_string())
+        .bind(name)
+        .fetch_one(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to count active pipelines: {}", e)))?;
+        Ok(count)
+    }
+
     /// Get a pipeline by ID
     pub async fn get(pool: &Pool, id: PipelineId) -> Result<Option<crate::models::Pipeline>> {
         let row = sqlx::query("SELECT * FROM pipelines WHERE id = ?")
@@ -979,6 +1012,28 @@ impl JobQueries {
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to requeue job: {}", e)))?;
+        Ok(())
+    }
+
+    /// Grade a running job as failed after its runner was lost.
+    ///
+    /// Runner-loss handling must never requeue a `running` row: the original
+    /// sandbox may still be executing, and a second execution of the same job
+    /// would race it (duplicate containers, duelling log appends, rejected
+    /// completions). Fencing the row as failed matches the recovery contract
+    /// of `requeue_inflight` for running rows and lets the pipeline finalize
+    /// deterministically; the abandoned-container reconciler collects the
+    /// orphaned sandbox after its grace period.
+    pub async fn fail_lost(pool: &Pool, id: JobId) -> Result<()> {
+        sqlx::query(
+            "UPDATE jobs SET status = 'failed', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE id = ? AND status = 'running'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(r#"{"status":"failed","reason":"runner_lost_while_running"}"#)
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to fence lost job: {}", e)))?;
         Ok(())
     }
 

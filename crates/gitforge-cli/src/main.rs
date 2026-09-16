@@ -210,7 +210,18 @@ enum Commands {
 }
 
 fn run_git(args: &[&str]) -> Result<String> {
+    // The CLI's git passthrough must work wherever GitForge itself runs —
+    // including CI job containers, where the workspace bind-mount keeps the
+    // host uid while the container user is root and bare `git` refuses the
+    // repo with "detected dubious ownership" (exit 128). Grant the same
+    // trust the sandbox grants job workspaces (see
+    // crates/gitforge-sandbox/src/docker.rs `workspace_git_env`). Env-based
+    // config is used because git only honors safe.directory from protected
+    // configuration; `-c safe.directory=...` on the command line is ignored.
     let output = Command::new("git")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "safe.directory")
+        .env("GIT_CONFIG_VALUE_0", "*")
         .args(args)
         .output()
         .context("failed to execute git")?;

@@ -34,12 +34,16 @@ impl Pool {
         // immediately with SQLITE_BUSY; under job assignment plus log
         // appends that cascaded into lost leases and dropped log chunks.
         // WAL keeps readers concurrent, and a busy timeout makes writers
-        // queue instead of erroring.
+        // queue instead of erroring. The timeout is set well above the
+        // multi-second transactions large log appends can produce: a victim
+        // writer that gives up early cascades into missed heartbeats and
+        // lease-sync failures, which the scheduler can misread as runner
+        // loss.
         let options = SqliteConnectOptions::from_str(&connect_url)
             .map_err(|e| Error::database(format!("invalid database URL: {}", e)))?
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(Duration::from_secs(5))
+            .busy_timeout(Duration::from_secs(15))
             .foreign_keys(true);
 
         let pool = SqlitePoolOptions::new()
@@ -126,6 +130,7 @@ impl Pool {
                 trigger_type TEXT NOT NULL,
                 config TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
                 FOREIGN KEY (repo_id) REFERENCES repositories(id)
             )
             "#,
@@ -133,6 +138,18 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create pipelines table: {}", e)))?;
+
+        // One active pipeline version per repository and name; superseded
+        // versions stay as history with active = 0.
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pipelines_active_repo_name
+            ON pipelines(repo_id, name) WHERE active = 1
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create pipelines active index: {}", e)))?;
 
         // Create pipeline_runs table
         sqlx::query(
