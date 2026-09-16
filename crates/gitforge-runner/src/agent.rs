@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
@@ -729,6 +730,10 @@ pub struct RunnerAgent {
     executor: Arc<JobExecutor>,
     is_running: Arc<RwLock<bool>>,
     reconciler_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Set when the scheduler has been unreachable for the loss threshold.
+    /// `run` surfaces this as an error so the service supervisor can restart
+    /// and re-register the runner instead of leaving it apparently healthy.
+    scheduler_lost: Arc<AtomicBool>,
     /// Authoritative active-job set shared with the reconciler. The reconciler
     /// holds this registry's lock across its Docker calls so admission cannot
     /// interleave between the snapshot and a remove decision.
@@ -754,6 +759,7 @@ impl RunnerAgent {
             executor: Arc::new(executor),
             is_running: Arc::new(RwLock::new(false)),
             reconciler_task: Arc::new(Mutex::new(None)),
+            scheduler_lost: Arc::new(AtomicBool::new(false)),
             active_jobs: ActiveJobRegistry::new(),
         })
     }
@@ -886,8 +892,10 @@ impl RunnerAgent {
         let heartbeat_url = self.config.scheduler_url.clone();
         let heartbeat_token = self.config.scheduler_token.clone();
         let is_running = self.is_running.clone();
+        let scheduler_lost = self.scheduler_lost.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(heartbeat_interval));
+            let mut consecutive_failures = 0_u32;
             loop {
                 ticker.tick().await;
                 if !*is_running.read().await {
@@ -900,9 +908,29 @@ impl RunnerAgent {
                 if let Some(token) = &heartbeat_token {
                     heartbeat_request = heartbeat_request.bearer_auth(token);
                 }
-                if let Err(e) = heartbeat_request.send().await {
-                    tracing::trace!("heartbeat failed: {}", e);
+                let delivered = heartbeat_request
+                    .send()
+                    .await
+                    .map(|response| response.status().is_success())
+                    .unwrap_or(false);
+                if delivered {
+                    consecutive_failures = 0;
+                    continue;
                 }
+                consecutive_failures += 1;
+                if consecutive_failures >= 10 {
+                    tracing::error!(
+                        "lost contact with scheduler after {} consecutive failed heartbeats; stopping for re-registration",
+                        consecutive_failures
+                    );
+                    scheduler_lost.store(true, Ordering::SeqCst);
+                    *is_running.write().await = false;
+                    break;
+                }
+                tracing::trace!(
+                    "heartbeat failed ({}/10 consecutive)",
+                    consecutive_failures
+                );
             }
         });
 
@@ -1017,6 +1045,12 @@ impl RunnerAgent {
         // Keep running until stopped
         while *self.is_running.read().await {
             tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        if self.scheduler_lost.load(Ordering::SeqCst) {
+            return Err(Error::internal(
+                "runner lost contact with the scheduler and stopped for re-registration",
+            ));
         }
 
         Ok(())

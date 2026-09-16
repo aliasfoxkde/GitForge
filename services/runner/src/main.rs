@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     // Fails fast at startup with an actionable error if required variables are
     // missing or invalid, rather than silently falling back to defaults.
     let config = gitforge_runner::RunnerConfig::from_env()
-        .map_err(|e| anyhow::anyhow!("failed to load runner configuration: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to load runner configuration: {}", e))?;
 
     // Create runner agent
     let mut agent = RunnerAgent::new(config).await?;
@@ -54,36 +54,49 @@ async fn main() -> anyhow::Result<()> {
     // owns its executor; keep the loop under a task handle so shutdown can
     // stop it cleanly and propagate runtime failures to the service.
     let agent_loop = agent.clone();
-    let runner_task = tokio::spawn(async move { agent_loop.run().await });
+    let mut runner_task = tokio::spawn(async move { agent_loop.run().await });
 
-    // Wait for shutdown signal
+    // Wait for the shutdown signal OR for the agent loop to end on its own.
+    // The loop self-terminates when the runner persistently loses contact
+    // with the scheduler; exiting here (instead of idling until a signal)
+    // lets the supervisor restart the unit and re-run registration against
+    // the restarted scheduler.
     let shutdown_future = create_shutdown_future(shutdown.clone());
     tracing::info!("Runner Agent running, press Ctrl+C to stop");
 
-    // Wait for shutdown signal
-    timeout(Duration::MAX, shutdown_future).await.ok();
+    tokio::select! {
+        _ = timeout(Duration::MAX, shutdown_future) => {
+            tracing::info!("shutting down Runner Agent");
 
-    tracing::info!("shutting down Runner Agent");
+            // Stop the agent gracefully (force=false to wait for jobs)
+            agent.stop(false).await;
 
-    // Stop the agent gracefully (force=false to wait for jobs)
-    agent.stop(false).await;
+            // Wait for active jobs to complete with a timeout
+            const JOB_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+            if !agent.wait_for_jobs_complete(JOB_SHUTDOWN_TIMEOUT).await {
+                tracing::warn!("jobs did not complete in time, force cancelling");
+                agent.stop(true).await;
+            }
 
-    // Wait for active jobs to complete with a timeout
-    const JOB_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-    if !agent.wait_for_jobs_complete(JOB_SHUTDOWN_TIMEOUT).await {
-        tracing::warn!("jobs did not complete in time, force cancelling");
-        agent.stop(true).await;
+            runner_task
+                .await
+                .map_err(|e| anyhow::anyhow!("runner task join failed: {}", e))??;
+
+            // Graceful shutdown delay
+            graceful_shutdown_delay().await;
+
+            tracing::info!("Runner Agent stopped");
+            Ok(())
+        }
+        result = &mut runner_task => {
+            agent.stop(true).await;
+            result
+                .map_err(|e| anyhow::anyhow!("runner task join failed: {}", e))??;
+            // The loop returned Ok without a shutdown signal — nothing
+            // should do that, but exiting beats an inert unit.
+            anyhow::bail!("runner loop exited without a shutdown signal")
+        }
     }
-
-    runner_task
-        .await
-        .map_err(|e| anyhow::anyhow!("runner task join failed: {e}"))??;
-
-    // Graceful shutdown delay
-    graceful_shutdown_delay().await;
-
-    tracing::info!("Runner Agent stopped");
-    Ok(())
 }
 
 /// Create the shutdown future that waits for shutdown signal
