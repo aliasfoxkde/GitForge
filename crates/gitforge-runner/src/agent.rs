@@ -1985,6 +1985,11 @@ fn sha256_hex(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn docker_daemon_available() -> bool {
+        std::path::Path::new("/var/run/docker.sock").exists()
+            || std::env::var_os("DOCKER_HOST").is_some()
+    }
+
     #[test]
     fn test_utf8_chunks_preserve_boundaries() {
         let value = "ééé";
@@ -2011,6 +2016,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_register_no_scheduler() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // Registration failure is fatal by default: a runner must not appear
         // healthy when it cannot reach the scheduler that assigns it work.
         let config = RunnerConfig {
@@ -2224,6 +2233,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_agent_stop() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         agent.stop(false).await;
@@ -2401,6 +2414,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_agent_not_registered() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // Agent without registration should have runner as None
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
@@ -2409,6 +2426,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_register_sets_runner() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
             allow_standalone: true,
@@ -2526,6 +2547,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_stop_after_registration() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
             allow_standalone: true,
@@ -2662,6 +2687,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_agent_with_custom_config() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig {
             scheduler_url: "http://custom-scheduler:8081".to_string(),
             name: "custom-runner".to_string(),
@@ -2709,6 +2738,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_run_and_stop() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
             allow_standalone: true,
