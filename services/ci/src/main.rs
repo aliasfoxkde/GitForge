@@ -1001,9 +1001,24 @@ async fn reconcile_orphaned_runs_filtered(
         if Utc::now() - run.created_at < min_age {
             continue;
         }
-        let jobs = gitforge_db::queries::JobQueries::list_by_run(pool, run.id)
-            .await
-            .unwrap_or_default();
+        // An unreadable job list must NOT be read as a jobless run: under a
+        // transient database error (e.g. a lock timeout while a long append
+        // transaction holds the write lock) `list_by_run` fails, and grading
+        // the run here would cancel a perfectly healthy run whose queued jobs
+        // are merely waiting for runner capacity (observed 2026-09-16: a run
+        // created 2m02s earlier was cancelled mid-flight by this pass). Skip
+        // the run and let the next periodic pass re-read it.
+        let jobs = match gitforge_db::queries::JobQueries::list_by_run(pool, run.id).await {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    run = %run.id,
+                    "run reconciliation skipped: job list unreadable"
+                );
+                continue;
+            }
+        };
         let unfinished = jobs.iter().any(|job| {
             gitforge_db::models::JobStatus::from_str(&job.status)
                 .is_some_and(|status| !status.is_terminal())
