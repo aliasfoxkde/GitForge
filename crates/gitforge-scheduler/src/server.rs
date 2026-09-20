@@ -1064,6 +1064,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_queue_status_handler_reports_durable_pending_rows() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let _ = seed_restart_scenario(&pool, "queue-status").await;
+        let state = create_state(crate::Scheduler::with_db(pool));
+        let response = get_queue_status(axum::extract::State(state)).await;
+        let response = response.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["durable_pending"], 2);
+        assert_eq!(payload["in_memory_queued"], 0);
+    }
+
+    #[tokio::test]
     async fn test_http_runner_protocol_uses_durable_lease() {
         let pool = gitforge_db::Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
