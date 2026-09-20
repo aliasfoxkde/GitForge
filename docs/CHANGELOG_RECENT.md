@@ -59,6 +59,14 @@ All notable changes to GitForge will be documented in this file.
   SIGTERM (the real graceful-shutdown path), so `cargo llvm-cov` now
   counts the entry-point code they exercise; workspace line coverage
   rose from 79.63% to 83.40% with no production changes
+- Job log store tests: `bounded_put` receipts are verified end to end —
+  SHA-256 over the stored content, byte counts, the `gitforge://log/`
+  URI, truncation of oversized logs (kept bytes are the head of the
+  log and the receipt reflects the truncated size), exact-boundary
+  non-truncation, and overwrite replacing the receipt — plus on-disk
+  delete removing both log and metadata, listing that skips corrupt
+  metadata files, and get returning None when only metadata remains.
+  job_logs.rs went from 62.84% to 92.94% lines
 - Git over SSH protocol integration tests: real `ssh-keygen` client
   keypairs and host-key pinning; `push`, `clone`, `fetch`, and `ls-remote`
   over the `ssh://` transport, plus rejection of key-less clients,

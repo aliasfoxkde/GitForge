@@ -102,9 +102,12 @@ spawned-binary trigger harness landed. gitforge-ai left the table on
 scripted HTTP server; gitforge-build left it the same day at 80.62%
 lines once the build daemon's connection handler was driven over real
 unix socket pairs. 2026-09-20 re-measurement: workspace 84.80% lines /
-85.86% regions with no further production changes; the largest
-file-level gap outside the Docker-gated executor is
-gitforge-storage/job_logs.rs at 62.84% lines.)
+85.86% regions; gitforge-storage/job_logs.rs — the largest file-level
+gap outside the Docker-gated executor at 62.84% lines — rose to 92.94%
+lines the same day once `bounded_put` receipts, truncation, and on-disk
+metadata handling were tested (`cargo llvm-cov -p gitforge-storage`).
+The largest remaining file-level gap outside the executor is now
+services/git-server/main.rs at 69.43% lines.)
 
 ## Remaining Gaps and Next Steps (2026-09-08)
 
