@@ -934,6 +934,7 @@ async fn test_scheduler_upload_is_downloadable_through_authenticated_api() {
         .unwrap();
     assert_eq!(started.status(), StatusCode::OK);
     let bytes = b"cross-process artifact";
+    let expected_checksum = "37984d2f0d9edb97e43c84ccb3aaaa8c98f28698c1d119662d5241d044c7a84c";
     let artifact = scheduler_app
         .oneshot(
             Request::builder()
@@ -944,6 +945,7 @@ async fn test_scheduler_upload_is_downloadable_through_authenticated_api() {
                 .header("x-runner-id", runner_id.to_string())
                 .header("x-lease-token", lease)
                 .header("x-artifact-name", "result.txt")
+                .header("x-artifact-sha256", expected_checksum)
                 .body(Body::from(bytes.as_slice()))
                 .unwrap(),
         )
@@ -957,6 +959,8 @@ async fn test_scheduler_upload_is_downloadable_through_authenticated_api() {
     )
     .unwrap();
     let artifact_id = payload["artifact_id"].as_str().unwrap();
+    assert_eq!(payload["sha256"], expected_checksum);
+    assert_eq!(payload["bytes"], bytes.len());
 
     let api = ApiServer::new("test-secret", pool)
         .with_storage_extension(storage)
@@ -964,7 +968,54 @@ async fn test_scheduler_upload_is_downloadable_through_authenticated_api() {
     let token = ApiAuth::new("test-secret")
         .generate_token(user.id, "boundary-owner", "admin")
         .unwrap();
+    let listed = api
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/artifacts")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(
+        &axum::body::to_bytes(listed.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let listed_artifact = listed
+        .iter()
+        .find(|artifact| artifact["id"] == artifact_id)
+        .expect("uploaded artifact should be listed");
+    assert_eq!(listed_artifact["checksum"], expected_checksum);
+    assert_eq!(listed_artifact["size_bytes"], bytes.len());
+
+    let metadata = api
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/artifacts/{artifact_id}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metadata.status(), StatusCode::OK);
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(metadata.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata["checksum"], expected_checksum);
+    assert_eq!(metadata["size_bytes"], bytes.len());
+
     let response = api
+        .clone()
         .oneshot(
             Request::builder()
                 .uri(format!("/api/artifacts/{artifact_id}/content"))
@@ -981,6 +1032,43 @@ async fn test_scheduler_upload_is_downloadable_through_authenticated_api() {
             .unwrap()[..],
         bytes
     );
+
+    let completed = scheduler_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/jobs/{job_id}/complete"))
+                .header("Authorization", "Bearer runner-token")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "runner_id": runner_id.to_string(),
+                        "lease_token": lease,
+                        "success": true,
+                        "artifacts": [{
+                            "artifact_id": artifact_id,
+                            "name": "result.txt",
+                            "sha256": expected_checksum,
+                            "bytes": bytes.len()
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+    let job = gitforge_db::queries::JobQueries::get(&pool, job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let receipt: serde_json::Value =
+        serde_json::from_str(job.result_json.as_deref().unwrap()).unwrap();
+    assert_eq!(receipt["success"], true);
+    assert_eq!(receipt["artifacts"][0]["artifact_id"], artifact_id);
+    assert_eq!(receipt["artifacts"][0]["sha256"], expected_checksum);
+    assert_eq!(receipt["artifacts"][0]["bytes"], bytes.len());
 }
 
 #[tokio::test]
