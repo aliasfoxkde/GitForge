@@ -78,7 +78,7 @@ The following require a running integration environment:
 | gitforge-events | 95%+ | 93%+ |
 | gitforge-db/models | 90%+ | 95%+ |
 | gitforge-scheduler | 88%+ | 87%+ |
-| gitforge-process | 86%+ | 93%+ |
+| gitforge-process | 93.02% | shutdown-signal delivery driven by a real SIGTERM to the test process; pool spawn lifecycle covered (2026-09-20) |
 | gitforge-review | 99.37% | diff parser, the ParsedDiff→FileChange AI bridge, and the security scanner fully exercised (2026-09-20) |
 | gitforge-ai | 90.16% | providers exercise their full HTTP boundary against a scripted server |
 

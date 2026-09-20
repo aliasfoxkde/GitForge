@@ -75,6 +75,14 @@ All notable changes to GitForge will be documented in this file.
   extension-scoped patterns skipping extensionless files, and findings
   aggregated across files. gitforge-review went from 83.87% to 99.37%
   lines
+- Process crate tests: the SIGTERM shutdown handler is driven by
+  delivering a real SIGTERM to the test process (with a guard stream
+  armed first so the delivery can never kill the binary),
+  `wait_for_shutdown` returns once its flag is set, and the process
+  pool's `spawn` is exercised over real children — tracked until exit,
+  reaped by the timeout arm against a hung `sleep`, and rejecting an
+  unknown program without a ghost tracking entry. gitforge-process
+  went from 86.11% to 93.02% lines; signal.rs reached 100%
 - Git over SSH protocol integration tests: real `ssh-keygen` client
   keypairs and host-key pinning; `push`, `clone`, `fetch`, and `ls-remote`
   over the `ssh://` transport, plus rejection of key-less clients,
