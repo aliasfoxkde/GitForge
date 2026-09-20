@@ -1,12 +1,17 @@
 # GitForge Handoff
 
 **Last Updated:** 2026-09-20
-**Current state:** Active development happens on dated
-`codex/*`/`fix/*` branches that are promoted to the Fedora deployment
-by revision, so `origin/main` lags the promoted builds. See
+**Current state:** `origin/main` was reconciled with the promoted
+branch history on 2026-09-20 (PR #175) — main now carries both the
+coverage campaign and the reconciler/dependency work, so it is the
+correct base for new branches again. Before that, active development
+happened on dated `codex/*`/`fix/*` branches promoted to the Fedora
+deployment by revision while main lagged. See
 `docs/handoffs/REPO_STATE_AUDIT_2026-09-20.md` for the branch/worktree
-landscape, `docs/planning/IMPROVEMENTS.md` for the improvement ledger
-and coverage state, and `docs/AUTH_DESIGN.md` for the planned identity
+audit and its "Resolution" section (WIP preserved on `preserve/*`
+branches, merged branches pruned, worktrees removed),
+`docs/planning/IMPROVEMENTS.md` for the improvement ledger and
+coverage state, and `docs/AUTH_DESIGN.md` for the planned identity
 work. The compose-stack smoke below was validated end to end on
 2026-09-08 and the fixes it produced shipped in 0.4.0.
 **Evidence boundary (central audit):** branch `main`, HEAD `186e3eb1fdda0fbc4571002a8807c51efbb40822`, 1 dirty status entries. This boundary covers the merged first-admin bootstrap, release packaging, and source promotion receipts; numeric ratings below remain historical context, not release gates.
