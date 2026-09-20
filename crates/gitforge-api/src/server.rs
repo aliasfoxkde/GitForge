@@ -5,7 +5,7 @@ use crate::metrics::Metrics;
 use crate::metrics_middleware::MetricsLayer;
 use crate::routes::{
     artifact_routes, ci_routes, public_runner_routes, repo_routes, review_routes, runner_routes,
-    user_routes, webhook_routes,
+    ssh_key_routes, user_routes, webhook_routes,
 };
 use axum::{
     extract::Extension,
@@ -102,6 +102,7 @@ impl ApiServer {
             .merge(ci_routes())
             .merge(runner_routes())
             .merge(user_routes())
+            .merge(ssh_key_routes())
             .merge(artifact_routes())
             .merge(webhook_routes())
             .merge(review_routes())

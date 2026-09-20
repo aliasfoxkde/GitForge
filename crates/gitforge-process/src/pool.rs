@@ -461,4 +461,75 @@ mod tests {
         assert_eq!(p1, p2);
         assert_ne!(p1, p3);
     }
+
+    // ─── spawn: real managed-process lifecycle ──────────────────────────
+
+    // The handler task that clears tracking runs on the same
+    // current-thread runtime as the test, so waiting must yield to it.
+    async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn test_spawn_tracks_process_until_exit() {
+        let pool = ProcessPool::with_default_config();
+
+        // Long enough that we can observe the tracked state before exit.
+        let pid = pool
+            .spawn(JobWeight::Light, "sleep", &["0.3"], |_| {})
+            .await
+            .unwrap();
+
+        assert_ne!(pid, 0);
+        assert!(pool.is_running(pid), "a live child must be tracked");
+        assert_eq!(pool.running_count(), 1);
+
+        assert!(
+            wait_until(|| !pool.is_running(pid)).await,
+            "tracking must clear once the process exits"
+        );
+        assert_eq!(pool.running_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_kills_process_at_timeout() {
+        let pool = ProcessPool::new(PoolConfig {
+            max_concurrent: 2,
+            default_timeout: Duration::from_millis(150),
+        });
+
+        let pid = pool
+            .spawn(JobWeight::Heavy, "sleep", &["30"], |_| {})
+            .await
+            .unwrap();
+        assert!(pool.is_running(pid));
+
+        assert!(
+            wait_until(|| !pool.is_running(pid)).await,
+            "a hung process must be reaped by the timeout arm"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_rejects_unknown_program() {
+        let pool = ProcessPool::with_default_config();
+
+        let result = pool
+            .spawn(
+                JobWeight::Light,
+                "definitely-not-a-real-binary-xyz",
+                &[],
+                |_| {},
+            )
+            .await;
+
+        assert!(result.is_err(), "spawn failure must propagate");
+        assert_eq!(pool.running_count(), 0, "no ghost tracking entry");
+    }
 }

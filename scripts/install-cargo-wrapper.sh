@@ -124,6 +124,8 @@ install() {
     fi
 
     # 2. Ensure ~/.cargo/bin is in PATH (add to shell rc if not)
+    # Single quotes are intentional: this literal is written to the rc file.
+    # shellcheck disable=SC2016
     PATH_LINE='export PATH="$HOME/.cargo/bin:$PATH"'
     if [[ ":$PATH:" != *":$HOME/.cargo/bin:"* ]]; then
         if ! grep -q 'cargo/bin' "$SHELL_RC" 2>/dev/null; then

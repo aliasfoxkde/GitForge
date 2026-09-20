@@ -410,4 +410,154 @@ mod tests {
         assert!(!vulns.is_empty());
         assert_eq!(vulns[0].vuln_type, VulnerabilityType::WeakHash);
     }
+
+    // ─── severity mapping, line kinds, extension filters, aggregation ───
+
+    fn diff_for(path: &str, lines: Vec<HunkLine>) -> ParsedDiff {
+        ParsedDiff {
+            old_path: Some(path.to_string()),
+            new_path: Some(path.to_string()),
+            is_new: false,
+            is_deleted: false,
+            is_binary: false,
+            hunks: vec![DiffHunk {
+                old_start: 10,
+                old_lines: lines.len() as u32,
+                new_start: 10,
+                new_lines: lines.len() as u32,
+                lines,
+            }],
+            language: None,
+        }
+    }
+
+    #[test]
+    fn test_severity_mapping_for_every_vulnerability_type() {
+        let expected = [
+            (VulnerabilityType::SqlInjection, "critical"),
+            (VulnerabilityType::CommandInjection, "critical"),
+            (VulnerabilityType::UnsafeDeserialization, "critical"),
+            (VulnerabilityType::BufferOverflow, "critical"),
+            (VulnerabilityType::HardcodedCredential, "high"),
+            (VulnerabilityType::SecretHardcoded, "high"),
+            (VulnerabilityType::Xss, "high"),
+            (VulnerabilityType::PathTraversal, "high"),
+            (VulnerabilityType::InsecureCrypto, "high"),
+            (VulnerabilityType::MissingAuth, "high"),
+            (VulnerabilityType::RaceCondition, "high"),
+            (VulnerabilityType::WeakHash, "medium"),
+            (VulnerabilityType::InsecureRandom, "medium"),
+            (VulnerabilityType::UnvalidatedRedirect, "medium"),
+            (VulnerabilityType::MissingRateLimit, "medium"),
+            (VulnerabilityType::MemoryLeak, "medium"),
+            (VulnerabilityType::Other, "low"),
+        ];
+
+        assert_eq!(
+            expected.len(),
+            17,
+            "every VulnerabilityType variant must stay in this table"
+        );
+        for (vuln, severity) in expected {
+            assert_eq!(vuln.severity(), severity, "{:?}", vuln);
+        }
+    }
+
+    #[test]
+    fn test_context_lines_scanned_and_deletions_ignored() {
+        let scanner = SecurityScanner::new();
+        let diff = diff_for(
+            "settings.ini",
+            vec![
+                HunkLine::Context("password = 'contextpass123'".to_string()),
+                HunkLine::Deletion("password = 'removedpass99'".to_string()),
+                HunkLine::Addition("password = 'addedpass4567'".to_string()),
+            ],
+        );
+
+        let vulns = scanner.scan_diff(&diff);
+        assert_eq!(
+            vulns.len(),
+            2,
+            "deletions are pre-existing code, never new findings"
+        );
+        // new_start is 10; line numbers follow the new-file side.
+        assert_eq!(vulns[0].line, 10, "context line keeps its new-side number");
+        assert_eq!(
+            vulns[1].line, 12,
+            "the deletion's slot still consumes an index"
+        );
+        assert!(vulns[0].description.contains("password"));
+        assert_eq!(
+            vulns[0].suggestion.as_deref(),
+            Some("Use environment variables or secure password storage")
+        );
+    }
+
+    #[test]
+    fn test_extension_scoped_patterns_skip_extensionless_files() {
+        let scanner = SecurityScanner::new();
+        let js_diff = diff_for(
+            "util.js",
+            vec![HunkLine::Addition(
+                "const seed = Math.random();".to_string(),
+            )],
+        );
+        let no_ext_diff = diff_for(
+            "run_checks",
+            vec![HunkLine::Addition(
+                "const seed = Math.random();".to_string(),
+            )],
+        );
+
+        let js_vulns = scanner.scan_diff(&js_diff);
+        assert_eq!(js_vulns.len(), 1);
+        assert_eq!(js_vulns[0].vuln_type, VulnerabilityType::InsecureRandom);
+
+        assert!(
+            scanner.scan_diff(&no_ext_diff).is_empty(),
+            "a pattern scoped to js/ts must not fire on an extensionless file"
+        );
+    }
+
+    #[test]
+    fn test_scan_diffs_aggregates_across_files() {
+        let scanner = SecurityScanner::new();
+        let diffs = vec![
+            diff_for(
+                "a.js",
+                vec![HunkLine::Addition("eval(userInput);".to_string())],
+            ),
+            diff_for(
+                "b.php",
+                vec![HunkLine::Addition("echo $_GET['q'];".to_string())],
+            ),
+        ];
+
+        let vulns = scanner.scan_diffs(&diffs);
+        assert_eq!(vulns.len(), 2);
+        assert_eq!(vulns[0].vuln_type, VulnerabilityType::CommandInjection);
+        assert_eq!(vulns[0].file, "a.js");
+        assert_eq!(vulns[1].vuln_type, VulnerabilityType::Xss);
+        assert_eq!(vulns[1].file, "b.php");
+
+        let convenience = scan_for_vulnerabilities(&diffs);
+        assert_eq!(convenience.len(), vulns.len());
+    }
+
+    #[test]
+    fn test_default_scanner_detects_private_key() {
+        let scanner = SecurityScanner::default();
+        let diff = diff_for(
+            "deploy/id_rsa",
+            vec![HunkLine::Addition(
+                "-----BEGIN OPENSSH PRIVATE KEY-----".to_string(),
+            )],
+        );
+
+        let vulns = scanner.scan_diff(&diff);
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0].vuln_type, VulnerabilityType::SecretHardcoded);
+        assert_eq!(vulns[0].file, "deploy/id_rsa");
+    }
 }

@@ -464,4 +464,178 @@ index abc123..def456 100644
         );
         assert_eq!(detect_language("unknown.xyz"), None);
     }
+
+    // ─── multi-file diffs, file kinds, and hunk-header variants ─────────
+
+    const MULTI_FILE_DIFF: &str = r#"diff --git a/src/kept.rs b/src/kept.rs
+index aaa111..bbb222 100644
+--- a/src/kept.rs
++++ b/src/kept.rs
+@@ -1,3 +1,4 @@
+ fn a() {}
+-old line
++new line
++extra line
+ fn b() {}
+diff --git a/src/added.rs b/src/added.rs
+new file mode 100644
+index 000000..ccc333
+--- /dev/null
++++ b/src/added.rs
+@@ -0,0 +1,2 @@
++fn c() {}
++fn d() {}
+diff --git a/src/gone.rs b/src/gone.rs
+deleted file mode 100644
+index ddd444..000000
+--- a/src/gone.rs
++++ /dev/null
+@@ -1,1 +0,0 @@
+-fn e() {}
+diff --git a/assets/logo.png b/assets/logo.png
+index eee555..fff666 100644
+Binary files assets/logo.png and assets/logo.png differ
+"#;
+
+    #[test]
+    fn test_parse_multi_file_diff_with_file_kinds() {
+        let parsed = parse_unified_diff(MULTI_FILE_DIFF).unwrap();
+        assert_eq!(parsed.len(), 4, "each file becomes its own ParsedDiff");
+
+        let kept = &parsed[0];
+        assert!(!kept.is_new && !kept.is_deleted && !kept.is_binary);
+        assert_eq!(kept.hunks.len(), 1);
+        assert_eq!(kept.language.as_deref(), Some("rust"));
+
+        let added = &parsed[1];
+        assert!(added.is_new, "new file mode marker is honored");
+        assert_eq!(added.old_path.as_deref(), Some("src/added.rs"));
+        assert_eq!(added.language.as_deref(), Some("rust"));
+
+        let deleted = &parsed[2];
+        assert!(deleted.is_deleted, "deleted file mode marker is honored");
+        assert_eq!(deleted.new_path.as_deref(), Some("src/gone.rs"));
+
+        let binary = &parsed[3];
+        assert!(binary.is_binary, "Binary files marker is honored");
+        assert!(binary.hunks.is_empty(), "binary diffs carry no text hunks");
+        assert_eq!(binary.language, None);
+    }
+
+    #[test]
+    fn test_hunk_header_without_counts_defaults_to_one() {
+        let diff =
+            "diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -3 +3 @@\n-old\n+new\n";
+
+        let parsed = parse_unified_diff(diff).unwrap();
+        let hunk = &parsed[0].hunks[0];
+        assert_eq!(hunk.old_start, 3);
+        assert_eq!(hunk.old_lines, 1, "omitted count defaults to 1");
+        assert_eq!(hunk.new_start, 3);
+        assert_eq!(hunk.new_lines, 1);
+    }
+
+    #[test]
+    fn test_has_additions_and_deletions() {
+        let parsed = parse_unified_diff(MULTI_FILE_DIFF).unwrap();
+
+        let kept = &parsed[0];
+        assert!(kept.has_additions());
+        assert!(kept.has_deletions());
+
+        assert!(parsed[1].has_additions());
+        assert!(!parsed[1].has_deletions(), "a new file only adds");
+        assert!(!parsed[2].has_additions());
+        assert!(parsed[2].has_deletions(), "a deleted file only removes");
+
+        let empty = ParsedDiff {
+            old_path: None,
+            new_path: Some("empty.rs".to_string()),
+            is_new: true,
+            is_deleted: false,
+            is_binary: false,
+            hunks: Vec::new(),
+            language: None,
+        };
+        assert!(!empty.has_additions());
+        assert!(!empty.has_deletions());
+    }
+
+    // ─── conversion to FileChange (the AI-review bridge) ────────────────
+
+    #[test]
+    fn test_extract_changes_from_diff_maps_change_types() {
+        let changes = extract_changes_from_diff(MULTI_FILE_DIFF).unwrap();
+        assert_eq!(changes.len(), 4);
+
+        assert_eq!(changes[0].path, "src/kept.rs");
+        assert_eq!(changes[0].change_type, ChangeType::Modified);
+        assert_eq!(changes[0].language.as_deref(), Some("rust"));
+
+        assert_eq!(changes[1].path, "src/added.rs");
+        assert_eq!(changes[1].change_type, ChangeType::Added);
+
+        assert_eq!(changes[2].path, "src/gone.rs");
+        assert_eq!(changes[2].change_type, ChangeType::Deleted);
+
+        assert_eq!(changes[3].path, "assets/logo.png");
+        assert_eq!(changes[3].change_type, ChangeType::Modified);
+    }
+
+    #[test]
+    fn test_extract_changes_round_trips_hunk_text() {
+        let changes = extract_changes_from_diff(MULTI_FILE_DIFF).unwrap();
+        let kept = &changes[0].diff;
+
+        assert!(
+            kept.starts_with("@@ -1,3 +1,4 @@\n"),
+            "hunk header is reconstructed, got: {:?}",
+            kept
+        );
+        assert!(kept.contains(" fn a() {}\n"), "context keeps its space");
+        assert!(kept.contains("-old line\n"));
+        assert!(kept.contains("+new line\n"));
+        assert!(kept.contains("+extra line\n"));
+        assert_eq!(
+            kept.lines().count(),
+            6,
+            "header plus five diff lines, no more"
+        );
+    }
+
+    #[test]
+    fn test_diff_stats_classifies_files_and_counts_lines() {
+        let stats = DiffStats::from_diff(MULTI_FILE_DIFF).unwrap();
+        assert_eq!(stats.files_changed, 4);
+        assert_eq!(stats.files_added, 1);
+        assert_eq!(stats.files_deleted, 1);
+        assert_eq!(stats.files_modified, 2);
+        assert_eq!(stats.insertions, 4, "2 in kept + 2 in added");
+        assert_eq!(stats.deletions, 2, "1 in kept + 1 in deleted");
+    }
+
+    #[test]
+    fn test_change_complexity_flags_docs_and_counts_churn() {
+        let changes = vec![
+            FileChange {
+                path: "docs/PLAN.md".to_string(),
+                change_type: ChangeType::Modified,
+                diff: "+doc line\n-old doc line".to_string(),
+                language: Some("markdown".to_string()),
+            },
+            FileChange {
+                path: "src/lib.rs".to_string(),
+                change_type: ChangeType::Modified,
+                diff: "+a\n+b\n-c".to_string(),
+                language: Some("rust".to_string()),
+            },
+        ];
+
+        let complexity = ChangeComplexity::analyze(&changes);
+        assert!(complexity.has_docs_changes, ".md path flags docs");
+        assert!(!complexity.has_test_changes);
+        assert_eq!(complexity.churn, 5, "every +/- diff line counts once");
+        assert_eq!(complexity.total_lines, 5);
+        assert_eq!(complexity.files_touched, 2);
+    }
 }

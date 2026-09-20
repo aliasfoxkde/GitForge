@@ -5,7 +5,9 @@
 use crate::models::JobStatus;
 use crate::Pool;
 use chrono::{DateTime, Utc};
-use gitforge_common::{Error, JobId, PipelineId, PipelineRunId, RepoId, Result, RunnerId, UserId};
+use gitforge_common::{
+    Error, JobId, PipelineId, PipelineRunId, RepoId, Result, RunnerId, SshKeyId, UserId,
+};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -93,6 +95,23 @@ fn hydrate_user(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::User> {
         password_hash: row
             .try_get("password_hash")
             .map_err(|error| Error::database(format!("invalid password hash: {}", error)))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+    })
+}
+
+fn hydrate_ssh_key(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::SshKey> {
+    Ok(crate::models::SshKey {
+        id: SshKeyId::from(parse_uuid_column(&row, "id")?),
+        user_id: UserId::from(parse_uuid_column(&row, "user_id")?),
+        name: row
+            .try_get("name")
+            .map_err(|error| Error::database(format!("invalid ssh key name: {}", error)))?,
+        fingerprint: row
+            .try_get("fingerprint")
+            .map_err(|error| Error::database(format!("invalid ssh key fingerprint: {}", error)))?,
+        public_key: row
+            .try_get("public_key")
+            .map_err(|error| Error::database(format!("invalid ssh key material: {}", error)))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
     })
 }
@@ -470,6 +489,95 @@ impl UserQueries {
 }
 
 // ============================================================================
+// SSH Key Queries
+// ============================================================================
+
+pub struct SshKeyQueries;
+
+impl SshKeyQueries {
+    /// Register a new SSH public key for a user. Duplicate fingerprints are
+    /// rejected: one public key maps to exactly one account.
+    pub async fn create(pool: &Pool, key: &crate::models::SshKey) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO ssh_keys (id, user_id, name, fingerprint, public_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(key.id.to_string())
+        .bind(key.user_id.to_string())
+        .bind(&key.name)
+        .bind(&key.fingerprint)
+        .bind(&key.public_key)
+        .bind(key.created_at.to_rfc3339())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("UNIQUE constraint failed") {
+                Error::invalid_input(format!(
+                    "ssh key fingerprint {} is already registered",
+                    key.fingerprint
+                ))
+            } else {
+                Error::database(format!("failed to create ssh key: {}", e))
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Get a key record by id.
+    pub async fn get(pool: &Pool, id: SshKeyId) -> Result<Option<crate::models::SshKey>> {
+        let row = sqlx::query("SELECT * FROM ssh_keys WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get ssh key: {}", e)))?;
+
+        row.map(hydrate_ssh_key).transpose()
+    }
+
+    /// Look up a key by its OpenSSH fingerprint — the identity the git
+    /// transport's public-key authentication resolves against.
+    pub async fn find_by_fingerprint(
+        pool: &Pool,
+        fingerprint: &str,
+    ) -> Result<Option<crate::models::SshKey>> {
+        let row = sqlx::query("SELECT * FROM ssh_keys WHERE fingerprint = ?")
+            .bind(fingerprint)
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| {
+                Error::database(format!("failed to look up ssh key by fingerprint: {}", e))
+            })?;
+
+        row.map(hydrate_ssh_key).transpose()
+    }
+
+    /// List every key registered to a user, newest first.
+    pub async fn list_by_user(pool: &Pool, user_id: UserId) -> Result<Vec<crate::models::SshKey>> {
+        let rows = sqlx::query("SELECT * FROM ssh_keys WHERE user_id = ? ORDER BY created_at DESC")
+            .bind(user_id.to_string())
+            .fetch_all(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to list ssh keys: {}", e)))?;
+
+        rows.into_iter().map(hydrate_ssh_key).collect()
+    }
+
+    /// Delete a key by id, but only when it belongs to `user_id`. Returns
+    /// whether a row was removed.
+    pub async fn delete_owned(pool: &Pool, id: SshKeyId, user_id: UserId) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM ssh_keys WHERE id = ? AND user_id = ?")
+            .bind(id.to_string())
+            .bind(user_id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to delete ssh key: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+}
+
+// ============================================================================
 // Pipeline Queries
 // ============================================================================
 
@@ -494,6 +602,39 @@ impl PipelineQueries {
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline: {}", e)))?;
         Ok(())
+    }
+
+    /// Retire the currently active pipeline version for (repo_id, name).
+    ///
+    /// The partial UNIQUE index `idx_pipelines_active_repo_name` admits only
+    /// one active row per repository and name, so a newly pushed version
+    /// must deactivate its predecessor or every push after the first fails
+    /// run creation with a constraint violation. Superseded rows stay as
+    /// history with active = 0.
+    pub async fn deactivate_active(pool: &Pool, repo_id: RepoId, name: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE pipelines SET active = 0 WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind(repo_id.to_string())
+        .bind(name)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to deactivate pipeline: {}", e)))?;
+        Ok(())
+    }
+
+    /// Number of active pipeline versions for (repo_id, name) — at most one
+    /// by the partial UNIQUE index; lets callers verify deactivation.
+    pub async fn count_active(pool: &Pool, repo_id: RepoId, name: &str) -> Result<i64> {
+        let (count,) = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM pipelines WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind(repo_id.to_string())
+        .bind(name)
+        .fetch_one(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to count active pipelines: {}", e)))?;
+        Ok(count)
     }
 
     /// Get a pipeline by ID

@@ -19,6 +19,21 @@ use tokio::time::{timeout, Duration, Instant};
 /// Default number of pre-warmed containers per image
 const POOL_SIZE: usize = 2;
 
+/// Sandbox acquisition ceiling in seconds. The pool copies whole layer
+/// stacks per container create (vfs storage), which on a loaded host can
+/// legitimately take minutes, so operators can raise the 60-second default
+/// instead of watching jobs fail before the daemon ever answered.
+fn sandbox_acquire_timeout() -> Duration {
+    const DEFAULT_SECS: u64 = 60;
+    Duration::from_secs(
+        std::env::var("GITFORGE_SANDBOX_ACQUIRE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(DEFAULT_SECS),
+    )
+}
+
 /// A pool of pre-warmed container instances
 pub struct ContainerPool {
     pools: Arc<RwLock<HashMap<String, Vec<SandboxInstance>>>>, // image -> instances
@@ -283,7 +298,7 @@ impl JobExecutor {
         tracing::info!("executing job {}", job_id);
 
         // Acquire container from pool
-        let acquire_timeout = job_timeout.min(Duration::from_secs(60));
+        let acquire_timeout = job_timeout.min(sandbox_acquire_timeout());
         let instance = match timeout(
             acquire_timeout,
             self.pool
@@ -689,6 +704,24 @@ impl JobResult {
 mod tests {
     use super::*;
     use gitforge_sandbox::StepResult;
+
+    #[test]
+    fn test_sandbox_acquire_timeout_default_and_env_override() {
+        // Default: the historical 60-second ceiling.
+        std::env::remove_var("GITFORGE_SANDBOX_ACQUIRE_SECS");
+        assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(60));
+
+        // Operators on slow storage can raise it.
+        std::env::set_var("GITFORGE_SANDBOX_ACQUIRE_SECS", "300");
+        assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(300));
+
+        // Garbage and non-positive values fall back to the default.
+        std::env::set_var("GITFORGE_SANDBOX_ACQUIRE_SECS", "not-a-number");
+        assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(60));
+        std::env::set_var("GITFORGE_SANDBOX_ACQUIRE_SECS", "0");
+        assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(60));
+        std::env::remove_var("GITFORGE_SANDBOX_ACQUIRE_SECS");
+    }
 
     #[test]
     fn test_executable_job_builder() {

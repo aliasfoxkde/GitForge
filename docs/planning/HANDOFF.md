@@ -1,6 +1,14 @@
 # GitForge Handoff
 
-**Last Updated:** 2026-09-01
+**Last Updated:** 2026-09-20
+**Current state:** Active development happens on dated
+`codex/*`/`fix/*` branches that are promoted to the Fedora deployment
+by revision, so `origin/main` lags the promoted builds. See
+`docs/handoffs/REPO_STATE_AUDIT_2026-09-20.md` for the branch/worktree
+landscape, `docs/planning/IMPROVEMENTS.md` for the improvement ledger
+and coverage state, and `docs/AUTH_DESIGN.md` for the planned identity
+work. The compose-stack smoke below was validated end to end on
+2026-09-08 and the fixes it produced shipped in 0.4.0.
 **Evidence boundary (central audit):** branch `main`, HEAD `186e3eb1fdda0fbc4571002a8807c51efbb40822`, 1 dirty status entries. This boundary covers the merged first-admin bootstrap, release packaging, and source promotion receipts; numeric ratings below remain historical context, not release gates.
 **Status:** 🔄 Active — merged first-admin bootstrap is built and promoted on Fedora; authenticated BigData registration and production operator provisioning remain pending
 **Location:** `/nas/Temp/repos/GitForge`
@@ -168,7 +176,7 @@ Control Center owner-scoped artifact retrieval contract remain open. Update
 this section when those gates receive reproducible evidence; do not erase the
 older audit conclusions without a replacement receipt.
 
-## Current audit reconciliation (2026-08-21)
+## Current audit reconciliation (2026-08-21, updated 2026-09-08)
 
 The historical runner-entrypoint finding is superseded on the current branch:
 `services/runner/src/main.rs` now starts `RunnerAgent::run()` in a task,
@@ -176,63 +184,73 @@ performs graceful stop, and awaits the task result. Package and integration
 tests pass for the API (212 unit, 39 integration), runner (38), and scheduler
 (74).
 
-The following production gaps remain confirmed:
+Resolution status of the previously confirmed production gaps:
 
-1. `RunnerAgent::register()` logs scheduler failure and continues in standalone
-   mode. Production registration failure must be fail-closed or explicitly
-   policy-controlled; otherwise a runner can appear healthy while it cannot
-   receive scheduler jobs.
-2. Runner heartbeat, pending-job fetch, assignment, and completion requests
-   have no service credential or replay/ownership proof. The scheduler routes
-   are assembled directly by `services/ci/src/main.rs`; the API
-   `auth_middleware` has no inbound caller in the current graph and does not
-   protect this CI listener.
-3. Compose previously supplied `DATABASE_URL` to CI while
-   `services/ci/src/main.rs` reads `GITFORGE_DATABASE_URL`. The CI compose entry
-   is now corrected to `GITFORGE_DATABASE_URL=sqlite:/data/gitforge.db`; this
-   still requires compose parsing and a disposable restart/persistence probe.
-4. `services/ci/src/main.rs` binds the scheduler listener to `0.0.0.0`;
-   deployment must keep it on the private GitForge network or add an explicit
-   service boundary before external exposure.
+1. **Runner registration fail-open — RESOLVED (2026-09-08).**
+   `RunnerAgent::register()` is fail-closed by default: a scheduler connection
+   failure or unexpected status aborts runner startup with an error. Legacy
+   standalone fallback remains available behind an explicit
+   `GITFORGE_RUNNER_STANDALONE=allow` policy. Auth rejections (401/503) were
+   already fail-closed.
+2. **Unauthenticated scheduler routes — RESOLVED (verified 2026-09-08).**
+   `scheduler_routes_with_tokens` enforces fail-closed bearer credentials on
+   every runner and operator route (unset credential returns 503
+   `scheduler_auth_not_configured`). Runner and operator tokens are scoped
+   independently, and completion/log/artifact routes are fenced by per-job
+   lease tokens. The `/jobs/{id}/assign` no-op stub was removed: assignment is
+   scheduler-owned and a client-selectable assignment route would bypass
+   scheduling policy. `POST /jobs/{id}/complete` now requires lease proof for
+   any existing job and returns 404 for unknown jobs; the anonymous completion
+   path is gone.
+3. **Compose DATABASE_URL mismatch — RESOLVED (2026-09-08, validated live).**
+   api, ci, and git-server now share one `gitforge-data` volume with
+   `sqlite:/data/gitforge.db?mode=rwc` (bare `sqlite:` URLs open an existing
+   file only — `?mode=rwc` is what lets first boot create it), and git-server
+   gained `DATABASE_URL` plus the CI trigger URL/token.
+4. **Scheduler listener on `0.0.0.0` — OPEN (deployment concern).**
+   Deployment must keep the listener on the private GitForge network or add an
+   explicit service boundary before external exposure. `docker-compose.yml`
+   now requires `GITFORGE_SCHEDULER_TOKEN` (via `${VAR:?}` interpolation) for
+   the CI and runner services so the fail-closed credential cannot be silently
+   absent.
 
-Required next packet: add an explicit runner/service credential contract,
-enforce it on registration/heartbeat/job fetch/assign/complete, reject runner
-identity mismatches, make production registration failure fail closed, and run
-one disposable queued-job smoke with durable completion and restart recovery.
-Do not mark GitForge operational based on unit tests alone.
+### Compose-stack queued-job smoke — COMPLETE (2026-09-08)
 
-## Current audit reconciliation (2026-08-21)
+Disposable project `gitforge-smoke` (api + ci + runner + git-server, shared
+SQLite/git volumes, host ports shifted to avoid native dev processes).
+Validated end to end:
 
-The historical runner-entrypoint finding is superseded on the current branch:
-`services/runner/src/main.rs` now starts `RunnerAgent::run()` in a task,
-performs graceful stop, and awaits the task result. Package and integration
-tests pass for the API (212 unit, 39 integration), runner (38), and scheduler
-(74).
+- Real `git push` through the compose git-server resolved owner/repo from the
+  shared database, found the API-provisioned bare repo in the shared `/git`
+  volume, and enqueued a durable `ci.trigger.pending` event; the delivery
+  loop posted it to CI with the shared bearer token.
+- CI loaded `.gitforce.yml` committed at the pushed revision, started the
+  pipeline, enqueued the job, and the runner claimed it with a lease, ran it
+  in a busybox container bind-mounted from the CI checkout, and completed it
+  with lease proof; the run finalized `succeeded` and the persisted log
+  chunk (with the step's marker) was retrievable through the authenticated
+  API.
+- Cross-process durable queue: `POST /api/jobs` returned 201 `queued`, the
+  CI scheduler reloaded the row on its next tick and executed it
+  (`rust:latest`), and resubmitting the same idempotency key returned 200
+  `already_queued` with the same job id.
+- Restart recovery: a mid-flight scheduler restart requeued the two in-flight
+  jobs (`requeued jobs left in-flight by scheduler restart count=2`);
+  stale-lease completions were rejected fail-closed (409
+  `completion_persistence_failed`); the next startup reconciliation finalized
+  the orphaned run as `failed`.
 
-The following production gaps remain confirmed:
+Compose/image defects found and fixed by this smoke (see CHANGELOG 0.4.0
+"Fixed"): split control-plane databases, missing git-server `DATABASE_URL`,
+wrong git-server port mappings, missing `GIT_ROOT` on api, missing `/git`
+mount on ci, root-owned volume mountpoints in all four images, missing git
+binary in the ci image, root Docker socket inaccessible to the non-root
+runner (`DOCKER_GID` group mapping), and workspace bind paths that must be
+host-identical (`GITFORGE_WORKSPACE_HOST_DIR`).
 
-1. `RunnerAgent::register()` logs scheduler failure and continues in standalone
-   mode. Production registration failure must be fail-closed or explicitly
-   policy-controlled; otherwise a runner can appear healthy while it cannot
-   receive scheduler jobs.
-2. Runner heartbeat, pending-job fetch, assignment, and completion requests
-   have no service credential or replay/ownership proof. The scheduler routes
-   are assembled directly by `services/ci/src/main.rs`; the API
-   `auth_middleware` has no inbound caller in the current graph and does not
-   protect this CI listener.
-3. Compose previously supplied `DATABASE_URL` to CI while
-   `services/ci/src/main.rs` reads `GITFORGE_DATABASE_URL`. The CI compose entry
-   is now corrected to `GITFORGE_DATABASE_URL=sqlite:/data/gitforge.db`; this
-   still requires compose parsing and a disposable restart/persistence probe.
-4. `services/ci/src/main.rs` binds the scheduler listener to `0.0.0.0`;
-   deployment must keep it on the private GitForge network or add an explicit
-   service boundary before external exposure.
-
-Required next packet: add an explicit runner/service credential contract,
-enforce it on registration/heartbeat/job fetch/assign/complete, reject runner
-identity mismatches, make production registration failure fail closed, and run
-one disposable queued-job smoke with durable completion and restart recovery.
-Do not mark GitForge operational based on unit tests alone.
+Follow-up product gaps recorded in IMPROVEMENTS.md: orphaned-run
+reconciliation runs only at startup, and post-restart requeued jobs complete
+without lease proof and are marked failed despite successful execution.
 
 ---
 

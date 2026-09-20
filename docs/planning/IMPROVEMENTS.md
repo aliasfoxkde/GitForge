@@ -1,22 +1,46 @@
 # GitForge Improvement Plan
 
 Date: 2026-08-28
+Updated: 2026-09-08
 Status: Active
 
 ## Summary
 
 Repository state after audit:
 - **Tests**: All passing (300+ tests across workspace)
-- **Linting**: Clippy passes with `-D warnings`
+- **Linting**: Clippy passes with `-D warnings`; ShellCheck clean on all
+  repo scripts; actionlint clean on all workflows; both gates added to
+  Rust CI and the Makefile
 - **Formatting**: `cargo fmt --check` passes
+- **Dependency vetting**: cargo-vet initialized (`supply-chain/`); `make
+  lint` no longer fails on a missing `cargo vet`
 - **Race Detection**: Fixed storage durability issue with `sync_all()` calls
-- **Coverage**: 80.12% lines, 81.59% regions, 81.38% functions (CI floor: 79.9%)
+- **Coverage**: 86.18% lines / 87.22% regions (`cargo llvm-cov --all`,
+  2026-09-20; CI floor: 79.9%)
 - **Aegis**: Integrated into CI (already present in security.yml)
 - **E2E**: Template framework exists in template-parts; GitForge has no web frontend
 
+## Resolved Security Gaps (2026-09-08)
+
+1. **Scheduler completion without lease proof** — `POST /jobs/{id}/complete`
+   accepted anonymous completions for any known job. Completion now requires
+   the assigning runner identity and lease token; unknown jobs return 404.
+2. **`/jobs/{id}/assign` no-op stub removed** — the route acknowledged
+   assignments without performing any; a client-selectable assignment path
+   would also have bypassed scheduler policy.
+3. **Runner registration fail-open** — `RunnerAgent::register()` now fails
+   closed by default (`GITFORGE_RUNNER_STANDALONE=deny`); legacy standalone
+   fallback requires an explicit `allow`.
+4. **Compose credentials** — `docker-compose.yml` requires
+   `GITFORGE_SCHEDULER_TOKEN` for CI and runners, matching the fail-closed
+   scheduler auth that was already enforced at the HTTP boundary.
+5. **ai-review.yml env bug** — review summary/critical findings were passed
+   as action inputs instead of step env vars, so `process.env` lookups in
+   the comment script always hit their fallback.
+
 ## Honest Assessment: What's Achievable
 
-### Achieved This Session
+### Achieved Previously
 1. **Storage Durability Fix**: `sync_all()` calls prevent race conditions
 2. **MockAiProvider**: Full mock implementation for testing AI providers
 3. **Executor Unit Tests**: 7 new tests for JobResult, ExecutableJob
@@ -27,10 +51,17 @@ The following require a running integration environment:
 
 | Item | Blocked By | Workaround |
 |------|------------|------------|
-| Docker integration tests | Docker daemon | Use stub sandbox in tests |
-| Git-server protocol tests | Git protocol handshake | Mock at higher layer |
-| Service entry point coverage | TCP listeners, DB pools | Integration test suite |
-| 99% coverage on main.rs | Full infra required | Not achievable in unit tests |
+| gitforge-runner/executor coverage | Live Docker daemon required | `#[ignore]` integration tests pass against a live daemon (see below) |
+| 99% coverage on main.rs | Full infra required | Not achievable; the spawned-binary harnesses for git-server and ci lifted main.rs to 69%/83.5% lines respectively |
+
+### Previously Blocked, Now Passing (2026-09-08)
+
+| Item | Status |
+|------|--------|
+| Docker sandbox integration tests | 3/3 `#[ignore]` tests pass against live Docker 26.1.5 (`cargo test -- --ignored`) |
+| Runner executor timeout reaping | Real-container test passes: hung job reaped at timeout |
+| Git-server protocol tests | NEW `services/git-server/tests/git_http_protocol.rs`: real `git push`, `git clone`, `fetch`, and `ls-remote` against the spawned binary + SQLite DB |
+| Compose-stack queued-job smoke | Disposable api+ci+runner+git-server run: push → trigger → pipeline → lease-fenced execution → durable completion → logs via API; cross-process durable queue with idempotency; restart requeue + reconciliation observed (see HANDOFF) |
 
 ### Not Applicable
 | Item | Reason |
@@ -47,59 +78,246 @@ The following require a running integration environment:
 | gitforge-events | 95%+ | 93%+ |
 | gitforge-db/models | 90%+ | 95%+ |
 | gitforge-scheduler | 88%+ | 87%+ |
-| gitforge-process | 86%+ | 93%+ |
+| gitforge-process | 93.02% | shutdown-signal delivery driven by a real SIGTERM to the test process; pool spawn lifecycle covered (2026-09-20) |
+| gitforge-review | 99.37% | diff parser, the ParsedDiff→FileChange AI bridge, and the security scanner fully exercised (2026-09-20) |
+| gitforge-ai | 90.16% | providers exercise their full HTTP boundary against a scripted server |
 
 ### Moderate Coverage (70-85%)
 | Crate | Lines | Issue |
 |-------|-------|-------|
 | gitforge-api | ~80% | API routes need error path tests |
 | gitforge-cli | ~81% | CLI integration tests |
-| gitforge-build | ~67% | Daemon mode hard to unit test |
+| gitforge-build | 80.62% | daemon.rs went from 19.78% to 77.92% lines once its unix-socket protocol loop was tested over real socket pairs (2026-09-09) |
 
 ### Low Coverage (<70%) - Entry Points
 | Crate | Lines | Issue |
 |-------|-------|-------|
-| services/ci | ~35% | main() entry point requires infra |
-| services/git-server | ~20% | Git protocol requires Docker |
-| gitforge-runner/executor | ~35% | Container execution requires Docker |
-|-------|-------|-------|
-| gitforge-runner/executor | 5.53% | Requires Docker integration |
-| services/git-server | 20.48% | Git protocol integration tests |
-| gitforge-ai | 7-58% | API mocking needed |
-| gitforge-build/daemon | 21.82% | Integration-only code |
+| gitforge-runner/executor | 62.09%* | Container execution requires Docker; *measured with the `#[ignore]` tests included (`cargo llvm-cov -p gitforge-runner -- --include-ignored`, 81/81 pass against live Docker 26.1.5); the CI floor sees 35.23% |
 
-## Technical Debt Identified
+(2026-09-08 re-measurement, `cargo llvm-cov --all`: workspace total
+82.90% lines. services/git-server left this table's sub-30% bucket after
+its protocol harnesses were made coverage-visible: main.rs 69.43%,
+ssh_server.rs 85.64%; services/ci followed at 83.54% once its
+spawned-binary trigger harness landed. gitforge-ai left the table on
+2026-09-09 at 90.16% lines once its providers were tested against a
+scripted HTTP server; gitforge-build left it the same day at 80.62%
+lines once the build daemon's connection handler was driven over real
+unix socket pairs. 2026-09-20 re-measurement: a same-day coverage
+campaign over job_logs receipts, the review parser/scanner, the process
+signal/pool layer, and the runner's scheduler boundary lifted the
+workspace to 86.18% lines / 87.22% regions (from 84.80% / 85.86%).
+gitforge-storage/job_logs.rs — the largest file-level gap outside the
+Docker-gated executor at the start of the day — rose to 92.94% lines.
+The largest remaining file-level gap outside the executor is now
+services/git-server/main.rs at 69.43% lines.)
 
-### High Priority
-1. **Storage**: Race condition fixed, needs stress testing
-2. **Runner Executor**: 95% untested - needs Docker test harness
-3. **Git Server**: 80% untested - needs integration test environment
+## Remaining Gaps and Next Steps (2026-09-08)
 
-### Medium Priority
-4. **AI Provider mocking**: Anthropic/OpenAI/Ollama need test doubles
-## Integration Testing Path
+Ordered by value; each item states the concrete blocker.
 
-### What's Needed for True 99% Coverage
-To cover the 20% gap in service entry points, you need:
+1. **cargo-vet audits** — the exemption backlog stands at 355 crates (86
+   fully audited), down from 377 after importing the zcash peer registry
+   and recording ten publisher trusts the tool derives from our existing
+   imports (dtolnay for proc-macro2/serde/serde_core/rustversion, epage
+   for toml_writer, Manishearth for potential_utf/icu_normalizer_data/
+   url/zerofrom/zerofrom-derive). The remainder is dominated by the
+   russh/RustCrypto tree from the SSH transport rewrite; the RustCrypto
+   0.9/0.10-rc and russh 0.63 versions have no audits in any peer
+   registry yet because they are too new. Incremental path: re-run
+   `cargo vet suggest` (it names both small-diff audits and trust
+   candidates grounded in existing imports), re-run `import` + `prune`
+   as peer registries pick the new versions up, and `cargo vet inspect`
+   + `certify` only for diffs a human actually reviewed. Six peer
+   registries are registered and pinned in `imports.lock`, so pruning is
+   automatic once coverage exists.
 
-1. **Docker-based integration tests**: Spin up real containers
-2. **Test database**: PostgreSQL or SQLite test instances
-3. **HTTP test harness**: Start services on test ports
-4. **Git protocol test fixtures**: Actual git repos for protocol tests
+## Resolved from the Remaining-Gaps Ledger (2026-09-08)
 
-### Realistic Target: 85-90%
-With unit tests only (no Docker), realistic coverage is:
-- Core business logic: 95%+
-- API handlers: 90%+
-- Service entry points: 50-60% (require integration tests)
+1. **Runner registration retry/backoff** — done. `RunnerAgent::register`
+   retries an unreachable or 503-answering scheduler with bounded
+   exponential backoff (`GITFORGE_REGISTER_ATTEMPTS`, default 6;
+   `GITFORGE_REGISTER_BACKOFF_SECS`, default 1s, doubling to a 30s cap)
+   before honoring the fail-closed exit. Auth rejections (401/403) are
+   fatal on the first attempt and other non-503 statuses are never retried;
+   standalone fallback still requires `GITFORGE_RUNNER_STANDALONE=allow`.
+   Covered by real-socket tests: 503/503/201 retry-then-succeed with
+   connection counting, single-attempt auth rejection, exhausted transport
+   errors, and the policy-rejection allow/deny matrix.
+2. **cargo-vet: registries + CI enforcement** — partially done. The vet
+   gate had gone red when the SSH rewrite landed 80+ new dependencies with
+   no audit coverage: the five applicable public audit registries (isrg,
+   google, mozilla, bytecode-alliance, embark-studios) are now registered
+   and pinned in `supply-chain/imports.lock`, the new tree is recorded as
+   tracked exemptions via `cargo vet regenerate exemptions`
+   (`cargo vet` is green again: 64 fully audited, 2 partially audited, 377
+   exempted), and a `supply-chain` job now enforces `cargo vet` in
+   rust-ci.yml so future dependency changes that lose coverage fail CI
+   instead of silently drifting. Mass-certifying the backlog was rejected
+   as dishonest: an audit entry asserts a human reviewed the source.
+3. **Per-user SSH key authorization** — done. SSH no longer authenticates
+   any key on possession. Public keys are registered to accounts through
+   `POST /api/ssh-keys` (name + OpenSSH public-key line, parsed and
+   validated at registration, stored with the `SHA256:` fingerprint),
+   listed with `GET /api/ssh-keys`, and removed with
+   `DELETE /api/ssh-keys/{id}` (ownership-fenced; 409 on a fingerprint
+   already registered to any account, enforced by a UNIQUE column and a
+   pre-check). `GitSshSession::auth_publickey` resolves the presented
+   key's fingerprint against the `ssh_keys` table, logs accepted
+   fingerprints with the owning account, and fails closed on all three
+   failure modes: no database, unregistered key, and registry lookup
+   error. This makes SSH strictly stronger than the unauthenticated Smart
+   HTTP transport. Covered by `test_ssh_unregistered_key_is_rejected`
+   (a real second keypair is denied with `Permission denied`),
+   `test_database_ssh_key_registry` (fingerprint resolution, scoping,
+   duplicate rejection, ownership-fenced deletion), and the API parsing
+   tests (valid ed25519, comment-insensitive fingerprints, garbage
+   rejection).
+4. **Service entry-point coverage, measurement side** — done for
+   git-server. The HTTP and SSH protocol harnesses spawn the real
+   `git-server` binary, but they stopped it with `start_kill()`, so the
+   child never flushed its LLVM profile and `cargo llvm-cov` reported the
+   entry point at ~20-26% despite the suites driving push/clone/fetch and
+   full SSH handshakes through it. Both suites now stop the server with
+   SIGTERM via `tests/common/mod.rs::shutdown_gracefully` — the real
+   graceful-shutdown path, with a SIGKILL fallback after 10s so tests
+   never hang — which counts the child's coverage: main.rs 23.83% →
+   69.43% lines, ssh_server.rs 22.07% → 85.64%. Lesson recorded: a
+   spawned-instrumented binary only reports coverage on a clean exit.
+5. **Service entry-point coverage, ci** — done. A new spawned-binary
+   harness (`services/ci/tests/ci_trigger_flow.rs`) boots the real `ci`
+   service against a temporary SQLite database, bare git repository with
+   a committed `.gitforce.yml`, workspace root, and artifact root, then
+   drives the same HTTP trigger endpoint the git-server calls after a
+   push: it asserts the trigger token is required (401 without), the run
+   is created and reported synchronously (202 `accepted` with the run
+   id), the run and job rows are durable in the database the service
+   wrote, the job's commands and image come from the committed
+   definition rather than a substituted default, and the workspace is a
+   real clone checked out at the pushed commit. The service is stopped
+   with the same SIGTERM graceful-shutdown helper, so the consumer loops
+   and startup path are counted. services/ci `main.rs` went from
+   64.08% to 83.54% lines.
+6. **Service entry-point coverage, api** — done. A spawned-binary
+   harness (`services/api/tests/api_gateway_flow.rs`) boots the real
+   `api` binary against a temporary database with a seeded
+   bcrypt-hashed account, then drives it like a genuine client:
+   protected routes reject anonymous callers, login rejects a wrong
+   password and returns a real bearer token otherwise, a repository
+   create/list round trip succeeds through the JWT middleware, and the
+   SSH key registry endpoints work over HTTP (register, duplicate 409,
+   list, delete) with the rows asserted in the service's own database.
+   services/api `main.rs` went from 72.46% regions to 91.07%
+   (95.11% lines). With all three harnesses in place the workspace
+   stands at 84.94% regions / 83.40% lines, up from 81.19%/79.63% at
+   the start of this ledger. What remains below that is inherent:
+   gitforge-runner/executor executes containers (62.09% lines measured
+   with the `#[ignore]` tests included against a live Docker daemon,
+   35.23% on the CI floor).
+
+## Resolved from the Remaining-Gaps Ledger (2026-09-09)
+
+1. **gitforge-ai HTTP boundary** — done. The providers were the worst
+   covered code in the workspace (openai.rs 7.03% lines, ollama.rs
+   51.48%, anthropic.rs 58.80%) because every path behind the HTTP call
+   was untested. A new harness (`crates/gitforge-ai/tests/provider_http.rs`)
+   points each provider at a local scripted HTTP server via
+   `ProviderConfig::base_url` and serves realistic wire-format responses,
+   asserting the request envelopes (auth headers, model, max_tokens,
+   temperature), the status-to-error mapping (429 → RateLimit, 401 →
+   Auth, 5xx → Api), the response parsing (message content → findings
+   with severity/category mapping and safe fallback for unknown labels,
+   token and cost accounting), and the failure modes (unparsable content,
+   empty choices, missing API-key env var). The crate stands at 90.16%
+   lines. The Anthropic test immediately caught a real bug: the response
+   struct expected a JSON key literally named `type_`, so every real
+   Anthropic API response failed to parse (`AiError::Parse`) — the health
+   check had masked it because it never reads the body. Fixed with
+   `#[serde(rename = "type")]`. The health check had masked the bug
+   because it only reads the status code, never the body.
+
+2. **gitforge-build daemon protocol loop** — done. `daemon.rs` sat at
+   19.78% lines because only its shutdown-flag helpers were tested; the
+   entire `handle_connection` request/response path was dark. The crate's
+   test module now drives the handler over real `UnixStream` pairs with
+   the same one-connection-per-request, shared-coordinator shape as the
+   live daemon: invalid and unknown job ids on status and cancel, empty
+   List/Stats, the socket Shutdown request raising the shared shutdown
+   flag, and oversized or undecodable requests being refused without a
+   response. A round-trip test submits a real `cargo --version` through
+   the framed protocol, polls it to `completed(0)` across separate
+   connections, and asserts the finished job appears in List with its
+   original arguments. daemon.rs stands at 77.92% lines (crate 80.62%),
+   and the remaining dark lines are the `main()` supervision path already
+   exercised by the compose smoke.
+
+## Resolved from the Remaining-Gaps Ledger (2026-09-20)
+
+1. **Coverage campaign, non-Docker surfaces** — done across four crates.
+   gitforge-storage/job_logs.rs 62.84% → 92.94% lines (`bounded_put`
+   receipts, truncation boundary, on-disk metadata handling);
+   gitforge-review 83.87% → 99.37% (multi-file diff parsing, the
+   ParsedDiff→FileChange AI bridge, the full vulnerability severity
+   table, extension filters); gitforge-process 86.11% → 93.02%
+   (shutdown handler proven by delivering a real SIGTERM to the test
+   process; pool spawn lifecycle over real children); and
+   gitforge-runner/agent.rs 75.55% → 86.72% lines, where a
+   request-recording HTTP harness now drives the scheduler boundary:
+   claim succeeds/fails closed, live log chunks are labelled and
+   flagged on rejection, final step output streams in UTF-8-safe
+   chunks, artifact uploads verify checksums and refuse path escapes,
+   and completion receipts stay bounded across multibyte text. What
+   remains dark in agent.rs is the `execute_job` happy path, which is
+   Docker-gated like the executor.
+
+## Resolved from the Compose Smoke (2026-09-08)
+
+1. **Periodic orphaned-run reconciliation** — done. `reconcile_orphaned_runs`
+   (services/ci/src/main.rs) now runs on a 60s loop with a 120s run-age grace
+   window and a live-engine guard; startup still sweeps once with no guards.
+2. **Post-restart requeued completions lack lease proof** — done. Root cause
+   was not lease propagation: `requeue_inflight` deliberately clears leases
+   (receipts cannot be trusted across a restart), so a still-running
+   execution is orphaned by design. The fix makes orphaning explicit and
+   prompt end to end:
+   - `Scheduler::is_cancelled` reports every terminal durable status, so the
+     runner's cancellation probe stops a sandbox whose row was failed or
+     requeued by restart recovery, not only operator cancellations.
+   - The runner skips log, artifact, and completion reporting once its probe
+     says the outcome was decided mid-execution; no doomed 409s.
+   - A credentialed completion for an unassigned job is rejected 409 with
+     "job is no longer assigned to a runner; its durable outcome was decided
+     without this completion" instead of the malformed-request message.
+   - Covered by `test_job_cancelled_probe_reports_terminal_durable_status`
+     and `test_complete_job_unassigned_reports_orphaned_outcome`.
+3. **git-server SSH protocol** — done, and the finding was bigger than a
+   missing test: the ssh2/libssh2 listener could never complete a handshake
+   (libssh2 is a client-side library and the socket was never attached to
+   the session), and the `SshGitHandler` behind it was advertisement-only
+   with a receive-pack that never moved refs. The transport is now a russh
+   server (`services/git-server/src/ssh_server.rs`) that pipes
+   authenticated channels to real `git upload-pack`/`git receive-pack`
+   child processes, with a persisted ed25519 host key and required
+   public-key auth. `tests/git_ssh_protocol.rs` drives real `push`, `clone`,
+   `fetch`, and `ls-remote` over `ssh://` with generated keypairs and
+   host-key pinning, and asserts key-less clients and unknown repositories
+   are rejected.
+
+### Not Applicable
+- Browser/WCAG e2e: GitForge has no web frontend; template-parts are
+  scaffolding templates, not GitForge UI.
 
 ## Release Checklist
 
-- [x] All tests pass (`cargo test --workspace`) - 300+ tests passing
-- [x] Clippy clean (`cargo clippy --workspace -- -D warnings`) - Pass
-- [x] Format check (`cargo fmt -- --check`) - Pass
-- [x] Coverage ≥80% (80.12% achieved; CI floor: 79.9%)
-- [x] No race conditions (storage sync fix applied)
+- [x] All tests pass (`cargo test --workspace`)
+- [x] Clippy clean (`cargo clippy --workspace -- -D warnings`)
+- [x] Format check (`cargo fmt -- --check`)
+- [x] ShellCheck clean (scripts/ + systemd/)
+- [x] actionlint clean (.github/workflows/)
+- [x] `cargo vet` gate initialized and passing
+- [x] Coverage ≥80% (CI floor: 79.9%)
+- [x] Docker-gated tests validated against a live daemon (4/4)
+- [x] Git Smart HTTP protocol validated end-to-end (push/clone/fetch)
+- [x] Compose-stack queued-job smoke validated (push → pipeline → durable completion → restart recovery)
 - [x] CHANGELOG updated
 - [x] GitHub release created (v0.3.3)
 

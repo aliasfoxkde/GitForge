@@ -48,6 +48,9 @@ pub struct PipelineResponse {
     pub id: String,
     pub name: String,
     pub repo_id: String,
+    /// The API list endpoint does not return `enabled`; default it so the
+    /// response still decodes (the run/list flows only need id/name/repo_id).
+    #[serde(default)]
     pub enabled: bool,
 }
 

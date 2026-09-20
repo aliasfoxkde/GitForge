@@ -163,4 +163,51 @@ mod tests {
         // Handler should still be running
         assert!(is_handler_running());
     }
+
+    #[tokio::test]
+    async fn test_wait_for_shutdown_returns_once_flag_is_set() {
+        let flag = create_shutdown_flag();
+        let waiter = tokio::spawn(wait_for_shutdown(flag.clone()));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        flag.store(true, Ordering::SeqCst);
+
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("wait_for_shutdown must return after the flag is set")
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_shutdown_handler_sets_flag_on_sigterm() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        // Arming our own SIGTERM stream installs the process-wide handler
+        // first, so a delivery that races ahead of the spawned task is
+        // caught instead of terminating the test binary.
+        let mut guard = signal(SignalKind::terminate()).expect("SIGTERM stream");
+
+        let flag = create_shutdown_flag();
+        spawn_shutdown_handler(flag.clone());
+        // Give the spawned task a chance to register its own streams.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let rc = unsafe { libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM) };
+        assert_eq!(rc, 0, "delivering SIGTERM to our own pid must succeed");
+
+        // The guard stream confirms the signal actually fired.
+        tokio::time::timeout(Duration::from_secs(2), guard.recv())
+            .await
+            .expect("guard stream should observe SIGTERM")
+            .expect("signal stream must stay open");
+
+        for _ in 0..50 {
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("SIGTERM must set the shutdown flag");
+    }
 }

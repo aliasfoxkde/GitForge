@@ -54,7 +54,8 @@ done
 list_backups() {
     if [[ -d "$BACKUP_ROOT" ]]; then
         echo "Available backups in $BACKUP_ROOT:"
-        ls -1td "$BACKUP_ROOT"/*/ 2>/dev/null | head -20
+        find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@\t%p\n' 2>/dev/null \
+            | sort -rn | head -20 | cut -f2-
     else
         echo "No backups found in $BACKUP_ROOT"
     fi

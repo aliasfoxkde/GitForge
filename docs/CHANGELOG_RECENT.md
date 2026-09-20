@@ -2,6 +2,163 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [0.4.0] - 2026-09-08
+
+### Security
+
+- Git over SSH now works and authenticates: the transport was rewritten
+  from ssh2/libssh2 (client-only library — the old listener could never
+  complete a handshake, so the port served nothing) to a russh server that
+  pipes authenticated channels to real `git upload-pack`/`git receive-pack`
+  child processes. Public-key auth is required; accepted fingerprints are
+  logged. The ed25519 host key is generated on first boot, persisted under
+  the ssh volume (override path with `GITFORGE_SSH_HOST_KEY`), and
+  published as `.pub` for `known_hosts` pinning
+- Scheduler job completion requires lease proof: anonymous completion of a
+  known job is rejected (409), unknown jobs return 404
+- Removed the `POST /jobs/{id}/assign` no-op stub that acknowledged
+  assignments without performing any
+- Runner registration is fail-closed by default
+  (`GITFORGE_RUNNER_STANDALONE=deny`); standalone fallback requires explicit
+  opt-in
+- Git over SSH authenticates against a per-user key registry instead of
+  accepting any key on possession: public keys are registered to accounts
+  via `POST /api/ssh-keys` (validated OpenSSH parsing, `SHA256:`
+  fingerprint, globally unique), the transport resolves presented keys
+  against that registry and rejects unregistered ones, and a broken
+  registry fails closed rather than letting connections through
+- docker-compose requires `GITFORGE_SCHEDULER_TOKEN` for CI and runners,
+  matching the fail-closed scheduler auth boundary
+
+### Added
+
+- Git Smart HTTP protocol integration tests: real `git push`, `clone`,
+  `fetch`, and `ls-remote` against the spawned git-server binary
+- API gateway flow integration test: boots the real `api` binary against
+  a temporary database, logs in with a seeded bcrypt-hashed account,
+  and drives authenticated repository creation and the SSH key registry
+  over HTTP, asserting the rows in the service's own database
+- CI trigger flow integration test: boots the real `ci` service against
+  a temporary database and bare repository, requires the trigger token,
+  and asserts the run, job commands, image, and workspace clone all come
+  from the committed `.gitforce.yml` at the pushed revision
+- AI provider HTTP boundary tests: each provider (OpenAI, Anthropic,
+  Ollama) is pointed at a local scripted HTTP server and driven through
+  health checks and reviews with realistic wire-format responses,
+  asserting auth headers, status-to-error mapping (429/401/5xx), finding
+  parsing with severity/category fallback, and cost/token accounting.
+  gitforge-ai went from 57.86% to 90.16% lines
+- Build daemon protocol tests: the request/response connection handler
+  is driven over real unix socket pairs — invalid and unknown job ids,
+  empty list/stats, the socket shutdown request raising the shared
+  flag, and oversized or undecodable requests refused without a
+  response — plus a round trip that submits a real `cargo --version`,
+  polls it to completion across connections, and lists the finished
+  job. daemon.rs went from 19.78% to 77.92% lines
+- Protocol and trigger test harnesses stop their spawned services with
+  SIGTERM (the real graceful-shutdown path), so `cargo llvm-cov` now
+  counts the entry-point code they exercise; workspace line coverage
+  rose from 79.63% to 83.40% with no production changes
+- Job log store tests: `bounded_put` receipts are verified end to end —
+  SHA-256 over the stored content, byte counts, the `gitforge://log/`
+  URI, truncation of oversized logs (kept bytes are the head of the
+  log and the receipt reflects the truncated size), exact-boundary
+  non-truncation, and overwrite replacing the receipt — plus on-disk
+  delete removing both log and metadata, listing that skips corrupt
+  metadata files, and get returning None when only metadata remains.
+  job_logs.rs went from 62.84% to 92.94% lines
+- Code review crate tests: multi-file diff parsing with new, deleted,
+  and binary file markers, single-line hunk headers (`@@ -3 +3 @@`),
+  the ParsedDiff → FileChange bridge (change-type mapping and hunk-text
+  round trip), diff stats and complexity flags, every vulnerability
+  severity mapping, context-line scanning with deletion lines ignored,
+  extension-scoped patterns skipping extensionless files, and findings
+  aggregated across files. gitforge-review went from 83.87% to 99.37%
+  lines
+- Process crate tests: the SIGTERM shutdown handler is driven by
+  delivering a real SIGTERM to the test process (with a guard stream
+  armed first so the delivery can never kill the binary),
+  `wait_for_shutdown` returns once its flag is set, and the process
+  pool's `spawn` is exercised over real children — tracked until exit,
+  reaped by the timeout arm against a hung `sleep`, and rejecting an
+  unknown program without a ghost tracking entry. gitforge-process
+  went from 86.11% to 93.02% lines; signal.rs reached 100%
+- Runner scheduler-boundary tests: a request-recording HTTP harness
+  drives the runner's reporting pipeline without Docker — job claims
+  yield lease tokens or fail closed on rejection, malformed payloads,
+  and unreachable schedulers; live log chunks carry `[stdout]`/
+  `[stderr]` labels and split multibyte payloads at UTF-8 boundaries;
+  final step output streams in bounded chunks per step; artifact
+  uploads assert runner/lease/checksum headers, refuse checksum drift
+  and path escapes, and no-op without a workspace; completion receipts
+  stay bounded when a 3-byte character straddles the byte limit.
+  agent.rs went from 75.55% to 86.72% lines (the remainder is the
+  Docker-gated execution path)
+- Git over SSH protocol integration tests: real `ssh-keygen` client
+  keypairs and host-key pinning; `push`, `clone`, `fetch`, and `ls-remote`
+  over the `ssh://` transport, plus rejection of key-less clients,
+  unregistered keys, and unknown repositories
+- Periodic orphaned-run reconciliation in CI (60s loop, 120s run-age grace,
+  live-engine guard); startup still sweeps once
+- Restart recovery stops orphaned executions: the scheduler's cancellation
+  probe reports every terminal durable status, the runner skips log,
+  artifact, and completion reporting once its outcome was decided
+  mid-execution, and credentialed completions for unassigned jobs are
+  rejected 409 with an explicit orphaned-outcome message
+- Runner registration retries an unreachable or not-ready scheduler with
+  bounded exponential backoff (`GITFORGE_REGISTER_ATTEMPTS`, default 6;
+  `GITFORGE_REGISTER_BACKOFF_SECS`, default 1s, doubling to a 30s cap) so a
+  runner started beside a restarting control plane survives the compose race
+  instead of exiting; auth rejections (401/403) are never retried
+- ShellCheck and actionlint gates in Rust CI and `make lint`
+- cargo-vet supply chain (`supply-chain/`) behind `make lint`
+- cargo-vet enforcement in Rust CI: a `supply-chain` job runs `cargo vet`
+  so dependency changes that lose audit coverage fail CI. Five public
+  audit registries (isrg, google, mozilla, bytecode-alliance,
+  embark-studios) are registered and pinned in `imports.lock`, and the
+  dependencies introduced by the SSH transport rewrite are recorded as
+  tracked exemptions so the gate is green without pretending they were
+  audited
+
+### Changed
+
+- The git-server image no longer ships `openssh-server`: SSH is served
+  in-process, so the container carries no sshd
+
+### Fixed
+
+- Anthropic reviews always failed to parse: the response struct expected
+  a JSON key literally named `type_` while the API sends `"type"`, so
+  every real `generate_review` call returned a parse error. The health
+  check had masked it because it only reads the status code
+- API list endpoints return 500 `database_error` instead of masking
+  storage failures as empty 200 responses
+- ai-review.yml passed review outputs as action inputs instead of step
+  env vars, so the PR comment always used its fallback text
+- ShellCheck SC2012/SC2034/SC2155 findings in scripts/
+- Compose stack could not run a pipeline end to end (found by a live
+  queued-job smoke, all fixed and validated):
+  - api, ci, and git-server used separate SQLite volumes and git-server
+    had no `DATABASE_URL`, so pushes and pipeline triggers could not
+    resolve repositories; they now share one `gitforge-data` volume
+  - `sqlite:` database URLs open an existing file only; compose now uses
+    `?mode=rwc` so first boot creates the database
+  - git-server port mappings pointed at ports the server does not bind
+    (in-container ports are 42022/42782)
+  - api provisioned repositories outside the shared git volume (no
+    `GIT_ROOT`) and ci could not read them (no `/git` mount)
+  - images lacked the volume mountpoints, so Docker seeded fresh volumes
+    root-owned and the non-root services could not write; the Dockerfile
+    now creates `/data` and `/git` with `gitforge` ownership
+  - the ci image had no `git` binary, so loading `.gitforce.yml` from a
+    pushed revision failed with ENOENT
+  - the non-root runner could not open the mounted Docker socket; compose
+    now maps the host docker group via `DOCKER_GID`
+  - run workspaces are bind-mounted at a host-identical absolute path
+    (`GITFORGE_WORKSPACE_HOST_DIR`): the runner passes workspace paths to
+    the host Docker daemon as bind sources, so a container-only path made
+    every job see an empty auto-created directory
+
 ## [0.3.2] - 2026-08-28
 
 ### Added

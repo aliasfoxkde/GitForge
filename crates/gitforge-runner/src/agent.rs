@@ -35,6 +35,33 @@ pub struct RunnerConfig {
     pub fetch_interval_secs: u64,
     /// Bearer token used for scheduler service authentication.
     pub scheduler_token: Option<String>,
+    /// Registration attempts against an unreachable scheduler before giving
+    /// up. Covers the compose race where a runner starts before the
+    /// scheduler's listener is up.
+    pub register_attempts: u32,
+    /// Initial delay in seconds between registration attempts. Doubles after
+    /// every failed attempt up to [`REGISTER_BACKOFF_CAP_SECS`].
+    pub register_backoff_secs: u64,
+    /// Whether registration failure may fall back to standalone execution.
+    /// Defaults to `false`: a runner that cannot register exits instead of
+    /// appearing healthy while it can never receive scheduler jobs.
+    pub allow_standalone: bool,
+}
+
+/// Upper bound for the exponential registration backoff.
+const REGISTER_BACKOFF_CAP_SECS: u64 = 30;
+
+/// Sleep out one registration backoff step, doubling the delay for the next
+/// attempt. A zero delay (used by tests) stays zero.
+async fn wait_registration_backoff(backoff: &mut u64) {
+    tokio::time::sleep(Duration::from_secs(*backoff)).await;
+    *backoff = next_registration_backoff(*backoff);
+}
+
+/// Compute the next registration backoff step: double the current delay,
+/// capped at [`REGISTER_BACKOFF_CAP_SECS`].
+fn next_registration_backoff(current: u64) -> u64 {
+    current.saturating_mul(2).min(REGISTER_BACKOFF_CAP_SECS)
 }
 
 impl fmt::Debug for RunnerConfig {
@@ -51,6 +78,9 @@ impl fmt::Debug for RunnerConfig {
                 "scheduler_token",
                 &self.scheduler_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("register_attempts", &self.register_attempts)
+            .field("register_backoff_secs", &self.register_backoff_secs)
+            .field("allow_standalone", &self.allow_standalone)
             .finish()
     }
 }
@@ -67,6 +97,9 @@ impl Default for RunnerConfig {
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
             scheduler_token: None,
+            register_attempts: 6,
+            register_backoff_secs: 1,
+            allow_standalone: false,
         }
     }
 }
@@ -83,6 +116,8 @@ impl RunnerConfig {
     /// - `GITFORGE_HEARTBEAT_INTERVAL` (optional, default: `30`)
     /// - `GITFORGE_FETCH_INTERVAL` (optional, default: `5`)
     /// - `GITFORGE_SCHEDULER_TOKEN` (optional, default: `None`)
+    /// - `GITFORGE_REGISTER_ATTEMPTS` (optional, default: `6`)
+    /// - `GITFORGE_REGISTER_BACKOFF_SECS` (optional, default: `1`)
     ///
     /// # Errors
     ///
@@ -100,6 +135,9 @@ impl RunnerConfig {
         let mut heartbeat_interval_secs: Option<u64> = None;
         let mut fetch_interval_secs: Option<u64> = None;
         let mut scheduler_token: Option<Option<String>> = None;
+        let mut register_attempts: Option<u32> = None;
+        let mut register_backoff_secs: Option<u64> = None;
+        let mut allow_standalone: Option<bool> = None;
 
         for (key, value) in iter {
             let key = key.as_ref();
@@ -172,6 +210,55 @@ impl RunnerConfig {
                         Some(v.to_string())
                     });
                 }
+                "GITFORGE_REGISTER_ATTEMPTS" => {
+                    let v = value.trim();
+                    if !v.is_empty() {
+                        let parsed: i64 = v.parse().map_err(|_| {
+                            Error::invalid_input(
+                                "GITFORGE_REGISTER_ATTEMPTS must be a valid integer",
+                            )
+                        })?;
+                        if parsed <= 0 {
+                            return Err(Error::invalid_input(format!(
+                                "GITFORGE_REGISTER_ATTEMPTS must be a positive integer (got {})",
+                                parsed
+                            )));
+                        }
+                        register_attempts = Some(parsed as u32);
+                    }
+                }
+                "GITFORGE_REGISTER_BACKOFF_SECS" => {
+                    let v = value.trim();
+                    if !v.is_empty() {
+                        let parsed: i64 = v.parse().map_err(|_| {
+                            Error::invalid_input(
+                                "GITFORGE_REGISTER_BACKOFF_SECS must be a valid integer",
+                            )
+                        })?;
+                        if parsed < 0 {
+                            return Err(Error::invalid_input(format!(
+                                "GITFORGE_REGISTER_BACKOFF_SECS must not be negative (got {})",
+                                parsed
+                            )));
+                        }
+                        register_backoff_secs = Some(parsed as u64);
+                    }
+                }
+                "GITFORGE_RUNNER_STANDALONE" => {
+                    let v = value.trim().to_ascii_lowercase();
+                    if !v.is_empty() {
+                        allow_standalone = Some(match v.as_str() {
+                            "allow" | "true" | "1" => true,
+                            "deny" | "false" | "0" => false,
+                            other => {
+                                return Err(Error::invalid_input(format!(
+                                    "GITFORGE_RUNNER_STANDALONE must be allow or deny (got {})",
+                                    other
+                                )))
+                            }
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -192,6 +279,9 @@ impl RunnerConfig {
             heartbeat_interval_secs: heartbeat_interval_secs.unwrap_or(30),
             fetch_interval_secs: fetch_interval_secs.unwrap_or(5),
             scheduler_token: scheduler_token.unwrap_or(None),
+            register_attempts: register_attempts.unwrap_or(6),
+            register_backoff_secs: register_backoff_secs.unwrap_or(1),
+            allow_standalone: allow_standalone.unwrap_or(false),
         })
     }
 
@@ -209,6 +299,12 @@ impl RunnerConfig {
     ///
     /// **Optional credentials** (no default — runner runs unauthenticated if unset):
     /// - `GITFORGE_SCHEDULER_TOKEN`  — bearer token for scheduler API
+    ///
+    /// **Optional policy:**
+    /// - `GITFORGE_RUNNER_STANDALONE` — `deny` (default) makes registration
+    ///   failure fatal at startup; `allow` restores legacy standalone
+    ///   fallback where an unreachable scheduler still permits local
+    ///   execution.
     ///
     /// # Errors
     ///
@@ -453,6 +549,150 @@ mod config_tests {
         assert_eq!(cfg.fetch_interval_secs, 5);
         assert!(cfg.scheduler_token.is_none());
     }
+
+    #[test]
+    fn test_standalone_policy_defaults_to_fail_closed() {
+        let cfg = RunnerConfig::parse_from_iter(env(vec![(
+            "GITFORGE_SCHEDULER_URL",
+            Some("http://localhost:42781"),
+        )]))
+        .unwrap();
+        assert!(!cfg.allow_standalone, "standalone fallback must be opt-in");
+    }
+
+    #[test]
+    fn test_standalone_policy_accepts_allow_and_deny() {
+        for (raw, expected) in [
+            ("allow", true),
+            ("ALLOW", true),
+            ("true", true),
+            ("1", true),
+            ("deny", false),
+            ("false", false),
+            ("0", false),
+        ] {
+            let cfg = RunnerConfig::parse_from_iter(vec![
+                (
+                    "GITFORGE_SCHEDULER_URL".to_string(),
+                    "http://localhost:42781".to_string(),
+                ),
+                ("GITFORGE_RUNNER_STANDALONE".to_string(), raw.to_string()),
+            ])
+            .unwrap_or_else(|err| panic!("valid value {raw} rejected: {err}"));
+            assert_eq!(cfg.allow_standalone, expected, "value {raw}");
+        }
+    }
+
+    #[test]
+    fn test_standalone_policy_rejects_unknown_values() {
+        let err = RunnerConfig::parse_from_iter(vec![
+            (
+                "GITFORGE_SCHEDULER_URL".to_string(),
+                "http://localhost:42781".to_string(),
+            ),
+            (
+                "GITFORGE_RUNNER_STANDALONE".to_string(),
+                "maybe".to_string(),
+            ),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("GITFORGE_RUNNER_STANDALONE"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── GITFORGE_REGISTER_ATTEMPTS / GITFORGE_REGISTER_BACKOFF_SECS ─────────
+
+    #[test]
+    fn test_parse_registration_retry_defaults() {
+        let cfg = RunnerConfig::parse_from_iter(env([(
+            "GITFORGE_SCHEDULER_URL",
+            Some("http://localhost:42781"),
+        )]))
+        .unwrap();
+        assert_eq!(cfg.register_attempts, 6);
+        assert_eq!(cfg.register_backoff_secs, 1);
+    }
+
+    #[test]
+    fn test_parse_registration_retry_overrides() {
+        let cfg = RunnerConfig::parse_from_iter(env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_REGISTER_ATTEMPTS", Some("10")),
+            ("GITFORGE_REGISTER_BACKOFF_SECS", Some("4")),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.register_attempts, 10);
+        assert_eq!(cfg.register_backoff_secs, 4);
+    }
+
+    #[test]
+    fn test_parse_registration_attempts_rejects_zero_and_negative() {
+        for bad in ["0", "-1"] {
+            let err = RunnerConfig::parse_from_iter(env([
+                ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+                ("GITFORGE_REGISTER_ATTEMPTS", Some(bad)),
+            ]))
+            .expect_err("non-positive attempts must fail");
+            assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+            assert!(err_contains(&err, "GITFORGE_REGISTER_ATTEMPTS"), "{err}");
+            assert!(err_contains(&err, "positive integer"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_registration_attempts_rejects_non_numeric() {
+        let err = RunnerConfig::parse_from_iter(env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_REGISTER_ATTEMPTS", Some("many")),
+        ]))
+        .expect_err("non-numeric attempts must fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+        assert!(err_contains(&err, "GITFORGE_REGISTER_ATTEMPTS"), "{err}");
+        assert!(err_contains(&err, "valid integer"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_registration_backoff_rejects_negative_and_non_numeric() {
+        for (bad, needle) in [("-3", "must not be negative"), ("soon", "valid integer")] {
+            let err = RunnerConfig::parse_from_iter(env([
+                ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+                ("GITFORGE_REGISTER_BACKOFF_SECS", Some(bad)),
+            ]))
+            .expect_err("invalid backoff must fail");
+            assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+            assert!(
+                err_contains(&err, "GITFORGE_REGISTER_BACKOFF_SECS"),
+                "{err}"
+            );
+            assert!(err_contains(&err, needle), "value {bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_registration_backoff_allows_zero() {
+        // Zero backoff is meaningful: it retries immediately and is what the
+        // retry tests use to stay fast.
+        let cfg = RunnerConfig::parse_from_iter(env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_REGISTER_BACKOFF_SECS", Some("0")),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.register_backoff_secs, 0);
+    }
+
+    #[test]
+    fn test_parse_registration_blank_values_use_defaults() {
+        let cfg = RunnerConfig::parse_from_iter(env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_REGISTER_ATTEMPTS", Some("  ")),
+            ("GITFORGE_REGISTER_BACKOFF_SECS", Some("  ")),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.register_attempts, 6);
+        assert_eq!(cfg.register_backoff_secs, 1);
+    }
 }
 
 /// Job assignment from scheduler
@@ -524,7 +764,13 @@ impl RunnerAgent {
         })
     }
 
-    /// Register with the scheduler via HTTP
+    /// Register with the scheduler via HTTP.
+    ///
+    /// An unreachable scheduler is retried with exponential backoff — a
+    /// runner started alongside a restarting control plane (compose race)
+    /// must tolerate a listener that is not up yet. Credential and policy
+    /// rejections are never retried: a bad token or a refused registration
+    /// does not heal by asking again.
     pub async fn register(&mut self) -> Result<RunnerId> {
         let mut runner = Runner::new(
             self.config.name.clone(),
@@ -532,7 +778,6 @@ impl RunnerAgent {
             self.config.capacity,
         );
 
-        // Try to register with scheduler via HTTP
         let register_url = format!("{}/runners", self.config.scheduler_url);
         let request = serde_json::json!({
             "name": runner.name,
@@ -540,13 +785,16 @@ impl RunnerAgent {
             "capacity": runner.capacity,
         });
 
-        let mut register_request = self.client.post(&register_url).json(&request);
-        if let Some(token) = &self.config.scheduler_token {
-            register_request = register_request.bearer_auth(token);
-        }
-        match register_request.send().await {
-            Ok(response) => {
-                if response.status().is_success() {
+        let attempts = self.config.register_attempts.max(1);
+        let mut backoff = self.config.register_backoff_secs;
+
+        for attempt in 1..=attempts {
+            let mut register_request = self.client.post(&register_url).json(&request);
+            if let Some(token) = &self.config.scheduler_token {
+                register_request = register_request.bearer_auth(token);
+            }
+            match register_request.send().await {
+                Ok(response) if response.status().is_success() => {
                     if let Ok(payload) = response.json::<serde_json::Value>().await {
                         if let Some(id) = payload["id"]
                             .as_str()
@@ -556,26 +804,68 @@ impl RunnerAgent {
                         }
                     }
                     tracing::info!("registered runner {} with scheduler", runner.id);
-                } else {
-                    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                        || response.status() == reqwest::StatusCode::UNAUTHORIZED
+                    self.runner = Some(runner.clone());
+                    return Ok(runner.id);
+                }
+                Ok(response) => {
+                    let status = response.status();
+                    // Credentials do not heal by retrying.
+                    if status == reqwest::StatusCode::UNAUTHORIZED
+                        || status == reqwest::StatusCode::FORBIDDEN
                     {
                         return Err(Error::internal(format!(
-                            "scheduler authentication rejected registration: {}",
-                            response.status()
+                            "scheduler authentication rejected registration: {status}"
+                        )));
+                    }
+                    // SERVICE_UNAVAILABLE means the scheduler is not ready to
+                    // answer, which is exactly the transient case.
+                    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && attempt < attempts {
+                        tracing::warn!(
+                            attempt,
+                            attempts,
+                            retry_in_secs = backoff,
+                            %status,
+                            "scheduler not ready; retrying registration"
+                        );
+                        wait_registration_backoff(&mut backoff).await;
+                        continue;
+                    }
+                    if !self.config.allow_standalone {
+                        return Err(Error::internal(format!(
+                            "scheduler rejected registration with status {status}; \
+                             refusing to run standalone (set GITFORGE_RUNNER_STANDALONE=allow \
+                             to override)"
                         )));
                     }
                     tracing::warn!(
-                        "scheduler returned {} for registration, running in standalone mode",
-                        response.status()
+                        "scheduler returned {status} for registration, running in standalone mode"
                     );
+                    break;
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "failed to register with scheduler: {}. Running in standalone mode.",
-                    e
-                );
+                Err(error) => {
+                    if attempt == attempts {
+                        if !self.config.allow_standalone {
+                            return Err(Error::internal(format!(
+                                "failed to register with scheduler after {attempt} attempts: \
+                                 {error}; refusing to run standalone \
+                                 (set GITFORGE_RUNNER_STANDALONE=allow to override)"
+                            )));
+                        }
+                        tracing::warn!(
+                            "failed to register with scheduler after {attempt} attempts: {error}. \
+                             Running in standalone mode."
+                        );
+                        break;
+                    }
+                    tracing::warn!(
+                        attempt,
+                        attempts,
+                        retry_in_secs = backoff,
+                        %error,
+                        "scheduler unreachable; retrying registration"
+                    );
+                    wait_registration_backoff(&mut backoff).await;
+                }
             }
         }
 
@@ -919,6 +1209,13 @@ impl RunnerAgent {
         let cancellation_job_id = assignment.job_id.clone();
         let cancellation_executor = executor.clone();
         let cancellation_token = scheduler_token.map(ToOwned::to_owned);
+        // Set when the scheduler says the job's durable outcome was already
+        // decided while this execution was still running: an operator
+        // cancellation, or restart recovery failing the in-flight row. The
+        // lease is gone in both cases, so post-execution reporting can only
+        // produce rejected requests.
+        let orphaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let orphaned_watch = orphaned.clone();
         let cancellation_watch = tokio::spawn(async move {
             let endpoint = format!(
                 "{}/jobs/{}/cancelled",
@@ -941,6 +1238,7 @@ impl RunnerAgent {
                             .and_then(|payload| payload["cancelled"].as_bool())
                             .unwrap_or(false);
                         if cancelled {
+                            orphaned_watch.store(true, std::sync::atomic::Ordering::Relaxed);
                             if let Ok(job_id) = uuid::Uuid::parse_str(&cancellation_job_id) {
                                 let job_id = JobId::from(job_id);
                                 if let Err(error) = cancellation_executor.cancel(&job_id).await {
@@ -993,6 +1291,20 @@ impl RunnerAgent {
             result.success,
             result.exit_code
         );
+
+        if orphaned.load(std::sync::atomic::Ordering::Relaxed) {
+            // The scheduler finalized this job while we were executing it
+            // (operator cancellation, or restart recovery re-queuing the
+            // row and failing the in-flight execution). The lease no longer
+            // exists, so log chunks, artifacts, and a completion POST would
+            // all be rejected 409; stop here instead of writing noise.
+            tracing::warn!(
+                job_id = %assignment.job_id,
+                "job outcome was decided by the scheduler mid-execution; \
+                 skipping log, artifact, and completion reporting"
+            );
+            return;
+        }
 
         let protocol = RunnerProtocol {
             client,
@@ -1680,15 +1992,215 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_register_no_scheduler() {
-        // Test that register doesn't panic when scheduler is unavailable
+        // Registration failure is fatal by default: a runner must not appear
+        // healthy when it cannot reach the scheduler that assigns it work.
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(), // Invalid URL
+            register_attempts: 1, // no retries: keeps this test instantaneous
+            ..Default::default()
+        };
+        let mut agent = RunnerAgent::new(config).await.unwrap();
+        let result = agent.register().await;
+        assert!(
+            result.is_err(),
+            "fail-closed default must reject standalone"
+        );
+        assert!(agent.runner.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_runner_register_unreachable_scheduler_allows_standalone() {
+        // Legacy standalone fallback remains available behind an explicit
+        // policy opt-in.
+        let config = RunnerConfig {
+            scheduler_url: "http://localhost:99999".to_string(),
+            register_attempts: 1, // no retries: keeps this test instantaneous
+            allow_standalone: true,
             ..Default::default()
         };
         let mut agent = RunnerAgent::new(config).await.unwrap();
         let result = agent.register().await;
         assert!(result.is_ok());
         assert!(agent.runner.is_some());
+    }
+
+    // ── Registration retry/backoff ──────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Reason phrases for the statuses served by [`spawn_status_server`].
+    /// reqwest parses the numeric status only, but a well-formed response
+    /// needs a phrase.
+    fn reason_phrase(status: u16) -> &'static str {
+        match status {
+            201 => "Created",
+            401 => "Unauthorized",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            _ => "Status",
+        }
+    }
+
+    /// Serve a scripted sequence of HTTP statuses from a local listener and
+    /// count accepted connections. The last status repeats for any further
+    /// connections. Every response body is `{"id":"<uuid>"}` so a success
+    /// status also exercises runner-id adoption.
+    async fn spawn_status_server(statuses: &[u16]) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let addr = listener.local_addr().expect("local addr");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        let statuses = statuses.to_vec();
+        assert!(!statuses.is_empty(), "at least one status is required");
+        tokio::spawn(async move {
+            let mut served = 0usize;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let status = statuses[served.min(statuses.len() - 1)];
+                served += 1;
+                counter.fetch_add(1, Ordering::Relaxed);
+                // Drain the request head before answering so the client's
+                // write never races our response.
+                let mut head = [0u8; 2048];
+                let _ = socket.read(&mut head).await;
+                let body = format!("{{\"id\":\"{}\"}}", uuid::Uuid::new_v4());
+                let response = format!(
+                    "HTTP/1.1 {status} {}\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\
+                     \r\n{body}",
+                    reason_phrase(status),
+                    body.len(),
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), connections)
+    }
+
+    #[tokio::test]
+    async fn test_registration_retries_unavailable_scheduler_then_succeeds() {
+        // The compose race: the scheduler is up but not ready (503) while the
+        // runner is already registering. Registration must retry with backoff
+        // and adopt the runner id once the scheduler accepts.
+        let (url, connections) = spawn_status_server(&[503, 503, 201]).await;
+        let config = RunnerConfig {
+            scheduler_url: url,
+            register_attempts: 5,
+            register_backoff_secs: 0,
+            ..Default::default()
+        };
+        let mut agent = RunnerAgent::new(config).await.unwrap();
+        let runner_id = agent
+            .register()
+            .await
+            .expect("registration must outlive 503s");
+        assert!(agent.runner.is_some());
+        assert_eq!(connections.load(Ordering::Relaxed), 3);
+        assert_eq!(agent.runner.as_ref().map(|r| r.id), Some(runner_id));
+    }
+
+    #[tokio::test]
+    async fn test_registration_auth_rejection_is_not_retried() {
+        // A rejected token does not heal by asking again: exactly one attempt
+        // is made and the error names the authentication failure.
+        let (url, connections) = spawn_status_server(&[401]).await;
+        let config = RunnerConfig {
+            scheduler_url: url,
+            register_attempts: 5,
+            register_backoff_secs: 0,
+            ..Default::default()
+        };
+        let mut agent = RunnerAgent::new(config).await.unwrap();
+        let error = agent
+            .register()
+            .await
+            .expect_err("auth rejection must fail closed");
+        assert!(
+            error.to_string().contains("authentication rejected"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_registration_exhausts_transport_retries() {
+        // Nothing listens on the reserved port, so every attempt is a
+        // transport error; the surfaced error must report the exhausted
+        // attempt count.
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve a port");
+        let port = reserved.local_addr().expect("local addr").port();
+        drop(reserved);
+
+        let config = RunnerConfig {
+            scheduler_url: format!("http://127.0.0.1:{port}"),
+            register_attempts: 3,
+            register_backoff_secs: 0,
+            ..Default::default()
+        };
+        let mut agent = RunnerAgent::new(config).await.unwrap();
+        let error = agent
+            .register()
+            .await
+            .expect_err("unreachable scheduler must exhaust retries");
+        assert!(
+            error.to_string().contains("after 3 attempts"),
+            "unexpected error: {error}"
+        );
+        assert!(agent.runner.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_registration_policy_rejection_falls_back_only_when_allowed() {
+        // A 500 is a scheduler refusal, not "not ready yet": it is never
+        // retried, it fails closed by default, and standalone fallback
+        // requires the explicit opt-in.
+        let (url, connections) = spawn_status_server(&[500]).await;
+
+        let deny = RunnerConfig {
+            scheduler_url: url.clone(),
+            register_attempts: 5,
+            register_backoff_secs: 0,
+            ..Default::default()
+        };
+        let mut agent = RunnerAgent::new(deny).await.unwrap();
+        let error = agent.register().await.expect_err("500 must fail closed");
+        assert!(
+            error.to_string().contains("refusing to run standalone"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+
+        let allow = RunnerConfig {
+            scheduler_url: url,
+            register_attempts: 5,
+            register_backoff_secs: 0,
+            allow_standalone: true,
+            ..Default::default()
+        };
+        let mut agent = RunnerAgent::new(allow).await.unwrap();
+        agent
+            .register()
+            .await
+            .expect("standalone opt-in tolerates a rejected registration");
+        assert!(agent.runner.is_some());
+        assert_eq!(connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_next_registration_backoff_doubles_and_caps() {
+        assert_eq!(next_registration_backoff(0), 0);
+        assert_eq!(next_registration_backoff(1), 2);
+        assert_eq!(next_registration_backoff(2), 4);
+        assert_eq!(next_registration_backoff(25), 30);
+        assert_eq!(next_registration_backoff(30), 30);
+        assert_eq!(next_registration_backoff(u64::MAX), 30);
     }
 
     #[tokio::test]
@@ -1709,11 +2221,16 @@ mod tests {
             heartbeat_interval_secs: 60,
             fetch_interval_secs: 10,
             scheduler_token: None,
+            register_attempts: 3,
+            register_backoff_secs: 2,
+            allow_standalone: false,
         };
         assert_eq!(config.name, "custom-runner");
         assert_eq!(config.capacity, 5);
         assert_eq!(config.heartbeat_interval_secs, 60);
         assert_eq!(config.fetch_interval_secs, 10);
+        assert_eq!(config.register_attempts, 3);
+        assert_eq!(config.register_backoff_secs, 2);
     }
 
     #[test]
@@ -1875,6 +2392,7 @@ mod tests {
     async fn test_runner_register_sets_runner() {
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
+            allow_standalone: true,
             ..Default::default()
         };
         let mut agent = RunnerAgent::new(config).await.unwrap();
@@ -1899,6 +2417,9 @@ mod tests {
             heartbeat_interval_secs: 15,
             fetch_interval_secs: 3,
             scheduler_token: None,
+            register_attempts: 2,
+            register_backoff_secs: 1,
+            allow_standalone: false,
         };
 
         assert_eq!(config.scheduler_url, "http://example.com:8081");
@@ -1988,6 +2509,7 @@ mod tests {
     async fn test_runner_stop_after_registration() {
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
+            allow_standalone: true,
             ..Default::default()
         };
         let mut agent = RunnerAgent::new(config).await.unwrap();
@@ -2018,6 +2540,9 @@ mod tests {
             heartbeat_interval_secs: 30,
             fetch_interval_secs: 5,
             scheduler_token: None,
+            register_attempts: 2,
+            register_backoff_secs: 1,
+            allow_standalone: false,
         };
         assert_eq!(config.capacity, 0);
     }
@@ -2095,6 +2620,9 @@ mod tests {
             heartbeat_interval_secs: 45,
             fetch_interval_secs: 10,
             scheduler_token: None,
+            register_attempts: 2,
+            register_backoff_secs: 1,
+            allow_standalone: false,
         };
         assert!(config.scheduler_url.contains("user:pass"));
     }
@@ -2123,6 +2651,9 @@ mod tests {
             heartbeat_interval_secs: 60,
             fetch_interval_secs: 15,
             scheduler_token: None,
+            register_attempts: 2,
+            register_backoff_secs: 1,
+            allow_standalone: false,
         };
         let agent = RunnerAgent::new(config).await.unwrap();
         assert!(agent.runner.is_none());
@@ -2161,6 +2692,7 @@ mod tests {
     async fn test_runner_run_and_stop() {
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
+            allow_standalone: true,
             ..Default::default()
         };
 
@@ -2199,5 +2731,433 @@ mod tests {
         // Agent is not registered, run should fail
         let result = agent.run().await;
         assert!(result.is_err());
+    }
+
+    // ── Scheduler HTTP boundary: claim, live logs, chunked logs, artifacts ──
+
+    use std::sync::Mutex as StdMutex;
+
+    /// One captured HTTP request: head plus body.
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl RecordedRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    type Responder = Arc<dyn Fn(&RecordedRequest) -> (u16, serde_json::Value) + Send + Sync>;
+
+    /// Parse a captured request body as JSON — the runner posts JSON, so the
+    /// recorded text has escaped newlines and only the parsed value shows the
+    /// real chunk content.
+    fn json_body(request: &RecordedRequest) -> serde_json::Value {
+        serde_json::from_str(&request.body).expect("captured body is valid JSON")
+    }
+
+    /// Serve scripted JSON responses while recording every request, so the
+    /// tests can assert both what the runner sent and how it reacted.
+    async fn spawn_recorder(
+        responder: impl Fn(&RecordedRequest) -> (u16, serde_json::Value) + Send + Sync + 'static,
+    ) -> (String, Arc<StdMutex<Vec<RecordedRequest>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let addr = listener.local_addr().expect("local addr");
+        let requests: Arc<StdMutex<Vec<RecordedRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured = requests.clone();
+        let responder: Responder = Arc::new(responder);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let responder = responder.clone();
+                let captured = captured.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+                    let mut reader = tokio::io::BufReader::new(&mut socket);
+                    let mut method = String::new();
+                    let mut path = String::new();
+                    let mut headers = Vec::new();
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let trimmed = line.trim_end().to_string();
+                        if trimmed.is_empty() {
+                            break;
+                        }
+                        if method.is_empty() {
+                            let mut parts = trimmed.split_whitespace();
+                            method = parts.next().unwrap_or("").to_string();
+                            path = parts.next().unwrap_or("").to_string();
+                        } else if let Some((name, value)) = trimmed.split_once(':') {
+                            let name = name.trim();
+                            let value = value.trim();
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.parse().unwrap_or(0);
+                            }
+                            headers.push((name.to_string(), value.to_string()));
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 {
+                        reader.read_exact(&mut body).await.ok();
+                    }
+                    drop(reader);
+                    let recorded = RecordedRequest {
+                        method,
+                        path,
+                        headers,
+                        body: String::from_utf8_lossy(&body).into_owned(),
+                    };
+                    let (status, payload) = responder(&recorded);
+                    captured.lock().unwrap().push(recorded);
+                    let body_text = payload.to_string();
+                    let reason = if status < 400 { "OK" } else { "Rejected" };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\n\
+                         content-type: application/json\r\n\
+                         content-length: {}\r\n\
+                         connection: close\r\n\
+                         \r\n{body_text}",
+                        body_text.len(),
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    fn test_protocol<'a>(client: &'a Client, url: &'a str, job_id: &'a str) -> RunnerProtocol<'a> {
+        RunnerProtocol {
+            client,
+            scheduler_url: url,
+            job_id,
+            runner_id: RunnerId::new(),
+            lease_token: "lease-1",
+            scheduler_token: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_claim_job_returns_lease_token() {
+        let (url, requests) =
+            spawn_recorder(|_req| (200, serde_json::json!({"lease_token": "lease-abc"}))).await;
+        let client = Client::new();
+        let runner_id = RunnerId::new();
+
+        let lease = RunnerAgent::claim_job(&client, &url, "job-1", runner_id, None)
+            .await
+            .expect("a successful claim yields its lease token");
+        assert_eq!(lease, "lease-abc");
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].method, "POST");
+        assert_eq!(recorded[0].path, "/jobs/job-1/claim");
+        assert!(recorded[0].body.contains("runner_id"));
+    }
+
+    #[tokio::test]
+    async fn test_claim_job_fails_closed_on_rejection_or_garbage() {
+        let (rejecting, _) =
+            spawn_recorder(|_req| (409, serde_json::json!({"error": "busy"}))).await;
+        let (garbage, _) = spawn_recorder(|_req| (200, serde_json::json!({"nope": true}))).await;
+        let client = Client::new();
+        let runner_id = RunnerId::new();
+
+        assert!(
+            RunnerAgent::claim_job(&client, &rejecting, "job-1", runner_id, None)
+                .await
+                .is_none(),
+            "a rejected claim yields no lease"
+        );
+        assert!(
+            RunnerAgent::claim_job(&client, &garbage, "job-1", runner_id, None)
+                .await
+                .is_none(),
+            "a claim response without a lease token yields none"
+        );
+        assert!(
+            RunnerAgent::claim_job(&client, "http://localhost:99999", "job-1", runner_id, None)
+                .await
+                .is_none(),
+            "an unreachable scheduler yields no lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_log_sink_labels_and_counts_deliveries() {
+        let (url, requests) = spawn_recorder(|_req| (200, serde_json::json!({"ok": true}))).await;
+        let client = Client::new();
+        let sink = LiveLogSink::new(&client, &url, "job-9", RunnerId::new(), "lease-1", None);
+
+        sink.on_output(OutputStream::Stdout, b"hello live".to_vec())
+            .await
+            .expect("live stdout delivery succeeds");
+        sink.on_output(OutputStream::Stderr, b"warn line".to_vec())
+            .await
+            .expect("live stderr delivery succeeds");
+
+        assert!(sink.sent_any());
+        assert!(!sink.failed());
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].path, "/jobs/job-9/logs");
+        assert_eq!(json_body(&recorded[0])["chunk"], "[stdout]\nhello live");
+        assert_eq!(json_body(&recorded[1])["chunk"], "[stderr]\nwarn line");
+        assert_eq!(recorded[0].header("authorization"), None);
+    }
+
+    #[tokio::test]
+    async fn test_live_log_sink_flags_rejected_delivery() {
+        let (url, requests) =
+            spawn_recorder(|_req| (409, serde_json::json!({"error": "no lease"}))).await;
+        let client = Client::new();
+        let sink = LiveLogSink::new(&client, &url, "job-9", RunnerId::new(), "stale", None);
+
+        sink.on_output(OutputStream::Stdout, b"doomed".to_vec())
+            .await
+            .expect("on_output reports delivery trouble via failed(), not Err");
+
+        assert!(!sink.sent_any());
+        assert!(
+            sink.failed(),
+            "a rejected chunk must degrade to the fallback upload"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_live_log_sink_splits_multibyte_payloads() {
+        let (url, requests) = spawn_recorder(|_req| (200, serde_json::json!({"ok": true}))).await;
+        let client = Client::new();
+        let sink = LiveLogSink::new(&client, &url, "job-9", RunnerId::new(), "lease-1", None);
+
+        // ~120KB of two-byte characters forces the 60KB chunking path.
+        let payload = "é".repeat(60_000);
+        sink.on_output(OutputStream::Stdout, payload.as_bytes().to_vec())
+            .await
+            .expect("large payload delivery succeeds");
+
+        let recorded = requests.lock().unwrap();
+        assert!(recorded.len() >= 2, "payload must be split");
+        let mut rejoined = String::new();
+        for request in recorded.iter() {
+            let parsed = json_body(request);
+            let chunk = parsed["chunk"].as_str().expect("chunk string");
+            let marker = "[stdout]\n";
+            let start = chunk.find(marker).expect("labelled chunk") + marker.len();
+            rejoined.push_str(&chunk[start..]);
+        }
+        assert_eq!(rejoined, payload, "chunks reassemble losslessly");
+    }
+
+    #[tokio::test]
+    async fn test_report_log_chunks_stream_step_output() {
+        let (url, requests) = spawn_recorder(|_req| (200, serde_json::json!({"ok": true}))).await;
+        let client = Client::new();
+        let protocol = test_protocol(&client, &url, "job-7");
+        let steps = vec![
+            StepResult {
+                exit_code: 0,
+                stdout: "hello".to_string(),
+                stderr: String::new(),
+            },
+            StepResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "boom".to_string(),
+            },
+        ];
+
+        report_log_chunks(&protocol, &steps)
+            .await
+            .expect("streaming accepted output succeeds");
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "one chunk per non-empty step output");
+        let first_parsed = json_body(&recorded[0]);
+        let second_parsed = json_body(&recorded[1]);
+        let first = first_parsed["chunk"].as_str().unwrap();
+        let second = second_parsed["chunk"].as_str().unwrap();
+        assert!(first.contains("[step 0 stdout]\nhello"));
+        assert!(
+            !first.contains("stderr"),
+            "empty stderr is omitted, not emitted as an empty section"
+        );
+        assert!(second.contains("[step 1 stderr]\nboom"));
+        assert_eq!(recorded[0].path, "/jobs/job-7/logs");
+    }
+
+    #[tokio::test]
+    async fn test_report_log_chunks_fail_on_rejection() {
+        let (url, _) = spawn_recorder(|_req| (500, serde_json::json!({"error": "down"}))).await;
+        let client = Client::new();
+        let protocol = test_protocol(&client, &url, "job-7");
+        let steps = vec![StepResult {
+            exit_code: 0,
+            stdout: "hello".to_string(),
+            stderr: String::new(),
+        }];
+
+        let error = report_log_chunks(&protocol, &steps)
+            .await
+            .expect_err("a rejected append must surface");
+        assert!(error.to_string().contains("rejected log append"));
+    }
+
+    #[tokio::test]
+    async fn test_report_artifacts_upload_matches_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts_dir = temp.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        std::fs::write(artifacts_dir.join("report.txt"), b"artifact-bytes").unwrap();
+
+        let (url, requests) =
+            spawn_recorder(|_req| (200, serde_json::json!({"stored": true}))).await;
+        let client = Client::new();
+        let protocol = test_protocol(&client, &url, "job-5");
+        let receipt = ArtifactReceipt {
+            name: "report.txt".to_string(),
+            uri: "gitforge://artifact/report".to_string(),
+            sha256: sha256_hex(b"artifact-bytes"),
+            bytes: 14,
+            media_type: Some("text/plain".to_string()),
+        };
+
+        let uploaded = report_artifacts(&protocol, Some(temp.path().to_str().unwrap()), &[receipt])
+            .await
+            .expect("artifact upload succeeds");
+        assert_eq!(uploaded, vec![serde_json::json!({"stored": true})]);
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].path, "/jobs/job-5/artifacts");
+        assert_eq!(recorded[0].header("x-artifact-name"), Some("report.txt"));
+        assert_eq!(
+            recorded[0].header("x-artifact-sha256"),
+            Some(sha256_hex(b"artifact-bytes").as_str())
+        );
+        assert_eq!(recorded[0].header("x-lease-token"), Some("lease-1"));
+        assert_eq!(recorded[0].body, "artifact-bytes");
+    }
+
+    #[tokio::test]
+    async fn test_report_artifacts_rejects_checksum_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts_dir = temp.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        std::fs::write(artifacts_dir.join("report.txt"), b"artifact-bytes").unwrap();
+
+        let (url, requests) =
+            spawn_recorder(|_req| (200, serde_json::json!({"stored": true}))).await;
+        let client = Client::new();
+        let protocol = test_protocol(&client, &url, "job-5");
+        let receipt = ArtifactReceipt {
+            name: "report.txt".to_string(),
+            uri: "gitforge://artifact/report".to_string(),
+            sha256: "deadbeef".to_string(),
+            bytes: 14,
+            media_type: None,
+        };
+
+        let error = report_artifacts(&protocol, Some(temp.path().to_str().unwrap()), &[receipt])
+            .await
+            .expect_err("drifting checksums must not be uploaded");
+        assert!(error.to_string().contains("checksum changed"));
+        assert!(requests.lock().unwrap().is_empty(), "nothing was uploaded");
+    }
+
+    #[tokio::test]
+    async fn test_report_artifacts_rejects_path_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts_dir = temp.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        std::fs::write(temp.path().join("secret.txt"), b"outside").unwrap();
+
+        let (url, requests) =
+            spawn_recorder(|_req| (200, serde_json::json!({"stored": true}))).await;
+        let client = Client::new();
+        let protocol = test_protocol(&client, &url, "job-5");
+        let receipt = ArtifactReceipt {
+            name: "../secret.txt".to_string(),
+            uri: "gitforge://artifact/secret".to_string(),
+            sha256: sha256_hex(b"outside"),
+            bytes: 7,
+            media_type: None,
+        };
+
+        let error = report_artifacts(&protocol, Some(temp.path().to_str().unwrap()), &[receipt])
+            .await
+            .expect_err("artifact names outside the artifact root are refused");
+        assert!(error.to_string().contains("escapes artifact directory"));
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_report_artifacts_noops_without_workspace_or_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let (url, requests) =
+            spawn_recorder(|_req| (200, serde_json::json!({"stored": true}))).await;
+        let client = Client::new();
+        let protocol = test_protocol(&client, &url, "job-5");
+        let receipt = ArtifactReceipt {
+            name: "report.txt".to_string(),
+            uri: "gitforge://artifact/report".to_string(),
+            sha256: sha256_hex(b"artifact-bytes"),
+            bytes: 14,
+            media_type: None,
+        };
+
+        let no_workspace = report_artifacts(&protocol, None, std::slice::from_ref(&receipt))
+            .await
+            .expect("no workspace means nothing to upload");
+        let no_artifacts = report_artifacts(&protocol, Some(temp.path().to_str().unwrap()), &[])
+            .await
+            .expect("no artifacts means nothing to upload");
+
+        assert!(no_workspace.is_empty());
+        assert!(no_artifacts.is_empty());
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_bounded_receipt_text_walks_char_boundaries() {
+        // A 3-byte character straddling the byte limit forces the boundary
+        // walk; the result must stay valid UTF-8 and carry the marker.
+        let value = format!("{}{}", "a".repeat(MAX_RECEIPT_STREAM_BYTES - 1), "日日");
+        let receipt = bounded_receipt_text(&value);
+        assert!(receipt.starts_with(&"a".repeat(MAX_RECEIPT_STREAM_BYTES - 1)));
+        assert!(
+            !receipt.contains("日"),
+            "the straddling character is dropped"
+        );
+        assert!(receipt.contains("output truncated"));
+        assert_eq!(bounded_receipt_text("ok"), "ok");
+    }
+
+    #[test]
+    fn test_utf8_chunks_keeps_oversized_single_char_intact() {
+        let value = "a😀b";
+        let chunks = utf8_chunks(value, 2);
+        assert_eq!(chunks.concat(), value);
+        assert_eq!(
+            chunks,
+            vec!["a", "😀", "b"],
+            "a char wider than the limit is never split"
+        );
     }
 }

@@ -149,7 +149,6 @@ pub fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
         .route("/jobs/{id}/artifacts", post(upload_job_artifact))
         .layer(DefaultBodyLimit::max(MAX_ARTIFACT_BYTES as usize))
         .route("/jobs/{id}/cancelled", get(job_cancelled))
-        .route("/jobs/{id}/assign", post(assign_job))
         .route("/jobs/{id}/complete", post(complete_job))
         .layer(middleware::from_fn(move |request, next: Next| {
             require_scheduler_auth(request, next, runner_auth_token.clone(), "runner")
@@ -825,44 +824,10 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Assign a job to a runner (runner claims a job)
-async fn assign_job(
-    State(_state): State<SchedulerServerState>,
-    Path(job_id): Path<String>,
-    Json(request): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let job_id: JobId = match Uuid::parse_str(&job_id) {
-        Ok(id) => JobId::from(id),
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid_job_id",
-                    "message": "Invalid job ID format"
-                })),
-            )
-        }
-    };
-
-    let runner_id: Option<RunnerId> = request["runner_id"]
-        .as_str()
-        .and_then(|s| Uuid::parse_str(s).ok().map(RunnerId::from));
-
-    if let Some(r_id) = runner_id {
-        // In real impl, mark job as assigned to this runner
-        tracing::info!("job {} assigned to runner {} via HTTP", job_id, r_id);
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "assigned",
-            "job_id": job_id.to_string()
-        })),
-    )
-}
-
-/// Complete a job
+/// Complete a job. Completion requires lease proof: the runner identity and
+/// the lease token issued when the scheduler assigned the job. There is no
+/// anonymous completion path — an unauthenticated completion would let any
+/// runner finalize a job it was never assigned.
 async fn complete_job(
     State(state): State<SchedulerServerState>,
     Path(job_id): Path<String>,
@@ -890,13 +855,6 @@ async fn complete_job(
         .map(RunnerId::from);
     let lease_token = request["lease_token"].as_str();
 
-    tracing::info!(
-        "job {} completed via HTTP: success={}, exit_code={}",
-        job_id,
-        success,
-        exit_code
-    );
-
     let receipt = serde_json::json!({
         "job_id": job_id.to_string(),
         "success": success,
@@ -907,6 +865,13 @@ async fn complete_job(
     })
     .to_string();
 
+    if !state.scheduler.job_exists(job_id).await {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "job_not_found", "job_id": job_id.to_string()})),
+        );
+    }
+
     let assigned_runner = state.scheduler.is_assigned(job_id).await;
     let completion = match (runner_id, lease_token, assigned_runner) {
         (Some(runner_id), Some(lease_token), Some(_)) => {
@@ -915,11 +880,14 @@ async fn complete_job(
                 .complete_job_with_lease(job_id, runner_id, lease_token, success, receipt)
                 .await
         }
-        (None, None, None) => {
-            // Preserve the synthetic no-database handler behavior used by
-            // legacy callers/tests. Real assigned jobs must use a lease.
-            state.scheduler.complete_job(job_id, success, receipt).await
-        }
+        // Credentialed completions for an unassigned job are the signature of
+        // an orphaned execution: restart recovery finalized the job while the
+        // runner was still executing it. Say so instead of implying the
+        // runner sent a malformed request.
+        (Some(_), Some(_), None) => Err(anyhow::anyhow!(
+            "job is no longer assigned to a runner; its durable outcome was \
+             decided without this completion"
+        )),
         _ => Err(anyhow::anyhow!("runner_id and lease_token are required")),
     };
     if let Err(error) = completion {
@@ -932,6 +900,13 @@ async fn complete_job(
             })),
         );
     }
+
+    tracing::info!(
+        "job {} completed via HTTP: success={}, exit_code={}",
+        job_id,
+        success,
+        exit_code
+    );
 
     (
         StatusCode::OK,
@@ -1289,77 +1264,202 @@ mod tests {
         assert_status(response, StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn test_assign_job_valid_uuid() {
-        let scheduler = crate::Scheduler::new();
-        let state = create_state(scheduler);
-        let job_id = uuid::Uuid::new_v4();
-        let runner_id = uuid::Uuid::new_v4();
+    /// Seed user/repo/pipeline/run rows plus two jobs in `pool`, returning
+    /// the job ids so tests can drive each job's durable status.
+    async fn seed_restart_scenario(pool: &gitforge_db::Pool, name: &str) -> (JobId, JobId) {
+        let user = gitforge_db::models::User::new(
+            format!("{name}-owner"),
+            format!("{name}-owner@example.com"),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            format!("{name}-repo"),
+            user.id,
+            format!("/git/{name}-repo"),
+        );
+        gitforge_db::queries::RepoQueries::create(pool, &repo)
+            .await
+            .unwrap();
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: format!("{name}-pipeline"),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            format!("{name}-owner"),
+            format!("{name}-commit"),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(pool, &run)
+            .await
+            .unwrap();
+        let first = gitforge_db::models::Job::new(run.id, format!("{name}-first"));
+        let second = gitforge_db::models::Job::new(run.id, format!("{name}-second"));
+        gitforge_db::queries::JobQueries::create(pool, &first)
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::create(pool, &second)
+            .await
+            .unwrap();
+        (first.id, second.id)
+    }
 
-        let response = assign_job(
+    /// After a scheduler restart, recovery fails in-flight rows: a live
+    /// execution is orphaned the moment its durable row goes terminal. The
+    /// read-only cancellation probe is how the runner learns this.
+    #[tokio::test]
+    async fn test_job_cancelled_probe_reports_terminal_durable_status() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (orphaned_job, live_job) = seed_restart_scenario(&pool, "probe-terminal").await;
+        // Mirror what requeue_inflight writes for a running row on restart.
+        gitforge_db::queries::JobQueries::update_status(&pool, orphaned_job, "failed")
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::update_status(&pool, live_job, "running")
+            .await
+            .unwrap();
+
+        let scheduler = crate::Scheduler::with_db(pool);
+        assert!(!scheduler.is_cancelled(live_job).await);
+        assert!(scheduler.is_cancelled(orphaned_job).await);
+    }
+
+    /// A credentialed completion for a job the restarted scheduler no longer
+    /// has assigned must be rejected, and the rejection must name the
+    /// orphaned execution instead of implying a malformed request.
+    #[tokio::test]
+    async fn test_complete_job_unassigned_reports_orphaned_outcome() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (orphaned_job, _) = seed_restart_scenario(&pool, "complete-orphan").await;
+        gitforge_db::queries::JobQueries::update_status(&pool, orphaned_job, "failed")
+            .await
+            .unwrap();
+
+        let scheduler = crate::Scheduler::with_db(pool);
+        let state = create_state(scheduler);
+        let response = complete_job(
             axum::extract::State(state),
-            axum::extract::Path(job_id.to_string()),
+            axum::extract::Path(orphaned_job.to_string()),
             axum::Json(serde_json::json!({
-                "runner_id": runner_id.to_string()
+                "runner_id": uuid::Uuid::new_v4().to_string(),
+                "lease_token": "pre-restart-lease",
+                "success": true,
             })),
         )
-        .await;
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "completion_persistence_failed");
+        assert!(
+            payload["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("no longer assigned")),
+            "unexpected rejection: {payload}"
+        );
+    }
 
-        assert_status(response.into_response(), StatusCode::OK);
+    /// Register a runner, enqueue one job, and drive scheduler assignment so
+    /// the job carries a live lease. Returns everything needed to complete it.
+    async fn assigned_job_with_lease(
+        name: &str,
+    ) -> (SchedulerServerState, JobId, RunnerId, String) {
+        let scheduler = crate::Scheduler::new();
+        let runner = Runner::new(name.to_string(), RunnerType::Docker, 1);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                gitforge_common::PipelineRunId::new(),
+                gitforge_common::RepoId::new(),
+                vec!["/bin/true".to_string()],
+                None,
+            )
+            .await;
+        scheduler.process_queue().await;
+        let lease_token = scheduler
+            .ensure_job_lease(job_id)
+            .await
+            .expect("assigned job must have a lease");
+        (create_state(scheduler), job_id, runner_id, lease_token)
     }
 
     #[tokio::test]
-    async fn test_assign_job_invalid_uuid() {
-        let scheduler = crate::Scheduler::new();
-        let state = create_state(scheduler);
-
-        let response = assign_job(
+    async fn test_complete_job_unknown_job_is_not_found() {
+        let state = create_state(crate::Scheduler::new());
+        let response = complete_job(
             axum::extract::State(state),
-            axum::extract::Path("not-a-uuid".to_string()),
-            axum::Json(serde_json::json!({
-                "runner_id": "something"
-            })),
+            axum::extract::Path(JobId::new().to_string()),
+            axum::Json(serde_json::json!({"success": true})),
         )
         .await;
+        assert_status(response.into_response(), StatusCode::NOT_FOUND);
+    }
 
-        assert_status(response.into_response(), StatusCode::BAD_REQUEST);
+    #[tokio::test]
+    async fn test_complete_job_without_lease_proof_is_rejected() {
+        let (state, job_id, _runner_id, _lease) = assigned_job_with_lease("no-lease-runner").await;
+        // Assigned job, but the completion carries no runner identity or
+        // lease: this must never finalize the job.
+        let response = complete_job(
+            axum::extract::State(state),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(serde_json::json!({"success": true})),
+        )
+        .await;
+        assert_status(response.into_response(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
     async fn test_complete_job_success_handler() {
-        let scheduler = crate::Scheduler::new();
-        let state = create_state(scheduler);
-        let job_id = uuid::Uuid::new_v4();
-
+        let (state, job_id, runner_id, lease) = assigned_job_with_lease("success-runner").await;
         let response = complete_job(
-            axum::extract::State(state),
+            axum::extract::State(state.clone()),
             axum::extract::Path(job_id.to_string()),
             axum::Json(serde_json::json!({
+                "runner_id": runner_id.to_string(),
+                "lease_token": lease,
                 "success": true
             })),
         )
         .await;
-
         assert_status(response.into_response(), StatusCode::OK);
+        assert_eq!(state.scheduler.is_assigned(job_id).await, None);
     }
 
     #[tokio::test]
     async fn test_complete_job_failure_handler() {
-        let scheduler = crate::Scheduler::new();
-        let state = create_state(scheduler);
-        let job_id = uuid::Uuid::new_v4();
-
+        let (state, job_id, runner_id, lease) = assigned_job_with_lease("failure-runner").await;
         let response = complete_job(
-            axum::extract::State(state),
+            axum::extract::State(state.clone()),
             axum::extract::Path(job_id.to_string()),
             axum::Json(serde_json::json!({
+                "runner_id": runner_id.to_string(),
+                "lease_token": lease,
                 "success": false,
                 "error": "test error"
             })),
         )
         .await;
-
         assert_status(response.into_response(), StatusCode::OK);
+        assert_eq!(state.scheduler.is_assigned(job_id).await, None);
     }
 
     #[tokio::test]
