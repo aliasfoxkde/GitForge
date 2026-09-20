@@ -17,7 +17,10 @@ Repository state after audit:
 - **Race Detection**: Fixed storage durability issue with `sync_all()` calls
 - **Coverage**: 86.22% lines / 87.06% regions (`cargo llvm-cov --all`,
   2026-09-20, after the main-reconciliation merge; CI floor: 79.9%)
-- **Aegis**: Integrated into CI (already present in security.yml)
+- **Aegis**: Integrated into CI (already present in security.yml) and
+  the Makefile: `make aegis` fails on findings outside the triaged
+  baseline (`.github/aegis-baseline.json`); full 2026-09-20 triage in
+  `docs/audits/AEGIS_BASELINE_2026-09-20.md`
 - **E2E**: Template framework exists in template-parts; GitForge has no web frontend
 
 ## Resolved Security Gaps (2026-09-08)
@@ -292,6 +295,35 @@ Ordered by value; each item states the concrete blocker.
    reqwest call and hung the push. services/git-server main.rs went
    from 67.83% (69.43% lines at the ledger's last note) to 91.77%
    lines / 90.94% regions; the crate totals 89.46% lines.
+
+## Baseline Audit Findings (2026-09-20)
+
+Full gate sweep on `main`: `cargo fmt --check`, `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --workspace`, `cargo vet`,
+`cargo audit`, `shellcheck`, `actionlint`, and the Aegis pattern scan —
+all green. Fixes made during the sweep:
+
+- `cargo vet` went red after the merge's dependency changes; the new
+  un-audited versions were recorded honestly as tracked exemptions
+  (`regenerate exemptions`), not claimed as audited.
+- `cargo audit` reported RUSTSEC-2023-0071 (rsa Marvin Attack, via
+  russh 0.63, no fixed version available). Accepted with justification
+  in `.cargo/audit.toml`: the SSH transport pins an ed25519 host key and
+  the per-user registry holds ed25519 keys; revisit on every russh bump.
+- `actionlint` did not know the repository's self-hosted runner label;
+  `.github/actionlint.yaml` declares it, and the SC2129 shellcheck
+  finding it unmasked in `ai-review.yml` is fixed (step outputs grouped
+  into single `{ …; } >> "$GITHUB_OUTPUT"` writes).
+- The Aegis scan (1 090 findings, 17 critical) produced **zero true
+  secrets or exploitable issues** — every finding is a documented
+  fixture, a placeholder, a `${{ secrets.* }}` reference, or the review
+  engine's own detector literals. Full triage:
+  `docs/audits/AEGIS_BASELINE_2026-09-20.md`. The findings are recorded
+  in `.github/aegis-baseline.json` and `make aegis` now fails the build
+  on any finding that is not in that baseline; `make aegis-baseline`
+  regenerates it. Baseline limitation to remember: fingerprints are
+  line-based, so refactors above a finding re-flag it and need a
+  baseline refresh.
 
 ## Resolved from the Compose Smoke (2026-09-08)
 
