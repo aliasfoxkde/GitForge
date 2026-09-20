@@ -1,6 +1,14 @@
 # GitForge Handoff
 
-**Last Updated:** 2026-09-01
+**Last Updated:** 2026-09-20
+**Current state:** Active development happens on dated
+`codex/*`/`fix/*` branches that are promoted to the Fedora deployment
+by revision, so `origin/main` lags the promoted builds. See
+`docs/handoffs/REPO_STATE_AUDIT_2026-09-20.md` for the branch/worktree
+landscape, `docs/planning/IMPROVEMENTS.md` for the improvement ledger
+and coverage state, and `docs/AUTH_DESIGN.md` for the planned identity
+work. The compose-stack smoke below was validated end to end on
+2026-09-08 and the fixes it produced shipped in 0.4.0.
 **Evidence boundary (central audit):** branch `main`, HEAD `186e3eb1fdda0fbc4571002a8807c51efbb40822`, 1 dirty status entries. This boundary covers the merged first-admin bootstrap, release packaging, and source promotion receipts; numeric ratings below remain historical context, not release gates.
 **Status:** 🔄 Active — merged first-admin bootstrap is built and promoted on Fedora; authenticated BigData registration and production operator provisioning remain pending
 **Location:** `/nas/Temp/repos/GitForge`
