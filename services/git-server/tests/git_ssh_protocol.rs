@@ -76,7 +76,7 @@ fn run_git(
 /// and never fall back to interactive prompts.
 fn ssh_options(client_key: &Path, known_hosts: &Path) -> String {
     format!(
-        "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+        "ssh -F /dev/null -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
          -o UserKnownHostsFile={} -o BatchMode=yes -o LogLevel=ERROR",
         client_key.display(),
         known_hosts.display()
@@ -406,7 +406,7 @@ async fn test_ssh_without_client_key_is_rejected() {
     // not get a session, let alone repository access.
     let known_hosts = base.join("known_hosts");
     let no_key_command = format!(
-        "ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+        "ssh -F /dev/null -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
          -o UserKnownHostsFile={} -o BatchMode=yes -o LogLevel=ERROR \
          -o PubkeyAuthentication=no",
         known_hosts.display()
