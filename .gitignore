@@ -57,7 +57,10 @@ artifacts/
 
 # ─── Environment ───────────────────────────────────────────────────────────────
 .env
-.cargo/
+# Local cargo config dir; the cargo-audit advisory ignore list is tracked
+# because both CI workflows run `cargo audit` and must share it.
+.cargo/*
+!.cargo/audit.toml
 
 # NOTE: Cargo.lock is committed to support security audits and reproducible builds
 # across multiple developers and CI environments for this multi-platform binary.

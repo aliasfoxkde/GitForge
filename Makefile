@@ -45,7 +45,7 @@ coverage: test
 	cargo llvm-cov report --all --html --open || true
 
 # ─── Lint ─────────────────────────────────────────────────────────────────────
-lint: fmt vet clippy shellcheck
+lint: fmt vet clippy shellcheck aegis
 
 fmt:
 	cargo fmt --check
@@ -58,6 +58,23 @@ clippy:
 
 shellcheck:
 	shellcheck scripts/*.sh systemd/*.sh
+
+# Security pattern scan (Aegis). The baseline records every finding triaged
+# as intentional or a false positive at audit time (see
+# docs/audits/AEGIS_BASELINE_2026-09-20.md); the gate fails only on NEW
+# findings. Run `make aegis-baseline` after triaging new findings.
+AEGIS ?= aegis
+
+aegis:
+	$(AEGIS) -f human scan . --config production --baseline .github/aegis-baseline.json -q
+
+aegis-report:
+	$(AEGIS) -f human scan . --config production
+
+aegis-baseline:
+	$(AEGIS) -f json scan . --config production --output-file .github/aegis-baseline.json || true
+	@python3 -c "import json; p='.github/aegis-baseline.json'; d=json.load(open(p)); d['stats'].pop('inspection_ledger', None); d['stats'].pop('files_by_extension', None); json.dump(d, open(p,'w'))"
+	@echo "Baseline regenerated. Triage every finding before committing it."
 
 # ─── Clean ─────────────────────────────────────────────────────────────────────
 clean:
@@ -127,6 +144,10 @@ help:
 	@echo ""
 	@echo "  make lint              - Run linters"
 	@echo "  make fmt               - Check formatting"
+	@echo ""
+	@echo "  make aegis             - Security pattern scan (new findings fail)"
+	@echo "  make aegis-report      - Security pattern scan (full report)"
+	@echo "  make aegis-baseline    - Regenerate the Aegis baseline"
 	@echo ""
 	@echo "  make run-all           - Refuse unmanaged startup; use Fedora systemd"
 	@echo "  make stop              - Refuse unmanaged termination; use Fedora systemd"

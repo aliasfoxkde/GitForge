@@ -1,0 +1,18 @@
+# cargo audit configuration.
+#
+# Recorded exceptions — each entry states why the advisory is accepted
+# and what would lift it. Revisit on every russh/RustCrypto bump.
+
+[advisories]
+ignore = [
+    # rsa 0.10.0-rc.18 — RUSTSEC-2023-0071 (Marvin Attack: timing side
+    # channel during RSA decryption). Pulled in transitively by russh 0.63
+    # for RSA user-auth support; the RustCrypto 0.10 line is still at
+    # release candidates and no fixed version exists to update to. The
+    # transport pins an ed25519 host key, and the per-user key registry
+    # is populated with ed25519 keys; clients presenting RSA keys remain
+    # possible, so the acceptance is conditional on monitoring russh for
+    # a release off the 0.10 RC line. Tracked in the supply-chain ledger
+    # and re-evaluated on every dependency refresh.
+    "RUSTSEC-2023-0071",
+]
