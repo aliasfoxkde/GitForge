@@ -199,7 +199,7 @@ jobs:
       - name: Install cargo-vet
         uses: taiki-e/install-action@562f912bf8a1174eb1007c4afe216a9187a8d722 # cargo-vet
         with:
-          tools: cargo-vet
+          tool: cargo-vet
       - name: Verify supply chain
         run: cargo vet
 
