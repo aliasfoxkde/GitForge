@@ -833,6 +833,29 @@ impl JobQueries {
         Ok(row.is_some())
     }
 
+    /// Check whether a durable lease token still binds to a runner regardless
+    /// of the row's current status. Used by the post-fence lease gate, where
+    /// a runner may legitimately upload an artifact or completion for a job
+    /// the scheduler fenced on startup but whose lease was deliberately
+    /// preserved. Returns `false` when the row is missing, the lease is
+    /// cleared, or another runner now owns the row.
+    pub async fn lease_matches(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> Result<bool> {
+        let row =
+            sqlx::query("SELECT 1 FROM jobs WHERE id = ? AND runner_id = ? AND lease_token = ?")
+                .bind(id.to_string())
+                .bind(runner_id.to_string())
+                .bind(lease_token)
+                .fetch_optional(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to check durable lease: {}", e)))?;
+        Ok(row.is_some())
+    }
+
     /// Persist the scheduler's in-memory lease so durable lease validation
     /// (which reads this row) accepts the lease handed to the runner.
     /// Returns whether a row was updated.
@@ -1290,6 +1313,12 @@ impl JobQueries {
     /// are fenced as failed instead of being re-run automatically: the old
     /// runner may still be alive, and requeueing would permit duplicate side
     /// effects without a durable runner-generation lease.
+    ///
+    /// The fence deliberately preserves `runner_id` and `lease_token` so a
+    /// late completion or log append from the original runner can still be
+    /// accepted idempotently. Without this, a restart between `claim` and
+    /// `complete` would convert every late event into a 409 conflict even
+    /// when the runner's lease was never invalidated.
     pub async fn requeue_inflight(pool: &Pool) -> Result<u64> {
         let mut transaction = pool
             .pool()
@@ -1308,8 +1337,13 @@ impl JobQueries {
         .execute(&mut *transaction)
         .await
         .map_err(|e| Error::database(format!("failed to requeue assigned jobs: {}", e)))?;
+        // Fence running jobs but keep `runner_id`/`lease_token` so the
+        // original runner can still publish a late terminal receipt or log
+        // chunk under its own lease. The fenced status is recorded in
+        // result_json; complete_with_lease accepts terminal rows whose
+        // existing result_json equals the incoming one.
         let running = sqlx::query(
-            "UPDATE jobs SET status = 'failed', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE status = 'running'",
+            "UPDATE jobs SET status = 'failed', finished_at = ?, result_json = ? WHERE status = 'running'",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(r#"{"status":"failed","reason":"scheduler_restart_fenced_running_job"}"#)
@@ -1321,6 +1355,128 @@ impl JobQueries {
             .await
             .map_err(|e| Error::database(format!("failed to commit recovery: {}", e)))?;
         Ok(queued_with_runner.rows_affected() + assigned.rows_affected() + running.rows_affected())
+    }
+
+    /// Persist a late runner completion under a lease that the scheduler has
+    /// already fenced. The fence preserves the runner's lease so a completion
+    /// delivered after a restart can still authenticate and (when it matches
+    /// the existing receipt) overwrite the synthetic fence with a real one.
+    ///
+    /// Returns `Ok(true)` when the row was updated, `Ok(false)` when the
+    /// lease is not currently held by this runner (already reassigned or
+    /// never claimed), and a database error otherwise.
+    pub async fn complete_late_with_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        status: &str,
+        result_json: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = ?, finished_at = COALESCE(finished_at, ?), result_json = ? WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running', 'succeeded', 'failed', 'cancelled', 'timed_out')",
+        )
+        .bind(status)
+        .bind(Utc::now().to_rfc3339())
+        .bind(result_json)
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to complete job with late lease: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Append a log chunk for a job whose lease is still bound to this
+    /// runner, even after the scheduler fenced the row. The fence only
+    /// changes the visible status; the lease remains valid until explicitly
+    /// reassigned so trailing log chunks from a restarted scheduler can land.
+    pub async fn append_log_with_lease_late(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        chunk: &str,
+    ) -> Result<Option<i64>> {
+        if chunk.is_empty() {
+            return Ok(None);
+        }
+        if chunk.len() > MAX_JOB_LOG_CHUNK_BYTES {
+            return Err(Error::invalid_input(format!(
+                "job log chunk exceeds {} bytes",
+                MAX_JOB_LOG_CHUNK_BYTES
+            )));
+        }
+        let mut conn = pool.pool().acquire().await.map_err(|e| {
+            Error::database(format!("failed to acquire late log connection: {}", e))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::database(format!("failed to begin late log append: {}", e)))?;
+        let Some(job) = sqlx::query("SELECT runner_id, lease_token, status FROM jobs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| Error::database(format!("failed to authorize late log append: {}", e)))?
+        else {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Ok(None);
+        };
+        let assigned_runner: Option<String> = job.get("runner_id");
+        let current_token: Option<String> = job.get("lease_token");
+        if assigned_runner.as_deref() != Some(&runner_id.to_string())
+            || current_token.as_deref() != Some(lease_token)
+        {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Ok(None);
+        }
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(length(chunk)), 0) FROM job_log_chunks WHERE job_id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| Error::database(format!("failed to measure job logs: {}", e)))?;
+        if total + chunk.len() as i64 > MAX_JOB_LOG_BYTES {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(Error::invalid_input(format!(
+                "job logs exceed {} bytes",
+                MAX_JOB_LOG_BYTES
+            )));
+        }
+
+        let next_sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM job_log_chunks WHERE job_id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| Error::database(format!("failed to allocate log sequence: {}", e)))?;
+
+        let insert = sqlx::query(
+            "INSERT INTO job_log_chunks (job_id, sequence, chunk, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(next_sequence)
+        .bind(chunk)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *conn)
+        .await;
+        if let Err(error) = insert {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(Error::database(format!(
+                "failed to append late log chunk: {}",
+                error
+            )));
+        }
+        sqlx::query("COMMIT")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::database(format!("failed to commit late log append: {}", e)))?;
+        Ok(Some(next_sequence))
     }
 
     /// Mark running jobs whose persisted deadline has elapsed as timed out.

@@ -42,6 +42,24 @@ pub enum OutputStream {
     Stderr,
 }
 
+/// Snapshot of the container fields the runner needs for resource
+/// classification. The Docker daemon populates these on every inspect
+/// response, so a probe is cheap and side-effect free.
+#[derive(Debug, Clone, Default)]
+pub struct ContainerStateProbe {
+    /// Whether the kernel OOM-killer terminated a process in this
+    /// container. Reported by Docker when the cgroup memory limit is
+    /// exceeded or the host hits reclaim pressure.
+    pub oom_killed: Option<bool>,
+    /// Last exit code reported by the container.
+    pub exit_code: Option<i64>,
+    /// Container error string set when the daemon forcibly stops the
+    /// container (for example, an eviction).
+    pub error: Option<String>,
+    /// Whether the container is currently running.
+    pub running: Option<bool>,
+}
+
 /// Receives bounded output chunks while a sandbox command is running.
 ///
 /// Implementations may apply backpressure by awaiting durable delivery. The
@@ -199,6 +217,33 @@ impl DockerSandbox {
     /// Check if Docker is available
     pub fn is_available(&self) -> bool {
         self.docker.is_some()
+    }
+
+    /// Probe a container's runtime state without mutating it. Used by the
+    /// runner executor to classify a signal-derived exit code (most often
+    /// 137/SIGKILL from the OOM killer) so operators can distinguish a
+    /// cgroup memory-limit violation from a runner-side timeout.
+    ///
+    /// In stub mode the probe returns an all-`None` snapshot so unit tests
+    /// can drive the classification branch without Docker. Production code
+    /// never observes this branch; the call site only acts on `Some(true)`.
+    pub async fn inspect_container_state(&self, container_id: &str) -> Result<ContainerStateProbe> {
+        let Some(ref docker) = self.docker else {
+            return Ok(ContainerStateProbe::default());
+        };
+        let inspect = docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|error| {
+                Error::sandbox(format!("failed to inspect container state: {}", error))
+            })?;
+        let state = inspect.state.unwrap_or_default();
+        Ok(ContainerStateProbe {
+            oom_killed: state.oom_killed,
+            exit_code: state.exit_code,
+            error: state.error,
+            running: state.running,
+        })
     }
 
     /// Pull an image if not present
@@ -572,25 +617,16 @@ impl Sandbox for DockerSandbox {
 
     async fn destroy(&self, instance: SandboxInstance) -> Result<()> {
         if let Some(ref docker) = self.docker {
-            // If this sandbox had a workspace mount, chown the workspace tree to
-            // the runner's UID/GID before shutting down.  Inside the container
-            // we run as root, so chown is always permitted.  After this succeeds
-            // the runner user on the host can delete the artifact files without
-            // requiring privileged escalation.
-            if let Some(ref workspace) = instance.workspace_path {
-                if let Err(e) = cleanup_workspace(docker, &instance.container_id, workspace).await {
-                    tracing::warn!(
-                        "workspace ownership cleanup failed for {}: {} \
-                         (artifact files may require privileged deletion)",
-                        workspace,
-                        e
-                    );
-                    // Proceed to container teardown even if chown fails
-                }
-            }
-
-            // Send SIGTERM for graceful shutdown first
-            // Wait up to 10 seconds for container to stop gracefully
+            // Stop the container first so no in-flight job command can race
+            // the workspace chown.  A concurrent `chown -R` against a
+            // workspace that is still being written to by a live container
+            // can truncate artifact files mid-upload or report a stale
+            // ownership state that the runner later acts on.
+            //
+            // The previous order (chown then stop) was unsafe because the
+            // workspace mount remained active and writable while chown ran,
+            // so a sandbox that the runner's own timeout watcher had just
+            // killed could still be flushing log lines or artifact bytes.
             let stop_options = StopContainerOptions {
                 t: Some(10),
                 ..Default::default()
@@ -605,6 +641,27 @@ impl Sandbox for DockerSandbox {
                     "stop_container returned error (container may already be stopped): {}",
                     e
                 );
+            }
+
+            // After SIGTERM/SIGKILL the container can still take a moment
+            // to exit.  Polling inspect is the cheapest way to wait for the
+            // kernel to fully drop its reference to the workspace mount
+            // before we mutate the workspace's ownership.
+            wait_for_container_exit(docker, &instance.container_id).await;
+
+            // Now the workspace is quiesced.  Transfer ownership to the
+            // runner UID/GID so the host process can delete artifact files
+            // without privileged escalation.
+            if let Some(ref workspace) = instance.workspace_path {
+                if let Err(e) = cleanup_workspace(docker, &instance.container_id, workspace).await {
+                    tracing::warn!(
+                        "workspace ownership cleanup failed for {}: {} \
+                         (artifact files may require privileged deletion)",
+                        workspace,
+                        e
+                    );
+                    // Proceed to container teardown even if chown fails
+                }
             }
 
             // Remove the container even when the graceful stop reported an
@@ -628,6 +685,50 @@ impl Sandbox for DockerSandbox {
             );
         }
         Ok(())
+    }
+}
+
+/// Maximum bounded poll time used by `wait_for_container_exit`.
+const MAX_WAIT_CONTAINER_EXIT_SECS: u64 = 5;
+
+/// Poll Docker until the container reports a terminal state or the bounded
+/// wait elapses. Used as a synchronization barrier so the workspace mount
+/// is guaranteed quiesced before `cleanup_workspace` runs.
+///
+/// Returns immediately when Docker cannot be reached; callers always
+/// proceed to the chown step because fail-open is correct for the
+/// ownership transfer (chown failure is already logged but non-fatal).
+async fn wait_for_container_exit(docker: &Docker, container_id: &str) {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(MAX_WAIT_CONTAINER_EXIT_SECS);
+    loop {
+        match docker.inspect_container(container_id, None).await {
+            Ok(inspect) => {
+                let running = inspect
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.running)
+                    .unwrap_or(false);
+                if !running {
+                    return;
+                }
+            }
+            Err(_) => {
+                // Inspect failed: container is gone or the daemon is
+                // unreachable. Either way it can no longer write to
+                // the workspace.
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                container_id,
+                "container did not reach exited state within {}s; proceeding with workspace cleanup",
+                MAX_WAIT_CONTAINER_EXIT_SECS
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
@@ -1686,6 +1787,52 @@ mod tests {
         assert!(
             result.is_ok(),
             "stub destroy must not fail even with workspace_path set"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // P0-GF-RESTART-20260913 sandbox-state probe tests
+    // -----------------------------------------------------------------
+
+    /// `inspect_container_state` is the data source for the executor's
+    /// OOM/signal classifier. In stub mode it must return an empty
+    /// snapshot so callers can distinguish a missing daemon from a real
+    /// probe failure.
+    #[tokio::test]
+    async fn test_inspect_container_state_stub_is_empty() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let probe = sandbox
+            .inspect_container_state("missing-container")
+            .await
+            .expect("stub probe must succeed");
+        assert!(probe.oom_killed.is_none());
+        assert!(probe.exit_code.is_none());
+        assert!(probe.error.is_none());
+        assert!(probe.running.is_none());
+    }
+
+    /// `ContainerStateProbe` must be constructible without Docker so
+    /// downstream code can carry the snapshot across an await boundary
+    /// without an extra clone path.
+    #[test]
+    fn test_container_state_probe_default_is_none() {
+        let probe = ContainerStateProbe::default();
+        assert!(probe.oom_killed.is_none());
+        assert!(probe.exit_code.is_none());
+        assert!(probe.error.is_none());
+        assert!(probe.running.is_none());
+    }
+
+    /// Document the bounded wait used by `wait_for_container_exit`. The
+    /// constant is referenced from the destroy path so any change must be
+    /// intentional; this test catches accidental edits that would let a
+    /// stuck container delay chown for minutes at a time.
+    #[test]
+    fn test_wait_for_container_exit_bound_is_bounded() {
+        assert!(
+            MAX_WAIT_CONTAINER_EXIT_SECS >= 1 && MAX_WAIT_CONTAINER_EXIT_SECS <= 30,
+            "wait_for_container_exit must remain bounded (got {}s)",
+            MAX_WAIT_CONTAINER_EXIT_SECS
         );
     }
 }

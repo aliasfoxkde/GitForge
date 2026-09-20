@@ -153,6 +153,11 @@ impl<'a> From<&'a TerminalPublication> for CheckRunRequest<'a> {
             ReceiptStatus::Failed => "failure",
             ReceiptStatus::TimedOut => "timed_out",
             ReceiptStatus::Cancelled => "cancelled",
+            // GitHub's check_run API accepts only a fixed set of conclusions;
+            // OOM-killed jobs map to the closest fit (`failure`) so the
+            // semantic distinction is preserved in the receipt while the
+            // downstream view surfaces the kill in the check name or summary.
+            ReceiptStatus::OomKilled => "failure",
         };
         Self {
             name: &publication.check_name,

@@ -5,5 +5,8 @@
 pub mod docker;
 pub mod limits;
 
-pub use docker::{DockerSandbox, OutputSink, OutputStream, Sandbox, SandboxInstance, StepResult};
+pub use docker::{
+    ContainerStateProbe, DockerSandbox, OutputSink, OutputStream, Sandbox, SandboxInstance,
+    StepResult,
+};
 pub use limits::SandboxLimits;

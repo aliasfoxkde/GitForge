@@ -16,6 +16,19 @@ use tokio::fs;
 use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration, Instant};
 
+/// Linux process exit code that Docker reports when the kernel kills the
+/// container's init process with SIGKILL (signal 9). Most memory-pressure
+/// kills land here and previously landed in receipts without any
+/// classification; we surface them as a distinct "killed by OOM" failure
+/// mode so operators can act on cgroup limits rather than chasing a phantom
+/// application crash.
+pub const SIGKILL_EXIT_CODE: i32 = 137;
+/// POSIX exit-code convention: signal-derived exit codes are encoded as
+/// `128 + signal_number`. Anything at or above this threshold is a signal
+/// kill, which means the job did not exit cleanly and is a candidate for
+/// resource classification.
+pub const SIGNAL_EXIT_BASE: i32 = 128;
+
 /// Default number of pre-warmed containers per image
 const POOL_SIZE: usize = 2;
 
@@ -268,6 +281,66 @@ impl JobExecutor {
         }
     }
 
+    /// Probe a sandbox whose process exited via a Unix signal so the receipt
+    /// records whether the kill was resource-driven (OOM), a runner-side
+    /// timeout, or a Docker-level stop. The classification is best-effort:
+    /// we only overwrite the failure message when Docker confirms a
+    /// resource kill, otherwise the original exec error remains authoritative.
+    async fn classify_signal_exit(
+        &self,
+        instance: &SandboxInstance,
+        exit_code: i32,
+    ) -> Option<String> {
+        let probe = match self
+            .pool
+            .sandbox
+            .inspect_container_state(&instance.container_id)
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::debug!(%error, container_id = %instance.container_id,
+                    "could not probe container for signal classification");
+                return None;
+            }
+        };
+        let mut reasons = Vec::new();
+        if probe.oom_killed.unwrap_or(false) {
+            reasons.push(format!(
+                "killed by OOM (exit_code={}, signal=SIGKILL, container_oomkilled=true)",
+                exit_code
+            ));
+        }
+        if let Some(error) = probe.error.as_deref() {
+            if !error.is_empty() && error != "exit status" && !error.contains("exited normally") {
+                reasons.push(format!("docker error: {}", error));
+            }
+        }
+        if reasons.is_empty() {
+            // SIGTERM is what the runner's destroy path sends; SIGKILL with
+            // a non-OOM cause usually indicates a host-level resource
+            // pressure or eviction. We annotate rather than fabricate a
+            // cause so operators can correlate with kernel logs.
+            let signal = exit_code - SIGNAL_EXIT_BASE;
+            if signal == 9 {
+                reasons.push(format!(
+                    "killed by SIGKILL (exit_code={}, no OOM flag set on container)",
+                    exit_code
+                ));
+            } else if signal != 0 {
+                reasons.push(format!(
+                    "killed by signal {} (exit_code={})",
+                    signal, exit_code
+                ));
+            }
+        }
+        if reasons.is_empty() {
+            None
+        } else {
+            Some(reasons.join("; "))
+        }
+    }
+
     /// Execute a job and forward sandbox output while each step is running.
     /// The sink is optional so existing callers and local tests retain the
     /// original accumulated-result behavior.
@@ -398,6 +471,20 @@ impl JobExecutor {
                     });
                     break;
                 }
+            }
+        }
+
+        // Classify a signal-derived exit (137 / SIGKILL, 134 / SIGABRT,
+        // 143 / SIGTERM) by inspecting the container. The Docker daemon
+        // exposes `State.OOMKilled` and `State.Error`, which let us tell
+        // "kernel killed us for memory pressure" apart from "the runner's
+        // own timeout watcher stopped us". Without this probe, every
+        // SIGKILL looks identical in the receipt and operators cannot tell
+        // whether to raise cgroup limits or shorten the job's command
+        // timeout.
+        if !success && final_exit_code >= SIGNAL_EXIT_BASE {
+            if let Some(reason) = self.classify_signal_exit(&instance, final_exit_code).await {
+                failure_error = Some(reason);
             }
         }
 
@@ -602,10 +689,22 @@ pub struct JobResult {
 }
 
 impl JobResult {
-    /// Determine receipt status from job result
+    /// Determine receipt status from job result.
+    ///
+    /// A signal-derived exit code classified as OOM by `classify_signal_exit`
+    /// is reported as `ReceiptStatus::OomKilled`. The classification marker
+    /// (`killed by OOM`) is set on `JobResult.error` by the executor, so we
+    /// detect it here to keep this method a pure function of the result.
     fn status(&self) -> ReceiptStatus {
         if self.success {
             ReceiptStatus::Succeeded
+        } else if self
+            .error
+            .as_ref()
+            .map(|e| e.contains("killed by OOM"))
+            .unwrap_or(false)
+        {
+            ReceiptStatus::OomKilled
         } else if self
             .error
             .as_ref()
@@ -863,5 +962,122 @@ mod tests {
         let (sha, bytes) = JobResult::compute_output_sha(&artifacts);
         assert!(!sha.is_empty());
         assert_eq!(bytes, 300); // 100 + 200
+    }
+
+    // -----------------------------------------------------------------
+    // P0-GF-RESTART-20260913 signal / OOM classification tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_sigkill_exit_constant_is_137() {
+        // POSIX: signal exit codes are encoded as 128 + signal_number;
+        // SIGKILL is signal 9, so the conventional exit code is 137.
+        assert_eq!(SIGKILL_EXIT_CODE, 137);
+        assert_eq!(SIGNAL_EXIT_BASE, 128);
+    }
+
+    #[test]
+    fn test_status_classifies_oom_via_error_marker() {
+        // The executor writes a structured error string when the container
+        // reports OOMKilled; the status() method must surface that as a
+        // distinct receipt state.
+        let started = chrono::Utc::now();
+        let completed = started + chrono::Duration::seconds(2);
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: 137,
+            step_results: vec![StepResult {
+                exit_code: 137,
+                stdout: String::new(),
+                stderr: "killed".to_string(),
+            }],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: Some(
+                "killed by OOM (exit_code=137, signal=SIGKILL, container_oomkilled=true)"
+                    .to_string(),
+            ),
+            workspace_path: None,
+        };
+        assert_eq!(result.status(), ReceiptStatus::OomKilled);
+    }
+
+    #[test]
+    fn test_status_classifies_timeout_above_oom() {
+        // A timeout error must still surface as TimedOut even when the
+        // exit code would otherwise look like a signal-derived exit.
+        let started = chrono::Utc::now();
+        let completed = started + chrono::Duration::seconds(900);
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: -1,
+            step_results: vec![],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: Some("job timed out: timeout exceeded".to_string()),
+            workspace_path: None,
+        };
+        assert_eq!(result.status(), ReceiptStatus::TimedOut);
+    }
+
+    #[test]
+    fn test_status_classifies_non_oom_signal_exit_as_failed() {
+        // A signal-derived exit without the OOM marker must NOT be reported
+        // as OomKilled; otherwise an unrelated SIGTERM kill would be
+        // misattributed to memory pressure.
+        let started = chrono::Utc::now();
+        let completed = started + chrono::Duration::seconds(3);
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: 137,
+            step_results: vec![StepResult {
+                exit_code: 137,
+                stdout: String::new(),
+                stderr: String::new(),
+            }],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: Some(
+                "killed by SIGKILL (exit_code=137, no OOM flag set on container)".to_string(),
+            ),
+            workspace_path: None,
+        };
+        assert_eq!(
+            result.status(),
+            ReceiptStatus::Failed,
+            "SIGKILL without OOM marker must remain classified as a generic failure"
+        );
+    }
+
+    #[test]
+    fn test_status_success_unchanged_by_classification_change() {
+        let started = chrono::Utc::now();
+        let completed = started + chrono::Duration::seconds(1);
+        let result = JobResult {
+            job_id: JobId::new(),
+            success: true,
+            exit_code: 0,
+            step_results: vec![StepResult {
+                exit_code: 0,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+            }],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: None,
+            workspace_path: None,
+        };
+        assert_eq!(result.status(), ReceiptStatus::Succeeded);
     }
 }

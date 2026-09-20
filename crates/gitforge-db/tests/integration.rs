@@ -1057,3 +1057,352 @@ async fn claim_pending_repeated_call_after_success_does_not_double_claim() {
     assert_eq!(stored.status, ReviewRunState::Running);
     assert_eq!(stored.attempt, 2);
 }
+
+// ===========================================================================
+// Restart recovery tests for P0-GF-RESTART-20260913
+//
+// These tests reproduce the failure mode from run 001a73d4-238f-447f-9ff7-
+// bcf1ee9dbd71: a scheduler restart between claim and completion caused
+// late completion messages and live log chunks to become 409 conflicts. The
+// fixes preserve the runner's lease across the fence so late events still
+// authenticate, and add an idempotent late-completion path that overwrites
+// the synthetic fence receipt with the real one.
+// ===========================================================================
+
+/// Helper: create a durable lease, advance the job to the `running` status,
+/// and return the lease token. Mirrors the real scheduler's assign + start
+/// flow so the recovery tests exercise the same row shape.
+async fn assign_and_start(
+    pool: &Pool,
+    job_id: gitforge_common::JobId,
+    runner_id: gitforge_common::RunnerId,
+    lease_token: &str,
+) {
+    assert!(
+        JobQueries::assign_with_lease(pool, job_id, runner_id, lease_token)
+            .await
+            .unwrap(),
+        "lease assignment must take effect on a fresh queued job"
+    );
+    assert!(
+        JobQueries::start_with_lease(pool, job_id, runner_id, lease_token)
+            .await
+            .unwrap(),
+        "start transition must succeed while the lease is active"
+    );
+}
+
+/// Reproduce the incident: scheduler restart between `claim` and `complete`.
+/// The fence must preserve the lease so the original runner's late
+/// completion can still authenticate, and the new `complete_late_with_lease`
+/// must overwrite the synthetic fence receipt with the real one.
+#[tokio::test]
+async fn test_restart_fence_accepts_late_completion_under_original_lease() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let user = User::new(
+        "restart-owner".to_string(),
+        "restart-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "restart-repo".to_string(),
+        user.id,
+        "/git/restart-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+    let pipeline = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "restart-pipeline".to_string(),
+        trigger_type: "manual".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    PipelineQueries::create(&pool, &pipeline).await.unwrap();
+    let run = PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "restart-owner".to_string(),
+        "restart-commit".to_string(),
+    );
+    PipelineRunQueries::create(&pool, &run).await.unwrap();
+    let job = Job::new(run.id, "restart-job".to_string());
+    JobQueries::create(&pool, &job).await.unwrap();
+    let runner = Runner::new("restart-runner".to_string(), RunnerType::Docker, 1);
+    RunnerQueries::create(&pool, &runner).await.unwrap();
+
+    assign_and_start(&pool, job.id, runner.id, "lease-original").await;
+
+    // 1. Simulate the scheduler restart: the recovery sweep fences running
+    //    jobs without nullifying their runner_id or lease_token.
+    JobQueries::requeue_inflight(&pool).await.unwrap();
+    let fenced = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+    assert_eq!(fenced.status, "failed", "fenced job must be visibly failed");
+    assert_eq!(
+        fenced.runner_id,
+        Some(runner.id),
+        "fence must preserve runner_id so late lease matches"
+    );
+    // The Job model does not expose the durable lease_token column; the
+    // lease_matches query below verifies the column is preserved.
+    assert!(
+        JobQueries::lease_matches(&pool, job.id, runner.id, "lease-original")
+            .await
+            .unwrap(),
+        "fence must preserve lease_token so late lease matches"
+    );
+
+    // 2. A stale lease from a different runner must NOT be accepted.
+    let other_runner = Runner::new("other-runner".to_string(), RunnerType::Docker, 1);
+    RunnerQueries::create(&pool, &other_runner).await.unwrap();
+    assert!(
+        !JobQueries::complete_late_with_lease(
+            &pool,
+            job.id,
+            other_runner.id,
+            "lease-original",
+            "succeeded",
+            r#"{"success":true}"#,
+        )
+        .await
+        .unwrap(),
+        "a foreign runner's lease must not authorize a late completion"
+    );
+
+    // 3. The original runner's late completion is accepted and overwrites
+    //    the synthetic fence receipt with the real one.
+    assert!(
+        JobQueries::complete_late_with_lease(
+            &pool,
+            job.id,
+            runner.id,
+            "lease-original",
+            "succeeded",
+            r#"{"success":true,"exit_code":0}"#,
+        )
+        .await
+        .unwrap(),
+        "the original runner's late completion must authenticate"
+    );
+    let finalized = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+    assert_eq!(finalized.status, "succeeded");
+    assert_eq!(
+        finalized.result_json.as_deref(),
+        Some(r#"{"success":true,"exit_code":0}"#)
+    );
+
+    // 4. Replays of the same late completion must not duplicate state
+    //    and the durable row must remain in the terminal state.
+    assert!(
+        JobQueries::complete_late_with_lease(
+            &pool,
+            job.id,
+            runner.id,
+            "lease-original",
+            "succeeded",
+            r#"{"success":true,"exit_code":0}"#,
+        )
+        .await
+        .unwrap(),
+        "an idempotent replay must still apply under the matching lease"
+    );
+}
+
+/// Late log chunks arriving after a restart fence must still be accepted.
+/// Without this, a streaming log line from a live container can land after
+/// the scheduler decided the job was lost, and the runner surfaces a 409
+/// for an otherwise valid chunk.
+#[tokio::test]
+async fn test_restart_fence_accepts_late_log_chunks_under_original_lease() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let user = User::new(
+        "restart-log-owner".to_string(),
+        "restart-log-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "restart-log-repo".to_string(),
+        user.id,
+        "/git/restart-log-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+    let pipeline = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "restart-log-pipeline".to_string(),
+        trigger_type: "manual".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    PipelineQueries::create(&pool, &pipeline).await.unwrap();
+    let run = PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "restart-log-owner".to_string(),
+        "restart-log-commit".to_string(),
+    );
+    PipelineRunQueries::create(&pool, &run).await.unwrap();
+    let job = Job::new(run.id, "restart-log-job".to_string());
+    JobQueries::create(&pool, &job).await.unwrap();
+    let runner = Runner::new("restart-log-runner".to_string(), RunnerType::Docker, 1);
+    RunnerQueries::create(&pool, &runner).await.unwrap();
+
+    assign_and_start(&pool, job.id, runner.id, "lease-original").await;
+    JobQueries::requeue_inflight(&pool).await.unwrap();
+
+    // Foreign lease: must be silently rejected.
+    let other_runner = Runner::new("foreign-log-runner".to_string(), RunnerType::Docker, 1);
+    RunnerQueries::create(&pool, &other_runner).await.unwrap();
+    assert_eq!(
+        JobQueries::append_log_with_lease_late(
+            &pool,
+            job.id,
+            other_runner.id,
+            "lease-original",
+            "must be fenced",
+        )
+        .await
+        .unwrap(),
+        None,
+        "foreign runner's late log chunk must be silently rejected"
+    );
+
+    // Original lease: late chunk is appended with a stable sequence number.
+    let sequence = JobQueries::append_log_with_lease_late(
+        &pool,
+        job.id,
+        runner.id,
+        "lease-original",
+        "late line\n",
+    )
+    .await
+    .unwrap()
+    .expect("the original runner's lease must still authorize late chunks");
+    let logs = JobQueries::list_logs(&pool, job.id).await.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].chunk, "late line\n");
+    assert_eq!(logs[0].sequence, sequence);
+}
+
+/// The standard `complete_with_lease` path must NOT clobber a fenced row
+/// once the lease no longer matches. This guarantees a runner that holds a
+/// stale lease (because the scheduler rotated it) cannot rewrite history.
+#[tokio::test]
+async fn test_complete_with_lease_rejects_after_lease_rotation() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let user = User::new(
+        "rotation-owner".to_string(),
+        "rotation-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "rotation-repo".to_string(),
+        user.id,
+        "/git/rotation-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+    let pipeline = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "rotation-pipeline".to_string(),
+        trigger_type: "manual".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    PipelineQueries::create(&pool, &pipeline).await.unwrap();
+    let run = PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "rotation-owner".to_string(),
+        "rotation-commit".to_string(),
+    );
+    PipelineRunQueries::create(&pool, &run).await.unwrap();
+    let job = Job::new(run.id, "rotation-job".to_string());
+    JobQueries::create(&pool, &job).await.unwrap();
+    let runner = Runner::new("rotation-runner".to_string(), RunnerType::Docker, 1);
+    RunnerQueries::create(&pool, &runner).await.unwrap();
+    assign_and_start(&pool, job.id, runner.id, "lease-a").await;
+    JobQueries::requeue_inflight(&pool).await.unwrap();
+    // After the fence the row is in a terminal status; simulate a future
+    // scheduler tick explicitly clearing the lease before reassignment.
+    sqlx::query("UPDATE jobs SET lease_token = 'lease-b' WHERE id = ?")
+        .bind(job.id.to_string())
+        .execute(pool.pool())
+        .await
+        .unwrap();
+    // The old lease token must NOT be accepted as a late completion.
+    assert!(
+        !JobQueries::complete_late_with_lease(
+            &pool,
+            job.id,
+            runner.id,
+            "lease-a",
+            "succeeded",
+            r#"{"success":true}"#,
+        )
+        .await
+        .unwrap(),
+        "rotated lease must reject late completion under the old token"
+    );
+}
+
+/// `lease_matches` must return true for a fenced row (preserved lease) but
+/// false for an explicitly cleared lease. Used by the artifact upload path
+/// to decide whether to accept a late upload without surfacing a 409.
+#[tokio::test]
+async fn test_lease_matches_after_restart_fence() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let user = User::new(
+        "match-owner".to_string(),
+        "match-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "match-repo".to_string(),
+        user.id,
+        "/git/match-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+    let pipeline = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "match-pipeline".to_string(),
+        trigger_type: "manual".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    PipelineQueries::create(&pool, &pipeline).await.unwrap();
+    let run = PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "match-owner".to_string(),
+        "match-commit".to_string(),
+    );
+    PipelineRunQueries::create(&pool, &run).await.unwrap();
+    let job = Job::new(run.id, "match-job".to_string());
+    JobQueries::create(&pool, &job).await.unwrap();
+    let runner = Runner::new("match-runner".to_string(), RunnerType::Docker, 1);
+    RunnerQueries::create(&pool, &runner).await.unwrap();
+    assign_and_start(&pool, job.id, runner.id, "lease-a").await;
+    JobQueries::requeue_inflight(&pool).await.unwrap();
+    assert!(
+        JobQueries::lease_matches(&pool, job.id, runner.id, "lease-a")
+            .await
+            .unwrap(),
+        "fenced row must still report the lease as matching"
+    );
+    assert!(
+        !JobQueries::lease_matches(&pool, job.id, runner.id, "lease-other")
+            .await
+            .unwrap(),
+        "a foreign lease must not match"
+    );
+}

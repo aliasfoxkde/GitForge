@@ -21,6 +21,12 @@ pub enum ReceiptStatus {
     Failed,
     TimedOut,
     Cancelled,
+    /// The container was killed by the kernel's OOM-killer. Surfaced as a
+    /// distinct receipt state so consumers can distinguish a cgroup memory
+    /// pressure event from a generic non-zero exit. A signal-derived exit
+    /// code without Docker's `OOMKilled` flag set is still classified as
+    /// `Failed` because we cannot authoritatively attribute the kill.
+    OomKilled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -333,5 +339,32 @@ mod tests {
         let mut value = receipt();
         value.receipt_signature = Some("bad".to_string());
         assert!(value.validate().is_err());
+    }
+
+    /// The new `ReceiptStatus::OomKilled` variant must round-trip through
+    /// JSON without losing the snake_case discriminator so a GitForge
+    /// Control Center or external CI consumer can render the distinction
+    /// between a cgroup memory kill and a generic non-zero exit.
+    #[test]
+    fn oom_killed_status_round_trips_as_snake_case() {
+        let value = ReceiptStatus::OomKilled;
+        let encoded = serde_json::to_string(&value).expect("encode must succeed");
+        assert_eq!(encoded, "\"oom_killed\"");
+        let decoded: ReceiptStatus =
+            serde_json::from_str(&encoded).expect("decode must round-trip");
+        assert_eq!(decoded, ReceiptStatus::OomKilled);
+    }
+
+    /// An OOM-killed receipt is terminal but never a success; `validate()`
+    /// must accept the new variant without forcing operators to re-deploy
+    /// existing pipelines.
+    #[test]
+    fn oom_killed_receipt_validates() {
+        let mut value = receipt();
+        value.status = ReceiptStatus::OomKilled;
+        value.exit_code = Some(137);
+        value.error = Some("killed by OOM".to_string());
+        value.receipt_signature = Some(value.compute_signature());
+        assert!(value.validate().is_ok());
     }
 }
