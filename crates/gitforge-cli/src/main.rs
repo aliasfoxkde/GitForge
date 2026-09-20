@@ -237,7 +237,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             status,
             whoami,
         } => {
-            let api_client = GitForgeClient::new(&config.api_url(), token.clone());
+            let api_client = GitForgeClient::new(&server, token.clone());
 
             if let Some(username) = login {
                 println!("🔐 Authenticating as {} to {}", username, server);
@@ -357,7 +357,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             clone,
             init,
         } => {
-            let api_client = GitForgeClient::new(&config.api_url(), token.clone());
+            let api_client = GitForgeClient::new(&server, token.clone());
 
             if *list {
                 match api_client.list_repos().await {
@@ -491,7 +491,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             create,
             delete,
         } => {
-            let api_client = GitForgeClient::new(&config.api_url(), token.clone());
+            let api_client = GitForgeClient::new(&server, token.clone());
 
             if *list {
                 match api_client.list_pipelines().await {
@@ -554,7 +554,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             capacity,
             deregister,
         } => {
-            let api_client = GitForgeClient::new(&config.api_url(), token.clone());
+            let api_client = GitForgeClient::new(&server, token.clone());
 
             if *list {
                 match api_client.list_runners().await {

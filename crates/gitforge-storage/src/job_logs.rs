@@ -441,4 +441,153 @@ mod tests {
         let entries = store.list().await.unwrap();
         assert!(entries.is_empty());
     }
+
+    // ─── bounded_put: truncation and integrity receipts ─────────────────
+
+    fn expected_sha256(data: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hex::encode(hasher.finalize())
+    }
+
+    #[tokio::test]
+    async fn test_bounded_put_returns_receipt_over_exact_content() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FileJobLogStore::new(temp_dir.path()).await.unwrap();
+        let job_id = JobId::new();
+        let data = b"step 1 ok\nstep 2 ok\n".to_vec();
+
+        let receipt = store.bounded_put(job_id, data.clone(), 1024).await.unwrap();
+
+        assert_eq!(receipt.uri, format!("gitforge://log/{}", job_id));
+        assert_eq!(receipt.bytes, data.len() as u64);
+        assert_eq!(receipt.sha256, expected_sha256(&data));
+        // The stored bytes are exactly what the receipt describes.
+        let stored = store.get(&job_id).await.unwrap().expect("stored log");
+        assert_eq!(stored, data);
+        assert_eq!(expected_sha256(&stored), receipt.sha256);
+    }
+
+    #[tokio::test]
+    async fn test_bounded_put_truncates_oversized_logs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FileJobLogStore::new(temp_dir.path()).await.unwrap();
+        let job_id = JobId::new();
+        let data: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        let max_bytes = 4_000u64;
+
+        let receipt = store.bounded_put(job_id, data, max_bytes).await.unwrap();
+
+        assert_eq!(receipt.bytes, max_bytes, "receipt reflects the truncation");
+        let stored = store.get(&job_id).await.unwrap().expect("stored log");
+        assert_eq!(stored.len() as u64, max_bytes);
+        assert_eq!(
+            stored,
+            (0..=255u8)
+                .cycle()
+                .take(max_bytes as usize)
+                .collect::<Vec<u8>>(),
+            "the kept bytes are the head of the log"
+        );
+        assert_eq!(receipt.sha256, expected_sha256(&stored));
+
+        let entries = store.list().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size_bytes, max_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_bounded_put_at_exact_boundary_is_not_truncated() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FileJobLogStore::new(temp_dir.path()).await.unwrap();
+        let job_id = JobId::new();
+        let data = vec![b'x'; 512];
+
+        let receipt = store.bounded_put(job_id, data.clone(), 512).await.unwrap();
+
+        assert_eq!(receipt.bytes, 512);
+        assert_eq!(receipt.sha256, expected_sha256(&data));
+    }
+
+    #[tokio::test]
+    async fn test_bounded_put_overwrite_replaces_receipt() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FileJobLogStore::new(temp_dir.path()).await.unwrap();
+        let job_id = JobId::new();
+
+        let first = store
+            .bounded_put(job_id, b"first".to_vec(), 1024)
+            .await
+            .unwrap();
+        let second = store
+            .bounded_put(job_id, b"second and longer".to_vec(), 1024)
+            .await
+            .unwrap();
+
+        assert_ne!(first.sha256, second.sha256);
+        assert_eq!(second.bytes, 17);
+        let stored = store.get(&job_id).await.unwrap().expect("stored log");
+        assert_eq!(stored, b"second and longer");
+
+        let entries = store.list().await.unwrap();
+        assert_eq!(entries.len(), 1, "overwrite must not duplicate metadata");
+        assert_eq!(entries[0].size_bytes, 17);
+    }
+
+    #[tokio::test]
+    async fn test_file_delete_removes_both_log_and_metadata() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FileJobLogStore::new(temp_dir.path()).await.unwrap();
+        let job_id = JobId::new();
+        store.put(job_id, b"ephemeral".to_vec()).await.unwrap();
+        let logs_dir = temp_dir.path().join("job_logs");
+        assert!(logs_dir.join(format!("{}.log", job_id)).exists());
+        assert!(logs_dir.join(format!("{}.meta.json", job_id)).exists());
+
+        store.delete(&job_id).await.unwrap();
+
+        assert!(!logs_dir.join(format!("{}.log", job_id)).exists());
+        assert!(!logs_dir.join(format!("{}.meta.json", job_id)).exists());
+        assert!(store.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_file_list_skips_corrupt_metadata() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FileJobLogStore::new(temp_dir.path()).await.unwrap();
+        let good = JobId::new();
+        store.put(good, b"good".to_vec()).await.unwrap();
+        // A torn write or hand-edited file must not fail the listing.
+        std::fs::write(
+            temp_dir.path().join("job_logs").join("garbage.meta.json"),
+            "not json",
+        )
+        .unwrap();
+
+        let entries = store.list().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].job_id, good);
+    }
+
+    #[tokio::test]
+    async fn test_file_get_without_log_returns_none_even_with_metadata() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FileJobLogStore::new(temp_dir.path()).await.unwrap();
+        let job_id = JobId::new();
+        store.put(job_id, b"present".to_vec()).await.unwrap();
+        // Remove only the log, as a partial cleanup would.
+        std::fs::remove_file(
+            temp_dir
+                .path()
+                .join("job_logs")
+                .join(format!("{}.log", job_id)),
+        )
+        .unwrap();
+
+        assert!(store.get(&job_id).await.unwrap().is_none());
+        // The orphaned metadata still lists; deletion clears it.
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        store.delete(&job_id).await.unwrap();
+        assert!(store.list().await.unwrap().is_empty());
+    }
 }

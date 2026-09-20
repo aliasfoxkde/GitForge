@@ -83,6 +83,27 @@ cargo run -p git-server
 - SSH: 42022
 - HTTP: 42782
 
+**Git over SSH:** the server runs an in-process SSH transport (russh) that
+requires public-key authentication against a per-user key registry. On
+first boot it generates an ed25519 host key at `GITFORGE_SSH_HOST_KEY`
+(default `$HOME/.ssh/gitforge_host_ed25519`) and publishes the public half
+as `<path>.pub` for `known_hosts` pinning. In compose the key lives on the
+`ssh-data` volume, so it survives restarts.
+
+A client key must be registered to an account before it can connect
+(`POST /api/ssh-keys` with `name` and the OpenSSH `public_key` line; the
+transport matches the presented key's `SHA256:` fingerprint against the
+registry and rejects everything else). List your keys with
+`GET /api/ssh-keys` and remove one with `DELETE /api/ssh-keys/{id}`.
+
+```bash
+# Register a key, then clone over SSH after pinning the host key
+curl -X POST http://localhost:42780/api/ssh-keys \
+  -H "Authorization: Bearer $JWT" -H 'Content-Type: application/json' \
+  -d '{"name":"laptop","public_key":"ssh-ed25519 AAAA... you@host"}'
+git clone "ssh://gitforge@localhost:42022/<owner>/<repo>.git"
+```
+
 ### 3. CI Orchestrator (includes Scheduler)
 
 The CI orchestrator manages pipeline execution and job scheduling. The scheduler HTTP API runs within this service on port 42781.
@@ -127,10 +148,15 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 | `GITFORGE_HEARTBEAT_INTERVAL` | No | `30` | Heartbeat interval in seconds |
 | `GITFORGE_FETCH_INTERVAL` | No | `5` | Job-poll interval in seconds |
 | `GITFORGE_SCHEDULER_TOKEN` | No | _(none)_ | Bearer token for scheduler API authentication |
+| `GITFORGE_REGISTER_ATTEMPTS` | No | `6` | Registration attempts before giving up when the scheduler is unreachable |
+| `GITFORGE_REGISTER_BACKOFF_SECS` | No | `1` | Initial registration retry delay; doubles per attempt up to 30s |
 
 > **Startup behavior**: If `GITFORGE_SCHEDULER_URL` is missing or empty, the runner exits immediately
 > with a clear error message. Invalid values for numeric variables (non-integer) also cause a fast
-> failure. Safe defaults apply to all optional variables when they are unset.
+> failure. Safe defaults apply to all optional variables when they are unset. When the scheduler is
+> merely unreachable or answering 503, registration retries up to `GITFORGE_REGISTER_ATTEMPTS`
+> times with exponential backoff before the fail-closed exit; credential rejections (401/403) are
+> never retried.
 
 Runner names are durable identities. Set a distinct name for every concurrently
 running runner (for example, `remote-podman-runner-01`); leaving the default
@@ -140,6 +166,15 @@ authenticated runner-retirement operation after confirming that they own no
 active jobs.
 
 ## Docker Compose
+
+Before `docker compose up`, set the required deployment variables in `.env`
+(see `.env.example`):
+
+| Variable | Why it is required |
+|----------|--------------------|
+| `GITFORGE_SCHEDULER_TOKEN` | Shared scheduler/trigger credential; scheduler auth is fail-closed without it |
+| `DOCKER_GID` | Host group id of `/var/run/docker.sock` (`stat -c %g /var/run/docker.sock`) so the non-root runner can use the mounted socket |
+| `GITFORGE_WORKSPACE_HOST_DIR` | Host directory (create it first) where CI checks out run workspaces; bind-mounted at the same absolute path in ci and runner because the runner passes workspace paths to the host Docker daemon as bind sources |
 
 ```bash
 # Start all services
@@ -286,9 +321,20 @@ capacity = 4
 | `GITFORGE_RUNNER_CAPACITY` | runner | 2 | Max concurrent jobs |
 | `GITFORGE_HEARTBEAT_INTERVAL` | runner | 30 | Heartbeat interval in seconds |
 | `GITFORGE_FETCH_INTERVAL` | runner | 5 | Job-poll interval in seconds |
-| `GITFORGE_SCHEDULER_TOKEN` | runner | _(none)_ | Bearer token for scheduler API |
+| `GITFORGE_SCHEDULER_TOKEN` | runner | _(none)_ | Bearer token for scheduler API. Required in compose: the scheduler rejects runner/operator requests when unset |
+| `GITFORGE_RUNNER_STANDALONE` | runner | `deny` | `deny` exits the runner when scheduler registration fails; `allow` falls back to standalone execution |
+| `GITFORGE_REGISTER_ATTEMPTS` | runner | `6` | Registration attempts against an unreachable scheduler before giving up |
+| `GITFORGE_REGISTER_BACKOFF_SECS` | runner | `1` | Initial registration backoff; doubles per failed attempt up to a 30s cap. Auth rejections (401/403) are never retried |
 | `SSH_PORT` | git-server | 42022 | SSH port |
 | `HTTP_PORT` | git-server | 42782 | HTTP port |
+| `GITFORGE_SSH_HOST_KEY` | git-server | `$HOME/.ssh/gitforge_host_ed25519` | ed25519 host key path; generated on first boot, persisted on the `ssh-data` volume, published as `.pub` for `known_hosts` pinning |
+
+**SSH key registry:** git-over-SSH accepts only public keys registered to
+an account through `POST /api/ssh-keys` (JWT required). Authentication
+matches the presented key's OpenSSH fingerprint; unregistered keys are
+rejected and the connection fails with `Permission denied (publickey)`.
+If the registry is unreachable, connections are refused rather than
+allowed through.
 
 ## Logging
 

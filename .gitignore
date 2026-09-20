@@ -53,6 +53,7 @@ temp/logs/
 temp/data/
 *.log
 data/
+artifacts/
 
 # ─── Environment ───────────────────────────────────────────────────────────────
 .env
@@ -60,3 +61,9 @@ data/
 
 # NOTE: Cargo.lock is committed to support security audits and reproducible builds
 # across multiple developers and CI environments for this multi-platform binary.
+
+# ─── GitForge runtime state ──────────────────────────────────────────────────
+# Smoke tests and compose runs seed bare repositories and pipeline workspaces
+# relative to the repo root; they are runtime data, never source.
+repos/
+workspaces/

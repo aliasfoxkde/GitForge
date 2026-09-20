@@ -68,8 +68,11 @@ RUN useradd -m -u 1000 -s /bin/bash gitforge
 # Copy binary
 COPY --from=builder /app/target/release/api /app/api
 
-# Set ownership
-RUN chown -R gitforge:gitforge /app
+# Set ownership. Volume mountpoints must exist and belong to the service
+# user before a named volume is first mounted: Docker seeds a fresh volume
+# from the image directory, so a root-owned mountpoint makes /data and /git
+# read-only for the non-root gateway.
+RUN mkdir -p /data /git && chown -R gitforge:gitforge /app /data /git
 
 USER gitforge
 
@@ -89,10 +92,12 @@ FROM debian:bookworm-slim AS ci-prod
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies. git is required: the orchestrator reads the
+# committed .gitforce.yml and clones run workspaces by shelling out to git.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -101,8 +106,8 @@ RUN useradd -m -u 1000 -s /bin/bash gitforge
 # Copy binary
 COPY --from=builder /app/target/release/ci /app/ci
 
-# Set ownership
-RUN chown -R gitforge:gitforge /app
+# Set ownership (mountpoint ownership rationale: see api-prod stage)
+RUN mkdir -p /data && chown -R gitforge:gitforge /app /data
 
 USER gitforge
 
@@ -131,8 +136,8 @@ RUN useradd -m -u 1000 -s /bin/bash gitforge
 # Copy binary
 COPY --from=runner-builder /app/target/release/runner /app/runner
 
-# Set ownership
-RUN chown -R gitforge:gitforge /app
+# Set ownership (mountpoint ownership rationale: see api-prod stage)
+RUN mkdir -p /data && chown -R gitforge:gitforge /app /data
 
 USER gitforge
 
@@ -145,11 +150,12 @@ FROM debian:bookworm-slim AS git-server-prod
 
 WORKDIR /app
 
-# Install runtime dependencies and OpenSSH
+# Install runtime dependencies. Git over SSH is served in-process by the
+# binary (russh), so there is no sshd in the container; git is required to
+# serve upload-pack/receive-pack child processes.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
-    openssh-server \
     git \
     && rm -rf /var/lib/apt/lists/*
 
@@ -162,8 +168,8 @@ COPY --from=builder /app/target/release/git-server /app/git-server
 # Setup SSH directory
 RUN mkdir -p /home/gitforge/.ssh && chmod 700 /home/gitforge/.ssh
 
-# Set ownership
-RUN chown -R gitforge:gitforge /home/gitforge
+# Set ownership (mountpoint ownership rationale: see api-prod stage)
+RUN mkdir -p /data /git && chown -R gitforge:gitforge /home/gitforge /data /git
 
 USER gitforge
 

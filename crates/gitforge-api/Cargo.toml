@@ -28,6 +28,10 @@ async-trait = { workspace = true }
 jsonwebtoken = { workspace = true }
 bcrypt = { workspace = true }
 reqwest = { workspace = true }
+# OpenSSH public key parsing/fingerprinting for the per-user SSH key
+# registry. Exact pin matches the transport's (russh) so only one copy of
+# the crate exists in the tree.
+ssh-key = "=0.7.0-rc.11"
 
 # Prometheus metrics
 prometheus = "0.14"

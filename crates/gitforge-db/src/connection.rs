@@ -116,6 +116,26 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create repositories table: {}", e)))?;
 
+        // Create ssh_keys table. A key's fingerprint is globally unique:
+        // the same public key may never authenticate as two different
+        // accounts.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS ssh_keys (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL UNIQUE,
+                public_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create ssh_keys table: {}", e)))?;
+
         // Create pipelines table
         sqlx::query(
             r#"
@@ -126,6 +146,7 @@ impl Pool {
                 trigger_type TEXT NOT NULL,
                 config TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
                 FOREIGN KEY (repo_id) REFERENCES repositories(id)
             )
             "#,
@@ -133,6 +154,18 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create pipelines table: {}", e)))?;
+
+        // One active pipeline version per repository and name; superseded
+        // versions stay as history with active = 0.
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pipelines_active_repo_name
+            ON pipelines(repo_id, name) WHERE active = 1
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create pipelines active index: {}", e)))?;
 
         // Create pipeline_runs table
         sqlx::query(
