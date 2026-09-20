@@ -53,7 +53,7 @@ Baseline mechanics and limitations (verified against Aegis 0.6.1):
 ### `pii` (573 findings, 3 critical) — none real
 
 - `.github/ISSUE_TEMPLATE/pattern_submission.yml` — AWS's documented
-  example key IDs (`AKIAIOSFODNN7EXAMPLE`) inside the issue template used
+  AWS-style example key IDs inside the issue-template submission used
   to *submit* new scanner patterns; examples are the point of the file.
 - `crates/gitforge-api/src/metrics_middleware.rs:186` — a UUID-format test
   string matched by a Luhn-style card heuristic.
