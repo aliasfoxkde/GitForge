@@ -79,6 +79,7 @@ The following require a running integration environment:
 | gitforge-db/models | 90%+ | 95%+ |
 | gitforge-scheduler | 88%+ | 87%+ |
 | gitforge-process | 86%+ | 93%+ |
+| gitforge-review | 99.37% | diff parser, the ParsedDiff→FileChange AI bridge, and the security scanner fully exercised (2026-09-20) |
 | gitforge-ai | 90.16% | providers exercise their full HTTP boundary against a scripted server |
 
 ### Moderate Coverage (70-85%)

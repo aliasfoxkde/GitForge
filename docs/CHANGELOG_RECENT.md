@@ -67,6 +67,14 @@ All notable changes to GitForge will be documented in this file.
   delete removing both log and metadata, listing that skips corrupt
   metadata files, and get returning None when only metadata remains.
   job_logs.rs went from 62.84% to 92.94% lines
+- Code review crate tests: multi-file diff parsing with new, deleted,
+  and binary file markers, single-line hunk headers (`@@ -3 +3 @@`),
+  the ParsedDiff → FileChange bridge (change-type mapping and hunk-text
+  round trip), diff stats and complexity flags, every vulnerability
+  severity mapping, context-line scanning with deletion lines ignored,
+  extension-scoped patterns skipping extensionless files, and findings
+  aggregated across files. gitforge-review went from 83.87% to 99.37%
+  lines
 - Git over SSH protocol integration tests: real `ssh-keygen` client
   keypairs and host-key pinning; `push`, `clone`, `fetch`, and `ls-remote`
   over the `ssh://` transport, plus rejection of key-less clients,
