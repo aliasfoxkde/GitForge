@@ -192,6 +192,29 @@ scheduler and runner observe it safely.
 }
 ```
 
+#### Scheduler queue status
+
+```text
+GET /queue/status
+```
+
+The authenticated scheduler/runner boundary exposes read-only admission
+telemetry. `durable_pending` is the number of `pending` or `queued` database
+rows, `in_memory_queued` is the scheduler's current queue depth,
+`assigned_jobs` is the number of active assignments, and `online_runners` is
+the in-memory online-runner count. `durable_pending` is `null` for an
+in-memory scheduler without a database.
+
+```json
+{
+  "contract_version": "scheduler.queue.v1",
+  "durable_pending": 156,
+  "in_memory_queued": 156,
+  "assigned_jobs": 1,
+  "online_runners": 1
+}
+```
+
 #### Code Review Runs
 
 ```

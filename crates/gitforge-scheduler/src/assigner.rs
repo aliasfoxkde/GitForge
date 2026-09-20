@@ -977,6 +977,36 @@ impl Scheduler {
         state.queue.len()
     }
 
+    /// Return durable and in-memory queue counters for operator telemetry.
+    pub async fn queue_status(&self) -> anyhow::Result<QueueStatus> {
+        let (in_memory_queued, assigned_jobs, online_runners) = {
+            let state = self.state.read().await;
+            (
+                state.queue.len(),
+                state.assigned_jobs.len(),
+                state
+                    .runners
+                    .values()
+                    .filter(|runner| runner.status == "online")
+                    .count(),
+            )
+        };
+        let durable_pending = match &self.db_pool {
+            Some(pool) => Some(
+                gitforge_db::queries::JobQueries::list_pending(pool)
+                    .await?
+                    .len(),
+            ),
+            None => None,
+        };
+        Ok(QueueStatus {
+            durable_pending,
+            in_memory_queued,
+            assigned_jobs,
+            online_runners,
+        })
+    }
+
     /// Check if a job is assigned
     pub async fn is_assigned(&self, job_id: JobId) -> Option<RunnerId> {
         let state = self.state.read().await;
@@ -1215,6 +1245,15 @@ impl Scheduler {
         }
         Ok(())
     }
+}
+
+/// Read-only queue admission telemetry exposed by the scheduler API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueStatus {
+    pub durable_pending: Option<usize>,
+    pub in_memory_queued: usize,
+    pub assigned_jobs: usize,
+    pub online_runners: usize,
 }
 
 impl Default for Scheduler {

@@ -143,6 +143,7 @@ pub fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
         .route("/runners", post(register_runner))
         .route("/runners/{id}/heartbeat", post(runner_heartbeat))
         .route("/jobs/pending", get(get_pending_jobs))
+        .route("/queue/status", get(get_queue_status))
         .route("/jobs/{id}/claim", post(claim_job))
         .route("/jobs/{id}/started", post(start_job))
         .route("/jobs/{id}/logs", post(append_job_log))
@@ -529,6 +530,29 @@ async fn get_pending_jobs(
     }
 
     Json(serde_json::json!(job_infos))
+}
+
+/// Return durable and in-memory queue counters for admission and operations.
+async fn get_queue_status(State(state): State<SchedulerServerState>) -> impl IntoResponse {
+    match state.scheduler.queue_status().await {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "contract_version": "scheduler.queue.v1",
+                "durable_pending": status.durable_pending,
+                "in_memory_queued": status.in_memory_queued,
+                "assigned_jobs": status.assigned_jobs,
+                "online_runners": status.online_runners,
+            })),
+        ),
+        Err(error) => {
+            tracing::error!(%error, "failed to read scheduler queue status");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "queue_status_unavailable"})),
+            )
+        }
+    }
 }
 
 /// Claim an already scheduler-assigned job with a runner lease.
@@ -1020,6 +1044,23 @@ mod tests {
 
         let resp = response.into_response();
         assert_status(resp, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_queue_status_handler_reports_empty_in_memory_state() {
+        let state = create_state(crate::Scheduler::new());
+        let response = get_queue_status(axum::extract::State(state)).await;
+        let response = response.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["contract_version"], "scheduler.queue.v1");
+        assert_eq!(payload["durable_pending"], serde_json::Value::Null);
+        assert_eq!(payload["in_memory_queued"], 0);
+        assert_eq!(payload["assigned_jobs"], 0);
+        assert_eq!(payload["online_runners"], 0);
     }
 
     #[tokio::test]
