@@ -862,4 +862,27 @@ mod tests {
         let _root = get_git_root();
         std::env::remove_var("GIT_ROOT");
     }
+
+    #[test]
+    fn test_max_git_body_bytes_default_is_512mib() {
+        let _guard = git_root_env_lock().lock().unwrap();
+        std::env::remove_var("GITFORGE_MAX_GIT_BODY_BYTES");
+        assert_eq!(max_git_body_bytes(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_max_git_body_bytes_env_override() {
+        let _guard = git_root_env_lock().lock().unwrap();
+        std::env::set_var("GITFORGE_MAX_GIT_BODY_BYTES", "4096");
+        assert_eq!(max_git_body_bytes(), 4096);
+        std::env::remove_var("GITFORGE_MAX_GIT_BODY_BYTES");
+    }
+
+    #[test]
+    fn test_max_git_body_bytes_invalid_value_falls_back_to_default() {
+        let _guard = git_root_env_lock().lock().unwrap();
+        std::env::set_var("GITFORGE_MAX_GIT_BODY_BYTES", "not-a-number");
+        assert_eq!(max_git_body_bytes(), 512 * 1024 * 1024);
+        std::env::remove_var("GITFORGE_MAX_GIT_BODY_BYTES");
+    }
 }

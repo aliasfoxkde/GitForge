@@ -94,6 +94,17 @@ All notable changes to GitForge will be documented in this file.
   stay bounded when a 3-byte character straddles the byte limit.
   agent.rs went from 75.55% to 86.72% lines (the remainder is the
   Docker-gated execution path)
+- Git-server edge-path and CI-outbox tests: a spawned-binary suite
+  drives the Smart HTTP handler branches real `git` never produces —
+  legacy and path-suffixed routes, unknown and storage-less
+  repositories (404), a database-less instance returning 503 on every
+  git route while `/health` keeps serving, oversized bodies rejected
+  as 413/400 under `GITFORGE_MAX_GIT_BODY_BYTES`, malformed packs as
+  500s — plus the durable push → `events` outbox → CI trigger
+  delivery: bearer-token and ref/hash payload assertions, lease
+  reclaim of a stale `delivering` row, and requeue-on-failure with
+  attempt counters when the trigger endpoint fails. services/git-server
+  main.rs went from 67.83% to 91.77% lines
 - Git over SSH protocol integration tests: real `ssh-keygen` client
   keypairs and host-key pinning; `push`, `clone`, `fetch`, and `ls-remote`
   over the `ssh://` transport, plus rejection of key-less clients,
