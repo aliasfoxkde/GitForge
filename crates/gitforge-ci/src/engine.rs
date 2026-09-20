@@ -107,6 +107,12 @@ impl CiEngine {
         self.state.read().await.clone()
     }
 
+    /// Return the immutable definition that produced a job ID. The scheduler
+    /// uses this to carry exact pipeline steps to the runner.
+    pub fn job_definition(&self, job_id: JobId) -> Option<crate::pipeline::JobDefinition> {
+        self.graph.get(job_id).map(|node| node.definition.clone())
+    }
+
     /// Start the pipeline run
     pub async fn start(&self) -> Result<()> {
         let mut state = self.state.write().await;

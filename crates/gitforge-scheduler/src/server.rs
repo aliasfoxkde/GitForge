@@ -2,7 +2,7 @@
 
 use crate::Scheduler;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -37,6 +37,11 @@ pub struct PendingJobInfo {
     pub pipeline_run_id: String,
     pub commands: Vec<String>,
     pub working_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingJobsQuery {
+    runner_id: Option<String>,
 }
 
 /// Create scheduler server state
@@ -118,23 +123,38 @@ async fn runner_heartbeat(
 }
 
 /// Get pending jobs for a runner
-async fn get_pending_jobs(State(state): State<SchedulerServerState>) -> impl IntoResponse {
+async fn get_pending_jobs(
+    State(state): State<SchedulerServerState>,
+    Query(query): Query<PendingJobsQuery>,
+) -> impl IntoResponse {
     // Process queue to assign pending jobs
     state.scheduler.process_queue().await;
 
     // Get jobs assigned to runners (these are pending execution)
-    let assigned_jobs = state.scheduler.get_assigned_jobs().await;
+    let assigned_jobs = state.scheduler.get_assigned_job_details().await;
+    let requested_runner = query
+        .runner_id
+        .as_deref()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .map(RunnerId::from);
 
     // Convert to response format
     let job_infos: Vec<PendingJobInfo> = assigned_jobs
         .into_iter()
-        .map(|(job_id, _runner_id, pipeline_run_id)| PendingJobInfo {
-            job_id: job_id.to_string(),
-            name: format!("job-{}", job_id),
-            pipeline_run_id: pipeline_run_id.to_string(),
-            commands: vec!["echo 'job assigned'".to_string()], // Placeholder - real impl would query DB
-            working_dir: None,
+        .filter(|(_, runner_id, _, _)| {
+            requested_runner
+                .map(|requested| requested == *runner_id)
+                .unwrap_or(false)
         })
+        .map(
+            |(job_id, _runner_id, pipeline_run_id, definition)| PendingJobInfo {
+                job_id: job_id.to_string(),
+                name: format!("job-{}", job_id),
+                pipeline_run_id: pipeline_run_id.to_string(),
+                commands: definition.commands,
+                working_dir: definition.working_dir,
+            },
+        )
         .collect();
 
     Json(serde_json::json!(job_infos))
@@ -179,7 +199,7 @@ async fn assign_job(
 
 /// Complete a job
 async fn complete_job(
-    State(_state): State<SchedulerServerState>,
+    State(state): State<SchedulerServerState>,
     Path(job_id): Path<String>,
     Json(request): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -207,20 +227,24 @@ async fn complete_job(
         exit_code
     );
 
-    // Log step results if present
-    if let Some(step_results) = request["step_results"].as_array() {
-        tracing::debug!("job {} had {} steps", job_id, step_results.len());
-        for (i, step) in step_results.iter().enumerate() {
-            let step_exit = step["exit_code"].as_i64().unwrap_or(-1);
-            tracing::debug!("  step {}: exit_code={}", i, step_exit);
-        }
-    }
+    let receipt = serde_json::json!({
+        "job_id": job_id.to_string(),
+        "success": success,
+        "exit_code": exit_code,
+        "error": error,
+        "step_results": request["step_results"].clone(),
+    })
+    .to_string();
 
-    // Log error if present
-    if let Some(err) = error {
-        if !err.is_empty() {
-            tracing::error!("job {} error: {}", job_id, err);
-        }
+    if let Err(error) = state.scheduler.complete_job(job_id, success, receipt).await {
+        tracing::error!("failed to persist job {} completion: {}", job_id, error);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "completion_persistence_failed",
+                "message": error.to_string(),
+            })),
+        );
     }
 
     (
@@ -312,7 +336,11 @@ mod tests {
         let scheduler = crate::Scheduler::new();
         let state = create_state(scheduler);
 
-        let response = get_pending_jobs(axum::extract::State(state)).await;
+        let response = get_pending_jobs(
+            axum::extract::State(state),
+            axum::extract::Query(PendingJobsQuery { runner_id: None }),
+        )
+        .await;
 
         let resp = response.into_response();
         assert_status(resp, StatusCode::OK);

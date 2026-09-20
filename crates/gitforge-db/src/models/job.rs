@@ -67,6 +67,12 @@ pub struct Job {
     pub finished_at: Option<DateTime<Utc>>,
     pub retry_count: i32,
     pub created_at: DateTime<Utc>,
+    /// Commands are persisted with the job so runners never need a
+    /// placeholder or independently reconstructed definition.
+    pub commands: Vec<String>,
+    pub working_dir: Option<String>,
+    /// JSON-encoded bounded execution receipt, when the job is terminal.
+    pub result_json: Option<String>,
 }
 
 impl Job {
@@ -82,6 +88,9 @@ impl Job {
             finished_at: None,
             retry_count: 0,
             created_at: Utc::now(),
+            commands: Vec::new(),
+            working_dir: None,
+            result_json: None,
         }
     }
 

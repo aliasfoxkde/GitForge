@@ -41,8 +41,18 @@ async fn main() -> anyhow::Result<()> {
     // Initialize event bus
     let event_bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
 
-    // Initialize scheduler
-    let scheduler = Scheduler::new();
+    // Initialize scheduler. Production deployments provide a database URL so
+    // job definitions and completion receipts survive service restarts;
+    // development keeps the in-memory fallback explicit and usable.
+    let scheduler = if let Ok(database_url) = std::env::var("GITFORGE_DATABASE_URL") {
+        let pool = gitforge_db::Pool::new(&database_url).await?;
+        pool.migrate().await?;
+        tracing::info!(database_url = %database_url, "using durable GitForge scheduler database");
+        Scheduler::with_db(pool)
+    } else {
+        tracing::warn!("GITFORGE_DATABASE_URL is unset; scheduler state is in-memory only");
+        Scheduler::new()
+    };
 
     // Start scheduler HTTP API server on port 42781
     let scheduler_port: u16 = std::env::var("SCHEDULER_PORT")
@@ -252,7 +262,21 @@ async fn handle_push_event(
     let state = engine.state().await;
     for job_id in ready_jobs {
         if let Some(_job_state) = state.jobs.get(&job_id) {
-            scheduler.enqueue(job_id, state.run_id, repo_id).await;
+            let definition = engine
+                .job_definition(job_id)
+                .ok_or_else(|| anyhow::anyhow!("missing definition for job {}", job_id))?;
+            let commands = definition
+                .steps
+                .iter()
+                .map(|step| step.run.clone())
+                .collect();
+            let working_dir = definition
+                .steps
+                .iter()
+                .find_map(|step| step.working_directory.clone());
+            scheduler
+                .enqueue_with_definition(job_id, state.run_id, repo_id, commands, working_dir)
+                .await;
             tracing::debug!("enqueued job {} for pipeline run {}", job_id, state.run_id);
         }
     }

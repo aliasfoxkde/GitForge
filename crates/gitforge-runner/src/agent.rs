@@ -168,6 +168,7 @@ impl RunnerAgent {
         let fetch_interval = self.config.fetch_interval_secs;
         let fetch_client = self.client.clone();
         let fetch_url = self.config.scheduler_url.clone();
+        let fetch_runner_id = runner_id;
         let is_running = self.is_running.clone();
         let executor = self.executor.clone();
         tokio::spawn(async move {
@@ -180,7 +181,7 @@ impl RunnerAgent {
                 }
                 tracing::debug!("runner checking for jobs...");
 
-                let jobs_url = format!("{}/jobs/pending", fetch_url);
+                let jobs_url = format!("{}/jobs/pending?runner_id={}", fetch_url, fetch_runner_id);
                 match fetch_client.get(&jobs_url).send().await {
                     Ok(response) => {
                         if response.status().is_success() {
