@@ -15,8 +15,8 @@ Repository state after audit:
 - **Dependency vetting**: cargo-vet initialized (`supply-chain/`); `make
   lint` no longer fails on a missing `cargo vet`
 - **Race Detection**: Fixed storage durability issue with `sync_all()` calls
-- **Coverage**: 86.18% lines / 87.22% regions (`cargo llvm-cov --all`,
-  2026-09-20; CI floor: 79.9%)
+- **Coverage**: 86.22% lines / 87.06% regions (`cargo llvm-cov --all`,
+  2026-09-20, after the main-reconciliation merge; CI floor: 79.9%)
 - **Aegis**: Integrated into CI (already present in security.yml)
 - **E2E**: Template framework exists in template-parts; GitForge has no web frontend
 
@@ -85,7 +85,7 @@ The following require a running integration environment:
 ### Moderate Coverage (70-85%)
 | Crate | Lines | Issue |
 |-------|-------|-------|
-| gitforge-api | ~80% | API routes need error path tests |
+| gitforge-api | ~80% | route handlers are the next gap: routes/ci.rs 62.42%, routes/webhook.rs 54.91%, routes/runners.rs 61.54% lines (2026-09-20) |
 | gitforge-cli | ~81% | CLI integration tests |
 | gitforge-build | 80.62% | daemon.rs went from 19.78% to 77.92% lines once its unix-socket protocol loop was tested over real socket pairs (2026-09-09) |
 
@@ -108,8 +108,11 @@ signal/pool layer, and the runner's scheduler boundary lifted the
 workspace to 86.18% lines / 87.22% regions (from 84.80% / 85.86%).
 gitforge-storage/job_logs.rs — the largest file-level gap outside the
 Docker-gated executor at the start of the day — rose to 92.94% lines.
-The largest remaining file-level gap outside the executor is now
-services/git-server/main.rs at 69.43% lines.)
+The largest remaining file-level gap outside the executor was then
+services/git-server/main.rs at 69.43% lines. 2026-09-20 (post-merge
+re-baseline): the reconciliation merge folded the reconciler/dependency
+work into the denominator and a new git-server suite lifted main.rs to
+91.77% lines; the workspace stands at 86.22% lines / 87.06% regions.)
 
 ## Remaining Gaps and Next Steps (2026-09-08)
 
@@ -268,6 +271,27 @@ Ordered by value; each item states the concrete blocker.
    and completion receipts stay bounded across multibyte text. What
    remains dark in agent.rs is the `execute_job` happy path, which is
    Docker-gated like the executor.
+
+2. **Git-server HTTP edge paths and the CI-trigger outbox** — done.
+   A new spawned-binary suite (`services/git-server/tests/
+   git_http_edges.rs`) complements the protocol suite by driving the
+   handler branches real `git` never produces: legacy and
+   path-suffixed routes, both info/refs advertisements, unknown and
+   storage-less repository rows (404), a database-less instance
+   degrading every git route to 503 while /health keeps serving,
+   oversized bodies rejected explicitly (413 receive-pack / 400
+   upload-pack under `GITFORGE_MAX_GIT_BODY_BYTES`), malformed pack
+   bodies surfacing as 500s, and the full push → `events` outbox →
+   CI trigger pipeline against a scripted axum receiver — asserting
+   the bearer token and ref/hash payload, lease reclaim of a stale
+   `delivering` row left by a crashed predecessor, and
+   requeue-on-failure with an incremented attempt counter after a 500
+   from the trigger endpoint (the push itself still succeeds). A
+   lesson worth keeping: the scripted receiver must be a real HTTP
+   stack — a hand-rolled byte-loop parser stalled the server's
+   reqwest call and hung the push. services/git-server main.rs went
+   from 67.83% (69.43% lines at the ledger's last note) to 91.77%
+   lines / 90.94% regions; the crate totals 89.46% lines.
 
 ## Resolved from the Compose Smoke (2026-09-08)
 

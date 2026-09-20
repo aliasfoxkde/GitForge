@@ -1,7 +1,49 @@
 //! Helpers shared by the git-server protocol test suites.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Run a real `git` command and panic with its stderr on failure.
+///
+/// Not every suite in this directory uses every helper; the shared
+/// module is compiled per test binary, so unused ones are expected.
+#[allow(dead_code)]
+pub fn run_git(
+    args: &[&str],
+    cwd: &std::path::Path,
+    envs: &[(&str, &str)],
+) -> std::process::Output {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::null());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().expect("spawn git");
+    if !output.status.success() {
+        panic!(
+            "git {} failed ({}): {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    output
+}
+
+/// Bind an ephemeral TCP port and return it.
+#[allow(dead_code)]
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
 
 /// Terminate a spawned git-server with SIGTERM and wait for it to exit.
 ///
