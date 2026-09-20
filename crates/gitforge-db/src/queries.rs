@@ -931,9 +931,14 @@ impl JobQueries {
     }
 
     /// Requeue an assigned job and clear its runner fencing token.
+    ///
+    /// A scheduler may have already persisted `queued` while retaining a
+    /// stale runner assignment (for example, after a runner-loss recovery
+    /// race). Treat that state as requeueable too; leaving `runner_id` set
+    /// prevents the next scheduler tick from assigning the job elsewhere.
     pub async fn requeue(pool: &Pool, id: JobId) -> Result<()> {
         sqlx::query(
-            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE id = ? AND status IN ('assigned', 'running')",
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE id = ? AND status IN ('pending', 'queued', 'assigned', 'running') AND runner_id IS NOT NULL",
         )
         .bind(id.to_string())
         .execute(pool.pool())
@@ -1256,6 +1261,12 @@ impl JobQueries {
             .begin()
             .await
             .map_err(|e| Error::database(format!("failed to begin recovery: {}", e)))?;
+        let queued_with_runner = sqlx::query(
+            "UPDATE jobs SET runner_id = NULL, started_at = NULL, lease_token = NULL WHERE status = 'queued' AND runner_id IS NOT NULL",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to clear queued runner assignments: {}", e)))?;
         let assigned = sqlx::query(
             "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE status = 'assigned'",
         )
@@ -1274,7 +1285,7 @@ impl JobQueries {
             .commit()
             .await
             .map_err(|e| Error::database(format!("failed to commit recovery: {}", e)))?;
-        Ok(assigned.rows_affected() + running.rows_affected())
+        Ok(queued_with_runner.rows_affected() + assigned.rows_affected() + running.rows_affected())
     }
 
     /// Mark running jobs whose persisted deadline has elapsed as timed out.
@@ -2738,6 +2749,24 @@ mod tests {
         JobQueries::create(&pool, &job).await.unwrap();
         JobQueries::start(&pool, job.id).await.unwrap();
 
+        // A runner-loss race can leave a durable row queued while retaining
+        // the offline runner identity. Requeue must clear that identity too,
+        // otherwise the replacement runner cannot claim the job.
+        let stale_runner_id = RunnerId::new();
+        let mut stale_runner = crate::models::Runner::new(
+            "stale-requeue-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        stale_runner.id = stale_runner_id;
+        RunnerQueries::create(&pool, &stale_runner).await.unwrap();
+        JobQueries::assign(&pool, job.id, stale_runner_id)
+            .await
+            .unwrap();
+        JobQueries::update_status(&pool, job.id, "queued")
+            .await
+            .unwrap();
+
         // Runner-loss recovery must clear an already-running lease, not only
         // jobs that were assigned but had not started execution yet.
         JobQueries::requeue(&pool, job.id).await.unwrap();
@@ -2747,7 +2776,16 @@ mod tests {
 
         JobQueries::start(&pool, job.id).await.unwrap();
 
-        assert_eq!(JobQueries::requeue_inflight(&pool).await.unwrap(), 1);
+        let queued_job = crate::models::Job::new(run.id, "queued-stale".to_string());
+        JobQueries::create(&pool, &queued_job).await.unwrap();
+        JobQueries::assign(&pool, queued_job.id, stale_runner_id)
+            .await
+            .unwrap();
+        JobQueries::update_status(&pool, queued_job.id, "queued")
+            .await
+            .unwrap();
+
+        assert_eq!(JobQueries::requeue_inflight(&pool).await.unwrap(), 2);
         let recovered = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
         assert_eq!(recovered.status, "failed");
         assert!(recovered.runner_id.is_none());
@@ -2756,6 +2794,9 @@ mod tests {
             .result_json
             .as_deref()
             .is_some_and(|receipt| receipt.contains("scheduler_restart_fenced_running_job")));
+        let queued_recovered = JobQueries::get(&pool, queued_job.id).await.unwrap().unwrap();
+        assert_eq!(queued_recovered.status, "queued");
+        assert!(queued_recovered.runner_id.is_none());
     }
 
     #[tokio::test]
