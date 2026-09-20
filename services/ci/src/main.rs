@@ -949,8 +949,13 @@ const RECONCILE_INTERVAL_SECS: u64 = 60;
 /// Grace window for the periodic reconciliation. The push handler creates
 /// the durable run row before it prepares the workspace, registers the
 /// engine, and enqueues jobs, so a freshly created jobless run is not
-/// orphaned yet and must not be cancelled by a concurrent pass.
-const RECONCILE_MIN_RUN_AGE_SECS: i64 = 120;
+/// orphaned yet and must not be cancelled by a concurrent pass. The window
+/// must exceed the slowest legitimate `prepare_run_workspace` — a
+/// `git clone --no-local` of a multi-gigabyte repository takes minutes —
+/// otherwise the pass cancels a run whose trigger is mid-clone and the
+/// workspace sweep then deletes the clone out from under the jobs the push
+/// handler enqueues seconds later.
+const RECONCILE_MIN_RUN_AGE_SECS: i64 = 600;
 
 /// Finalize non-terminal runs whose jobs are all terminal. `live_run_ids`
 /// and `min_age` guard the periodic pass against racing the push handler:
