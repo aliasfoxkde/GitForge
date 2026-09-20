@@ -249,6 +249,25 @@ Ordered by value; each item states the concrete blocker.
    and the remaining dark lines are the `main()` supervision path already
    exercised by the compose smoke.
 
+## Resolved from the Remaining-Gaps Ledger (2026-09-20)
+
+1. **Coverage campaign, non-Docker surfaces** — done across four crates.
+   gitforge-storage/job_logs.rs 62.84% → 92.94% lines (`bounded_put`
+   receipts, truncation boundary, on-disk metadata handling);
+   gitforge-review 83.87% → 99.37% (multi-file diff parsing, the
+   ParsedDiff→FileChange AI bridge, the full vulnerability severity
+   table, extension filters); gitforge-process 86.11% → 93.02%
+   (shutdown handler proven by delivering a real SIGTERM to the test
+   process; pool spawn lifecycle over real children); and
+   gitforge-runner/agent.rs 75.55% → 86.72% lines, where a
+   request-recording HTTP harness now drives the scheduler boundary:
+   claim succeeds/fails closed, live log chunks are labelled and
+   flagged on rejection, final step output streams in UTF-8-safe
+   chunks, artifact uploads verify checksums and refuse path escapes,
+   and completion receipts stay bounded across multibyte text. What
+   remains dark in agent.rs is the `execute_job` happy path, which is
+   Docker-gated like the executor.
+
 ## Resolved from the Compose Smoke (2026-09-08)
 
 1. **Periodic orphaned-run reconciliation** — done. `reconcile_orphaned_runs`

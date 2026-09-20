@@ -83,6 +83,17 @@ All notable changes to GitForge will be documented in this file.
   reaped by the timeout arm against a hung `sleep`, and rejecting an
   unknown program without a ghost tracking entry. gitforge-process
   went from 86.11% to 93.02% lines; signal.rs reached 100%
+- Runner scheduler-boundary tests: a request-recording HTTP harness
+  drives the runner's reporting pipeline without Docker — job claims
+  yield lease tokens or fail closed on rejection, malformed payloads,
+  and unreachable schedulers; live log chunks carry `[stdout]`/
+  `[stderr]` labels and split multibyte payloads at UTF-8 boundaries;
+  final step output streams in bounded chunks per step; artifact
+  uploads assert runner/lease/checksum headers, refuse checksum drift
+  and path escapes, and no-op without a workspace; completion receipts
+  stay bounded when a 3-byte character straddles the byte limit.
+  agent.rs went from 75.55% to 86.72% lines (the remainder is the
+  Docker-gated execution path)
 - Git over SSH protocol integration tests: real `ssh-keygen` client
   keypairs and host-key pinning; `push`, `clone`, `fetch`, and `ls-remote`
   over the `ssh://` transport, plus rejection of key-less clients,

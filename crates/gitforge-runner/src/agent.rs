@@ -2358,4 +2358,432 @@ mod tests {
         let result = agent.run().await;
         assert!(result.is_err());
     }
+
+    // ── Scheduler HTTP boundary: claim, live logs, chunked logs, artifacts ──
+
+    use std::sync::Mutex as StdMutex;
+
+    /// One captured HTTP request: head plus body.
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl RecordedRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    type Responder = Arc<dyn Fn(&RecordedRequest) -> (u16, serde_json::Value) + Send + Sync>;
+
+    /// Parse a captured request body as JSON — the runner posts JSON, so the
+    /// recorded text has escaped newlines and only the parsed value shows the
+    /// real chunk content.
+    fn json_body(request: &RecordedRequest) -> serde_json::Value {
+        serde_json::from_str(&request.body).expect("captured body is valid JSON")
+    }
+
+    /// Serve scripted JSON responses while recording every request, so the
+    /// tests can assert both what the runner sent and how it reacted.
+    async fn spawn_recorder(
+        responder: impl Fn(&RecordedRequest) -> (u16, serde_json::Value) + Send + Sync + 'static,
+    ) -> (String, Arc<StdMutex<Vec<RecordedRequest>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let addr = listener.local_addr().expect("local addr");
+        let requests: Arc<StdMutex<Vec<RecordedRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured = requests.clone();
+        let responder: Responder = Arc::new(responder);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let responder = responder.clone();
+                let captured = captured.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+                    let mut reader = tokio::io::BufReader::new(&mut socket);
+                    let mut method = String::new();
+                    let mut path = String::new();
+                    let mut headers = Vec::new();
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let trimmed = line.trim_end().to_string();
+                        if trimmed.is_empty() {
+                            break;
+                        }
+                        if method.is_empty() {
+                            let mut parts = trimmed.split_whitespace();
+                            method = parts.next().unwrap_or("").to_string();
+                            path = parts.next().unwrap_or("").to_string();
+                        } else if let Some((name, value)) = trimmed.split_once(':') {
+                            let name = name.trim();
+                            let value = value.trim();
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.parse().unwrap_or(0);
+                            }
+                            headers.push((name.to_string(), value.to_string()));
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 {
+                        reader.read_exact(&mut body).await.ok();
+                    }
+                    drop(reader);
+                    let recorded = RecordedRequest {
+                        method,
+                        path,
+                        headers,
+                        body: String::from_utf8_lossy(&body).into_owned(),
+                    };
+                    let (status, payload) = responder(&recorded);
+                    captured.lock().unwrap().push(recorded);
+                    let body_text = payload.to_string();
+                    let reason = if status < 400 { "OK" } else { "Rejected" };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\n\
+                         content-type: application/json\r\n\
+                         content-length: {}\r\n\
+                         connection: close\r\n\
+                         \r\n{body_text}",
+                        body_text.len(),
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    fn test_protocol<'a>(client: &'a Client, url: &'a str, job_id: &'a str) -> RunnerProtocol<'a> {
+        RunnerProtocol {
+            client,
+            scheduler_url: url,
+            job_id,
+            runner_id: RunnerId::new(),
+            lease_token: "lease-1",
+            scheduler_token: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_claim_job_returns_lease_token() {
+        let (url, requests) =
+            spawn_recorder(|_req| (200, serde_json::json!({"lease_token": "lease-abc"}))).await;
+        let client = Client::new();
+        let runner_id = RunnerId::new();
+
+        let lease = RunnerAgent::claim_job(&client, &url, "job-1", runner_id, None)
+            .await
+            .expect("a successful claim yields its lease token");
+        assert_eq!(lease, "lease-abc");
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].method, "POST");
+        assert_eq!(recorded[0].path, "/jobs/job-1/claim");
+        assert!(recorded[0].body.contains("runner_id"));
+    }
+
+    #[tokio::test]
+    async fn test_claim_job_fails_closed_on_rejection_or_garbage() {
+        let (rejecting, _) =
+            spawn_recorder(|_req| (409, serde_json::json!({"error": "busy"}))).await;
+        let (garbage, _) = spawn_recorder(|_req| (200, serde_json::json!({"nope": true}))).await;
+        let client = Client::new();
+        let runner_id = RunnerId::new();
+
+        assert!(
+            RunnerAgent::claim_job(&client, &rejecting, "job-1", runner_id, None)
+                .await
+                .is_none(),
+            "a rejected claim yields no lease"
+        );
+        assert!(
+            RunnerAgent::claim_job(&client, &garbage, "job-1", runner_id, None)
+                .await
+                .is_none(),
+            "a claim response without a lease token yields none"
+        );
+        assert!(
+            RunnerAgent::claim_job(&client, "http://localhost:99999", "job-1", runner_id, None)
+                .await
+                .is_none(),
+            "an unreachable scheduler yields no lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_log_sink_labels_and_counts_deliveries() {
+        let (url, requests) = spawn_recorder(|_req| (200, serde_json::json!({"ok": true}))).await;
+        let client = Client::new();
+        let sink = LiveLogSink::new(&client, &url, "job-9", RunnerId::new(), "lease-1", None);
+
+        sink.on_output(OutputStream::Stdout, b"hello live".to_vec())
+            .await
+            .expect("live stdout delivery succeeds");
+        sink.on_output(OutputStream::Stderr, b"warn line".to_vec())
+            .await
+            .expect("live stderr delivery succeeds");
+
+        assert!(sink.sent_any());
+        assert!(!sink.failed());
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].path, "/jobs/job-9/logs");
+        assert_eq!(json_body(&recorded[0])["chunk"], "[stdout]\nhello live");
+        assert_eq!(json_body(&recorded[1])["chunk"], "[stderr]\nwarn line");
+        assert_eq!(recorded[0].header("authorization"), None);
+    }
+
+    #[tokio::test]
+    async fn test_live_log_sink_flags_rejected_delivery() {
+        let (url, requests) =
+            spawn_recorder(|_req| (409, serde_json::json!({"error": "no lease"}))).await;
+        let client = Client::new();
+        let sink = LiveLogSink::new(&client, &url, "job-9", RunnerId::new(), "stale", None);
+
+        sink.on_output(OutputStream::Stdout, b"doomed".to_vec())
+            .await
+            .expect("on_output reports delivery trouble via failed(), not Err");
+
+        assert!(!sink.sent_any());
+        assert!(
+            sink.failed(),
+            "a rejected chunk must degrade to the fallback upload"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_live_log_sink_splits_multibyte_payloads() {
+        let (url, requests) = spawn_recorder(|_req| (200, serde_json::json!({"ok": true}))).await;
+        let client = Client::new();
+        let sink = LiveLogSink::new(&client, &url, "job-9", RunnerId::new(), "lease-1", None);
+
+        // ~120KB of two-byte characters forces the 60KB chunking path.
+        let payload = "é".repeat(60_000);
+        sink.on_output(OutputStream::Stdout, payload.as_bytes().to_vec())
+            .await
+            .expect("large payload delivery succeeds");
+
+        let recorded = requests.lock().unwrap();
+        assert!(recorded.len() >= 2, "payload must be split");
+        let mut rejoined = String::new();
+        for request in recorded.iter() {
+            let parsed = json_body(request);
+            let chunk = parsed["chunk"].as_str().expect("chunk string");
+            let marker = "[stdout]\n";
+            let start = chunk.find(marker).expect("labelled chunk") + marker.len();
+            rejoined.push_str(&chunk[start..]);
+        }
+        assert_eq!(rejoined, payload, "chunks reassemble losslessly");
+    }
+
+    #[tokio::test]
+    async fn test_report_log_chunks_stream_step_output() {
+        let (url, requests) = spawn_recorder(|_req| (200, serde_json::json!({"ok": true}))).await;
+        let client = Client::new();
+        let protocol = test_protocol(&client, &url, "job-7");
+        let steps = vec![
+            StepResult {
+                exit_code: 0,
+                stdout: "hello".to_string(),
+                stderr: String::new(),
+            },
+            StepResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "boom".to_string(),
+            },
+        ];
+
+        report_log_chunks(&protocol, &steps)
+            .await
+            .expect("streaming accepted output succeeds");
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "one chunk per non-empty step output");
+        let first_parsed = json_body(&recorded[0]);
+        let second_parsed = json_body(&recorded[1]);
+        let first = first_parsed["chunk"].as_str().unwrap();
+        let second = second_parsed["chunk"].as_str().unwrap();
+        assert!(first.contains("[step 0 stdout]\nhello"));
+        assert!(
+            !first.contains("stderr"),
+            "empty stderr is omitted, not emitted as an empty section"
+        );
+        assert!(second.contains("[step 1 stderr]\nboom"));
+        assert_eq!(recorded[0].path, "/jobs/job-7/logs");
+    }
+
+    #[tokio::test]
+    async fn test_report_log_chunks_fail_on_rejection() {
+        let (url, _) = spawn_recorder(|_req| (500, serde_json::json!({"error": "down"}))).await;
+        let client = Client::new();
+        let protocol = test_protocol(&client, &url, "job-7");
+        let steps = vec![StepResult {
+            exit_code: 0,
+            stdout: "hello".to_string(),
+            stderr: String::new(),
+        }];
+
+        let error = report_log_chunks(&protocol, &steps)
+            .await
+            .expect_err("a rejected append must surface");
+        assert!(error.to_string().contains("rejected log append"));
+    }
+
+    #[tokio::test]
+    async fn test_report_artifacts_upload_matches_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts_dir = temp.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        std::fs::write(artifacts_dir.join("report.txt"), b"artifact-bytes").unwrap();
+
+        let (url, requests) =
+            spawn_recorder(|_req| (200, serde_json::json!({"stored": true}))).await;
+        let client = Client::new();
+        let protocol = test_protocol(&client, &url, "job-5");
+        let receipt = ArtifactReceipt {
+            name: "report.txt".to_string(),
+            uri: "gitforge://artifact/report".to_string(),
+            sha256: sha256_hex(b"artifact-bytes"),
+            bytes: 14,
+            media_type: Some("text/plain".to_string()),
+        };
+
+        let uploaded = report_artifacts(&protocol, Some(temp.path().to_str().unwrap()), &[receipt])
+            .await
+            .expect("artifact upload succeeds");
+        assert_eq!(uploaded, vec![serde_json::json!({"stored": true})]);
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].path, "/jobs/job-5/artifacts");
+        assert_eq!(recorded[0].header("x-artifact-name"), Some("report.txt"));
+        assert_eq!(
+            recorded[0].header("x-artifact-sha256"),
+            Some(sha256_hex(b"artifact-bytes").as_str())
+        );
+        assert_eq!(recorded[0].header("x-lease-token"), Some("lease-1"));
+        assert_eq!(recorded[0].body, "artifact-bytes");
+    }
+
+    #[tokio::test]
+    async fn test_report_artifacts_rejects_checksum_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts_dir = temp.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        std::fs::write(artifacts_dir.join("report.txt"), b"artifact-bytes").unwrap();
+
+        let (url, requests) =
+            spawn_recorder(|_req| (200, serde_json::json!({"stored": true}))).await;
+        let client = Client::new();
+        let protocol = test_protocol(&client, &url, "job-5");
+        let receipt = ArtifactReceipt {
+            name: "report.txt".to_string(),
+            uri: "gitforge://artifact/report".to_string(),
+            sha256: "deadbeef".to_string(),
+            bytes: 14,
+            media_type: None,
+        };
+
+        let error = report_artifacts(&protocol, Some(temp.path().to_str().unwrap()), &[receipt])
+            .await
+            .expect_err("drifting checksums must not be uploaded");
+        assert!(error.to_string().contains("checksum changed"));
+        assert!(requests.lock().unwrap().is_empty(), "nothing was uploaded");
+    }
+
+    #[tokio::test]
+    async fn test_report_artifacts_rejects_path_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts_dir = temp.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        std::fs::write(temp.path().join("secret.txt"), b"outside").unwrap();
+
+        let (url, requests) =
+            spawn_recorder(|_req| (200, serde_json::json!({"stored": true}))).await;
+        let client = Client::new();
+        let protocol = test_protocol(&client, &url, "job-5");
+        let receipt = ArtifactReceipt {
+            name: "../secret.txt".to_string(),
+            uri: "gitforge://artifact/secret".to_string(),
+            sha256: sha256_hex(b"outside"),
+            bytes: 7,
+            media_type: None,
+        };
+
+        let error = report_artifacts(&protocol, Some(temp.path().to_str().unwrap()), &[receipt])
+            .await
+            .expect_err("artifact names outside the artifact root are refused");
+        assert!(error.to_string().contains("escapes artifact directory"));
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_report_artifacts_noops_without_workspace_or_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let (url, requests) =
+            spawn_recorder(|_req| (200, serde_json::json!({"stored": true}))).await;
+        let client = Client::new();
+        let protocol = test_protocol(&client, &url, "job-5");
+        let receipt = ArtifactReceipt {
+            name: "report.txt".to_string(),
+            uri: "gitforge://artifact/report".to_string(),
+            sha256: sha256_hex(b"artifact-bytes"),
+            bytes: 14,
+            media_type: None,
+        };
+
+        let no_workspace = report_artifacts(&protocol, None, std::slice::from_ref(&receipt))
+            .await
+            .expect("no workspace means nothing to upload");
+        let no_artifacts = report_artifacts(&protocol, Some(temp.path().to_str().unwrap()), &[])
+            .await
+            .expect("no artifacts means nothing to upload");
+
+        assert!(no_workspace.is_empty());
+        assert!(no_artifacts.is_empty());
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_bounded_receipt_text_walks_char_boundaries() {
+        // A 3-byte character straddling the byte limit forces the boundary
+        // walk; the result must stay valid UTF-8 and carry the marker.
+        let value = format!("{}{}", "a".repeat(MAX_RECEIPT_STREAM_BYTES - 1), "日日");
+        let receipt = bounded_receipt_text(&value);
+        assert!(receipt.starts_with(&"a".repeat(MAX_RECEIPT_STREAM_BYTES - 1)));
+        assert!(
+            !receipt.contains("日"),
+            "the straddling character is dropped"
+        );
+        assert!(receipt.contains("output truncated"));
+        assert_eq!(bounded_receipt_text("ok"), "ok");
+    }
+
+    #[test]
+    fn test_utf8_chunks_keeps_oversized_single_char_intact() {
+        let value = "a😀b";
+        let chunks = utf8_chunks(value, 2);
+        assert_eq!(chunks.concat(), value);
+        assert_eq!(
+            chunks,
+            vec!["a", "😀", "b"],
+            "a char wider than the limit is never split"
+        );
+    }
 }
