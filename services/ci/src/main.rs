@@ -1148,6 +1148,34 @@ async fn run_event_consumer(
     Ok(())
 }
 
+/// Persist the pipeline definition governing this push and return the
+/// durable identifier it is recorded under.
+///
+/// Push events for one repository recur on every push and can repeat or
+/// overlap while an earlier delivery is still executing, and the shared
+/// database file may enforce uniqueness for (repo_id, name) with an index
+/// this binary did not create. The definition is therefore upserted rather
+/// than inserted: the first push records the row, later pushes reuse or
+/// refresh it in place, so duplicate deliveries stay constraint-clean and
+/// every pipeline run remains attributable to a single definition row.
+async fn persist_push_pipeline(
+    pool: &gitforge_db::Pool,
+    repo_id: gitforge_common::RepoId,
+    requested_pipeline_id: gitforge_common::PipelineId,
+    pipeline: &PipelineDefinition,
+) -> anyhow::Result<gitforge_common::PipelineId> {
+    let db_pipeline = DbPipeline {
+        id: requested_pipeline_id,
+        repo_id,
+        name: pipeline.name.clone(),
+        trigger_type: "push".to_string(),
+        config: serde_json::to_value(pipeline)?,
+        created_at: Utc::now(),
+    };
+    let persisted = gitforge_db::queries::PipelineQueries::upsert(pool, &db_pipeline).await?;
+    Ok(persisted.id)
+}
+
 /// Handle a push received event - trigger pipeline if configured
 async fn handle_push_event(
     event: &EventEnvelope,
@@ -1245,18 +1273,11 @@ async fn handle_push_event(
 
     let state = engine.state().await;
     if let Some(pool) = scheduler_db {
-        let db_pipeline = DbPipeline {
-            id: pipeline_id,
-            repo_id,
-            name: pipeline.name.clone(),
-            trigger_type: "push".to_string(),
-            config: serde_json::to_value(&pipeline)?,
-            created_at: Utc::now(),
-        };
-        gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
+        let persisted_pipeline_id =
+            persist_push_pipeline(pool, repo_id, pipeline_id, &pipeline).await?;
 
         let mut db_run = DbPipelineRun::new(
-            pipeline_id,
+            persisted_pipeline_id,
             repo_id,
             "push".to_string(),
             payload.new_hash.clone(),
@@ -2129,6 +2150,241 @@ mod tests {
         .await;
         assert_eq!(finalized, 1, "the stale jobless orphan is cancelled");
         assert_eq!(run_status(&pool, stale_run).await, "cancelled");
+    }
+
+    /// User + repository fixture for push persistence tests on any pool.
+    async fn seed_repository_for_push_tests(pool: &gitforge_db::Pool) -> gitforge_common::RepoId {
+        let user = gitforge_db::models::User::new(
+            "push-persistence-test".to_string(),
+            "push-persistence@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(pool, &user)
+            .await
+            .unwrap();
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "push-persistence-test".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: "/git/push-persistence-test".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        repo_id
+    }
+
+    fn push_test_definition(name: &str, step: &str) -> PipelineDefinition {
+        PipelineDefinition {
+            name: name.to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![JobDefinition {
+                name: "build".to_string(),
+                image: "rust:latest".to_string(),
+                needs: vec![],
+                env: HashMap::new(),
+                steps: vec![StepDefinition {
+                    name: "build".to_string(),
+                    run: step.to_string(),
+                    env: None,
+                    working_directory: None,
+                    condition: None,
+                }],
+                timeout: Some("30m".to_string()),
+                retry: Some(1),
+            }],
+        }
+    }
+
+    /// Repeated push events for one repository/name must keep persisting to
+    /// a single definition row under a stable identifier: an unconditional
+    /// insert either violates the (repo_id, name) uniqueness a durable
+    /// database enforces or silently duplicates the row.
+    #[tokio::test]
+    async fn test_persist_push_pipeline_reuses_definition_for_repeated_push_events() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let repo_id = seed_repository_for_push_tests(&pool).await;
+        let definition = push_test_definition("repeat-push-pipeline", "echo first");
+
+        let first = persist_push_pipeline(
+            &pool,
+            repo_id,
+            gitforge_common::PipelineId::new(),
+            &definition,
+        )
+        .await
+        .unwrap();
+
+        // History: a run recorded against the first push's definition.
+        let mut run = gitforge_db::models::PipelineRun::new(
+            first,
+            repo_id,
+            "push".to_string(),
+            "commit-one".to_string(),
+        );
+        run.start();
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+
+        let second_definition =
+            push_test_definition("repeat-push-pipeline", "echo changed config");
+        let second = persist_push_pipeline(
+            &pool,
+            repo_id,
+            gitforge_common::PipelineId::new(),
+            &second_definition,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first, second, "repeated pushes reuse the definition row");
+
+        let stored =
+            gitforge_db::queries::PipelineQueries::get(&pool, second)
+                .await
+                .unwrap()
+                .expect("definition row survives repeated pushes");
+        assert!(
+            serde_json::to_value(&second_definition)
+                .unwrap()
+                .eq(&stored.config),
+            "the persisted config tracks the pushed definition"
+        );
+
+        let pipelines =
+            gitforge_db::queries::PipelineQueries::list_by_repo(&pool, repo_id)
+                .await
+                .unwrap();
+        assert_eq!(pipelines.len(), 1, "repeated pushes must not duplicate rows");
+
+        let history = gitforge_db::queries::PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .expect("earlier run keeps resolving");
+        assert_eq!(history.pipeline_id, first, "run history stays attributable");
+    }
+
+    /// A push must persist even against the durable schema the deployed
+    /// database carries: the promotion lineage added an active column plus
+    /// a partial unique index per (repo_id, name), and CREATE TABLE IF NOT
+    /// EXISTS never alters an existing file, so production runs against
+    /// this shape although a fresh migrate() does not create it.
+    async fn seeded_unique_index_pool(db_path: &std::path::Path) -> gitforge_db::Pool {
+        let pool = gitforge_db::Pool::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+        pool.migrate().await.unwrap();
+        sqlx::query("ALTER TABLE pipelines ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pipelines_active_repo_name \
+             ON pipelines(repo_id, name) WHERE active = 1",
+        )
+        .execute(pool.pool())
+        .await
+        .unwrap();
+        pool
+    }
+
+    fn remove_db_files(db_path: &std::path::Path) {
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn test_persist_push_pipeline_survives_unique_index_schema() {
+        let db_path = std::env::temp_dir().join(format!(
+            "gitforge-ci-push-upsert-{}.db",
+            gitforge_common::PipelineRunId::new()
+        ));
+        let pool = seeded_unique_index_pool(&db_path).await;
+        let repo_id = seed_repository_for_push_tests(&pool).await;
+        let definition = push_test_definition("unique-schema-pipeline", "echo one");
+
+        let first = persist_push_pipeline(
+            &pool,
+            repo_id,
+            gitforge_common::PipelineId::new(),
+            &definition,
+        )
+        .await
+        .unwrap();
+        let second = persist_push_pipeline(
+            &pool,
+            repo_id,
+            gitforge_common::PipelineId::new(),
+            &definition,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first, second);
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM pipelines WHERE repo_id = ?")
+                .bind(repo_id.to_string())
+                .fetch_one(pool.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "the second push must reuse the definition row");
+
+        drop(pool);
+        remove_db_files(&db_path);
+    }
+
+    /// Duplicate deliveries racing through persistence must serialize on
+    /// the database write lock instead of racing between the existence
+    /// check and the insert: both succeed and agree on the same row.
+    #[tokio::test]
+    async fn test_persist_push_pipeline_serializes_duplicate_concurrent_delivery() {
+        let db_path = std::env::temp_dir().join(format!(
+            "gitforge-ci-push-concurrent-{}.db",
+            gitforge_common::PipelineRunId::new()
+        ));
+        let pool = seeded_unique_index_pool(&db_path).await;
+        let repo_id = seed_repository_for_push_tests(&pool).await;
+        let definition = push_test_definition("concurrent-pipeline", "echo one");
+
+        let (first, second) = tokio::join!(
+            persist_push_pipeline(
+                &pool,
+                repo_id,
+                gitforge_common::PipelineId::new(),
+                &definition,
+            ),
+            persist_push_pipeline(
+                &pool,
+                repo_id,
+                gitforge_common::PipelineId::new(),
+                &definition,
+            ),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(first, second, "both deliveries record one definition");
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM pipelines WHERE repo_id = ?")
+                .bind(repo_id.to_string())
+                .fetch_one(pool.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "concurrent deliveries must not duplicate rows");
+
+        drop(pool);
+        remove_db_files(&db_path);
     }
 
     #[tokio::test]

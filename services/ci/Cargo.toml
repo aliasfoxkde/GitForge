@@ -32,3 +32,4 @@ tower-http = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }
+sqlx = { workspace = true, features = ["sqlite"] }

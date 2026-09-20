@@ -604,6 +604,90 @@ impl PipelineQueries {
         Ok(())
     }
 
+    /// Persist a push-triggered pipeline definition and return the row it is
+    /// recorded under.
+    ///
+    /// Every push event for a repository reaches persistence with the same
+    /// (repo_id, name), and deliveries repeat or overlap while an earlier
+    /// one is still executing. The durable database file is shared between
+    /// processes and may enforce uniqueness for (repo_id, name) with an
+    /// index this binary did not create, so an unconditional INSERT fails
+    /// every push after the first with a constraint violation there, and
+    /// silently duplicates definition rows on schemas without the index.
+    /// The existence check and write run in one BEGIN IMMEDIATE
+    /// transaction, so concurrent deliveries serialize on SQLite's write
+    /// lock instead of racing between check and insert: the first delivery
+    /// records the row, later deliveries reuse it — refreshing only the
+    /// trigger and config when they changed — while the stable identity
+    /// keeps all pipeline runs attributable to a single definition row.
+    pub async fn upsert(
+        pool: &Pool,
+        pipeline: &crate::models::Pipeline,
+    ) -> Result<crate::models::Pipeline> {
+        let mut tx = pool
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::database(format!("failed to begin pipeline upsert: {}", e)))?;
+
+        let existing = sqlx::query(
+            "SELECT * FROM pipelines WHERE repo_id = ? AND name = ? \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(pipeline.repo_id.to_string())
+        .bind(&pipeline.name)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to look up pipeline: {}", e)))?;
+
+        let canonical = match existing {
+            Some(row) => {
+                let mut canonical = hydrate_pipeline(row)?;
+                if canonical.trigger_type != pipeline.trigger_type
+                    || canonical.config != pipeline.config
+                {
+                    sqlx::query("UPDATE pipelines SET trigger_type = ?, config = ? WHERE id = ?")
+                        .bind(&pipeline.trigger_type)
+                        .bind(pipeline.config.to_string())
+                        .bind(canonical.id.to_string())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            Error::database(format!("failed to refresh pipeline: {}", e))
+                        })?;
+                    canonical.trigger_type = pipeline.trigger_type.clone();
+                    canonical.config = pipeline.config.clone();
+                }
+                canonical
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO pipelines (id, repo_id, name, trigger_type, config, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    "#,
+                )
+                .bind(pipeline.id.to_string())
+                .bind(pipeline.repo_id.to_string())
+                .bind(&pipeline.name)
+                .bind(&pipeline.trigger_type)
+                .bind(pipeline.config.to_string())
+                .bind(pipeline.created_at.to_rfc3339())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    Error::database(format!("failed to create pipeline: {}", e))
+                })?;
+                pipeline.clone()
+            }
+        };
+
+        tx.commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit pipeline upsert: {}", e)))?;
+        Ok(canonical)
+    }
+
     /// Get a pipeline by ID
     pub async fn get(pool: &Pool, id: PipelineId) -> Result<Option<crate::models::Pipeline>> {
         let row = sqlx::query("SELECT * FROM pipelines WHERE id = ?")
@@ -1645,6 +1729,127 @@ mod tests {
         // List all
         let all_pipelines = PipelineQueries::list(&pool).await.unwrap();
         assert_eq!(all_pipelines.len(), 1);
+    }
+
+    /// Repeated push events for one repository/name must not accumulate
+    /// definition rows: every delivery upserts onto the same row and the
+    /// identifier it is recorded under stays stable so run history remains
+    /// attributable.
+    #[tokio::test]
+    async fn test_pipeline_upsert_reuses_row_for_repeated_pushes() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "pusher".to_string(),
+            "pusher@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "push-repo".to_string(),
+            user.id,
+            "/git/push-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let definition = |config: serde_json::Value| crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "repo-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config,
+            created_at: chrono::Utc::now(),
+        };
+
+        let first = PipelineQueries::upsert(&pool, &definition(serde_json::json!({"v": 1})))
+            .await
+            .unwrap();
+        let second = PipelineQueries::upsert(&pool, &definition(serde_json::json!({"v": 1})))
+            .await
+            .unwrap();
+        assert_eq!(first.id, second.id, "repeated pushes reuse the row");
+        assert_eq!(first.created_at, second.created_at);
+
+        let pipelines = PipelineQueries::list_by_repo(&pool, repo.id).await.unwrap();
+        assert_eq!(pipelines.len(), 1, "repeated pushes must not duplicate rows");
+    }
+
+    /// A push carrying a changed definition refreshes the canonical row in
+    /// place: the identity and creation time stay stable so runs recorded
+    /// against earlier pushes keep resolving, and no second row appears.
+    #[tokio::test]
+    async fn test_pipeline_upsert_refreshes_config_preserving_run_history() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "pusher".to_string(),
+            "pusher@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "push-repo".to_string(),
+            user.id,
+            "/git/push-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let initial = PipelineQueries::upsert(
+            &pool,
+            &crate::models::Pipeline {
+                id: PipelineId::new(),
+                repo_id: repo.id,
+                name: "repo-pipeline".to_string(),
+                trigger_type: "push".to_string(),
+                config: serde_json::json!({"v": 1}),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // History: a run recorded against the first push's definition.
+        let mut run = crate::models::PipelineRun::new(
+            initial.id,
+            repo.id,
+            "push".to_string(),
+            "commit-one".to_string(),
+        );
+        run.start();
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        let changed = PipelineQueries::upsert(
+            &pool,
+            &crate::models::Pipeline {
+                id: PipelineId::new(),
+                repo_id: repo.id,
+                name: "repo-pipeline".to_string(),
+                trigger_type: "push".to_string(),
+                config: serde_json::json!({"v": 2}),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(changed.id, initial.id, "the definition row stays stable");
+        assert_eq!(changed.created_at, initial.created_at);
+        assert_eq!(changed.config, serde_json::json!({"v": 2}));
+
+        let stored = PipelineQueries::get(&pool, initial.id)
+            .await
+            .unwrap()
+            .expect("definition row survives");
+        assert_eq!(stored.config, serde_json::json!({"v": 2}));
+        assert_eq!(PipelineQueries::list_by_repo(&pool, repo.id).await.unwrap().len(), 1);
+
+        let history = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .expect("earlier run keeps resolving");
+        assert_eq!(history.pipeline_id, initial.id);
     }
 
     #[tokio::test]
