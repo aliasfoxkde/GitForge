@@ -1469,6 +1469,33 @@ async fn handle_push_event(
     Ok(state.run_id)
 }
 
+/// Convert a parsed pipeline job into the scheduler's transport definition.
+///
+/// `JobExecutionDefinition::working_dir` is the host path that the runner's
+/// Docker daemon binds into the container. A YAML step's
+/// `working_directory` is a container-side path (normally `/workspace`) and
+/// must not replace that host workspace path.
+fn job_execution_definition(
+    definition: &JobDefinition,
+    workspace_path: Option<&str>,
+) -> anyhow::Result<JobExecutionDefinition> {
+    let commands = definition.steps.iter().map(|step| step.run.clone()).collect();
+    let working_dir = definition
+        .steps
+        .iter()
+        .find_map(|step| step.working_directory.clone())
+        .or_else(|| workspace_path.map(ToOwned::to_owned));
+    let timeout_secs = definition
+        .timeout_secs()
+        .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
+    Ok(JobExecutionDefinition {
+        commands,
+        image: definition.image.clone(),
+        working_dir,
+        timeout_secs,
+    })
+}
+
 async fn run_scheduler_event_consumer(
     scheduler: Arc<Scheduler>,
     pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
