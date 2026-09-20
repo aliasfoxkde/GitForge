@@ -894,6 +894,7 @@ impl Scheduler {
         };
 
         let pending_jobs = gitforge_db::queries::JobQueries::list_pending(pool).await?;
+        let pending_rows = pending_jobs.len();
         let mut state = self.state.write().await;
 
         let mut loaded = 0;
@@ -931,7 +932,12 @@ impl Scheduler {
             }
         }
 
-        tracing::info!("loaded {} pending jobs from database", loaded);
+        tracing::info!(
+            pending_rows,
+            newly_loaded = loaded,
+            in_memory_queue = state.queue.len(),
+            "refreshed pending jobs from database"
+        );
         Ok(loaded)
     }
 
