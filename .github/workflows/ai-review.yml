@@ -91,9 +91,11 @@ jobs:
           esac
           if [[ -z "$REVIEW_KEY" ]]; then
             echo "AI review skipped: no credential configured for provider '$PROVIDER'."
-            echo "summary=AI review skipped: provider '$PROVIDER' is not configured; deterministic gates remain authoritative." >> "$GITHUB_OUTPUT"
-            echo "critical_findings=false" >> "$GITHUB_OUTPUT"
-            echo "review_status=0" >> "$GITHUB_OUTPUT"
+            {
+              echo "summary=AI review skipped: provider '$PROVIDER' is not configured; deterministic gates remain authoritative."
+              echo "critical_findings=false"
+              echo "review_status=0"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -112,16 +114,19 @@ jobs:
 
           # Extract summary for GitHub comment
           SUMMARY=$(echo "$OUTPUT" | grep -A 20 "CODE REVIEW RESULTS" | head -30 | tr '\n' ' ' || echo "Review completed")
-          echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
 
           # Check for critical findings
           if echo "$OUTPUT" | grep -q "Critical"; then
-            echo "critical_findings=true" >> "$GITHUB_OUTPUT"
+            CRITICAL_FINDINGS=true
           else
-            echo "critical_findings=false" >> "$GITHUB_OUTPUT"
+            CRITICAL_FINDINGS=false
           fi
 
-          echo "review_status=$REVIEW_STATUS" >> "$GITHUB_OUTPUT"
+          {
+            echo "summary=$SUMMARY"
+            echo "critical_findings=$CRITICAL_FINDINGS"
+            echo "review_status=$REVIEW_STATUS"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Post review comment
         if: github.event_name == 'pull_request'
