@@ -39,6 +39,12 @@ user-id = 3618 # David Tolnay (dtolnay)
 start = "2025-09-13"
 end = "2027-09-09"
 
+[[trusted.tokio-test]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2021-05-14"
+end = "2027-09-20"
+
 [[trusted.toml_writer]]
 criteria = "safe-to-deploy"
 user-id = 6743 # Ed Page (epage)
