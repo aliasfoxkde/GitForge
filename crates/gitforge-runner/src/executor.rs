@@ -356,20 +356,27 @@ impl JobExecutor {
             let cmd = vec!["sh", "-c", &step.run];
 
             let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut step_timed_out = false;
             let result = if remaining.is_zero() {
+                step_timed_out = true;
                 Err(gitforge_common::Error::timeout(
                     "job timed out before step started",
                 ))
             } else {
-                timeout(
+                match timeout(
                     remaining,
                     self.pool
                         .sandbox
                         .execute_with_output(&instance, &cmd, output_sink.clone()),
                 )
                 .await
-                .map_err(|_| gitforge_common::Error::timeout("job timed out"))
-                .and_then(|result| result)
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        step_timed_out = true;
+                        Err(gitforge_common::Error::timeout("job timed out"))
+                    }
+                }
             };
 
             match result {
@@ -389,7 +396,7 @@ impl JobExecutor {
                 Err(e) => {
                     success = false;
                     final_exit_code = -1;
-                    timed_out = deadline <= Instant::now();
+                    timed_out = step_timed_out;
                     failure_error = Some(format!("execution error: {}", e));
                     step_results.push(StepResult {
                         exit_code: -1,
@@ -405,15 +412,15 @@ impl JobExecutor {
         // inside the container has exited.  Tear down the exact container
         // immediately on timeout, before artifact/log collection, so timed-out
         // jobs cannot leave an active exec or conmon helper behind.
-        if timed_out
-            && timeout(
-                Duration::from_secs(15),
-                self.pool.sandbox.destroy(instance.clone()),
-            )
-            .await
-            .is_err()
-        {
-            tracing::error!(%job_id, "timed-out sandbox teardown exceeded 15 seconds");
+        if timed_out {
+            if let Err(error) = self.pool.sandbox.destroy(instance.clone()).await {
+                tracing::error!(%job_id, %error, "timed-out sandbox teardown failed");
+                // If the exact destroy path failed after the Docker daemon
+                // accepted the container, retry by the ownership label. This
+                // remains scoped to this job and prevents a terminal timeout
+                // from leaking a managed container.
+                self.reap_attempt_containers(job_id).await;
+            }
         }
 
         // Collect artifacts
@@ -731,9 +738,17 @@ mod tests {
     async fn test_real_docker_job_timeout_reaps_sandbox() {
         let executor = JobExecutor::new().await.expect("Docker must be available");
         let job_id = JobId::new();
+        let workspace = std::env::temp_dir().join(format!("gitforge-timeout-{}", job_id));
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("timeout test workspace should be created");
         let job = ExecutableJob::new(job_id, PipelineRunId::new(), "alpine:latest".to_string())
             .with_steps(vec![JobStep::new("hang", "sleep 30")])
             .with_timeout(5);
+        let job = ExecutableJob {
+            working_dir: Some(workspace.to_string_lossy().into_owned()),
+            ..job
+        };
 
         let result = executor.execute(job).await;
 
@@ -744,12 +759,16 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error.contains("timeout")));
         assert_eq!(executor.active_job_count().await, 0);
-        assert!(executor
-            .pool
-            .sandbox
-            .remove_job_containers(job_id)
-            .await
-            .is_ok());
+        assert_eq!(
+            executor
+                .pool
+                .sandbox
+                .remove_job_containers(job_id)
+                .await
+                .expect("container listing should succeed"),
+            0
+        );
+        let _ = tokio::fs::remove_dir_all(workspace).await;
     }
 
     #[test]

@@ -15,7 +15,7 @@ use gitforge_common::{Error, JobId, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
 /// Sandbox instance handle
 #[derive(Debug, Clone)]
@@ -79,9 +79,9 @@ impl DockerSandbox {
     /// ownership label, so unrelated containers are never considered. Public
     /// so callers that abandon an acquisition (timeout, creation error) can
     /// reap the half-created container instead of leaking it.
-    pub async fn remove_job_containers(&self, job_id: JobId) -> Result<()> {
+    pub async fn remove_job_containers(&self, job_id: JobId) -> Result<usize> {
         let Some(ref docker) = self.docker else {
-            return Ok(());
+            return Ok(0);
         };
 
         let mut filters = HashMap::new();
@@ -98,6 +98,7 @@ impl DockerSandbox {
             .await
             .map_err(|e| Error::sandbox(format!("failed to list job containers: {}", e)))?;
 
+        let mut removed = 0;
         for container in containers {
             let owned_by_job = container
                 .labels
@@ -119,6 +120,7 @@ impl DockerSandbox {
                     .await
                 {
                     Ok(()) => {
+                        removed += 1;
                         tracing::info!(%id, %job_id, "Removed stale sandbox container before retry");
                     }
                     // 404: the container is already gone. 409: a concurrent
@@ -142,7 +144,7 @@ impl DockerSandbox {
                 }
             }
         }
-        Ok(())
+        Ok(removed)
     }
 
     /// Create a new Docker sandbox, requiring Docker to be available.
@@ -572,20 +574,36 @@ impl Sandbox for DockerSandbox {
 
     async fn destroy(&self, instance: SandboxInstance) -> Result<()> {
         if let Some(ref docker) = self.docker {
-            // If this sandbox had a workspace mount, chown the workspace tree to
-            // the runner's UID/GID before shutting down.  Inside the container
-            // we run as root, so chown is always permitted.  After this succeeds
-            // the runner user on the host can delete the artifact files without
-            // requiring privileged escalation.
+            const WORKSPACE_CLEANUP_TIMEOUT_SECS: u64 = 5;
+            const CONTAINER_STOP_TIMEOUT_SECS: u64 = 15;
+            const CONTAINER_REMOVE_TIMEOUT_SECS: u64 = 15;
+
+            // Workspace ownership cleanup is best effort and bounded. In
+            // particular, a timed-out exec can leave the cleanup exec waiting
+            // on a busy container; it must never prevent stop/remove below.
             if let Some(ref workspace) = instance.workspace_path {
-                if let Err(e) = cleanup_workspace(docker, &instance.container_id, workspace).await {
-                    tracing::warn!(
-                        "workspace ownership cleanup failed for {}: {} \
-                         (artifact files may require privileged deletion)",
-                        workspace,
-                        e
-                    );
-                    // Proceed to container teardown even if chown fails
+                match timeout(
+                    Duration::from_secs(WORKSPACE_CLEANUP_TIMEOUT_SECS),
+                    cleanup_workspace(docker, &instance.container_id, workspace),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "workspace ownership cleanup failed for {}: {} \
+                             (artifact files may require privileged deletion)",
+                            workspace,
+                            e
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "workspace ownership cleanup timed out for {} \
+                             (artifact files may require privileged deletion)",
+                            workspace
+                        );
+                    }
                 }
             }
 
@@ -596,30 +614,67 @@ impl Sandbox for DockerSandbox {
                 ..Default::default()
             };
 
-            if let Err(e) = docker
-                .stop_container(&instance.container_id, Some(stop_options))
-                .await
+            match timeout(
+                Duration::from_secs(CONTAINER_STOP_TIMEOUT_SECS),
+                docker.stop_container(&instance.container_id, Some(stop_options)),
+            )
+            .await
             {
-                // Container might already be stopped or not exist - that's OK
-                tracing::debug!(
-                    "stop_container returned error (container may already be stopped): {}",
-                    e
-                );
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // Container might already be stopped or not exist - that's OK
+                    tracing::debug!(
+                        "stop_container returned error (container may already be stopped): {}",
+                        e
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        container_id = %instance.container_id,
+                        "stop_container timed out; attempting forced removal"
+                    );
+                }
             }
 
-            // Remove the container even when the graceful stop reported an
-            // already-stopped or inconsistent rootless-Podman state. The
-            // container is owned by this exact job instance; force removal
-            // prevents its conmon helper from surviving the sandbox lifecycle.
-            let remove_options = RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            };
+            // Force removal is required after a timed-out exec: dropping the
+            // attached stream does not terminate the process or its conmon
+            // helper. The exact container ID prevents unrelated jobs from being
+            // affected.
+            let remove_result = timeout(
+                Duration::from_secs(CONTAINER_REMOVE_TIMEOUT_SECS),
+                docker.remove_container(
+                    &instance.container_id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                ),
+            )
+            .await;
 
-            docker
-                .remove_container(&instance.container_id, Some(remove_options))
-                .await
-                .map_err(|e| Error::sandbox(format!("failed to remove container: {}", e)))?;
+            match remove_result {
+                Ok(Ok(())) => {}
+                Ok(Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })) => {
+                    // A concurrent cleanup already removed it; destroy is
+                    // intentionally idempotent.
+                    tracing::debug!(
+                        container_id = %instance.container_id,
+                        "container was already removed"
+                    );
+                }
+                Ok(Err(e)) => {
+                    return Err(Error::sandbox(format!("failed to remove container: {}", e)));
+                }
+                Err(_) => {
+                    return Err(Error::sandbox(format!(
+                        "timed out removing container {}",
+                        instance.container_id
+                    )));
+                }
+            }
 
             tracing::info!(
                 "Destroyed container {} for job {}",
@@ -894,6 +949,46 @@ mod tests {
         }
 
         let _ = sandbox.destroy(instance).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Docker and is slow - run manually with `cargo test -- --ignored`
+    async fn test_docker_sandbox_real_destroy_is_idempotent_and_scoped() {
+        let sandbox = match DockerSandbox::connect_required().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let target = sandbox
+            .create(JobId::new(), "alpine:latest", SandboxLimits::default())
+            .await;
+        let target = match target {
+            Ok(instance) => instance,
+            Err(_) => return,
+        };
+        let unrelated = sandbox
+            .create(JobId::new(), "alpine:latest", SandboxLimits::default())
+            .await
+            .expect("second Docker sandbox should be created");
+
+        sandbox
+            .destroy(target.clone())
+            .await
+            .expect("first destroy should succeed");
+        sandbox
+            .destroy(target)
+            .await
+            .expect("destroying an already removed container should be a no-op");
+
+        let result = sandbox
+            .execute(&unrelated, &["sh", "-c", "test -d / && echo alive"])
+            .await
+            .expect("unrelated container should remain available");
+        assert_eq!(result.exit_code, 0);
+        sandbox
+            .destroy(unrelated)
+            .await
+            .expect("cleanup unrelated container");
     }
 
     #[tokio::test]
