@@ -340,7 +340,8 @@ impl Scheduler {
         if let Some(pool) = &self.db_pool {
             let mut db_job = DbJob::new(pipeline_run_id, format!("job-{}", job_id));
             db_job.id = job_id;
-            if let Err(e) = gitforge_db::queries::JobQueries::create(pool, &db_job).await {
+            if let Err(e) = gitforge_db::queries::JobQueries::create_if_absent(pool, &db_job).await
+            {
                 tracing::error!("failed to persist job to DB: {}", e);
             }
             if let Err(e) =

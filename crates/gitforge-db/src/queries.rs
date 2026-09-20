@@ -871,6 +871,38 @@ impl JobQueries {
         Ok(())
     }
 
+    /// Create a job when its ID is not already durable.
+    ///
+    /// Scheduler callers may enqueue a job that was persisted by another
+    /// control-plane boundary. The primary-key contract makes this operation
+    /// race-safe without turning ordinary duplicate creation into success.
+    pub async fn create_if_absent(pool: &Pool, job: &crate::models::Job) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, timeout_secs, result_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(job.id.to_string())
+        .bind(job.pipeline_run_id.to_string())
+        .bind(&job.name)
+        .bind(&job.status)
+        .bind(job.runner_id.map(|id| id.to_string()))
+        .bind(job.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(job.finished_at.map(|dt| dt.to_rfc3339()))
+        .bind(job.retry_count)
+        .bind(job.created_at.to_rfc3339())
+        .bind(serde_json::to_string(&job.commands).unwrap_or_else(|_| "[]".to_string()))
+        .bind(&job.image)
+        .bind(&job.working_dir)
+        .bind(i64::try_from(job.timeout_secs).unwrap_or(i64::MAX))
+        .bind(&job.result_json)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to create job if absent: {}", e)))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Get a job by ID
     pub async fn get(pool: &Pool, id: JobId) -> Result<Option<crate::models::Job>> {
         let row = sqlx::query("SELECT * FROM jobs WHERE id = ?")
@@ -2564,6 +2596,41 @@ mod tests {
                 .unwrap(),
             (job_id, "fingerprint".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_if_absent_preserves_existing_job() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let job = crate::models::Job::new(PipelineRunId::new(), "existing-job".to_string());
+
+        assert!(JobQueries::create_if_absent(&pool, &job).await.unwrap());
+        assert!(!JobQueries::create_if_absent(&pool, &job).await.unwrap());
+        assert_eq!(
+            JobQueries::get(&pool, job.id).await.unwrap().unwrap().name,
+            "existing-job"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_idempotency_reservation_has_one_winner() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let first = JobId::new();
+        let second = JobId::new();
+
+        let (left, right) = tokio::join!(
+            JobQueries::reserve_idempotency(&pool, "webhook:test", "commit-1", "same", first),
+            JobQueries::reserve_idempotency(&pool, "webhook:test", "commit-1", "same", second),
+        );
+        assert_eq!(left.unwrap() as u8 + right.unwrap() as u8, 1);
+        let (stored_id, fingerprint) =
+            JobQueries::get_idempotency(&pool, "webhook:test", "commit-1")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(fingerprint, "same");
+        assert!(stored_id == first || stored_id == second);
     }
 
     #[tokio::test]

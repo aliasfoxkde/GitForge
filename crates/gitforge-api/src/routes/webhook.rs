@@ -337,7 +337,7 @@ async fn trigger_pipeline(
                     tracing::info!(%existing_job_id, %pipeline_id, "Webhook delivery already queued");
                 }
                 Ok(None) => {
-                    if let Err(error) = JobQueries::reserve_idempotency(
+                    match JobQueries::reserve_idempotency(
                         &pool,
                         &scope,
                         &idempotency_key,
@@ -346,17 +346,78 @@ async fn trigger_pipeline(
                     )
                     .await
                     {
-                        let _ = PipelineRunQueries::update_status(&pool, run_id, "failed").await;
-                        tracing::error!(%error, %pipeline_id, "failed to reserve webhook job idempotency key");
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(WebhookTriggerResponse {
-                                success: false,
-                                message: "Failed to queue pipeline job".to_string(),
-                                pipeline_id: None,
-                            }),
-                        )
-                            .into_response();
+                        Ok(true) => {}
+                        Ok(false) => {
+                            match JobQueries::get_idempotency(&pool, &scope, &idempotency_key).await
+                            {
+                                Ok(Some((existing_job_id, stored_fingerprint)))
+                                    if stored_fingerprint == fingerprint =>
+                                {
+                                    let _ = PipelineRunQueries::update_status(
+                                        &pool,
+                                        run_id,
+                                        "cancelled",
+                                    )
+                                    .await;
+                                    tracing::info!(%existing_job_id, %pipeline_id, "Webhook delivery won by concurrent request");
+                                    return (
+                                        StatusCode::OK,
+                                        Json(WebhookTriggerResponse {
+                                            success: true,
+                                            message: format!(
+                                                "Pipeline triggered for branch '{}'",
+                                                payload.branch
+                                            ),
+                                            pipeline_id: Some(pipeline_id),
+                                        }),
+                                    )
+                                        .into_response();
+                                }
+                                Ok(Some(_)) => {
+                                    let _ =
+                                        PipelineRunQueries::update_status(&pool, run_id, "failed")
+                                            .await;
+                                    return (
+                                        StatusCode::CONFLICT,
+                                        Json(WebhookTriggerResponse {
+                                            success: false,
+                                            message: "Webhook idempotency key was reused with a different job".to_string(),
+                                            pipeline_id: None,
+                                        }),
+                                    ).into_response();
+                                }
+                                Ok(None) | Err(_) => {
+                                    let _ =
+                                        PipelineRunQueries::update_status(&pool, run_id, "failed")
+                                            .await;
+                                    return (
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        Json(WebhookTriggerResponse {
+                                            success: false,
+                                            message:
+                                                "Failed to resolve concurrent webhook reservation"
+                                                    .to_string(),
+                                            pipeline_id: None,
+                                        }),
+                                    )
+                                        .into_response();
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let _ =
+                                PipelineRunQueries::update_status(&pool, run_id, "failed").await;
+                            tracing::error!(%error, %pipeline_id, "failed to reserve webhook job idempotency key");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(WebhookTriggerResponse {
+                                    success: false,
+                                    message: "Failed to queue pipeline job".to_string(),
+                                    pipeline_id: None,
+                                }),
+                            )
+                                .into_response();
+                        }
                     }
                     let mut job =
                         gitforge_db::models::Job::new(run_id, job_definition.name.clone());
