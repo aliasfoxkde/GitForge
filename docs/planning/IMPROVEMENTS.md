@@ -15,7 +15,7 @@ Repository state after audit:
 - **Dependency vetting**: cargo-vet initialized (`supply-chain/`); `make
   lint` no longer fails on a missing `cargo vet`
 - **Race Detection**: Fixed storage durability issue with `sync_all()` calls
-- **Coverage**: 84.80% lines / 85.86% regions (`cargo llvm-cov --all`,
+- **Coverage**: 86.18% lines / 87.22% regions (`cargo llvm-cov --all`,
   2026-09-20; CI floor: 79.9%)
 - **Aegis**: Integrated into CI (already present in security.yml)
 - **E2E**: Template framework exists in template-parts; GitForge has no web frontend
@@ -102,11 +102,12 @@ spawned-binary trigger harness landed. gitforge-ai left the table on
 2026-09-09 at 90.16% lines once its providers were tested against a
 scripted HTTP server; gitforge-build left it the same day at 80.62%
 lines once the build daemon's connection handler was driven over real
-unix socket pairs. 2026-09-20 re-measurement: workspace 84.80% lines /
-85.86% regions; gitforge-storage/job_logs.rs — the largest file-level
-gap outside the Docker-gated executor at 62.84% lines — rose to 92.94%
-lines the same day once `bounded_put` receipts, truncation, and on-disk
-metadata handling were tested (`cargo llvm-cov -p gitforge-storage`).
+unix socket pairs. 2026-09-20 re-measurement: a same-day coverage
+campaign over job_logs receipts, the review parser/scanner, the process
+signal/pool layer, and the runner's scheduler boundary lifted the
+workspace to 86.18% lines / 87.22% regions (from 84.80% / 85.86%).
+gitforge-storage/job_logs.rs — the largest file-level gap outside the
+Docker-gated executor at the start of the day — rose to 92.94% lines.
 The largest remaining file-level gap outside the executor is now
 services/git-server/main.rs at 69.43% lines.)
 
