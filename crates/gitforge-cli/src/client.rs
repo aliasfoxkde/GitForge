@@ -127,7 +127,7 @@ impl ApiClient {
         let mut req = self.http.get(&url);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
@@ -140,7 +140,7 @@ impl ApiClient {
         let mut req = self.http.post(&url).json(body);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
@@ -153,7 +153,7 @@ impl ApiClient {
         let mut req = self.http.delete(&url);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         req.send().await?;
@@ -173,7 +173,7 @@ impl ApiClient {
 
         if !status.is_success() {
             let error_text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Login failed: {} - {}", status, error_text);
+            anyhow::bail!("Login failed: {status} - {error_text}");
         }
 
         let login_resp: LoginResponse = resp.json().await?;
@@ -186,7 +186,7 @@ impl ApiClient {
         let mut req = self.http.get(&url);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
@@ -200,7 +200,7 @@ impl ApiClient {
         let mut req = self.http.get(&url);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
@@ -217,7 +217,7 @@ impl ApiClient {
         let mut req = self.http.get(&url);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
@@ -243,7 +243,7 @@ impl ApiClient {
         let mut req = self.http.post(&url).json(&body);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
@@ -260,7 +260,7 @@ impl ApiClient {
         let mut req = self.http.delete(&url);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
@@ -276,7 +276,7 @@ impl ApiClient {
         let mut req = self.http.get(&url);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
@@ -293,7 +293,7 @@ impl ApiClient {
         let mut req = self.http.get(&url);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
@@ -310,7 +310,7 @@ impl ApiClient {
         let mut req = self.http.get(&url);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
@@ -327,7 +327,7 @@ impl ApiClient {
         let mut req = self.http.get(&url);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
@@ -344,7 +344,7 @@ impl ApiClient {
         let mut req = self.http.get(&url);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
@@ -361,14 +361,14 @@ impl ApiClient {
         let mut req = self.http.delete(&url);
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to retire runner: {} - {}", status, body);
+            anyhow::bail!("Failed to retire runner: {status} - {body}");
         }
         Ok(())
     }

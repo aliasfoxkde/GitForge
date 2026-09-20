@@ -223,7 +223,7 @@ mod tests {
             iat: Utc::now().timestamp(),
         };
         let user = AuthenticatedUser { claims };
-        let debug_str = format!("{:?}", user);
+        let debug_str = format!("{user:?}");
         assert!(debug_str.contains("testuser"));
     }
 
@@ -279,7 +279,7 @@ mod tests {
     fn test_auth_error_response_debug() {
         let response = auth_error_response("test", "message");
         // Just verify it doesn't panic when formatted
-        let debug_str = format!("{:?}", response);
+        let debug_str = format!("{response:?}");
         assert!(!debug_str.is_empty());
     }
 

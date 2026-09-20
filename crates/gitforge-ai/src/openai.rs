@@ -39,7 +39,7 @@ impl OpenAiProvider {
             client: Client::builder()
                 .timeout(Duration::from_secs(60))
                 .build()
-                .map_err(|e| AiError::Config(format!("Failed to create HTTP client: {}", e)))?,
+                .map_err(|e| AiError::Config(format!("Failed to create HTTP client: {e}")))?,
             model: "gpt-4o".to_string(),
             organization: config.organization,
         })
@@ -74,7 +74,7 @@ impl AiProvider for OpenAiProvider {
         let response = request
             .send()
             .await
-            .map_err(|e| AiError::Network(format!("Health check failed: {}", e)))?;
+            .map_err(|e| AiError::Network(format!("Health check failed: {e}")))?;
 
         if response.status().is_success() {
             Ok(())
@@ -112,7 +112,7 @@ impl AiProvider for OpenAiProvider {
         let response = req_builder
             .send()
             .await
-            .map_err(|e| AiError::Network(format!("Request failed: {}", e)))?;
+            .map_err(|e| AiError::Network(format!("Request failed: {e}")))?;
 
         if response.status() == 429 {
             return Err(AiError::RateLimit);
@@ -124,13 +124,13 @@ impl AiProvider for OpenAiProvider {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            return Err(AiError::Api(format!("API error: {}", error_text)));
+            return Err(AiError::Api(format!("API error: {error_text}")));
         }
 
         let api_response: OpenAiResponse = response
             .json()
             .await
-            .map_err(|e| AiError::Parse(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| AiError::Parse(format!("Failed to parse response: {e}")))?;
 
         self.parse_review_response(api_response, request)
     }
@@ -146,9 +146,8 @@ impl OpenAiProvider {
 
         if let Some(base) = &request.base_branch {
             prompt.push_str(&format!(
-                r#"Compare against branch "{}".
-"#,
-                base
+                r#"Compare against branch "{base}".
+"#
             ));
         }
 
@@ -232,8 +231,7 @@ JSON Response:
 
         let parsed: ParsedReviewResponse = serde_json::from_str(&content).map_err(|e| {
             AiError::Parse(format!(
-                "Failed to parse review JSON: {}\n\nContent:\n{}",
-                e, content
+                "Failed to parse review JSON: {e}\n\nContent:\n{content}"
             ))
         })?;
 

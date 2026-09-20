@@ -59,7 +59,10 @@ where
             // Record metrics
             let duration = start.elapsed().as_secs_f64();
             // Handle case where inner service returns error (shouldn't happen with Infallible)
-            let status = response.as_ref().map(|r| r.status()).unwrap_or_default();
+            let status = response
+                .as_ref()
+                .map(axum::http::Response::status)
+                .unwrap_or_default();
 
             metrics.record_http_request(&method, &path, status.as_u16());
             metrics.record_http_duration(&method, &path, duration);

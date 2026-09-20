@@ -602,7 +602,7 @@ mod tests {
 
         for (event_type, expected_str) in test_cases {
             assert_eq!(event_type.as_str(), expected_str);
-            assert_eq!(format!("{}", event_type), expected_str);
+            assert_eq!(format!("{event_type}"), expected_str);
         }
     }
 
@@ -623,7 +623,7 @@ mod tests {
             None,
         );
 
-        let debug_str = format!("{:?}", event);
+        let debug_str = format!("{event:?}");
         assert!(debug_str.contains("PushReceived"));
         assert!(debug_str.contains("event_id"));
     }

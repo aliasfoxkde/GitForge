@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn test_sandbox_limits_debug() {
         let limits = SandboxLimits::default();
-        let debug_str = format!("{:?}", limits);
+        let debug_str = format!("{limits:?}");
         assert!(debug_str.contains("cpu_ms"));
         assert!(debug_str.contains("memory_mb"));
     }

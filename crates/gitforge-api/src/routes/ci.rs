@@ -477,10 +477,7 @@ async fn submit_job(
         )
             .into_response();
     }
-    if JobStatus::from_str(&run.status)
-        .map(|status| status.is_terminal())
-        .unwrap_or(false)
-    {
+    if JobStatus::from_str(&run.status).is_some_and(|status| status.is_terminal()) {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "pipeline_run_already_terminal"})),

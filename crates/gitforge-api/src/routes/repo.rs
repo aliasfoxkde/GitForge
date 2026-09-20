@@ -48,19 +48,16 @@ fn validate_repo_name(name: &str) -> Result<(), String> {
     ];
     for c in invalid_chars {
         if name.contains(c) {
-            return Err(format!(
-                "Repository name contains invalid character: {:?}",
-                c
-            ));
+            return Err(format!("Repository name contains invalid character: {c:?}"));
         }
     }
 
     // Must start and end with alphanumeric
     let chars: Vec<char> = name.chars().collect();
-    if !chars.first().map(|c| c.is_alphanumeric()).unwrap_or(false) {
+    if !chars.first().is_some_and(|c| c.is_alphanumeric()) {
         return Err("Repository name must start with an alphanumeric character".to_string());
     }
-    if !chars.last().map(|c| c.is_alphanumeric()).unwrap_or(false) {
+    if !chars.last().is_some_and(|c| c.is_alphanumeric()) {
         return Err("Repository name must end with an alphanumeric character".to_string());
     }
 
@@ -195,7 +192,7 @@ async fn create_repo(
     );
 
     match RepoQueries::create(&pool, &repo).await {
-        Ok(_) => {
+        Ok(()) => {
             let response = RepoResponse {
                 id: repo.id.to_string(),
                 name: repo.name,
@@ -295,7 +292,7 @@ async fn delete_repo(
             match RepoQueries::get(&pool, repo_id).await {
                 Ok(Some(repo)) if can_access_repo(&claims, repo.owner_id) => {
                     match RepoQueries::delete(&pool, repo_id).await {
-                        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                        Ok(()) => StatusCode::NO_CONTENT.into_response(),
                         Err(e) => {
                             tracing::error!("failed to delete repo: {}", e);
                             (

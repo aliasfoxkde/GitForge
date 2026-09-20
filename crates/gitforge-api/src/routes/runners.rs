@@ -98,7 +98,7 @@ async fn register_runner(
     let runner = gitforge_db::models::Runner::new(name, rt, capacity);
 
     match RunnerQueries::create(&pool, &runner).await {
-        Ok(_) => {
+        Ok(()) => {
             let response = RunnerResponse {
                 id: runner.id.to_string(),
                 name: runner.name,

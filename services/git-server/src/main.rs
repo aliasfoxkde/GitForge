@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     // Start HTTP server
-    let http_addr = format!("0.0.0.0:{}", http_port);
+    let http_addr = format!("0.0.0.0:{http_port}");
     tracing::info!("starting Git HTTP server on {}", http_addr);
 
     let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
@@ -262,7 +262,7 @@ async fn git_upload_pack(
     Path((owner, repo)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> Response {
-    let repo_path = format!("{}/{}", owner, repo);
+    let repo_path = format!("{owner}/{repo}");
 
     // Try to look up repo ID from database first
     let repo_id = if let Some(_pool) = &state.db_pool {
@@ -272,7 +272,7 @@ async fn git_upload_pack(
                 tracing::warn!("repository not found in DB: {}", repo_path);
                 return finish_response(
                     Response::builder().status(StatusCode::NOT_FOUND),
-                    Body::from(format!("Repository not found: {}", repo_path)),
+                    Body::from(format!("Repository not found: {repo_path}")),
                 );
             }
         }
@@ -292,7 +292,7 @@ async fn git_upload_pack(
         tracing::warn!("repository not found in storage: {}", repo_path);
         return finish_response(
             Response::builder().status(StatusCode::NOT_FOUND),
-            Body::from(format!("Repository not found: {}", repo_path)),
+            Body::from(format!("Repository not found: {repo_path}")),
         );
     }
 
@@ -315,7 +315,7 @@ async fn git_upload_pack(
             tracing::warn!("upload-pack failed for {}: {}", repo_path, e);
             finish_response(
                 Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR),
-                Body::from(format!("Error: {}", e)),
+                Body::from(format!("Error: {e}")),
             )
         }
     }
@@ -428,7 +428,7 @@ async fn git_upload_pack_standard(
             tracing::warn!("failed to read upload-pack body: {}", error);
             return finish_response(
                 Response::builder().status(StatusCode::BAD_REQUEST),
-                Body::from(format!("Bad request: {}", error)),
+                Body::from(format!("Bad request: {error}")),
             );
         }
     };
@@ -443,7 +443,7 @@ async fn git_upload_pack_standard(
             tracing::warn!("upload-pack failed for {}: {}", repo_path, e);
             finish_response(
                 Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR),
-                Body::from(format!("Error: {}", e)),
+                Body::from(format!("Error: {e}")),
             )
         }
     }
@@ -455,7 +455,7 @@ async fn git_receive_pack(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> Response {
-    let repo_path = format!("{}/{}", owner, repo);
+    let repo_path = format!("{owner}/{repo}");
 
     // Try to look up repo ID from database first
     let repo_id = if let Some(_pool) = &state.db_pool {
@@ -465,7 +465,7 @@ async fn git_receive_pack(
                 tracing::warn!("repository not found in DB: {}", repo_path);
                 return finish_response(
                     Response::builder().status(StatusCode::NOT_FOUND),
-                    Body::from(format!("Repository not found: {}", repo_path)),
+                    Body::from(format!("Repository not found: {repo_path}")),
                 );
             }
         }
@@ -485,7 +485,7 @@ async fn git_receive_pack(
         tracing::warn!("repository not found in storage: {}", repo_path);
         return finish_response(
             Response::builder().status(StatusCode::NOT_FOUND),
-            Body::from(format!("Repository not found: {}", repo_path)),
+            Body::from(format!("Repository not found: {repo_path}")),
         );
     }
 
@@ -498,7 +498,7 @@ async fn git_receive_pack(
             tracing::warn!("failed to read receive-pack body: {}", error);
             return finish_response(
                 Response::builder().status(StatusCode::PAYLOAD_TOO_LARGE),
-                Body::from(format!("Receive-pack body rejected: {}", error)),
+                Body::from(format!("Receive-pack body rejected: {error}")),
             );
         }
     };
@@ -533,7 +533,7 @@ async fn git_receive_pack(
             tracing::warn!("receive-pack failed for {}: {}", repo_path, e);
             finish_response(
                 Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR),
-                Body::from(format!("Error: {}", e)),
+                Body::from(format!("Error: {e}")),
             )
         }
     }

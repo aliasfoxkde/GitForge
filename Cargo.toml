@@ -96,3 +96,12 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Selected pedantic lints promoted to workspace policy: mechanical to
+# satisfy, and they keep formatting/Option-handling consistent. The rest of
+# pedantic is surveyed in docs/audits and stays advisory.
+[workspace.lints.clippy]
+uninlined_format_args = "deny"
+map_unwrap_or = "deny"
+redundant_closure_for_method_calls = "deny"
+ignored_unit_patterns = "deny"

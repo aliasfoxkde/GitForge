@@ -50,13 +50,13 @@ pub fn get_git_diff(
 
     match (base_branch, target) {
         (Some(base), Some(target)) => {
-            cmd.arg(format!("{}...{}", base, target));
+            cmd.arg(format!("{base}...{target}"));
         }
         (Some(base), None) => {
-            cmd.arg(format!("{}...HEAD", base));
+            cmd.arg(format!("{base}...HEAD"));
         }
         (None, Some(target)) => {
-            cmd.arg(format!("{}...HEAD", target));
+            cmd.arg(format!("{target}...HEAD"));
         }
         (None, None) => {
             cmd.arg("--staged");
@@ -69,7 +69,7 @@ pub fn get_git_diff(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git diff failed: {}", stderr);
+        anyhow::bail!("git diff failed: {stderr}");
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -85,7 +85,7 @@ pub fn get_uncommitted_diff(repo_path: &Path) -> Result<String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git diff failed: {}", stderr);
+        anyhow::bail!("git diff failed: {stderr}");
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -115,10 +115,7 @@ pub fn provider_type_from_name(name: &str) -> Result<ProviderType> {
         "anthropic" => Ok(ProviderType::Anthropic),
         "openai" => Ok(ProviderType::OpenAI),
         "ollama" => Ok(ProviderType::Ollama),
-        other => anyhow::bail!(
-            "Unknown provider '{}'. Use: anthropic, openai, or ollama.",
-            other
-        ),
+        other => anyhow::bail!("Unknown provider '{other}'. Use: anthropic, openai, or ollama."),
     }
 }
 
@@ -154,7 +151,7 @@ pub async fn run_review(
 
     // Check provider health
     if let Err(e) = provider.health_check().await {
-        eprintln!("⚠️  Warning: Provider health check failed: {}", e);
+        eprintln!("⚠️  Warning: Provider health check failed: {e}");
         eprintln!("   Continuing anyway...");
     }
 
@@ -225,17 +222,17 @@ pub fn print_review_results(response: &ReviewResponse, verbose: bool) {
                     println!("    {}. {}", i + 1, f.title);
                     println!("       📁 {}", f.file);
                     if let (Some(start), Some(end)) = (f.line_start, f.line_end) {
-                        println!("       📍 Lines {}-{}", start, end);
+                        println!("       📍 Lines {start}-{end}");
                     } else if let Some(start) = f.line_start {
-                        println!("       📍 Line {}", start);
+                        println!("       📍 Line {start}");
                     }
                     println!("       💬 {}", f.description);
                     if verbose {
                         if let Some(suggestion) = &f.suggestion {
-                            println!("       ✨ Suggestion: {}", suggestion);
+                            println!("       ✨ Suggestion: {suggestion}");
                         }
                         if let Some(snippet) = &f.code_snippet {
-                            println!("       💻 Code: {}", snippet);
+                            println!("       💻 Code: {snippet}");
                         }
                     }
                 }
@@ -314,8 +311,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains("No file changes found"),
-            "expected 'No file changes found', got: {}",
-            err
+            "expected 'No file changes found', got: {err}"
         );
     }
 
@@ -327,8 +323,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains("No file changes found"),
-            "expected 'No file changes found', got: {}",
-            err
+            "expected 'No file changes found', got: {err}"
         );
     }
 
@@ -590,13 +585,11 @@ Binary files /dev/null and b/logo.png differ
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains("Unknown provider"),
-            "expected 'Unknown provider', got: {}",
-            err
+            "expected 'Unknown provider', got: {err}"
         );
         assert!(
             err.to_string().contains("not_a_provider"),
-            "expected provider name in error, got: {}",
-            err
+            "expected provider name in error, got: {err}"
         );
     }
 
@@ -604,10 +597,10 @@ Binary files /dev/null and b/logo.png differ
     fn test_provider_type_from_name_unknown_includes_suggestions() {
         let err = provider_type_from_name("openaii").unwrap_err().to_string();
         // Error should mention the unknown name
-        assert!(err.contains("openaii"), "got: {}", err);
+        assert!(err.contains("openaii"), "got: {err}");
         // Error should list valid options
-        assert!(err.contains("anthropic"), "got: {}", err);
-        assert!(err.contains("openai"), "got: {}", err);
-        assert!(err.contains("ollama"), "got: {}", err);
+        assert!(err.contains("anthropic"), "got: {err}");
+        assert!(err.contains("openai"), "got: {err}");
+        assert!(err.contains("ollama"), "got: {err}");
     }
 }
