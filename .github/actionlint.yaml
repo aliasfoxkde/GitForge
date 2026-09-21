@@ -1,4 +1,9 @@
-# Keep actionlint aware of the labels assigned to the GitForge self-hosted runner.
+# actionlint configuration.
+#
+# The GitForge runner is a managed self-hosted runner with a repository-local
+# label. Declare it so actionlint can validate runs-on expressions without
+# treating the label as an unknown runner.
 self-hosted-runner:
   labels:
     - gitforge
+    - gitforge-github

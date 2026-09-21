@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   check:
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - name: CI check
         run: echo "CI check passed — repository validated"

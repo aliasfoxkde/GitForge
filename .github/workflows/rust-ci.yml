@@ -26,7 +26,7 @@ jobs:
   # ─── Code Formatting ─────────────────────────────────────────────────────────
   fmt:
     name: Format
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -40,7 +40,7 @@ jobs:
   # ─── Linting ────────────────────────────────────────────────────────────────
   clippy:
     name: Clippy
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -78,7 +78,7 @@ jobs:
   # ─── Testing ────────────────────────────────────────────────────────────────
   test:
     name: Test
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -93,7 +93,7 @@ jobs:
   # race detector requires a separate supported toolchain/target strategy.
   test-serialized:
     name: Test (Serialized)
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -111,7 +111,7 @@ jobs:
   # ─── Coverage ───────────────────────────────────────────────────────────────
   coverage:
     name: Coverage
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
@@ -172,7 +172,7 @@ jobs:
   # ─── Security Audit ─────────────────────────────────────────────────────────
   security:
     name: Security Audit
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -206,7 +206,7 @@ jobs:
   # ─── Build ──────────────────────────────────────────────────────────────────
   build:
     name: Build
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
