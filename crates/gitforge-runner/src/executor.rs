@@ -337,7 +337,7 @@ impl JobExecutor {
                     logs: None,
                     started_at,
                     completed_at,
-                    error: Some(format!("failed to create sandbox: {}", e)),
+                    error: Some(format!("failed to create sandbox: {e}")),
                     workspace_path: job.working_dir.clone(),
                 };
             }
@@ -405,7 +405,7 @@ impl JobExecutor {
                     success = false;
                     final_exit_code = -1;
                     timed_out = deadline <= Instant::now();
-                    failure_error = Some(format!("execution error: {}", e));
+                    failure_error = Some(format!("execution error: {e}"));
                     step_results.push(StepResult {
                         exit_code: -1,
                         stdout: String::new(),
@@ -621,12 +621,7 @@ impl JobResult {
     fn status(&self) -> ReceiptStatus {
         if self.success {
             ReceiptStatus::Succeeded
-        } else if self
-            .error
-            .as_ref()
-            .map(|e| e.contains("timeout"))
-            .unwrap_or(false)
-        {
+        } else if self.error.as_ref().is_some_and(|e| e.contains("timeout")) {
             ReceiptStatus::TimedOut
         } else {
             ReceiptStatus::Failed

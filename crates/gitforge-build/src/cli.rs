@@ -98,7 +98,7 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
 
     match response {
         Response::Submitted { job_id } => {
-            println!("submitted job: {}", job_id);
+            println!("submitted job: {job_id}");
 
             if cli.no_wait {
                 return Ok(());
@@ -110,27 +110,27 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 match client.get_status(&socket_path, job_id.clone()).await? {
                     Response::Status { status, .. } => {
-                        println!("status: {}", status);
+                        println!("status: {status}");
                         if status.starts_with("completed(")
                             || status.starts_with("failed")
                             || status == "cancelled"
                         {
                             if status.starts_with("failed") || status == "cancelled" {
-                                anyhow::bail!("job {}", status);
+                                anyhow::bail!("job {status}");
                             }
                             return Ok(());
                         }
                     }
-                    Response::Error { message } => anyhow::bail!("error: {}", message),
-                    response => anyhow::bail!("unexpected response: {:?}", response),
+                    Response::Error { message } => anyhow::bail!("error: {message}"),
+                    response => anyhow::bail!("unexpected response: {response:?}"),
                 }
             }
         }
         Response::Error { message } => {
-            anyhow::bail!("error: {}", message);
+            anyhow::bail!("error: {message}");
         }
         _ => {
-            anyhow::bail!("unexpected response: {:?}", response);
+            anyhow::bail!("unexpected response: {response:?}");
         }
     }
 }
@@ -138,11 +138,11 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
 async fn cancel_cmd<C: JobSubmitter>(client: &C, socket_path: &str, job_id: String) -> Result<()> {
     match client.cancel_job(socket_path, job_id).await? {
         Response::Status { status, .. } => {
-            println!("{}", status);
+            println!("{status}");
             Ok(())
         }
-        Response::Error { message } => anyhow::bail!("error: {}", message),
-        response => anyhow::bail!("unexpected response: {:?}", response),
+        Response::Error { message } => anyhow::bail!("error: {message}"),
+        response => anyhow::bail!("unexpected response: {response:?}"),
     }
 }
 
@@ -152,8 +152,8 @@ async fn shutdown_cmd<C: JobSubmitter>(client: &C, socket_path: &str) -> Result<
             println!("shutdown requested");
             Ok(())
         }
-        Response::Error { message } => anyhow::bail!("error: {}", message),
-        response => anyhow::bail!("unexpected response: {:?}", response),
+        Response::Error { message } => anyhow::bail!("error: {message}"),
+        response => anyhow::bail!("unexpected response: {response:?}"),
     }
 }
 
@@ -178,7 +178,7 @@ async fn list_jobs_cmd<C: JobSubmitter>(client: &C, socket_path: &str) -> Result
             if message.contains("No such file") {
                 anyhow::bail!("daemon not running. Start with: gitforge-buildd");
             }
-            anyhow::bail!("error: {}", message);
+            anyhow::bail!("error: {message}");
         }
         _ => anyhow::bail!("unexpected response"),
     }
@@ -196,17 +196,17 @@ async fn stats_cmd<C: JobSubmitter>(client: &C, socket_path: &str) -> Result<()>
         } => {
             println!("GitForge Build Daemon");
             println!("====================");
-            println!("max concurrent: {}", max_concurrent);
-            println!("running:        {}", running_count);
-            println!("queued:         {}", queued_count);
-            println!("completed:      {}", completed_count);
+            println!("max concurrent: {max_concurrent}");
+            println!("running:        {running_count}");
+            println!("queued:         {queued_count}");
+            println!("completed:      {completed_count}");
             Ok(())
         }
         Response::Error { message } => {
             if message.contains("No such file") {
                 anyhow::bail!("daemon not running. Start with: gitforge-buildd");
             }
-            anyhow::bail!("error: {}", message);
+            anyhow::bail!("error: {message}");
         }
         _ => anyhow::bail!("unexpected response"),
     }

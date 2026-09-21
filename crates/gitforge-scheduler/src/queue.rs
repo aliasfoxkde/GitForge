@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn test_priority_debug() {
         let priority = Priority::High;
-        let debug_str = format!("{:?}", priority);
+        let debug_str = format!("{priority:?}");
         assert!(debug_str.contains("High"));
     }
 

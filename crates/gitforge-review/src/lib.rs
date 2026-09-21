@@ -180,22 +180,10 @@ pub fn parse_unified_diff(diff: &str) -> Result<Vec<ParsedDiff>, ReviewError> {
                     d.hunks.push(h);
                 }
 
-                let old_start: u32 = caps
-                    .get(1)
-                    .map(|m| m.as_str().parse().unwrap_or(1))
-                    .unwrap_or(1);
-                let old_lines: u32 = caps
-                    .get(2)
-                    .map(|m| m.as_str().parse().unwrap_or(1))
-                    .unwrap_or(1);
-                let new_start: u32 = caps
-                    .get(3)
-                    .map(|m| m.as_str().parse().unwrap_or(1))
-                    .unwrap_or(1);
-                let new_lines: u32 = caps
-                    .get(4)
-                    .map(|m| m.as_str().parse().unwrap_or(1))
-                    .unwrap_or(1);
+                let old_start: u32 = caps.get(1).map_or(1, |m| m.as_str().parse().unwrap_or(1));
+                let old_lines: u32 = caps.get(2).map_or(1, |m| m.as_str().parse().unwrap_or(1));
+                let new_start: u32 = caps.get(3).map_or(1, |m| m.as_str().parse().unwrap_or(1));
+                let new_lines: u32 = caps.get(4).map_or(1, |m| m.as_str().parse().unwrap_or(1));
 
                 current_hunk = Some(DiffHunk {
                     old_start,
@@ -266,9 +254,9 @@ fn hunks_to_diff_string(hunks: &[DiffHunk]) -> String {
 
         for line in &hunk.lines {
             match line {
-                HunkLine::Context(c) => output.push_str(&format!(" {}\n", c)),
-                HunkLine::Addition(a) => output.push_str(&format!("+{}\n", a)),
-                HunkLine::Deletion(d) => output.push_str(&format!("-{}\n", d)),
+                HunkLine::Context(c) => output.push_str(&format!(" {c}\n")),
+                HunkLine::Addition(a) => output.push_str(&format!("+{a}\n")),
+                HunkLine::Deletion(d) => output.push_str(&format!("-{d}\n")),
             }
         }
     }
@@ -589,8 +577,7 @@ Binary files assets/logo.png and assets/logo.png differ
 
         assert!(
             kept.starts_with("@@ -1,3 +1,4 @@\n"),
-            "hunk header is reconstructed, got: {:?}",
-            kept
+            "hunk header is reconstructed, got: {kept:?}"
         );
         assert!(kept.contains(" fn a() {}\n"), "context keeps its space");
         assert!(kept.contains("-old line\n"));

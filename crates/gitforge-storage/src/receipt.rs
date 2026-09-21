@@ -119,8 +119,7 @@ impl JobReceipt {
             validate_digest(&log.sha256)?;
             if log.bytes > MAX_LOG_BYTES {
                 return Err(gitforge_common::Error::invalid_input(format!(
-                    "job log exceeds {} byte limit",
-                    MAX_LOG_BYTES
+                    "job log exceeds {MAX_LOG_BYTES} byte limit"
                 )));
             }
         }

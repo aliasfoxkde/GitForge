@@ -43,7 +43,7 @@ mod tests {
     #[test]
     fn test_result_map_err_context() {
         let result: std::result::Result<i32, &str> = Err("original error");
-        let mapped = result.map_err_context(|e| format!("wrapped: {}", e));
+        let mapped = result.map_err_context(|e| format!("wrapped: {e}"));
         assert!(mapped.is_err());
         assert_eq!(mapped.unwrap_err(), "wrapped: original error");
     }
@@ -69,7 +69,7 @@ mod tests {
     #[test]
     fn test_result_map_err_context_ok() {
         let result: std::result::Result<i32, &str> = Ok(100);
-        let mapped = result.map_err_context(|e| format!("error: {}", e));
+        let mapped = result.map_err_context(|e| format!("error: {e}"));
         assert!(mapped.is_ok());
         assert_eq!(mapped.unwrap(), 100);
     }

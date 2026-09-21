@@ -19,9 +19,10 @@ GitForge is a production-ready, self-hosted Git service that provides Git hostin
 
 - **Git Hosting** — Git server with SSH and HTTP protocol support
 - **Event-Driven CI/CD** — Pipeline automation triggered by Git events
+- **AI Code Review** — Review runs with per-commit findings over the diff
 - **Sandbox Execution** — Job isolation via Docker containers
 - **Artifact Storage** — Build artifact and cache management
-- **REST API** — Full API for integration with other tools
+- **REST API** — Full API for integration with other tools and the `gitforge` CLI
 - **Prometheus Metrics** — Built-in observability
 - **Cross-Platform** — Linux, macOS, and Windows binaries
 
@@ -49,20 +50,28 @@ GitForge is a production-ready, self-hosted Git service that provides Git hostin
 ## Quick Start
 
 ```bash
-# Clone and build
-cargo build --release
+# Build everything
+make build            # or: cargo build --release
 
-# Start with Docker Compose
+# Run the test suite and quality gates
+make test
+make lint
+
+# Start the stack with Docker Compose (requires .env — see below)
+cp .env.example .env  # then set JWT_SECRET and the scheduler token
 docker-compose up -d
 
-# Or run services individually
-./target/release/api &
-./target/release/ci &
-./target/release/git-server &
-./target/release/runner &
+# Bootstrap the first administrator, then log in
+./target/release/gitforge admin --bootstrap
+./target/release/gitforge auth --login
 ```
 
-See [docs/RUNBOOK.md](docs/RUNBOOK.md) for detailed instructions.
+> The compose stack requires environment variables from `.env`
+> (`DOCKER_GID`, `GITFORGE_WORKSPACE_HOST_DIR`, `GITFORGE_SCHEDULER_TOKEN`,
+> `JWT_SECRET`). Services are configured exclusively through the
+> environment — there is no `config.toml`. Running binaries directly
+> needs at least `JWT_SECRET` (API) and `GITFORGE_SCHEDULER_URL`
+> (runner); see the [Runbook](docs/RUNBOOK.md) for the full table.
 
 ## Documentation
 
@@ -78,18 +87,19 @@ See [docs/RUNBOOK.md](docs/RUNBOOK.md) for detailed instructions.
 ```
 GitForge/
 ├── crates/           # Core libraries
-│   ├── gitforce-api/        # REST API
-│   ├── gitforce-ci/         # CI orchestration
-│   ├── gitforce-core/       # Git protocol handlers
-│   ├── gitforce-runner/     # Job execution
+│   ├── gitforge-api/        # REST API (axum router + routes)
+│   ├── gitforge-ci/         # CI pipeline engine + DAG
+│   ├── gitforge-scheduler/  # Durable job scheduler
+│   ├── gitforge-core/       # Git protocol handlers
+│   ├── gitforge-review/     # AI review domain (diff scan, findings)
 │   └── ...
 ├── services/         # Binary services
 │   ├── api/          # API gateway
-│   ├── ci/          # CI orchestrator
-│   ├── git-server/  # Git SSH/HTTP server
+│   ├── ci/           # CI orchestrator (+ scheduler API)
+│   ├── git-server/   # Git SSH/HTTP server
 │   └── runner/       # Job runner agent
 ├── docs/             # Documentation
-└── .github/          # GitHub workflows
+└── .github/          # CI workflows
 ```
 
 ## License

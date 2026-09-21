@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn test_id_display() {
         let id = RepoId::new();
-        let display = format!("{}", id);
+        let display = format!("{id}");
         assert_eq!(display, id.0.to_string());
     }
 
@@ -574,13 +574,13 @@ mod tests {
         let step = StepId::new();
         let user = UserId::new();
 
-        assert!(format!("{:?}", repo).contains("RepoId"));
-        assert!(format!("{:?}", pipeline).contains("PipelineId"));
-        assert!(format!("{:?}", run).contains("PipelineRunId"));
-        assert!(format!("{:?}", job).contains("JobId"));
-        assert!(format!("{:?}", runner).contains("RunnerId"));
-        assert!(format!("{:?}", step).contains("StepId"));
-        assert!(format!("{:?}", user).contains("UserId"));
+        assert!(format!("{repo:?}").contains("RepoId"));
+        assert!(format!("{pipeline:?}").contains("PipelineId"));
+        assert!(format!("{run:?}").contains("PipelineRunId"));
+        assert!(format!("{job:?}").contains("JobId"));
+        assert!(format!("{runner:?}").contains("RunnerId"));
+        assert!(format!("{step:?}").contains("StepId"));
+        assert!(format!("{user:?}").contains("UserId"));
     }
 
     #[test]

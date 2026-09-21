@@ -338,7 +338,7 @@ impl Scheduler {
 
         // Persist to database if available
         if let Some(pool) = &self.db_pool {
-            let mut db_job = DbJob::new(pipeline_run_id, format!("job-{}", job_id));
+            let mut db_job = DbJob::new(pipeline_run_id, format!("job-{job_id}"));
             db_job.id = job_id;
             if let Err(e) = gitforge_db::queries::JobQueries::create(pool, &db_job).await {
                 tracing::error!("failed to persist job to DB: {}", e);
@@ -962,11 +962,10 @@ impl Scheduler {
                 .await
                 .ok()
                 .flatten()
-                .map(|job| {
+                .is_some_and(|job| {
                     gitforge_db::models::JobStatus::from_str(&job.status)
                         .is_some_and(|status| status.is_terminal())
-                })
-                .unwrap_or(false);
+                });
         }
         false
     }
@@ -1229,7 +1228,7 @@ impl Scheduler {
             if existing == &result_json {
                 return Ok(());
             }
-            anyhow::bail!("job {} already has a conflicting receipt", job_id);
+            anyhow::bail!("job {job_id} already has a conflicting receipt");
         }
         state.completed_receipts.insert(job_id, result_json);
         state.job_assignments.remove(&job_id);
@@ -1698,7 +1697,7 @@ mod tests {
             repo_id: RepoId::new(),
             priority: Priority::Normal,
         };
-        assert!(format!("{:?}", cmd).contains("Enqueue"));
+        assert!(format!("{cmd:?}").contains("Enqueue"));
     }
 
     #[test]
@@ -1706,7 +1705,7 @@ mod tests {
         let evt = SchedulerEvent::NoRunnerAvailable {
             job_id: JobId::new(),
         };
-        assert!(format!("{:?}", evt).contains("NoRunnerAvailable"));
+        assert!(format!("{evt:?}").contains("NoRunnerAvailable"));
     }
 
     #[test]

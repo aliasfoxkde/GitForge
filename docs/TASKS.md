@@ -1,5 +1,7 @@
 # Tasks: Dark Factory Enhancement
 
+> **Abandoned.** This task list belonged to the Dark Factory Go-template effort, not GitForge. Current plans live in [planning/](planning/).
+
 ## Task Checklist
 
 ### Phase 1: Documentation

@@ -25,3 +25,6 @@ bytes = { workspace = true }
 sha2 = { workspace = true }
 reqwest = { workspace = true }
 hex = { workspace = true }
+
+[lints]
+workspace = true

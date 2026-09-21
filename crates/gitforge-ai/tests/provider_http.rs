@@ -32,8 +32,10 @@ impl RecordedRequest {
         self.headers
             .iter()
             .find(|(header, _)| header == name)
-            .map(|(_, value)| value.as_str())
-            .unwrap_or_else(|| panic!("request carried no {name} header"))
+            .map_or_else(
+                || panic!("request carried no {name} header"),
+                |(_, value)| value.as_str(),
+            )
     }
 }
 

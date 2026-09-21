@@ -102,19 +102,19 @@ impl FileJobLogStore {
 
         fs::create_dir_all(&logs_dir)
             .await
-            .map_err(|e| Error::storage(format!("failed to create job logs directory: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create job logs directory: {e}")))?;
 
         Ok(Self { root })
     }
 
     fn log_path(&self, job_id: &JobId) -> PathBuf {
-        self.root.join("job_logs").join(format!("{}.log", job_id))
+        self.root.join("job_logs").join(format!("{job_id}.log"))
     }
 
     fn meta_path(&self, job_id: &JobId) -> PathBuf {
         self.root
             .join("job_logs")
-            .join(format!("{}.meta.json", job_id))
+            .join(format!("{job_id}.meta.json"))
     }
 
     /// Store job logs with a size bound, returning a LogReceipt.
@@ -151,13 +151,13 @@ impl FileJobLogStore {
         // Write log data
         let mut file = fs::File::create(&log_path)
             .await
-            .map_err(|e| Error::storage(format!("failed to create log file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create log file: {e}")))?;
         file.write_all(&stored_data)
             .await
-            .map_err(|e| Error::storage(format!("failed to write log data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to write log data: {e}")))?;
         file.flush()
             .await
-            .map_err(|e| Error::storage(format!("failed to flush log data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to flush log data: {e}")))?;
         drop(file);
 
         // Write metadata
@@ -167,18 +167,18 @@ impl FileJobLogStore {
             created_at: started_at,
         };
         let meta_json = serde_json::to_string(&meta)
-            .map_err(|e| Error::storage(format!("failed to serialize log meta: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to serialize log meta: {e}")))?;
         let mut meta_file = fs::File::create(&meta_path)
             .await
-            .map_err(|e| Error::storage(format!("failed to create log metadata file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create log metadata file: {e}")))?;
         meta_file
             .write_all(meta_json.as_bytes())
             .await
-            .map_err(|e| Error::storage(format!("failed to write log metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to write log metadata: {e}")))?;
         meta_file
             .flush()
             .await
-            .map_err(|e| Error::storage(format!("failed to flush log metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to flush log metadata: {e}")))?;
         drop(meta_file);
 
         if truncated {
@@ -192,7 +192,7 @@ impl FileJobLogStore {
         tracing::debug!("stored job log for job {} ({} bytes)", job_id, size_bytes);
 
         Ok(LogReceipt {
-            uri: format!("gitforge://log/{}", job_id),
+            uri: format!("gitforge://log/{job_id}"),
             sha256,
             bytes: size_bytes,
         })
@@ -217,29 +217,29 @@ impl JobLogStore for FileJobLogStore {
         // Write log data
         let mut file = fs::File::create(&log_path)
             .await
-            .map_err(|e| Error::storage(format!("failed to create log file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create log file: {e}")))?;
         file.write_all(&data)
             .await
-            .map_err(|e| Error::storage(format!("failed to write log data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to write log data: {e}")))?;
         file.flush()
             .await
-            .map_err(|e| Error::storage(format!("failed to flush log data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to flush log data: {e}")))?;
         drop(file);
 
         // Write metadata
         let meta_json = serde_json::to_string(&meta)
-            .map_err(|e| Error::storage(format!("failed to serialize log meta: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to serialize log meta: {e}")))?;
         let mut meta_file = fs::File::create(&meta_path)
             .await
-            .map_err(|e| Error::storage(format!("failed to create log metadata file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create log metadata file: {e}")))?;
         meta_file
             .write_all(meta_json.as_bytes())
             .await
-            .map_err(|e| Error::storage(format!("failed to write log metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to write log metadata: {e}")))?;
         meta_file
             .flush()
             .await
-            .map_err(|e| Error::storage(format!("failed to flush log metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to flush log metadata: {e}")))?;
         drop(meta_file);
 
         tracing::debug!("stored job log for job {} ({} bytes)", job_id, size_bytes);
@@ -256,11 +256,11 @@ impl JobLogStore for FileJobLogStore {
 
         let mut file = fs::File::open(&log_path)
             .await
-            .map_err(|e| Error::storage(format!("failed to open log file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to open log file: {e}")))?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)
             .await
-            .map_err(|e| Error::storage(format!("failed to read log data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read log data: {e}")))?;
 
         tracing::debug!(
             "retrieved job log for job {} ({} bytes)",
@@ -277,12 +277,12 @@ impl JobLogStore for FileJobLogStore {
         if log_path.exists() {
             fs::remove_file(&log_path)
                 .await
-                .map_err(|e| Error::storage(format!("failed to delete log file: {}", e)))?;
+                .map_err(|e| Error::storage(format!("failed to delete log file: {e}")))?;
         }
         if meta_path.exists() {
             fs::remove_file(&meta_path)
                 .await
-                .map_err(|e| Error::storage(format!("failed to delete log metadata: {}", e)))?;
+                .map_err(|e| Error::storage(format!("failed to delete log metadata: {e}")))?;
         }
 
         Ok(())
@@ -294,15 +294,15 @@ impl JobLogStore for FileJobLogStore {
 
         let mut dir = fs::read_dir(&logs_dir)
             .await
-            .map_err(|e| Error::storage(format!("failed to read job logs directory: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read job logs directory: {e}")))?;
 
         while let Some(item) = dir
             .next_entry()
             .await
-            .map_err(|e| Error::storage(format!("failed to read job log entry: {}", e)))?
+            .map_err(|e| Error::storage(format!("failed to read job log entry: {e}")))?
         {
             let path = item.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
+            if path.extension().is_some_and(|e| e == "json") {
                 // This is a metadata file
                 if let Ok(meta_json) = fs::read_to_string(&path).await {
                     if let Ok(meta) = serde_json::from_str::<JobLogMeta>(&meta_json) {
@@ -349,7 +349,7 @@ mod tests {
         for i in 0..5 {
             let job_id = JobId::new();
             store
-                .put(job_id, format!("log {}", i).into_bytes())
+                .put(job_id, format!("log {i}").into_bytes())
                 .await
                 .unwrap();
         }
@@ -459,7 +459,7 @@ mod tests {
 
         let receipt = store.bounded_put(job_id, data.clone(), 1024).await.unwrap();
 
-        assert_eq!(receipt.uri, format!("gitforge://log/{}", job_id));
+        assert_eq!(receipt.uri, format!("gitforge://log/{job_id}"));
         assert_eq!(receipt.bytes, data.len() as u64);
         assert_eq!(receipt.sha256, expected_sha256(&data));
         // The stored bytes are exactly what the receipt describes.
@@ -541,13 +541,13 @@ mod tests {
         let job_id = JobId::new();
         store.put(job_id, b"ephemeral".to_vec()).await.unwrap();
         let logs_dir = temp_dir.path().join("job_logs");
-        assert!(logs_dir.join(format!("{}.log", job_id)).exists());
-        assert!(logs_dir.join(format!("{}.meta.json", job_id)).exists());
+        assert!(logs_dir.join(format!("{job_id}.log")).exists());
+        assert!(logs_dir.join(format!("{job_id}.meta.json")).exists());
 
         store.delete(&job_id).await.unwrap();
 
-        assert!(!logs_dir.join(format!("{}.log", job_id)).exists());
-        assert!(!logs_dir.join(format!("{}.meta.json", job_id)).exists());
+        assert!(!logs_dir.join(format!("{job_id}.log")).exists());
+        assert!(!logs_dir.join(format!("{job_id}.meta.json")).exists());
         assert!(store.list().await.unwrap().is_empty());
     }
 
@@ -580,7 +580,7 @@ mod tests {
             temp_dir
                 .path()
                 .join("job_logs")
-                .join(format!("{}.log", job_id)),
+                .join(format!("{job_id}.log")),
         )
         .unwrap();
 

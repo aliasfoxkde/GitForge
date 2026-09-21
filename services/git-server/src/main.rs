@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     // Start HTTP server
-    let http_addr = format!("0.0.0.0:{}", http_port);
+    let http_addr = format!("0.0.0.0:{http_port}");
     tracing::info!("starting Git HTTP server on {}", http_addr);
 
     let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
@@ -247,12 +247,22 @@ async fn lookup_repo_id(
     }
 }
 
+/// Complete a statically-constructed response. Builder inputs here are
+/// constants, so a builder failure would be a programming error; degrade
+/// to a bare 500 instead of unwinding the connection handler.
+fn finish_response(builder: axum::http::response::Builder, body: Body) -> Response {
+    builder.body(body).unwrap_or_else(|error| {
+        tracing::error!(%error, "response construction failed");
+        Response::new(Body::from("internal error"))
+    })
+}
+
 /// Git upload-pack handler (GET) - returns ref advertisement
 async fn git_upload_pack(
     Path((owner, repo)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> Response {
-    let repo_path = format!("{}/{}", owner, repo);
+    let repo_path = format!("{owner}/{repo}");
 
     // Try to look up repo ID from database first
     let repo_id = if let Some(_pool) = &state.db_pool {
@@ -260,10 +270,10 @@ async fn git_upload_pack(
             Some(id) => id,
             None => {
                 tracing::warn!("repository not found in DB: {}", repo_path);
-                return Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::from(format!("Repository not found: {}", repo_path)))
-                    .unwrap();
+                return finish_response(
+                    Response::builder().status(StatusCode::NOT_FOUND),
+                    Body::from(format!("Repository not found: {repo_path}")),
+                );
             }
         }
     } else {
@@ -271,31 +281,30 @@ async fn git_upload_pack(
             "database not available, cannot look up repository: {}",
             repo_path
         );
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(Body::from("Database not available"))
-            .unwrap();
+        return finish_response(
+            Response::builder().status(StatusCode::SERVICE_UNAVAILABLE),
+            Body::from("Database not available"),
+        );
     };
 
     // Check if repository exists in storage
     if !state.storage.exists(repo_id).await {
         tracing::warn!("repository not found in storage: {}", repo_path);
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from(format!("Repository not found: {}", repo_path)))
-            .unwrap();
+        return finish_response(
+            Response::builder().status(StatusCode::NOT_FOUND),
+            Body::from(format!("Repository not found: {repo_path}")),
+        );
     }
 
     match state.http_handler.upload_pack(repo_id, vec![]).await {
         Ok(response) => {
-            let mut res = Response::builder()
-                .status(StatusCode::OK)
-                .header(
+            let mut res = finish_response(
+                Response::builder().status(StatusCode::OK).header(
                     "Content-Type",
                     "application/x-git-upload-pack-advertisement",
-                )
-                .body(Body::from(response))
-                .unwrap();
+                ),
+                Body::from(response),
+            );
             res.headers_mut().insert(
                 "Cache-Control",
                 axum::http::HeaderValue::from_static("no-cache"),
@@ -304,10 +313,10 @@ async fn git_upload_pack(
         }
         Err(e) => {
             tracing::warn!("upload-pack failed for {}: {}", repo_path, e);
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from(format!("Error: {}", e)))
-                .unwrap()
+            finish_response(
+                Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR),
+                Body::from(format!("Error: {e}")),
+            )
         }
     }
 }
@@ -336,41 +345,42 @@ async fn git_info_refs(
         match lookup_repo_id(&state.db_pool, &owner, &repo).await {
             Some(id) => id,
             None => {
-                return Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::from(format!("Repository not found: {repo_path}")))
-                    .unwrap()
+                return finish_response(
+                    Response::builder().status(StatusCode::NOT_FOUND),
+                    Body::from(format!("Repository not found: {repo_path}")),
+                )
             }
         }
     } else {
         tracing::warn!(
             "database not available for info/refs, cannot look up repository: {repo_path}"
         );
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(Body::from("Database not available"))
-            .unwrap();
+        return finish_response(
+            Response::builder().status(StatusCode::SERVICE_UNAVAILABLE),
+            Body::from("Database not available"),
+        );
     };
     if !state.storage.exists(repo_id).await {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from(format!("Repository not found: {repo_path}")))
-            .unwrap();
+        return finish_response(
+            Response::builder().status(StatusCode::NOT_FOUND),
+            Body::from(format!("Repository not found: {repo_path}")),
+        );
     }
     match state.http_handler.receive_pack_advertisement(repo_id).await {
-        Ok(response) => Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                "Content-Type",
-                "application/x-git-receive-pack-advertisement",
-            )
-            .header("Cache-Control", "no-cache")
-            .body(Body::from(response))
-            .unwrap(),
-        Err(error) => Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Body::from(format!("Error: {error}")))
-            .unwrap(),
+        Ok(response) => finish_response(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    "Content-Type",
+                    "application/x-git-receive-pack-advertisement",
+                )
+                .header("Cache-Control", "no-cache"),
+            Body::from(response),
+        ),
+        Err(error) => finish_response(
+            Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR),
+            Body::from(format!("Error: {error}")),
+        ),
     }
 }
 
@@ -389,10 +399,10 @@ async fn git_upload_pack_standard(
             Some(id) => id,
             None => {
                 tracing::warn!("repository not found in DB: {}", repo_path);
-                return Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::from(format!("Repository not found: {repo_path}")))
-                    .unwrap();
+                return finish_response(
+                    Response::builder().status(StatusCode::NOT_FOUND),
+                    Body::from(format!("Repository not found: {repo_path}")),
+                );
             }
         }
     } else {
@@ -400,40 +410,41 @@ async fn git_upload_pack_standard(
             "database not available, cannot look up repository: {}",
             repo_path
         );
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(Body::from("Database not available"))
-            .unwrap();
+        return finish_response(
+            Response::builder().status(StatusCode::SERVICE_UNAVAILABLE),
+            Body::from("Database not available"),
+        );
     };
     if !state.storage.exists(repo_id).await {
         tracing::warn!("repository not found in storage: {}", repo_path);
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from(format!("Repository not found: {repo_path}")))
-            .unwrap();
+        return finish_response(
+            Response::builder().status(StatusCode::NOT_FOUND),
+            Body::from(format!("Repository not found: {repo_path}")),
+        );
     }
     let body = match axum::body::to_bytes(request.into_body(), max_git_body_bytes()).await {
         Ok(body) => body,
         Err(error) => {
             tracing::warn!("failed to read upload-pack body: {}", error);
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from(format!("Bad request: {}", error)))
-                .unwrap();
+            return finish_response(
+                Response::builder().status(StatusCode::BAD_REQUEST),
+                Body::from(format!("Bad request: {error}")),
+            );
         }
     };
     match state.http_handler.upload_pack(repo_id, body.to_vec()).await {
-        Ok(response) => Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/x-git-upload-pack-result")
-            .body(Body::from(response))
-            .unwrap(),
+        Ok(response) => finish_response(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/x-git-upload-pack-result"),
+            Body::from(response),
+        ),
         Err(e) => {
             tracing::warn!("upload-pack failed for {}: {}", repo_path, e);
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from(format!("Error: {}", e)))
-                .unwrap()
+            finish_response(
+                Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR),
+                Body::from(format!("Error: {e}")),
+            )
         }
     }
 }
@@ -444,7 +455,7 @@ async fn git_receive_pack(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> Response {
-    let repo_path = format!("{}/{}", owner, repo);
+    let repo_path = format!("{owner}/{repo}");
 
     // Try to look up repo ID from database first
     let repo_id = if let Some(_pool) = &state.db_pool {
@@ -452,10 +463,10 @@ async fn git_receive_pack(
             Some(id) => id,
             None => {
                 tracing::warn!("repository not found in DB: {}", repo_path);
-                return Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::from(format!("Repository not found: {}", repo_path)))
-                    .unwrap();
+                return finish_response(
+                    Response::builder().status(StatusCode::NOT_FOUND),
+                    Body::from(format!("Repository not found: {repo_path}")),
+                );
             }
         }
     } else {
@@ -463,19 +474,19 @@ async fn git_receive_pack(
             "database not available, cannot look up repository: {}",
             repo_path
         );
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(Body::from("Database not available"))
-            .unwrap();
+        return finish_response(
+            Response::builder().status(StatusCode::SERVICE_UNAVAILABLE),
+            Body::from("Database not available"),
+        );
     };
 
     // Check if repository exists in storage
     if !state.storage.exists(repo_id).await {
         tracing::warn!("repository not found in storage: {}", repo_path);
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from(format!("Repository not found: {}", repo_path)))
-            .unwrap();
+        return finish_response(
+            Response::builder().status(StatusCode::NOT_FOUND),
+            Body::from(format!("Repository not found: {repo_path}")),
+        );
     }
 
     // Read request body. Oversized pushes are rejected explicitly instead of
@@ -485,10 +496,10 @@ async fn git_receive_pack(
         Ok(body) => body,
         Err(error) => {
             tracing::warn!("failed to read receive-pack body: {}", error);
-            return Response::builder()
-                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .body(Body::from(format!("Receive-pack body rejected: {}", error)))
-                .unwrap();
+            return finish_response(
+                Response::builder().status(StatusCode::PAYLOAD_TOO_LARGE),
+                Body::from(format!("Receive-pack body rejected: {error}")),
+            );
         }
     };
 
@@ -511,18 +522,19 @@ async fn git_receive_pack(
             if let Err(error) = deliver_pending_ci_events(&state).await {
                 tracing::warn!(error = %error, "CI outbox delivery deferred after push");
             }
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/x-git-receive-pack-result")
-                .body(Body::from(response))
-                .unwrap()
+            finish_response(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/x-git-receive-pack-result"),
+                Body::from(response),
+            )
         }
         Err(e) => {
             tracing::warn!("receive-pack failed for {}: {}", repo_path, e);
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from(format!("Error: {}", e)))
-                .unwrap()
+            finish_response(
+                Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR),
+                Body::from(format!("Error: {e}")),
+            )
         }
     }
 }

@@ -403,7 +403,7 @@ mod tests {
             "def456".to_string(),
             None,
         );
-        let debug_str = format!("{:?}", payload);
+        let debug_str = format!("{payload:?}");
         assert!(debug_str.contains("HookPayload"));
     }
 
@@ -499,7 +499,7 @@ mod tests {
             let result = execute_push_hooks(
                 &manager,
                 RepoId::new(),
-                &format!("refs/heads/{}", branch),
+                &format!("refs/heads/{branch}"),
                 "abc123",
                 "def456",
                 None,
@@ -526,13 +526,8 @@ mod tests {
                 "def456".to_string(),
                 None,
             );
-            assert_eq!(
-                payload.is_branch_push(),
-                is_branch,
-                "failed for {}",
-                ref_name
-            );
-            assert_eq!(payload.is_tag_push(), is_tag, "failed for {}", ref_name);
+            assert_eq!(payload.is_branch_push(), is_branch, "failed for {ref_name}");
+            assert_eq!(payload.is_tag_push(), is_tag, "failed for {ref_name}");
         }
     }
 

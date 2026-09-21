@@ -15,7 +15,10 @@ fn make_pipeline(jobs: Vec<(&str, Vec<&str>)>) -> PipelineDefinition {
         .map(|(name, needs)| gitforge_ci::JobDefinition {
             name: name.to_string(),
             image: "rust:latest".to_string(),
-            needs: needs.into_iter().map(|s| s.to_string()).collect(),
+            needs: needs
+                .into_iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             env: HashMap::new(),
             steps: vec![],
             timeout: None,

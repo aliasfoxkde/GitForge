@@ -58,7 +58,7 @@ impl HttpClient for RealHttpClient {
         let response = self
             .client
             .post(url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", format!("Bearer {token}"))
             .json(payload)
             .send()
             .await
@@ -80,7 +80,7 @@ impl HttpClient for RealHttpClient {
         let response = self
             .client
             .get(url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", format!("Bearer {token}"))
             .send()
             .await
             .context("failed to pull from cloud")?;
@@ -145,7 +145,7 @@ impl HttpClient for MockHttpClient {
                 let json = serde_json::to_string(resp).unwrap();
                 Ok(serde_json::from_str(&json).unwrap())
             }
-            Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+            Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
             None => anyhow::bail!("mock push not configured"),
         }
     }
@@ -160,7 +160,7 @@ impl HttpClient for MockHttpClient {
                 let json = serde_json::to_string(resp).unwrap();
                 Ok(serde_json::from_str(&json).unwrap())
             }
-            Some(Err(e)) => Err(anyhow::anyhow!("{}", e)),
+            Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
             None => anyhow::bail!("mock pull not configured"),
         }
     }
@@ -337,7 +337,7 @@ impl<C: HttpClient> SyncClient<C> {
         };
 
         // POST to cloud sync endpoint
-        let url = format!("{}/sync/push", api_url);
+        let url = format!("{api_url}/sync/push");
         let push_response: PushResponse = self
             .http_client
             .post_json(&url, token, &payload)
@@ -358,7 +358,7 @@ impl<C: HttpClient> SyncClient<C> {
     /// Pull cloud state to local
     pub async fn pull(&self, api_url: &str, token: &str) -> Result<PullResponse> {
         // GET from cloud sync endpoint
-        let url = format!("{}/sync/pull", api_url);
+        let url = format!("{api_url}/sync/pull");
         let pull_response: PullResponse = self
             .http_client
             .get_json(&url, token)

@@ -230,8 +230,8 @@ async fn test_database_multiple_users() {
     // Create multiple users
     for i in 0..5 {
         let user = User::new(
-            format!("user{}", i),
-            format!("user{}@example.com", i),
+            format!("user{i}"),
+            format!("user{i}@example.com"),
             "hash".to_string(),
         );
         UserQueries::create(&pool, &user).await.unwrap();

@@ -163,8 +163,7 @@ impl RunnerConfig {
                         })?;
                         if parsed <= 0 {
                             return Err(Error::invalid_input(format!(
-                                "GITFORGE_RUNNER_CAPACITY must be a positive integer (got {})",
-                                parsed
+                                "GITFORGE_RUNNER_CAPACITY must be a positive integer (got {parsed})"
                             )));
                         }
                         capacity = Some(parsed as i32);
@@ -180,8 +179,7 @@ impl RunnerConfig {
                         })?;
                         if parsed <= 0 {
                             return Err(Error::invalid_input(format!(
-                                "GITFORGE_HEARTBEAT_INTERVAL must be a positive integer (got {})",
-                                parsed
+                                "GITFORGE_HEARTBEAT_INTERVAL must be a positive integer (got {parsed})"
                             )));
                         }
                         heartbeat_interval_secs = Some(parsed as u64);
@@ -195,8 +193,7 @@ impl RunnerConfig {
                         })?;
                         if parsed <= 0 {
                             return Err(Error::invalid_input(format!(
-                                "GITFORGE_FETCH_INTERVAL must be a positive integer (got {})",
-                                parsed
+                                "GITFORGE_FETCH_INTERVAL must be a positive integer (got {parsed})"
                             )));
                         }
                         fetch_interval_secs = Some(parsed as u64);
@@ -220,8 +217,7 @@ impl RunnerConfig {
                         })?;
                         if parsed <= 0 {
                             return Err(Error::invalid_input(format!(
-                                "GITFORGE_REGISTER_ATTEMPTS must be a positive integer (got {})",
-                                parsed
+                                "GITFORGE_REGISTER_ATTEMPTS must be a positive integer (got {parsed})"
                             )));
                         }
                         register_attempts = Some(parsed as u32);
@@ -237,8 +233,7 @@ impl RunnerConfig {
                         })?;
                         if parsed < 0 {
                             return Err(Error::invalid_input(format!(
-                                "GITFORGE_REGISTER_BACKOFF_SECS must not be negative (got {})",
-                                parsed
+                                "GITFORGE_REGISTER_BACKOFF_SECS must not be negative (got {parsed})"
                             )));
                         }
                         register_backoff_secs = Some(parsed as u64);
@@ -252,8 +247,7 @@ impl RunnerConfig {
                             "deny" | "false" | "0" => false,
                             other => {
                                 return Err(Error::invalid_input(format!(
-                                    "GITFORGE_RUNNER_STANDALONE must be allow or deny (got {})",
-                                    other
+                                    "GITFORGE_RUNNER_STANDALONE must be allow or deny (got {other})"
                                 )))
                             }
                         });
@@ -747,7 +741,7 @@ impl RunnerAgent {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| Error::internal(format!("failed to create HTTP client: {}", e)))?;
+            .map_err(|e| Error::internal(format!("failed to create HTTP client: {e}")))?;
 
         let sandbox = DockerSandbox::connect_required().await?;
         let executor = JobExecutor::new().await?;
@@ -901,10 +895,7 @@ impl RunnerAgent {
                     break;
                 }
                 tracing::debug!("runner {} sending heartbeat", heartbeat_runner_id);
-                let url = format!(
-                    "{}/runners/{}/heartbeat",
-                    heartbeat_url, heartbeat_runner_id
-                );
+                let url = format!("{heartbeat_url}/runners/{heartbeat_runner_id}/heartbeat");
                 let mut heartbeat_request = heartbeat_client.post(&url);
                 if let Some(token) = &heartbeat_token {
                     heartbeat_request = heartbeat_request.bearer_auth(token);
@@ -942,7 +933,7 @@ impl RunnerAgent {
                 }
                 tracing::debug!("runner checking for jobs...");
 
-                let jobs_url = format!("{}/jobs/pending?runner_id={}", fetch_url, fetch_runner_id);
+                let jobs_url = format!("{fetch_url}/jobs/pending?runner_id={fetch_runner_id}");
                 let mut fetch_request = fetch_client.get(&jobs_url);
                 if let Some(token) = &fetch_token {
                     fetch_request = fetch_request.bearer_auth(token);
@@ -1101,7 +1092,7 @@ impl RunnerAgent {
         runner_id: RunnerId,
         scheduler_token: Option<&str>,
     ) -> Option<String> {
-        let url = format!("{}/jobs/{}/claim", scheduler_url, job_id);
+        let url = format!("{scheduler_url}/jobs/{job_id}/claim");
         let mut request = client
             .post(url)
             .json(&serde_json::json!({"runner_id": runner_id.to_string()}));
@@ -1141,8 +1132,7 @@ impl RunnerAgent {
 
         // Convert assignment to ExecutableJob
         let pipeline_run_id = uuid::Uuid::parse_str(&assignment.pipeline_run_id)
-            .map(PipelineRunId::from)
-            .unwrap_or_else(|_| PipelineRunId::new());
+            .map_or_else(|_| PipelineRunId::new(), PipelineRunId::from);
 
         let executable = ExecutableJob {
             job_id,
@@ -1217,10 +1207,7 @@ impl RunnerAgent {
         let orphaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let orphaned_watch = orphaned.clone();
         let cancellation_watch = tokio::spawn(async move {
-            let endpoint = format!(
-                "{}/jobs/{}/cancelled",
-                cancellation_url, cancellation_job_id
-            );
+            let endpoint = format!("{cancellation_url}/jobs/{cancellation_job_id}/cancelled");
             let mut probe_failures = 0u8;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1418,8 +1405,7 @@ pub(crate) enum ReceiptWriteOutcome {
 /// Read the reconciler env-var configuration and validate it.
 fn load_reconciler_config_from_env() -> std::result::Result<ReconcilerLoopConfig, String> {
     let deletion_enabled = std::env::var("GITFORGE_RECONCILE_DELETE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let grace_secs: u64 = std::env::var("GITFORGE_RECONCILE_GRACE_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1899,8 +1885,7 @@ fn utf8_chunks(value: &str, max_bytes: usize) -> Vec<&str> {
             end = value[start..]
                 .char_indices()
                 .nth(1)
-                .map(|(offset, _)| start + offset)
-                .unwrap_or(value.len());
+                .map_or(value.len(), |(offset, _)| start + offset);
         }
         chunks.push(&value[start..end]);
         start = end;
@@ -2285,7 +2270,7 @@ mod tests {
     #[test]
     fn test_runner_config_debug() {
         let config = RunnerConfig::default();
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
         assert!(debug_str.contains("runner"));
     }
 
@@ -2300,7 +2285,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
         };
-        let debug_str = format!("{:?}", assignment);
+        let debug_str = format!("{assignment:?}");
         assert!(debug_str.contains("job-123"));
     }
 
@@ -2450,7 +2435,7 @@ mod tests {
         // We can't easily create a running agent for debug test
         // but we can verify the type implements Debug
         let config = RunnerConfig::default();
-        assert!(format!("{:?}", config).contains("RunnerConfig"));
+        assert!(format!("{config:?}").contains("RunnerConfig"));
     }
 
     #[test]
@@ -2549,7 +2534,7 @@ mod tests {
 
     #[test]
     fn test_job_assignment_with_many_commands() {
-        let commands: Vec<String> = (0..100).map(|i| format!("echo step{}", i)).collect();
+        let commands: Vec<String> = (0..100).map(|i| format!("echo step{i}")).collect();
         let assignment = JobAssignment {
             job_id: "job-many".to_string(),
             name: "many-steps".to_string(),

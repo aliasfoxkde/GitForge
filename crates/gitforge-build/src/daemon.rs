@@ -118,10 +118,10 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            _ = &mut shutdown_signal => {
+            () = &mut shutdown_signal => {
                 break;
             }
-            _ = create_shutdown_future(shutdown_flag.clone()) => {
+            () = create_shutdown_future(shutdown_flag.clone()) => {
                 break;
             }
         }
