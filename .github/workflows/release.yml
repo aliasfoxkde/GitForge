@@ -18,7 +18,7 @@ jobs:
   # Linux build (x86_64 only - cross-compilation not available)
   # ─────────────────────────────────────────────────────────────────────────────
   build-linux:
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -103,7 +103,7 @@ jobs:
   release:
     needs: [build-linux, build-macos, build-windows]
     if: github.repository_owner == 'aliasfoxkde'
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     permissions:
       actions: read
       contents: write

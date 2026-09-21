@@ -6,3 +6,4 @@
 self-hosted-runner:
   labels:
     - gitforge
+    - gitforge-github
