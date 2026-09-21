@@ -187,13 +187,16 @@ fn test_gitforge_buildd_list_jobs() {
     );
 }
 
-/// Helper: Check if daemon is running
+/// Resolve the daemon socket the same way gitforge-build does.
+fn daemon_socket_path() -> String {
+    std::env::var("GITFORGE_BUILD_SOCKET")
+        .unwrap_or_else(|_| "/tmp/gitforge-build.sock".to_string())
+}
+
+/// Helper: Check if daemon is running. The daemon's contract is its Unix
+/// socket; process-name matching false-positives on unrelated processes.
 fn is_daemon_running() -> bool {
-    Command::new("pgrep")
-        .args(["-f", "gitforge-buildd"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    std::path::Path::new(&daemon_socket_path()).exists()
 }
 
 /// Helper: Get daemon stats

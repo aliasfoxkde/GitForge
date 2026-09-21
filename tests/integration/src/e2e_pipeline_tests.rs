@@ -130,11 +130,10 @@ async fn test_job_assignment_flow() {
     let job = &jobs[0];
     JobQueries::assign(&pool, job.id, runner.id).await.unwrap();
 
-    // Verify assignment - note: assign only sets runner_id, not status
+    // Assignment claims the job for the runner and advances its status.
     let found = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
     assert_eq!(found.runner_id, Some(runner.id));
-    // Status remains "pending" since assign doesn't update status
-    assert_eq!(found.status, "pending");
+    assert_eq!(found.status, "assigned");
 }
 
 #[tokio::test]
