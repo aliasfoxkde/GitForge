@@ -170,18 +170,6 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create pipelines active index: {e}")))?;
 
-        // One active pipeline version per repository and name; superseded
-        // versions stay as history with active = 0.
-        sqlx::query(
-            r#"
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_pipelines_active_repo_name
-            ON pipelines(repo_id, name) WHERE active = 1
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Error::database(format!("failed to create pipelines active index: {e}")))?;
-
         // Create pipeline_runs table
         sqlx::query(
             r#"

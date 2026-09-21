@@ -633,6 +633,7 @@ impl Scheduler {
 
         let mut requeued = 0;
         let db_pool = self.db_pool.clone();
+        let mut fenced_jobs = Vec::new();
         let mut state = self.state.write().await;
 
         for (job_id, pipeline_run_id, repo_id) in &jobs_to_requeue {
@@ -690,8 +691,10 @@ impl Scheduler {
 
             if fenced {
                 // A fenced execution is terminal: it must NOT re-enter the
-                // queue. The pipeline finalizes failed through the ordinary
-                // job-finalization path.
+                // queue. Notify the CI engine after releasing the scheduler
+                // state lock so its in-memory mirror can fail the job and
+                // finalize the pipeline instead of remaining live forever.
+                fenced_jobs.push((*job_id, *pipeline_run_id));
                 continue;
             }
 
@@ -708,6 +711,16 @@ impl Scheduler {
                 runner_id
             );
             requeued += 1;
+        }
+
+        drop(state);
+        for (job_id, pipeline_run_id) in fenced_jobs {
+            let _ = self.event_tx.send(SchedulerEvent::JobCompleted {
+                job_id,
+                pipeline_run_id,
+                runner_id,
+                success: false,
+            });
         }
 
         requeued
@@ -1659,6 +1672,7 @@ mod tests {
             .unwrap();
 
         let scheduler = Scheduler::with_db(pool.clone());
+        let mut events = scheduler.subscribe();
         let runner_id = RunnerId::new();
         scheduler
             .register_runner(make_runner(runner_id, "fence-runner", "online", 1))
@@ -1682,6 +1696,7 @@ mod tests {
             state.runners.get_mut(&runner_id).unwrap().last_heartbeat =
                 Some(chrono::Utc::now() - chrono::Duration::seconds(120));
         }
+        while events.try_recv().is_ok() {}
         scheduler.process_queue().await;
 
         // The running job is fenced failed, NOT re-enqueued.
@@ -1693,6 +1708,16 @@ mod tests {
         assert!(fenced.runner_id.is_none());
         assert_eq!(scheduler.queue_len().await, 0);
         assert!(scheduler.is_assigned(job_id).await.is_none());
+
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            SchedulerEvent::JobCompleted {
+                job_id: completed_job,
+                pipeline_run_id: completed_run,
+                runner_id: completed_runner,
+                success: false,
+            } if completed_job == job_id && completed_run == run.id && completed_runner == runner_id
+        ));
 
         let state = scheduler.state.read().await;
         assert_eq!(state.runners[&runner_id].status, "offline");
