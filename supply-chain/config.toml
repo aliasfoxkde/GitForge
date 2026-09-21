@@ -79,11 +79,11 @@ version = "1.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-lc-rs]]
-version = "1.17.3"
+version = "1.18.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-lc-sys]]
-version = "0.43.0"
+version = "0.45.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.axum]]
@@ -99,7 +99,7 @@ version = "1.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.base64]]
-version = "0.23.0"
+version = "0.23.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.base64ct]]
@@ -299,7 +299,7 @@ version = "0.11.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.dirs]]
-version = "6.0.0"
+version = "7.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.dirs-sys]]
@@ -367,7 +367,7 @@ version = "1.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.futures]]
-version = "0.3.33"
+version = "0.3.34"
 criteria = "safe-to-deploy"
 
 [[exemptions.futures-channel]]
@@ -379,7 +379,7 @@ version = "0.3.34"
 criteria = "safe-to-deploy"
 
 [[exemptions.futures-executor]]
-version = "0.3.33"
+version = "0.3.34"
 criteria = "safe-to-deploy"
 
 [[exemptions.futures-intrusive]]
@@ -479,7 +479,7 @@ version = "0.4.14"
 criteria = "safe-to-deploy"
 
 [[exemptions.hyper]]
-version = "1.11.0"
+version = "1.11.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.hyper-named-pipe]]
@@ -831,7 +831,7 @@ version = "0.8.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.reqwest]]
-version = "0.13.4"
+version = "0.13.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.rfc6979]]
@@ -875,7 +875,7 @@ version = "1.1.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls]]
-version = "0.23.42"
+version = "0.23.37"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls-native-certs]]
@@ -1147,7 +1147,7 @@ version = "0.7.19"
 criteria = "safe-to-deploy"
 
 [[exemptions.toml]]
-version = "1.1.4+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.toml_parser]]
@@ -1163,7 +1163,7 @@ version = "0.6.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.tower-http]]
-version = "0.7.0"
+version = "0.7.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.tower-layer]]
@@ -1219,7 +1219,7 @@ version = "0.9.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.uuid]]
-version = "1.26.0"
+version = "1.26.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.version_check]]
