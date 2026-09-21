@@ -39,7 +39,9 @@ impl CiEngineState {
 
     /// Check if all jobs are finished
     pub fn all_jobs_finished(&self) -> bool {
-        self.jobs.values().all(|j| j.is_terminal())
+        self.jobs
+            .values()
+            .all(super::state::JobStateMachine::is_terminal)
     }
 
     /// Check if all jobs succeeded

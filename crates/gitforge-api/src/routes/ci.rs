@@ -73,10 +73,6 @@ fn can_manage_jobs(claims: &Claims) -> bool {
     matches!(claims.role.as_str(), "admin" | "maintainer")
 }
 
-fn claims_from_user(user: AuthenticatedUser) -> Result<Claims, StatusCode> {
-    Ok(user.claims)
-}
-
 /// Require ownership of a repository, with admin/maintainer override.
 async fn authorize_repo(
     pool: &Pool,
@@ -128,36 +124,34 @@ async fn list_pipelines(
     Extension(pool): Extension<Arc<Pool>>,
     user: AuthenticatedUser,
 ) -> impl IntoResponse {
-    match claims_from_user(user) {
-        Err(e) => e.into_response(),
-        Ok(claims) => match PipelineQueries::list(&pool).await {
-            Ok(pipelines) => {
-                let mut response = Vec::new();
-                for p in pipelines {
-                    if authorize_repo(&pool, &claims, p.repo_id).await.is_ok() {
-                        response.push(serde_json::json!({
-                            "id": p.id.to_string(),
-                            "repo_id": p.repo_id.to_string(),
-                            "name": p.name,
-                            "trigger_type": p.trigger_type,
-                            "created_at": p.created_at.to_rfc3339()
-                        }));
-                    }
+    let claims = user.claims;
+    match PipelineQueries::list(&pool).await {
+        Ok(pipelines) => {
+            let mut response = Vec::new();
+            for p in pipelines {
+                if authorize_repo(&pool, &claims, p.repo_id).await.is_ok() {
+                    response.push(serde_json::json!({
+                        "id": p.id.to_string(),
+                        "repo_id": p.repo_id.to_string(),
+                        "name": p.name,
+                        "trigger_type": p.trigger_type,
+                        "created_at": p.created_at.to_rfc3339()
+                    }));
                 }
-                Json(response).into_response()
             }
-            Err(e) => {
-                tracing::error!("failed to list pipelines: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": "database_error",
-                        "message": "failed to list pipelines"
-                    })),
-                )
-                    .into_response()
-            }
-        },
+            Json(response).into_response()
+        }
+        Err(e) => {
+            tracing::error!("failed to list pipelines: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "failed to list pipelines"
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -167,64 +161,60 @@ async fn get_pipeline(
     user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match claims_from_user(user) {
-        Err(e) => e.into_response(),
-        Ok(claims) => {
-            tracing::debug!("get pipeline: {}", id);
+    let claims = user.claims;
+    tracing::debug!("get pipeline: {}", id);
 
-            match Uuid::parse_str(&id) {
-                Ok(uuid) => {
-                    let pipeline_id = PipelineId::from(uuid);
-                    match PipelineQueries::get(&pool, pipeline_id).await {
-                        Ok(Some(pipeline)) => match authorize_repo(&pool, &claims, pipeline.repo_id).await {
-                            Ok(()) => (
-                                StatusCode::OK,
-                                Json(serde_json::json!({
-                                    "id": pipeline.id.to_string(),
-                                    "repo_id": pipeline.repo_id.to_string(),
-                                    "name": pipeline.name,
-                                    "trigger_type": pipeline.trigger_type,
-                                    "created_at": pipeline.created_at.to_rfc3339()
-                                })),
-                            )
-                                .into_response(),
-                            Err(status) => (
-                                status,
-                                Json(serde_json::json!({"error": "forbidden", "message": "Pipeline access is not permitted"})),
-                            )
-                                .into_response(),
-                        },
-                        Ok(None) => (
-                            StatusCode::NOT_FOUND,
+    match Uuid::parse_str(&id) {
+        Ok(uuid) => {
+            let pipeline_id = PipelineId::from(uuid);
+            match PipelineQueries::get(&pool, pipeline_id).await {
+                    Ok(Some(pipeline)) => match authorize_repo(&pool, &claims, pipeline.repo_id).await {
+                        Ok(()) => (
+                            StatusCode::OK,
                             Json(serde_json::json!({
-                                "error": "not_found",
-                                "message": "Pipeline not found"
+                                "id": pipeline.id.to_string(),
+                                "repo_id": pipeline.repo_id.to_string(),
+                                "name": pipeline.name,
+                                "trigger_type": pipeline.trigger_type,
+                                "created_at": pipeline.created_at.to_rfc3339()
                             })),
                         )
                             .into_response(),
-                        Err(e) => {
-                            tracing::error!("failed to get pipeline: {}", e);
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(serde_json::json!({
-                                    "error": "database_error",
-                                    "message": format!("failed to get pipeline: {}", e)
-                                })),
-                            )
-                                .into_response()
-                        }
+                        Err(status) => (
+                            status,
+                            Json(serde_json::json!({"error": "forbidden", "message": "Pipeline access is not permitted"})),
+                        )
+                            .into_response(),
+                    },
+                    Ok(None) => (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": "not_found",
+                            "message": "Pipeline not found"
+                        })),
+                    )
+                        .into_response(),
+                    Err(e) => {
+                        tracing::error!("failed to get pipeline: {}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "database_error",
+                                "message": format!("failed to get pipeline: {}", e)
+                            })),
+                        )
+                            .into_response()
                     }
                 }
-                Err(_) => (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "invalid_id",
-                        "message": "Invalid pipeline ID format"
-                    })),
-                )
-                    .into_response(),
-            }
         }
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_id",
+                "message": "Invalid pipeline ID format"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -233,38 +223,36 @@ async fn list_pipeline_runs(
     Extension(pool): Extension<Arc<Pool>>,
     user: AuthenticatedUser,
 ) -> impl IntoResponse {
-    match claims_from_user(user) {
-        Err(e) => e.into_response(),
-        Ok(claims) => match PipelineRunQueries::list(&pool).await {
-            Ok(runs) => {
-                let mut response = Vec::new();
-                for r in runs {
-                    if authorize_repo(&pool, &claims, r.repo_id).await.is_ok() {
-                        response.push(serde_json::json!({
-                            "id": r.id.to_string(),
-                            "pipeline_id": r.pipeline_id.to_string(),
-                            "status": r.status,
-                            "commit_hash": r.commit_hash,
-                            "triggered_by": r.triggered_by,
-                            "started_at": r.started_at.map(|dt| dt.to_rfc3339()),
-                            "finished_at": r.finished_at.map(|dt| dt.to_rfc3339())
-                        }));
-                    }
+    let claims = user.claims;
+    match PipelineRunQueries::list(&pool).await {
+        Ok(runs) => {
+            let mut response = Vec::new();
+            for r in runs {
+                if authorize_repo(&pool, &claims, r.repo_id).await.is_ok() {
+                    response.push(serde_json::json!({
+                        "id": r.id.to_string(),
+                        "pipeline_id": r.pipeline_id.to_string(),
+                        "status": r.status,
+                        "commit_hash": r.commit_hash,
+                        "triggered_by": r.triggered_by,
+                        "started_at": r.started_at.map(|dt| dt.to_rfc3339()),
+                        "finished_at": r.finished_at.map(|dt| dt.to_rfc3339())
+                    }));
                 }
-                Json(response).into_response()
             }
-            Err(e) => {
-                tracing::error!("failed to list pipeline runs: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": "database_error",
-                        "message": "failed to list pipeline runs"
-                    })),
-                )
-                    .into_response()
-            }
-        },
+            Json(response).into_response()
+        }
+        Err(e) => {
+            tracing::error!("failed to list pipeline runs: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "failed to list pipeline runs"
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -274,66 +262,62 @@ async fn get_pipeline_run(
     user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match claims_from_user(user) {
-        Err(e) => e.into_response(),
-        Ok(claims) => {
-            tracing::debug!("get pipeline run: {}", id);
+    let claims = user.claims;
+    tracing::debug!("get pipeline run: {}", id);
 
-            match Uuid::parse_str(&id) {
-                Ok(uuid) => {
-                    let run_id = PipelineRunId::from(uuid);
-                    match PipelineRunQueries::get(&pool, run_id).await {
-                        Ok(Some(run)) => match authorize_repo(&pool, &claims, run.repo_id).await {
-                            Ok(()) => (
-                                StatusCode::OK,
-                                Json(serde_json::json!({
-                                    "id": run.id.to_string(),
-                                    "pipeline_id": run.pipeline_id.to_string(),
-                                    "status": run.status,
-                                    "commit_hash": run.commit_hash,
-                                    "triggered_by": run.triggered_by,
-                                    "started_at": run.started_at.map(|dt| dt.to_rfc3339()),
-                                    "finished_at": run.finished_at.map(|dt| dt.to_rfc3339())
-                                })),
-                            )
-                                .into_response(),
-                            Err(status) => (
-                                status,
-                                Json(serde_json::json!({"error": "forbidden", "message": "Pipeline run access is not permitted"})),
-                            )
-                                .into_response(),
-                        },
-                        Ok(None) => (
-                            StatusCode::NOT_FOUND,
+    match Uuid::parse_str(&id) {
+        Ok(uuid) => {
+            let run_id = PipelineRunId::from(uuid);
+            match PipelineRunQueries::get(&pool, run_id).await {
+                    Ok(Some(run)) => match authorize_repo(&pool, &claims, run.repo_id).await {
+                        Ok(()) => (
+                            StatusCode::OK,
                             Json(serde_json::json!({
-                                "error": "not_found",
-                                "message": "Pipeline run not found"
+                                "id": run.id.to_string(),
+                                "pipeline_id": run.pipeline_id.to_string(),
+                                "status": run.status,
+                                "commit_hash": run.commit_hash,
+                                "triggered_by": run.triggered_by,
+                                "started_at": run.started_at.map(|dt| dt.to_rfc3339()),
+                                "finished_at": run.finished_at.map(|dt| dt.to_rfc3339())
                             })),
                         )
                             .into_response(),
-                        Err(e) => {
-                            tracing::error!("failed to get pipeline run: {}", e);
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(serde_json::json!({
-                                    "error": "database_error",
-                                    "message": format!("failed to get pipeline run: {}", e)
-                                })),
-                            )
-                                .into_response()
-                        }
+                        Err(status) => (
+                            status,
+                            Json(serde_json::json!({"error": "forbidden", "message": "Pipeline run access is not permitted"})),
+                        )
+                            .into_response(),
+                    },
+                    Ok(None) => (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": "not_found",
+                            "message": "Pipeline run not found"
+                        })),
+                    )
+                        .into_response(),
+                    Err(e) => {
+                        tracing::error!("failed to get pipeline run: {}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "database_error",
+                                "message": format!("failed to get pipeline run: {}", e)
+                            })),
+                        )
+                            .into_response()
                     }
                 }
-                Err(_) => (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "invalid_id",
-                        "message": "Invalid pipeline run ID format"
-                    })),
-                )
-                    .into_response(),
-            }
         }
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_id",
+                "message": "Invalid pipeline run ID format"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -343,80 +327,76 @@ async fn get_pipeline_run_jobs(
     user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match claims_from_user(user) {
-        Err(e) => e.into_response(),
-        Ok(claims) => {
-            tracing::debug!("get pipeline run jobs: {}", id);
+    let claims = user.claims;
+    tracing::debug!("get pipeline run jobs: {}", id);
 
-            match Uuid::parse_str(&id) {
-                Ok(uuid) => {
-                    let run_id = PipelineRunId::from(uuid);
-                    let run = match PipelineRunQueries::get(&pool, run_id).await {
-                        Ok(Some(run)) => run,
-                        Ok(None) => {
-                            return (
-                                StatusCode::NOT_FOUND,
-                                Json(serde_json::json!({"error": "not_found", "message": "Pipeline run not found"})),
-                            )
-                                .into_response();
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, %run_id, "failed to load pipeline run for jobs");
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(serde_json::json!({"error": "database_error", "message": "Failed to load pipeline run"})),
-                            )
-                                .into_response();
-                        }
-                    };
-                    if let Err(status) = authorize_repo(&pool, &claims, run.repo_id).await {
-                        return (
-                            status,
-                            Json(serde_json::json!({"error": "forbidden", "message": "Pipeline run access is not permitted"})),
+    match Uuid::parse_str(&id) {
+        Ok(uuid) => {
+            let run_id = PipelineRunId::from(uuid);
+            let run = match PipelineRunQueries::get(&pool, run_id).await {
+                Ok(Some(run)) => run,
+                Ok(None) => {
+                    return (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({"error": "not_found", "message": "Pipeline run not found"})),
                         )
                             .into_response();
-                    }
-                    match JobQueries::list_by_run(&pool, run_id).await {
-                        Ok(jobs) => {
-                            let jobs_json: Vec<serde_json::Value> = jobs
-                                .into_iter()
-                                .map(|j| {
-                                    serde_json::json!({
-                                        "id": j.id.to_string(),
-                                        "name": j.name,
-                                        "status": j.status,
-                                        "runner_id": j.runner_id.map(|id| id.to_string()),
-                                        "started_at": j.started_at.map(|dt| dt.to_rfc3339()),
-                                        "finished_at": j.finished_at.map(|dt| dt.to_rfc3339()),
-                                        "receipt": j.result_json.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
-                                    })
-                                })
-                                .collect();
-                            Json(jobs_json).into_response()
-                        }
-                        Err(e) => {
-                            tracing::error!("failed to list jobs: {}", e);
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(serde_json::json!({
-                                    "error": "database_error",
-                                    "message": format!("failed to list jobs: {}", e)
-                                })),
-                            )
-                                .into_response()
-                        }
-                    }
                 }
-                Err(_) => (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "invalid_id",
-                        "message": "Invalid pipeline run ID format"
-                    })),
-                )
-                    .into_response(),
+                Err(error) => {
+                    tracing::error!(%error, %run_id, "failed to load pipeline run for jobs");
+                    return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "database_error", "message": "Failed to load pipeline run"})),
+                        )
+                            .into_response();
+                }
+            };
+            if let Err(status) = authorize_repo(&pool, &claims, run.repo_id).await {
+                return (
+                        status,
+                        Json(serde_json::json!({"error": "forbidden", "message": "Pipeline run access is not permitted"})),
+                    )
+                        .into_response();
+            }
+            match JobQueries::list_by_run(&pool, run_id).await {
+                Ok(jobs) => {
+                    let jobs_json: Vec<serde_json::Value> = jobs
+                            .into_iter()
+                            .map(|j| {
+                                serde_json::json!({
+                                    "id": j.id.to_string(),
+                                    "name": j.name,
+                                    "status": j.status,
+                                    "runner_id": j.runner_id.map(|id| id.to_string()),
+                                    "started_at": j.started_at.map(|dt| dt.to_rfc3339()),
+                                    "finished_at": j.finished_at.map(|dt| dt.to_rfc3339()),
+                                    "receipt": j.result_json.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                                })
+                            })
+                            .collect();
+                    Json(jobs_json).into_response()
+                }
+                Err(e) => {
+                    tracing::error!("failed to list jobs: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "database_error",
+                            "message": format!("failed to list jobs: {}", e)
+                        })),
+                    )
+                        .into_response()
+                }
             }
         }
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_id",
+                "message": "Invalid pipeline run ID format"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -497,10 +477,7 @@ async fn submit_job(
         )
             .into_response();
     }
-    if JobStatus::from_str(&run.status)
-        .map(|status| status.is_terminal())
-        .unwrap_or(false)
-    {
+    if JobStatus::from_str(&run.status).is_some_and(|status| status.is_terminal()) {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "pipeline_run_already_terminal"})),
@@ -819,392 +796,53 @@ async fn cancel_job(
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The run listing wire contract: exact field names with timestamps
+    /// rendered only once the run has started and finished.
     #[test]
-    fn test_pipeline_run_response_serialization() {
-        let response = PipelineRunResponse {
-            id: "run-123".to_string(),
-            pipeline_id: "pipe-456".to_string(),
-            status: "running".to_string(),
-            commit_hash: "abc123".to_string(),
-            triggered_by: "alice".to_string(),
-            started_at: Some("2024-01-01T00:00:00Z".to_string()),
-            finished_at: None,
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("run-123"));
-        assert!(json.contains("running"));
+    fn pipeline_run_response_wire_contract() {
+        let json = serde_json::to_value(PipelineRunResponse {
+            id: "run-1".to_string(),
+            pipeline_id: "pipe-1".to_string(),
+            status: "succeeded".to_string(),
+            commit_hash: "a".repeat(40),
+            triggered_by: "webhook".to_string(),
+            started_at: Some("2026-01-01T00:00:00Z".to_string()),
+            finished_at: Some("2026-01-01T00:05:00Z".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "id": "run-1",
+                "pipeline_id": "pipe-1",
+                "status": "succeeded",
+                "commit_hash": "a".repeat(40),
+                "triggered_by": "webhook",
+                "started_at": "2026-01-01T00:00:00Z",
+                "finished_at": "2026-01-01T00:05:00Z"
+            })
+        );
     }
 
+    /// A queued job has no runner assignment or lifecycle timestamps.
     #[test]
-    fn test_job_response_serialization() {
-        let response = JobResponse {
-            id: "job-789".to_string(),
+    fn job_response_wire_contract() {
+        let json = serde_json::to_value(JobResponse {
+            id: "job-1".to_string(),
             name: "build".to_string(),
-            status: "succeeded".to_string(),
-            runner_id: Some("runner-1".to_string()),
-            started_at: Some("2024-01-01T00:00:00Z".to_string()),
-            finished_at: Some("2024-01-01T00:05:00Z".to_string()),
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("job-789"));
-        assert!(json.contains("build"));
-        assert!(json.contains("succeeded"));
-    }
-
-    #[test]
-    fn test_pipeline_run_response_without_timestamps() {
-        let response = PipelineRunResponse {
-            id: "run-001".to_string(),
-            pipeline_id: "pipe-002".to_string(),
-            status: "pending".to_string(),
-            commit_hash: "def456".to_string(),
-            triggered_by: "bob".to_string(),
-            started_at: None,
-            finished_at: None,
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("pending"));
-        assert!(json.contains("def456"));
-    }
-
-    #[test]
-    fn test_job_response_without_runner() {
-        let response = JobResponse {
-            id: "job-002".to_string(),
-            name: "test".to_string(),
-            status: "queued".to_string(),
-            runner_id: None,
-            started_at: None,
-            finished_at: None,
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("queued"));
-        assert!(json.contains("job-002"));
-    }
-
-    #[test]
-    fn test_pipeline_run_response_deserialization() {
-        let json = r#"{
-            "id": "run-123",
-            "pipeline_id": "pipe-456",
-            "status": "failed",
-            "commit_hash": "xyz789",
-            "triggered_by": "charlie",
-            "started_at": "2024-01-01T00:00:00Z",
-            "finished_at": "2024-01-01T00:10:00Z"
-        }"#;
-        let response: PipelineRunResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.id, "run-123");
-        assert_eq!(response.status, "failed");
-        assert_eq!(response.triggered_by, "charlie");
-    }
-
-    #[test]
-    fn test_job_response_deserialization() {
-        let json = r#"{
-            "id": "job-999",
-            "name": "deploy",
-            "status": "running",
-            "runner_id": "runner-5",
-            "started_at": "2024-01-01T00:00:00Z",
-            "finished_at": null
-        }"#;
-        let response: JobResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.id, "job-999");
-        assert_eq!(response.name, "deploy");
-        assert_eq!(response.status, "running");
-        assert_eq!(response.runner_id, Some("runner-5".to_string()));
-    }
-
-    #[test]
-    fn test_pipeline_run_response_debug() {
-        let response = PipelineRunResponse {
-            id: "run-debug".to_string(),
-            pipeline_id: "pipe-debug".to_string(),
-            status: "debugging".to_string(),
-            commit_hash: "abc123debug".to_string(),
-            triggered_by: "debug-user".to_string(),
-            started_at: Some("2024-01-01T00:00:00Z".to_string()),
-            finished_at: None,
-        };
-        let debug_str = format!("{:?}", response);
-        assert!(debug_str.contains("run-debug"));
-    }
-
-    #[test]
-    fn test_job_response_debug() {
-        let response = JobResponse {
-            id: "job-debug".to_string(),
-            name: "debug-job".to_string(),
-            status: "debugging".to_string(),
-            runner_id: None,
-            started_at: None,
-            finished_at: None,
-        };
-        let debug_str = format!("{:?}", response);
-        assert!(debug_str.contains("job-debug"));
-    }
-
-    #[test]
-    fn test_pipeline_run_response_with_all_statuses() {
-        for status in &["pending", "running", "succeeded", "failed", "cancelled"] {
-            let response = PipelineRunResponse {
-                id: "run-status".to_string(),
-                pipeline_id: "pipe-status".to_string(),
-                status: status.to_string(),
-                commit_hash: "abc123".to_string(),
-                triggered_by: "test".to_string(),
-                started_at: None,
-                finished_at: None,
-            };
-            let json = serde_json::to_string(&response).unwrap();
-            assert!(json.contains(status));
-        }
-    }
-
-    #[test]
-    fn test_job_response_with_all_statuses() {
-        for status in &["queued", "assigned", "running", "succeeded", "failed"] {
-            let response = JobResponse {
-                id: "job-status".to_string(),
-                name: "status-test".to_string(),
-                status: status.to_string(),
-                runner_id: None,
-                started_at: None,
-                finished_at: None,
-            };
-            let json = serde_json::to_string(&response).unwrap();
-            assert!(json.contains(status));
-        }
-    }
-
-    #[test]
-    fn test_pipeline_run_response_large_commit_hash() {
-        let response = PipelineRunResponse {
-            id: "run-large".to_string(),
-            pipeline_id: "pipe-large".to_string(),
-            status: "running".to_string(),
-            commit_hash: "abc123def456789012345678901234567890".to_string(),
-            triggered_by: "test".to_string(),
-            started_at: Some("2024-01-01T00:00:00Z".to_string()),
-            finished_at: None,
-        };
-        assert!(response.commit_hash.len() > 20);
-    }
-
-    #[test]
-    fn test_job_response_with_runner_assignment() {
-        let response = JobResponse {
-            id: "job-assigned".to_string(),
-            name: "assigned-job".to_string(),
-            status: "assigned".to_string(),
-            runner_id: Some("runner-assigned-123".to_string()),
-            started_at: None,
-            finished_at: None,
-        };
-        assert!(response.runner_id.is_some());
-        assert_eq!(response.runner_id.unwrap(), "runner-assigned-123");
-    }
-
-    #[test]
-    fn test_pipeline_run_response_complete_cycle() {
-        let response = PipelineRunResponse {
-            id: "run-complete".to_string(),
-            pipeline_id: "pipe-complete".to_string(),
-            status: "succeeded".to_string(),
-            commit_hash: "abc123".to_string(),
-            triggered_by: "ci-bot".to_string(),
-            started_at: Some("2024-01-01T00:00:00Z".to_string()),
-            finished_at: Some("2024-01-01T00:10:00Z".to_string()),
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("succeeded"));
-        assert!(json.contains("ci-bot"));
-    }
-
-    #[test]
-    fn test_job_response_complete_with_timestamps() {
-        let response = JobResponse {
-            id: "job-complete".to_string(),
-            name: "complete-job".to_string(),
-            status: "succeeded".to_string(),
-            runner_id: Some("runner-1".to_string()),
-            started_at: Some("2024-01-01T00:00:00Z".to_string()),
-            finished_at: Some("2024-01-01T00:05:00Z".to_string()),
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("succeeded"));
-        assert!(json.contains("runner-1"));
-    }
-
-    #[test]
-    fn test_pipeline_run_response_deserialize() {
-        let json = r#"{
-            "id": "run-123",
-            "pipeline_id": "pipe-456",
-            "status": "running",
-            "commit_hash": "abc123",
-            "triggered_by": "user1",
-            "started_at": "2024-01-01T00:00:00Z",
-            "finished_at": null
-        }"#;
-        let response: PipelineRunResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.id, "run-123");
-        assert_eq!(response.pipeline_id, "pipe-456");
-        assert_eq!(response.status, "running");
-        assert!(response.started_at.is_some());
-        assert!(response.finished_at.is_none());
-    }
-
-    #[test]
-    fn test_job_response_deserialize() {
-        let json = r#"{
-            "id": "job-123",
-            "name": "build",
-            "status": "pending",
-            "runner_id": null,
-            "started_at": null,
-            "finished_at": null
-        }"#;
-        let response: JobResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.id, "job-123");
-        assert_eq!(response.name, "build");
-        assert_eq!(response.status, "pending");
-        assert!(response.runner_id.is_none());
-    }
-
-    #[test]
-    fn test_pipeline_run_response_with_empty_commit_hash() {
-        let response = PipelineRunResponse {
-            id: "run-empty".to_string(),
-            pipeline_id: "pipe-empty".to_string(),
-            status: "pending".to_string(),
-            commit_hash: "".to_string(),
-            triggered_by: "user".to_string(),
-            started_at: None,
-            finished_at: None,
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"commit_hash\":\"\""));
-    }
-
-    #[test]
-    fn test_job_response_with_empty_name() {
-        let response = JobResponse {
-            id: "job-empty".to_string(),
-            name: "".to_string(),
             status: "pending".to_string(),
             runner_id: None,
             started_at: None,
             finished_at: None,
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"name\":\"\""));
-    }
-
-    #[test]
-    fn test_pipeline_run_response_special_characters_in_triggered_by() {
-        let response = PipelineRunResponse {
-            id: "run-special".to_string(),
-            pipeline_id: "pipe-special".to_string(),
-            status: "running".to_string(),
-            commit_hash: "abc123".to_string(),
-            triggered_by: "user@domain.com".to_string(),
-            started_at: None,
-            finished_at: None,
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("user@domain.com"));
-    }
-
-    #[test]
-    fn test_pipeline_run_response_all_json_fields() {
-        let response = PipelineRunResponse {
-            id: "run-all".to_string(),
-            pipeline_id: "pipe-all".to_string(),
-            status: "failed".to_string(),
-            commit_hash: "xyz789".to_string(),
-            triggered_by: "tester".to_string(),
-            started_at: Some("2024-06-15T10:30:00Z".to_string()),
-            finished_at: Some("2024-06-15T10:45:00Z".to_string()),
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        // Verify all fields are present
-        assert!(json.contains("\"id\":\"run-all\""));
-        assert!(json.contains("\"pipeline_id\":\"pipe-all\""));
-        assert!(json.contains("\"status\":\"failed\""));
-        assert!(json.contains("\"commit_hash\":\"xyz789\""));
-        assert!(json.contains("\"triggered_by\":\"tester\""));
-        assert!(json.contains("started_at"));
-        assert!(json.contains("finished_at"));
-    }
-
-    #[test]
-    fn test_pipeline_run_response_all_commit_hashes() {
-        for hash in &["a", "abc", "abcdef123456", "a1b2c3d4e5f6789012345678901234"] {
-            let response = PipelineRunResponse {
-                id: "run-hash".to_string(),
-                pipeline_id: "pipe-hash".to_string(),
-                status: "running".to_string(),
-                commit_hash: hash.to_string(),
-                triggered_by: "test".to_string(),
-                started_at: None,
-                finished_at: None,
-            };
-            let json = serde_json::to_string(&response).unwrap();
-            assert!(json.contains(hash));
-        }
-    }
-
-    #[test]
-    fn test_pipeline_run_response_all_triggered_by() {
-        for user in &["alice", "bob", "ci-bot", "webhook", "schedule"] {
-            let response = PipelineRunResponse {
-                id: "run-trigger".to_string(),
-                pipeline_id: "pipe-trigger".to_string(),
-                status: "running".to_string(),
-                commit_hash: "abc123".to_string(),
-                triggered_by: user.to_string(),
-                started_at: None,
-                finished_at: None,
-            };
-            let json = serde_json::to_string(&response).unwrap();
-            assert!(json.contains(user));
-        }
-    }
-
-    #[test]
-    fn test_job_response_all_names() {
-        for name in &["build", "test", "deploy", "lint", "security-scan"] {
-            let response = JobResponse {
-                id: "job-name".to_string(),
-                name: name.to_string(),
-                status: "queued".to_string(),
-                runner_id: None,
-                started_at: None,
-                finished_at: None,
-            };
-            let json = serde_json::to_string(&response).unwrap();
-            assert!(json.contains(name));
-        }
-    }
-
-    #[test]
-    fn test_job_response_with_future_timestamps() {
-        let response = JobResponse {
-            id: "job-future".to_string(),
-            name: "future-job".to_string(),
-            status: "running".to_string(),
-            runner_id: Some("runner-1".to_string()),
-            started_at: Some("2026-12-01T00:00:00Z".to_string()),
-            finished_at: Some("2026-12-01T00:10:00Z".to_string()),
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("2026-12-01"));
+        })
+        .unwrap();
+        assert_eq!(json["runner_id"], serde_json::Value::Null);
+        assert_eq!(json["started_at"], serde_json::Value::Null);
+        assert_eq!(json["finished_at"], serde_json::Value::Null);
+        assert_eq!(json["name"], "build");
     }
 }

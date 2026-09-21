@@ -91,7 +91,7 @@ impl InMemoryReceiptStore {
             .as_ref()
             .and_then(|p| p.split('/').next_back())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
     }
 }
 
@@ -205,19 +205,19 @@ impl FileReceiptStore {
 
         fs::create_dir_all(&receipts_dir)
             .await
-            .map_err(|e| Error::storage(format!("failed to create receipts directory: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create receipts directory: {e}")))?;
 
         Ok(Self { root })
     }
 
     fn receipt_path(&self, job_id: &JobId) -> PathBuf {
-        self.root.join("receipts").join(format!("{}.json", job_id))
+        self.root.join("receipts").join(format!("{job_id}.json"))
     }
 
     fn meta_path(&self, job_id: &JobId) -> PathBuf {
         self.root
             .join("receipts")
-            .join(format!("{}.meta.json", job_id))
+            .join(format!("{job_id}.meta.json"))
     }
 
     fn compute_receipt_sha256(receipt: &JobReceipt) -> String {
@@ -233,7 +233,7 @@ impl FileReceiptStore {
             .as_ref()
             .and_then(|p| p.split('/').next_back())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
     }
 
     async fn write_atomic(path: &PathBuf, contents: &[u8]) -> Result<()> {
@@ -249,17 +249,17 @@ impl FileReceiptStore {
 
         let result = async {
             let mut file = fs::File::create(&temporary_path).await.map_err(|e| {
-                Error::storage(format!("failed to create temporary receipt file: {}", e))
+                Error::storage(format!("failed to create temporary receipt file: {e}"))
             })?;
             file.write_all(contents).await.map_err(|e| {
-                Error::storage(format!("failed to write temporary receipt file: {}", e))
+                Error::storage(format!("failed to write temporary receipt file: {e}"))
             })?;
             file.sync_all().await.map_err(|e| {
-                Error::storage(format!("failed to flush temporary receipt file: {}", e))
+                Error::storage(format!("failed to flush temporary receipt file: {e}"))
             })?;
             fs::rename(&temporary_path, path)
                 .await
-                .map_err(|e| Error::storage(format!("failed to publish receipt file: {}", e)))
+                .map_err(|e| Error::storage(format!("failed to publish receipt file: {e}")))
         }
         .await;
 
@@ -282,7 +282,7 @@ impl ReceiptStore for FileReceiptStore {
         // Write receipt JSON
         let receipt_path = self.receipt_path(&job_id);
         let receipt_json = serde_json::to_string_pretty(receipt)
-            .map_err(|e| Error::storage(format!("failed to serialize receipt: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to serialize receipt: {e}")))?;
         Self::write_atomic(&receipt_path, receipt_json.as_bytes()).await?;
 
         // Write metadata for indexing
@@ -300,7 +300,7 @@ impl ReceiptStore for FileReceiptStore {
         };
         let meta_path = self.meta_path(&job_id);
         let meta_json = serde_json::to_string_pretty(&meta)
-            .map_err(|e| Error::storage(format!("failed to serialize meta: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to serialize meta: {e}")))?;
         Self::write_atomic(&meta_path, meta_json.as_bytes()).await?;
 
         tracing::debug!("persisted receipt for job {}", job_id);
@@ -316,14 +316,14 @@ impl ReceiptStore for FileReceiptStore {
 
         let mut file = fs::File::open(&receipt_path)
             .await
-            .map_err(|e| Error::storage(format!("failed to open receipt: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to open receipt: {e}")))?;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)
             .await
-            .map_err(|e| Error::storage(format!("failed to read receipt: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read receipt: {e}")))?;
 
         let receipt: JobReceipt = serde_json::from_slice(&contents)
-            .map_err(|e| Error::storage(format!("failed to parse receipt: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to parse receipt: {e}")))?;
 
         Ok(Some(receipt))
     }
@@ -335,15 +335,15 @@ impl ReceiptStore for FileReceiptStore {
 
         let mut entries = fs::read_dir(&receipts_dir)
             .await
-            .map_err(|e| Error::storage(format!("failed to read receipts directory: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read receipts directory: {e}")))?;
 
         while let Some(entry) = entries
             .next_entry()
             .await
-            .map_err(|e| Error::storage(format!("failed to read entry: {}", e)))?
+            .map_err(|e| Error::storage(format!("failed to read entry: {e}")))?
         {
             let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false)
+            if path.extension().is_some_and(|e| e == "json")
                 && !path.to_string_lossy().ends_with(".meta.json")
             {
                 if let Ok(mut file) = fs::File::open(&path).await {
@@ -371,15 +371,15 @@ impl ReceiptStore for FileReceiptStore {
 
         let mut entries = fs::read_dir(&receipts_dir)
             .await
-            .map_err(|e| Error::storage(format!("failed to read receipts directory: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read receipts directory: {e}")))?;
 
         while let Some(entry) = entries
             .next_entry()
             .await
-            .map_err(|e| Error::storage(format!("failed to read entry: {}", e)))?
+            .map_err(|e| Error::storage(format!("failed to read entry: {e}")))?
         {
             let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false)
+            if path.extension().is_some_and(|e| e == "json")
                 && !path.to_string_lossy().ends_with(".meta.json")
             {
                 if let Ok(mut file) = fs::File::open(&path).await {
@@ -402,15 +402,15 @@ impl ReceiptStore for FileReceiptStore {
 
         let mut entries = fs::read_dir(&receipts_dir)
             .await
-            .map_err(|e| Error::storage(format!("failed to read receipts directory: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read receipts directory: {e}")))?;
 
         while let Some(entry) = entries
             .next_entry()
             .await
-            .map_err(|e| Error::storage(format!("failed to read entry: {}", e)))?
+            .map_err(|e| Error::storage(format!("failed to read entry: {e}")))?
         {
             let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false)
+            if path.extension().is_some_and(|e| e == "json")
                 && !path.to_string_lossy().ends_with(".meta.json")
             {
                 if let Ok(mut file) = fs::File::open(&path).await {
@@ -488,7 +488,7 @@ mod tests {
             completed_at: completed,
             output_sha: output.clone(),
             output_bytes: 20,
-            stable_uri: format!("gitforge://job/{}", job_id),
+            stable_uri: format!("gitforge://job/{job_id}"),
             log_uri: vec!["gitforge://log/test".into()],
             artifact_uri: vec!["gitforge://artifact/test/report.json".into()],
             logs: Some(LogReceipt {

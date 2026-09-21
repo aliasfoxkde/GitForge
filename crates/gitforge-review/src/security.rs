@@ -459,7 +459,7 @@ mod tests {
             "every VulnerabilityType variant must stay in this table"
         );
         for (vuln, severity) in expected {
-            assert_eq!(vuln.severity(), severity, "{:?}", vuln);
+            assert_eq!(vuln.severity(), severity, "{vuln:?}");
         }
     }
 

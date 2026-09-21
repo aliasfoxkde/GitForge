@@ -196,12 +196,12 @@ impl BuildCoordinator {
                 JobStatus::Queued => "queued".to_string(),
                 JobStatus::Running { .. } => "running".to_string(),
                 JobStatus::Completed { exit_code, .. } => {
-                    format!("completed({})", exit_code)
+                    format!("completed({exit_code})")
                 }
                 JobStatus::Failed {
                     exit_code, error, ..
                 } => {
-                    format!("failed({}): {}", exit_code, error)
+                    format!("failed({exit_code}): {error}")
                 }
                 JobStatus::Cancelled => "cancelled".to_string(),
             };
@@ -218,9 +218,9 @@ impl BuildCoordinator {
                     JobStatus::Queued => "queued".to_string(),
                     JobStatus::Running { .. } => "running".to_string(),
                     JobStatus::Completed { exit_code, .. } => {
-                        format!("completed({})", exit_code)
+                        format!("completed({exit_code})")
                     }
-                    JobStatus::Failed { error, .. } => format!("failed: {}", error),
+                    JobStatus::Failed { error, .. } => format!("failed: {error}"),
                     JobStatus::Cancelled => "cancelled".to_string(),
                 };
                 JobInfo {
@@ -406,7 +406,7 @@ async fn execute_cargo_job(
                 job,
                 -1,
                 String::new(),
-                format!("failed to spawn: {}", e),
+                format!("failed to spawn: {e}"),
             ));
         }
     };
@@ -493,7 +493,7 @@ async fn execute_cargo_job(
                 job,
                 -1,
                 String::new(),
-                format!("timed out after {:?}", timeout_duration),
+                format!("timed out after {timeout_duration:?}"),
             ))
         }
     };

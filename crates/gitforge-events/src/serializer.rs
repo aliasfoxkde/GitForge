@@ -204,7 +204,7 @@ mod tests {
         );
 
         let json_event = JsonEvent::from_envelope(&event);
-        let debug_str = format!("{:?}", json_event);
+        let debug_str = format!("{json_event:?}");
         assert!(debug_str.contains("event_id"));
         assert!(debug_str.contains("event_type"));
     }

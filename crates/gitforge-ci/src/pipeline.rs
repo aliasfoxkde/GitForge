@@ -27,23 +27,17 @@ pub fn parse_timeout_secs(value: Option<&str>) -> Result<u64, String> {
         Some('m') => (&raw[..raw.len() - 1], 60),
         Some('h') => (&raw[..raw.len() - 1], 60 * 60),
         Some(last) if last.is_ascii_digit() => (raw, 1),
-        _ => {
-            return Err(format!(
-                "invalid timeout '{}': use seconds, s, m, or h",
-                raw
-            ))
-        }
+        _ => return Err(format!("invalid timeout '{raw}': use seconds, s, m, or h")),
     };
     let amount: u64 = number
         .parse()
-        .map_err(|_| format!("invalid timeout '{}': expected a positive integer", raw))?;
+        .map_err(|_| format!("invalid timeout '{raw}': expected a positive integer"))?;
     let seconds = amount
         .checked_mul(multiplier)
-        .ok_or_else(|| format!("timeout '{}' overflows", raw))?;
+        .ok_or_else(|| format!("timeout '{raw}' overflows"))?;
     if !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&seconds) {
         return Err(format!(
-            "timeout '{}' must be between {} seconds and {} seconds",
-            raw, MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS
+            "timeout '{raw}' must be between {MIN_TIMEOUT_SECS} seconds and {MAX_TIMEOUT_SECS} seconds"
         ));
     }
     Ok(seconds)

@@ -25,3 +25,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 async-trait = { workspace = true }
 git2 = { workspace = true }
+
+[lints]
+workspace = true

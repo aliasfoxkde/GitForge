@@ -60,6 +60,9 @@ run after an administrator exists.
 
 ### Endpoints
 
+Authenticated endpoints are mounted under the `/api` prefix; the
+examples below show the full paths.
+
 #### Health Check
 
 ```
@@ -80,16 +83,16 @@ Returns server health status including database connectivity.
 #### Repositories
 
 ```
-GET /repos
-POST /repos
-GET /repos/{id}
-DELETE /repos/{id}
+GET /api/repos
+POST /api/repos
+GET /api/repos/{id}
+DELETE /api/repos/{id}
 ```
 
 #### User roles
 
 ```
-PATCH /users/{id}/role
+PATCH /api/users/{id}/role
 ```
 
 **Request:**
@@ -121,16 +124,16 @@ PATCH /users/{id}/role
 #### Pipelines
 
 ```
-GET /pipelines
-GET /pipelines/{id}
+GET /api/pipelines
+GET /api/pipelines/{id}
 ```
 
 #### Pipeline Runs
 
 ```
-GET /pipeline-runs
-GET /pipeline-runs/{id}
-GET /pipeline-runs/{id}/jobs
+GET /api/pipeline-runs
+GET /api/pipeline-runs/{id}
+GET /api/pipeline-runs/{id}/jobs
 ```
 
 **Pipeline Run Response:**
@@ -149,10 +152,10 @@ GET /pipeline-runs/{id}/jobs
 #### Jobs
 
 ```
-POST /jobs
-GET /jobs/{id}
-GET /jobs/{id}/logs
-POST /jobs/{id}/cancel
+POST /api/jobs
+GET /api/jobs/{id}
+GET /api/jobs/{id}/logs
+POST /api/jobs/{id}/cancel
 ```
 
 Job submission requires a pipeline run owned by the authenticated user (or an
@@ -192,12 +195,35 @@ scheduler and runner observe it safely.
 }
 ```
 
+#### Scheduler queue status
+
+```text
+GET /queue/status  *(CI orchestrator, port 42781 — not the API gateway)*
+```
+
+The authenticated scheduler/runner boundary exposes read-only admission
+telemetry. `durable_pending` is the number of `pending` or `queued` database
+rows, `in_memory_queued` is the scheduler's current queue depth,
+`assigned_jobs` is the number of active assignments, and `online_runners` is
+the in-memory online-runner count. `durable_pending` is `null` for an
+in-memory scheduler without a database.
+
+```json
+{
+  "contract_version": "scheduler.queue.v1",
+  "durable_pending": 156,
+  "in_memory_queued": 156,
+  "assigned_jobs": 1,
+  "online_runners": 1
+}
+```
+
 #### Code Review Runs
 
 ```
-POST /review-runs
-GET /review-runs/{id}
-GET /review-runs/{id}/findings
+POST /api/review-runs
+GET /api/review-runs/{id}
+GET /api/review-runs/{id}/findings
 ```
 
 Review run submission persists an AI code-review run for a repository head
@@ -280,13 +306,27 @@ first, then fingerprint) and bounded pagination (`limit` 1-500, default 100;
 }
 ```
 
+#### Dashboard
+
+```
+GET /dashboard
+```
+
+Public aggregate dashboard data (no authentication required).
+
 #### Runners
 
 ```
-GET /runners
-POST /runners
-GET /runners/{id}
+GET /api/runners
+POST /api/runners
+GET /api/runners/{id}
+DELETE /api/runners/{id}
 ```
+
+`POST /api/runners` is a public bootstrap endpoint used before a runner
+has credentials. `DELETE /api/runners/{id}` retires an idle runner while
+preserving its record for audit; it requires an administrator or
+maintainer and refuses runners with active jobs (409 `runner_busy`).
 
 **Register Runner Request:**
 ```json
@@ -312,10 +352,11 @@ GET /runners/{id}
 #### Artifacts
 
 ```
-GET /artifacts
-GET /artifacts/{id}
-DELETE /artifacts/{id}
-GET /jobs/{job_id}/artifacts
+GET /api/artifacts
+GET /api/artifacts/{id}
+GET /api/artifacts/{id}/content
+DELETE /api/artifacts/{id}
+GET /api/jobs/{job_id}/artifacts
 ```
 
 **Artifact Response:**
@@ -331,6 +372,42 @@ GET /jobs/{job_id}/artifacts
 }
 ```
 
+#### SSH Keys
+
+```
+GET /api/ssh-keys
+POST /api/ssh-keys
+DELETE /api/ssh-keys/{id}
+```
+
+The per-user public key registry backing Git-over-SSH authentication.
+Fingerprints are computed server-side and globally unique; registering a
+duplicate key — even under a different comment or account — returns 409
+`duplicate_key`.
+
+**Register Key Request:**
+```json
+{
+  "name": "laptop",
+  "public_key": "ssh-ed25519 AAAA... user@host"
+}
+```
+
+#### Webhook Trigger
+
+```
+POST /api/webhook/trigger/{pipeline_id}
+```
+
+Authenticated webhook entry point. When the API gateway is deployed with
+a CI trigger client it delegates execution to the CI orchestrator and
+returns 202; otherwise it queues the pipeline's first runnable job
+directly into the durable queue (200). Redeliveries for the same commit
+are idempotent — one webhook key maps to exactly one job, and a replay's
+run row is recorded as `cancelled`. If the pipeline's stored definition
+is unusable the endpoint returns 422, and CI delegation failures return
+502 without persisting a phantom job.
+
 ## Metrics
 
 ```
@@ -338,7 +415,7 @@ GET /metrics
 ```
 
 Prometheus-format metrics including:
-- `gitforge_http_requests_total` - HTTP request counts
+- `http_requests_total` - HTTP request counts
 - `gitforge_job_duration_seconds` - Job execution duration
 - `gitforge_runners_online` - Number of online runners
 - `gitforge_pipeline_runs_total` - Pipeline run counts by status
@@ -361,7 +438,7 @@ Prometheus-format metrics including:
 ### Create a Repository
 
 ```bash
-curl -X POST http://localhost:42780/repos \
+curl -X POST http://localhost:42780/api/repos \
   -H "Content-Type: application/json" \
   -d '{"name": "my-project", "visibility": "public"}'
 ```
@@ -369,13 +446,13 @@ curl -X POST http://localhost:42780/repos \
 ### Check Pipeline Status
 
 ```bash
-curl http://localhost:42780/pipeline-runs/your-run-id
+curl http://localhost:42780/api/pipeline-runs/your-run-id
 ```
 
 ### Register a Runner
 
 ```bash
-curl -X POST http://localhost:42780/runners \
+curl -X POST http://localhost:42780/api/runners \
   -H "Content-Type: application/json" \
   -d '{"name": "docker-runner-1", "type": "docker", "capacity": 4}'
 ```

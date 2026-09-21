@@ -29,7 +29,7 @@ impl OllamaProvider {
             client: Client::builder()
                 .timeout(Duration::from_secs(120)) // Longer timeout for local models
                 .build()
-                .map_err(|e| AiError::Config(format!("Failed to create HTTP client: {}", e)))?,
+                .map_err(|e| AiError::Config(format!("Failed to create HTTP client: {e}")))?,
             model: "codellama".to_string(),
         })
     }
@@ -59,7 +59,7 @@ impl AiProvider for OllamaProvider {
             .get(&url)
             .send()
             .await
-            .map_err(|e| AiError::Network(format!("Health check failed: {}", e)))?;
+            .map_err(|e| AiError::Network(format!("Health check failed: {e}")))?;
 
         if response.status().is_success() {
             Ok(())
@@ -90,17 +90,17 @@ impl AiProvider for OllamaProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AiError::Network(format!("Request failed: {}", e)))?;
+            .map_err(|e| AiError::Network(format!("Request failed: {e}")))?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            return Err(AiError::Api(format!("API error: {}", error_text)));
+            return Err(AiError::Api(format!("API error: {error_text}")));
         }
 
         let api_response: OllamaResponse = response
             .json()
             .await
-            .map_err(|e| AiError::Parse(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| AiError::Parse(format!("Failed to parse response: {e}")))?;
 
         self.parse_review_response(api_response, request)
     }
@@ -116,9 +116,8 @@ impl OllamaProvider {
 
         if let Some(base) = &request.base_branch {
             prompt.push_str(&format!(
-                r#"Compare against branch "{}".
-"#,
-                base
+                r#"Compare against branch "{base}".
+"#
             ));
         }
 

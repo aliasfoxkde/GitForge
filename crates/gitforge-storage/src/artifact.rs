@@ -55,7 +55,7 @@ impl Artifact {
     pub async fn from_file(job_id: JobId, name: String, path: &PathBuf) -> Result<Self> {
         let mut file = File::open(path)
             .await
-            .map_err(|e| Error::storage(format!("failed to open file for artifact: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to open file for artifact: {e}")))?;
 
         let mut hasher = Sha256::new();
         let mut size: u64 = 0;
@@ -65,7 +65,7 @@ impl Artifact {
             let bytes_read = file
                 .read(&mut buffer)
                 .await
-                .map_err(|e| Error::storage(format!("failed to read file for artifact: {}", e)))?;
+                .map_err(|e| Error::storage(format!("failed to read file for artifact: {e}")))?;
 
             if bytes_read == 0 {
                 break;
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn test_artifact_id_display() {
         let id = ArtifactId::new();
-        let display = format!("{}", id);
+        let display = format!("{id}");
         assert_eq!(display, id.0.to_string());
     }
 
@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn test_artifact_id_debug() {
         let id = ArtifactId::new();
-        let debug_str = format!("{:?}", id);
+        let debug_str = format!("{id:?}");
         assert!(debug_str.contains("ArtifactId"));
     }
 
@@ -304,7 +304,7 @@ mod tests {
                 id: ArtifactId::new(),
                 job_id: JobId::new(),
                 name: name.to_string(),
-                path: format!("/tmp/{}", name),
+                path: format!("/tmp/{name}"),
                 checksum: "test".to_string(),
                 size_bytes: 100,
                 content_type: Some(content_type.to_string()),

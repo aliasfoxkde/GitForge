@@ -186,7 +186,7 @@ mod tests {
             pid: 12345,
             weight: JobWeight::Medium,
         };
-        let debug_str = format!("{:?}", process);
+        let debug_str = format!("{process:?}");
         assert!(debug_str.contains("12345"));
         assert!(debug_str.contains("Medium"));
     }
@@ -272,14 +272,14 @@ mod tests {
     #[test]
     fn test_pool_debug() {
         let pool = ProcessPool::with_default_config();
-        let debug_str = format!("{:?}", pool);
+        let debug_str = format!("{pool:?}");
         assert!(debug_str.contains("ProcessPool"));
     }
 
     #[test]
     fn test_pool_config_debug() {
         let config = PoolConfig::default();
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
         assert!(debug_str.contains("max_concurrent"));
     }
 
@@ -298,7 +298,7 @@ mod tests {
     fn test_process_pool_clone() {
         let pool = ProcessPool::with_default_config();
         // Pool doesn't implement Clone, but we can verify the type works
-        let debug_str = format!("{:?}", pool);
+        let debug_str = format!("{pool:?}");
         assert!(debug_str.contains("ProcessPool"));
     }
 

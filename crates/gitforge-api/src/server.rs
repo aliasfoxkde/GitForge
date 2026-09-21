@@ -52,7 +52,7 @@ impl ApiServer {
         let allowed_origins = std::env::var("CORS_ALLOWED_ORIGINS")
             .unwrap_or_else(|_| "http://localhost:3000,http://localhost:42780".to_string());
 
-        let origins: Vec<&str> = allowed_origins.split(',').map(|s| s.trim()).collect();
+        let origins: Vec<&str> = allowed_origins.split(',').map(str::trim).collect();
 
         let cors = if origins.contains(&"*") {
             // Wildcard only allowed in development (not production)
@@ -188,7 +188,7 @@ impl ApiServer {
 /// Health check endpoint
 async fn health_check(Extension(pool): Extension<Arc<Pool>>) -> impl IntoResponse {
     let db_status = match pool.health_check().await {
-        Ok(_) => "connected",
+        Ok(()) => "connected",
         Err(e) => {
             tracing::warn!("database health check failed: {}", e);
             "disconnected"

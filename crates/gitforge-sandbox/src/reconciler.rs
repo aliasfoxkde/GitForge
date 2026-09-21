@@ -158,7 +158,12 @@ pub fn classify(
     now: Now,
 ) -> Decision {
     // 1. Ownership: exact managed label, exact value "true".
-    if record.labels.get(MANAGED_LABEL).map(|value| value.as_str()) != Some("true") {
+    if record
+        .labels
+        .get(MANAGED_LABEL)
+        .map(std::string::String::as_str)
+        != Some("true")
+    {
         return Decision::RetainNotOwned;
     }
     // 2. Valid job identity: present and parseable as a UUID.
@@ -430,7 +435,7 @@ impl DockerContainerSource {
             ));
         }
         let docker = bollard::Docker::connect_with_local_defaults()
-            .map_err(|e| Error::sandbox(format!("reconciler docker connect failed: {}", e)))?;
+            .map_err(|e| Error::sandbox(format!("reconciler docker connect failed: {e}")))?;
         Ok(Self {
             docker,
             call_timeout,
@@ -464,7 +469,7 @@ impl ContainerSource for DockerContainerSource {
         )
         .await
         .map_err(|_| Error::sandbox("reconciler list timed out"))?
-        .map_err(|e| Error::sandbox(format!("reconciler list failed: {}", e)))?;
+        .map_err(|e| Error::sandbox(format!("reconciler list failed: {e}")))?;
 
         let mut records = Vec::with_capacity(containers.len());
         for c in containers {

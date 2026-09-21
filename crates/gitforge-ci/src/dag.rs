@@ -224,7 +224,10 @@ mod tests {
         JobDefinition {
             name: name.to_string(),
             image: "rust:latest".to_string(),
-            needs: needs.into_iter().map(|s| s.to_string()).collect(),
+            needs: needs
+                .into_iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             env: HashMap::new(),
             steps: vec![StepDefinition {
                 name: "step1".to_string(),

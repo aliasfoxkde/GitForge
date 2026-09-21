@@ -1,0 +1,4 @@
+# Keep actionlint aware of the labels assigned to the GitForge self-hosted runner.
+self-hosted-runner:
+  labels:
+    - gitforge

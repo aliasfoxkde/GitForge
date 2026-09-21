@@ -474,7 +474,7 @@ pub async fn run_ssh_server(
         result = &mut running => {
             result.map_err(|error| anyhow::anyhow!("SSH server failed: {error}"))?;
         }
-        _ = wait_for_shutdown_flag(shutdown) => {
+        () = wait_for_shutdown_flag(shutdown) => {
             shutdown_requested = true;
         }
     }

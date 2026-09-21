@@ -1,18 +1,18 @@
-# Contributing to Dark Factory
+# Contributing to GitForge
 
-Thank you for your interest in contributing!
+Thank you for your interest in contributing! GitForge is a Rust
+workspace: fifteen libraries under `crates/` and four service binaries
+under `services/`.
 
 ## Branch Strategy
 
 ```
 main (production)
-  └── stable (integration)
-       ├── feature/description
-       ├── fix/description
-       ├── docs/description
-       ├── test/description
-       └── refactor/description
+  └── feature/description, fix/description, docs/description, ...
 ```
+
+Work happens on short-lived branches cut from `main` and lands through
+pull requests. See [BRANCH_STRATEGY.md](BRANCH_STRATEGY.md).
 
 ## Commit Convention
 
@@ -34,24 +34,33 @@ perf: performance improvements
 ## Pull Request Checklist
 
 - [ ] Conventional commit format in title
-- [ ] Root cause analysis in PR description (for `fix:` prefix)
-- [ ] `go vet ./...` passes
-- [ ] `go test -p 1 ./...` passes
-- [ ] `go build ./...` passes
-- [ ] `golangci-lint run --timeout=5m` passes
-- [ ] `gofmt -l .` shows no files
-- [ ] Coverage maintained or improved
-- [ ] CODEOWNERS review required
-- [ ] CHANGELOG updated (if applicable)
-- [ ] ADR added/updated (for architectural decisions)
+- [ ] Root cause analysis in PR description (for `fix:` prefixes)
+- [ ] `make lint` passes — formatting, `go vet`-equivalent checks, and
+      `cargo clippy --workspace --all-targets -- -D warnings` (which
+      also enforces the workspace's promoted pedantic lints)
+- [ ] `make test` passes (`cargo test --workspace`; the pre-push hook
+      additionally runs the coverage gate)
+- [ ] Coverage maintained or improved (`make coverage`)
+- [ ] `make vuln` clean (`cargo audit` with the shared ignore list in
+      `.cargo/audit.toml`)
+- [ ] ADR added/updated in `docs/architecture/` for architectural
+      decisions
 
 ## Coding Standards
 
-- **Sentinel errors** — `var ErrXxx = errors.New("...")`
-- **Context propagation** — All public APIs accept `context.Context`
-- **Structured logging** — `log/slog` (Go), not `fmt.Fprintf`
-- **Error wrapping** — `fmt.Errorf("context: %w", err)`
-- **Tests** — Write tests alongside code, not deferred
+- **No `unwrap()` in library code** — use `?` or explicit error
+  handling; `Response`-style builders degrade gracefully instead of
+  panicking (see `services/git-server/src/main.rs::finish_response`)
+- **Structured logging** — `tracing`, not `println!`
+- **Context propagation** — async public APIs take `&Pool`/state via
+  extractors and return `Result` with typed errors
+- **Sentinel errors** — `thiserror` error enums per crate
+- **Tests** — write tests alongside code, not deferred; route behavior
+  is covered by integration tests driving the real router
+  (`crates/gitforge-api/tests/`)
+- **Workspace lints** — `[workspace.lints.clippy]` in the root
+  `Cargo.toml` promotes selected pedantic lints to `deny`; every crate
+  opts in via `[lints] workspace = true`
 
 ## Coverage Requirements
 
@@ -62,13 +71,15 @@ perf: performance improvements
 | Configuration | 85% |
 | Utilities | 85% |
 
+Run `make coverage` for the current numbers; per-crate coverage notes
+live in `docs/planning/IMPROVEMENTS.md`.
+
 ## Documentation
 
-Every exported function must have a doc comment explaining:
-1. What it does
-2. What inputs it accepts
-3. What outputs it produces
-4. Any side effects or error conditions
+Every exported item must have a doc comment explaining what it does,
+its inputs and outputs, and error conditions. Architectural decisions
+get an ADR in `docs/architecture/`. Wire-format behavior (JSON field
+names, renames) must be pinned by a test, not just documented.
 
 ## Security
 

@@ -297,7 +297,7 @@ async fn delete_artifact(
             .into_response();
     }
     match storage.delete(artifact_id).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!("failed to delete artifact: {}", e);
             (
@@ -457,7 +457,7 @@ mod tests {
             size_bytes: 128,
             created_at: "2024-01-01T00:00:00Z".to_string(),
         };
-        let debug_str = format!("{:?}", response);
+        let debug_str = format!("{response:?}");
         assert!(debug_str.contains("art-debug"));
     }
 

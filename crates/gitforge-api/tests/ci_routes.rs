@@ -12,7 +12,7 @@ use axum::{
 };
 use gitforge_api::{ApiAuth, ApiServer, CiTriggerClient};
 use gitforge_ci::{JobDefinition, PipelineDefinition, StepDefinition, TriggerType};
-use gitforge_common::{PipelineId, PipelineRunId, RepoId, RunnerId};
+use gitforge_common::{PipelineId, PipelineRunId, RepoId};
 use gitforge_db::{
     models::{Job, JobStatus, Pipeline, PipelineRun, Repository, Runner, RunnerType, User},
     queries::{
@@ -522,14 +522,11 @@ async fn job_logs_are_lease_scoped_and_readable_through_the_api() {
     job.status = JobStatus::Queued.as_str().to_string();
     let job_id = job.id;
     JobQueries::create(&f.pool, &job).await.unwrap();
-    assert!(JobQueries::assign_with_lease(
-        &f.pool,
-        job_id,
-        runner.id,
-        "lease-token-1",
-    )
-    .await
-    .unwrap());
+    assert!(
+        JobQueries::assign_with_lease(&f.pool, job_id, runner.id, "lease-token-1",)
+            .await
+            .unwrap()
+    );
     JobQueries::append_log_with_lease(
         &f.pool,
         job_id,

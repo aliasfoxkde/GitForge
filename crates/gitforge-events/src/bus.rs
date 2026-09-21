@@ -105,7 +105,7 @@ impl EventBus for InMemoryEventBus {
     async fn publish(&self, event: EventEnvelope) -> Result<()> {
         self.sender
             .send(event)
-            .map_err(|e| gitforge_common::Error::event_system(format!("publish failed: {}", e)))?;
+            .map_err(|e| gitforge_common::Error::event_system(format!("publish failed: {e}")))?;
 
         Ok(())
     }
@@ -333,14 +333,14 @@ mod tests {
     #[test]
     fn test_event_filter_debug() {
         let filter = EventFilter::all();
-        let debug_str = format!("{:?}", filter);
+        let debug_str = format!("{filter:?}");
         assert!(debug_str.contains("EventFilter"));
     }
 
     #[test]
     fn test_in_memory_event_bus_debug() {
         let bus = InMemoryEventBus::new();
-        let debug_str = format!("{:?}", bus);
+        let debug_str = format!("{bus:?}");
         assert!(debug_str.contains("InMemoryEventBus"));
     }
 
@@ -365,7 +365,7 @@ mod tests {
                 EventType::PushReceived,
                 EventPayload::PushReceived(PushReceivedPayload {
                     repo_id: gitforge_common::RepoId::new(),
-                    ref_name: format!("refs/heads/branch{}", i),
+                    ref_name: format!("refs/heads/branch{i}"),
                     old_hash: "abc".to_string(),
                     new_hash: "def".to_string(),
                     pusher_id: None,

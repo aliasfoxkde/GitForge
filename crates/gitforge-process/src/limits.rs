@@ -118,7 +118,7 @@ fn set_memory_limit(max_bytes: u64) -> std::io::Result<()> {
     let output = Command::new("prlimit")
         .args([
             &format!("--pid={}", std::process::id()),
-            &format!("--as={}", max_bytes),
+            &format!("--as={max_bytes}"),
         ])
         .output();
 
@@ -145,7 +145,7 @@ fn set_cpu_limit(cpu_time_secs: u64) -> std::io::Result<()> {
     let output = Command::new("prlimit")
         .args([
             &format!("--pid={}", std::process::id()),
-            &format!("--cpu={}", cpu_time_secs),
+            &format!("--cpu={cpu_time_secs}"),
         ])
         .output();
 

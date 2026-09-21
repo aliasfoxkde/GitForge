@@ -60,13 +60,14 @@ mod tests {
     };
 
     fn test_artifact_directory() -> PathBuf {
-        let directory = env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
+        let directory = env::var_os("CARGO_TARGET_DIR").map_or_else(
+            || {
                 env::current_dir()
                     .expect("test working directory should be available")
                     .join("target")
-            });
+            },
+            PathBuf::from,
+        );
         directory.join("gitforge-cli-admin-tests")
     }
 

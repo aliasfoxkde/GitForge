@@ -19,3 +19,6 @@ tokio = { workspace = true }
 
 # SQLite for MVP - embedded, no server needed
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json"] }
+
+[lints]
+workspace = true

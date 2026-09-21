@@ -338,7 +338,7 @@ impl Scheduler {
 
         // Persist to database if available
         if let Some(pool) = &self.db_pool {
-            let mut db_job = DbJob::new(pipeline_run_id, format!("job-{}", job_id));
+            let mut db_job = DbJob::new(pipeline_run_id, format!("job-{job_id}"));
             db_job.id = job_id;
             if let Err(e) = gitforge_db::queries::JobQueries::create(pool, &db_job).await {
                 tracing::error!("failed to persist job to DB: {}", e);
@@ -894,6 +894,7 @@ impl Scheduler {
         };
 
         let pending_jobs = gitforge_db::queries::JobQueries::list_pending(pool).await?;
+        let pending_rows = pending_jobs.len();
         let mut state = self.state.write().await;
 
         let mut loaded = 0;
@@ -931,7 +932,12 @@ impl Scheduler {
             }
         }
 
-        tracing::info!("loaded {} pending jobs from database", loaded);
+        tracing::info!(
+            pending_rows,
+            newly_loaded = loaded,
+            in_memory_queue = state.queue.len(),
+            "refreshed pending jobs from database"
+        );
         Ok(loaded)
     }
 
@@ -956,11 +962,10 @@ impl Scheduler {
                 .await
                 .ok()
                 .flatten()
-                .map(|job| {
+                .is_some_and(|job| {
                     gitforge_db::models::JobStatus::from_str(&job.status)
                         .is_some_and(|status| status.is_terminal())
-                })
-                .unwrap_or(false);
+                });
         }
         false
     }
@@ -969,6 +974,36 @@ impl Scheduler {
     pub async fn queue_len(&self) -> usize {
         let state = self.state.read().await;
         state.queue.len()
+    }
+
+    /// Return durable and in-memory queue counters for operator telemetry.
+    pub async fn queue_status(&self) -> anyhow::Result<QueueStatus> {
+        let (in_memory_queued, assigned_jobs, online_runners) = {
+            let state = self.state.read().await;
+            (
+                state.queue.len(),
+                state.assigned_jobs.len(),
+                state
+                    .runners
+                    .values()
+                    .filter(|runner| runner.status == "online")
+                    .count(),
+            )
+        };
+        let durable_pending = match &self.db_pool {
+            Some(pool) => Some(
+                gitforge_db::queries::JobQueries::list_pending(pool)
+                    .await?
+                    .len(),
+            ),
+            None => None,
+        };
+        Ok(QueueStatus {
+            durable_pending,
+            in_memory_queued,
+            assigned_jobs,
+            online_runners,
+        })
     }
 
     /// Check if a job is assigned
@@ -1193,7 +1228,7 @@ impl Scheduler {
             if existing == &result_json {
                 return Ok(());
             }
-            anyhow::bail!("job {} already has a conflicting receipt", job_id);
+            anyhow::bail!("job {job_id} already has a conflicting receipt");
         }
         state.completed_receipts.insert(job_id, result_json);
         state.job_assignments.remove(&job_id);
@@ -1209,6 +1244,15 @@ impl Scheduler {
         }
         Ok(())
     }
+}
+
+/// Read-only queue admission telemetry exposed by the scheduler API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueStatus {
+    pub durable_pending: Option<usize>,
+    pub in_memory_queued: usize,
+    pub assigned_jobs: usize,
+    pub online_runners: usize,
 }
 
 impl Default for Scheduler {
@@ -1653,7 +1697,7 @@ mod tests {
             repo_id: RepoId::new(),
             priority: Priority::Normal,
         };
-        assert!(format!("{:?}", cmd).contains("Enqueue"));
+        assert!(format!("{cmd:?}").contains("Enqueue"));
     }
 
     #[test]
@@ -1661,7 +1705,7 @@ mod tests {
         let evt = SchedulerEvent::NoRunnerAvailable {
             job_id: JobId::new(),
         };
-        assert!(format!("{:?}", evt).contains("NoRunnerAvailable"));
+        assert!(format!("{evt:?}").contains("NoRunnerAvailable"));
     }
 
     #[test]

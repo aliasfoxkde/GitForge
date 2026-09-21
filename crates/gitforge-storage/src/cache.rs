@@ -143,7 +143,7 @@ impl FileCacheStore {
 
         fs::create_dir_all(&cache_dir)
             .await
-            .map_err(|e| Error::storage(format!("failed to create cache directory: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create cache directory: {e}")))?;
 
         Ok(Self { root })
     }
@@ -178,21 +178,21 @@ impl CacheStore for FileCacheStore {
         // Write data file
         let mut file = fs::File::create(&cache_path)
             .await
-            .map_err(|e| Error::storage(format!("failed to create cache file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create cache file: {e}")))?;
         file.write_all(&data)
             .await
-            .map_err(|e| Error::storage(format!("failed to write cache data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to write cache data: {e}")))?;
 
         // Write metadata file
         let meta_json = serde_json::to_string(&entry)
-            .map_err(|e| Error::storage(format!("failed to serialize cache entry: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to serialize cache entry: {e}")))?;
         let mut meta_file = fs::File::create(&meta_path)
             .await
-            .map_err(|e| Error::storage(format!("failed to create cache metadata file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create cache metadata file: {e}")))?;
         meta_file
             .write_all(meta_json.as_bytes())
             .await
-            .map_err(|e| Error::storage(format!("failed to write cache metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to write cache metadata: {e}")))?;
 
         tracing::debug!("cached {} bytes to {:?}", size_bytes, cache_path);
         Ok(())
@@ -210,11 +210,11 @@ impl CacheStore for FileCacheStore {
         // Read data
         let mut file = fs::File::open(&cache_path)
             .await
-            .map_err(|e| Error::storage(format!("failed to open cache file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to open cache file: {e}")))?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)
             .await
-            .map_err(|e| Error::storage(format!("failed to read cache data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read cache data: {e}")))?;
 
         // Update metadata access time
         if meta_path.exists() {
@@ -239,12 +239,12 @@ impl CacheStore for FileCacheStore {
         if cache_path.exists() {
             fs::remove_file(&cache_path)
                 .await
-                .map_err(|e| Error::storage(format!("failed to delete cache file: {}", e)))?;
+                .map_err(|e| Error::storage(format!("failed to delete cache file: {e}")))?;
         }
         if meta_path.exists() {
             fs::remove_file(&meta_path)
                 .await
-                .map_err(|e| Error::storage(format!("failed to delete cache metadata: {}", e)))?;
+                .map_err(|e| Error::storage(format!("failed to delete cache metadata: {e}")))?;
         }
 
         Ok(())
@@ -256,15 +256,15 @@ impl CacheStore for FileCacheStore {
 
         let mut dir = fs::read_dir(&cache_dir)
             .await
-            .map_err(|e| Error::storage(format!("failed to read cache directory: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read cache directory: {e}")))?;
 
         while let Some(item) = dir
             .next_entry()
             .await
-            .map_err(|e| Error::storage(format!("failed to read cache directory entry: {}", e)))?
+            .map_err(|e| Error::storage(format!("failed to read cache directory entry: {e}")))?
         {
             let path = item.path();
-            if path.extension().map(|e| e == "meta.json").unwrap_or(false) {
+            if path.extension().is_some_and(|e| e == "meta.json") {
                 if let Ok(meta_json) = fs::read_to_string(path.as_path()).await {
                     if let Ok(entry) = serde_json::from_str::<CacheEntry>(&meta_json) {
                         entries.push(entry);
@@ -398,7 +398,7 @@ mod tests {
     fn test_cache_key_debug() {
         let repo_id = gitforge_common::RepoId::new();
         let key = CacheKey::new(repo_id, "cargo", "linux-x86_64");
-        let debug_str = format!("{:?}", key);
+        let debug_str = format!("{key:?}");
         assert!(debug_str.contains("CacheKey"));
     }
 
@@ -412,7 +412,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             accessed_at: chrono::Utc::now(),
         };
-        let debug_str = format!("{:?}", entry);
+        let debug_str = format!("{entry:?}");
         assert!(debug_str.contains("CacheEntry"));
     }
 
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn test_in_memory_cache_store_debug() {
         let store = InMemoryCacheStore::new();
-        let debug_str = format!("{:?}", store);
+        let debug_str = format!("{store:?}");
         assert!(debug_str.contains("InMemoryCacheStore"));
     }
 
@@ -448,7 +448,7 @@ mod tests {
         let repo_id = gitforge_common::RepoId::new();
 
         for i in 0..10 {
-            let key = CacheKey::new(repo_id, &format!("key{}", i), "linux-x86_64");
+            let key = CacheKey::new(repo_id, &format!("key{i}"), "linux-x86_64");
             store.put(key, vec![i as u8]).await.unwrap();
         }
 

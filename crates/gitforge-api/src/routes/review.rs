@@ -156,7 +156,7 @@ fn validate_submission(request: &SubmitReviewRunRequest) -> ApiResult<()> {
         Box::new(error_response(
             StatusCode::BAD_REQUEST,
             "invalid_review_submission",
-            &format!("{} must be 1-{} characters", field, MAX_SHA_LEN),
+            &format!("{field} must be 1-{MAX_SHA_LEN} characters"),
         ))
     };
     if request.base_sha.is_empty() || request.base_sha.len() > MAX_SHA_LEN {
@@ -170,17 +170,14 @@ fn validate_submission(request: &SubmitReviewRunRequest) -> ApiResult<()> {
         return Err(Box::new(error_response(
             StatusCode::BAD_REQUEST,
             "invalid_review_submission",
-            &format!(
-                "idempotency_key must be 1-{} characters",
-                MAX_IDEMPOTENCY_KEY_LEN
-            ),
+            &format!("idempotency_key must be 1-{MAX_IDEMPOTENCY_KEY_LEN} characters"),
         )));
     }
     if !(1..=MAX_ATTEMPT).contains(&request.attempt) {
         return Err(Box::new(error_response(
             StatusCode::BAD_REQUEST,
             "invalid_review_submission",
-            &format!("attempt must be between 1 and {}", MAX_ATTEMPT),
+            &format!("attempt must be between 1 and {MAX_ATTEMPT}"),
         )));
     }
     let has_repo_id = request.repo_id.is_some();
@@ -399,7 +396,7 @@ async fn list_review_findings(
         return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_pagination",
-            &format!("limit must be between 1 and {}", FINDINGS_MAX_LIMIT),
+            &format!("limit must be between 1 and {FINDINGS_MAX_LIMIT}"),
         );
     }
     let run = match authorized_review_run(&pool, &claims, run_id).await {
