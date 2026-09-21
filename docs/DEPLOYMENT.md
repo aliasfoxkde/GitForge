@@ -1,5 +1,7 @@
 # GitForge Deployment Guide
 
+> **Partially superseded (2026-09).** Configuration is environment-only (no config.toml), the database is SQLite-only, and SSH is implemented. Where this document conflicts with [RUNBOOK.md](RUNBOOK.md), prefer the Runbook.
+
 This guide covers deploying GitForge using Docker Compose for self-hosted Git with CI/CD.
 
 ## Prerequisites
@@ -17,10 +19,13 @@ git clone https://github.com/your-org/gitforge.git
 cd gitforge
 ```
 
-2. Copy the configuration file:
+2. Configure the environment. Services read configuration from environment
+variables only — there is no config file. Copy `.env.example` to `.env.local`
+and fill in the deployment variables:
 ```bash
-cp config.toml.example config.toml
-# Edit config.toml with your settings
+cp .env.example .env.local
+# Edit .env.local: JWT_SECRET, DATABASE_URL, GITFORGE_SCHEDULER_TOKEN,
+# DOCKER_GID, GITFORGE_WORKSPACE_HOST_DIR
 ```
 
 3. Set a secure JWT secret:
@@ -77,18 +82,15 @@ Processes pipeline events and orchestrates job execution. The scheduler HTTP API
 Executes CI jobs in Docker containers. Multiple runners can be deployed horizontally. Connects to CI service at `http://ci:42781`.
 
 ### Git Server (ports 42782 HTTP, 42022 SSH)
-Handles Git SSH and HTTP protocols. SSH support is pending implementation.
+Handles Git SSH and HTTP protocols. SSH is served by an in-process russh
+transport that authenticates against the SSH key registry — a client key must
+be registered to an account (`POST /api/ssh-keys`) before it can connect.
 
 ## Configuration
 
-Edit `config.toml` to customize:
-
-| Section | Key | Description |
-|---------|-----|-------------|
-| `server` | `port` | API port |
-| `database` | `url` | SQLite or PostgreSQL URL |
-| `auth` | `jwt_secret` | JWT signing secret |
-| `runner` | `capacity` | Concurrent job slots |
+Services are configured exclusively through environment variables; there is no
+config file. See `.env.example` for the deployment variables and
+[RUNBOOK.md](RUNBOOK.md#configuration) for the full per-service table.
 
 ## Scaling Runners
 
@@ -97,20 +99,14 @@ Add more runners by scaling the service:
 docker-compose up -d --scale runner=3
 ```
 
-Or enable the second runner in docker-compose.yml:
-```yaml
-runner-2:
-  deploy:
-    replicas: 1  # Enable
-```
+Give each instance a distinct `GITFORGE_RUNNER_NAME` so they do not contend
+for a single registry row.
 
-## Database Migration
+## Database
 
-For production, use PostgreSQL:
-```toml
-[database]
-url = "postgres://gitforge:password@postgres:5432/gitforge"
-```
+The database is SQLite, pointed at by `DATABASE_URL` (for example
+`sqlite:/data/gitforge.db?mode=rwc`). There is no PostgreSQL backend; persist
+the database file on a volume and back it up (see the checklist below).
 
 ## Monitoring
 
@@ -126,23 +122,23 @@ Key metrics:
 ### Runner can't connect to scheduler
 ```bash
 docker-compose logs runner
-# Check SCHEDULER_URL environment variable
+# Check GITFORGE_SCHEDULER_URL environment variable
 ```
 
 ### Jobs stuck in queue
 ```bash
-docker-compose logs scheduler
 docker-compose logs ci
 ```
 
 ### Database locked
-SQLite doesn't support concurrent writes. For multi-runner setups, use PostgreSQL.
+The database is SQLite, which serializes writers. Stagger write-heavy work and
+scale by adding runners rather than extra direct database writers.
 
 ## Production Checklist
 
 - [ ] Change JWT secret
-- [ ] Use PostgreSQL instead of SQLite
+- [ ] Restrict access to the SQLite database file and back up its volume
 - [ ] Configure CORS origins
 - [ ] Set up TLS reverse proxy
-- [ ] Enable rate limiting
+- [ ] Front the API with a rate-limiting proxy (no rate limiter is built into the API)
 - [ ] Configure backup for database volume

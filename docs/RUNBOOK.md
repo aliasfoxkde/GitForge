@@ -52,7 +52,7 @@ JWT_SECRET=your-secret PORT=42780 ./target/release/api
 **Environment Variables:**
 - `JWT_SECRET` - Secret for JWT token signing (required)
 - `PORT` - API listen port (default: `42780`)
-- `DATABASE_URL` - SQLite or PostgreSQL URL
+- `DATABASE_URL` - SQLite database URL (e.g. `sqlite:/data/gitforge.db?mode=rwc`)
 - `GITFORGE_CI_TRIGGER_URL` - CI trigger endpoint used by Git-server after a successful push
 - `GITFORGE_CI_TRIGGER_TOKEN` - bearer token matching CI's `GITFORGE_TRIGGER_TOKEN`
 
@@ -229,10 +229,11 @@ curl http://localhost:42780/health
 
 ### Runner Not Picking Up Jobs
 
-1. Verify runner is registered:
+1. Verify runner is registered. The runner list is served by the API gateway;
+   the scheduler on 42781 only exposes `POST /runners` (registration and
+   heartbeat), so query the gateway:
    ```bash
-   curl -H "Authorization: Bearer $GITFORGE_RUNNER_TOKEN" \
-     http://localhost:42781/runners  # Scheduler API
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:42780/api/runners
    ```
 2. Check runner logs for heartbeat errors
 3. Verify runner can reach scheduler
@@ -257,12 +258,11 @@ as a backward-compatible migration fallback.
 
 ### Database Locked
 
-SQLite doesn't support concurrent writes. For multi-runner setups, use PostgreSQL:
-
-```toml
-[database]
-url = "postgres://gitforge:password@localhost:5432/gitforge"
-```
+The database is SQLite (`DATABASE_URL`, e.g.
+`sqlite:/data/gitforge.db?mode=rwc`); there is no PostgreSQL backend. SQLite
+serializes writers, so bursts of concurrent writes surface as
+`database is locked`. Keep the write path short and add runners gradually —
+the scheduler queue absorbs bursts better than extra direct writers.
 
 ## Development
 
@@ -273,10 +273,10 @@ url = "postgres://gitforge:password@localhost:5432/gitforge"
 cargo test --workspace
 
 # Run specific crate tests
-cargo test -p gitforce-ci
+cargo test -p gitforge-ci
 
 # Run with output
-RUST_LOG=debug cargo test -p gitforce-events
+RUST_LOG=debug cargo test -p gitforge-events
 ```
 
 ### Code Quality
@@ -292,23 +292,9 @@ cargo fmt
 
 ## Configuration
 
-### config.toml
-
-```toml
-[server]
-host = "0.0.0.0"
-port = 42780
-
-[database]
-url = "sqlite:/data/gitforge.db"
-
-[auth]
-jwt_secret = "your-secret-here"
-
-[runner]
-scheduler_url = "http://ci:42781"
-capacity = 4
-```
+Services are configured exclusively through environment variables; there is no
+config file. The `gitforge` CLI keeps its own client configuration (server URL
+and auth token), which it writes after `gitforge auth --login`.
 
 ### Environment Variables
 
@@ -343,10 +329,12 @@ Services use `tracing` for structured logging.
 ```bash
 # Set log level
 RUST_LOG=debug cargo run -p api
-
-# JSON logging for production
-RUST_LOG=json cargo run -p api
 ```
+
+`RUST_LOG` is a `tracing` `EnvFilter` directive, not a format switch: it
+selects which targets and levels are emitted (`info`, `debug`,
+`gitforge_ci=trace`, and so on). Services default to `info` and always emit
+structured `tracing` events.
 
 ## Metrics
 
@@ -379,7 +367,7 @@ docker-compose up -d --scale runner=3
 
 - [ ] Change JWT secret from default
 - [ ] Configure CORS origins
-- [ ] Use PostgreSQL for production
+- [ ] Restrict access to the SQLite database file (there is no network database)
 - [ ] Set up TLS reverse proxy
 - [ ] Configure firewall rules
-- [ ] Enable rate limiting
+- [ ] Front the API with a rate-limiting proxy (no rate limiter is built into the API)
