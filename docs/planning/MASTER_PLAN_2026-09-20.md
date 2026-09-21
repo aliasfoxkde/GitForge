@@ -1,0 +1,280 @@
+# GitForge Master Plan — 2026-09-20
+
+Status: Active
+Supersedes: COMPREHENSIVE_EXECUTION_PLAN_2026-08-28.md (completes it; do not
+delete — it records how the current state was reached)
+Inputs: baseline audit (2026-09-20), coverage campaign, strict-lint/code-smell
+audit (`docs/audits/CODE_SMELLS_2026-09-20.md`), documentation audit, and a
+**live instance validation** against the production-local GitForge deployment
+(2026-09-20/21) — trigger → run → job DAG → queue → execution.
+
+---
+
+## 1. Honest assessment of where the project stands
+
+### What is genuinely strong
+
+- **Test mass**: 1 517 workspace tests, all green under
+  `cargo test --workspace` with `-p 1`; the standalone `tests/integration`
+  harness (its own workspace) is at 94/94 after its 2026-09-20 repair
+  (PR #183).
+- **Lint strictness**: clippy `-D warnings` workspace-wide plus four pedantic
+  lints promoted to `deny` in `[workspace.lints.clippy]` with all 19 members
+  opted in. The remaining pedantic backlog is inventoried, not hidden
+  (`docs/audits/CODE_SMELLS_2026-09-20.md`).
+- **Coverage**: 86.22% lines / 87.06% regions against a 79.9% CI floor;
+  per-crate weak spots were attacked directly (git-server 91.8% lines,
+  review 99.4%, storage/job_logs 92.9%).
+- **Security posture**: cargo-vet + cargo-audit (with an honest, justified
+  rsa/russh exemption) + Aegis pattern scanning with a triaged baseline that
+  fails the build on new findings. The Aegis sweep found zero true secrets.
+- **Documentation**: API.md, RUNBOOK, ARCHITECTURE, CONTRIBUTING, README all
+  rewritten against the real code in 2026-09-20; wire formats are pinned by
+  contract tests, not prose.
+- **The platform runs real work**: the live instance carries five other
+  projects' CI (dsc, VIVERE, gods-eye-view, the-craft-coven-website, BigData)
+  with 1 422 succeeded jobs in the durability ledger.
+
+### What is genuinely weak (evidence from live validation)
+
+The deployed instance diverges from `main` in ways that matter, and several
+multi-tenant behaviors have no owner yet. Each finding below is actionable
+and carries its evidence. None of these are hypothetical: all were observed
+against the live deployment on 2026-09-20/21.
+
+### Standards mappings (honest, not aspirational)
+
+| Standard | Verdict |
+|---|---|
+| WGCA / WCAG 2.1 AAA | **N/A** — GitForge ships no web frontend. The dashboard route is a JSON endpoint, not UI. Template-parts are scaffolding for downstream projects. Revisit only if a real UI lands. |
+| Strictest linting | **Achieved for the default+pedantic tier**; `restriction`-tier lints (e.g. `unwrap_used`) are deliberately not enabled globally because the codebase's accepted-unwrap classes (documented in CODE_SMELLS) would flood it. Crate-by-crate `unwrap_used` denial in pure-library crates is a Phase 3 item. |
+| 99% coverage | **Not honest as a blanket target.** The remaining uncovered mass is Docker-gated execution paths and process-bootstrap code that cannot be meaningfully unit-tested. The plan targets ≥90% lines per non-Docker-gated crate and keeps the CI floor at 79.9% until Phase 3 raises it deliberately. |
+
+---
+
+## 2. Findings ledger (live validation, 2026-09-20/21)
+
+Each finding: what was observed, why it matters, where the fix lands.
+
+- **F1 — Deployment drift.** The running service binaries were built
+  2026-09-16/17 while `main` had advanced through 2026-09-20 (three merged
+  PRs). The stale gateway 404'd `GET /api/pipelines/{id}`, served a pipeline
+  listing that duplicates rows, and made the CLI's `pipeline --list`
+  misleading. **Fix lands in**: Phase 0 (refresh procedure below) + a
+  build-stamp line in `scripts/gitforge-status` output so drift is visible
+  without digging through `/proc`.
+- **F2 — Runner registry pollution.** The runners table held **29 rows for
+  the single runner name `swarmone-docker`**; every runner start inserts a
+  new row instead of adopting its durable identity. 28 rows were stale (one
+  had a heartbeat <2 min old). Retirement endpoints exist
+  (`DELETE /api/runners/{id}` refuses busy runners) but nothing reclaims
+  duplicates automatically. **Fix lands in**: Phase 1 (runner upsert-by-name
+  on registration) + Phase 0 ops (retire the 28 stale rows once).
+- **F3 — Online status lies.** 20 of the 29 runner rows reported `status =
+  'online'` with heartbeats hours to weeks old; the status column is only
+  ever written by the runner itself. Consumers (scheduler placement, the
+  CLI listing) cannot trust it. **Fix lands in**: Phase 1 — derive display/
+  placement status from `last_heartbeat` age (single source of truth), or a
+  janitor that flips rows offline on heartbeat timeout.
+- **F4 — Pipeline version-per-push growth.** The `pipelines` table holds
+  **226 rows for dsc, 69 for VIVERE** — one new version row per push, old
+  versions left at `active = 0`, no pruning, no `UNIQUE` constraint. This is
+  the active `codex/push-pipeline-version-retire-20260911` feature area;
+  do not collide with it. **Fix lands in**: Phase 2 — retention policy
+  (keep N versions), a uniqueness boundary, and a decision on whether
+  inactive versions should remain queryable.
+- **F5 — CLI auth UX.** `~/.config/gitforge/config.toml` carries no token;
+  every command 401s until the user discovers `--token`. Login itself works
+  (`POST /auth/login` — note: mounted at the router root, **not** under
+  `/api`; API.md documents this correctly). **Fix lands in**: Phase 0/1 —
+  persist the token on `auth --login` (chmod 600), print a hint on 401 that
+  names the command.
+- **F6 — JWT rotation is session-destructive.** All issued tokens 401 after
+  any service restart that picks up a new `JWT_SECRET` (observed: restart at
+  04:14 on 2026-09-20 invalidated tokens minted hours earlier). **Fix lands
+  in**: Phase 4 — deployment contract: `JWT_SECRET` must come from a
+  persistent secret file/env the operator owns; document that rotation
+  invalidates sessions (or add a key-id ring later).
+- **F7 — Trigger/run correlation race.** `POST /pipelines/trigger` answered
+  `{"status":"queued","pipeline_run_id":null}` while the run row materialized
+  within seconds. The waiter window is 15 s in current code (comment
+  documents an earlier 3 s that was too short); the deployed build predates
+  it. **Action**: re-test on the refreshed deployment (Phase 0 exit
+  criterion); if it still races, instrument the waiter resolution path.
+- **F8 — `.env` is tracked in git.** A secret-shaped file (placeholders
+  today, real values for the live stack) has no business in the index.
+  Untracking naively would delete operators' local `.env` on pull, and
+  compose depends on it. **Fix lands in**: Phase 4 — move to
+  `.env.example` (exists) + `data/`-scoped real env, `git rm --cached` with
+  a release note warning operators to back the file up first.
+- **F9 — Rate limiter built, never mounted.** The gateway middleware exists
+  but no layer is applied to the router. **Fix lands in**: Phase 4 — mount
+  on the public auth routes at minimum (login brute-force is the obvious
+  surface), with its own tests.
+- **F10 — Compose fallback secret.** docker-compose falls back to a
+  `'changeme-in-production'` JWT secret when unset. **Fix lands in**: Phase 4
+  — fail fast at startup when `JWT_SECRET` is missing or is the known-bad
+  default (mirrors the scheduler token's fail-closed treatment).
+- **F11 — Pedantic backlog.** 548 advisory findings, dominated by
+  `cast_possible_truncation` (45), `doc_markdown` (26), `must_use_candidate`
+  (19), `missing_errors_doc` (17), `too_many_lines` (13). Campaign plan in
+  CODE_SMELLS; scheduled Phase 3.
+- **F12 — Queue observability.** Jobs are stored with `name = "job-<uuid>"`
+  (no step name), queue status requires scheduler-token auth at the CI
+  service, and the CLI has no `queue`/`runs` view — during a live saturation
+  episode (both runner slots busy, three projects queued) there is no
+  user-visible answer to "when will my job run". **Fix lands in**: Phase 5 —
+  store the step name at enqueue, expose `GET /api/queue` through the
+  gateway with repo-scoped authorization, add `gitforge pipeline --watch`
+  output for queue position.
+- **F13 — Unmanaged process reality.** The Makefile refuses unmanaged
+  startup and points at "Fedora systemd", `scripts/gitforge-status` reports
+  on `gitforge-*.service` user units — but **no unit files exist anywhere**
+  and the services actually run as ad-hoc processes with a hand-built env
+  block (recreated verbatim in §5). Docs describe governance that does not
+  exist. **Fix lands in**: Phase 0 — either ship the units + installer (the
+  lifecycle doc already specifies the safety contract) or reword the docs to
+  describe the actual stop-services/start procedure.
+
+---
+
+## 3. Phased plan
+
+### Phase 0 — Instance hygiene and honest deployment (days)
+
+1. **Refresh the deployment** to current `main` using the procedure in §5,
+   during a queue-quiet window (no `queued`/`running` jobs; poll the DB).
+   Exit criterion: `GET /api/pipelines/{id}` answers 200; `pipeline --list`
+   shows no duplicate ids; F7 re-test passes.
+2. **Retire the 28 stale runner rows** via the authenticated retirement
+   endpoint (it refuses busy runners — safe by construction).
+3. **CLI login persistence** (F5): store token at
+   `~/.config/gitforge/config.toml` `[auth] token` with 600 perms; 401 hint.
+4. **Resolve F13**: ship `systemd/user/gitforge-*.service` units generated
+   from the §5 env contract + an installer, or correct the docs.
+5. `gitforge-status` gains a build-stamp field (binary mtime/commit vs
+   origin/main) so F1 can never hide again.
+
+### Phase 1 — Scheduler/runner truthfulness (1–2 weeks)
+
+1. **Runner registration = upsert by name** (F2): `RunnerQueries::create`
+   becomes create-or-adopt; add the concurrency test (two simultaneous
+   registrations of one name → one row).
+2. **Heartbeat-derived status** (F3): runner listing and scheduler placement
+   both treat `last_heartbeat` older than N (default 90 s) as offline;
+   property test for the boundary.
+3. **Trigger correlation** (F7): integration test asserting the synchronous
+   response carries the run id when creation completes within the window.
+4. **Job names** (F12, part 1): carry the pipeline step name onto the job
+   row at enqueue; surface it in run/queue responses.
+
+### Phase 2 — Pipeline versioning maturity (coordinate with the
+push-pipeline-version-retire branch)
+
+1. Retention: keep the newest N versions per (repo, name); prune older
+   inactive rows (configurable, default 10).
+2. Uniqueness: `UNIQUE(repo_id, name, version)` or equivalent once version
+   semantics settle.
+3. Document the version model in ARCHITECTURE.md (what `active` means, what
+   a historical version answers).
+4. Backfill cleanup for the live instance (226-row dsc table → bounded).
+
+### Phase 3 — Strictness and testability campaign
+
+1. `PipelineQueries::update_config` so webhook-conflict paths are testable
+   without DB surgery (unblocks the `too_many_lines` handler splits).
+2. Injectable `CiTriggerClient` endpoint (already constructed with URL —
+   allow override in tests beyond the loopback pin).
+3. Cast campaign: enable `cast_possible_truncation` crate-by-crate starting
+   with `gitforge-common`, `gitforge-events`; every cast gets an explicit
+   range guard.
+4. `OnceLock` for the review engine's literal regexes.
+5. `unwrap_used` denial for pure-library crates (not services, not tests).
+6. Raise the coverage floor 79.9% → 85% once Phase 3.1 unblocks handler
+   tests.
+
+### Phase 4 — Hardening
+
+1. Untrack `.env` with the operator-safe procedure (F8).
+2. Mount the rate limiter on `/auth/login` + public runner registration
+   (F9).
+3. Fail fast on missing/default `JWT_SECRET` in compose and binary boots
+   (F10, F6).
+4. Secret-file support (`JWT_SECRET_FILE`) so operators stop pasting secrets
+   into process env blocks.
+
+### Phase 5 — Platform maturation (GitForge eating its own dog food)
+
+1. Queue visibility through the gateway (F12): repo-scoped
+   `GET /api/repos/{id}/queue`, CLI `pipeline --watch` with position.
+2. Artifact GC: artifacts root grows unbounded; add a retention sweep with
+   receipts (mirrors the workspace sweep pattern).
+3. GitForge's own CI (the `gitforge-ci` pipeline in the repo) runs on the
+   live instance on every push to `main` — make this the release gate
+   instead of GitHub Actions (which stays a red/billing-blocked mirror).
+4. Multi-runner soak: two runners, one saturated queue, cancel storms —
+   the load shapes F2/F3 will be exercised under.
+
+---
+
+## 4. Deployment procedure (captured verbatim from the live instance,
+2026-09-20)
+
+The four services run from one checkout with a shared env block. This is the
+complete restart contract (env values live in the operator's secret store —
+never in the repo):
+
+```
+# 0. Preconditions
+#    - queue quiet: SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running') == 0
+#    - env block saved (see below); SQLite at data/gitforge.db (absolute path)
+
+# 1. Build (release, from a main-matching checkout)
+cargo build --release --package api --package ci --package git-server --package runner
+
+# 2. Stop (scoped, /proc/exe-exact, TERM→KILL per docs/RESOURCE_SAFE_LIFECYCLE.md)
+sudo ./scripts/stop-services.sh
+
+# 3. Start as the gitforge user with the captured env (all four processes):
+#    API_PORT=42780  SCHEDULER_PORT=42781  HTTP_PORT=42782  SSH_PORT=42022
+#    DATABASE_URL / GITFORGE_DATABASE_URL = sqlite://<checkout>/data/gitforge.db?mode=rwc
+#    JWT_SECRET=<operator secret>          GITFORGE_SCHEDULER_TOKEN=<operator secret>
+#    GITFORGE_CI_TRIGGER_TOKEN=<operator secret>
+#    GITFORGE_CI_TRIGGER_URL=http://127.0.0.1:42781/pipelines/trigger
+#    GITFORGE_SCHEDULER_URL=http://127.0.0.1:42781
+#    GITFORGE_RUNNER_NAME=swarmone-docker  GITFORGE_RUNNER_CAPACITY=2
+#    GITFORGE_RUNNER_TOKEN=<operator secret>
+#    GITFORGE_WORKSPACE_ROOT(S)=<checkout>/workspaces
+#    GITFORGE_ARTIFACT_ROOT=<checkout>/artifacts
+#    GITFORGE_CONTAINER_BACKEND=docker
+#    RUST_LOG=info
+#    (runner-only: GITFORGE_RECONCILE_DELETE=1, GITFORGE_RECONCILE_GRACE_SECS=3600,
+#     GITFORGE_RECONCILE_RECEIPT=<checkout>/data/abandoned-container-receipts.json)
+
+# 4. Verify
+curl -fsS localhost:42780/health && curl -fsS localhost:42781/health
+./scripts/gitforge-status
+```
+
+Write the env block to a 600-perm file outside git before step 2; source it
+in step 3. Note that restarting with a changed `JWT_SECRET` invalidates every
+issued token (F6).
+
+## 5. Live E2E validation evidence (this session)
+
+- Trigger accepted: `POST /pipelines/trigger` (trigger-token auth) → run row
+  `e2db3c38` created; job DAG materialized (`fmt` → `clippy` → `test`, the
+  repo's `needs` graph) with the first job enqueued on image `dsc-ci-rust:4`.
+- Saturation behavior verified live: with both runner slots held by real
+  work (a 570%-CPU python:3.10-slim VIVERE job; a dsc-ci-node job), the new
+  job stayed `queued` with no runner — the scheduler did **not** misplace it
+  and the runner did **not** over-subscribe. Queue-under-load behaves
+  correctly; the gap is observability (F12), not placement.
+- Companion merges during this session: PR #183 (E2E harness repair, 94/94).
+
+## 6. Release checklist delta (extends IMPROVEMENTS.md §Release Checklist)
+
+- [ ] Phase 0 deploy refresh executed; `gitforge-status` shows build-stamp
+- [ ] Stale runner rows retired; registry row count == live runners
+- [ ] v0.4.0 tag + GitHub release after Phase 0 (the merged PRs #180–#183
+      plus the docs/lint campaigns justify a minor bump over v0.3.3)
