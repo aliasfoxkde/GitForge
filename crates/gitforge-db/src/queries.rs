@@ -1134,7 +1134,7 @@ impl JobQueries {
         .bind(id.to_string())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to fence lost job: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to fence lost job: {e}")))?;
         Ok(())
     }
 

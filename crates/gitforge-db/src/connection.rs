@@ -180,7 +180,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create pipelines active index: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create pipelines active index: {e}")))?;
 
         // Create pipeline_runs table
         sqlx::query(
