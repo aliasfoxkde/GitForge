@@ -317,7 +317,7 @@ async fn main() -> anyhow::Result<()> {
                         .await;
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
                     if watchdog_shutdown.load(Ordering::SeqCst) {
                         break;
                     }
