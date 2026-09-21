@@ -927,10 +927,7 @@ impl RunnerAgent {
                     *is_running.write().await = false;
                     break;
                 }
-                tracing::trace!(
-                    "heartbeat failed ({}/10 consecutive)",
-                    consecutive_failures
-                );
+                tracing::trace!("heartbeat failed ({}/10 consecutive)", consecutive_failures);
             }
         });
 
