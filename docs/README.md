@@ -6,6 +6,7 @@ This directory contains both current product documentation and historical planni
 
 | Need | Document |
 |------|----------|
+| Master plan (phases, findings ledger) | [planning/MASTER_PLAN_2026-09-20.md](planning/MASTER_PLAN_2026-09-20.md) |
 | Current improvement backlog | [planning/IMPROVEMENTS.md](planning/IMPROVEMENTS.md) |
 | Current handoff / live state | [planning/HANDOFF.md](planning/HANDOFF.md) |
 | Code quality audit | [AUDIT.md](AUDIT.md) |
