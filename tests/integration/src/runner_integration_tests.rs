@@ -5,7 +5,7 @@
 
 use gitforge_runner::{RunnerAgent, RunnerConfig};
 use gitforge_runner::executor::{ExecutableJob, JobStep, JobResult, JobExecutor};
-use gitforge_common::JobId;
+use gitforge_common::{JobId, PipelineRunId};
 use std::collections::HashMap;
 
 /// Test runner configuration
@@ -30,6 +30,7 @@ fn test_runner_config_custom() {
         capacity: 8,
         heartbeat_interval_secs: 60,
         fetch_interval_secs: 10,
+        ..RunnerConfig::default()
     };
     assert_eq!(config.name, "custom-runner");
     assert_eq!(config.runner_type, "firecracker");
@@ -41,9 +42,9 @@ fn test_runner_config_custom() {
 /// Test executable job creation
 #[test]
 fn test_executable_job_creation() {
-    let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string());
+    let job = ExecutableJob::new(JobId::new(), PipelineRunId::new(), "rust:latest".to_string());
     assert_eq!(job.image, "rust:latest");
-    assert_eq!(job.timeout_secs, 3600);
+    assert_eq!(job.timeout_secs, 300);
     assert!(job.steps.is_empty());
 }
 
@@ -57,7 +58,7 @@ fn test_executable_job_builder_pattern() {
     let mut env = HashMap::new();
     env.insert("RUST_BACKTRACE".to_string(), "1".to_string());
 
-    let job = ExecutableJob::new(JobId::new(), "rust:latest".to_string())
+    let job = ExecutableJob::new(JobId::new(), PipelineRunId::new(), "rust:latest".to_string())
         .with_steps(steps.clone())
         .with_env(env.clone())
         .with_timeout(7200);
@@ -106,7 +107,12 @@ fn test_job_result_success() {
         success: true,
         exit_code: 0,
         step_results: vec![],
+        artifacts: vec![],
+        logs: None,
+        started_at: chrono::Utc::now(),
+        completed_at: chrono::Utc::now(),
         error: None,
+        workspace_path: None,
     };
     assert!(result.success);
     assert_eq!(result.exit_code, 0);
@@ -121,7 +127,12 @@ fn test_job_result_failure() {
         success: false,
         exit_code: 1,
         step_results: vec![],
+        artifacts: vec![],
+        logs: None,
+        started_at: chrono::Utc::now(),
+        completed_at: chrono::Utc::now(),
         error: Some("build failed".to_string()),
+        workspace_path: None,
     };
     assert!(!result.success);
     assert_eq!(result.exit_code, 1);
@@ -135,7 +146,7 @@ async fn test_job_executor_creation() {
     // This may fail if Docker is not available
     // In that case we skip - this is expected in CI without Docker
     if executor.is_ok() {
-        assert_eq!(executor.unwrap().active_count().await, 0);
+        assert_eq!(executor.unwrap().active_job_count().await, 0);
     }
 }
 
@@ -150,7 +161,7 @@ fn test_multiple_job_steps() {
         JobStep::new("deploy", "npm run deploy"),
     ];
 
-    let job = ExecutableJob::new(JobId::new(), "node:18".to_string())
+    let job = ExecutableJob::new(JobId::new(), PipelineRunId::new(), "node:18".to_string())
         .with_steps(steps);
 
     assert_eq!(job.steps.len(), 5);
