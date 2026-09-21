@@ -319,7 +319,7 @@ fn workspace_git_env() -> Vec<String> {
     vec![
         "GIT_CONFIG_COUNT=1".to_owned(),
         "GIT_CONFIG_KEY_0=safe.directory".to_owned(),
-        "GIT_CONFIG_VALUE_0=*".to_owned(),
+        "GIT_CONFIG_VALUE_0=/workspace".to_owned(),
     ]
 }
 
@@ -517,7 +517,7 @@ impl Sandbox for DockerSandbox {
                     None
                 },
                 env: if instance.workspace_path.is_some() {
-                    Some(workspace_git_env())
+                    Some(workspace_exec_git_env())
                 } else {
                     None
                 },
@@ -711,7 +711,7 @@ fn resolve_runner_uid_gid() -> Result<(u32, u32)> {
 /// `|| true` (tag probes, version detection) into a no-op. Tell git this
 /// one mount is trusted; scoped to `/workspace` rather than `*` so it
 /// cannot leak meaning into repositories steps create themselves.
-fn workspace_git_env() -> Vec<&'static str> {
+fn workspace_exec_git_env() -> Vec<&'static str> {
     vec![
         "GIT_CONFIG_COUNT=1",
         "GIT_CONFIG_KEY_0=safe.directory",
@@ -825,13 +825,13 @@ mod tests {
         let env = workspace_git_env();
         // git's env-based config protocol: COUNT declares the entries, each
         // KEY_n/VALUE_n pair supplies one. The key must be the safe.directory
-        // setting and the value must be the wildcard — this trio is what keeps
-        // host-owned workspace mounts usable by root job users (the 2026-09-16
-        // "dubious ownership" CI failure in gitforge-cli's git tests).
+        // setting and the value must be the mounted workspace path — this trio
+        // keeps host-owned workspace mounts usable without trusting unrelated
+        // repositories.
         assert_eq!(env.len(), 3);
         assert_eq!(env[0], "GIT_CONFIG_COUNT=1");
         assert_eq!(env[1], "GIT_CONFIG_KEY_0=safe.directory");
-        assert_eq!(env[2], "GIT_CONFIG_VALUE_0=*");
+        assert_eq!(env[2], "GIT_CONFIG_VALUE_0=/workspace");
     }
 
     #[async_trait]
@@ -1477,7 +1477,7 @@ mod tests {
     /// disables tag probes and other `|| true`-guarded git steps.
     #[test]
     fn workspace_git_env_marks_the_mount_trusted() {
-        let env = super::workspace_git_env();
+        let env = super::workspace_exec_git_env();
         assert!(env.contains(&"GIT_CONFIG_COUNT=1"));
         assert!(env.contains(&"GIT_CONFIG_KEY_0=safe.directory"));
         assert!(env.contains(&"GIT_CONFIG_VALUE_0=/workspace"));
