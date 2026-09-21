@@ -129,12 +129,31 @@ Each finding: what was observed, why it matters, where the fix lands.
   output for queue position.
 - **F13 — Unmanaged process reality.** The Makefile refuses unmanaged
   startup and points at "Fedora systemd", `scripts/gitforge-status` reports
-  on `gitforge-*.service` user units — but **no unit files exist anywhere**
-  and the services actually run as ad-hoc processes with a hand-built env
-  block (recreated verbatim in §5). Docs describe governance that does not
-  exist. **Fix lands in**: Phase 0 — either ship the units + installer (the
-  lifecycle doc already specifies the safety contract) or reword the docs to
-  describe the actual stop-services/start procedure.
+  on `gitforge-*.service` user units — and while `.example` unit templates
+  and a full release-bundle/promote toolchain exist
+  (`scripts/gitforge-release-*`, `systemd/user/`), **no active units are
+  installed** and the services actually run as ad-hoc processes with a
+  hand-built env block (recreated verbatim in §5). Docs describe governance
+  that is not applied to the live host. **Fix lands in**: Phase 0 — install
+  the units from the bundle (the tooling already ships them) or reword the
+  docs to describe the actual procedure.
+- **F14 — Sandbox outlives a decided outcome.** Observed during the
+  2026-09-21 live cutover: when the CI service died mid-execution and its
+  replacement durably failed the in-flight job, the runner (which survived)
+  neither aborted the job's container nor stopped its compile; the container
+  kept burning CPU until the runner's abandoned-container reconcile grace
+  (default `GITFORGE_RECONCILE_GRACE_SECS=3600`) reaps it. The cancellation
+  probe correctly suppresses doomed completions, but it should also **stop
+  the sandbox** when the probe reports a terminal durable status.
+  **Fix lands in**: Phase 1, alongside the runner upsert work.
+- **F15 — Rebuild-while-running defeats the ownership check.** The
+  lifecycle contract matches services by exact `/proc/<pid>/exe` path; a
+  `cargo build --release` into the same `target/` replaces the inode, the
+  exe link gains ` (deleted)`, and `scripts/stop-services.sh` finds nothing
+  to stop. Rebuilding into a checkout that is currently serving traffic
+  therefore silently disarms the stop tool. **Fix lands in**: Phase 0 —
+  stop-services before rebuilding into a live `target/`, and/or teach the
+  ownership check to accept the ` (deleted)` suffix of the exact path.
 
 ---
 
@@ -270,7 +289,28 @@ issued token (F6).
   job stayed `queued` with no runner — the scheduler did **not** misplace it
   and the runner did **not** over-subscribe. Queue-under-load behaves
   correctly; the gap is observability (F12), not placement.
-- Companion merges during this session: PR #183 (E2E harness repair, 94/94).
+- Full DAG execution: `fmt` succeeded end-to-end, `clippy` succeeded
+  end-to-end (both with streaming log receipts persisted durably).
+- Unplanned restart drill: the service cutover of 2026-09-21 landed
+  mid-`test`-job. The in-flight job was durably failed, its full log
+  receipt (327 chunks, ending mid-compilation) survived the restart and
+  remained retrievable via `GET /api/jobs/{id}/logs`, and post-restart the
+  scheduler/runner resumed processing new pushes within a minute — no
+  zombie runs, no lost history. The failure was restart-induced, not a
+  test failure (the workspace suite passes locally: 1 517 tests).
+  Post-cutover freshness probe: `GET /api/pipelines/{id}` answers 200
+  (the stale binary 404'd this route), and the pipeline listing now shows
+  the true per-version rows (F4) instead of the old binary's duplicated
+  ids.
+- Companion merges during this session: PR #183 (E2E harness repair,
+  94/94), PR #184 (this plan), PR #185 (0.5.0 changelog).
+- Deployment state after the cutover: api/ci/git-server serve from the
+  rebuilt `target/release` (binaries identical to the release bundle —
+  same commit inputs), the runner serves from the verified bundle via
+  `/home/gitforge/work/gitforge-current`. An auto-restart actor on the
+  host races manual cutovers (it re-launched the three killed services
+  within seconds from `target/release`); the Phase 0 systemd cutover is
+  what removes this race properly.
 
 ## 6. Release checklist delta (extends IMPROVEMENTS.md §Release Checklist)
 
