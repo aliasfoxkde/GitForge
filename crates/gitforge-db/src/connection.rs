@@ -34,12 +34,16 @@ impl Pool {
         // immediately with SQLITE_BUSY; under job assignment plus log
         // appends that cascaded into lost leases and dropped log chunks.
         // WAL keeps readers concurrent, and a busy timeout makes writers
-        // queue instead of erroring.
+        // queue instead of erroring. The timeout is set well above the
+        // multi-second transactions large log appends can produce: a victim
+        // writer that gives up early cascades into missed heartbeats and
+        // lease-sync failures, which the scheduler can misread as runner
+        // loss.
         let options = SqliteConnectOptions::from_str(&connect_url)
             .map_err(|e| Error::database(format!("invalid database URL: {e}")))?
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(Duration::from_secs(5))
+            .busy_timeout(Duration::from_secs(15))
             .foreign_keys(true);
 
         let pool = SqlitePoolOptions::new()

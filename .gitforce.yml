@@ -1,0 +1,49 @@
+# GitForge local CI pipeline (self-hosted GitForge at /nas/Temp/repos/GitForge).
+#
+# The project's own gates, run by the project itself: rustfmt --check, the
+# strict clippy pass, and the workspace test suite. Pushes to any branch run
+# the full chain, so a PR branch is validated here before it merges.
+#
+# Documented constraints (same list proven in gods-eye-view's and dsc's
+# .gitforce.yml):
+# - The job graph is a LINEAR CHAIN (fmt → clippy → test), not a fan-out,
+#   because all jobs of one run share the SAME workspace directory on this
+#   runner. Concurrent jobs would run cargo against the same target/
+#   directory and corrupt each other's build locks.
+# - `environment: {}` is required by the parser (PipelineDefinition has no
+#   serde default) even though it is never forwarded.
+# - The image is pre-built on the host (dsc-ci-rust:4 — cargo 1.98, clippy, GitForge workspace cargo registry cache (765 crates) baked in for offline builds; v3 lacked bcrypt & co)
+#   rustfmt) and must exist before the first run: the NAS daemon's vfs
+#   storage driver plus the runner's hard 60-second sandbox-acquisition cap
+#   make a pull-at-run-time a guaranteed failure.
+# - Cargo state is cold in the container (no cache mount), so clippy and
+#   test each pay a full dependency compile; the generous timeouts absorb
+#   that rather than gating on a cache setup this repo doesn't own.
+name: gitforge-ci
+version: "1.0"
+trigger_on:
+  - push
+environment: {}
+jobs:
+  - name: fmt
+    image: dsc-ci-rust:4
+    steps:
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+    timeout: 15m
+
+  - name: clippy
+    image: dsc-ci-rust:4
+    needs: [fmt]
+    steps:
+      - name: Strict lint (zero warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+    timeout: 60m
+
+  - name: test
+    image: dsc-ci-rust:4
+    needs: [clippy]
+    steps:
+      - name: Workspace test suite
+        run: cargo test --workspace
+    timeout: 60m

@@ -633,15 +633,46 @@ impl Scheduler {
 
         let mut requeued = 0;
         let db_pool = self.db_pool.clone();
+        let mut fenced_jobs = Vec::new();
         let mut state = self.state.write().await;
 
         for (job_id, pipeline_run_id, repo_id) in &jobs_to_requeue {
             // Persist first so a database failure leaves the in-memory
-            // assignment available for a later stale-runner retry.
+            // assignment available for a later stale-runner retry. A job the
+            // lost runner had already STARTED must not be requeued — its
+            // sandbox may still be executing, and a second execution of the
+            // job would race it (duplicate containers, duelling log appends,
+            // rejected completions) — so it is fenced as failed instead, the
+            // same contract as requeue_inflight's recovery of running jobs.
+            let mut fenced = false;
             if let Some(pool) = &db_pool {
-                if let Err(error) = gitforge_db::queries::JobQueries::requeue(pool, *job_id).await {
-                    tracing::error!(%error, %job_id, "failed to persist runner-loss requeue");
-                    continue;
+                match gitforge_db::queries::JobQueries::get(pool, *job_id).await {
+                    Ok(Some(job)) if job.status == "running" => {
+                        if let Err(error) =
+                            gitforge_db::queries::JobQueries::fail_lost(pool, *job_id).await
+                        {
+                            tracing::error!(%error, %job_id, "failed to fence runner-loss job");
+                            continue;
+                        }
+                        tracing::warn!(
+                            %job_id,
+                            %runner_id,
+                            "job was running on the lost runner; fenced as failed instead of requeued"
+                        );
+                        fenced = true;
+                    }
+                    Ok(_) => {
+                        if let Err(error) =
+                            gitforge_db::queries::JobQueries::requeue(pool, *job_id).await
+                        {
+                            tracing::error!(%error, %job_id, "failed to persist runner-loss requeue");
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, %job_id, "failed to read job for runner-loss handling");
+                        continue;
+                    }
                 }
             }
 
@@ -658,6 +689,15 @@ impl Scheduler {
             state.assigned_jobs.remove(job_id);
             state.job_leases.remove(job_id);
 
+            if fenced {
+                // A fenced execution is terminal: it must NOT re-enter the
+                // queue. Notify the CI engine after releasing the scheduler
+                // state lock so its in-memory mirror can fail the job and
+                // finalize the pipeline instead of remaining live forever.
+                fenced_jobs.push((*job_id, *pipeline_run_id));
+                continue;
+            }
+
             // Re-enqueue the job with the original pipeline run and repository
             // IDs. The queue entry must remain tied to the original checkout.
             state.queue.enqueue(crate::queue::QueuedJob::new(
@@ -671,6 +711,16 @@ impl Scheduler {
                 runner_id
             );
             requeued += 1;
+        }
+
+        drop(state);
+        for (job_id, pipeline_run_id) in fenced_jobs {
+            let _ = self.event_tx.send(SchedulerEvent::JobCompleted {
+                job_id,
+                pipeline_run_id,
+                runner_id,
+                success: false,
+            });
         }
 
         requeued
@@ -1568,6 +1618,109 @@ mod tests {
         assert_eq!(state.runners[&runner_id].status, "offline");
         assert!(!state.job_leases.contains_key(&job_id));
         assert_eq!(state.queue.all()[0].repo_id, repo_id);
+    }
+
+    #[tokio::test]
+    async fn test_runner_loss_fences_running_job_instead_of_requeueing_it() {
+        // A job the lost runner had already STARTED must not re-enter the
+        // queue: its sandbox may still be executing, and a second execution
+        // would race it (duplicate containers, duelling log appends). It is
+        // fenced as failed instead — the same contract as the scheduler's
+        // restart recovery for running rows.
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "fence-owner".to_string(),
+            "fence-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            "fence-repo".to_string(),
+            user.id,
+            "/git/fence-repo".to_string(),
+        );
+        gitforge_db::queries::RepoQueries::create(&pool, &repo)
+            .await
+            .unwrap();
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: "fence-pipeline".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "fence-owner".to_string(),
+            "fence-commit".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+        let job = gitforge_db::models::Job::new(run.id, "fence-running".to_string());
+        let job_id = job.id;
+        gitforge_db::queries::JobQueries::create(&pool, &job)
+            .await
+            .unwrap();
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        let mut events = scheduler.subscribe();
+        let runner_id = RunnerId::new();
+        scheduler
+            .register_runner(make_runner(runner_id, "fence-runner", "online", 1))
+            .await;
+        scheduler.enqueue(job_id, run.id, repo.id).await;
+        scheduler.process_queue().await;
+        let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
+        scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .unwrap();
+        let running = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.status, "running");
+
+        // The runner goes stale while its job is running.
+        {
+            let mut state = scheduler.state.write().await;
+            state.runners.get_mut(&runner_id).unwrap().last_heartbeat =
+                Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        }
+        while events.try_recv().is_ok() {}
+        scheduler.process_queue().await;
+
+        // The running job is fenced failed, NOT re-enqueued.
+        let fenced = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fenced.status, "failed");
+        assert!(fenced.runner_id.is_none());
+        assert_eq!(scheduler.queue_len().await, 0);
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            SchedulerEvent::JobCompleted {
+                job_id: completed_job,
+                pipeline_run_id: completed_run,
+                runner_id: completed_runner,
+                success: false,
+            } if completed_job == job_id && completed_run == run.id && completed_runner == runner_id
+        ));
+
+        let state = scheduler.state.read().await;
+        assert_eq!(state.runners[&runner_id].status, "offline");
     }
 
     #[tokio::test]

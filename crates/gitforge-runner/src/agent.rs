@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
@@ -729,6 +730,10 @@ pub struct RunnerAgent {
     executor: Arc<JobExecutor>,
     is_running: Arc<RwLock<bool>>,
     reconciler_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Set when the scheduler has been unreachable for the loss threshold.
+    /// `run` surfaces this as an error so the service supervisor can restart
+    /// and re-register the runner instead of leaving it apparently healthy.
+    scheduler_lost: Arc<AtomicBool>,
     /// Authoritative active-job set shared with the reconciler. The reconciler
     /// holds this registry's lock across its Docker calls so admission cannot
     /// interleave between the snapshot and a remove decision.
@@ -754,6 +759,7 @@ impl RunnerAgent {
             executor: Arc::new(executor),
             is_running: Arc::new(RwLock::new(false)),
             reconciler_task: Arc::new(Mutex::new(None)),
+            scheduler_lost: Arc::new(AtomicBool::new(false)),
             active_jobs: ActiveJobRegistry::new(),
         })
     }
@@ -886,8 +892,10 @@ impl RunnerAgent {
         let heartbeat_url = self.config.scheduler_url.clone();
         let heartbeat_token = self.config.scheduler_token.clone();
         let is_running = self.is_running.clone();
+        let scheduler_lost = self.scheduler_lost.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(heartbeat_interval));
+            let mut consecutive_failures = 0_u32;
             loop {
                 ticker.tick().await;
                 if !*is_running.read().await {
@@ -900,9 +908,25 @@ impl RunnerAgent {
                 if let Some(token) = &heartbeat_token {
                     heartbeat_request = heartbeat_request.bearer_auth(token);
                 }
-                if let Err(e) = heartbeat_request.send().await {
-                    tracing::trace!("heartbeat failed: {}", e);
+                let delivered = heartbeat_request
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success());
+                if delivered {
+                    consecutive_failures = 0;
+                    continue;
                 }
+                consecutive_failures += 1;
+                if consecutive_failures >= 10 {
+                    tracing::error!(
+                        "lost contact with scheduler after {} consecutive failed heartbeats; stopping for re-registration",
+                        consecutive_failures
+                    );
+                    scheduler_lost.store(true, Ordering::SeqCst);
+                    *is_running.write().await = false;
+                    break;
+                }
+                tracing::trace!("heartbeat failed ({}/10 consecutive)", consecutive_failures);
             }
         });
 
@@ -1017,6 +1041,12 @@ impl RunnerAgent {
         // Keep running until stopped
         while *self.is_running.read().await {
             tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        if self.scheduler_lost.load(Ordering::SeqCst) {
+            return Err(Error::internal(
+                "runner lost contact with the scheduler and stopped for re-registration",
+            ));
         }
 
         Ok(())
@@ -1951,6 +1981,11 @@ fn sha256_hex(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn docker_daemon_available() -> bool {
+        std::path::Path::new("/var/run/docker.sock").exists()
+            || std::env::var_os("DOCKER_HOST").is_some()
+    }
+
     #[test]
     fn test_utf8_chunks_preserve_boundaries() {
         let value = "ééé";
@@ -1977,6 +2012,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_register_no_scheduler() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // Registration failure is fatal by default: a runner must not appear
         // healthy when it cannot reach the scheduler that assigns it work.
         let config = RunnerConfig {
@@ -2190,6 +2229,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_agent_stop() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         agent.stop(false).await;
@@ -2367,6 +2410,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_agent_not_registered() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // Agent without registration should have runner as None
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
@@ -2375,6 +2422,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_register_sets_runner() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
             allow_standalone: true,
@@ -2492,6 +2543,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_stop_after_registration() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
             allow_standalone: true,
@@ -2628,6 +2683,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_agent_with_custom_config() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig {
             scheduler_url: "http://custom-scheduler:8081".to_string(),
             name: "custom-runner".to_string(),
@@ -2675,6 +2734,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_run_and_stop() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
             allow_standalone: true,
