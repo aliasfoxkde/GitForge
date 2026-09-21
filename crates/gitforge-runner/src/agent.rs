@@ -911,8 +911,7 @@ impl RunnerAgent {
                 let delivered = heartbeat_request
                     .send()
                     .await
-                    .map(|response| response.status().is_success())
-                    .unwrap_or(false);
+                    .is_ok_and(|response| response.status().is_success());
                 if delivered {
                     consecutive_failures = 0;
                     continue;
