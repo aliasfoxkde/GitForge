@@ -32,11 +32,18 @@ pub struct RunnerResponse {
 
 impl From<gitforge_db::models::Runner> for RunnerResponse {
     fn from(runner: gitforge_db::models::Runner) -> Self {
+        // Status is derived with heartbeat liveness: a registry row left
+        // online by a scheduler restart reports offline once its last
+        // activity crosses the shared threshold.
+        let status = runner.effective_status(
+            chrono::Utc::now(),
+            gitforge_db::models::RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS,
+        );
         Self {
             id: runner.id.to_string(),
             name: runner.name,
             runner_type: runner.runner_type,
-            status: runner.status,
+            status,
             capacity: runner.capacity,
             last_heartbeat: runner.last_heartbeat.map(|dt| dt.to_rfc3339()),
         }

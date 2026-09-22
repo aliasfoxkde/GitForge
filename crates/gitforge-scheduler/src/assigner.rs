@@ -3,7 +3,10 @@
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
 use gitforge_common::{JobId, PipelineRunId, RepoId, RunnerId};
-use gitforge_db::models::{Job as DbJob, JobStatus, PipelineRun as DbPipelineRun, Runner};
+use gitforge_db::models::{
+    Job as DbJob, JobStatus, PipelineRun as DbPipelineRun, Runner,
+    RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS,
+};
 use gitforge_db::Pool;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,8 +16,9 @@ use uuid::Uuid;
 
 /// Maximum heartbeat age before a runner is considered lost by the normal
 /// scheduler tick. Keep this bounded so an interrupted runner cannot retain a
-/// durable job lease indefinitely.
-const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 90;
+/// durable job lease indefinitely. Shared with the API listings through the
+/// model constant so every consumer agrees on the threshold.
+const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS;
 
 /// Scheduler command
 #[derive(Debug)]
@@ -158,10 +162,14 @@ impl SchedulerState {
         self.runners.get(&runner_id)
     }
 
+    /// Runners eligible for placement: persisted status online AND heartbeat
+    /// liveness applied, so a runner whose heartbeat went stale between
+    /// recovery ticks is not offered new work in the meantime.
     pub fn list_online_runners(&self) -> Vec<Runner> {
+        let now = chrono::Utc::now();
         self.runners
             .values()
-            .filter(|r| r.status == "online")
+            .filter(|r| r.effective_status(now, RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS) == "online")
             .cloned()
             .collect()
     }
@@ -1028,6 +1036,7 @@ impl Scheduler {
 
     /// Return durable and in-memory queue counters for operator telemetry.
     pub async fn queue_status(&self) -> anyhow::Result<QueueStatus> {
+        let now = chrono::Utc::now();
         let (in_memory_queued, assigned_jobs, online_runners) = {
             let state = self.state.read().await;
             (
@@ -1036,7 +1045,10 @@ impl Scheduler {
                 state
                     .runners
                     .values()
-                    .filter(|runner| runner.status == "online")
+                    .filter(|runner| {
+                        runner.effective_status(now, RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS)
+                            == "online"
+                    })
                     .count(),
             )
         };
@@ -1900,6 +1912,28 @@ mod tests {
         let online = state.list_online_runners();
         assert_eq!(online.len(), 1);
         assert_eq!(online[0].name, "runner1");
+    }
+
+    /// Placement eligibility derives from heartbeat liveness: a runner still
+    /// marked online whose heartbeat crossed the shared threshold is not
+    /// offered new work, even before the next recovery tick flips it.
+    #[test]
+    fn test_scheduler_state_excludes_stale_heartbeat_from_placement() {
+        let mut state = SchedulerState::new();
+
+        let mut fresh = make_runner(RunnerId::new(), "fresh", "online", 2);
+        fresh.last_heartbeat = Some(chrono::Utc::now());
+        state.add_runner(fresh);
+
+        let mut stale = make_runner(RunnerId::new(), "stale", "online", 2);
+        stale.last_heartbeat = Some(
+            chrono::Utc::now() - chrono::Duration::seconds(RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS + 1),
+        );
+        state.add_runner(stale);
+
+        let online = state.list_online_runners();
+        assert_eq!(online.len(), 1);
+        assert_eq!(online[0].name, "fresh");
     }
 
     #[test]
