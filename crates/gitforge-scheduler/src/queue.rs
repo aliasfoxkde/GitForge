@@ -77,6 +77,8 @@ impl Ord for QueuedJob {
 pub struct JobQueue {
     heap: BinaryHeap<QueuedJob>,
     by_id: HashMap<JobId, QueuedJob>,
+    insertion_order: HashMap<JobId, u64>,
+    next_insertion_order: u64,
 }
 
 impl Default for JobQueue {
@@ -91,12 +93,17 @@ impl JobQueue {
         Self {
             heap: BinaryHeap::new(),
             by_id: HashMap::new(),
+            insertion_order: HashMap::new(),
+            next_insertion_order: 0,
         }
     }
 
     /// Enqueue a job
     pub fn enqueue(&mut self, job: QueuedJob) {
         let job_id = job.job_id;
+        self.next_insertion_order = self.next_insertion_order.saturating_add(1);
+        self.insertion_order
+            .insert(job_id, self.next_insertion_order);
         self.by_id.insert(job_id, job.clone());
         self.heap.push(job);
     }
@@ -109,6 +116,7 @@ impl JobQueue {
     pub fn dequeue(&mut self) -> Option<QueuedJob> {
         while let Some(job) = self.heap.pop() {
             if self.by_id.remove(&job.job_id).is_some() {
+                self.insertion_order.remove(&job.job_id);
                 return Some(job);
             }
         }
@@ -126,9 +134,39 @@ impl JobQueue {
         None
     }
 
+    /// Peek at the next active job using bounded repository fairness.
+    ///
+    /// Priority remains the first ordering key. Within one priority, the
+    /// repository with fewer queued jobs is preferred, preventing a burst
+    /// from monopolizing a single runner while work from another repository
+    /// waits indefinitely. FIFO remains the final tie-breaker.
+    pub fn peek_fair(&self) -> Option<&QueuedJob> {
+        let mut queued_by_repo: HashMap<RepoId, usize> = HashMap::new();
+        for job in self.by_id.values() {
+            *queued_by_repo.entry(job.repo_id).or_default() += 1;
+        }
+
+        self.by_id.values().max_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| {
+                    queued_by_repo
+                        .get(&right.repo_id)
+                        .cmp(&queued_by_repo.get(&left.repo_id))
+                })
+                .then_with(|| right.queued_at.cmp(&left.queued_at))
+                .then_with(|| {
+                    self.insertion_order
+                        .get(&right.job_id)
+                        .cmp(&self.insertion_order.get(&left.job_id))
+                })
+        })
+    }
+
     /// Remove a specific job from the queue
     pub fn remove(&mut self, job_id: JobId) -> Option<QueuedJob> {
         let job = self.by_id.remove(&job_id)?;
+        self.insertion_order.remove(&job_id);
         // Note: We can't efficiently remove from BinaryHeap, so we mark it as removed
         // by checking by_id when dequeueing
         Some(job)
@@ -253,6 +291,31 @@ mod tests {
         assert_eq!(queue.peek().map(|job| job.job_id), Some(active.job_id));
         assert_eq!(queue.dequeue().map(|job| job.job_id), Some(active.job_id));
         assert!(queue.dequeue().is_none());
+    }
+
+    #[test]
+    fn test_fair_peek_prefers_repository_with_smaller_backlog() {
+        let mut queue = JobQueue::new();
+        let burst_repo = RepoId::new();
+        let waiting_repo = RepoId::new();
+
+        queue.enqueue(QueuedJob::new(
+            JobId::new(),
+            PipelineRunId::new(),
+            burst_repo,
+        ));
+        queue.enqueue(QueuedJob::new(
+            JobId::new(),
+            PipelineRunId::new(),
+            burst_repo,
+        ));
+        let waiting_job = QueuedJob::new(JobId::new(), PipelineRunId::new(), waiting_repo);
+        queue.enqueue(waiting_job.clone());
+
+        assert_eq!(
+            queue.peek_fair().map(|job| job.job_id),
+            Some(waiting_job.job_id)
+        );
     }
 
     #[test]
