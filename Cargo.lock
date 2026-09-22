@@ -1480,6 +1480,7 @@ dependencies = [
  "gitforge-db",
  "gitforge-events",
  "hex",
+ "libc",
  "serde",
  "sha2 0.11.0",
  "tempfile",
