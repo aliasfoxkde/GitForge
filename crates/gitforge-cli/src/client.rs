@@ -1,9 +1,33 @@
 //! API client for GitForge CLI
 
 use anyhow::Result;
-use reqwest::Client;
+use reqwest::{Client, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+/// The hint printed when the server rejects or expires the caller's
+/// credentials. `gitforge auth --login` is where the CLI persists a token.
+pub const LOGIN_HINT: &str = "run `gitforge auth --login <username>` first";
+
+/// Turn a failed HTTP response into an error carrying the operation and
+/// status. A 401 names the re-login path; other failures include a bounded
+/// slice of the response body because endpoints put the actionable reason
+/// there (conflict details, validation messages).
+async fn ensure_success(resp: Response, operation: &str) -> Result<Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    if status == StatusCode::UNAUTHORIZED {
+        anyhow::bail!("{operation} failed: 401 Unauthorized — {LOGIN_HINT}");
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let detail: String = body.trim().chars().take(200).collect();
+    if detail.is_empty() {
+        anyhow::bail!("{operation} failed: {status}");
+    }
+    anyhow::bail!("{operation} failed: {status} — {detail}");
+}
 
 /// Login response from the API
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,9 +228,7 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Failed to list repos: {}", resp.status());
-        }
+        let resp = ensure_success(resp, "list repositories").await?;
         let repos: Vec<RepoResponse> = resp.json().await?;
         Ok(repos)
     }
@@ -221,9 +243,7 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Failed to get repo: {}", resp.status());
-        }
+        let resp = ensure_success(resp, "get repository").await?;
         let repo: RepoResponse = resp.json().await?;
         Ok(repo)
     }
@@ -247,9 +267,7 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Failed to create repo: {}", resp.status());
-        }
+        let resp = ensure_success(resp, "create repository").await?;
         let repo: RepoResponse = resp.json().await?;
         Ok(repo)
     }
@@ -264,9 +282,7 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Failed to delete repo: {}", resp.status());
-        }
+        ensure_success(resp, "delete repository").await?;
         Ok(())
     }
 
@@ -280,9 +296,7 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Failed to list pipelines: {}", resp.status());
-        }
+        let resp = ensure_success(resp, "list pipelines").await?;
         let pipelines: Vec<PipelineResponse> = resp.json().await?;
         Ok(pipelines)
     }
@@ -297,9 +311,7 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Failed to get pipeline: {}", resp.status());
-        }
+        let resp = ensure_success(resp, "get pipeline").await?;
         let pipeline: PipelineResponse = resp.json().await?;
         Ok(pipeline)
     }
@@ -314,9 +326,7 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Failed to list pipeline runs: {}", resp.status());
-        }
+        let resp = ensure_success(resp, "list pipeline runs").await?;
         let runs: Vec<PipelineRunResponse> = resp.json().await?;
         Ok(runs)
     }
@@ -331,9 +341,7 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Failed to list runners: {}", resp.status());
-        }
+        let resp = ensure_success(resp, "list runners").await?;
         let runners: Vec<RunnerResponse> = resp.json().await?;
         Ok(runners)
     }
@@ -348,9 +356,7 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Failed to get runner: {}", resp.status());
-        }
+        let resp = ensure_success(resp, "get runner").await?;
         let runner: RunnerResponse = resp.json().await?;
         Ok(runner)
     }
@@ -365,11 +371,7 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to retire runner: {status} - {body}");
-        }
+        ensure_success(resp, "retire runner").await?;
         Ok(())
     }
 }
@@ -484,6 +486,76 @@ mod tests {
     fn test_api_client_new() {
         let client = ApiClient::new("http://localhost:42780", None);
         assert_eq!(client.base_url, "http://localhost:42780");
+    }
+
+    /// A 401 must name the re-login path — that is the actionable fix for a
+    /// missing or expired token.
+    #[tokio::test]
+    async fn test_unauthorized_error_names_login_hint() {
+        let mut mock_server = mockito::Server::new_async().await;
+        let m = mock_server
+            .mock("GET", "/api/repos")
+            .with_status(401)
+            .with_body(r#"{"error":"invalid_token","message":"bad token"}"#)
+            .create();
+
+        let url = mock_server.url();
+        let client = ApiClient::new(&url, Some("expired".to_string()));
+        let err = client.list_repos().await.unwrap_err().to_string();
+        assert!(
+            err.contains("401"),
+            "message should carry the status: {err}"
+        );
+        assert!(
+            err.contains("gitforge auth --login"),
+            "message should carry the login hint: {err}"
+        );
+        m.assert();
+    }
+
+    /// Non-401 failures surface the endpoint's error body (bounded), which
+    /// is where conflict and validation reasons live.
+    #[tokio::test]
+    async fn test_error_includes_status_and_bounded_body() {
+        let mut mock_server = mockito::Server::new_async().await;
+        let m = mock_server
+            .mock("GET", "/api/repos")
+            .with_status(409)
+            .with_body(r#"{"error":"conflict","message":"name already exists"}"#)
+            .create();
+
+        let url = mock_server.url();
+        let client = ApiClient::new(&url, Some("t".to_string()));
+        let err = client.list_repos().await.unwrap_err().to_string();
+        assert!(
+            err.contains("409"),
+            "message should carry the status: {err}"
+        );
+        assert!(
+            err.contains("name already exists"),
+            "message should carry the endpoint's reason: {err}"
+        );
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn test_error_body_is_bounded() {
+        let mut mock_server = mockito::Server::new_async().await;
+        let m = mock_server
+            .mock("GET", "/api/repos")
+            .with_status(500)
+            .with_body("x".repeat(5000))
+            .create();
+
+        let url = mock_server.url();
+        let client = ApiClient::new(&url, Some("t".to_string()));
+        let err = client.list_repos().await.unwrap_err().to_string();
+        assert!(
+            err.chars().count() < 300,
+            "error text must stay bounded: {} chars",
+            err.chars().count()
+        );
+        m.assert();
     }
 
     #[test]

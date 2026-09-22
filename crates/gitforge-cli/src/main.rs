@@ -210,18 +210,7 @@ enum Commands {
 }
 
 fn run_git(args: &[&str]) -> Result<String> {
-    // The CLI's git passthrough must work wherever GitForge itself runs —
-    // including CI job containers, where the workspace bind-mount keeps the
-    // host uid while the container user is root and bare `git` refuses the
-    // repo with "detected dubious ownership" (exit 128). Grant the same
-    // trust the sandbox grants job workspaces (see
-    // crates/gitforge-sandbox/src/docker.rs `workspace_git_env`). Env-based
-    // config is used because git only honors safe.directory from protected
-    // configuration; `-c safe.directory=...` on the command line is ignored.
     let output = Command::new("git")
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "safe.directory")
-        .env("GIT_CONFIG_VALUE_0", "*")
         .args(args)
         .output()
         .context("failed to execute git")?;
@@ -389,7 +378,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("  Run `gitforge repo create <name>` to create a new repository.");
                     }
                     Err(e) => {
-                        println!("❌ Failed to list repositories: {e}");
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(name) = create {
@@ -405,7 +394,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("   Visibility: {}", repo.visibility);
                     }
                     Err(e) => {
-                        println!("❌ Failed to create repository: {e}");
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(id) = info {
@@ -419,7 +408,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("   Created: {}", repo.created_at);
                     }
                     Err(e) => {
-                        println!("❌ Failed to get repository: {e}");
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(id) = delete {
@@ -430,7 +419,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("✅ Repository deleted successfully.");
                     }
                     Err(e) => {
-                        println!("❌ Failed to delete repository: {e}");
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(url_or_name) = clone {
@@ -528,7 +517,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("  Run `gitforge pipeline create <name>` to create a pipeline.");
                     }
                     Err(e) => {
-                        println!("❌ Failed to list pipelines: {e}");
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(id) = show {
@@ -540,7 +529,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("   Enabled: {}", pipeline.enabled);
                     }
                     Err(e) => {
-                        println!("❌ Failed to get pipeline: {e}");
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(id) = run {
@@ -586,7 +575,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("  Run `gitforge runner register <name>` to register a runner.");
                     }
                     Err(e) => {
-                        println!("❌ Failed to list runners: {e}");
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(id) = info {
@@ -602,7 +591,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        println!("❌ Failed to get runner: {e}");
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(name) = register {
@@ -614,7 +603,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             } else if let Some(id) = deregister {
                 match api_client.retire_runner(id).await {
                     Ok(()) => println!("✅ Runner {id} retired (audit record preserved)"),
-                    Err(e) => println!("❌ Failed to retire runner: {e}"),
+                    Err(e) => println!("❌ {e}"),
                 }
             } else if let Some(cap) = capacity {
                 println!("🤖 Updating runner capacity to: {cap}");
