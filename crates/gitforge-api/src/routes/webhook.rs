@@ -47,6 +47,59 @@ pub struct WebhookTriggerResponse {
     pub pipeline_id: Option<String>,
 }
 
+#[derive(Debug)]
+enum WebhookJobPlanError {
+    InvalidStoredDefinition(serde_json::Error),
+    MissingEntryJob,
+    InvalidTimeout { job: String, error: String },
+}
+
+#[derive(Debug)]
+struct WebhookJobPlan {
+    name: String,
+    image: String,
+    commands: Vec<String>,
+    working_dir: Option<String>,
+    timeout_secs: u64,
+}
+
+/// Validate the stored pipeline definition and derive the durable entry-job
+/// plan. This function is deliberately pure: persistence, CI delegation, and
+/// response mapping remain at the route boundary.
+fn derive_webhook_job_plan(
+    config: &serde_json::Value,
+) -> Result<WebhookJobPlan, WebhookJobPlanError> {
+    let definition: gitforge_ci::PipelineDefinition = serde_json::from_value(config.clone())
+        .map_err(WebhookJobPlanError::InvalidStoredDefinition)?;
+    let job_definition = definition
+        .jobs
+        .iter()
+        .find(|job| job.needs.is_empty())
+        .ok_or(WebhookJobPlanError::MissingEntryJob)?;
+    let timeout_secs =
+        job_definition
+            .timeout_secs()
+            .map_err(|error| WebhookJobPlanError::InvalidTimeout {
+                job: job_definition.name.clone(),
+                error: error.to_string(),
+            })?;
+
+    Ok(WebhookJobPlan {
+        name: job_definition.name.clone(),
+        image: job_definition.image.clone(),
+        commands: job_definition
+            .steps
+            .iter()
+            .map(|step| step.run.clone())
+            .collect(),
+        working_dir: job_definition
+            .steps
+            .iter()
+            .find_map(|step| step.working_directory.clone()),
+        timeout_secs,
+    })
+}
+
 /// HTTP client for the separately deployed CI orchestrator. The API gateway
 /// must hand webhook execution to CI so CI can create the run-owned checkout,
 /// register the pipeline engine, and progress the dependency DAG.
@@ -214,11 +267,9 @@ async fn trigger_pipeline(
                 }
             }
 
-            let definition: gitforge_ci::PipelineDefinition = match serde_json::from_value(
-                pipeline.config.clone(),
-            ) {
-                Ok(definition) => definition,
-                Err(error) => {
+            let job_plan = match derive_webhook_job_plan(&pipeline.config) {
+                Ok(plan) => plan,
+                Err(WebhookJobPlanError::InvalidStoredDefinition(error)) => {
                     tracing::error!(%error, %pipeline_id, "stored pipeline definition is invalid");
                     return (
                         StatusCode::UNPROCESSABLE_ENTITY,
@@ -230,46 +281,32 @@ async fn trigger_pipeline(
                     )
                         .into_response();
                 }
-            };
-            let Some(job_definition) = definition.jobs.iter().find(|job| job.needs.is_empty())
-            else {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(WebhookTriggerResponse {
-                        success: false,
-                        message: "Pipeline has no runnable entry job".to_string(),
-                        pipeline_id: None,
-                    }),
-                )
-                    .into_response();
-            };
-            let timeout_secs = match job_definition.timeout_secs() {
-                Ok(timeout_secs) => timeout_secs,
-                Err(error) => {
-                    tracing::error!(%error, job = %job_definition.name, "pipeline job timeout is invalid");
+                Err(WebhookJobPlanError::MissingEntryJob) => {
                     return (
                         StatusCode::UNPROCESSABLE_ENTITY,
                         Json(WebhookTriggerResponse {
                             success: false,
-                            message: format!(
-                                "Invalid timeout for job '{}': {error}",
-                                job_definition.name
-                            ),
+                            message: "Pipeline has no runnable entry job".to_string(),
+                            pipeline_id: None,
+                        }),
+                    )
+                        .into_response();
+                }
+                Err(WebhookJobPlanError::InvalidTimeout { job, error }) => {
+                    tracing::error!(%error, %job, "pipeline job timeout is invalid");
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(WebhookTriggerResponse {
+                            success: false,
+                            message: format!("Invalid timeout for job '{job}': {error}"),
                             pipeline_id: None,
                         }),
                     )
                         .into_response();
                 }
             };
-            let commands: Vec<String> = job_definition
-                .steps
-                .iter()
-                .map(|step| step.run.clone())
-                .collect();
-            let working_dir = job_definition
-                .steps
-                .iter()
-                .find_map(|step| step.working_directory.clone());
+            let commands = job_plan.commands.clone();
+            let working_dir = job_plan.working_dir.clone();
 
             // Persist the run before queueing so scheduler job foreign keys
             // and recovery have a durable parent record.
@@ -309,11 +346,11 @@ async fn trigger_pipeline(
             let job_id = JobId::new();
             let idempotency_key = format!("webhook:{pipeline_id}:{}", payload.commit_hash);
             let fingerprint = serde_json::json!({
-                "name": job_definition.name,
+                "name": job_plan.name,
                 "commands": commands,
                 "working_dir": working_dir,
-                "image": job_definition.image,
-                "timeout_secs": timeout_secs,
+                "image": job_plan.image,
+                "timeout_secs": job_plan.timeout_secs,
             })
             .to_string();
             let scope = format!("webhook:{pipeline_id}");
@@ -432,13 +469,12 @@ async fn trigger_pipeline(
                                 .into_response();
                         }
                     }
-                    let mut job =
-                        gitforge_db::models::Job::new(run_id, job_definition.name.clone());
+                    let mut job = gitforge_db::models::Job::new(run_id, job_plan.name.clone());
                     job.id = job_id;
                     job.commands = commands.clone();
-                    job.image = job_definition.image.clone();
+                    job.image = job_plan.image.clone();
                     job.working_dir = working_dir.clone();
-                    job.timeout_secs = timeout_secs;
+                    job.timeout_secs = job_plan.timeout_secs;
                     job.status = JobStatus::Queued.as_str().to_string();
                     if let Err(error) = JobQueries::create(&pool, &job).await {
                         let _ =
