@@ -319,6 +319,29 @@ mod tests {
     }
 
     #[test]
+    fn test_fair_peek_preserves_priority_before_repository_fairness() {
+        let mut queue = JobQueue::new();
+        let burst_repo = RepoId::new();
+        let urgent_repo = RepoId::new();
+
+        for _ in 0..3 {
+            queue.enqueue(QueuedJob::new(
+                JobId::new(),
+                PipelineRunId::new(),
+                burst_repo,
+            ));
+        }
+        let urgent_job = QueuedJob::new(JobId::new(), PipelineRunId::new(), urgent_repo)
+            .with_priority(Priority::High);
+        queue.enqueue(urgent_job.clone());
+
+        assert_eq!(
+            queue.peek_fair().map(|job| job.job_id),
+            Some(urgent_job.job_id)
+        );
+    }
+
+    #[test]
     fn test_queue_remove_nonexistent() {
         let mut queue = JobQueue::new();
         let removed = queue.remove(JobId::new());
