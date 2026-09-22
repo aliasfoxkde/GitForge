@@ -24,6 +24,8 @@ struct TestServer {
     repo_id: RepoId,
     /// `GIT_SSH_COMMAND` that authenticates with the generated client key.
     git_ssh_command: String,
+    ssh_key_dir: PathBuf,
+    _ssh_key_tempdir: tempfile::TempDir,
 }
 
 impl Drop for TestServer {
@@ -95,6 +97,31 @@ fn pin_host_key(base: &Path, port: u16, host_public_key: &str) -> PathBuf {
     known_hosts
 }
 
+/// Keep private SSH keys on a filesystem that enforces owner-only permissions.
+/// Repository/database artifacts intentionally remain under the test's normal
+/// temporary root, which may be a NAS mount without POSIX mode semantics.
+fn secure_ssh_key_tempdir() -> tempfile::TempDir {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    if let Some(runtime_dir) = runtime_dir {
+        if let Ok(tempdir) = tempfile::tempdir_in(runtime_dir) {
+            return tempdir;
+        }
+    }
+    tempfile::tempdir_in("/tmp").expect("create local secure SSH key temp dir")
+}
+
+#[cfg(unix)]
+fn assert_private_key_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = std::fs::metadata(path)
+        .expect("stat private SSH key")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "private SSH key must be owner-only: {path:?}");
+}
+
 /// Spawn the real git-server binary with a prepared database containing a
 /// single `testowner/proto` repository backed by a bare git repository, a
 /// generated host key, and a generated client keypair.
@@ -104,6 +131,8 @@ async fn spawn_server() -> TestServer {
     let git_root = base.join("git");
     let ssh_dir = base.join("ssh");
     let db_path = base.join("gitforge.db");
+    let ssh_key_tempdir = secure_ssh_key_tempdir();
+    let ssh_key_dir = ssh_key_tempdir.path().to_path_buf();
     std::fs::create_dir_all(&git_root).expect("create git root");
     std::fs::create_dir_all(&ssh_dir).expect("create ssh dir");
 
@@ -130,7 +159,7 @@ async fn spawn_server() -> TestServer {
         .expect("create repository");
 
     // Generate the ed25519 client keypair the tests will authenticate with.
-    let client_key = ssh_dir.join("client_ed25519");
+    let client_key = ssh_key_dir.join("client_ed25519");
     let keygen = Command::new("ssh-keygen")
         .args([
             "-t",
@@ -149,6 +178,8 @@ async fn spawn_server() -> TestServer {
         "ssh-keygen failed: {}",
         String::from_utf8_lossy(&keygen.stderr)
     );
+    #[cfg(unix)]
+    assert_private_key_permissions(&client_key);
 
     // Register the generated client key to the owner account before the
     // server starts (as a user would through the API), because the
@@ -229,6 +260,8 @@ async fn spawn_server() -> TestServer {
         git_root,
         repo_id,
         git_ssh_command,
+        ssh_key_dir,
+        _ssh_key_tempdir: ssh_key_tempdir,
     }
 }
 
@@ -355,7 +388,7 @@ async fn test_ssh_unregistered_key_is_rejected() {
 
     // A second, real keypair that was never registered to any account.
     // The transport must not authenticate it on possession alone.
-    let stranger_key = base.join("stranger_ed25519");
+    let stranger_key = server.ssh_key_dir.join("stranger_ed25519");
     let keygen = Command::new("ssh-keygen")
         .args([
             "-t",
@@ -374,6 +407,8 @@ async fn test_ssh_unregistered_key_is_rejected() {
         "ssh-keygen failed: {}",
         String::from_utf8_lossy(&keygen.stderr)
     );
+    #[cfg(unix)]
+    assert_private_key_permissions(&stranger_key);
 
     let stranger_command = ssh_options(&stranger_key, &known_hosts);
     let output = Command::new("git")
