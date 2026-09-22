@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 
 [dev-dependencies]
+# Test-only: POSIX waitid/kill assertions in the child lifecycle suite. The
+# production code in this crate does not call libc directly.
+libc = "0.2"
 tempfile = { workspace = true }
 
 [dependencies]
@@ -25,4 +28,3 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 async-trait = { workspace = true }
 git2 = { workspace = true }
-libc = "0.2"

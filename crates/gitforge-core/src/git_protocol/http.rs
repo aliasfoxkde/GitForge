@@ -598,13 +598,16 @@ mod tests {
     // reaper, so the handler owns every spawned git child until it is reaped.
     // These tests exercise that ownership contract on real child processes in
     // a self-contained way: /bin/sh stand-ins and /proc-free waitid checks, no
-    // live host or network dependency.
+    // live host or network dependency. The suite relies on POSIX process
+    // semantics (`sh`, `waitid`, `kill`), so every item below is explicitly
+    // gated with `#[cfg(unix)]`; Linux coverage is unchanged.
 
-    /// Spawn `sh -c 'exit N'` as a stand-in git child so lifecycle tests run
-    /// anywhere the rest of this suite runs.
-    fn spawn_test_child(exit_code: i32) -> GitRpcChild {
+    /// Spawn `sh -c '<script>'` with fully piped stdio as a stand-in git child
+    /// for the lifecycle suite.
+    #[cfg(unix)]
+    fn spawn_test_child_script(script: String) -> GitRpcChild {
         let mut command = Command::new("sh");
-        command.arg("-c").arg(format!("exit {exit_code}"));
+        command.arg("-c").arg(script);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -612,9 +615,26 @@ mod tests {
             .expect("failed to spawn sh")
     }
 
+    /// Spawn `sh -c 'exit N'` as a stand-in git child so lifecycle tests run
+    /// anywhere the rest of this suite runs.
+    #[cfg(unix)]
+    fn spawn_test_child(exit_code: i32) -> GitRpcChild {
+        spawn_test_child_script(format!("exit {exit_code}"))
+    }
+
+    /// Spawn a child that stays alive and silent until killed, so a dropped
+    /// `drive` future is provably cancelled while it is still awaiting a live
+    /// child rather than after the child already exited.
+    #[cfg(unix)]
+    fn spawn_test_child_holding_open() -> GitRpcChild {
+        // `exec` guarantees the tracked pid is the long-lived process itself.
+        spawn_test_child_script("exec sleep 30".to_string())
+    }
+
     /// Assert the raw pid has been fully reaped: waitid(WNOWAIT|WNOHANG) must
     /// fail with ECHILD. A zombie (unreaped) or still-running child would make
     /// waitid succeed instead, failing the assertion.
+    #[cfg(unix)]
     fn assert_pid_reaped(pid: u32) {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let result = unsafe {
@@ -631,6 +651,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_git_rpc_child_drive_reports_success_status() {
         // Normal completion: the child is waited on by the owner and its
         // stdout is returned.
@@ -640,6 +661,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_git_rpc_child_drive_maps_child_error() {
         // Child error path: a nonzero exit maps to the same git error string
         // the handler previously produced, and the child is reaped.
@@ -653,6 +675,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_git_rpc_child_abandoned_mid_flight_is_reaped_not_zombied() {
         // Cancellation/disconnect path: the guard (with its still-running
         // child) is dropped between spawn and wait, exactly like a handler
@@ -670,6 +693,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_git_rpc_child_drop_after_reap_is_noop() {
         // After a completed drive the guard no longer owns a child
         // (drive consumed it and cleared `child`), so no second reap happens
@@ -687,6 +711,79 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn test_git_rpc_child_drive_cancelled_mid_await_reaps_live_child() {
+        // Genuine mid-`drive` cancellation: the future is dropped while it is
+        // parked on an await point with a still-live child, not before `drive`
+        // starts or after the child exits. The guard is owned by the future,
+        // so the drop must kill and reap the live child synchronously even
+        // though `drive` never reached its own `wait()` call.
+        let guard = spawn_test_child_holding_open();
+        let pid = guard
+            .child
+            .as_ref()
+            .expect(OWNED_CHILD_INVARIANT)
+            .id()
+            .expect("live child pid");
+
+        // Drive with empty input: after `write_all` (a no-op here) the future
+        // parks inside the stdout/stderr `read_to_end` awaits for the full
+        // 30s `sleep 30` lifetime, so dropping it now is cancellation at a
+        // live-child await point. The box owns the future and therefore the
+        // guard, so dropping the box runs the guard's Drop.
+        let mut future = Box::pin(guard.drive(Vec::new()));
+
+        // Poll the future exactly once with a no-op waker. `sleep 30` emits no
+        // output, so the pipes stay open and the single poll deterministically
+        // parks on the stdout/stderr drain — proving the drop below happens
+        // mid-`drive`, not after completion. A no-op waker is correct here:
+        // the future is never polled again, it is only dropped.
+        use std::future::Future;
+        use std::task::Context;
+        use std::task::Poll;
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        let poll_result = future.as_mut().poll(&mut cx);
+        assert!(
+            matches!(poll_result, Poll::Pending),
+            "drive finished or panicked before the cancellation point; \
+             the test would no longer prove mid-await cancellation"
+        );
+
+        // Abort: drop the future (and therefore the owned guard) while the
+        // child is still alive. Reaped-assertion below fails on a zombie.
+        drop(future);
+
+        // A still-running child would make waitid succeed here; the guard
+        // must have SIGKILLed and reaped it.
+        assert_pid_reaped(pid);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_git_rpc_child_drive_drains_stderr_backpressure_concurrently() {
+        // Regression test for stdout/stderr pipe backpressure: a child whose
+        // stderr output exceeds the 64 KiB pipe buffer must never deadlock
+        // against an undrained pipe. The child only exits after its write
+        // succeeds, so completion of `drive` proves the concurrent drain kept
+        // reading while stdout stayed silent.
+        let total_bytes = 256 * 1024; // 4x the default 64 KiB pipe capacity
+        let child = spawn_test_child_script(format!("exec head -c {total_bytes} /dev/zero 1>&2"));
+
+        let driven =
+            tokio::time::timeout(Duration::from_secs(30), child.drive(b"ignored".to_vec()))
+                .await
+                .expect("drive hung draining oversized stderr; concurrent drain regressed")
+                .expect("child writing to stderr must still exit successfully");
+
+        assert!(
+            driven.is_empty(),
+            "stdout must stay empty; only stderr carries the payload"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn test_upload_pack_child_spawn_is_reaped_when_abandoned() {
         // Same abandon-reap contract against the real spawn configuration
         // (git-upload-pack --stateless-rpc on a real repository with piped
