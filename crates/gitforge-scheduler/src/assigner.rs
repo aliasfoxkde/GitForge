@@ -515,7 +515,7 @@ impl Scheduler {
     pub async fn register_runner(&self, mut runner: Runner) -> Runner {
         if let Some(pool) = &self.db_pool {
             match gitforge_db::queries::RunnerQueries::register_or_refresh(pool, &runner).await {
-                Ok(persisted) => runner = persisted,
+                Ok((persisted, _registration)) => runner = persisted,
                 Err(error) => {
                     tracing::error!("failed to persist runner {}: {}", runner.id, error);
                 }

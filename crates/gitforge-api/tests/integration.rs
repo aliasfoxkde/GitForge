@@ -1139,6 +1139,89 @@ async fn test_api_runners_endpoint() {
 }
 
 #[tokio::test]
+async fn test_api_runner_registration_adopts_existing_name() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforge_db::models::User::new(
+        "runner-admin".to_string(),
+        "runner-admin@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+    let auth = ApiAuth::new("test-secret");
+    let token = auth
+        .generate_token(user.id, "runner-admin", "admin")
+        .unwrap();
+
+    let body = r#"{"name":"stable-api-runner","type":"docker","capacity":2}"#;
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runners")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+
+    // A restarted agent re-registers under the same name: the existing row
+    // is adopted, not duplicated.
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runners")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+    let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+
+    assert_eq!(
+        first_json["id"], second_json["id"],
+        "re-registration must return the adopted runner id"
+    );
+
+    let listed = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/runners")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let list_body = to_bytes(listed.into_body(), usize::MAX).await.unwrap();
+    let runners: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    let same_name = runners
+        .as_array()
+        .expect("runner list is a JSON array")
+        .iter()
+        .filter(|r| r["name"] == "stable-api-runner")
+        .count();
+    assert_eq!(same_name, 1, "registry must hold one row for the name");
+}
+
+#[tokio::test]
 async fn test_api_get_nonexistent_artifact() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();

@@ -1510,6 +1510,15 @@ pub enum RunnerRetirement {
     NotFound,
 }
 
+/// Outcome of a name-keyed runner registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerRegistration {
+    /// A new registry row was created for this runner.
+    Created,
+    /// An existing row carrying the same name was adopted and refreshed.
+    Refreshed,
+}
+
 impl RunnerQueries {
     /// Create a new runner
     pub async fn create(pool: &Pool, runner: &crate::models::Runner) -> Result<()> {
@@ -1536,47 +1545,64 @@ impl RunnerQueries {
 
     /// Register a runner by its stable operator-facing name.
     ///
-    /// Runner processes are routinely restarted by systemd. Registration must
-    /// therefore refresh the existing identity instead of inserting a new UUID
-    /// on every restart, otherwise the registry accumulates stale capacity.
+    /// Runner processes are routinely restarted. Registration must therefore
+    /// adopt the existing identity instead of inserting a new UUID on every
+    /// restart, otherwise the registry accumulates stale capacity. The
+    /// unique index on `runners(name)` backs this up under concurrency: the
+    /// SELECT-then-INSERT sequence has a race window, and the losing
+    /// registration's INSERT trips the index, sending it around the loop
+    /// into the refresh path. Exactly one row per name results either way.
     pub async fn register_or_refresh(
         pool: &Pool,
         runner: &crate::models::Runner,
-    ) -> Result<crate::models::Runner> {
-        let existing = sqlx::query(
-            "SELECT * FROM runners WHERE name = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
-        )
-            .bind(&runner.name)
-            .fetch_optional(pool.pool())
+    ) -> Result<(crate::models::Runner, RunnerRegistration)> {
+        for _ in 0..3 {
+            let existing = sqlx::query(
+                "SELECT * FROM runners WHERE name = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+            )
+                .bind(&runner.name)
+                .fetch_optional(pool.pool())
+                .await
+                .map_err(|error| {
+                    Error::database(format!("failed to find runner by name: {error}"))
+                })?
+                .map(hydrate_runner)
+                .transpose()?;
+
+            let Some(mut existing) = existing else {
+                match Self::create(pool, runner).await {
+                    Ok(()) => return Ok((runner.clone(), RunnerRegistration::Created)),
+                    // Lost the race: another registration created the name
+                    // first. Loop and refresh that row instead.
+                    Err(error) if error.message.contains("UNIQUE constraint failed") => continue,
+                    Err(error) => return Err(error),
+                }
+            };
+
+            sqlx::query(
+                "UPDATE runners SET runner_type = ?, status = ?, capacity = ?, labels = ?, last_heartbeat = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(&runner.runner_type)
+            .bind(&runner.status)
+            .bind(runner.capacity)
+            .bind("[]")
+            .bind(runner.last_heartbeat.map(|date| date.to_rfc3339()))
+            .bind(Utc::now().to_rfc3339())
+            .bind(existing.id.to_string())
+            .execute(pool.pool())
             .await
-            .map_err(|error| Error::database(format!("failed to find runner by name: {error}")))?
-            .map(hydrate_runner)
-            .transpose()?;
+            .map_err(|error| Error::database(format!("failed to refresh runner: {error}")))?;
 
-        let Some(mut existing) = existing else {
-            Self::create(pool, runner).await?;
-            return Ok(runner.clone());
-        };
+            existing.runner_type = runner.runner_type.clone();
+            existing.status = runner.status.clone();
+            existing.capacity = runner.capacity;
+            existing.last_heartbeat = runner.last_heartbeat;
+            return Ok((existing, RunnerRegistration::Refreshed));
+        }
 
-        sqlx::query(
-            "UPDATE runners SET runner_type = ?, status = ?, capacity = ?, labels = ?, last_heartbeat = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(&runner.runner_type)
-        .bind(&runner.status)
-        .bind(runner.capacity)
-        .bind("[]")
-        .bind(runner.last_heartbeat.map(|date| date.to_rfc3339()))
-        .bind(Utc::now().to_rfc3339())
-        .bind(existing.id.to_string())
-        .execute(pool.pool())
-        .await
-        .map_err(|error| Error::database(format!("failed to refresh runner: {error}")))?;
-
-        existing.runner_type = runner.runner_type.clone();
-        existing.status = runner.status.clone();
-        existing.capacity = runner.capacity;
-        existing.last_heartbeat = runner.last_heartbeat;
-        Ok(existing)
+        Err(Error::database(
+            "runner registration raced on the same name repeatedly; giving up",
+        ))
     }
 
     /// Get a runner by ID
@@ -2560,9 +2586,10 @@ mod tests {
             crate::models::RunnerType::Docker,
             2,
         );
-        let registered = RunnerQueries::register_or_refresh(&pool, &first)
+        let (registered, outcome) = RunnerQueries::register_or_refresh(&pool, &first)
             .await
             .unwrap();
+        assert_eq!(outcome, RunnerRegistration::Created);
 
         let mut restarted = crate::models::Runner::new(
             "stable-runner".to_string(),
@@ -2570,14 +2597,132 @@ mod tests {
             4,
         );
         restarted.set_busy();
-        let refreshed = RunnerQueries::register_or_refresh(&pool, &restarted)
+        let (refreshed, outcome) = RunnerQueries::register_or_refresh(&pool, &restarted)
             .await
             .unwrap();
+        assert_eq!(outcome, RunnerRegistration::Refreshed);
 
         assert_eq!(refreshed.id, registered.id);
         assert_eq!(refreshed.capacity, 4);
         assert_eq!(refreshed.status, "busy");
         assert_eq!(RunnerQueries::list(&pool).await.unwrap().len(), 1);
+    }
+
+    /// Concurrent registrations of one name must converge on a single row.
+    /// The SELECT-then-INSERT race window is closed by the unique index on
+    /// runners(name); losers of the insert race fall through to the refresh
+    /// path, so every caller succeeds and the registry stays honest.
+    #[tokio::test]
+    async fn test_runner_registration_converges_under_concurrency() {
+        let pool = std::sync::Arc::new(Pool::memory().await.unwrap());
+        pool.migrate().await.unwrap();
+
+        let mut handles = Vec::new();
+        for attempt in 0..8 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                let runner = crate::models::Runner::new(
+                    "shared-runner".to_string(),
+                    crate::models::RunnerType::Docker,
+                    attempt + 1,
+                );
+                RunnerQueries::register_or_refresh(&pool, &runner).await
+            }));
+        }
+
+        let mut ids = std::collections::HashSet::new();
+        for handle in handles {
+            let (runner, _) = handle.await.unwrap().unwrap();
+            ids.insert(runner.id);
+        }
+
+        assert_eq!(ids.len(), 1, "all registrations must adopt one row");
+        assert_eq!(
+            RunnerQueries::list(&pool).await.unwrap().len(),
+            1,
+            "registry must hold exactly one row for the name"
+        );
+    }
+
+    /// The unique index is the backstop: even a raw duplicate insert is
+    /// rejected, and migration renames pre-existing duplicates instead of
+    /// dropping their audit records.
+    #[tokio::test]
+    async fn test_runner_name_unique_index_rejects_duplicates() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let first = crate::models::Runner::new(
+            "indexed-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        RunnerQueries::create(&pool, &first).await.unwrap();
+
+        let duplicate = crate::models::Runner::new(
+            "indexed-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        let error = RunnerQueries::create(&pool, &duplicate)
+            .await
+            .expect_err("duplicate name must be rejected by the unique index");
+        assert!(
+            error.message.contains("UNIQUE constraint failed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Migration must heal databases that accumulated one row per runner
+    /// restart before names were unique: the newest row keeps the name and
+    /// older duplicates are renamed (audit preserved), then the index holds.
+    #[tokio::test]
+    async fn test_migration_renames_duplicate_runner_names() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        // Simulate a pre-index database: drop the index, insert duplicates.
+        sqlx::query("DROP INDEX idx_runners_name")
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        let now = Utc::now().to_rfc3339();
+        let older = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        for (id, updated) in [
+            ("11111111-1111-1111-1111-111111111111", older),
+            ("22222222-2222-2222-2222-222222222222", Utc::now()),
+        ] {
+            sqlx::query(
+                "INSERT INTO runners (id, name, runner_type, status, capacity, labels, last_heartbeat, created_at, updated_at) \
+                 VALUES (?, 'dup-runner', 'docker', 'offline', 1, '[]', NULL, ?, ?)",
+            )
+            .bind(id)
+            .bind(now.clone())
+            .bind(updated.to_rfc3339())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        }
+
+        // Re-running migration deduplicates and recreates the index.
+        pool.migrate().await.unwrap();
+
+        let runners = RunnerQueries::list(&pool).await.unwrap();
+        assert_eq!(runners.len(), 2, "audit records must be preserved");
+        let kept: Vec<_> = runners.iter().filter(|r| r.name == "dup-runner").collect();
+        assert_eq!(kept.len(), 1, "newest row keeps the operator-facing name");
+        assert_eq!(
+            kept[0].id.to_string(),
+            "22222222-2222-2222-2222-222222222222"
+        );
+        let legacy: Vec<_> = runners
+            .iter()
+            .filter(|r| r.name.contains("-legacy-"))
+            .collect();
+        assert_eq!(legacy.len(), 1);
+        assert!(legacy[0].name.starts_with("dup-runner-legacy-"));
     }
 
     #[tokio::test]
