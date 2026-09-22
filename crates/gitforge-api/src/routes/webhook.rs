@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
+const CI_TRIGGER_URL: &str = "http://127.0.0.1:42781/pipelines/trigger";
 const CI_TRIGGER_PATH: &str = "/pipelines/trigger";
 
 /// Webhook payload for triggering a pipeline
@@ -53,7 +54,7 @@ pub struct WebhookTriggerResponse {
 #[derive(Clone)]
 pub struct CiTriggerClient {
     token: String,
-    url: reqwest::Url,
+    port: u16,
     client: reqwest::Client,
 }
 
@@ -76,9 +77,18 @@ impl CiTriggerClient {
             );
         }
 
+        let port = url
+            .port()
+            .ok_or_else(|| "CI trigger URL must include an explicit port".to_string())?;
+
         Ok(Self {
             token: token.into(),
-            url,
+            // Keep the request URL's scheme, host, and path rooted in a
+            // compile-time constant. The configurable port is validated as a
+            // numeric value above and applied to that safe base at request
+            // time, which keeps the request sink independent of raw config
+            // text and makes the SSRF boundary explicit to CodeQL.
+            port,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none())
@@ -97,9 +107,13 @@ impl CiTriggerClient {
         let old_hash = old_commit_hash
             .filter(|hash| !hash.is_empty())
             .unwrap_or("0000000000000000000000000000000000000000");
+        let mut url = reqwest::Url::parse(CI_TRIGGER_URL)
+            .expect("the compile-time CI trigger URL must remain valid");
+        url.set_port(Some(self.port))
+            .expect("a parsed u16 port must be accepted by reqwest::Url");
         let response = self
             .client
-            .post(self.url.clone())
+            .post(url)
             .header("x-gitforge-trigger-token", &self.token)
             .json(&serde_json::json!({
                 "repo_id": repo_id.to_string(),
