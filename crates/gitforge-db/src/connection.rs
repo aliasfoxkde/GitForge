@@ -212,6 +212,30 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create runners table: {e}")))?;
 
+        // Runner names are stable identities: registration adopts the row
+        // that already carries the name (RunnerQueries::register_or_refresh).
+        // Databases created before that contract hold one row per restart of
+        // the same runner. Keep the newest row per name under the
+        // operator-facing name and rename the older duplicates so their audit
+        // records survive the unique index below. RFC3339 timestamps compare
+        // lexicographically, so the concatenated key orders by recency with
+        // the row id as a deterministic tiebreaker.
+        sqlx::query(
+            r#"
+            UPDATE runners SET name = name || '-legacy-' || id
+            WHERE updated_at || id NOT IN (
+                SELECT MAX(updated_at || id) FROM runners GROUP BY name
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to rename duplicate runner names: {e}")))?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_runners_name ON runners(name)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::database(format!("failed to create runners name index: {e}")))?;
+
         // Create jobs table
         sqlx::query(
             r#"

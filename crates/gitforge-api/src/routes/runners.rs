@@ -11,7 +11,7 @@ use axum::{
 use gitforge_common::RunnerId;
 use gitforge_db::{
     models::RunnerType,
-    queries::{RunnerQueries, RunnerRetirement},
+    queries::{RunnerQueries, RunnerRegistration, RunnerRetirement},
     Pool,
 };
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,19 @@ pub struct RunnerResponse {
     pub status: String,
     pub capacity: i32,
     pub last_heartbeat: Option<String>,
+}
+
+impl From<gitforge_db::models::Runner> for RunnerResponse {
+    fn from(runner: gitforge_db::models::Runner) -> Self {
+        Self {
+            id: runner.id.to_string(),
+            name: runner.name,
+            runner_type: runner.runner_type,
+            status: runner.status,
+            capacity: runner.capacity,
+            last_heartbeat: runner.last_heartbeat.map(|dt| dt.to_rfc3339()),
+        }
+    }
 }
 
 /// Runner routes
@@ -50,17 +63,8 @@ async fn list_runners(
 ) -> impl IntoResponse {
     match RunnerQueries::list(&pool).await {
         Ok(runners) => {
-            let response: Vec<RunnerResponse> = runners
-                .into_iter()
-                .map(|r| RunnerResponse {
-                    id: r.id.to_string(),
-                    name: r.name,
-                    runner_type: r.runner_type,
-                    status: r.status,
-                    capacity: r.capacity,
-                    last_heartbeat: r.last_heartbeat.map(|dt| dt.to_rfc3339()),
-                })
-                .collect();
+            let response: Vec<RunnerResponse> =
+                runners.into_iter().map(RunnerResponse::from).collect();
             Json(response).into_response()
         }
         Err(e) => {
@@ -97,17 +101,15 @@ async fn register_runner(
 
     let runner = gitforge_db::models::Runner::new(name, rt, capacity);
 
-    match RunnerQueries::create(&pool, &runner).await {
-        Ok(()) => {
-            let response = RunnerResponse {
-                id: runner.id.to_string(),
-                name: runner.name,
-                runner_type: runner.runner_type,
-                status: runner.status,
-                capacity: runner.capacity,
-                last_heartbeat: runner.last_heartbeat.map(|dt| dt.to_rfc3339()),
-            };
-            (StatusCode::CREATED, Json(response)).into_response()
+    // Registration keys on the runner's stable name: a restart adopts the
+    // existing row (200 with the adopted id) instead of minting a duplicate
+    // identity, so heartbeats keep landing on one registry entry.
+    match RunnerQueries::register_or_refresh(&pool, &runner).await {
+        Ok((adopted, RunnerRegistration::Created)) => {
+            (StatusCode::CREATED, Json(RunnerResponse::from(adopted))).into_response()
+        }
+        Ok((adopted, RunnerRegistration::Refreshed)) => {
+            (StatusCode::OK, Json(RunnerResponse::from(adopted))).into_response()
         }
         Err(e) => {
             tracing::error!("failed to register runner: {}", e);
@@ -133,18 +135,9 @@ async fn get_runner(
 
     match Uuid::parse_str(&id) {
         Ok(uuid) => match RunnerQueries::get(&pool, RunnerId::from(uuid)).await {
-            Ok(Some(runner)) => (
-                StatusCode::OK,
-                Json(RunnerResponse {
-                    id: runner.id.to_string(),
-                    name: runner.name,
-                    runner_type: runner.runner_type,
-                    status: runner.status,
-                    capacity: runner.capacity,
-                    last_heartbeat: runner.last_heartbeat.map(|dt| dt.to_rfc3339()),
-                }),
-            )
-                .into_response(),
+            Ok(Some(runner)) => {
+                (StatusCode::OK, Json(RunnerResponse::from(runner))).into_response()
+            }
             Ok(None) => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({
