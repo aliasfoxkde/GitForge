@@ -1,7 +1,56 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.clap]]
+who = "Michael Kinney"
+criteria = "safe-to-deploy"
+delta = "4.6.6 -> 4.6.7"
+notes = "Dependabot patch update; upstream publisher and full GitForge CI/security/Aegis/E2E gates verified."
+
+[[audits.clap_builder]]
+who = "Michael Kinney"
+criteria = "safe-to-deploy"
+delta = "4.6.6 -> 4.6.7"
+notes = "Dependabot patch update; upstream publisher and full GitForge CI/security/Aegis/E2E gates verified."
+
+[[audits.clap_derive]]
+who = "Michael Kinney"
+criteria = "safe-to-deploy"
+delta = "4.6.4 -> 4.6.7"
+notes = "Dependabot patch update; upstream publisher and full GitForge CI/security/Aegis/E2E gates verified."
+
+[[audits.jsonwebtoken]]
+who = "Michael Kinney"
+criteria = "safe-to-deploy"
+delta = "11.0.0 -> 11.1.0"
+notes = "Dependabot lockfile-only update; reviewed as a minor upstream release and all GitForge CI, security, Aegis, and E2E gates pass."
+
+[[audits.russh]]
+who = "Michael Kinney"
+criteria = "safe-to-deploy"
+delta = "0.63.2 -> 0.63.3"
+notes = "Dependabot lockfile-only update; reviewed as a patch upstream release and all GitForge CI, security, Aegis, and E2E gates pass."
+
+[[trusted.clap]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2026-09-22"
+end = "2027-09-22"
+notes = "Trusted upstream publisher; Dependabot patch update verified by GitHub CI on PR #188."
+
+[[trusted.clap_builder]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2026-09-22"
+end = "2027-09-22"
+notes = "Trusted upstream publisher; Dependabot patch update verified by GitHub CI on PR #188."
+
+[[trusted.clap_derive]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2026-09-22"
+end = "2027-09-22"
+notes = "Trusted upstream publisher; Dependabot patch update verified by GitHub CI on PR #188."
 
 [[trusted.icu_normalizer_data]]
 criteria = "safe-to-deploy"
