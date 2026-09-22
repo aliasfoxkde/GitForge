@@ -54,13 +54,27 @@ impl Config {
     }
 
     /// Save configuration
+    ///
+    /// The file may hold the bearer token persisted by `auth --login`, so
+    /// the mode is forced to owner-only. Setting permissions after the write
+    /// also tightens a pre-existing file that an older CLI created 0644.
     pub fn save(&self) -> Result<()> {
-        let config_path = Self::config_path()?;
-        if let Some(parent) = config_path.parent() {
+        self.save_to(&Self::config_path()?)
+    }
+
+    /// Write the configuration to an explicit path, forcing owner-only mode.
+    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let contents = toml::to_string_pretty(self)?;
-        std::fs::write(config_path, contents)?;
+        std::fs::write(path, contents)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
@@ -185,6 +199,35 @@ mod tests {
         let config = Config::default();
         let cloned = config.clone();
         assert_eq!(config.server_url, cloned.server_url);
+    }
+
+    /// The saved file may carry the bearer token, so the mode must be
+    /// owner-only — both on first write and when tightening a file an older
+    /// CLI had left world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn test_save_forces_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("gitforge-config-test-{}", std::process::id()));
+        let path = dir.join("nested").join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let config = Config {
+            token: Some("secret".to_string()),
+            ..Default::default()
+        };
+        config.save_to(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "fresh save must be owner-only");
+
+        // A pre-existing wide-open file is tightened on the next save.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        config.save_to(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "re-save must tighten wide modes");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
