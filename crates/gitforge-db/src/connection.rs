@@ -158,6 +158,22 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create pipelines table: {e}")))?;
 
+        // Older installations created pipelines before revision history was
+        // modeled. Add the column idempotently so upgraded databases receive
+        // the same schema as fresh installations.
+        if let Err(error) =
+            sqlx::query("ALTER TABLE pipelines ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(Error::database(format!(
+                    "failed to migrate pipelines table: {error}"
+                )));
+            }
+        }
+
         // One active pipeline version per repository and name; superseded
         // versions stay as history with active = 0.
         sqlx::query(
@@ -540,6 +556,30 @@ mod tests {
         let pool = Pool::memory().await.unwrap();
         let result = pool.migrate().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_legacy_pipeline_table_gets_active_revision_column() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        sqlx::query("DROP INDEX idx_pipelines_active_repo_name")
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE pipelines DROP COLUMN active")
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        pool.migrate().await.unwrap();
+
+        let columns = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM pragma_table_info('pipelines') WHERE name = 'active'",
+        )
+        .fetch_optional(pool.pool())
+        .await
+        .unwrap();
+        assert_eq!(columns.as_deref(), Some("active"));
     }
 
     #[tokio::test]
