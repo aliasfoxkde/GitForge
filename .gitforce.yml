@@ -12,12 +12,14 @@
 #   directory and corrupt each other's build locks.
 # - `environment: {}` is required by the parser (PipelineDefinition has no
 #   serde default) even though it is never forwarded.
-# - The image is pre-built on the host (dsc-ci-rust:5 — cargo, clippy,
+# - The image is pre-built on the host (dsc-ci-rust:6 — cargo, clippy,
 #   rustfmt, and the GitForge workspace cargo registry cache baked in for
 #   offline builds). Rebuild and bump the tag whenever Cargo.lock changes —
 #   a stale cache fails every cargo job in seconds with "candidate versions
-#   found which didn't match" (v5 exists because the audited-deps bump moved
-#   jsonwebtoken to 11.1.0 ahead of v4's cache). The recipe lives at
+#   found which didn't match" (v6 exists because v5 dropped openssh-client,
+#   which the hermetic ssh-protocol tests spawn via ssh-keygen; v5 itself
+#   existed because the audited-deps bump moved jsonwebtoken to 11.1.0
+#   ahead of v4's cache). The recipe lives at
 #   infrastructure/docker/ci-rust.Dockerfile. The image must exist before
 #   the first run: the NAS daemon's vfs storage driver plus the runner's
 #   hard 60-second sandbox-acquisition cap make a pull-at-run-time a
@@ -32,14 +34,14 @@ trigger_on:
 environment: {}
 jobs:
   - name: fmt
-    image: dsc-ci-rust:5
+    image: dsc-ci-rust:6
     steps:
       - name: Check formatting
         run: cargo fmt --all -- --check
     timeout: 15m
 
   - name: clippy
-    image: dsc-ci-rust:5
+    image: dsc-ci-rust:6
     needs: [fmt]
     steps:
       - name: Strict lint (zero warnings)
@@ -47,7 +49,7 @@ jobs:
     timeout: 60m
 
   - name: test
-    image: dsc-ci-rust:5
+    image: dsc-ci-rust:6
     needs: [clippy]
     steps:
       - name: Workspace test suite

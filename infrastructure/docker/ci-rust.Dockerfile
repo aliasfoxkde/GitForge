@@ -28,10 +28,11 @@
 FROM rust:1-slim-bookworm
 
 # openssl-sys needs pkg-config + libssl headers; git is a test dependency
-# (ssh/https protocol suites drive a real git client).
+# (ssh/https protocol suites drive a real git client) and openssh-client
+# supplies ssh-keygen, which the hermetic git_ssh_protocol suite spawns.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev curl ca-certificates git \
+        pkg-config libssl-dev curl ca-certificates git openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Slim images ship the minimal rustup profile; the pipeline needs both linters.
