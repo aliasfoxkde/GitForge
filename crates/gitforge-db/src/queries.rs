@@ -594,7 +594,7 @@ impl PipelineQueries {
     ) -> Result<()> {
         let mut transaction =
             pool.pool().begin().await.map_err(|e| {
-                Error::database(format!("failed to begin pipeline replacement: {}", e))
+                Error::database(format!("failed to begin pipeline replacement: {e}"))
             })?;
 
         sqlx::query(
@@ -604,7 +604,7 @@ impl PipelineQueries {
         .bind(&pipeline.name)
         .execute(&mut *transaction)
         .await
-        .map_err(|e| Error::database(format!("failed to retire pipeline version: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to retire pipeline version: {e}")))?;
 
         sqlx::query(
             r#"
@@ -620,7 +620,7 @@ impl PipelineQueries {
         .bind(pipeline.created_at.to_rfc3339())
         .execute(&mut *transaction)
         .await
-        .map_err(|e| Error::database(format!("failed to create pipeline version: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create pipeline version: {e}")))?;
 
         sqlx::query(
             r#"
@@ -641,11 +641,12 @@ impl PipelineQueries {
         .bind(run.created_at.to_rfc3339())
         .execute(&mut *transaction)
         .await
-        .map_err(|e| Error::database(format!("failed to create pipeline run: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create pipeline run: {e}")))?;
 
-        transaction.commit().await.map_err(|e| {
-            Error::database(format!("failed to commit pipeline replacement: {}", e))
-        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit pipeline replacement: {e}")))?;
         Ok(())
     }
 

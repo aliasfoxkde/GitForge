@@ -33,6 +33,76 @@ async fn test_database_in_memory_pool() {
 }
 
 #[tokio::test]
+async fn pipeline_replacement_rolls_back_when_run_insert_fails() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = User::new(
+        "pipeline-owner".to_string(),
+        "pipeline-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "pipeline-repo".to_string(),
+        user.id,
+        "/git/pipeline-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+
+    let first = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "default".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({"version": 1}),
+        created_at: chrono::Utc::now(),
+    };
+    PipelineQueries::create(&pool, &first).await.unwrap();
+    let existing_run = PipelineRun::new(
+        first.id,
+        repo.id,
+        "push".to_string(),
+        "first-commit".to_string(),
+    );
+    PipelineRunQueries::create(&pool, &existing_run)
+        .await
+        .unwrap();
+
+    let replacement = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "default".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({"version": 2}),
+        created_at: chrono::Utc::now(),
+    };
+    let mut conflicting_run = PipelineRun::new(
+        replacement.id,
+        repo.id,
+        "push".to_string(),
+        "second-commit".to_string(),
+    );
+    conflicting_run.id = existing_run.id;
+
+    assert!(
+        PipelineQueries::replace_active_and_create_run(&pool, &replacement, &conflicting_run)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        PipelineQueries::count_active(&pool, repo.id, "default")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(PipelineQueries::get(&pool, replacement.id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn test_database_repository_crud() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();
