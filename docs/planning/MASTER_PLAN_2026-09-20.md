@@ -137,6 +137,15 @@ Each finding: what was observed, why it matters, where the fix lands.
   that is not applied to the live host. **Fix lands in**: Phase 0 — install
   the units from the bundle (the tooling already ships them) or reword the
   docs to describe the actual procedure.
+  **RESOLVED 2026-09-22, reframed**: the services were *not* ad-hoc — they
+  are supervised by **system template instances**
+  `gitforge@{api,ci,git-server,runner}.service` (`Restart=always`, resource
+  limits enforced, env via a `platform-runtime.conf` drop-in). The audit's
+  user-unit/scope assumption was wrong; the status tool looked for
+  `gitforge-*.service` user units only. Fixed by PR #205: the script probes
+  both scopes and reports the unit that actually owns the process. The
+  2026-09-22 cutover additionally pinned the units' `ExecStart` to the
+  promoted release bundle, so deployment governance is now explicit (§4).
 - **F14 — Sandbox outlives a decided outcome.** Observed during the
   2026-09-21 live cutover: when the CI service died mid-execution and its
   replacement durably failed the in-flight job, the runner (which survived)
@@ -146,6 +155,13 @@ Each finding: what was observed, why it matters, where the fix lands.
   probe correctly suppresses doomed completions, but it should also **stop
   the sandbox** when the probe reports a terminal durable status.
   **Fix lands in**: Phase 1, alongside the runner upsert work.
+  **RESOLVED 2026-09-22**: commit 68476c75 made the scheduler's
+  `is_cancelled` probe report *every* terminal durable status (not only
+  operator cancellation), so the runner's existing probe→cancel path stops
+  the sandbox as soon as restart recovery decides the outcome; PR #204
+  extracted the probe into `run_cancellation_watch` and added the runner-side
+  tests (decided-outcome stop, transient-failure recovery, repeated-failure
+  stop without orphaning).
 - **F15 — Rebuild-while-running defeats the ownership check.** The
   lifecycle contract matches services by exact `/proc/<pid>/exe` path; a
   `cargo build --release` into the same `target/` replaces the inode, the
@@ -154,6 +170,10 @@ Each finding: what was observed, why it matters, where the fix lands.
   therefore silently disarms the stop tool. **Fix lands in**: Phase 0 —
   stop-services before rebuilding into a live `target/`, and/or teach the
   ownership check to accept the ` (deleted)` suffix of the exact path.
+  **RESOLVED 2026-09-22**: `scripts/stop-services.sh` now matches the
+  ` (deleted)` suffix of the exact path, and the units no longer execute from
+  a checkout's `target/` at all — `ExecStart` pins the promoted release
+  bundle, so rebuilding a checkout never touches serving binaries.
 
 ---
 
@@ -171,17 +191,23 @@ Each finding: what was observed, why it matters, where the fix lands.
    `~/.config/gitforge/config.toml` `[auth] token` with 600 perms; 401 hint.
 4. **Resolve F13**: ship `systemd/user/gitforge-*.service` units generated
    from the §5 env contract + an installer, or correct the docs.
+   *(Done 2026-09-22, by correction: supervision already existed as system
+   template units — F13 resolution; units now pin the promoted release.)*
 5. `gitforge-status` gains a build-stamp field (binary mtime/commit vs
    origin/main) so F1 can never hide again.
+   *(Done: PRs #198 and #205 — BUILD verdict per service plus release-vs-main
+   comparison.)*
 
 ### Phase 1 — Scheduler/runner truthfulness (1–2 weeks)
 
 1. **Runner registration = upsert by name** (F2): `RunnerQueries::create`
    becomes create-or-adopt; add the concurrency test (two simultaneous
    registrations of one name → one row).
+   *(Done: PR #202, including the healing migration for existing duplicates.)*
 2. **Heartbeat-derived status** (F3): runner listing and scheduler placement
    both treat `last_heartbeat` older than N (default 90 s) as offline;
    property test for the boundary.
+   *(Done: PR #203 — one shared `RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS`.)*
 3. **Trigger correlation** (F7): integration test asserting the synchronous
    response carries the run id when creation completes within the window.
 4. **Job names** (F12, part 1): carry the pipeline step name onto the job
@@ -236,48 +262,42 @@ push-pipeline-version-retire branch)
 
 ---
 
-## 4. Deployment procedure (captured verbatim from the live instance,
-2026-09-20)
+## 4. Deployment procedure (as of the 2026-09-22 cutover)
 
-The four services run from one checkout with a shared env block. This is the
-complete restart contract (env values live in the operator's secret store —
-never in the repo):
+Lifecycle is owned by the **system template units**
+`gitforge@{api,ci,git-server,runner}.service` (enabled, `Restart=always`,
+MemoryMax/CPUQuota/TasksMax enforced). The drop-in
+`/etc/systemd/system/gitforge@.service.d/platform-runtime.conf` carries the
+env block (operator secrets live there and in the secret store — never in the
+repo) and pins `ExecStart` to the promoted release bundle. A release cutover:
 
 ```
-# 0. Preconditions
-#    - queue quiet: SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running') == 0
-#    - env block saved (see below); SQLite at data/gitforge.db (absolute path)
+# 0. Build from a clean main-matching checkout (separate from any checkout
+#    whose target/ serves traffic):
+cargo build --release -p api -p ci -p git-server -p runner
 
-# 1. Build (release, from a main-matching checkout)
-cargo build --release --package api --package ci --package git-server --package runner
+# 1. Stage the four binaries plus scripts/gitforge-status, then:
+GITFORGE_SOURCE_COMMIT=<sha> scripts/gitforge-release-bundle <stage> <releases-root> gitforge-<short>-<date>
+scripts/gitforge-release-verify <releases-root>/gitforge-<short>-<date>
+sudo scripts/gitforge-release-promote --apply <bundle> /home/gitforge/work/gitforge-current
 
-# 2. Stop (scoped, /proc/exe-exact, TERM→KILL per docs/RESOURCE_SAFE_LIFECYCLE.md)
-sudo ./scripts/stop-services.sh
+# 2. Pin the units to the new bundle (drop-in ExecStart):
+#    ExecStart=/nas/Temp/repos/GitForge/releases/<bundle-id>/bin/%i
+sudo systemctl daemon-reload
 
-# 3. Start as the gitforge user with the captured env (all four processes):
-#    API_PORT=42780  SCHEDULER_PORT=42781  HTTP_PORT=42782  SSH_PORT=42022
-#    DATABASE_URL / GITFORGE_DATABASE_URL = sqlite://<checkout>/data/gitforge.db?mode=rwc
-#    JWT_SECRET=<operator secret>          GITFORGE_SCHEDULER_TOKEN=<operator secret>
-#    GITFORGE_CI_TRIGGER_TOKEN=<operator secret>
-#    GITFORGE_CI_TRIGGER_URL=http://127.0.0.1:42781/pipelines/trigger
-#    GITFORGE_SCHEDULER_URL=http://127.0.0.1:42781
-#    GITFORGE_RUNNER_NAME=swarmone-docker  GITFORGE_RUNNER_CAPACITY=2
-#    GITFORGE_RUNNER_TOKEN=<operator secret>
-#    GITFORGE_WORKSPACE_ROOT(S)=<checkout>/workspaces
-#    GITFORGE_ARTIFACT_ROOT=<checkout>/artifacts
-#    GITFORGE_CONTAINER_BACKEND=docker
-#    RUST_LOG=info
-#    (runner-only: GITFORGE_RECONCILE_DELETE=1, GITFORGE_RECONCILE_GRACE_SECS=3600,
-#     GITFORGE_RECONCILE_RECEIPT=<checkout>/data/abandoned-container-receipts.json)
+# 3. Drain check — restarting ci fails in-flight rows (recovery), so wait for
+#    a quiet queue or accept the recovery:
+#    SELECT COUNT(*) FROM jobs WHERE status IN ('pending','assigned','running')
+sudo systemctl restart gitforge@api.service gitforge@git-server.service   # stateless, any time
+sudo systemctl restart gitforge@ci.service gitforge@runner.service        # after drain
 
 # 4. Verify
-curl -fsS localhost:42780/health && curl -fsS localhost:42781/health
-./scripts/gitforge-status
+./scripts/gitforge-status    # expect BUILD=current, overall: healthy
 ```
 
-Write the env block to a 600-perm file outside git before step 2; source it
-in step 3. Note that restarting with a changed `JWT_SECRET` invalidates every
-issued token (F6).
+Restarting anything with a changed `JWT_SECRET` invalidates every issued
+token (F6): re-login after cutover. `data/start-release-services.sh` is now a
+thin `systemctl restart` wrapper; the units are the single source of truth.
 
 ## 5. Live E2E validation evidence (this session)
 
