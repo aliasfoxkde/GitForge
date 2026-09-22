@@ -1224,67 +1224,27 @@ impl RunnerAgent {
             return;
         }
 
-        let cancellation_client = client.clone();
-        let cancellation_url = scheduler_url.to_string();
-        let cancellation_job_id = assignment.job_id.clone();
-        let cancellation_executor = executor.clone();
-        let cancellation_token = scheduler_token.map(ToOwned::to_owned);
         // Set when the scheduler says the job's durable outcome was already
         // decided while this execution was still running: an operator
         // cancellation, or restart recovery failing the in-flight row. The
         // lease is gone in both cases, so post-execution reporting can only
         // produce rejected requests.
-        let orphaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let orphaned_watch = orphaned.clone();
-        let cancellation_watch = tokio::spawn(async move {
-            let endpoint = format!("{cancellation_url}/jobs/{cancellation_job_id}/cancelled");
-            let mut probe_failures = 0u8;
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let mut request = cancellation_client.get(&endpoint);
-                if let Some(token) = &cancellation_token {
-                    request = request.bearer_auth(token);
-                }
-                match request.send().await {
-                    Ok(response) if response.status().is_success() => {
-                        probe_failures = 0;
-                        let cancelled = response
-                            .json::<serde_json::Value>()
-                            .await
-                            .ok()
-                            .and_then(|payload| payload["cancelled"].as_bool())
-                            .unwrap_or(false);
-                        if cancelled {
-                            orphaned_watch.store(true, std::sync::atomic::Ordering::Relaxed);
-                            if let Ok(job_id) = uuid::Uuid::parse_str(&cancellation_job_id) {
-                                let job_id = JobId::from(job_id);
-                                if let Err(error) = cancellation_executor.cancel(&job_id).await {
-                                    tracing::warn!(%error, %job_id, "failed to destroy cancelled sandbox");
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    Ok(response) => {
-                        probe_failures = probe_failures.saturating_add(1);
-                        tracing::warn!(status = %response.status(), attempt = probe_failures, "job cancellation probe rejected");
-                    }
-                    Err(error) => {
-                        probe_failures = probe_failures.saturating_add(1);
-                        tracing::warn!(%error, attempt = probe_failures, "job cancellation probe failed");
-                    }
-                }
-                if probe_failures >= 3 {
-                    tracing::error!(
-                        "cancellation probe unavailable repeatedly; stopping local job sandbox"
-                    );
-                    if let Ok(job_id) = uuid::Uuid::parse_str(&cancellation_job_id) {
-                        let _ = cancellation_executor.cancel(&JobId::from(job_id)).await;
-                    }
-                    break;
-                }
-            }
-        });
+        let orphaned = Arc::new(AtomicBool::new(false));
+        let cancellation_executor = executor.clone();
+        let cancellation_watch = tokio::spawn(run_cancellation_watch(
+            CancellationWatchConfig {
+                client: client.clone(),
+                scheduler_url: scheduler_url.to_string(),
+                job_id: assignment.job_id.clone(),
+                token: scheduler_token.map(ToOwned::to_owned),
+                orphaned: orphaned.clone(),
+            },
+            Duration::from_secs(1),
+            move |job_id| {
+                let executor = cancellation_executor.clone();
+                async move { executor.cancel(&job_id).await }
+            },
+        ));
 
         // Execute the job. Output is sent to the scheduler while the sandbox
         // is running; the bounded sink applies network backpressure and never
@@ -1408,6 +1368,92 @@ impl RunnerAgent {
                 );
             }
             Err(error) => tracing::error!("failed to report job completion: {}", error),
+        }
+    }
+}
+
+/// Probe configuration for the per-job cancellation watch. Pulled out of
+/// `execute_assignment` so the decided-outcome lifecycle can be exercised in
+/// tests against a scripted scheduler.
+pub(crate) struct CancellationWatchConfig {
+    pub client: Client,
+    pub scheduler_url: String,
+    pub job_id: String,
+    pub token: Option<String>,
+    pub orphaned: Arc<AtomicBool>,
+}
+
+/// Background loop body for the cancellation watch. Extracted from
+/// `execute_assignment` so the probe→stop lifecycle can be exercised in
+/// tests without a real sandbox.
+///
+/// The scheduler owns the durable outcome: an operator cancellation and a
+/// restart-recovery failure both surface here as `cancelled: true`, because
+/// in both cases the lease is gone and finishing the execution can only
+/// produce requests the scheduler rejects. Three consecutive probe failures
+/// also stop the sandbox — a scheduler that cannot be asked about the job
+/// must not leave it running unobserved — but do not mark the execution
+/// orphaned, since the outcome is unknown rather than decided.
+pub(crate) async fn run_cancellation_watch<S, Fut>(
+    config: CancellationWatchConfig,
+    probe_interval: Duration,
+    stop_sandbox: S,
+) where
+    S: Fn(JobId) -> Fut,
+    Fut: std::future::Future<Output = Result<()>> + Send,
+{
+    let CancellationWatchConfig {
+        client,
+        scheduler_url,
+        job_id,
+        token,
+        orphaned,
+    } = config;
+    let endpoint = format!("{scheduler_url}/jobs/{job_id}/cancelled");
+    let mut probe_failures = 0u8;
+    loop {
+        tokio::time::sleep(probe_interval).await;
+        let mut request = client.get(&endpoint);
+        if let Some(token) = &token {
+            request = request.bearer_auth(token);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                probe_failures = 0;
+                let cancelled = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|payload| payload["cancelled"].as_bool())
+                    .unwrap_or(false);
+                if cancelled {
+                    orphaned.store(true, Ordering::Relaxed);
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&job_id) {
+                        let job_id = JobId::from(uuid);
+                        if let Err(error) = stop_sandbox(job_id).await {
+                            tracing::warn!(%error, %job_id, "failed to destroy cancelled sandbox");
+                        }
+                    }
+                    break;
+                }
+            }
+            Ok(response) => {
+                probe_failures = probe_failures.saturating_add(1);
+                tracing::warn!(status = %response.status(), attempt = probe_failures, "job cancellation probe rejected");
+            }
+            Err(error) => {
+                probe_failures = probe_failures.saturating_add(1);
+                tracing::warn!(%error, attempt = probe_failures, "job cancellation probe failed");
+            }
+        }
+        if probe_failures >= 3 {
+            tracing::error!(
+                "cancellation probe unavailable repeatedly; stopping local job sandbox"
+            );
+            if let Ok(uuid) = uuid::Uuid::parse_str(&job_id) {
+                let _ = stop_sandbox(JobId::from(uuid)).await;
+            }
+            break;
         }
     }
 }
@@ -3207,5 +3253,158 @@ mod tests {
             vec!["a", "😀", "b"],
             "a char wider than the limit is never split"
         );
+    }
+
+    // ── Cancellation watch ─────────────────────────────────────────────────
+
+    /// Serve a scripted sequence of probe responses from a local listener;
+    /// the last entry repeats for any further connection.
+    async fn spawn_probe_server(responses: &[(u16, &str)]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let addr = listener.local_addr().expect("local addr");
+        let responses: Vec<(u16, String)> = responses
+            .iter()
+            .map(|(status, body)| (*status, (*body).to_string()))
+            .collect();
+        assert!(!responses.is_empty(), "at least one response is required");
+        tokio::spawn(async move {
+            let mut served = 0usize;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let (status, body) = responses[served.min(responses.len() - 1)].clone();
+                served += 1;
+                // Drain the request head before answering so the client's
+                // write never races our response.
+                let mut head = [0u8; 2048];
+                let _ = socket.read(&mut head).await;
+                let reason = match status {
+                    200 => "OK",
+                    500 => "Internal Server Error",
+                    _ => "Status",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\
+                     \r\n{body}",
+                    body.len(),
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A stop callback that records the jobs it was asked to destroy.
+    fn recording_stop(
+        stopped: Arc<Mutex<Vec<JobId>>>,
+    ) -> impl Fn(JobId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+    {
+        move |job_id: JobId| {
+            let stopped = stopped.clone();
+            Box::pin(async move {
+                stopped.lock().await.push(job_id);
+                Ok(())
+            })
+        }
+    }
+
+    fn watch_config(
+        job_id: String,
+        scheduler_url: String,
+        orphaned: Arc<AtomicBool>,
+    ) -> CancellationWatchConfig {
+        CancellationWatchConfig {
+            client: Client::new(),
+            scheduler_url,
+            job_id,
+            token: None,
+            orphaned,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_watch_stops_sandbox_on_decided_outcome() {
+        // The scheduler owns the durable outcome: once it reports the job
+        // decided (operator cancellation or restart recovery failing the
+        // row), the sandbox must be destroyed and the execution marked
+        // orphaned so post-execution reporting is skipped.
+        let url = spawn_probe_server(&[
+            (200, r#"{"cancelled":false}"#),
+            (200, r#"{"cancelled":true}"#),
+        ])
+        .await;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let orphaned = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        run_cancellation_watch(
+            watch_config(job_id.clone(), url, orphaned.clone()),
+            Duration::from_millis(20),
+            recording_stop(stopped.clone()),
+        )
+        .await;
+        assert!(orphaned.load(Ordering::Relaxed));
+        let destroyed = stopped.lock().await;
+        assert_eq!(destroyed.len(), 1, "the sandbox is destroyed exactly once");
+        assert_eq!(
+            destroyed[0].to_string(),
+            job_id,
+            "the configured job's sandbox is the one destroyed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_watch_survives_transient_probe_failure() {
+        // One rejected probe is not a decision: the watch resets its failure
+        // streak on the next success and only stops when the scheduler
+        // actually reports the outcome decided.
+        let url = spawn_probe_server(&[
+            (500, r#"{"error":"unavailable"}"#),
+            (200, r#"{"cancelled":false}"#),
+            (200, r#"{"cancelled":true}"#),
+        ])
+        .await;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let orphaned = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        run_cancellation_watch(
+            watch_config(job_id.clone(), url, orphaned.clone()),
+            Duration::from_millis(20),
+            recording_stop(stopped.clone()),
+        )
+        .await;
+        assert!(orphaned.load(Ordering::Relaxed));
+        let destroyed = stopped.lock().await;
+        assert_eq!(destroyed.len(), 1);
+        assert_eq!(destroyed[0].to_string(), job_id);
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_watch_stops_sandbox_after_repeated_probe_failures() {
+        // A scheduler that keeps rejecting the probe cannot be asked about
+        // the job's fate: after three consecutive failures the sandbox is
+        // destroyed as a safety measure, but the execution is NOT marked
+        // orphaned — the outcome is unknown rather than decided, so
+        // post-execution reporting still runs.
+        let url = spawn_probe_server(&[(500, r#"{"error":"unavailable"}"#)]).await;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let orphaned = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        run_cancellation_watch(
+            watch_config(job_id.clone(), url, orphaned.clone()),
+            Duration::from_millis(20),
+            recording_stop(stopped.clone()),
+        )
+        .await;
+        assert!(
+            !orphaned.load(Ordering::Relaxed),
+            "unknown outcome must not be reported as decided"
+        );
+        let destroyed = stopped.lock().await;
+        assert_eq!(destroyed.len(), 1);
+        assert_eq!(destroyed[0].to_string(), job_id);
     }
 }
