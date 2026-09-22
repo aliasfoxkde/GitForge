@@ -8,7 +8,10 @@ another worktree, or the host operating system.
 
 - Identify services by the kernel-resolved `/proc/<pid>/exe` matching an exact
   executable path under `GITFORGE_ROOT/target/release`; service arguments are
-  therefore supported without substring matching.
+  therefore supported without substring matching. A trailing ` (deleted)`
+  suffix is stripped before comparing: it is the kernel's marker for the
+  old inode of an executable whose file was replaced on disk (for example by
+  a rebuild into the same `target/`) and is still the exact same path.
 - Send `TERM` first and allow `GITFORGE_TERM_WAIT_SECONDS` (default `10`) for
   graceful shutdown.
 - Send `KILL` only to the same exact executable if it remains after the grace
