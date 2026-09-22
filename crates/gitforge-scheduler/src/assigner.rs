@@ -1169,10 +1169,87 @@ impl Scheduler {
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             if !accepted {
+                self.fence_dead_lease(job_id, runner_id).await;
                 anyhow::bail!("durable job lease is no longer active");
             }
         }
         Ok(())
+    }
+
+    /// A durable start/complete rejection means the assignment this scheduler
+    /// still mirrors is dead: the durable lease was superseded or lost while
+    /// the in-memory mirror kept the job assigned. Left alone, every
+    /// pending-jobs poll re-offers the job and every offer is rejected — a
+    /// hot loop observed live (2026-09-22) that wedged the pipeline run at
+    /// `running` forever. Fence the durable row and drop the in-memory
+    /// mirror so the job stops being offered; the fenced case emits
+    /// `JobCompleted` so the CI engine can finalize the pipeline.
+    ///
+    /// Ownership is checked before any durable write: a row running on a
+    /// different runner belongs to a live execution elsewhere and is only
+    /// forgotten here, never fenced.
+    async fn fence_dead_lease(&self, job_id: JobId, runner_id: RunnerId) {
+        let pipeline_run_id = {
+            let mut state = self.state.write().await;
+            let Some((mirror_runner, pipeline_run_id, repo_id)) =
+                state.assigned_jobs.remove(&job_id)
+            else {
+                // Another path already completed or cleaned the assignment.
+                return;
+            };
+            if mirror_runner != runner_id {
+                // The mirror was reassigned to another runner between the
+                // lease validation and this fence; their assignment stands.
+                state
+                    .assigned_jobs
+                    .insert(job_id, (mirror_runner, pipeline_run_id, repo_id));
+                return;
+            }
+            state.job_assignments.remove(&job_id);
+            state.job_leases.remove(&job_id);
+            pipeline_run_id
+        };
+        let Some(pool) = &self.db_pool else {
+            return;
+        };
+        match gitforge_db::queries::JobQueries::get(pool, job_id).await {
+            Ok(Some(job))
+                if job.status == "running" && job.runner_id.is_some_and(|r| r == runner_id) =>
+            {
+                if let Err(error) = gitforge_db::queries::JobQueries::fail_lost(pool, job_id).await
+                {
+                    tracing::error!(%error, %job_id, "failed to fence job whose durable lease died");
+                } else {
+                    tracing::warn!(
+                        %job_id,
+                        "durable lease was dead while the job stayed mirrored as assigned; fenced as failed"
+                    );
+                    let _ = self.event_tx.send(SchedulerEvent::JobCompleted {
+                        job_id,
+                        pipeline_run_id,
+                        runner_id,
+                        success: false,
+                    });
+                }
+            }
+            Ok(Some(job)) if job.runner_id.is_some_and(|r| r == runner_id) => {
+                // Never started durably: return it to the queue for a fresh
+                // assignment instead of leaving it assigned to a dead lease.
+                match gitforge_db::queries::JobQueries::requeue(pool, job_id).await {
+                    Ok(()) => tracing::warn!(
+                        %job_id,
+                        "durable assignment was dead before start; requeued"
+                    ),
+                    Err(error) => {
+                        tracing::error!(%error, %job_id, "failed to requeue job with dead durable lease")
+                    }
+                }
+            }
+            _ => {
+                // Terminal or owned by another runner: the durable state
+                // already decided; only the stale mirror needed dropping.
+            }
+        }
     }
 
     /// Complete a job only when the active runner lease is presented.
@@ -1212,6 +1289,10 @@ impl Scheduler {
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             if !accepted {
+                // The durable lease died mid-execution (superseded or
+                // recovered): fence the stale mirror instead of leaving the
+                // job assigned here forever.
+                self.fence_dead_lease(job_id, runner_id).await;
                 anyhow::bail!("durable job lease is no longer active");
             }
         }
@@ -1733,6 +1814,173 @@ mod tests {
 
         let state = scheduler.state.read().await;
         assert_eq!(state.runners[&runner_id].status, "offline");
+    }
+
+    /// Seed a user/repo/pipeline/run plus a pending job row and return the
+    /// ids the assignment tests need. Each test uses its own in-memory
+    /// database, so fixed names never collide.
+    async fn seed_dead_lease_fixture(pool: &gitforge_db::Pool) -> (RepoId, PipelineRunId, JobId) {
+        let user = gitforge_db::models::User::new(
+            "dead-lease-owner".to_string(),
+            "dead-lease@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(pool, &user)
+            .await
+            .unwrap();
+        let repo_id = RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "dead-lease-repo".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: "/tmp/dead-lease-repo".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        gitforge_db::queries::PipelineQueries::create(
+            pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: "dead-lease-pipeline".to_string(),
+                trigger_type: "manual".to_string(),
+                config: serde_json::json!({}),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline_id,
+            repo_id,
+            "dead-lease-trigger".to_string(),
+            "dead-lease-commit".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(pool, &run)
+            .await
+            .unwrap();
+        let job = gitforge_db::models::Job::new(run.id, "dead-lease-job".to_string());
+        let job_id = job.id;
+        gitforge_db::queries::JobQueries::create(pool, &job)
+            .await
+            .unwrap();
+        (repo_id, run.id, job_id)
+    }
+
+    #[tokio::test]
+    async fn test_dead_durable_lease_fences_instead_of_looping() {
+        // Live-observed wedge (2026-09-22): the durable row decided while
+        // the in-memory mirror kept the assignment, so every pending-jobs
+        // poll re-offered the job and every start was rejected — forever,
+        // wedging the pipeline run at running. A rejected start must fence
+        // the stale mirror instead of leaving the loop in place.
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (repo_id, run_id, job_id) = seed_dead_lease_fixture(&pool).await;
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        let mut events = scheduler.subscribe();
+        let runner_id = RunnerId::new();
+        scheduler
+            .register_runner(make_runner(runner_id, "dead-lease-runner", "online", 1))
+            .await;
+        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.process_queue().await;
+        let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
+        scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        // The durable lease moves on (recovery supersedes it) while the
+        // mirror keeps offering the stale token: the divergence that loops.
+        {
+            let mut state = scheduler.state.write().await;
+            state
+                .job_leases
+                .insert(job_id, "superseded-lease".to_string());
+        }
+        let error = scheduler
+            .start_job(job_id, runner_id, "superseded-lease")
+            .await
+            .expect_err("a superseded durable lease must reject the start");
+        assert!(error
+            .to_string()
+            .contains("durable job lease is no longer active"));
+
+        // The running row is fenced failed, the assignment mirror is gone,
+        // and the engine learns the outcome so the pipeline can finalize.
+        let fenced = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fenced.status, "failed");
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            SchedulerEvent::JobCompleted {
+                job_id: completed,
+                pipeline_run_id: completed_run,
+                runner_id: completed_runner,
+                success: false,
+            } if completed == job_id && completed_run == run_id && completed_runner == runner_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_dead_durable_lease_drops_mirror_for_requeued_row() {
+        // When recovery requeued the row outright, the stale mirror must
+        // still be dropped so the runner stops being offered a start that
+        // can never be accepted — but the queued row itself is left for a
+        // fresh assignment, and no completion is invented for it.
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (repo_id, run_id, job_id) = seed_dead_lease_fixture(&pool).await;
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        let mut events = scheduler.subscribe();
+        let runner_id = RunnerId::new();
+        scheduler
+            .register_runner(make_runner(runner_id, "dead-lease-runner", "online", 1))
+            .await;
+        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.process_queue().await;
+        let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
+        scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        gitforge_db::queries::JobQueries::requeue(&pool, job_id)
+            .await
+            .unwrap();
+        let error = scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .expect_err("a requeued row must reject the stale start");
+        assert!(error
+            .to_string()
+            .contains("durable job lease is no longer active"));
+
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        let row = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "queued");
+        assert!(
+            events.try_recv().is_err(),
+            "a requeued row is not terminal; no completion may be invented"
+        );
     }
 
     #[tokio::test]
