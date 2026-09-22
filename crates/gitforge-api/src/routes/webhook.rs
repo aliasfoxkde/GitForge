@@ -69,24 +69,29 @@ struct WebhookJobPlan {
 fn derive_webhook_job_plan(
     config: &serde_json::Value,
 ) -> Result<WebhookJobPlan, WebhookJobPlanError> {
-    let definition: gitforge_ci::PipelineDefinition =
-        serde_json::from_value(config.clone()).map_err(WebhookJobPlanError::InvalidStoredDefinition)?;
+    let definition: gitforge_ci::PipelineDefinition = serde_json::from_value(config.clone())
+        .map_err(WebhookJobPlanError::InvalidStoredDefinition)?;
     let job_definition = definition
         .jobs
         .iter()
         .find(|job| job.needs.is_empty())
         .ok_or(WebhookJobPlanError::MissingEntryJob)?;
-    let timeout_secs = job_definition.timeout_secs().map_err(|error| {
-        WebhookJobPlanError::InvalidTimeout {
-            job: job_definition.name.clone(),
-            error: error.to_string(),
-        }
-    })?;
+    let timeout_secs =
+        job_definition
+            .timeout_secs()
+            .map_err(|error| WebhookJobPlanError::InvalidTimeout {
+                job: job_definition.name.clone(),
+                error: error.to_string(),
+            })?;
 
     Ok(WebhookJobPlan {
         name: job_definition.name.clone(),
         image: job_definition.image.clone(),
-        commands: job_definition.steps.iter().map(|step| step.run.clone()).collect(),
+        commands: job_definition
+            .steps
+            .iter()
+            .map(|step| step.run.clone())
+            .collect(),
         working_dir: job_definition
             .steps
             .iter()
