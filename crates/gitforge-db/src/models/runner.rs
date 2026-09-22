@@ -40,6 +40,11 @@ impl RunnerStatus {
     }
 }
 
+/// Heartbeat age after which a runner still marked `online` is reported and
+/// scheduled as `offline`. One shared definition so API listings, scheduler
+/// placement, and lease recovery agree on what "online" means.
+pub const RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS: i64 = 90;
+
 /// Runner entity
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Runner {
@@ -88,6 +93,26 @@ impl Runner {
             age.num_seconds() < threshold_secs
         } else {
             false
+        }
+    }
+
+    /// Effective status with heartbeat liveness applied. A runner persisted
+    /// as `online` whose last activity — the heartbeat, or the registration
+    /// time when no heartbeat ever arrived — is older than the threshold
+    /// reports `offline`. Registry rows left online by a scheduler restart
+    /// therefore cannot lie to listings or placement.
+    ///
+    /// The comparison is strict: a last activity exactly at the threshold is
+    /// still online, matching the tick-based recovery in the scheduler.
+    pub fn effective_status(&self, now: DateTime<Utc>, offline_after_secs: i64) -> String {
+        if self.status != RunnerStatus::Online.as_str() {
+            return self.status.clone();
+        }
+        let last_activity = self.last_heartbeat.unwrap_or(self.created_at);
+        if last_activity < now - chrono::Duration::seconds(offline_after_secs) {
+            RunnerStatus::Offline.as_str().to_string()
+        } else {
+            RunnerStatus::Online.as_str().to_string()
         }
     }
 }
@@ -141,6 +166,49 @@ mod tests {
         let mut runner = Runner::new("test-runner".to_string(), RunnerType::Docker, 2);
         runner.last_heartbeat = None;
         assert!(!runner.is_healthy(60));
+    }
+
+    #[test]
+    fn test_effective_status_boundary() {
+        let now = Utc::now();
+        let mut runner = Runner::new("hb-runner".to_string(), RunnerType::Docker, 1);
+        assert_eq!(runner.effective_status(now, 90), "online");
+
+        // Exactly at the threshold is still online (strict comparison, same
+        // as the scheduler's tick-based recovery).
+        runner.last_heartbeat = Some(now - chrono::Duration::seconds(90));
+        assert_eq!(runner.effective_status(now, 90), "online");
+
+        // One second past it is offline.
+        runner.last_heartbeat = Some(now - chrono::Duration::seconds(91));
+        assert_eq!(runner.effective_status(now, 90), "offline");
+    }
+
+    #[test]
+    fn test_effective_status_passthrough_non_online() {
+        let now = Utc::now();
+        let mut runner = Runner::new("busy-runner".to_string(), RunnerType::Docker, 1);
+        runner.set_busy();
+        runner.last_heartbeat = Some(now - chrono::Duration::seconds(3600));
+        assert_eq!(runner.effective_status(now, 90), "busy");
+
+        runner.status = "offline".to_string();
+        assert_eq!(runner.effective_status(now, 90), "offline");
+    }
+
+    #[test]
+    fn test_effective_status_without_heartbeat_uses_registration_time() {
+        let now = Utc::now();
+        // No heartbeat ever arrived: a fresh registration is online, one
+        // that registered longer ago than the threshold is offline.
+        let mut fresh = Runner::new("fresh-runner".to_string(), RunnerType::Docker, 1);
+        fresh.last_heartbeat = None;
+        assert_eq!(fresh.effective_status(now, 90), "online");
+
+        let mut ancient = Runner::new("ancient-runner".to_string(), RunnerType::Docker, 1);
+        ancient.last_heartbeat = None;
+        ancient.created_at = now - chrono::Duration::seconds(3600);
+        assert_eq!(ancient.effective_status(now, 90), "offline");
     }
 
     #[test]

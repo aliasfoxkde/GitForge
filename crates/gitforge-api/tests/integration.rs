@@ -1222,6 +1222,71 @@ async fn test_api_runner_registration_adopts_existing_name() {
 }
 
 #[tokio::test]
+async fn test_api_runner_list_derives_status_from_heartbeat() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforge_db::models::User::new(
+        "hb-admin".to_string(),
+        "hb-admin@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+
+    // A registry row left online whose heartbeat died long ago — the shape
+    // a scheduler restart leaves behind.
+    let mut stale = Runner::new("stale-runner".to_string(), RunnerType::Docker, 2);
+    stale.last_heartbeat = Some(chrono::Utc::now() - chrono::Duration::seconds(3600));
+    gitforge_db::queries::RunnerQueries::create(&pool, &stale)
+        .await
+        .unwrap();
+
+    let fresh = Runner::new("fresh-runner".to_string(), RunnerType::Docker, 2);
+    gitforge_db::queries::RunnerQueries::create(&pool, &fresh)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+    let token = ApiAuth::new("test-secret")
+        .generate_token(user.id, "hb-admin", "admin")
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/runners")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let runners: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let by_name: std::collections::HashMap<String, String> = runners
+        .as_array()
+        .expect("runner list is a JSON array")
+        .iter()
+        .map(|r| {
+            (
+                r["name"].as_str().unwrap().to_string(),
+                r["status"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        by_name["stale-runner"], "offline",
+        "persisted online with a dead heartbeat must report offline"
+    );
+    assert_eq!(by_name["fresh-runner"], "online");
+}
+
+#[tokio::test]
 async fn test_api_get_nonexistent_artifact() {
     let pool = Pool::memory().await.unwrap();
     pool.migrate().await.unwrap();
