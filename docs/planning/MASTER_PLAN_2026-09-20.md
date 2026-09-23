@@ -259,7 +259,18 @@ Each finding: what was observed, why it matters, where the fix lands.
   (`services/api/src/main.rs` — "no dev fallback in production"), so
   rotation carries no code risk. **Fix lands in**: Phase 0 ops (rotation at
   the v0.6.7 cutover) + untrack commit.
->>>>>>> edc6cece (docs(plan): record F22 tracked-.env secret exposure)
+- **F24 — A cancelled run can be resurrected to succeeded.** After the
+  orphan sweep graded run `50b35e0b` `cancelled` (F19's jobless verdict),
+  its late head-job row still sat `queued`; the scheduler dispatched it
+  ~50 minutes later, the chain advanced, and final grading flipped the run
+  to `succeeded` — with genuinely executed jobs (all three steps re-ran to
+  real completions), but a status timeline that read cancelled-then-
+  succeeded with no marker of the reversal. The work was honest in this
+  instance; the bookkeeping was not. **Fix lands in**: Phase 1 (a
+  terminal run must either stay terminal or log the reversal loudly —
+  grade flips need an audit trail in the finalize log, and a queued job
+  whose run is terminal should be cancelled, not dispatched).
+>>>>>>> 6b8e905e (docs(plan): record F24 cancelled-run resurrection)
 
 ---
 
