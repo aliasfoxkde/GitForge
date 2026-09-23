@@ -146,10 +146,18 @@ impl JobStateMachine {
             (JobStatus::Queued, JobStatus::Assigned) => true,
             (JobStatus::Queued, JobStatus::Cancelled) => true,
             (JobStatus::Queued, JobStatus::Failed) => true,
+            // The timeout watchdog times jobs out from the durable rows, which
+            // may be ahead of this engine's mirror: a job dispatched to a
+            // runner that hung before reporting assignment/progress still sits
+            // at Queued here while the database records it Running. The
+            // durable deadline is authoritative, so allow the reaping.
+            (JobStatus::Queued, JobStatus::TimedOut) => true,
 
             // From assigned
             (JobStatus::Assigned, JobStatus::Running) => true,
             (JobStatus::Assigned, JobStatus::Cancelled) => true,
+            // Same watchdog rationale as the Queued case above.
+            (JobStatus::Assigned, JobStatus::TimedOut) => true,
 
             // From running
             (JobStatus::Running, JobStatus::Succeeded) => true,
@@ -260,6 +268,43 @@ mod tests {
         state.assign(RunnerId::new()).unwrap();
         state.cancel().unwrap();
         assert_eq!(state.status(), JobStatus::Cancelled);
+    }
+
+    // The timeout watchdog times jobs out from the durable rows. A dispatched
+    // job that hung before reporting progress sits at Queued/Assigned in the
+    // engine mirror while the database says Running, so the reaping transition
+    // must be valid from both pre-running states.
+    #[test]
+    fn test_timeout_from_queued() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        state.queue().unwrap();
+        state.timeout().unwrap();
+        assert_eq!(state.status(), JobStatus::TimedOut);
+    }
+
+    #[test]
+    fn test_timeout_from_assigned() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        state.queue().unwrap();
+        state.assign(RunnerId::new()).unwrap();
+        state.timeout().unwrap();
+        assert_eq!(state.status(), JobStatus::TimedOut);
+    }
+
+    #[test]
+    fn test_timeout_from_running() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+
+        state.queue().unwrap();
+        state.assign(RunnerId::new()).unwrap();
+        state.start().unwrap();
+        state.timeout().unwrap();
+        assert_eq!(state.status(), JobStatus::TimedOut);
     }
 
     #[test]

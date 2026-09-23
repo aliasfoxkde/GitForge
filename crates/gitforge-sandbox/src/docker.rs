@@ -312,6 +312,17 @@ pub trait Sandbox: Send + Sync {
     async fn destroy(&self, instance: SandboxInstance) -> Result<()>;
 }
 
+/// Env vars granting the in-container git client trust for the host-owned
+/// workspace mount — see `DockerSandbox`'s `create_with_workspace`. Extracted
+/// as a free function so a unit test can pin the exact injection contract.
+fn workspace_git_env() -> Vec<String> {
+    vec![
+        "GIT_CONFIG_COUNT=1".to_owned(),
+        "GIT_CONFIG_KEY_0=safe.directory".to_owned(),
+        "GIT_CONFIG_VALUE_0=/workspace".to_owned(),
+    ]
+}
+
 #[async_trait]
 impl Sandbox for DockerSandbox {
     async fn create(
@@ -397,7 +408,6 @@ impl Sandbox for DockerSandbox {
         let Some(workspace_path) = workspace_path else {
             return self.create(job_id, image, limits).await;
         };
-
         let workspace = Path::new(workspace_path);
         if !workspace.is_absolute() || !workspace.is_dir() {
             return Err(Error::sandbox(format!(
@@ -435,6 +445,16 @@ impl Sandbox for DockerSandbox {
                 image: Some(image.to_owned()),
                 cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
                 working_dir: Some("/workspace".to_owned()),
+                // The workspace bind-mount keeps the host checkout's uid (the
+                // job user inside the image is usually root), and git's
+                // `safe.directory` check rejects any repo owned by a different
+                // account outright — every `git` invocation in the job dies
+                // with "detected dubious ownership" (exit 128) before it does
+                // any work. Inject the allowance through git's env-based
+                // config so it applies to every image and repo without baking
+                // anything into the image itself. Only the workspace-mount
+                // path needs this: a plain sandbox has no host repo to trust.
+                env: Some(workspace_git_env()),
                 host_config: Some(host_config),
                 labels: Some(labels),
                 ..Default::default()
@@ -497,7 +517,7 @@ impl Sandbox for DockerSandbox {
                     None
                 },
                 env: if instance.workspace_path.is_some() {
-                    Some(workspace_git_env())
+                    Some(workspace_exec_git_env())
                 } else {
                     None
                 },
@@ -691,7 +711,7 @@ fn resolve_runner_uid_gid() -> Result<(u32, u32)> {
 /// `|| true` (tag probes, version detection) into a no-op. Tell git this
 /// one mount is trusted; scoped to `/workspace` rather than `*` so it
 /// cannot leak meaning into repositories steps create themselves.
-fn workspace_git_env() -> Vec<&'static str> {
+fn workspace_exec_git_env() -> Vec<&'static str> {
     vec![
         "GIT_CONFIG_COUNT=1",
         "GIT_CONFIG_KEY_0=safe.directory",
@@ -798,6 +818,20 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with(&format!("gitforce-job-{job_id}-")));
         assert!(second.starts_with(&format!("gitforce-job-{job_id}-")));
+    }
+
+    #[test]
+    fn test_workspace_git_env_grants_safe_directory_via_env_config() {
+        let env = workspace_git_env();
+        // git's env-based config protocol: COUNT declares the entries, each
+        // KEY_n/VALUE_n pair supplies one. The key must be the safe.directory
+        // setting and the value must be the mounted workspace path — this trio
+        // keeps host-owned workspace mounts usable without trusting unrelated
+        // repositories.
+        assert_eq!(env.len(), 3);
+        assert_eq!(env[0], "GIT_CONFIG_COUNT=1");
+        assert_eq!(env[1], "GIT_CONFIG_KEY_0=safe.directory");
+        assert_eq!(env[2], "GIT_CONFIG_VALUE_0=/workspace");
     }
 
     #[async_trait]
@@ -1443,7 +1477,7 @@ mod tests {
     /// disables tag probes and other `|| true`-guarded git steps.
     #[test]
     fn workspace_git_env_marks_the_mount_trusted() {
-        let env = super::workspace_git_env();
+        let env = super::workspace_exec_git_env();
         assert!(env.contains(&"GIT_CONFIG_COUNT=1"));
         assert!(env.contains(&"GIT_CONFIG_KEY_0=safe.directory"));
         assert!(env.contains(&"GIT_CONFIG_VALUE_0=/workspace"));

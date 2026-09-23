@@ -32,12 +32,12 @@ jobs:
   # ─── Security Audit (Rust) ─────────────────────────────────────────────────
   cargo-audit:
     name: Cargo Audit
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
 
@@ -49,7 +49,7 @@ jobs:
 
   # ─── Secrets scan (all repos — always runs) ─────────────────────────────────
   secrets-scan:
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -75,7 +75,7 @@ jobs:
     # dependency-graph capability is enabled. Cargo Audit remains mandatory;
     # opt this supplementary gate in only after GitHub reports it supported.
     if: vars.DEPENDENCY_REVIEW_ENABLED == 'true'
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     permissions:
       contents: read
     steps:
@@ -89,7 +89,7 @@ jobs:
   # an unreviewable baseline. New high/critical findings fail the workflow.
   aegis-scan:
     name: Aegis Changed-Line Scan
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -182,12 +182,12 @@ jobs:
   # ─── Rust-specific Security Checks ─────────────────────────────────────────
   rust-security:
     name: Rust Security
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
           components: clippy

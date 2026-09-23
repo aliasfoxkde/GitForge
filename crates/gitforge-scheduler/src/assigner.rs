@@ -854,7 +854,7 @@ impl Scheduler {
 
         while processed < max_jobs_per_batch {
             // Peek at next job
-            let job = match state.queue.peek() {
+            let job = match state.queue.peek_fair() {
                 Some(j) => j,
                 None => break, // No more jobs
             };
@@ -902,7 +902,7 @@ impl Scheduler {
                         {
                             Ok(true) => {}
                             Ok(false) => {
-                                state.queue.dequeue();
+                                state.queue.remove(job_id);
                                 state.job_leases.remove(&job_id);
                                 tracing::debug!(%job_id, "job assignment won by another scheduler");
                                 continue;
@@ -916,7 +916,7 @@ impl Scheduler {
                     }
 
                     // Dequeue and assign (JobId and RunnerId are Copy types)
-                    state.queue.dequeue();
+                    state.queue.remove(job_id);
                     state.job_assignments.insert(job_id, r_id);
                     state
                         .assigned_jobs

@@ -40,7 +40,7 @@ env:
 jobs:
   ai-review:
     name: AI Code Review
-    runs-on: [self-hosted, linux, x64, gitforge]
+    runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -48,7 +48,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
 
@@ -65,11 +65,12 @@ jobs:
 
           # Generate diff
           git diff "origin/$BASE_BRANCH"...HEAD > pr.diff
-          echo "diff_file=pr.diff" >> "$GITHUB_OUTPUT"
-
           # Count files changed
           FILES_CHANGED=$(git diff --name-only "origin/$BASE_BRANCH"...HEAD | wc -l)
-          echo "files_changed=$FILES_CHANGED" >> "$GITHUB_OUTPUT"
+          {
+            echo "diff_file=pr.diff"
+            echo "files_changed=$FILES_CHANGED"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Run AI Review
         id: review
@@ -83,6 +84,10 @@ jobs:
           # is configured for this repository. Never claim a review happened
           # when the provider is unavailable; deterministic checks remain the
           # required gate in that case.
+          write_output() {
+            printf '%s\n' "$1" >> "$GITHUB_OUTPUT"
+          }
+
           case "$PROVIDER" in
             anthropic) REVIEW_KEY="$ANTHROPIC_API_KEY" ;;
             openai) REVIEW_KEY="$OPENAI_API_KEY" ;;
@@ -91,11 +96,9 @@ jobs:
           esac
           if [[ -z "$REVIEW_KEY" ]]; then
             echo "AI review skipped: no credential configured for provider '$PROVIDER'."
-            {
-              echo "summary=AI review skipped: provider '$PROVIDER' is not configured; deterministic gates remain authoritative."
-              echo "critical_findings=false"
-              echo "review_status=0"
-            } >> "$GITHUB_OUTPUT"
+            write_output "summary=AI review skipped: provider '$PROVIDER' is not configured; deterministic gates remain authoritative."
+            write_output "critical_findings=false"
+            write_output "review_status=0"
             exit 0
           fi
 
@@ -114,19 +117,16 @@ jobs:
 
           # Extract summary for GitHub comment
           SUMMARY=$(echo "$OUTPUT" | grep -A 20 "CODE REVIEW RESULTS" | head -30 | tr '\n' ' ' || echo "Review completed")
+          write_output "summary=$SUMMARY"
 
           # Check for critical findings
           if echo "$OUTPUT" | grep -q "Critical"; then
-            CRITICAL_FINDINGS=true
+            write_output "critical_findings=true"
           else
-            CRITICAL_FINDINGS=false
+            write_output "critical_findings=false"
           fi
 
-          {
-            echo "summary=$SUMMARY"
-            echo "critical_findings=$CRITICAL_FINDINGS"
-            echo "review_status=$REVIEW_STATUS"
-          } >> "$GITHUB_OUTPUT"
+          write_output "review_status=$REVIEW_STATUS"
 
       - name: Post review comment
         if: github.event_name == 'pull_request'

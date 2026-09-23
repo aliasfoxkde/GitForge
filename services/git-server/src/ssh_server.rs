@@ -25,7 +25,8 @@ use russh::keys::{ssh_key::LineEnding, Algorithm, HashAlg, PrivateKey, PublicKey
 use russh::server::{Auth, Handler, Msg, Server, Session};
 use russh::{Channel, MethodKind, MethodSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::ChildStdin;
+use tokio::process::{Child, ChildStdin};
+use tokio::sync::oneshot;
 
 /// Configuration for the SSH git transport.
 pub struct SshServerConfig {
@@ -122,7 +123,10 @@ impl Server for GitSshServer {
 /// channel data and EOF can flow into the child; the reader task owns the
 /// child itself along with its stdout and stderr.
 struct ChannelProcess {
-    stdin: ChildStdin,
+    /// Kept here so channel data can be forwarded and EOF can close stdin.
+    stdin: Option<ChildStdin>,
+    /// Signals the pump task to kill and reap the child on disconnect.
+    cancel: Option<oneshot::Sender<()>>,
 }
 
 /// Per-connection handler.
@@ -231,13 +235,16 @@ impl Handler for GitSshSession {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if let Some(process) = self.processes.get_mut(&channel) {
-            if let Err(error) = process.stdin.write_all(data).await {
+            let Some(stdin) = process.stdin.as_mut() else {
+                return Ok(());
+            };
+            if let Err(error) = stdin.write_all(data).await {
                 tracing::warn!(
                     ?channel,
                     %error,
                     "failed to forward SSH channel data to git process"
                 );
-                self.processes.remove(&channel);
+                self.stop_process(channel);
             }
         }
         Ok(())
@@ -249,7 +256,11 @@ impl Handler for GitSshSession {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         // Dropping stdin signals EOF to the git child process.
-        self.processes.remove(&channel);
+        if let Some(process) = self.processes.get_mut(&channel) {
+            // Normal EOF must reach git so a valid receive-pack can finish;
+            // it is not a disconnect and must not cancel the child.
+            process.stdin.take();
+        }
         Ok(())
     }
 
@@ -258,12 +269,23 @@ impl Handler for GitSshSession {
         channel: russh::ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.processes.remove(&channel);
+        self.stop_process(channel);
         Ok(())
     }
 }
 
 impl GitSshSession {
+    /// Close the child's stdin, signal cancellation, and let the pump task
+    /// kill and await the child so it cannot become a zombie.
+    fn stop_process(&mut self, channel: russh::ChannelId) {
+        if let Some(mut process) = self.processes.remove(&channel) {
+            drop(process.stdin.take());
+            if let Some(cancel) = process.cancel.take() {
+                let _ = cancel.send(());
+            }
+        }
+    }
+
     /// Resolve the requested git command to a repository and start the real
     /// git child process that serves it, wiring the channel to its stdio.
     async fn serve_git_command(
@@ -286,6 +308,7 @@ impl GitSshSession {
         let mut child = tokio::process::Command::new("git")
             .arg(git_command)
             .arg(&repo_disk_path)
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -305,16 +328,33 @@ impl GitSshSession {
             .take()
             .ok_or_else(|| "git process was spawned without a piped stderr".to_string())?;
 
-        self.processes.insert(channel, ChannelProcess { stdin });
+        let (cancel, cancellation) = oneshot::channel();
+        self.processes.insert(
+            channel,
+            ChannelProcess {
+                stdin: Some(stdin),
+                cancel: Some(cancel),
+            },
+        );
 
         session
             .handle()
             .channel_success(channel)
             .await
-            .map_err(|()| format!("channel {channel:?} already closed"))?;
+            .map_err(|()| {
+                self.stop_process(channel);
+                format!("channel {channel:?} already closed")
+            })?;
 
         let handle = session.handle();
-        tokio::spawn(pump_until_exit(handle, channel, child, stdout, stderr));
+        tokio::spawn(pump_until_exit(
+            handle,
+            channel,
+            child,
+            stdout,
+            stderr,
+            cancellation,
+        ));
         tracing::info!(
             command = %command.trim(),
             %repo_path,
@@ -387,30 +427,48 @@ fn parse_git_command(command: &str) -> Result<(&str, String), String> {
 async fn pump_until_exit(
     handle: russh::server::Handle,
     channel: russh::ChannelId,
-    mut child: tokio::process::Child,
+    mut child: Child,
     stdout: tokio::process::ChildStdout,
     stderr: tokio::process::ChildStderr,
+    mut cancellation: oneshot::Receiver<()>,
 ) {
     let data_handle = handle.clone();
-    let out_task = tokio::spawn(async move {
+    let mut out_task = tokio::spawn(async move {
         pipe_to_channel(data_handle, channel, stdout, false).await;
     });
     let error_handle = handle.clone();
-    let err_task = tokio::spawn(async move {
+    let mut err_task = tokio::spawn(async move {
         pipe_to_channel(error_handle, channel, stderr, true).await;
     });
-    let _ = out_task.await;
-    let _ = err_task.await;
+    tokio::select! {
+        _ = &mut cancellation => {
+            out_task.abort();
+            err_task.abort();
+            reap_cancelled_child(&mut child).await;
+            return;
+        }
+        () = async {
+            let _ = (&mut out_task).await;
+            let _ = (&mut err_task).await;
+        } => {}
+    }
 
-    let status = child
-        .wait()
-        .await
-        .ok()
-        .and_then(|status| status.code())
-        .unwrap_or(-1);
+    let status = tokio::select! {
+        result = child.wait() => result.ok().and_then(|status| status.code()).unwrap_or(-1),
+        _ = &mut cancellation => {
+            reap_cancelled_child(&mut child).await;
+            return;
+        }
+    };
     let _ = handle.exit_status_request(channel, status as u32).await;
     let _ = handle.eof(channel).await;
     let _ = handle.close(channel).await;
+}
+
+/// Kill a disconnected git child and await it so it cannot remain a zombie.
+async fn reap_cancelled_child(child: &mut Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
 
 /// Copy one pipe of a git child process into the SSH channel until EOF.
@@ -545,5 +603,17 @@ mod tests {
             generated.to_openssh(LineEnding::LF).unwrap(),
             reloaded.to_openssh(LineEnding::LF).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_reap_cancelled_child_kills_and_waits() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .unwrap();
+
+        reap_cancelled_child(&mut child).await;
+
+        assert!(child.try_wait().unwrap().is_some());
     }
 }

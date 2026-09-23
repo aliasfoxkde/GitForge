@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{interval, Duration};
+use tokio::task::{AbortHandle, JoinHandle};
+use tokio::time::{interval, Duration, Instant};
 
 /// Runner configuration
 #[derive(Clone)]
@@ -730,6 +731,8 @@ pub struct RunnerAgent {
     executor: Arc<JobExecutor>,
     is_running: Arc<RwLock<bool>>,
     reconciler_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    background_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    control_task_abort_handles: Arc<Mutex<Vec<AbortHandle>>>,
     /// Set when the scheduler has been unreachable for the loss threshold.
     /// `run` surfaces this as an error so the service supervisor can restart
     /// and re-register the runner instead of leaving it apparently healthy.
@@ -759,6 +762,8 @@ impl RunnerAgent {
             executor: Arc::new(executor),
             is_running: Arc::new(RwLock::new(false)),
             reconciler_task: Arc::new(Mutex::new(None)),
+            background_tasks: Arc::new(Mutex::new(Vec::new())),
+            control_task_abort_handles: Arc::new(Mutex::new(Vec::new())),
             scheduler_lost: Arc::new(AtomicBool::new(false)),
             active_jobs: ActiveJobRegistry::new(),
         })
@@ -893,7 +898,7 @@ impl RunnerAgent {
         let heartbeat_token = self.config.scheduler_token.clone();
         let is_running = self.is_running.clone();
         let scheduler_lost = self.scheduler_lost.clone();
-        tokio::spawn(async move {
+        let heartbeat_handle = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(heartbeat_interval));
             let mut consecutive_failures = 0_u32;
             loop {
@@ -929,6 +934,11 @@ impl RunnerAgent {
                 tracing::trace!("heartbeat failed ({}/10 consecutive)", consecutive_failures);
             }
         });
+        self.control_task_abort_handles
+            .lock()
+            .await
+            .push(heartbeat_handle.abort_handle());
+        self.background_tasks.lock().await.push(heartbeat_handle);
 
         let active_jobs = self.active_jobs.clone();
 
@@ -947,7 +957,8 @@ impl RunnerAgent {
         let is_running = self.is_running.clone();
         let executor = self.executor.clone();
         let active_jobs_for_loop = active_jobs.clone();
-        tokio::spawn(async move {
+        let background_tasks = self.background_tasks.clone();
+        let fetch_handle = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(fetch_interval));
             loop {
                 ticker.tick().await;
@@ -1014,7 +1025,7 @@ impl RunnerAgent {
                                     let token = fetch_token.clone();
                                     let active_jobs = active_jobs_for_loop.clone();
                                     let active_job_id = job.job_id.clone();
-                                    tokio::spawn(async move {
+                                    let job_handle = tokio::spawn(async move {
                                         Self::execute_job(
                                             &executor,
                                             &job,
@@ -1027,6 +1038,7 @@ impl RunnerAgent {
                                         .await;
                                         active_jobs.release(&active_job_id).await;
                                     });
+                                    background_tasks.lock().await.push(job_handle);
                                 }
                             }
                         }
@@ -1037,6 +1049,11 @@ impl RunnerAgent {
                 }
             }
         });
+        self.control_task_abort_handles
+            .lock()
+            .await
+            .push(fetch_handle.abort_handle());
+        self.background_tasks.lock().await.push(fetch_handle);
 
         // Keep running until stopped
         while *self.is_running.read().await {
@@ -1083,6 +1100,14 @@ impl RunnerAgent {
     /// If force is true, cancel all running jobs immediately.
     /// Otherwise, wait for jobs to complete gracefully.
     pub async fn stop(&self, force: bool) {
+        let _ = self.stop_with_timeout(force, Duration::from_secs(30)).await;
+    }
+
+    /// Stop the runner and bound how long shutdown may wait for owned tasks.
+    ///
+    /// Returns `true` only when every owned task settled before the deadline.
+    /// Remaining tasks are explicitly aborted and awaited on timeout.
+    pub async fn stop_with_timeout(&self, force: bool, timeout: Duration) -> bool {
         *self.is_running.write().await = false;
 
         if let Some(handle) = self.reconciler_task.lock().await.take() {
@@ -1096,12 +1121,65 @@ impl RunnerAgent {
             self.executor.cancel_all_jobs().await;
         }
 
+        self.abort_control_tasks().await;
+        let settled = self.join_background_tasks_until(timeout).await;
+
         let runner_id = self
             .runner
             .as_ref()
             .map(|r| r.id.to_string())
             .unwrap_or_default();
-        tracing::info!("runner {} stopped", runner_id);
+        tracing::info!(runner_id = %runner_id, settled, "runner stopped");
+        settled
+    }
+
+    async fn abort_control_tasks(&self) {
+        let handles = {
+            let mut owned = self.control_task_abort_handles.lock().await;
+            std::mem::take(&mut *owned)
+        };
+        for handle in handles {
+            handle.abort();
+        }
+    }
+
+    /// Join every owned task until the monotonic deadline. If the deadline is
+    /// reached, abort and await every remaining task before returning.
+    async fn join_background_tasks_until(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut handles = {
+            let mut owned = self.background_tasks.lock().await;
+            std::mem::take(&mut *owned)
+        };
+        while let Some(mut handle) = handles.pop() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                handle.abort();
+                let _ = handle.await;
+                for pending in handles {
+                    pending.abort();
+                    let _ = pending.await;
+                }
+                return false;
+            }
+            tokio::select! {
+                result = &mut handle => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "owned runner task failed during shutdown");
+                    }
+                }
+                () = tokio::time::sleep(remaining) => {
+                    handle.abort();
+                    let _ = handle.await;
+                    for pending in handles {
+                        pending.abort();
+                        let _ = pending.await;
+                    }
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Wait for all active jobs to complete within the given timeout
@@ -2042,6 +2120,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_creation() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         assert!(agent.runner.is_none());
@@ -2080,6 +2162,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_register_unreachable_scheduler_allows_standalone() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // Legacy standalone fallback remains available behind an explicit
         // policy opt-in.
         let config = RunnerConfig {
@@ -2154,6 +2240,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_registration_retries_unavailable_scheduler_then_succeeds() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // The compose race: the scheduler is up but not ready (503) while the
         // runner is already registering. Registration must retry with backoff
         // and adopt the runner id once the scheduler accepts.
@@ -2176,6 +2266,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_registration_auth_rejection_is_not_retried() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // A rejected token does not heal by asking again: exactly one attempt
         // is made and the error names the authentication failure.
         let (url, connections) = spawn_status_server(&[401]).await;
@@ -2199,6 +2293,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_registration_exhausts_transport_retries() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // Nothing listens on the reserved port, so every attempt is a
         // transport error; the surfaced error must report the exhausted
         // attempt count.
@@ -2228,6 +2326,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_registration_policy_rejection_falls_back_only_when_allowed() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // A 500 is a scheduler refusal, not "not ready yet": it is never
         // retried, it fails closed by default, and standalone fallback
         // requires the explicit opt-in.
@@ -2581,6 +2683,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_stop_when_not_running() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         // Stop without running should not panic
@@ -2773,6 +2879,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_is_running() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         assert!(!agent.is_running().await);
@@ -2819,6 +2929,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_run_requires_registration() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
 

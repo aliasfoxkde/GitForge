@@ -174,6 +174,38 @@ Each finding: what was observed, why it matters, where the fix lands.
   ` (deleted)` suffix of the exact path, and the units no longer execute from
   a checkout's `target/` at all — `ExecStart` pins the promoted release
   bundle, so rebuilding a checkout never touches serving binaries.
+- **F16 — Restart publishes false greens.** Chained jobs are enqueued lazily
+  by the in-memory engine; a `gitforge@ci` restart mid-pipeline left only
+  the head job as a durable row, scheduler recovery re-ran just that job,
+  nothing re-advanced the chain, and orphaned-run reconciliation graded the
+  run `succeeded` with the rest of the pipeline never executed. Observed
+  2026-09-22: two gitforge-ci runs finalized `succeeded` with 1 of 3 jobs
+  (`44d2f87f`, `a117f789`). **Fix lands in**: reconciliation comparing
+  durable rows against the run's persisted pipeline definition.
+  **RESOLVED 2026-09-22**: PR #212 grades a shortfall `failed`
+  (`incomplete_chain=true` in the finalize log); shipped in v0.6.6
+  (`gitforge-d821d44-20260922`). Operating rule: never trust a green run
+  whose durable job count does not cover its pipeline definition. Full
+  resume of interrupted chains (rebuilding the engine from definition +
+  rows) remains open if restart-resilient pipelines are wanted.
+- **F17 — CI image cache staleness.** The `dsc-ci-rust` image bakes a warm
+  cargo registry; a changed `Cargo.lock` against a stale cached image fails
+  with "candidate versions didn't match" in ways unrelated to the code
+  under test. **Fix lands in**: an in-repo image recipe plus an explicit
+  bump contract. **RESOLVED 2026-09-22**: PR #208 added
+  `infrastructure/docker/ci-rust.Dockerfile`; contract: any `Cargo.lock`
+  change ⇒ rebuild the image and bump its tag (deployed at `dsc-ci-rust:6`).
+- **F18 — CI-only latent failures hide behind false greens.** The first
+  workspace test job that actually ran to completion on the refreshed image
+  failed in two unrelated places: the build daemon invoked
+  `rustup run stable cargo` where the image ships only a dated toolchain
+  (PR #213 — the daemon now resolves the real cargo via `rustup which
+  cargo`, bypass env still wins), and nine agent tests constructed
+  `RunnerAgent` without the module's docker-availability guard
+  (PR #214 — guard added; injecting the sandbox backend is the follow-up
+  that removes the need). Lesson: a job class only falsifies under the
+  environment it runs in — the false-green defect (F16) had been masking
+  both.
 
 ---
 
@@ -257,6 +289,12 @@ push-pipeline-version-retire branch)
 3. GitForge's own CI (the `gitforge-ci` pipeline in the repo) runs on the
    live instance on every push to `main` — make this the release gate
    instead of GitHub Actions (which stays a red/billing-blocked mirror).
+   *(Practice established 2026-09-22/23: the v0.6.3→v0.6.6 cutover chain
+   was each gated on a live-instance true green; run `c68cd7a8` on
+   `d821d44e` is the first complete honest green on `dsc-ci-rust:6` —
+   fmt ✓ clippy ✓ test ✓, 3/3 jobs. Remaining: codify the gate so the
+   release tooling refuses a cut without a green run id covering the
+   definition.)*
 4. Multi-runner soak: two runners, one saturated queue, cancel storms —
    the load shapes F2/F3 will be exercised under.
 
@@ -334,7 +372,15 @@ thin `systemctl restart` wrapper; the units are the single source of truth.
 
 ## 6. Release checklist delta (extends IMPROVEMENTS.md §Release Checklist)
 
-- [ ] Phase 0 deploy refresh executed; `gitforge-status` shows build-stamp
-- [ ] Stale runner rows retired; registry row count == live runners
-- [ ] v0.4.0 tag + GitHub release after Phase 0 (the merged PRs #180–#183
-      plus the docs/lint campaigns justify a minor bump over v0.3.3)
+- [x] Phase 0 deploy refresh executed; `gitforge-status` shows build-stamp
+      *(PRs #198, #205; deployment pinned to the promoted bundle — §4)*
+- [x] Stale runner rows retired; registry row count == live runners
+      *(PR #202 upsert-by-name registration incl. the healing migration)*
+- [x] Release gated on a live-instance true green
+      *(v0.6.6 = tag `gitforge-d821d44-20260922`; GitHub release published
+      with notes covering the v0.6.2–v0.6.5 gap — v0.6.2 shipped tag-only,
+      v0.6.3–v0.6.5 bundles were never GitHub-released. Recorded in
+      `docs/CHANGELOG_RECENT.md`.)*
+- [ ] Codify the gate mechanically: the release tooling refuses a cut
+      without a green run id whose job count covers the pipeline
+      definition (F16's operating rule, enforced rather than remembered)

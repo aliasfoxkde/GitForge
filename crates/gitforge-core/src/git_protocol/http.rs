@@ -8,8 +8,193 @@ use async_trait::async_trait;
 use gitforge_common::{RepoId, Result};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use std::thread;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+
+/// Upper bound on how long the synchronous abandon-reap may block waiting for
+/// a SIGKILLed git child to actually exit. Git processes die within
+/// microseconds of SIGKILL unless stuck in uninterruptible I/O; exceeding the
+/// bound logs a warning and leaves the child to tokio's best-effort orphan
+/// queue rather than blocking the caller indefinitely.
+const ABANDONED_CHILD_REAP_GRACE: Duration = Duration::from_secs(1);
+
+/// Owns a spawned `git-*-pack --stateless-rpc` child until it has been reaped.
+///
+/// GitForge services run with `init_without_sigchld_reaper`, so the spawner is
+/// the only party responsible for reaping (see `gitforge_process`). This guard
+/// makes that ownership explicit:
+///
+/// - On the success path `drive` waits on the child itself, so the exit status
+///   is observed exactly once by the owner.
+/// - On any early return (client disconnect while feeding stdin, child spawn
+///   or I/O error) or cancellation (the handler future is dropped at an await
+///   point, including during service shutdown), `Drop` kills the child and
+///   reaps it synchronously instead of leaving a zombie behind and hoping
+///   tokio's documented best-effort orphan queue gets scheduled.
+struct GitRpcChild {
+    child: Option<tokio::process::Child>,
+    /// Binary name, also used in error messages ("git-upload-pack").
+    service: &'static str,
+    /// Short name used in stdin error messages ("upload-pack").
+    short: &'static str,
+}
+
+impl GitRpcChild {
+    fn spawn(
+        service: &'static str,
+        short: &'static str,
+        repo_path: &std::path::Path,
+    ) -> Result<Self> {
+        let mut command = Command::new(service);
+        command
+            .arg("--stateless-rpc")
+            .arg(repo_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Self::from_command(command, service, short)
+    }
+
+    fn from_command(
+        mut command: Command,
+        service: &'static str,
+        short: &'static str,
+    ) -> Result<Self> {
+        let child = command.spawn().map_err(|error| {
+            gitforge_common::Error::git(format!("failed to execute {service}: {error}"))
+        })?;
+        Ok(Self {
+            child: Some(child),
+            service,
+            short,
+        })
+    }
+
+    /// Feed `input` to the child's stdin and collect its response.
+    ///
+    /// The child stays owned by `self` across every await point, so dropping
+    /// this future at any point still runs the reaping `Drop`.
+    async fn drive(mut self, input: Vec<u8>) -> Result<Vec<u8>> {
+        if let Some(mut stdin) = self
+            .child
+            .as_mut()
+            .expect(OWNED_CHILD_INVARIANT)
+            .stdin
+            .take()
+        {
+            stdin.write_all(&input).await.map_err(|error| {
+                gitforge_common::Error::git(format!(
+                    "failed to send {} request: {error}",
+                    self.short
+                ))
+            })?;
+        }
+        // stdin is dropped here, signalling EOF to the git child.
+
+        // Drain stdout and stderr concurrently so a chatty child cannot fill
+        // a pipe buffer and deadlock, mirroring `Child::wait_with_output`
+        // while keeping the child owned by the guard at every await point.
+        let stdout_pipe = self
+            .child
+            .as_mut()
+            .expect(OWNED_CHILD_INVARIANT)
+            .stdout
+            .take();
+        let stderr_pipe = self
+            .child
+            .as_mut()
+            .expect(OWNED_CHILD_INVARIANT)
+            .stderr
+            .take();
+        let (stdout, stderr) = tokio::join!(drain_pipe(stdout_pipe), drain_pipe(stderr_pipe));
+        let wait_error = |error: std::io::Error| {
+            gitforge_common::Error::git(format!("failed to wait for {}: {error}", self.service))
+        };
+        let stdout = stdout.map_err(wait_error)?;
+        let stderr = stderr.map_err(wait_error)?;
+
+        let status = self
+            .child
+            .as_mut()
+            .expect(OWNED_CHILD_INVARIANT)
+            .wait()
+            .await
+            .map_err(wait_error)?;
+        // Fully reaped: tell the Drop guard to stand down.
+        self.child = None;
+
+        if !status.success() {
+            return Err(gitforge_common::Error::git(format!(
+                "{} failed: {}",
+                self.service,
+                String::from_utf8_lossy(&stderr)
+            )));
+        }
+        Ok(stdout)
+    }
+}
+
+const OWNED_CHILD_INVARIANT: &str = "git rpc child is owned by GitRpcChild until it is reaped";
+
+/// Read a piped child stream to EOF, returning whatever was collected.
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> std::io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut buffer).await?;
+    }
+    Ok(buffer)
+}
+
+impl Drop for GitRpcChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return, // already reaped (or not ours anymore)
+            Ok(None) => {}
+        }
+        // The child was abandoned before it could be waited on: kill it and
+        // reap synchronously so it cannot linger as a zombie in this process,
+        // which runs without a global SIGCHLD reaper.
+        if let Err(error) = child.start_kill() {
+            tracing::warn!(
+                "failed to signal abandoned {} child: {}",
+                self.service,
+                error
+            );
+        }
+        let deadline = Instant::now() + ABANDONED_CHILD_REAP_GRACE;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::debug!(
+                        "reaped abandoned {} child with status {status}",
+                        self.service
+                    );
+                    break;
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        tracing::warn!(
+                            "abandoned {} child did not exit within {ABANDONED_CHILD_REAP_GRACE:?}; \
+                             leaving it to the runtime orphan queue",
+                            self.service
+                        );
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => {
+                    tracing::warn!("failed to reap abandoned {} child: {}", self.service, error);
+                    break;
+                }
+            }
+        }
+    }
+}
 
 /// HTTP Git protocol handler
 pub struct HttpGitHandler<S: StorageBackend> {
@@ -141,33 +326,11 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
 
         // Serve fetch negotiation by piping the client wants/haves through a
         // real git-upload-pack (same shape as receive_pack): returning the
-        // advertisement here made clones and fetches unusable.
+        // advertisement here made clones and fetches unusable. The child is
+        // owned by a guard that reaps it on every exit path.
         let repo = self.storage.open(repo_id).await?;
-        let mut child = Command::new("git-upload-pack")
-            .arg("--stateless-rpc")
-            .arg(repo.path())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                gitforge_common::Error::git(format!("failed to execute git-upload-pack: {error}"))
-            })?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(&input).await.map_err(|error| {
-                gitforge_common::Error::git(format!("failed to send upload-pack request: {error}"))
-            })?;
-        }
-        let output = child.wait_with_output().await.map_err(|error| {
-            gitforge_common::Error::git(format!("failed to wait for git-upload-pack: {error}"))
-        })?;
-        if !output.status.success() {
-            return Err(gitforge_common::Error::git(format!(
-                "git-upload-pack failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        Ok(output.stdout)
+        let child = GitRpcChild::spawn("git-upload-pack", "upload-pack", repo.path())?;
+        child.drive(input).await
     }
 
     async fn receive_pack(&self, repo_id: RepoId, input: Vec<u8>) -> Result<Vec<u8>> {
@@ -190,33 +353,11 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
 
         // Let Git parse the request, update refs, execute hooks, and produce
         // correctly framed status output. Writing only the pack to the object
-        // database leaves refs unchanged and breaks clients.
+        // database leaves refs unchanged and breaks clients. The child is
+        // owned by a guard that reaps it on every exit path.
         let repo = self.storage.open(repo_id).await?;
-        let mut child = Command::new("git-receive-pack")
-            .arg("--stateless-rpc")
-            .arg(repo.path())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                gitforge_common::Error::git(format!("failed to execute git-receive-pack: {error}"))
-            })?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(&input).await.map_err(|error| {
-                gitforge_common::Error::git(format!("failed to send receive-pack request: {error}"))
-            })?;
-        }
-        let output = child.wait_with_output().await.map_err(|error| {
-            gitforge_common::Error::git(format!("failed to wait for git-receive-pack: {error}"))
-        })?;
-        if !output.status.success() {
-            return Err(gitforge_common::Error::git(format!(
-                "git-receive-pack failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        return Ok(output.stdout);
+        let child = GitRpcChild::spawn("git-receive-pack", "receive-pack", repo.path())?;
+        child.drive(input).await
     }
 }
 
@@ -446,5 +587,229 @@ mod tests {
             parse_service("git-receive-pack/my-org/my-repo"),
             Some(("git-receive-pack".to_string(), "my-org/my-repo".to_string()))
         );
+    }
+
+    // ---- Child lifecycle tests -------------------------------------------
+    //
+    // GitForge services intentionally run without a process-wide SIGCHLD
+    // reaper, so the handler owns every spawned git child until it is reaped.
+    // These tests exercise that ownership contract on real child processes in
+    // a self-contained way: /bin/sh stand-ins and /proc-free waitid checks, no
+    // live host or network dependency. The suite relies on POSIX process
+    // semantics (`sh`, `waitid`, `kill`), so every item below is explicitly
+    // gated with `#[cfg(unix)]`; Linux coverage is unchanged.
+
+    /// Spawn `sh -c '<script>'` with fully piped stdio as a stand-in git child
+    /// for the lifecycle suite.
+    #[cfg(unix)]
+    fn spawn_test_child_script(script: String) -> GitRpcChild {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        GitRpcChild::from_command(command, "git-upload-pack", "upload-pack")
+            .expect("failed to spawn sh")
+    }
+
+    /// Spawn `sh -c 'exit N'` as a stand-in git child so lifecycle tests run
+    /// anywhere the rest of this suite runs.
+    #[cfg(unix)]
+    fn spawn_test_child(exit_code: i32) -> GitRpcChild {
+        spawn_test_child_script(format!("exit {exit_code}"))
+    }
+
+    /// Spawn a child that stays alive and silent until killed, so a dropped
+    /// `drive` future is provably cancelled while it is still awaiting a live
+    /// child rather than after the child already exited.
+    #[cfg(unix)]
+    fn spawn_test_child_holding_open() -> GitRpcChild {
+        // `exec` guarantees the tracked pid is the long-lived process itself.
+        spawn_test_child_script("exec sleep 30".to_string())
+    }
+
+    /// Assert the raw pid has been fully reaped: waitid(WNOWAIT|WNOHANG) must
+    /// fail with ECHILD. A zombie (unreaped) or still-running child would make
+    /// waitid succeed instead, failing the assertion.
+    #[cfg(unix)]
+    fn assert_pid_reaped(pid: u32) {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(result, -1, "pid {pid} still exists (not reaped)");
+        assert_eq!(errno, Some(libc::ECHILD), "pid {pid} unexpected errno");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_git_rpc_child_drive_reports_success_status() {
+        // Normal completion: the child is waited on by the owner and its
+        // stdout is returned.
+        let child = spawn_test_child(0);
+        let output = child.drive(b"ignored".to_vec()).await.unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_git_rpc_child_drive_maps_child_error() {
+        // Child error path: a nonzero exit maps to the same git error string
+        // the handler previously produced, and the child is reaped.
+        let child = spawn_test_child(3);
+        let error = child.drive(b"ignored".to_vec()).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("git-upload-pack failed"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_git_rpc_child_abandoned_mid_flight_is_reaped_not_zombied() {
+        // Cancellation/disconnect path: the guard (with its still-running
+        // child) is dropped between spawn and wait, exactly like a handler
+        // future dropped at an await point. Drop must kill and reap the child
+        // synchronously because the process has no global SIGCHLD reaper.
+        let guard = spawn_test_child(0);
+        let pid = guard
+            .child
+            .as_ref()
+            .expect(OWNED_CHILD_INVARIANT)
+            .id()
+            .expect("live child pid");
+        drop(guard);
+        assert_pid_reaped(pid);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_git_rpc_child_drop_after_reap_is_noop() {
+        // After a completed drive the guard no longer owns a child
+        // (drive consumed it and cleared `child`), so no second reap happens
+        // and the completed pid is fully gone — no double-reap, no zombie.
+        let guard = spawn_test_child(0);
+        let pid = guard
+            .child
+            .as_ref()
+            .expect(OWNED_CHILD_INVARIANT)
+            .id()
+            .expect("live child pid");
+        let driven = guard.drive(b"ignored".to_vec()).await;
+        assert!(driven.is_ok());
+        assert_pid_reaped(pid);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_git_rpc_child_drive_cancelled_mid_await_reaps_live_child() {
+        // Genuine mid-`drive` cancellation: the future is dropped while it is
+        // parked on an await point with a still-live child, not before `drive`
+        // starts or after the child exits. The guard is owned by the future,
+        // so the drop must kill and reap the live child synchronously even
+        // though `drive` never reached its own `wait()` call.
+        let guard = spawn_test_child_holding_open();
+        let pid = guard
+            .child
+            .as_ref()
+            .expect(OWNED_CHILD_INVARIANT)
+            .id()
+            .expect("live child pid");
+
+        // Drive with empty input: after `write_all` (a no-op here) the future
+        // parks inside the stdout/stderr `read_to_end` awaits for the full
+        // 30s `sleep 30` lifetime, so dropping it now is cancellation at a
+        // live-child await point. The box owns the future and therefore the
+        // guard, so dropping the box runs the guard's Drop.
+        let mut future = Box::pin(guard.drive(Vec::new()));
+
+        // Poll the future exactly once with a no-op waker. `sleep 30` emits no
+        // output, so the pipes stay open and the single poll deterministically
+        // parks on the stdout/stderr drain — proving the drop below happens
+        // mid-`drive`, not after completion. A no-op waker is correct here:
+        // the future is never polled again, it is only dropped.
+        use std::future::Future;
+        use std::task::Context;
+        use std::task::Poll;
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        let poll_result = future.as_mut().poll(&mut cx);
+        assert!(
+            matches!(poll_result, Poll::Pending),
+            "drive finished or panicked before the cancellation point; \
+             the test would no longer prove mid-await cancellation"
+        );
+
+        // Abort: drop the future (and therefore the owned guard) while the
+        // child is still alive. Reaped-assertion below fails on a zombie.
+        drop(future);
+
+        // A still-running child would make waitid succeed here; the guard
+        // must have SIGKILLed and reaped it.
+        assert_pid_reaped(pid);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_git_rpc_child_drive_drains_stderr_backpressure_concurrently() {
+        // Regression test for stdout/stderr pipe backpressure: a child whose
+        // stderr output exceeds the 64 KiB pipe buffer must never deadlock
+        // against an undrained pipe. The child only exits after its write
+        // succeeds, so completion of `drive` proves the concurrent drain kept
+        // reading while stdout stayed silent.
+        let total_bytes = 256 * 1024; // 4x the default 64 KiB pipe capacity
+        let child = spawn_test_child_script(format!("exec head -c {total_bytes} /dev/zero 1>&2"));
+
+        let driven =
+            tokio::time::timeout(Duration::from_secs(30), child.drive(b"ignored".to_vec()))
+                .await
+                .expect("drive hung draining oversized stderr; concurrent drain regressed")
+                .expect("child writing to stderr must still exit successfully");
+
+        assert!(
+            driven.is_empty(),
+            "stdout must stay empty; only stderr carries the payload"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_upload_pack_child_spawn_is_reaped_when_abandoned() {
+        // Same abandon-reap contract against the real spawn configuration
+        // (git-upload-pack --stateless-rpc on a real repository with piped
+        // stdio), covering the exact call site the handler uses.
+        use crate::storage::FileStorageBackend;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let repo_id = RepoId::new();
+        storage.create(repo_id).await.unwrap();
+        let repo = storage.open(repo_id).await.unwrap();
+
+        let guard = GitRpcChild::spawn("git-upload-pack", "upload-pack", repo.path()).unwrap();
+        let pid = guard
+            .child
+            .as_ref()
+            .expect(OWNED_CHILD_INVARIANT)
+            .id()
+            .expect("live child pid");
+        drop(guard);
+        assert_pid_reaped(pid);
+    }
+
+    #[test]
+    fn test_abandoned_child_grace_is_bounded() {
+        // The synchronous abandon-reap runs on the caller's thread inside
+        // Drop; it must stay bounded so a stuck child can never block the
+        // runtime thread indefinitely.
+        assert!(ABANDONED_CHILD_REAP_GRACE <= std::time::Duration::from_secs(5));
     }
 }
