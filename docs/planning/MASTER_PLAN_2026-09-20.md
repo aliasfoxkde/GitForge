@@ -206,6 +206,20 @@ Each finding: what was observed, why it matters, where the fix lands.
   that removes the need). Lesson: a job class only falsifies under the
   environment it runs in — the false-green defect (F16) had been masking
   both.
+- **F19 — The orphan reconciler races the lazy enqueue.** The periodic
+  sweep grades a jobless run `cancelled` once it is older than the 600 s
+  grace window, on the assumption that no engine will ever enqueue work
+  for it. Under database write-lock contention the lazy enqueue lags the
+  run row by far more than that: on 2026-09-23 the docs-push run
+  `556dd836` had its head job enqueued at minute 29, but the sweep had
+  already graded the run `cancelled` at minute 12 — stranding the job
+  (repaired by hand) and making the new release gate refuse the commit,
+  exactly as designed. The engine registers itself in the live-run
+  registry only at first job execution, so an enqueue-starved run is
+  invisible to the sweep's live filter. **Fix lands in**: an enqueue
+  horizon for the jobless-run verdict (1 h, `RECONCILE_EMPTY_RUN_HORIZON_
+  SECS`), plus the structural follow-up of registering the run with the
+  engine at trigger time rather than first job.
 
 ---
 
@@ -381,6 +395,7 @@ thin `systemctl restart` wrapper; the units are the single source of truth.
       with notes covering the v0.6.2–v0.6.5 gap — v0.6.2 shipped tag-only,
       v0.6.3–v0.6.5 bundles were never GitHub-released. Recorded in
       `docs/CHANGELOG_RECENT.md`.)*
-- [ ] Codify the gate mechanically: the release tooling refuses a cut
+- [x] Codify the gate mechanically: the release tooling refuses a cut
       without a green run id whose job count covers the pipeline
-      definition (F16's operating rule, enforced rather than remembered)
+      definition *(scripts/gitforge-release-gate, invoked by
+      gitforge-release-bundle before assembly)*
