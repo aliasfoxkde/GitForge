@@ -259,6 +259,19 @@ Each finding: what was observed, why it matters, where the fix lands.
   (`services/api/src/main.rs` — "no dev fallback in production"), so
   rotation carries no code risk. **Fix lands in**: Phase 0 ops (rotation at
   the v0.6.7 cutover) + untrack commit.
+- **F23 — Lease write failure under contention churns assignments.**
+  The runner's "mark job started" write is single-shot; when it fails
+  with `database is locked` (409 to the runner), the lease looks dead to
+  the scheduler, which reassigns the same job — observed live on
+  2026-09-23 as a reassignment loop producing duplicate and zombie
+  containers, runner log chunks rejected with 500, and a completion
+  report lost (job `21497438` finished `failed` on the runner but stayed
+  `assigned` in the database). Same systemic disease as F19/F20/F21:
+  SQLite write saturation breaking one-shot durability writes at every
+  layer. **Fix lands in**: Phase 1 (retry the lease write with bounded
+  backoff like F20's trigger retry; make completion reporting idempotent
+  and reconcilable — coordinate with the queue-idempotence lane and the
+  F21 durable-write fix).
 - **F24 — A cancelled run can be resurrected to succeeded.** After the
   orphan sweep graded run `50b35e0b` `cancelled` (F19's jobless verdict),
   its late head-job row still sat `queued`; the scheduler dispatched it
