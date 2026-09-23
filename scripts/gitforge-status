@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# Report GitForge user-systemd and HTTP health without mutating the host.
+# Report GitForge systemd and HTTP health without mutating the host.
+#
+# Also reports build-stamp drift: which executable each unit is actually
+# running, and whether it came from the promoted release bundle
+# (GITFORGE_RELEASE_ROOT, default /home/gitforge/work/gitforge-current).
+# A unit running a binary from anywhere else while a stamped release is
+# promoted is reported as drift and degrades the overall verdict, because a
+# cutover that missed its services looks exactly like this. No git command
+# here fetches from a remote; comparisons use local refs only.
 set -u -o pipefail
 
 JSON=false
@@ -7,7 +15,19 @@ case "${1:-}" in
     "") ;;
     --json) JSON=true ;;
     -h|--help)
-        printf 'Usage: %s [--json]\n' "$(basename "$0")"
+        cat <<EOF
+Usage: $(basename "$0") [--json]
+
+Reports systemd unit state (user units or system template instances),
+HTTP health, and build-stamp drift.
+Environment:
+  GITFORGE_RELEASE_ROOT  promoted release bundle (default
+                         /home/gitforge/work/gitforge-current); set to empty
+                         to skip drift comparison
+  GITFORGE_REPO          checkout used to compare the release stamp with
+                         origin/main (default: the repository containing this
+                         script, when it is one)
+EOF
         exit 0
         ;;
     *)
@@ -28,9 +48,123 @@ declare -A endpoints=(
     [gitforge-git-server.service]='http://127.0.0.1:42782/health'
 )
 
+# --- Promoted release stamp ------------------------------------------------
+# Default applies only when the variable is unset; an explicit empty value
+# opts out of drift comparison entirely (dev checkouts with no promotion).
+release_root="${GITFORGE_RELEASE_ROOT-/home/gitforge/work/gitforge-current}"
+release_root_resolved=""
+release_id="absent"
+release_source_commit="absent"
+release_built="absent"
+if [[ -n "$release_root" ]]; then
+    release_root_resolved=$(readlink -f "$release_root" 2>/dev/null || true)
+fi
+if [[ -n "$release_root_resolved" && -r "$release_root_resolved/RELEASE_METADATA.txt" ]]; then
+    release_id=$(sed -n 's/^release_id=//p' "$release_root_resolved/RELEASE_METADATA.txt")
+    release_source_commit=$(sed -n 's/^source_commit=//p' "$release_root_resolved/RELEASE_METADATA.txt")
+    release_built=$(sed -n 's/^build_timestamp_utc=//p' "$release_root_resolved/RELEASE_METADATA.txt")
+fi
+
+# --- Release stamp vs origin/main (local ref; never fetches) ---------------
+repo_dir="${GITFORGE_REPO:-}"
+if [[ -z "$repo_dir" ]]; then
+    script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    repo_dir=$(git -C "$script_dir/.." rev-parse --show-toplevel 2>/dev/null || true)
+fi
+release_vs_main="no release stamp"
+if [[ -n "$repo_dir" && "$release_source_commit" != "absent" ]]; then
+    git_err=$(git -C "$repo_dir" rev-parse --git-dir 2>&1 >/dev/null)
+    if printf '%s' "$git_err" | grep -q "dubious ownership"; then
+        release_vs_main="git refused the repository (dubious ownership)"
+    elif [[ -n "$git_err" ]] || ! git -C "$repo_dir" rev-parse --git-dir >/dev/null 2>&1; then
+        release_vs_main="repository unreadable for this user"
+    elif ! git -C "$repo_dir" cat-file -e "${release_source_commit}^{commit}" 2>/dev/null; then
+        release_vs_main="commit not present in repo"
+    elif ! git -C "$repo_dir" rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+        release_vs_main="origin/main ref unavailable"
+    else
+        behind=$(git -C "$repo_dir" rev-list --count "${release_source_commit}..origin/main" 2>/dev/null || echo '?')
+        ahead=$(git -C "$repo_dir" rev-list --count "origin/main..${release_source_commit}" 2>/dev/null || echo '?')
+        if [[ "$behind" == 0 && "$ahead" == 0 ]]; then
+            release_vs_main="matches origin/main (local ref)"
+        else
+            release_vs_main="${behind} behind / ${ahead} ahead of origin/main (local ref)"
+        fi
+    fi
+elif [[ -z "$repo_dir" && "$release_source_commit" != "absent" ]]; then
+    release_vs_main="no repository to compare with"
+fi
+
+# --- Sweep for service processes outside any unit ---------------------------
+# Ground truth for drift when the systemd view is empty but the ports still
+# answer: any process whose executable is one of the service binaries and
+# lives in a GitForge deployment path. Processes already owned by a systemd
+# unit (their cgroup names the unit) are skipped here — the per-unit BUILD
+# column judges those; this sweep only catches ununit'd strays. The
+# /proc/<pid>/exe link is the authoritative source but is unreadable when the
+# kernel cleared the process's dumpable flag (setuid launches such as
+# `sudo -u`); argv[0] from /proc/<pid>/cmdline stays readable in that case
+# and is marked "argv0" as lower-confidence provenance. Nothing here mutates
+# a process.
+declare -A proc_map=()
+declare -A proc_exes=()
+for proc in /proc/[0-9]*; do
+    pid="${proc##*/}"
+    cgroup=$(cat "$proc/cgroup" 2>/dev/null || true)
+    if printf '%s' "$cgroup" | grep -qE '/gitforge[-@][^/]*\.service'; then
+        continue
+    fi
+    exe=$(readlink -f "$proc/exe" 2>/dev/null || true)
+    exe="${exe% (deleted)}"
+    marker=""
+    if [[ -z "$exe" ]]; then
+        argv0=$(cat "$proc/cmdline" 2>/dev/null | tr '\0' '\n' | head -1)
+        [[ -n "$argv0" ]] || continue
+        exe=$(readlink -f -- "$argv0" 2>/dev/null || printf '%s' "$argv0")
+        marker=" [argv0]"
+    fi
+    bin_name="${exe##*/}"
+    case " api ci git-server runner " in
+        *" $bin_name "*) ;;
+        *) continue ;;
+    esac
+    case "$exe" in
+        */GitForge/target/release/*|*/gitforge/target/release/*|/home/gitforge/*)
+            :
+            ;;
+        "$release_root_resolved"/*)
+            # An empty release root would make this pattern "/*", matching
+            # every same-named binary on the host; require a real root.
+            [[ -n "$release_root_resolved" ]] || continue
+            ;;
+        *)
+            continue
+            ;;
+    esac
+    proc_map[$bin_name]+="${proc_map[$bin_name]:+;}$pid=$exe$marker"
+    proc_exes[$bin_name]+=" $exe"
+done
+
 rows=()
 overall=0
 for unit in "${units[@]}"; do
+    bin_name="${unit#gitforge-}"
+    bin_name="${bin_name%.service}"
+    # The same service may be supervised at user scope (gitforge-<svc>.service)
+    # or by a system template instance (gitforge@<svc>.service). Query the
+    # scope that actually owns the process so the BUILD verdict reflects the
+    # real supervision source instead of reporting a supervised service as
+    # unsupervised.
+    query_unit="$unit"
+    scope_flags=(--user)
+    if command -v systemctl >/dev/null 2>&1; then
+        sys_pid=$(systemctl show "gitforge@${bin_name}.service" --value --property=ExecMainPID 2>/dev/null || true)
+        sys_active=$(systemctl is-active "gitforge@${bin_name}.service" 2>/dev/null) || sys_active="inactive"
+        if [[ "$sys_active" == active || "$sys_pid" =~ ^[1-9][0-9]*$ ]]; then
+            query_unit="gitforge@${bin_name}.service"
+            scope_flags=()
+        fi
+    fi
     active="unknown"
     enabled="unknown"
     memory_max="unknown"
@@ -41,15 +175,69 @@ for unit in "${units[@]}"; do
     tasks_current="unknown"
     control_group="unknown"
     if command -v systemctl >/dev/null 2>&1; then
-        active=$(systemctl --user is-active "$unit" 2>/dev/null) || active="${active:-inactive}"
-        enabled=$(systemctl --user is-enabled "$unit" 2>/dev/null) || enabled="${enabled:-unknown}"
-        memory_max=$(systemctl --user show "$unit" --value --property=MemoryMax 2>/dev/null) || memory_max="${memory_max:-unknown}"
-        cpu_quota=$(systemctl --user show "$unit" --value --property=CPUQuotaPerSecUSec 2>/dev/null) || cpu_quota="${cpu_quota:-unknown}"
-        tasks_max=$(systemctl --user show "$unit" --value --property=TasksMax 2>/dev/null) || tasks_max="${tasks_max:-unknown}"
-        memory_current=$(systemctl --user show "$unit" --value --property=MemoryCurrent 2>/dev/null) || memory_current="${memory_current:-unknown}"
-        memory_peak=$(systemctl --user show "$unit" --value --property=MemoryPeak 2>/dev/null) || memory_peak="${memory_peak:-unknown}"
-        tasks_current=$(systemctl --user show "$unit" --value --property=TasksCurrent 2>/dev/null) || tasks_current="${tasks_current:-unknown}"
-        control_group=$(systemctl --user show "$unit" --value --property=ControlGroup 2>/dev/null) || control_group="${control_group:-unknown}"
+        active=$(systemctl "${scope_flags[@]}" is-active "$query_unit" 2>/dev/null) || active="${active:-inactive}"
+        enabled=$(systemctl "${scope_flags[@]}" is-enabled "$query_unit" 2>/dev/null) || enabled="${enabled:-unknown}"
+        memory_max=$(systemctl "${scope_flags[@]}" show "$query_unit" --value --property=MemoryMax 2>/dev/null) || memory_max="${memory_max:-unknown}"
+        cpu_quota=$(systemctl "${scope_flags[@]}" show "$query_unit" --value --property=CPUQuotaPerSecUSec 2>/dev/null) || cpu_quota="${cpu_quota:-unknown}"
+        tasks_max=$(systemctl "${scope_flags[@]}" show "$query_unit" --value --property=TasksMax 2>/dev/null) || tasks_max="${tasks_max:-unknown}"
+        memory_current=$(systemctl "${scope_flags[@]}" show "$query_unit" --value --property=MemoryCurrent 2>/dev/null) || memory_current="${memory_current:-unknown}"
+        memory_peak=$(systemctl "${scope_flags[@]}" show "$query_unit" --value --property=MemoryPeak 2>/dev/null) || memory_peak="${memory_peak:-unknown}"
+        tasks_current=$(systemctl "${scope_flags[@]}" show "$query_unit" --value --property=TasksCurrent 2>/dev/null) || tasks_current="${tasks_current:-unknown}"
+        control_group=$(systemctl "${scope_flags[@]}" show "$query_unit" --value --property=ControlGroup 2>/dev/null) || control_group="${control_group:-unknown}"
+    fi
+
+    # Build provenance: the kernel link is the ground truth for what the unit
+    # is running. The " (deleted)" suffix (executable replaced on disk) is
+    # stripped; it is still the exact same path.
+    main_pid=""
+    exe=""
+    exe_mtime=""
+    build="no_pid"
+    if command -v systemctl >/dev/null 2>&1; then
+        main_pid=$(systemctl "${scope_flags[@]}" show "$query_unit" --value --property=ExecMainPID 2>/dev/null || true)
+    fi
+    if [[ "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
+        exe=$(readlink -f "/proc/$main_pid/exe" 2>/dev/null || true)
+        exe="${exe% (deleted)}"
+        if [[ -z "$exe" ]]; then
+            # dumpable cleared (setuid launch): fall back to argv[0].
+            argv0=$(cat "/proc/$main_pid/cmdline" 2>/dev/null | tr '\0' '\n' | head -1)
+            [[ -n "$argv0" ]] && exe=$(readlink -f -- "$argv0" 2>/dev/null || printf '%s' "$argv0")
+        fi
+    fi
+    if [[ -n "$exe" ]]; then
+        if [[ -n "$release_root_resolved" && -r "$release_root_resolved/RELEASE_METADATA.txt" ]]; then
+            if [[ "$exe" == "$release_root_resolved"/* ]]; then
+                build="current"
+            else
+                build="drift"
+                overall=1
+            fi
+        else
+            # No promoted stamp to compare against; fall back to binary mtime.
+            build="unmanaged"
+            exe_mtime=$(stat -c %y "$exe" 2>/dev/null | cut -d. -f1 || true)
+        fi
+    elif [[ -n "${proc_map[$bin_name]:-}" ]]; then
+        # The unit is not running it, but a process serving this service's
+        # binary exists outside any unit — an unsupervised deployment. With
+        # several same-named processes the verdict considers every one.
+        overall=1
+        where="out-of-release"
+        if [[ -n "$release_root_resolved" && -r "$release_root_resolved/RELEASE_METADATA.txt" ]]; then
+            for pexe in ${proc_exes[$bin_name]}; do
+                if [[ "$pexe" == "$release_root_resolved"/* ]]; then
+                    where="in-release"
+                    break
+                fi
+            done
+        fi
+        build="unsupervised ($where)"
+        exe="${proc_map[$bin_name]%%;*}"
+        exe="${exe#*=}"
+    elif [[ "$active" == active ]]; then
+        # Running but the executable link is unreadable (different user).
+        build="unreadable"
     fi
 
     http_status="not_applicable"
@@ -75,32 +263,54 @@ for unit in "${units[@]}"; do
         *) overall=1 ;;
     esac
 
-    rows+=("$unit|$active|$enabled|$memory_max|$cpu_quota|$tasks_max|$memory_current|$memory_peak|$tasks_current|$control_group|$policy_status|$http_status")
+    rows+=("$query_unit|$active|$enabled|$memory_max|$cpu_quota|$tasks_max|$memory_current|$memory_peak|$tasks_current|$control_group|$policy_status|$http_status|$build|$exe|$exe_mtime")
 done
 
 if [[ "$JSON" == true ]]; then
-    python3 - "$overall" "${rows[@]}" <<'PY'
+    python3 - "$overall" "$release_id" "$release_source_commit" "$release_built" "$release_vs_main" "${rows[@]}" <<'PY'
 import json
 import sys
 
-overall, *rows = sys.argv[1:]
+overall, release_id, release_source_commit, release_built, release_vs_main, *rows = sys.argv[1:]
 services = []
 for row in rows:
-    unit, active, enabled, memory_max, cpu_quota, tasks_max, memory_current, memory_peak, tasks_current, control_group, policy_status, http_status = row.split("|", 11)
+    (unit, active, enabled, memory_max, cpu_quota, tasks_max, memory_current,
+     memory_peak, tasks_current, control_group, policy_status, http_status,
+     build, exe, exe_mtime) = row.split("|", 14)
     services.append({"unit": unit, "active": active, "enabled": enabled,
                      "memory_max": memory_max, "cpu_quota": cpu_quota,
                      "tasks_max": tasks_max, "memory_current": memory_current,
                      "memory_peak": memory_peak, "tasks_current": tasks_current,
                      "control_group": control_group, "policy_status": policy_status,
-                     "http_status": http_status})
-print(json.dumps({"status": "healthy" if overall == "0" else "degraded", "services": services}))
+                     "http_status": http_status, "build": build,
+                     "exe": exe, "exe_mtime": exe_mtime})
+release = {"release_id": release_id, "source_commit": release_source_commit,
+           "build_timestamp_utc": release_built, "vs_origin_main": release_vs_main}
+print(json.dumps({"status": "healthy" if overall == "0" else "degraded",
+                  "services": services, "release": release}))
 PY
 else
-    printf '%-32s %-10s %-10s %-14s %-14s %-10s %-10s %s\n' SERVICE SYSTEMD ENABLED MEMORY_MAX CPU_QUOTA TASKS POLICY HTTP
+    printf '%-32s %-10s %-10s %-14s %-14s %-10s %-10s %-8s %s\n' SERVICE SYSTEMD ENABLED MEMORY_MAX CPU_QUOTA TASKS POLICY HTTP BUILD
     for row in "${rows[@]}"; do
-        IFS='|' read -r unit active enabled memory_max cpu_quota tasks_max memory_current memory_peak tasks_current control_group policy_status http_status <<<"$row"
-        printf '%-32s %-10s %-10s %-14s %-14s %-10s %-10s %s\n' \
-            "$unit" "$active" "$enabled" "$memory_max" "$cpu_quota" "$tasks_max" "$policy_status" "$http_status"
+        IFS='|' read -r unit active enabled memory_max cpu_quota tasks_max memory_current memory_peak tasks_current control_group policy_status http_status build exe exe_mtime <<<"$row"
+        printf '%-32s %-10s %-10s %-14s %-14s %-10s %-10s %-8s %s\n' \
+            "$unit" "$active" "$enabled" "$memory_max" "$cpu_quota" "$tasks_max" "$policy_status" "$http_status" "$build"
+    done
+    printf '\n'
+    printf 'release: %s (built %s, source %s)\n' "$release_id" "$release_built" "${release_source_commit:0:12}"
+    printf 'release vs main: %s\n' "$release_vs_main"
+    for row in "${rows[@]}"; do
+        IFS='|' read -r unit active enabled memory_max cpu_quota tasks_max memory_current memory_peak tasks_current control_group policy_status http_status build exe exe_mtime <<<"$row"
+        if [[ -n "$exe" && "$build" != unsupervised* ]]; then
+            printf 'running: %s from %s (mtime %s)\n' "$unit" "$exe" "${exe_mtime:-n/a}"
+        fi
+    done
+    for bin_name in api ci git-server runner; do
+        [[ -n "${proc_map[$bin_name]:-}" ]] || continue
+        IFS=';' read -ra entries <<<"${proc_map[$bin_name]}"
+        for entry in "${entries[@]}"; do
+            printf 'unsupervised: %s (%s)\n' "$entry" "${bin_name}"
+        done
     done
     if ((overall == 0)); then
         printf 'overall: healthy\n'

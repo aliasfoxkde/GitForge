@@ -14,12 +14,22 @@ case "$TERM_WAIT_SECONDS" in
         ;;
 esac
 
+# Normalize a kernel /proc/<pid>/exe link. When the executable file has been
+# replaced on disk (for example by a rebuild into the same target/), the link
+# for the still-running old inode gains a " (deleted)" suffix; it is the same
+# exact path and must still count as owned.
+resolved_exe() {
+    local link
+    link="$(readlink -f -- "$1" 2>/dev/null || true)"
+    printf '%s\n' "${link% (deleted)}"
+}
+
 owned_pids() {
     local executable="$1" proc pid resolved
     for proc in /proc/[0-9]*; do
         pid="${proc##*/}"
         [ -r "$proc/exe" ] || continue
-        resolved="$(readlink -f -- "$proc/exe" 2>/dev/null || true)"
+        resolved="$(resolved_exe "$proc/exe")"
         [ "$resolved" = "$executable" ] && printf '%s\n' "$pid"
     done
 }
@@ -33,10 +43,10 @@ stop_service() {
         echo "Stopping $name (pid $pid)"
         kill -TERM "$pid" 2>/dev/null || true
         deadline=$((SECONDS + TERM_WAIT_SECONDS))
-        while [ "$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)" = "$executable" ] && [ "$SECONDS" -lt "$deadline" ]; do
+        while [ "$(resolved_exe "/proc/$pid/exe")" = "$executable" ] && [ "$SECONDS" -lt "$deadline" ]; do
             sleep 1
         done
-        if [ "$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)" = "$executable" ]; then
+        if [ "$(resolved_exe "/proc/$pid/exe")" = "$executable" ]; then
             echo "$name did not stop after ${TERM_WAIT_SECONDS}s; sending KILL" >&2
             kill -KILL "$pid" 2>/dev/null || true
         fi

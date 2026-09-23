@@ -1,5 +1,7 @@
 # GitForge System Audit
 
+> **Snapshot (2026-08-31).** Sections below predate the SSH server, JWT auth, and the SSH key registry; several "not implemented" notes are now false. For current state see [handoffs/REPO_STATE_AUDIT_2026-09-20.md](handoffs/REPO_STATE_AUDIT_2026-09-20.md) and [planning/IMPROVEMENTS.md](planning/IMPROVEMENTS.md).
+
 ## Overview
 GitForge is a self-hosted Git platform with CI/CD capabilities. This document audits the current state of the system and identifies gaps and areas for improvement.
 

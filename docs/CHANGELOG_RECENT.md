@@ -2,6 +2,49 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [0.5.0] - 2026-09-21
+
+### Added
+
+- Route-contract coverage for the CI, admin, and SSH-key API surfaces,
+  including webhook replay idempotency (a replayed delivery maps to one
+  durable job; the replay's own run row is cancelled) and the delegation
+  fail-closed path when the CI trigger is unavailable (502, run row
+  preserved)
+- Exact wire-format contract tests for pipeline-run, job, and runner
+  responses — pinning, among other things, that the runner payload
+  serializes its type field as `"type"`
+- The four mechanical pedantic lints
+  (`uninlined_format_args`, `map_unwrap_or`,
+  `redundant_closure_for_method_calls`, `ignored_unit_patterns`)
+  promoted to `deny` in `[workspace.lints.clippy]`; all nineteen
+  workspace members opt in
+- Master plan (`docs/planning/MASTER_PLAN_2026-09-20.md`): phased
+  roadmap with a findings ledger built from a live instance
+  validation, plus the deployment procedure captured from the running
+  stack
+- Standalone E2E harness (`tests/integration`) repaired to 94/94
+  after library API drift; daemon detection now keys on the build
+  daemon's Unix socket instead of process-name matching
+
+### Changed
+
+- git-server response construction degrades to a bare 500 response
+  (`finish_response`) instead of unwrapping a malformed builder chain
+  inside a connection thread; 22 handler chains converted
+- `docs/CONTRIBUTING.md` rewritten for the Rust workspace; API.md,
+  RUNBOOK, ARCHITECTURE, and DEPLOYMENT corrected against the real
+  code; superseded planning docs carry banners
+- Code-smell audit recorded in `docs/audits/CODE_SMELLS_2026-09-20.md`
+  (130 non-test unwrap sites surveyed with verdicts; 548 pedantic
+  findings inventoried with a campaign plan)
+
+### Removed
+
+- Orphaned test suites `tests/service_tests.rs` and
+  `tests/cli/cli_test.rs` (owned by no Cargo.toml, superseded by the
+  integration harness)
+
 ## [0.4.0] - 2026-09-08
 
 ### Security

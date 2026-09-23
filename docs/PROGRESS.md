@@ -1,5 +1,7 @@
 # Progress: Dark Factory Enhancement
 
+> **Abandoned.** This log tracked the Dark Factory Go-template effort, not GitForge. Current progress lives in [planning/IMPROVEMENTS.md](planning/IMPROVEMENTS.md).
+
 ## Execution Log
 
 ### 2026-07-01
