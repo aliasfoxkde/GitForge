@@ -37,3 +37,6 @@ mockito = "1"
 [[bin]]
 name = "gitforge"
 path = "src/main.rs"
+
+[lints]
+workspace = true

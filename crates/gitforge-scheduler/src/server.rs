@@ -508,15 +508,12 @@ async fn get_pending_jobs(
     // Convert to response format
     let mut job_infos = Vec::new();
     for (job_id, runner_id, pipeline_run_id, definition) in assigned_jobs {
-        if requested_runner
-            .map(|requested| requested == runner_id)
-            .unwrap_or(false)
-        {
+        if requested_runner.is_some_and(|requested| requested == runner_id) {
             if let Some(lease_token) = state.scheduler.ensure_job_lease(job_id).await {
                 job_infos.push(PendingJobInfo {
                     contract_version: "harness.job.v1",
                     job_id: job_id.to_string(),
-                    name: format!("job-{}", job_id),
+                    name: format!("job-{job_id}"),
                     pipeline_run_id: pipeline_run_id.to_string(),
                     commands: definition.commands,
                     image: definition.image,
@@ -952,8 +949,7 @@ mod tests {
         let status = response.status();
         assert_eq!(
             status, expected,
-            "Expected status {:?}, got {:?}",
-            expected, status
+            "Expected status {expected:?}, got {status:?}"
         );
     }
 

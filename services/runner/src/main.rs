@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     // Fails fast at startup with an actionable error if required variables are
     // missing or invalid, rather than silently falling back to defaults.
     let config = gitforge_runner::RunnerConfig::from_env()
-        .map_err(|e| anyhow::anyhow!("failed to load runner configuration: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to load runner configuration: {e}"))?;
 
     // Create runner agent
     let mut agent = RunnerAgent::new(config).await?;
@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
 
     runner_task
         .await
-        .map_err(|e| anyhow::anyhow!("runner task join failed: {}", e))??;
+        .map_err(|e| anyhow::anyhow!("runner task join failed: {e}"))??;
 
     // Graceful shutdown delay
     graceful_shutdown_delay().await;

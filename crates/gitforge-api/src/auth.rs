@@ -74,7 +74,7 @@ impl ApiAuth {
         let claims = Claims::new(user_id, username, role, 24); // 24 hour expiry
 
         let token = encode(&Header::default(), &claims, &self.encoding_key)
-            .map_err(|e| Error::auth(format!("failed to generate token: {}", e)))?;
+            .map_err(|e| Error::auth(format!("failed to generate token: {e}")))?;
 
         Ok(token)
     }
@@ -82,7 +82,7 @@ impl ApiAuth {
     /// Validate and decode a JWT token
     pub fn validate_token(&self, token: &str) -> Result<Claims, Error> {
         let token_data = decode::<Claims>(token, &self.decoding_key, &Validation::default())
-            .map_err(|e| Error::auth(format!("invalid token: {}", e)))?;
+            .map_err(|e| Error::auth(format!("invalid token: {e}")))?;
 
         let claims = token_data.claims;
 
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn test_claims_debug() {
         let claims = Claims::new(UserId::new(), "test", "admin", 1);
-        let debug_str = format!("{:?}", claims);
+        let debug_str = format!("{claims:?}");
         assert!(debug_str.contains("test"));
     }
 

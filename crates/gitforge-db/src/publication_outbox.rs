@@ -31,30 +31,30 @@ pub struct PublicationOutboxItem {
 fn parse_time(value: String, field: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&value)
         .map(|value| value.with_timezone(&Utc))
-        .map_err(|error| Error::database(format!("invalid {}: {}", field, error)))
+        .map_err(|error| Error::database(format!("invalid {field}: {error}")))
 }
 
 fn hydrate(row: &sqlx::sqlite::SqliteRow) -> Result<PublicationOutboxItem> {
     let id = Uuid::parse_str(
         &row.try_get::<String, _>("id")
-            .map_err(|error| Error::database(format!("invalid publication ID: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid publication ID: {error}")))?,
     )
-    .map_err(|error| Error::database(format!("invalid publication ID: {}", error)))?;
-    let job_id =
-        JobId::from(
-            Uuid::parse_str(&row.try_get::<String, _>("job_id").map_err(|error| {
-                Error::database(format!("invalid publication job ID: {}", error))
-            })?)
-            .map_err(|error| Error::database(format!("invalid publication job ID: {}", error)))?,
-        );
+    .map_err(|error| Error::database(format!("invalid publication ID: {error}")))?;
+    let job_id = JobId::from(
+        Uuid::parse_str(
+            &row.try_get::<String, _>("job_id")
+                .map_err(|error| Error::database(format!("invalid publication job ID: {error}")))?,
+        )
+        .map_err(|error| Error::database(format!("invalid publication job ID: {error}")))?,
+    );
     let next_attempt_at = parse_time(
         row.try_get("next_attempt_at")
-            .map_err(|error| Error::database(format!("invalid next attempt time: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid next attempt time: {error}")))?,
         "next attempt time",
     )?;
     let claim_until = row
         .try_get::<Option<String>, _>("claim_until")
-        .map_err(|error| Error::database(format!("invalid claim time: {}", error)))?
+        .map_err(|error| Error::database(format!("invalid claim time: {error}")))?
         .map(|value| parse_time(value, "claim time"))
         .transpose()?;
     Ok(PublicationOutboxItem {
@@ -120,7 +120,7 @@ impl PublicationOutboxQueries {
         .bind(&now)
         .execute(pool.pool())
         .await
-        .map_err(|error| Error::database(format!("failed to enqueue publication: {}", error)))?;
+        .map_err(|error| Error::database(format!("failed to enqueue publication: {error}")))?;
         let existing = Self::get(pool, job_id, provider, kind)
             .await?
             .ok_or_else(|| Error::database("publication disappeared immediately after enqueue"))?;
@@ -146,7 +146,7 @@ impl PublicationOutboxQueries {
         .bind(kind)
         .fetch_optional(pool.pool())
         .await
-        .map_err(|error| Error::database(format!("failed to read publication: {}", error)))?;
+        .map_err(|error| Error::database(format!("failed to read publication: {error}")))?;
         row.as_ref().map(hydrate).transpose()
     }
 
@@ -171,11 +171,11 @@ impl PublicationOutboxQueries {
         .bind(&now_text)
         .fetch_optional(pool.pool())
         .await
-        .map_err(|error| Error::database(format!("failed to find due publication: {}", error)))?;
+        .map_err(|error| Error::database(format!("failed to find due publication: {error}")))?;
         let Some(row) = row else { return Ok(None) };
         let id: String = row
             .try_get("id")
-            .map_err(|error| Error::database(format!("invalid publication ID: {}", error)))?;
+            .map_err(|error| Error::database(format!("invalid publication ID: {error}")))?;
         let token = Uuid::new_v4().to_string();
         let until = (now + lease).to_rfc3339();
         let changed = sqlx::query(
@@ -196,7 +196,7 @@ impl PublicationOutboxQueries {
         .bind(&now_text)
         .execute(pool.pool())
         .await
-        .map_err(|error| Error::database(format!("failed to claim publication: {}", error)))?;
+        .map_err(|error| Error::database(format!("failed to claim publication: {error}")))?;
         if changed.rows_affected() != 1 {
             return Ok(None);
         }
@@ -205,7 +205,7 @@ impl PublicationOutboxQueries {
             .fetch_one(pool.pool())
             .await
             .map_err(|error| {
-                Error::database(format!("failed to load claimed publication: {}", error))
+                Error::database(format!("failed to load claimed publication: {error}"))
             })?;
         hydrate(&result).map(Some)
     }
@@ -230,7 +230,7 @@ impl PublicationOutboxQueries {
         .bind(claim_token)
         .execute(pool.pool())
         .await
-        .map_err(|error| Error::database(format!("failed to publish publication: {}", error)))?;
+        .map_err(|error| Error::database(format!("failed to publish publication: {error}")))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -257,7 +257,7 @@ impl PublicationOutboxQueries {
         .execute(pool.pool())
         .await
         .map_err(|error| {
-            Error::database(format!("failed to schedule publication retry: {}", error))
+            Error::database(format!("failed to schedule publication retry: {error}"))
         })?;
         Ok(result.rows_affected() == 1)
     }
@@ -281,9 +281,7 @@ impl PublicationOutboxQueries {
         .bind(claim_token)
         .execute(pool.pool())
         .await
-        .map_err(|error| {
-            Error::database(format!("failed to mark publication failure: {}", error))
-        })?;
+        .map_err(|error| Error::database(format!("failed to mark publication failure: {error}")))?;
         Ok(result.rows_affected() == 1)
     }
 }

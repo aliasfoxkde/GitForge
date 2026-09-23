@@ -22,7 +22,7 @@ impl Pool {
             if database_url.starts_with("sqlite:") || database_url.starts_with("file:") {
                 database_url.to_string()
             } else if Path::new(database_url).exists() || database_url.contains('/') {
-                format!("sqlite:{}?mode=rwc", database_url)
+                format!("sqlite:{database_url}?mode=rwc")
             } else {
                 // Memory database
                 "sqlite::memory:".to_string()
@@ -34,19 +34,23 @@ impl Pool {
         // immediately with SQLITE_BUSY; under job assignment plus log
         // appends that cascaded into lost leases and dropped log chunks.
         // WAL keeps readers concurrent, and a busy timeout makes writers
-        // queue instead of erroring.
+        // queue instead of erroring. The timeout is set well above the
+        // multi-second transactions large log appends can produce: a victim
+        // writer that gives up early cascades into missed heartbeats and
+        // lease-sync failures, which the scheduler can misread as runner
+        // loss.
         let options = SqliteConnectOptions::from_str(&connect_url)
-            .map_err(|e| Error::database(format!("invalid database URL: {}", e)))?
+            .map_err(|e| Error::database(format!("invalid database URL: {e}")))?
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(Duration::from_secs(5))
+            .busy_timeout(Duration::from_secs(15))
             .foreign_keys(true);
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)
             .await
-            .map_err(|e| Error::database(format!("failed to connect to database: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to connect to database: {e}")))?;
 
         Ok(Self { pool })
     }
@@ -78,7 +82,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create users table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create users table: {e}")))?;
 
         // Add the role column for databases created before role persistence
         // existed. Existing accounts receive the least-privileged developer
@@ -91,8 +95,7 @@ impl Pool {
             let message = error.to_string();
             if !message.contains("duplicate column name") {
                 return Err(Error::database(format!(
-                    "failed to migrate users table: {}",
-                    error
+                    "failed to migrate users table: {error}"
                 )));
             }
         }
@@ -114,7 +117,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create repositories table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create repositories table: {e}")))?;
 
         // Create ssh_keys table. A key's fingerprint is globally unique:
         // the same public key may never authenticate as two different
@@ -134,7 +137,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create ssh_keys table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create ssh_keys table: {e}")))?;
 
         // Create pipelines table
         sqlx::query(
@@ -153,7 +156,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create pipelines table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create pipelines table: {e}")))?;
 
         // One active pipeline version per repository and name; superseded
         // versions stay as history with active = 0.
@@ -165,7 +168,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create pipelines active index: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create pipelines active index: {e}")))?;
 
         // Create pipeline_runs table
         sqlx::query(
@@ -187,7 +190,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create pipeline_runs table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create pipeline_runs table: {e}")))?;
 
         // Create runners table
         sqlx::query(
@@ -207,7 +210,31 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create runners table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create runners table: {e}")))?;
+
+        // Runner names are stable identities: registration adopts the row
+        // that already carries the name (RunnerQueries::register_or_refresh).
+        // Databases created before that contract hold one row per restart of
+        // the same runner. Keep the newest row per name under the
+        // operator-facing name and rename the older duplicates so their audit
+        // records survive the unique index below. RFC3339 timestamps compare
+        // lexicographically, so the concatenated key orders by recency with
+        // the row id as a deterministic tiebreaker.
+        sqlx::query(
+            r#"
+            UPDATE runners SET name = name || '-legacy-' || id
+            WHERE updated_at || id NOT IN (
+                SELECT MAX(updated_at || id) FROM runners GROUP BY name
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to rename duplicate runner names: {e}")))?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_runners_name ON runners(name)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::database(format!("failed to create runners name index: {e}")))?;
 
         // Create jobs table
         sqlx::query(
@@ -234,7 +261,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create jobs table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create jobs table: {e}")))?;
 
         // Additive migration for databases created before job definitions and
         // receipts were persisted. SQLite has no portable IF NOT EXISTS form
@@ -252,8 +279,7 @@ impl Pool {
                 let message = error.to_string();
                 if !message.contains("duplicate column name") {
                     return Err(Error::database(format!(
-                        "failed to migrate jobs table: {}",
-                        error
+                        "failed to migrate jobs table: {error}"
                     )));
                 }
             }
@@ -276,7 +302,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create artifacts table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create artifacts table: {e}")))?;
 
         // Append-only, bounded runner log chunks. The lease fields are not
         // duplicated here: every append is authorized against the current
@@ -296,7 +322,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create job log chunks table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create job log chunks table: {e}")))?;
 
         // Create events table
         sqlx::query(
@@ -314,7 +340,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create events table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create events table: {e}")))?;
 
         // Durable CI event delivery claims must survive a process restart.
         // Older databases predate the lease columns, so add them idempotently.
@@ -326,8 +352,7 @@ impl Pool {
             if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
                 if !error.to_string().contains("duplicate column name") {
                     return Err(Error::database(format!(
-                        "failed to migrate events table: {}",
-                        error
+                        "failed to migrate events table: {error}"
                     )));
                 }
             }
@@ -349,7 +374,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create job idempotency table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create job idempotency table: {e}")))?;
 
         sqlx::query(
             r#"
@@ -374,7 +399,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create publication outbox: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create publication outbox: {e}")))?;
 
         // Review runs (ADR 20260905 code review contract, R3). Mirrors the
         // PostgreSQL migration in migrations/002_review_domain.sql using this
@@ -402,7 +427,7 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create review_runs table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create review_runs table: {e}")))?;
 
         // Review findings (ADR R4/R5). Content-addressed fingerprints are
         // unique per run so retried ingestion is idempotent, and the
@@ -439,20 +464,18 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create review_findings table: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create review_findings table: {e}")))?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_review_runs_repo ON review_runs(repo_id)")
             .execute(&self.pool)
             .await
-            .map_err(|e| {
-                Error::database(format!("failed to create idx_review_runs_repo: {}", e))
-            })?;
+            .map_err(|e| Error::database(format!("failed to create idx_review_runs_repo: {e}")))?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_review_runs_status ON review_runs(status)")
             .execute(&self.pool)
             .await
             .map_err(|e| {
-                Error::database(format!("failed to create idx_review_runs_status: {}", e))
+                Error::database(format!("failed to create idx_review_runs_status: {e}"))
             })?;
 
         sqlx::query(
@@ -460,34 +483,32 @@ impl Pool {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to create idx_review_findings_run: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create idx_review_findings_run: {e}")))?;
 
         // Create indexes for performance
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
             .execute(&self.pool)
             .await
-            .map_err(|e| Error::database(format!("failed to create idx_jobs_status: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to create idx_jobs_status: {e}")))?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_pipeline_run_id ON jobs(pipeline_run_id)")
             .execute(&self.pool)
             .await
             .map_err(|e| {
-                Error::database(format!("failed to create idx_jobs_pipeline_run_id: {}", e))
+                Error::database(format!("failed to create idx_jobs_pipeline_run_id: {e}"))
             })?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pipeline_id ON pipeline_runs(pipeline_id)")
             .execute(&self.pool)
             .await
-            .map_err(|e| Error::database(format!("failed to create idx_pipeline_runs_pipeline_id: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to create idx_pipeline_runs_pipeline_id: {e}")))?;
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_repositories_owner_id ON repositories(owner_id)",
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| {
-            Error::database(format!("failed to create idx_repositories_owner_id: {}", e))
-        })?;
+        .map_err(|e| Error::database(format!("failed to create idx_repositories_owner_id: {e}")))?;
 
         tracing::info!("database migrations completed successfully");
         Ok(())
@@ -498,7 +519,7 @@ impl Pool {
         sqlx::query("SELECT 1")
             .execute(&self.pool)
             .await
-            .map_err(|e| Error::database(format!("health check failed: {}", e)))?;
+            .map_err(|e| Error::database(format!("health check failed: {e}")))?;
         Ok(())
     }
 }

@@ -194,10 +194,7 @@ mod tests {
         let token = auth.generate_token(user_id, "testuser", "user").unwrap();
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "Authorization",
-            format!("Bearer {}", token).parse().unwrap(),
-        );
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
 
         let response = auth_status(Extension(Arc::new(auth)), headers)
             .await
@@ -232,7 +229,7 @@ mod tests {
             username: "user1".to_string(),
             password: "secret".to_string(),
         };
-        let debug_str = format!("{:?}", req);
+        let debug_str = format!("{req:?}");
         assert!(debug_str.contains("user1"));
     }
 
@@ -243,7 +240,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             expires_in: 3600,
         };
-        let debug_str = format!("{:?}", response);
+        let debug_str = format!("{response:?}");
         assert!(debug_str.contains("debug-token"));
     }
 
@@ -333,10 +330,7 @@ mod tests {
         .unwrap();
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "Authorization",
-            format!("Bearer {}", token).parse().unwrap(),
-        );
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
 
         let response = auth_status(Extension(Arc::new(auth)), headers)
             .await

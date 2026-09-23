@@ -97,7 +97,7 @@ impl DockerSandbox {
                 ..Default::default()
             }))
             .await
-            .map_err(|e| Error::sandbox(format!("failed to list job containers: {}", e)))?;
+            .map_err(|e| Error::sandbox(format!("failed to list job containers: {e}")))?;
 
         for container in containers {
             let owned_by_job = container
@@ -136,8 +136,7 @@ impl DockerSandbox {
                     }
                     Err(e) => {
                         return Err(Error::sandbox(format!(
-                            "failed to remove stale job container: {}",
-                            e
+                            "failed to remove stale job container: {e}"
                         )));
                     }
                 }
@@ -167,13 +166,13 @@ impl DockerSandbox {
             .filter(|host| host.starts_with("unix://"))
             .unwrap_or_else(|| "unix:///var/run/docker.sock".to_owned());
         let docker = Docker::connect_with_unix(&socket, client_timeout, API_DEFAULT_VERSION)
-            .map_err(|e| Error::sandbox(format!("failed to connect to Docker: {}", e)))?;
+            .map_err(|e| Error::sandbox(format!("failed to connect to Docker: {e}")))?;
 
         // Verify connection by pinging Docker
         docker
             .ping()
             .await
-            .map_err(|e| Error::sandbox(format!("Docker daemon not available: {}", e)))?;
+            .map_err(|e| Error::sandbox(format!("Docker daemon not available: {e}")))?;
 
         tracing::info!("Connected to Docker daemon");
 
@@ -249,7 +248,7 @@ impl DockerSandbox {
                         tracing::debug!("Pull progress: {:?}", info);
                     }
                     Err(e) => {
-                        return Err(Error::sandbox(format!("failed to pull image: {}", e)));
+                        return Err(Error::sandbox(format!("failed to pull image: {e}")));
                     }
                 }
             }
@@ -363,13 +362,13 @@ impl Sandbox for DockerSandbox {
             let response = docker
                 .create_container(Some(options), config)
                 .await
-                .map_err(|e| Error::sandbox(format!("failed to create container: {}", e)))?;
+                .map_err(|e| Error::sandbox(format!("failed to create container: {e}")))?;
 
             // Start container
             docker
                 .start_container(&response.id, None)
                 .await
-                .map_err(|e| Error::sandbox(format!("failed to start container: {}", e)))?;
+                .map_err(|e| Error::sandbox(format!("failed to start container: {e}")))?;
 
             tracing::info!("Created container {} for job {}", response.id, job_id);
 
@@ -381,7 +380,7 @@ impl Sandbox for DockerSandbox {
         } else {
             // Stub mode - no Docker available
             Ok(SandboxInstance {
-                container_id: format!("gitforce-job-{}", job_id),
+                container_id: format!("gitforce-job-{job_id}"),
                 job_id,
                 workspace_path: None,
             })
@@ -402,8 +401,7 @@ impl Sandbox for DockerSandbox {
         let workspace = Path::new(workspace_path);
         if !workspace.is_absolute() || !workspace.is_dir() {
             return Err(Error::sandbox(format!(
-                "workspace must be an existing absolute directory: {}",
-                workspace_path
+                "workspace must be an existing absolute directory: {workspace_path}"
             )));
         }
 
@@ -451,14 +449,12 @@ impl Sandbox for DockerSandbox {
                 )
                 .await
                 .map_err(|e| {
-                    Error::sandbox(format!("failed to create workspace container: {}", e))
+                    Error::sandbox(format!("failed to create workspace container: {e}"))
                 })?;
             docker
                 .start_container(&response.id, None)
                 .await
-                .map_err(|e| {
-                    Error::sandbox(format!("failed to start workspace container: {}", e))
-                })?;
+                .map_err(|e| Error::sandbox(format!("failed to start workspace container: {e}")))?;
             tracing::info!(
                 "Created workspace container {} for job {} from {}",
                 response.id,
@@ -511,13 +507,13 @@ impl Sandbox for DockerSandbox {
             let exec = docker
                 .create_exec(&instance.container_id, config)
                 .await
-                .map_err(|e| Error::sandbox(format!("failed to create exec: {}", e)))?;
+                .map_err(|e| Error::sandbox(format!("failed to create exec: {e}")))?;
 
             // Start exec and get results
             let result = docker
                 .start_exec(&exec.id, None::<StartExecOptions>)
                 .await
-                .map_err(|e| Error::sandbox(format!("failed to start exec: {}", e)))?;
+                .map_err(|e| Error::sandbox(format!("failed to start exec: {e}")))?;
 
             let mut stdout = String::new();
             let mut stderr = String::new();
@@ -547,7 +543,7 @@ impl Sandbox for DockerSandbox {
                                 None => break,
                             }
                         }
-                        _ = sleep(Duration::from_secs(1)) => {
+                        () = sleep(Duration::from_secs(1)) => {
                             match docker.inspect_exec(&exec.id).await {
                                 Ok(inspect) if inspect.running == Some(false) => break,
                                 Ok(_) => {}
@@ -580,7 +576,7 @@ impl Sandbox for DockerSandbox {
             tracing::debug!("Executing command in stub mode: {:?}", command);
             let result = StepResult {
                 exit_code: 0,
-                stdout: format!("[STUB] Executing: {:?}\n", command),
+                stdout: format!("[STUB] Executing: {command:?}\n"),
                 stderr: "[STUB] Warning: running in stub mode, exit code is always 0\n".to_string(),
             };
             if let Some(sink) = sink {
@@ -642,7 +638,7 @@ impl Sandbox for DockerSandbox {
             docker
                 .remove_container(&instance.container_id, Some(remove_options))
                 .await
-                .map_err(|e| Error::sandbox(format!("failed to remove container: {}", e)))?;
+                .map_err(|e| Error::sandbox(format!("failed to remove container: {e}")))?;
 
             tracing::info!(
                 "Destroyed container {} for job {}",
@@ -670,7 +666,7 @@ fn parse_uid_gid(raw: &str) -> Option<u32> {
 
 /// Format a UID and GID as the "uid:gid" string accepted by `chown`.
 fn chown_owner_string(uid: u32, gid: u32) -> String {
-    format!("{}:{}", uid, gid)
+    format!("{uid}:{gid}")
 }
 
 /// Resolve the runner UID/GID from environment variables, falling back to
@@ -681,9 +677,9 @@ fn resolve_runner_uid_gid() -> Result<(u32, u32)> {
     let gid_raw = std::env::var("GITFORGE_RUNNER_GID").unwrap_or_else(|_| "1000".to_string());
 
     let uid = parse_uid_gid(&uid_raw)
-        .ok_or_else(|| Error::sandbox(format!("invalid GITFORGE_RUNNER_UID: {}", uid_raw)))?;
+        .ok_or_else(|| Error::sandbox(format!("invalid GITFORGE_RUNNER_UID: {uid_raw}")))?;
     let gid = parse_uid_gid(&gid_raw)
-        .ok_or_else(|| Error::sandbox(format!("invalid GITFORGE_RUNNER_GID: {}", gid_raw)))?;
+        .ok_or_else(|| Error::sandbox(format!("invalid GITFORGE_RUNNER_GID: {gid_raw}")))?;
 
     Ok((uid, gid))
 }
@@ -738,7 +734,7 @@ async fn cleanup_workspace(docker: &Docker, container_id: &str, workspace: &str)
     let exec = docker
         .create_exec(container_id, config)
         .await
-        .map_err(|e| Error::sandbox(format!("failed to create cleanup exec: {}", e)))?;
+        .map_err(|e| Error::sandbox(format!("failed to create cleanup exec: {e}")))?;
 
     // start_exec returns StartExecResults. If the container supports exec
     // (Linux containers always do) we get an Attached handle with the output
@@ -746,7 +742,7 @@ async fn cleanup_workspace(docker: &Docker, container_id: &str, workspace: &str)
     let result = docker
         .start_exec(&exec.id, None::<StartExecOptions>)
         .await
-        .map_err(|e| Error::sandbox(format!("failed to start workspace chown: {}", e)))?;
+        .map_err(|e| Error::sandbox(format!("failed to start workspace chown: {e}")))?;
 
     let exit_code = match result {
         StartExecResults::Attached { mut output, .. } => {
@@ -760,7 +756,7 @@ async fn cleanup_workspace(docker: &Docker, container_id: &str, workspace: &str)
             docker
                 .inspect_exec(&exec.id)
                 .await
-                .map_err(|e| Error::sandbox(format!("failed to inspect cleanup exec: {}", e)))?
+                .map_err(|e| Error::sandbox(format!("failed to inspect cleanup exec: {e}")))?
                 .exit_code
                 .unwrap_or(1) as i32
         }
@@ -769,15 +765,14 @@ async fn cleanup_workspace(docker: &Docker, container_id: &str, workspace: &str)
         StartExecResults::Detached => docker
             .inspect_exec(&exec.id)
             .await
-            .map_err(|e| Error::sandbox(format!("failed to inspect cleanup exec: {}", e)))?
+            .map_err(|e| Error::sandbox(format!("failed to inspect cleanup exec: {e}")))?
             .exit_code
             .unwrap_or(1) as i32,
     };
 
     if exit_code != 0 {
         return Err(Error::sandbox(format!(
-            "workspace chown exited with code {} (uid={}, gid={})",
-            exit_code, uid, gid
+            "workspace chown exited with code {exit_code} (uid={uid}, gid={gid})"
         )));
     }
 
@@ -801,8 +796,8 @@ mod tests {
         let second = DockerSandbox::container_name(job_id);
 
         assert_ne!(first, second);
-        assert!(first.starts_with(&format!("gitforce-job-{}-", job_id)));
-        assert!(second.starts_with(&format!("gitforce-job-{}-", job_id)));
+        assert!(first.starts_with(&format!("gitforce-job-{job_id}-")));
+        assert!(second.starts_with(&format!("gitforce-job-{job_id}-")));
     }
 
     #[async_trait]
@@ -967,7 +962,7 @@ mod tests {
             job_id: JobId::new(),
             workspace_path: None,
         };
-        let debug_str = format!("{:?}", instance);
+        let debug_str = format!("{instance:?}");
         assert!(debug_str.contains("test-container"));
     }
 
@@ -978,7 +973,7 @@ mod tests {
             stdout: "hello".to_string(),
             stderr: String::new(),
         };
-        let debug_str = format!("{:?}", result);
+        let debug_str = format!("{result:?}");
         assert!(debug_str.contains("hello"));
     }
 
@@ -1417,8 +1412,7 @@ mod tests {
         let result = sandbox.destroy(instance).await;
         assert!(
             result.is_ok(),
-            "destroy with workspace_path should succeed on stub: {:?}",
-            result
+            "destroy with workspace_path should succeed on stub: {result:?}"
         );
     }
 
@@ -1439,7 +1433,7 @@ mod tests {
         assert!(instance.workspace_path.is_none());
 
         // Debug output should exist and not panic.
-        let debug_str = format!("{:?}", instance);
+        let debug_str = format!("{instance:?}");
         assert!(!debug_str.is_empty());
         sandbox.destroy(instance).await.unwrap();
     }
@@ -1526,11 +1520,10 @@ mod tests {
             workspace_path: Some("/custom/path".to_string()),
         };
 
-        let debug_str = format!("{:?}", instance);
+        let debug_str = format!("{instance:?}");
         assert!(
             debug_str.contains("/custom/path"),
-            "debug output: {}",
-            debug_str
+            "debug output: {debug_str}"
         );
     }
 
@@ -1631,8 +1624,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("GITFORGE_RUNNER_UID"),
-            "error message should mention GITFORGE_RUNNER_UID: {}",
-            err_msg
+            "error message should mention GITFORGE_RUNNER_UID: {err_msg}"
         );
     }
 
@@ -1651,8 +1643,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("GITFORGE_RUNNER_GID"),
-            "error message should mention GITFORGE_RUNNER_GID: {}",
-            err_msg
+            "error message should mention GITFORGE_RUNNER_GID: {err_msg}"
         );
     }
 

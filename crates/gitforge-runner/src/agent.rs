@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
@@ -163,8 +164,7 @@ impl RunnerConfig {
                         })?;
                         if parsed <= 0 {
                             return Err(Error::invalid_input(format!(
-                                "GITFORGE_RUNNER_CAPACITY must be a positive integer (got {})",
-                                parsed
+                                "GITFORGE_RUNNER_CAPACITY must be a positive integer (got {parsed})"
                             )));
                         }
                         capacity = Some(parsed as i32);
@@ -180,8 +180,7 @@ impl RunnerConfig {
                         })?;
                         if parsed <= 0 {
                             return Err(Error::invalid_input(format!(
-                                "GITFORGE_HEARTBEAT_INTERVAL must be a positive integer (got {})",
-                                parsed
+                                "GITFORGE_HEARTBEAT_INTERVAL must be a positive integer (got {parsed})"
                             )));
                         }
                         heartbeat_interval_secs = Some(parsed as u64);
@@ -195,8 +194,7 @@ impl RunnerConfig {
                         })?;
                         if parsed <= 0 {
                             return Err(Error::invalid_input(format!(
-                                "GITFORGE_FETCH_INTERVAL must be a positive integer (got {})",
-                                parsed
+                                "GITFORGE_FETCH_INTERVAL must be a positive integer (got {parsed})"
                             )));
                         }
                         fetch_interval_secs = Some(parsed as u64);
@@ -220,8 +218,7 @@ impl RunnerConfig {
                         })?;
                         if parsed <= 0 {
                             return Err(Error::invalid_input(format!(
-                                "GITFORGE_REGISTER_ATTEMPTS must be a positive integer (got {})",
-                                parsed
+                                "GITFORGE_REGISTER_ATTEMPTS must be a positive integer (got {parsed})"
                             )));
                         }
                         register_attempts = Some(parsed as u32);
@@ -237,8 +234,7 @@ impl RunnerConfig {
                         })?;
                         if parsed < 0 {
                             return Err(Error::invalid_input(format!(
-                                "GITFORGE_REGISTER_BACKOFF_SECS must not be negative (got {})",
-                                parsed
+                                "GITFORGE_REGISTER_BACKOFF_SECS must not be negative (got {parsed})"
                             )));
                         }
                         register_backoff_secs = Some(parsed as u64);
@@ -252,8 +248,7 @@ impl RunnerConfig {
                             "deny" | "false" | "0" => false,
                             other => {
                                 return Err(Error::invalid_input(format!(
-                                    "GITFORGE_RUNNER_STANDALONE must be allow or deny (got {})",
-                                    other
+                                    "GITFORGE_RUNNER_STANDALONE must be allow or deny (got {other})"
                                 )))
                             }
                         });
@@ -735,6 +730,10 @@ pub struct RunnerAgent {
     executor: Arc<JobExecutor>,
     is_running: Arc<RwLock<bool>>,
     reconciler_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Set when the scheduler has been unreachable for the loss threshold.
+    /// `run` surfaces this as an error so the service supervisor can restart
+    /// and re-register the runner instead of leaving it apparently healthy.
+    scheduler_lost: Arc<AtomicBool>,
     /// Authoritative active-job set shared with the reconciler. The reconciler
     /// holds this registry's lock across its Docker calls so admission cannot
     /// interleave between the snapshot and a remove decision.
@@ -747,7 +746,7 @@ impl RunnerAgent {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| Error::internal(format!("failed to create HTTP client: {}", e)))?;
+            .map_err(|e| Error::internal(format!("failed to create HTTP client: {e}")))?;
 
         let sandbox = DockerSandbox::connect_required().await?;
         let executor = JobExecutor::new().await?;
@@ -760,6 +759,7 @@ impl RunnerAgent {
             executor: Arc::new(executor),
             is_running: Arc::new(RwLock::new(false)),
             reconciler_task: Arc::new(Mutex::new(None)),
+            scheduler_lost: Arc::new(AtomicBool::new(false)),
             active_jobs: ActiveJobRegistry::new(),
         })
     }
@@ -892,8 +892,10 @@ impl RunnerAgent {
         let heartbeat_url = self.config.scheduler_url.clone();
         let heartbeat_token = self.config.scheduler_token.clone();
         let is_running = self.is_running.clone();
+        let scheduler_lost = self.scheduler_lost.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(heartbeat_interval));
+            let mut consecutive_failures = 0_u32;
             loop {
                 ticker.tick().await;
                 if !*is_running.read().await {
@@ -901,17 +903,30 @@ impl RunnerAgent {
                     break;
                 }
                 tracing::debug!("runner {} sending heartbeat", heartbeat_runner_id);
-                let url = format!(
-                    "{}/runners/{}/heartbeat",
-                    heartbeat_url, heartbeat_runner_id
-                );
+                let url = format!("{heartbeat_url}/runners/{heartbeat_runner_id}/heartbeat");
                 let mut heartbeat_request = heartbeat_client.post(&url);
                 if let Some(token) = &heartbeat_token {
                     heartbeat_request = heartbeat_request.bearer_auth(token);
                 }
-                if let Err(e) = heartbeat_request.send().await {
-                    tracing::trace!("heartbeat failed: {}", e);
+                let delivered = heartbeat_request
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success());
+                if delivered {
+                    consecutive_failures = 0;
+                    continue;
                 }
+                consecutive_failures += 1;
+                if consecutive_failures >= 10 {
+                    tracing::error!(
+                        "lost contact with scheduler after {} consecutive failed heartbeats; stopping for re-registration",
+                        consecutive_failures
+                    );
+                    scheduler_lost.store(true, Ordering::SeqCst);
+                    *is_running.write().await = false;
+                    break;
+                }
+                tracing::trace!("heartbeat failed ({}/10 consecutive)", consecutive_failures);
             }
         });
 
@@ -942,7 +957,7 @@ impl RunnerAgent {
                 }
                 tracing::debug!("runner checking for jobs...");
 
-                let jobs_url = format!("{}/jobs/pending?runner_id={}", fetch_url, fetch_runner_id);
+                let jobs_url = format!("{fetch_url}/jobs/pending?runner_id={fetch_runner_id}");
                 let mut fetch_request = fetch_client.get(&jobs_url);
                 if let Some(token) = &fetch_token {
                     fetch_request = fetch_request.bearer_auth(token);
@@ -1028,6 +1043,12 @@ impl RunnerAgent {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
+        if self.scheduler_lost.load(Ordering::SeqCst) {
+            return Err(Error::internal(
+                "runner lost contact with the scheduler and stopped for re-registration",
+            ));
+        }
+
         Ok(())
     }
 
@@ -1101,7 +1122,7 @@ impl RunnerAgent {
         runner_id: RunnerId,
         scheduler_token: Option<&str>,
     ) -> Option<String> {
-        let url = format!("{}/jobs/{}/claim", scheduler_url, job_id);
+        let url = format!("{scheduler_url}/jobs/{job_id}/claim");
         let mut request = client
             .post(url)
             .json(&serde_json::json!({"runner_id": runner_id.to_string()}));
@@ -1141,8 +1162,7 @@ impl RunnerAgent {
 
         // Convert assignment to ExecutableJob
         let pipeline_run_id = uuid::Uuid::parse_str(&assignment.pipeline_run_id)
-            .map(PipelineRunId::from)
-            .unwrap_or_else(|_| PipelineRunId::new());
+            .map_or_else(|_| PipelineRunId::new(), PipelineRunId::from);
 
         let executable = ExecutableJob {
             job_id,
@@ -1204,70 +1224,27 @@ impl RunnerAgent {
             return;
         }
 
-        let cancellation_client = client.clone();
-        let cancellation_url = scheduler_url.to_string();
-        let cancellation_job_id = assignment.job_id.clone();
-        let cancellation_executor = executor.clone();
-        let cancellation_token = scheduler_token.map(ToOwned::to_owned);
         // Set when the scheduler says the job's durable outcome was already
         // decided while this execution was still running: an operator
         // cancellation, or restart recovery failing the in-flight row. The
         // lease is gone in both cases, so post-execution reporting can only
         // produce rejected requests.
-        let orphaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let orphaned_watch = orphaned.clone();
-        let cancellation_watch = tokio::spawn(async move {
-            let endpoint = format!(
-                "{}/jobs/{}/cancelled",
-                cancellation_url, cancellation_job_id
-            );
-            let mut probe_failures = 0u8;
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let mut request = cancellation_client.get(&endpoint);
-                if let Some(token) = &cancellation_token {
-                    request = request.bearer_auth(token);
-                }
-                match request.send().await {
-                    Ok(response) if response.status().is_success() => {
-                        probe_failures = 0;
-                        let cancelled = response
-                            .json::<serde_json::Value>()
-                            .await
-                            .ok()
-                            .and_then(|payload| payload["cancelled"].as_bool())
-                            .unwrap_or(false);
-                        if cancelled {
-                            orphaned_watch.store(true, std::sync::atomic::Ordering::Relaxed);
-                            if let Ok(job_id) = uuid::Uuid::parse_str(&cancellation_job_id) {
-                                let job_id = JobId::from(job_id);
-                                if let Err(error) = cancellation_executor.cancel(&job_id).await {
-                                    tracing::warn!(%error, %job_id, "failed to destroy cancelled sandbox");
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    Ok(response) => {
-                        probe_failures = probe_failures.saturating_add(1);
-                        tracing::warn!(status = %response.status(), attempt = probe_failures, "job cancellation probe rejected");
-                    }
-                    Err(error) => {
-                        probe_failures = probe_failures.saturating_add(1);
-                        tracing::warn!(%error, attempt = probe_failures, "job cancellation probe failed");
-                    }
-                }
-                if probe_failures >= 3 {
-                    tracing::error!(
-                        "cancellation probe unavailable repeatedly; stopping local job sandbox"
-                    );
-                    if let Ok(job_id) = uuid::Uuid::parse_str(&cancellation_job_id) {
-                        let _ = cancellation_executor.cancel(&JobId::from(job_id)).await;
-                    }
-                    break;
-                }
-            }
-        });
+        let orphaned = Arc::new(AtomicBool::new(false));
+        let cancellation_executor = executor.clone();
+        let cancellation_watch = tokio::spawn(run_cancellation_watch(
+            CancellationWatchConfig {
+                client: client.clone(),
+                scheduler_url: scheduler_url.to_string(),
+                job_id: assignment.job_id.clone(),
+                token: scheduler_token.map(ToOwned::to_owned),
+                orphaned: orphaned.clone(),
+            },
+            Duration::from_secs(1),
+            move |job_id| {
+                let executor = cancellation_executor.clone();
+                async move { executor.cancel(&job_id).await }
+            },
+        ));
 
         // Execute the job. Output is sent to the scheduler while the sandbox
         // is running; the bounded sink applies network backpressure and never
@@ -1395,6 +1372,92 @@ impl RunnerAgent {
     }
 }
 
+/// Probe configuration for the per-job cancellation watch. Pulled out of
+/// `execute_assignment` so the decided-outcome lifecycle can be exercised in
+/// tests against a scripted scheduler.
+pub(crate) struct CancellationWatchConfig {
+    pub client: Client,
+    pub scheduler_url: String,
+    pub job_id: String,
+    pub token: Option<String>,
+    pub orphaned: Arc<AtomicBool>,
+}
+
+/// Background loop body for the cancellation watch. Extracted from
+/// `execute_assignment` so the probe→stop lifecycle can be exercised in
+/// tests without a real sandbox.
+///
+/// The scheduler owns the durable outcome: an operator cancellation and a
+/// restart-recovery failure both surface here as `cancelled: true`, because
+/// in both cases the lease is gone and finishing the execution can only
+/// produce requests the scheduler rejects. Three consecutive probe failures
+/// also stop the sandbox — a scheduler that cannot be asked about the job
+/// must not leave it running unobserved — but do not mark the execution
+/// orphaned, since the outcome is unknown rather than decided.
+pub(crate) async fn run_cancellation_watch<S, Fut>(
+    config: CancellationWatchConfig,
+    probe_interval: Duration,
+    stop_sandbox: S,
+) where
+    S: Fn(JobId) -> Fut,
+    Fut: std::future::Future<Output = Result<()>> + Send,
+{
+    let CancellationWatchConfig {
+        client,
+        scheduler_url,
+        job_id,
+        token,
+        orphaned,
+    } = config;
+    let endpoint = format!("{scheduler_url}/jobs/{job_id}/cancelled");
+    let mut probe_failures = 0u8;
+    loop {
+        tokio::time::sleep(probe_interval).await;
+        let mut request = client.get(&endpoint);
+        if let Some(token) = &token {
+            request = request.bearer_auth(token);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                probe_failures = 0;
+                let cancelled = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|payload| payload["cancelled"].as_bool())
+                    .unwrap_or(false);
+                if cancelled {
+                    orphaned.store(true, Ordering::Relaxed);
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&job_id) {
+                        let job_id = JobId::from(uuid);
+                        if let Err(error) = stop_sandbox(job_id).await {
+                            tracing::warn!(%error, %job_id, "failed to destroy cancelled sandbox");
+                        }
+                    }
+                    break;
+                }
+            }
+            Ok(response) => {
+                probe_failures = probe_failures.saturating_add(1);
+                tracing::warn!(status = %response.status(), attempt = probe_failures, "job cancellation probe rejected");
+            }
+            Err(error) => {
+                probe_failures = probe_failures.saturating_add(1);
+                tracing::warn!(%error, attempt = probe_failures, "job cancellation probe failed");
+            }
+        }
+        if probe_failures >= 3 {
+            tracing::error!(
+                "cancellation probe unavailable repeatedly; stopping local job sandbox"
+            );
+            if let Ok(uuid) = uuid::Uuid::parse_str(&job_id) {
+                let _ = stop_sandbox(JobId::from(uuid)).await;
+            }
+            break;
+        }
+    }
+}
+
 /// Resolved configuration for the reconciler background loop. Pulled out of
 /// `spawn_reconciler` so it is fully unit-testable without touching the
 /// process environment.
@@ -1418,8 +1481,7 @@ pub(crate) enum ReceiptWriteOutcome {
 /// Read the reconciler env-var configuration and validate it.
 fn load_reconciler_config_from_env() -> std::result::Result<ReconcilerLoopConfig, String> {
     let deletion_enabled = std::env::var("GITFORGE_RECONCILE_DELETE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let grace_secs: u64 = std::env::var("GITFORGE_RECONCILE_GRACE_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1899,8 +1961,7 @@ fn utf8_chunks(value: &str, max_bytes: usize) -> Vec<&str> {
             end = value[start..]
                 .char_indices()
                 .nth(1)
-                .map(|(offset, _)| start + offset)
-                .unwrap_or(value.len());
+                .map_or(value.len(), |(offset, _)| start + offset);
         }
         chunks.push(&value[start..end]);
         start = end;
@@ -1966,6 +2027,11 @@ fn sha256_hex(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn docker_daemon_available() -> bool {
+        std::path::Path::new("/var/run/docker.sock").exists()
+            || std::env::var_os("DOCKER_HOST").is_some()
+    }
+
     #[test]
     fn test_utf8_chunks_preserve_boundaries() {
         let value = "ééé";
@@ -1992,6 +2058,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_register_no_scheduler() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // Registration failure is fatal by default: a runner must not appear
         // healthy when it cannot reach the scheduler that assigns it work.
         let config = RunnerConfig {
@@ -2205,6 +2275,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_agent_stop() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         agent.stop(false).await;
@@ -2285,7 +2359,7 @@ mod tests {
     #[test]
     fn test_runner_config_debug() {
         let config = RunnerConfig::default();
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
         assert!(debug_str.contains("runner"));
     }
 
@@ -2300,7 +2374,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
         };
-        let debug_str = format!("{:?}", assignment);
+        let debug_str = format!("{assignment:?}");
         assert!(debug_str.contains("job-123"));
     }
 
@@ -2382,6 +2456,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_agent_not_registered() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // Agent without registration should have runner as None
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
@@ -2390,6 +2468,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_register_sets_runner() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
             allow_standalone: true,
@@ -2450,7 +2532,7 @@ mod tests {
         // We can't easily create a running agent for debug test
         // but we can verify the type implements Debug
         let config = RunnerConfig::default();
-        assert!(format!("{:?}", config).contains("RunnerConfig"));
+        assert!(format!("{config:?}").contains("RunnerConfig"));
     }
 
     #[test]
@@ -2507,6 +2589,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_stop_after_registration() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
             allow_standalone: true,
@@ -2549,7 +2635,7 @@ mod tests {
 
     #[test]
     fn test_job_assignment_with_many_commands() {
-        let commands: Vec<String> = (0..100).map(|i| format!("echo step{}", i)).collect();
+        let commands: Vec<String> = (0..100).map(|i| format!("echo step{i}")).collect();
         let assignment = JobAssignment {
             job_id: "job-many".to_string(),
             name: "many-steps".to_string(),
@@ -2643,6 +2729,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_agent_with_custom_config() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig {
             scheduler_url: "http://custom-scheduler:8081".to_string(),
             name: "custom-runner".to_string(),
@@ -2690,6 +2780,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_run_and_stop() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig {
             scheduler_url: "http://localhost:99999".to_string(),
             allow_standalone: true,
@@ -3159,5 +3253,158 @@ mod tests {
             vec!["a", "😀", "b"],
             "a char wider than the limit is never split"
         );
+    }
+
+    // ── Cancellation watch ─────────────────────────────────────────────────
+
+    /// Serve a scripted sequence of probe responses from a local listener;
+    /// the last entry repeats for any further connection.
+    async fn spawn_probe_server(responses: &[(u16, &str)]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let addr = listener.local_addr().expect("local addr");
+        let responses: Vec<(u16, String)> = responses
+            .iter()
+            .map(|(status, body)| (*status, (*body).to_string()))
+            .collect();
+        assert!(!responses.is_empty(), "at least one response is required");
+        tokio::spawn(async move {
+            let mut served = 0usize;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let (status, body) = responses[served.min(responses.len() - 1)].clone();
+                served += 1;
+                // Drain the request head before answering so the client's
+                // write never races our response.
+                let mut head = [0u8; 2048];
+                let _ = socket.read(&mut head).await;
+                let reason = match status {
+                    200 => "OK",
+                    500 => "Internal Server Error",
+                    _ => "Status",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\
+                     \r\n{body}",
+                    body.len(),
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A stop callback that records the jobs it was asked to destroy.
+    fn recording_stop(
+        stopped: Arc<Mutex<Vec<JobId>>>,
+    ) -> impl Fn(JobId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+    {
+        move |job_id: JobId| {
+            let stopped = stopped.clone();
+            Box::pin(async move {
+                stopped.lock().await.push(job_id);
+                Ok(())
+            })
+        }
+    }
+
+    fn watch_config(
+        job_id: String,
+        scheduler_url: String,
+        orphaned: Arc<AtomicBool>,
+    ) -> CancellationWatchConfig {
+        CancellationWatchConfig {
+            client: Client::new(),
+            scheduler_url,
+            job_id,
+            token: None,
+            orphaned,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_watch_stops_sandbox_on_decided_outcome() {
+        // The scheduler owns the durable outcome: once it reports the job
+        // decided (operator cancellation or restart recovery failing the
+        // row), the sandbox must be destroyed and the execution marked
+        // orphaned so post-execution reporting is skipped.
+        let url = spawn_probe_server(&[
+            (200, r#"{"cancelled":false}"#),
+            (200, r#"{"cancelled":true}"#),
+        ])
+        .await;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let orphaned = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        run_cancellation_watch(
+            watch_config(job_id.clone(), url, orphaned.clone()),
+            Duration::from_millis(20),
+            recording_stop(stopped.clone()),
+        )
+        .await;
+        assert!(orphaned.load(Ordering::Relaxed));
+        let destroyed = stopped.lock().await;
+        assert_eq!(destroyed.len(), 1, "the sandbox is destroyed exactly once");
+        assert_eq!(
+            destroyed[0].to_string(),
+            job_id,
+            "the configured job's sandbox is the one destroyed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_watch_survives_transient_probe_failure() {
+        // One rejected probe is not a decision: the watch resets its failure
+        // streak on the next success and only stops when the scheduler
+        // actually reports the outcome decided.
+        let url = spawn_probe_server(&[
+            (500, r#"{"error":"unavailable"}"#),
+            (200, r#"{"cancelled":false}"#),
+            (200, r#"{"cancelled":true}"#),
+        ])
+        .await;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let orphaned = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        run_cancellation_watch(
+            watch_config(job_id.clone(), url, orphaned.clone()),
+            Duration::from_millis(20),
+            recording_stop(stopped.clone()),
+        )
+        .await;
+        assert!(orphaned.load(Ordering::Relaxed));
+        let destroyed = stopped.lock().await;
+        assert_eq!(destroyed.len(), 1);
+        assert_eq!(destroyed[0].to_string(), job_id);
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_watch_stops_sandbox_after_repeated_probe_failures() {
+        // A scheduler that keeps rejecting the probe cannot be asked about
+        // the job's fate: after three consecutive failures the sandbox is
+        // destroyed as a safety measure, but the execution is NOT marked
+        // orphaned — the outcome is unknown rather than decided, so
+        // post-execution reporting still runs.
+        let url = spawn_probe_server(&[(500, r#"{"error":"unavailable"}"#)]).await;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let orphaned = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        run_cancellation_watch(
+            watch_config(job_id.clone(), url, orphaned.clone()),
+            Duration::from_millis(20),
+            recording_stop(stopped.clone()),
+        )
+        .await;
+        assert!(
+            !orphaned.load(Ordering::Relaxed),
+            "unknown outcome must not be reported as decided"
+        );
+        let destroyed = stopped.lock().await;
+        assert_eq!(destroyed.len(), 1);
+        assert_eq!(destroyed[0].to_string(), job_id);
     }
 }

@@ -43,3 +43,6 @@ path = "src/daemon.rs"
 [[bin]]
 name = "gitforge-build"
 path = "src/cli.rs"
+
+[lints]
+workspace = true

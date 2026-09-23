@@ -28,7 +28,7 @@ impl<S: StorageBackend> HttpGitHandler<S> {
         let len = 4 + content.len();
         let mut result = Vec::with_capacity(len);
         // pkt-line length as 4-digit hex
-        result.extend_from_slice(format!("{:04x}", len).as_bytes());
+        result.extend_from_slice(format!("{len:04x}").as_bytes());
         result.extend_from_slice(content.as_bytes());
         result
     }
@@ -77,10 +77,10 @@ impl<S: StorageBackend> HttpGitHandler<S> {
                 if let (Some(name), Some(target)) = (reference.name().ok(), reference.target()) {
                     if name.starts_with("refs/") && !name.contains("^{}") {
                         let ref_line = if advertised_ref {
-                            format!("{} {}\n", target, name)
+                            format!("{target} {name}\n")
                         } else {
                             advertised_ref = true;
-                            format!("{} {}\0{}\n", target, name, capabilities)
+                            format!("{target} {name}\0{capabilities}\n")
                         };
                         response.extend_from_slice(&Self::format_pkt_line(&ref_line));
                     }
@@ -108,8 +108,7 @@ impl<S: StorageBackend> HttpGitHandler<S> {
     pub async fn receive_pack_advertisement(&self, repo_id: RepoId) -> Result<Vec<u8>> {
         if !self.storage.exists(repo_id).await {
             return Err(gitforge_common::Error::git(format!(
-                "Repository {} not found",
-                repo_id
+                "Repository {repo_id} not found"
             )));
         }
         self.build_ref_advertisement(repo_id, "git-receive-pack")
@@ -129,8 +128,7 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
         // Check if repository exists
         if !self.storage.exists(repo_id).await {
             return Err(gitforge_common::Error::git(format!(
-                "Repository {} not found",
-                repo_id
+                "Repository {repo_id} not found"
             )));
         }
 
@@ -182,8 +180,7 @@ impl<S: StorageBackend> GitProtocolHandler for HttpGitHandler<S> {
         // Check if repository exists
         if !self.storage.exists(repo_id).await {
             return Err(gitforge_common::Error::git(format!(
-                "Repository {} not found",
-                repo_id
+                "Repository {repo_id} not found"
             )));
         }
 

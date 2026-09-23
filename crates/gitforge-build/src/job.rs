@@ -69,7 +69,9 @@ pub struct BuildJob {
 impl BuildJob {
     /// Create a new build job from cargo arguments
     pub fn new(cargo_args: Vec<String>, working_dir: Option<String>) -> Self {
-        let cmd = cargo_args.first().map(|s| s.as_str()).unwrap_or("test");
+        let cmd = cargo_args
+            .first()
+            .map_or("test", std::string::String::as_str);
         let weight = JobWeight::from_cargo_cmd(cmd);
         Self {
             id: uuid::Uuid::new_v4(),

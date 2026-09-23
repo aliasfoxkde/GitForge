@@ -3,7 +3,10 @@
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
 use gitforge_common::{JobId, PipelineRunId, RepoId, RunnerId};
-use gitforge_db::models::{Job as DbJob, JobStatus, PipelineRun as DbPipelineRun, Runner};
+use gitforge_db::models::{
+    Job as DbJob, JobStatus, PipelineRun as DbPipelineRun, Runner,
+    RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS,
+};
 use gitforge_db::Pool;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,8 +16,9 @@ use uuid::Uuid;
 
 /// Maximum heartbeat age before a runner is considered lost by the normal
 /// scheduler tick. Keep this bounded so an interrupted runner cannot retain a
-/// durable job lease indefinitely.
-const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 90;
+/// durable job lease indefinitely. Shared with the API listings through the
+/// model constant so every consumer agrees on the threshold.
+const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS;
 
 /// Scheduler command
 #[derive(Debug)]
@@ -158,10 +162,14 @@ impl SchedulerState {
         self.runners.get(&runner_id)
     }
 
+    /// Runners eligible for placement: persisted status online AND heartbeat
+    /// liveness applied, so a runner whose heartbeat went stale between
+    /// recovery ticks is not offered new work in the meantime.
     pub fn list_online_runners(&self) -> Vec<Runner> {
+        let now = chrono::Utc::now();
         self.runners
             .values()
-            .filter(|r| r.status == "online")
+            .filter(|r| r.effective_status(now, RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS) == "online")
             .cloned()
             .collect()
     }
@@ -338,7 +346,7 @@ impl Scheduler {
 
         // Persist to database if available
         if let Some(pool) = &self.db_pool {
-            let mut db_job = DbJob::new(pipeline_run_id, format!("job-{}", job_id));
+            let mut db_job = DbJob::new(pipeline_run_id, format!("job-{job_id}"));
             db_job.id = job_id;
             if let Err(e) = gitforge_db::queries::JobQueries::create(pool, &db_job).await {
                 tracing::error!("failed to persist job to DB: {}", e);
@@ -515,7 +523,7 @@ impl Scheduler {
     pub async fn register_runner(&self, mut runner: Runner) -> Runner {
         if let Some(pool) = &self.db_pool {
             match gitforge_db::queries::RunnerQueries::register_or_refresh(pool, &runner).await {
-                Ok(persisted) => runner = persisted,
+                Ok((persisted, _registration)) => runner = persisted,
                 Err(error) => {
                     tracing::error!("failed to persist runner {}: {}", runner.id, error);
                 }
@@ -633,15 +641,46 @@ impl Scheduler {
 
         let mut requeued = 0;
         let db_pool = self.db_pool.clone();
+        let mut fenced_jobs = Vec::new();
         let mut state = self.state.write().await;
 
         for (job_id, pipeline_run_id, repo_id) in &jobs_to_requeue {
             // Persist first so a database failure leaves the in-memory
-            // assignment available for a later stale-runner retry.
+            // assignment available for a later stale-runner retry. A job the
+            // lost runner had already STARTED must not be requeued — its
+            // sandbox may still be executing, and a second execution of the
+            // job would race it (duplicate containers, duelling log appends,
+            // rejected completions) — so it is fenced as failed instead, the
+            // same contract as requeue_inflight's recovery of running jobs.
+            let mut fenced = false;
             if let Some(pool) = &db_pool {
-                if let Err(error) = gitforge_db::queries::JobQueries::requeue(pool, *job_id).await {
-                    tracing::error!(%error, %job_id, "failed to persist runner-loss requeue");
-                    continue;
+                match gitforge_db::queries::JobQueries::get(pool, *job_id).await {
+                    Ok(Some(job)) if job.status == "running" => {
+                        if let Err(error) =
+                            gitforge_db::queries::JobQueries::fail_lost(pool, *job_id).await
+                        {
+                            tracing::error!(%error, %job_id, "failed to fence runner-loss job");
+                            continue;
+                        }
+                        tracing::warn!(
+                            %job_id,
+                            %runner_id,
+                            "job was running on the lost runner; fenced as failed instead of requeued"
+                        );
+                        fenced = true;
+                    }
+                    Ok(_) => {
+                        if let Err(error) =
+                            gitforge_db::queries::JobQueries::requeue(pool, *job_id).await
+                        {
+                            tracing::error!(%error, %job_id, "failed to persist runner-loss requeue");
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, %job_id, "failed to read job for runner-loss handling");
+                        continue;
+                    }
                 }
             }
 
@@ -658,6 +697,15 @@ impl Scheduler {
             state.assigned_jobs.remove(job_id);
             state.job_leases.remove(job_id);
 
+            if fenced {
+                // A fenced execution is terminal: it must NOT re-enter the
+                // queue. Notify the CI engine after releasing the scheduler
+                // state lock so its in-memory mirror can fail the job and
+                // finalize the pipeline instead of remaining live forever.
+                fenced_jobs.push((*job_id, *pipeline_run_id));
+                continue;
+            }
+
             // Re-enqueue the job with the original pipeline run and repository
             // IDs. The queue entry must remain tied to the original checkout.
             state.queue.enqueue(crate::queue::QueuedJob::new(
@@ -671,6 +719,16 @@ impl Scheduler {
                 runner_id
             );
             requeued += 1;
+        }
+
+        drop(state);
+        for (job_id, pipeline_run_id) in fenced_jobs {
+            let _ = self.event_tx.send(SchedulerEvent::JobCompleted {
+                job_id,
+                pipeline_run_id,
+                runner_id,
+                success: false,
+            });
         }
 
         requeued
@@ -962,11 +1020,10 @@ impl Scheduler {
                 .await
                 .ok()
                 .flatten()
-                .map(|job| {
+                .is_some_and(|job| {
                     gitforge_db::models::JobStatus::from_str(&job.status)
                         .is_some_and(|status| status.is_terminal())
-                })
-                .unwrap_or(false);
+                });
         }
         false
     }
@@ -979,6 +1036,7 @@ impl Scheduler {
 
     /// Return durable and in-memory queue counters for operator telemetry.
     pub async fn queue_status(&self) -> anyhow::Result<QueueStatus> {
+        let now = chrono::Utc::now();
         let (in_memory_queued, assigned_jobs, online_runners) = {
             let state = self.state.read().await;
             (
@@ -987,7 +1045,10 @@ impl Scheduler {
                 state
                     .runners
                     .values()
-                    .filter(|runner| runner.status == "online")
+                    .filter(|runner| {
+                        runner.effective_status(now, RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS)
+                            == "online"
+                    })
                     .count(),
             )
         };
@@ -1108,10 +1169,87 @@ impl Scheduler {
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             if !accepted {
+                self.fence_dead_lease(job_id, runner_id).await;
                 anyhow::bail!("durable job lease is no longer active");
             }
         }
         Ok(())
+    }
+
+    /// A durable start/complete rejection means the assignment this scheduler
+    /// still mirrors is dead: the durable lease was superseded or lost while
+    /// the in-memory mirror kept the job assigned. Left alone, every
+    /// pending-jobs poll re-offers the job and every offer is rejected — a
+    /// hot loop observed live (2026-09-22) that wedged the pipeline run at
+    /// `running` forever. Fence the durable row and drop the in-memory
+    /// mirror so the job stops being offered; the fenced case emits
+    /// `JobCompleted` so the CI engine can finalize the pipeline.
+    ///
+    /// Ownership is checked before any durable write: a row running on a
+    /// different runner belongs to a live execution elsewhere and is only
+    /// forgotten here, never fenced.
+    async fn fence_dead_lease(&self, job_id: JobId, runner_id: RunnerId) {
+        let pipeline_run_id = {
+            let mut state = self.state.write().await;
+            let Some((mirror_runner, pipeline_run_id, repo_id)) =
+                state.assigned_jobs.remove(&job_id)
+            else {
+                // Another path already completed or cleaned the assignment.
+                return;
+            };
+            if mirror_runner != runner_id {
+                // The mirror was reassigned to another runner between the
+                // lease validation and this fence; their assignment stands.
+                state
+                    .assigned_jobs
+                    .insert(job_id, (mirror_runner, pipeline_run_id, repo_id));
+                return;
+            }
+            state.job_assignments.remove(&job_id);
+            state.job_leases.remove(&job_id);
+            pipeline_run_id
+        };
+        let Some(pool) = &self.db_pool else {
+            return;
+        };
+        match gitforge_db::queries::JobQueries::get(pool, job_id).await {
+            Ok(Some(job))
+                if job.status == "running" && job.runner_id.is_some_and(|r| r == runner_id) =>
+            {
+                if let Err(error) = gitforge_db::queries::JobQueries::fail_lost(pool, job_id).await
+                {
+                    tracing::error!(%error, %job_id, "failed to fence job whose durable lease died");
+                } else {
+                    tracing::warn!(
+                        %job_id,
+                        "durable lease was dead while the job stayed mirrored as assigned; fenced as failed"
+                    );
+                    let _ = self.event_tx.send(SchedulerEvent::JobCompleted {
+                        job_id,
+                        pipeline_run_id,
+                        runner_id,
+                        success: false,
+                    });
+                }
+            }
+            Ok(Some(job)) if job.runner_id.is_some_and(|r| r == runner_id) => {
+                // Never started durably: return it to the queue for a fresh
+                // assignment instead of leaving it assigned to a dead lease.
+                match gitforge_db::queries::JobQueries::requeue(pool, job_id).await {
+                    Ok(()) => tracing::warn!(
+                        %job_id,
+                        "durable assignment was dead before start; requeued"
+                    ),
+                    Err(error) => {
+                        tracing::error!(%error, %job_id, "failed to requeue job with dead durable lease")
+                    }
+                }
+            }
+            _ => {
+                // Terminal or owned by another runner: the durable state
+                // already decided; only the stale mirror needed dropping.
+            }
+        }
     }
 
     /// Complete a job only when the active runner lease is presented.
@@ -1151,6 +1289,10 @@ impl Scheduler {
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             if !accepted {
+                // The durable lease died mid-execution (superseded or
+                // recovered): fence the stale mirror instead of leaving the
+                // job assigned here forever.
+                self.fence_dead_lease(job_id, runner_id).await;
                 anyhow::bail!("durable job lease is no longer active");
             }
         }
@@ -1229,7 +1371,7 @@ impl Scheduler {
             if existing == &result_json {
                 return Ok(());
             }
-            anyhow::bail!("job {} already has a conflicting receipt", job_id);
+            anyhow::bail!("job {job_id} already has a conflicting receipt");
         }
         state.completed_receipts.insert(job_id, result_json);
         state.job_assignments.remove(&job_id);
@@ -1572,6 +1714,276 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_runner_loss_fences_running_job_instead_of_requeueing_it() {
+        // A job the lost runner had already STARTED must not re-enter the
+        // queue: its sandbox may still be executing, and a second execution
+        // would race it (duplicate containers, duelling log appends). It is
+        // fenced as failed instead — the same contract as the scheduler's
+        // restart recovery for running rows.
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "fence-owner".to_string(),
+            "fence-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            "fence-repo".to_string(),
+            user.id,
+            "/git/fence-repo".to_string(),
+        );
+        gitforge_db::queries::RepoQueries::create(&pool, &repo)
+            .await
+            .unwrap();
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: "fence-pipeline".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "fence-owner".to_string(),
+            "fence-commit".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+        let job = gitforge_db::models::Job::new(run.id, "fence-running".to_string());
+        let job_id = job.id;
+        gitforge_db::queries::JobQueries::create(&pool, &job)
+            .await
+            .unwrap();
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        let mut events = scheduler.subscribe();
+        let runner_id = RunnerId::new();
+        scheduler
+            .register_runner(make_runner(runner_id, "fence-runner", "online", 1))
+            .await;
+        scheduler.enqueue(job_id, run.id, repo.id).await;
+        scheduler.process_queue().await;
+        let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
+        scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .unwrap();
+        let running = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.status, "running");
+
+        // The runner goes stale while its job is running.
+        {
+            let mut state = scheduler.state.write().await;
+            state.runners.get_mut(&runner_id).unwrap().last_heartbeat =
+                Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        }
+        while events.try_recv().is_ok() {}
+        scheduler.process_queue().await;
+
+        // The running job is fenced failed, NOT re-enqueued.
+        let fenced = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fenced.status, "failed");
+        assert!(fenced.runner_id.is_none());
+        assert_eq!(scheduler.queue_len().await, 0);
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            SchedulerEvent::JobCompleted {
+                job_id: completed_job,
+                pipeline_run_id: completed_run,
+                runner_id: completed_runner,
+                success: false,
+            } if completed_job == job_id && completed_run == run.id && completed_runner == runner_id
+        ));
+
+        let state = scheduler.state.read().await;
+        assert_eq!(state.runners[&runner_id].status, "offline");
+    }
+
+    /// Seed a user/repo/pipeline/run plus a pending job row and return the
+    /// ids the assignment tests need. Each test uses its own in-memory
+    /// database, so fixed names never collide.
+    async fn seed_dead_lease_fixture(pool: &gitforge_db::Pool) -> (RepoId, PipelineRunId, JobId) {
+        let user = gitforge_db::models::User::new(
+            "dead-lease-owner".to_string(),
+            "dead-lease@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(pool, &user)
+            .await
+            .unwrap();
+        let repo_id = RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "dead-lease-repo".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: "/tmp/dead-lease-repo".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        gitforge_db::queries::PipelineQueries::create(
+            pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: "dead-lease-pipeline".to_string(),
+                trigger_type: "manual".to_string(),
+                config: serde_json::json!({}),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline_id,
+            repo_id,
+            "dead-lease-trigger".to_string(),
+            "dead-lease-commit".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(pool, &run)
+            .await
+            .unwrap();
+        let job = gitforge_db::models::Job::new(run.id, "dead-lease-job".to_string());
+        let job_id = job.id;
+        gitforge_db::queries::JobQueries::create(pool, &job)
+            .await
+            .unwrap();
+        (repo_id, run.id, job_id)
+    }
+
+    #[tokio::test]
+    async fn test_dead_durable_lease_fences_instead_of_looping() {
+        // Live-observed wedge (2026-09-22): the durable row decided while
+        // the in-memory mirror kept the assignment, so every pending-jobs
+        // poll re-offered the job and every start was rejected — forever,
+        // wedging the pipeline run at running. A rejected start must fence
+        // the stale mirror instead of leaving the loop in place.
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (repo_id, run_id, job_id) = seed_dead_lease_fixture(&pool).await;
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        let mut events = scheduler.subscribe();
+        let runner_id = RunnerId::new();
+        scheduler
+            .register_runner(make_runner(runner_id, "dead-lease-runner", "online", 1))
+            .await;
+        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.process_queue().await;
+        let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
+        scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        // The durable lease moves on (recovery supersedes it) while the
+        // mirror keeps offering the stale token: the divergence that loops.
+        {
+            let mut state = scheduler.state.write().await;
+            state
+                .job_leases
+                .insert(job_id, "superseded-lease".to_string());
+        }
+        let error = scheduler
+            .start_job(job_id, runner_id, "superseded-lease")
+            .await
+            .expect_err("a superseded durable lease must reject the start");
+        assert!(error
+            .to_string()
+            .contains("durable job lease is no longer active"));
+
+        // The running row is fenced failed, the assignment mirror is gone,
+        // and the engine learns the outcome so the pipeline can finalize.
+        let fenced = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fenced.status, "failed");
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            SchedulerEvent::JobCompleted {
+                job_id: completed,
+                pipeline_run_id: completed_run,
+                runner_id: completed_runner,
+                success: false,
+            } if completed == job_id && completed_run == run_id && completed_runner == runner_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_dead_durable_lease_drops_mirror_for_requeued_row() {
+        // When recovery requeued the row outright, the stale mirror must
+        // still be dropped so the runner stops being offered a start that
+        // can never be accepted — but the queued row itself is left for a
+        // fresh assignment, and no completion is invented for it.
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (repo_id, run_id, job_id) = seed_dead_lease_fixture(&pool).await;
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        let mut events = scheduler.subscribe();
+        let runner_id = RunnerId::new();
+        scheduler
+            .register_runner(make_runner(runner_id, "dead-lease-runner", "online", 1))
+            .await;
+        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.process_queue().await;
+        let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
+        scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        gitforge_db::queries::JobQueries::requeue(&pool, job_id)
+            .await
+            .unwrap();
+        let error = scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .expect_err("a requeued row must reject the stale start");
+        assert!(error
+            .to_string()
+            .contains("durable job lease is no longer active"));
+
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        let row = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "queued");
+        assert!(
+            events.try_recv().is_err(),
+            "a requeued row is not terminal; no completion may be invented"
+        );
+    }
+
+    #[tokio::test]
     async fn test_runner_without_heartbeat_is_offlined_from_registration_time() {
         let scheduler = Scheduler::new();
         let runner_id = RunnerId::new();
@@ -1698,7 +2110,7 @@ mod tests {
             repo_id: RepoId::new(),
             priority: Priority::Normal,
         };
-        assert!(format!("{:?}", cmd).contains("Enqueue"));
+        assert!(format!("{cmd:?}").contains("Enqueue"));
     }
 
     #[test]
@@ -1706,7 +2118,7 @@ mod tests {
         let evt = SchedulerEvent::NoRunnerAvailable {
             job_id: JobId::new(),
         };
-        assert!(format!("{:?}", evt).contains("NoRunnerAvailable"));
+        assert!(format!("{evt:?}").contains("NoRunnerAvailable"));
     }
 
     #[test]
@@ -1748,6 +2160,28 @@ mod tests {
         let online = state.list_online_runners();
         assert_eq!(online.len(), 1);
         assert_eq!(online[0].name, "runner1");
+    }
+
+    /// Placement eligibility derives from heartbeat liveness: a runner still
+    /// marked online whose heartbeat crossed the shared threshold is not
+    /// offered new work, even before the next recovery tick flips it.
+    #[test]
+    fn test_scheduler_state_excludes_stale_heartbeat_from_placement() {
+        let mut state = SchedulerState::new();
+
+        let mut fresh = make_runner(RunnerId::new(), "fresh", "online", 2);
+        fresh.last_heartbeat = Some(chrono::Utc::now());
+        state.add_runner(fresh);
+
+        let mut stale = make_runner(RunnerId::new(), "stale", "online", 2);
+        stale.last_heartbeat = Some(
+            chrono::Utc::now() - chrono::Duration::seconds(RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS + 1),
+        );
+        state.add_runner(stale);
+
+        let online = state.list_online_runners();
+        assert_eq!(online.len(), 1);
+        assert_eq!(online[0].name, "fresh");
     }
 
     #[test]

@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!("server task panicked: {}", e);
             }
         }
-        _ = shutdown_future => {
+        () = shutdown_future => {
             tracing::info!("shutdown signal received, stopping server...");
         }
     }
@@ -315,7 +315,7 @@ mod tests {
             port: 42780,
             database_url: "sqlite::memory:".to_string(),
         };
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
         assert!(debug_str.contains("jwt_secret"));
         assert!(debug_str.contains("42780"));
     }

@@ -34,6 +34,24 @@ fn sandbox_acquire_timeout() -> Duration {
     )
 }
 
+/// Sandbox memory ceiling in megabytes. Debug codegen and linking of
+/// test binaries that statically link native crypto (aws-lc-sys via
+/// jsonwebtoken 11, libgit2) transiently pins the full 4GiB default and
+/// gets SIGKILLed by the cgroup, so operators on CI-capable hosts can
+/// raise the ceiling per deployment.
+fn sandbox_limits() -> SandboxLimits {
+    const DEFAULT_MB: u64 = 4096;
+    let memory_mb = std::env::var("GITFORGE_SANDBOX_MEMORY_MB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|mb| *mb >= 128)
+        .unwrap_or(DEFAULT_MB);
+    SandboxLimits {
+        memory_mb,
+        ..SandboxLimits::default()
+    }
+}
+
 /// A pool of pre-warmed container instances
 pub struct ContainerPool {
     pools: Arc<RwLock<HashMap<String, Vec<SandboxInstance>>>>, // image -> instances
@@ -57,11 +75,7 @@ impl ContainerPool {
 
         while instances.len() < count {
             let id = JobId::new();
-            match self
-                .sandbox
-                .create(id, image, SandboxLimits::default())
-                .await
-            {
+            match self.sandbox.create(id, image, sandbox_limits()).await {
                 Ok(instance) => {
                     tracing::info!("pre-warmed container for image {}", image);
                     instances.push(instance);
@@ -85,7 +99,7 @@ impl ContainerPool {
         if workspace_path.is_some() {
             return self
                 .sandbox
-                .create_with_workspace(*job_id, image, SandboxLimits::default(), workspace_path)
+                .create_with_workspace(*job_id, image, sandbox_limits(), workspace_path)
                 .await;
         }
         let mut pools = self.pools.write().await;
@@ -100,9 +114,7 @@ impl ContainerPool {
 
         // Pool empty or no pool for this image, create new
         tracing::debug!("creating new container for job {} (pool empty)", job_id);
-        self.sandbox
-            .create(*job_id, image, SandboxLimits::default())
-            .await
+        self.sandbox.create(*job_id, image, sandbox_limits()).await
     }
 
     /// Return a container to the pool
@@ -128,11 +140,7 @@ impl ContainerPool {
             }
             // Create fresh instance for the pool
             let id = JobId::new();
-            match self
-                .sandbox
-                .create(id, image, SandboxLimits::default())
-                .await
-            {
+            match self.sandbox.create(id, image, sandbox_limits()).await {
                 Ok(new_instance) => {
                     instances.push(new_instance);
                     tracing::debug!("returned container to pool");
@@ -337,7 +345,7 @@ impl JobExecutor {
                     logs: None,
                     started_at,
                     completed_at,
-                    error: Some(format!("failed to create sandbox: {}", e)),
+                    error: Some(format!("failed to create sandbox: {e}")),
                     workspace_path: job.working_dir.clone(),
                 };
             }
@@ -405,7 +413,7 @@ impl JobExecutor {
                     success = false;
                     final_exit_code = -1;
                     timed_out = deadline <= Instant::now();
-                    failure_error = Some(format!("execution error: {}", e));
+                    failure_error = Some(format!("execution error: {e}"));
                     step_results.push(StepResult {
                         exit_code: -1,
                         stdout: String::new(),
@@ -621,12 +629,7 @@ impl JobResult {
     fn status(&self) -> ReceiptStatus {
         if self.success {
             ReceiptStatus::Succeeded
-        } else if self
-            .error
-            .as_ref()
-            .map(|e| e.contains("timeout"))
-            .unwrap_or(false)
-        {
+        } else if self.error.as_ref().is_some_and(|e| e.contains("timeout")) {
             ReceiptStatus::TimedOut
         } else {
             ReceiptStatus::Failed
@@ -721,6 +724,24 @@ mod tests {
         std::env::set_var("GITFORGE_SANDBOX_ACQUIRE_SECS", "0");
         assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(60));
         std::env::remove_var("GITFORGE_SANDBOX_ACQUIRE_SECS");
+    }
+
+    #[test]
+    fn test_sandbox_limits_default_and_env_override() {
+        // Default: the historical 4GiB ceiling.
+        std::env::remove_var("GITFORGE_SANDBOX_MEMORY_MB");
+        assert_eq!(sandbox_limits().memory_mb, 4096);
+
+        // CI-capable hosts can raise it for the native-crypto link step.
+        std::env::set_var("GITFORGE_SANDBOX_MEMORY_MB", "6144");
+        assert_eq!(sandbox_limits().memory_mb, 6144);
+
+        // Garbage and sub-floor values fall back to the default.
+        std::env::set_var("GITFORGE_SANDBOX_MEMORY_MB", "not-a-number");
+        assert_eq!(sandbox_limits().memory_mb, 4096);
+        std::env::set_var("GITFORGE_SANDBOX_MEMORY_MB", "64");
+        assert_eq!(sandbox_limits().memory_mb, 4096);
+        std::env::remove_var("GITFORGE_SANDBOX_MEMORY_MB");
     }
 
     #[test]

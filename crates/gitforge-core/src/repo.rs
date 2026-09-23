@@ -54,7 +54,7 @@ impl From<RepoError> for gitforge_common::Error {
                 gitforge_common::Error::already_exists("repository", name)
             }
             RepoError::InvalidName(name) => {
-                gitforge_common::Error::invalid_input(format!("invalid repo name: {}", name))
+                gitforge_common::Error::invalid_input(format!("invalid repo name: {name}"))
             }
             RepoError::Storage(msg) => gitforge_common::Error::storage(msg),
         }
@@ -168,9 +168,9 @@ impl<S: StorageBackend> RepoService<S> {
         // Iterate over all references
         for name in repo
             .references()
-            .map_err(|e| Error::git(format!("failed to list refs: {}", e)))?
+            .map_err(|e| Error::git(format!("failed to list refs: {e}")))?
         {
-            let name = name.map_err(|e| Error::git(format!("failed to read ref: {}", e)))?;
+            let name = name.map_err(|e| Error::git(format!("failed to read ref: {e}")))?;
             let ref_name = name.name().unwrap_or("").to_string();
             let is_branch = ref_name.starts_with("refs/heads/");
             let is_tag = ref_name.starts_with("refs/tags/");
@@ -336,16 +336,16 @@ mod tests {
     fn test_repo_error_display() {
         let repo_id = RepoId::new();
         let err = RepoError::NotFound(repo_id);
-        assert!(format!("{}", err).contains("not found"));
+        assert!(format!("{err}").contains("not found"));
 
         let err = RepoError::AlreadyExists("test".to_string());
-        assert!(format!("{}", err).contains("already exists"));
+        assert!(format!("{err}").contains("already exists"));
 
         let err = RepoError::InvalidName("bad".to_string());
-        assert!(format!("{}", err).contains("Invalid repository name"));
+        assert!(format!("{err}").contains("Invalid repository name"));
 
         let err = RepoError::Storage("disk error".to_string());
-        assert!(format!("{}", err).contains("Storage error"));
+        assert!(format!("{err}").contains("Storage error"));
     }
 
     #[tokio::test]
@@ -408,7 +408,7 @@ mod tests {
             "has%percent",
         ] {
             let result = service.create(name.to_string(), owner_id).await;
-            assert!(result.is_err(), "Expected '{}' to be invalid", name);
+            assert!(result.is_err(), "Expected '{name}' to be invalid");
         }
     }
 
@@ -423,7 +423,7 @@ mod tests {
         // Valid names with dashes, underscores, dots
         for name in ["my-repo", "my_repo", "my.repo", "repo.1", "repo-2_name"] {
             let result = service.create(name.to_string(), owner_id).await;
-            assert!(result.is_ok(), "Expected '{}' to be valid", name);
+            assert!(result.is_ok(), "Expected '{name}' to be valid");
         }
     }
 
@@ -456,7 +456,7 @@ mod tests {
             is_branch: true,
             is_tag: false,
         };
-        let debug_str = format!("{:?}", git_ref);
+        let debug_str = format!("{git_ref:?}");
         assert!(debug_str.contains("main"));
         assert!(debug_str.contains("abc123"));
     }
@@ -469,7 +469,7 @@ mod tests {
             owner_id: UserId::new(),
             git_path: "/tmp/git".to_string(),
         };
-        let debug_str = format!("{:?}", meta);
+        let debug_str = format!("{meta:?}");
         assert!(debug_str.contains("debug-test"));
     }
 
@@ -477,28 +477,28 @@ mod tests {
     fn test_repo_error_not_found_display() {
         let repo_id = RepoId::new();
         let err = RepoError::NotFound(repo_id);
-        let display = format!("{}", err);
+        let display = format!("{err}");
         assert!(display.contains("Repository not found"));
     }
 
     #[test]
     fn test_repo_error_already_exists_display() {
         let err = RepoError::AlreadyExists("my-repo".to_string());
-        let display = format!("{}", err);
+        let display = format!("{err}");
         assert!(display.contains("already exists"));
     }
 
     #[test]
     fn test_repo_error_invalid_name_display() {
         let err = RepoError::InvalidName("bad!name".to_string());
-        let display = format!("{}", err);
+        let display = format!("{err}");
         assert!(display.contains("Invalid repository name"));
     }
 
     #[test]
     fn test_repo_error_storage_display() {
         let err = RepoError::Storage("disk full".to_string());
-        let display = format!("{}", err);
+        let display = format!("{err}");
         assert!(display.contains("Storage error"));
     }
 }

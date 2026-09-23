@@ -77,14 +77,14 @@ impl Error {
 
     /// Create a not found error
     pub fn not_found(entity: &str, id: impl std::fmt::Display) -> Self {
-        Self::new(ErrorKind::NotFound, format!("{} not found: {}", entity, id))
+        Self::new(ErrorKind::NotFound, format!("{entity} not found: {id}"))
     }
 
     /// Create an already exists error
     pub fn already_exists(entity: &str, name: impl std::fmt::Display) -> Self {
         Self::new(
             ErrorKind::AlreadyExists,
-            format!("{} already exists: {}", entity, name),
+            format!("{entity} already exists: {name}"),
         )
     }
 
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn test_error_display() {
         let err = Error::invalid_input("name cannot be empty");
-        let display = format!("{}", err);
+        let display = format!("{err}");
         assert!(display.contains("invalid_input"));
         assert!(display.contains("name cannot be empty"));
     }

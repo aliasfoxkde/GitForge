@@ -25,3 +25,6 @@ anyhow = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+
+[lints]
+workspace = true

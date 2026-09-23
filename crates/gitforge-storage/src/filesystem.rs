@@ -26,11 +26,11 @@ impl FileStorage {
         // Create directories
         fs::create_dir_all(&artifacts_dir)
             .await
-            .map_err(|e| Error::storage(format!("failed to create artifacts directory: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create artifacts directory: {e}")))?;
 
         fs::create_dir_all(&cache_dir)
             .await
-            .map_err(|e| Error::storage(format!("failed to create cache directory: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create cache directory: {e}")))?;
 
         Ok(Self {
             root,
@@ -41,12 +41,12 @@ impl FileStorage {
 
     /// Get artifact path
     fn artifact_path(&self, id: ArtifactId) -> PathBuf {
-        self.artifacts_dir.join(format!("{}.data", id))
+        self.artifacts_dir.join(format!("{id}.data"))
     }
 
     /// Get artifact metadata path
     fn artifact_meta_path(&self, id: ArtifactId) -> PathBuf {
-        self.artifacts_dir.join(format!("{}.meta.json", id))
+        self.artifacts_dir.join(format!("{id}.meta.json"))
     }
 
     /// Get cache path
@@ -69,35 +69,35 @@ impl ArtifactStore for FileStorage {
         // Write data
         let mut file = fs::File::create(&artifact_path)
             .await
-            .map_err(|e| Error::storage(format!("failed to create artifact file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create artifact file: {e}")))?;
 
         file.write_all(data)
             .await
-            .map_err(|e| Error::storage(format!("failed to write artifact data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to write artifact data: {e}")))?;
 
         // Ensure data is flushed to disk before returning
         file.sync_all()
             .await
-            .map_err(|e| Error::storage(format!("failed to sync artifact data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to sync artifact data: {e}")))?;
 
         // Write metadata
         let meta_json = serde_json::to_string_pretty(artifact)
-            .map_err(|e| Error::storage(format!("failed to serialize artifact metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to serialize artifact metadata: {e}")))?;
 
-        let mut meta_file = fs::File::create(&meta_path).await.map_err(|e| {
-            Error::storage(format!("failed to create artifact metadata file: {}", e))
-        })?;
+        let mut meta_file = fs::File::create(&meta_path)
+            .await
+            .map_err(|e| Error::storage(format!("failed to create artifact metadata file: {e}")))?;
 
         meta_file
             .write_all(meta_json.as_bytes())
             .await
-            .map_err(|e| Error::storage(format!("failed to write artifact metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to write artifact metadata: {e}")))?;
 
         // Ensure metadata is flushed to disk before returning
         meta_file
             .sync_all()
             .await
-            .map_err(|e| Error::storage(format!("failed to sync artifact metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to sync artifact metadata: {e}")))?;
 
         tracing::info!(
             "stored artifact {} ({} bytes)",
@@ -112,12 +112,12 @@ impl ArtifactStore for FileStorage {
 
         let mut file = fs::File::open(&path)
             .await
-            .map_err(|e| Error::storage(format!("failed to open artifact file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to open artifact file: {e}")))?;
 
         let mut data = Vec::new();
         file.read_to_end(&mut data)
             .await
-            .map_err(|e| Error::storage(format!("failed to read artifact data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read artifact data: {e}")))?;
 
         Ok(data)
     }
@@ -129,12 +129,12 @@ impl ArtifactStore for FileStorage {
         if artifact_path.exists() {
             fs::remove_file(&artifact_path)
                 .await
-                .map_err(|e| Error::storage(format!("failed to delete artifact file: {}", e)))?;
+                .map_err(|e| Error::storage(format!("failed to delete artifact file: {e}")))?;
         }
 
         if meta_path.exists() {
             fs::remove_file(&meta_path).await.map_err(|e| {
-                Error::storage(format!("failed to delete artifact metadata file: {}", e))
+                Error::storage(format!("failed to delete artifact metadata file: {e}"))
             })?;
         }
 
@@ -147,15 +147,15 @@ impl ArtifactStore for FileStorage {
 
         let mut file = fs::File::open(&meta_path)
             .await
-            .map_err(|e| Error::storage(format!("failed to open artifact metadata file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to open artifact metadata file: {e}")))?;
 
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)
             .await
-            .map_err(|e| Error::storage(format!("failed to read artifact metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read artifact metadata: {e}")))?;
 
         let artifact: Artifact = serde_json::from_slice(&contents)
-            .map_err(|e| Error::storage(format!("failed to parse artifact metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to parse artifact metadata: {e}")))?;
 
         Ok(artifact)
     }
@@ -165,12 +165,12 @@ impl ArtifactStore for FileStorage {
 
         let mut entries = fs::read_dir(&self.artifacts_dir)
             .await
-            .map_err(|e| Error::storage(format!("failed to read artifacts directory: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read artifacts directory: {e}")))?;
 
         while let Some(entry) = entries
             .next_entry()
             .await
-            .map_err(|e| Error::storage(format!("failed to read artifact entry: {}", e)))?
+            .map_err(|e| Error::storage(format!("failed to read artifact entry: {e}")))?
         {
             let path = entry.path();
             // Check if filename ends with .meta.json
@@ -208,16 +208,16 @@ impl CacheStore for FileStorage {
 
         let mut file = fs::File::create(&path)
             .await
-            .map_err(|e| Error::storage(format!("failed to create cache file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create cache file: {e}")))?;
 
         file.write_all(&data)
             .await
-            .map_err(|e| Error::storage(format!("failed to write cache data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to write cache data: {e}")))?;
 
         // Ensure data is flushed to disk before returning
         file.sync_all()
             .await
-            .map_err(|e| Error::storage(format!("failed to sync cache data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to sync cache data: {e}")))?;
 
         // Write metadata
         let now = chrono::Utc::now();
@@ -229,22 +229,22 @@ impl CacheStore for FileStorage {
         };
 
         let meta_json = serde_json::to_string(&entry)
-            .map_err(|e| Error::storage(format!("failed to serialize cache metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to serialize cache metadata: {e}")))?;
 
         let mut meta_file = fs::File::create(&meta_path)
             .await
-            .map_err(|e| Error::storage(format!("failed to create cache metadata file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to create cache metadata file: {e}")))?;
 
         meta_file
             .write_all(meta_json.as_bytes())
             .await
-            .map_err(|e| Error::storage(format!("failed to write cache metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to write cache metadata: {e}")))?;
 
         // Ensure metadata is flushed to disk before returning
         meta_file
             .sync_all()
             .await
-            .map_err(|e| Error::storage(format!("failed to sync cache metadata: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to sync cache metadata: {e}")))?;
 
         tracing::debug!("cached {} bytes at {:?}", data.len(), path);
         Ok(())
@@ -259,12 +259,12 @@ impl CacheStore for FileStorage {
 
         let mut file = fs::File::open(&path)
             .await
-            .map_err(|e| Error::storage(format!("failed to open cache file: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to open cache file: {e}")))?;
 
         let mut data = Vec::new();
         file.read_to_end(&mut data)
             .await
-            .map_err(|e| Error::storage(format!("failed to read cache data: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read cache data: {e}")))?;
 
         Ok(Some(data))
     }
@@ -276,12 +276,12 @@ impl CacheStore for FileStorage {
         if path.exists() {
             fs::remove_file(&path)
                 .await
-                .map_err(|e| Error::storage(format!("failed to delete cache file: {}", e)))?;
+                .map_err(|e| Error::storage(format!("failed to delete cache file: {e}")))?;
         }
 
         if meta_path.exists() {
             fs::remove_file(&meta_path).await.map_err(|e| {
-                Error::storage(format!("failed to delete cache metadata file: {}", e))
+                Error::storage(format!("failed to delete cache metadata file: {e}"))
             })?;
         }
 
@@ -293,12 +293,12 @@ impl CacheStore for FileStorage {
 
         let mut dir_entries = fs::read_dir(&self.cache_dir)
             .await
-            .map_err(|e| Error::storage(format!("failed to read cache directory: {}", e)))?;
+            .map_err(|e| Error::storage(format!("failed to read cache directory: {e}")))?;
 
         while let Some(entry) = dir_entries
             .next_entry()
             .await
-            .map_err(|e| Error::storage(format!("failed to read cache entry: {}", e)))?
+            .map_err(|e| Error::storage(format!("failed to read cache entry: {e}")))?
         {
             let path = entry.path();
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
@@ -473,15 +473,15 @@ mod tests {
             let artifact = Artifact {
                 id: ArtifactId::new(),
                 job_id: gitforge_common::JobId::new(),
-                name: format!("artifact-{}", i),
+                name: format!("artifact-{i}"),
                 path: "/fake/path".to_string(),
-                checksum: format!("checksum{}", i),
+                checksum: format!("checksum{i}"),
                 size_bytes: 1024 + i as u64,
                 content_type: None,
                 created_at: chrono::Utc::now(),
             };
 
-            let data = format!("content{}", i);
+            let data = format!("content{i}");
             ArtifactStore::put(&storage, &artifact, data.as_bytes())
                 .await
                 .unwrap();
@@ -533,8 +533,8 @@ mod tests {
 
         // Put multiple cache entries
         for i in 0..3 {
-            let key = CacheKey::new(repo_id, &format!("key-{}", i), "main");
-            let data = format!("value{}", i);
+            let key = CacheKey::new(repo_id, &format!("key-{i}"), "main");
+            let data = format!("value{i}");
             CacheStore::put(&storage, key.clone(), data.into_bytes())
                 .await
                 .unwrap();
@@ -542,10 +542,10 @@ mod tests {
 
         // Get them back
         for i in 0..3 {
-            let key = CacheKey::new(repo_id, &format!("key-{}", i), "main");
+            let key = CacheKey::new(repo_id, &format!("key-{i}"), "main");
             let retrieved = CacheStore::get(&storage, &key).await.unwrap();
             assert!(retrieved.is_some());
-            assert_eq!(retrieved.unwrap(), format!("value{}", i).into_bytes());
+            assert_eq!(retrieved.unwrap(), format!("value{i}").into_bytes());
         }
     }
 
@@ -722,14 +722,14 @@ mod tests {
             let artifact = Artifact {
                 id: ArtifactId::new(),
                 job_id,
-                name: format!("artifact-{}", i),
-                path: format!("/fake/path{}", i),
-                checksum: format!("checksum{}", i),
+                name: format!("artifact-{i}"),
+                path: format!("/fake/path{i}"),
+                checksum: format!("checksum{i}"),
                 size_bytes: 100 + i as u64,
                 content_type: None,
                 created_at: chrono::Utc::now(),
             };
-            ArtifactStore::put(&storage, &artifact, format!("data{}", i).as_bytes())
+            ArtifactStore::put(&storage, &artifact, format!("data{i}").as_bytes())
                 .await
                 .unwrap();
         }
@@ -751,14 +751,14 @@ mod tests {
             let artifact = Artifact {
                 id: ArtifactId::new(),
                 job_id: *job_id,
-                name: format!("artifact-{}", i),
-                path: format!("/fake/path{}", i),
-                checksum: format!("checksum{}", i),
+                name: format!("artifact-{i}"),
+                path: format!("/fake/path{i}"),
+                checksum: format!("checksum{i}"),
                 size_bytes: 100,
                 content_type: None,
                 created_at: chrono::Utc::now(),
             };
-            ArtifactStore::put(&storage, &artifact, format!("data{}", i).as_bytes())
+            ArtifactStore::put(&storage, &artifact, format!("data{i}").as_bytes())
                 .await
                 .unwrap();
         }

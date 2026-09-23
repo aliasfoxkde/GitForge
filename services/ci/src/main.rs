@@ -121,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(Extension(trigger_state))
         .layer(TraceLayer::new_for_http());
 
-    let scheduler_addr = format!("0.0.0.0:{}", scheduler_port);
+    let scheduler_addr = format!("0.0.0.0:{scheduler_port}");
     tracing::info!("starting Scheduler HTTP API on {}", scheduler_addr);
 
     let scheduler_listener = tokio::net::TcpListener::bind(&scheduler_addr).await?;
@@ -270,7 +270,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
                     if runner_loss_shutdown.load(Ordering::SeqCst) {
                         break;
                     }
@@ -310,7 +310,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
                     if timeout_shutdown.load(Ordering::SeqCst) {
                         break;
                     }
@@ -487,7 +487,7 @@ async fn trigger_pipeline(
             let pipeline_run_id = tokio::time::timeout(Duration::from_secs(15), run_rx)
                 .await
                 .ok()
-                .and_then(|result| result.ok());
+                .and_then(std::result::Result::ok);
             if pipeline_run_id.is_none() {
                 trigger_state
                     .run_waiters
@@ -518,7 +518,7 @@ async fn trigger_pipeline(
 
 fn validate_workspace_path(path: &str) -> Result<String, String> {
     let workspace = std::fs::canonicalize(path)
-        .map_err(|error| format!("workspace is not accessible: {}", error))?;
+        .map_err(|error| format!("workspace is not accessible: {error}"))?;
     if !workspace.is_dir() {
         return Err("workspace must be a directory".to_string());
     }
@@ -526,7 +526,7 @@ fn validate_workspace_path(path: &str) -> Result<String, String> {
         .into_iter()
         .map(|root_path| {
             std::fs::canonicalize(&root_path)
-                .map_err(|error| format!("workspace root is not accessible: {}", error))
+                .map_err(|error| format!("workspace root is not accessible: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
     if !roots.iter().any(|root| workspace.starts_with(root)) {
@@ -557,7 +557,7 @@ async fn load_pipeline_from_commit(
 ) -> anyhow::Result<Option<PipelineDefinition>> {
     let repository = gitforge_db::queries::RepoQueries::get(pool, repo_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("repository {} is not registered", repo_id))?;
+        .ok_or_else(|| anyhow::anyhow!("repository {repo_id} is not registered"))?;
 
     let committed = tokio::process::Command::new("git")
         .arg("--git-dir")
@@ -565,7 +565,7 @@ async fn load_pipeline_from_commit(
         .args([
             "cat-file",
             "-e",
-            &format!("{}:{}", commit_hash, PIPELINE_CONFIG_PATH),
+            &format!("{commit_hash}:{PIPELINE_CONFIG_PATH}"),
         ])
         .output()
         .await?;
@@ -576,7 +576,7 @@ async fn load_pipeline_from_commit(
     let show = tokio::process::Command::new("git")
         .arg("--git-dir")
         .arg(&repository.git_path)
-        .args(["show", &format!("{}:{}", commit_hash, PIPELINE_CONFIG_PATH)])
+        .args(["show", &format!("{commit_hash}:{PIPELINE_CONFIG_PATH}")])
         .output()
         .await?;
     if !show.status.success() {
@@ -590,20 +590,10 @@ async fn load_pipeline_from_commit(
     }
 
     let yaml = String::from_utf8(show.stdout).map_err(|error| {
-        anyhow::anyhow!(
-            "{} at {} is not valid UTF-8: {}",
-            PIPELINE_CONFIG_PATH,
-            commit_hash,
-            error
-        )
+        anyhow::anyhow!("{PIPELINE_CONFIG_PATH} at {commit_hash} is not valid UTF-8: {error}")
     })?;
     PipelineDefinition::parse(&yaml).map(Some).map_err(|error| {
-        anyhow::anyhow!(
-            "invalid {} at {}: {}",
-            PIPELINE_CONFIG_PATH,
-            commit_hash,
-            error
-        )
+        anyhow::anyhow!("invalid {PIPELINE_CONFIG_PATH} at {commit_hash}: {error}")
     })
 }
 
@@ -1141,7 +1131,7 @@ async fn prepare_run_workspace(
 ) -> anyhow::Result<String> {
     let repository = gitforge_db::queries::RepoQueries::get(pool, repo_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("repository {} is not registered", repo_id))?;
+        .ok_or_else(|| anyhow::anyhow!("repository {repo_id} is not registered"))?;
     let source = std::fs::canonicalize(&repository.git_path).map_err(|error| {
         anyhow::anyhow!(
             "repository {} git path is unavailable ({}): {}",
@@ -1162,10 +1152,7 @@ async fn prepare_run_workspace(
     tokio::fs::create_dir_all(&root).await?;
     let workspace = root.join(run_id.to_string());
     if tokio::fs::try_exists(&workspace).await? {
-        return Err(anyhow::anyhow!(
-            "workspace already exists for run {}",
-            run_id
-        ));
+        return Err(anyhow::anyhow!("workspace already exists for run {run_id}"));
     }
 
     // Do not request Git's hard-link-based local clone optimization here.
@@ -1251,7 +1238,7 @@ async fn run_event_consumer(
         }
 
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+            () = tokio::time::sleep(Duration::from_millis(100)) => {
                 if shutdown.load(Ordering::SeqCst) {
                     break;
                 }
@@ -1444,7 +1431,7 @@ async fn handle_push_event(
         if let Some(_job_state) = state.jobs.get(&job_id) {
             let definition = engine
                 .job_definition(job_id)
-                .ok_or_else(|| anyhow::anyhow!("missing definition for job {}", job_id))?;
+                .ok_or_else(|| anyhow::anyhow!("missing definition for job {job_id}"))?;
             let commands = definition
                 .steps
                 .iter()
@@ -1637,7 +1624,7 @@ pub fn create_trigger_event(
 /// Create a default pipeline definition
 fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
     PipelineDefinition {
-        name: format!("{}-pipeline", repo_id),
+        name: format!("{repo_id}-pipeline"),
         version: "1.0".to_string(),
         trigger_on: vec![TriggerType::Push],
         environment: HashMap::new(),
@@ -2742,7 +2729,7 @@ mod tests {
         let repos: Vec<_> = (0..5).map(|_| gitforge_common::RepoId::new()).collect();
 
         for (i, repo_id) in repos.iter().enumerate() {
-            let pipeline = create_default_pipeline(&format!("repo{}", i));
+            let pipeline = create_default_pipeline(&format!("repo{i}"));
             cache.insert(*repo_id, pipeline);
         }
 

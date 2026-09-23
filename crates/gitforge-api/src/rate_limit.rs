@@ -234,8 +234,10 @@ fn extract_client_id<B>(request: &Request<B>) -> String {
                 .get("cf-connecting-ip")
                 .and_then(|v| v.to_str().ok())
         })
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(
+            || "unknown".to_string(),
+            |s| s.split(',').next().unwrap_or(s).trim().to_string(),
+        );
 
     // If authenticated, could use user ID instead
     // For now, use IP
@@ -361,7 +363,7 @@ mod tests {
     #[test]
     fn test_rate_limit_config_debug() {
         let config = RateLimitConfig::default();
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
         assert!(debug_str.contains("requests_per_minute"));
     }
 
@@ -372,7 +374,7 @@ mod tests {
             message: "Too many requests".to_string(),
             retry_after_secs: 60,
         };
-        let debug_str = format!("{:?}", error);
+        let debug_str = format!("{error:?}");
         assert!(debug_str.contains("rate_limit_exceeded"));
     }
 

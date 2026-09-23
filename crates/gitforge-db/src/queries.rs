@@ -14,18 +14,18 @@ use uuid::Uuid;
 fn parse_uuid_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<Uuid> {
     let value: String = row
         .try_get(column)
-        .map_err(|error| Error::database(format!("missing {} column: {}", column, error)))?;
+        .map_err(|error| Error::database(format!("missing {column} column: {error}")))?;
     Uuid::parse_str(&value)
-        .map_err(|error| Error::database(format!("invalid UUID in {}: {}", column, error)))
+        .map_err(|error| Error::database(format!("invalid UUID in {column}: {error}")))
 }
 
 fn parse_timestamp_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<DateTime<Utc>> {
     let value: String = row
         .try_get(column)
-        .map_err(|error| Error::database(format!("missing {} column: {}", column, error)))?;
+        .map_err(|error| Error::database(format!("missing {column} column: {error}")))?;
     DateTime::parse_from_rfc3339(&value)
         .map(|date| date.with_timezone(&Utc))
-        .map_err(|error| Error::database(format!("invalid timestamp in {}: {}", column, error)))
+        .map_err(|error| Error::database(format!("invalid timestamp in {column}: {error}")))
 }
 
 fn parse_optional_timestamp_column(
@@ -34,14 +34,12 @@ fn parse_optional_timestamp_column(
 ) -> Result<Option<DateTime<Utc>>> {
     let value: Option<String> = row
         .try_get(column)
-        .map_err(|error| Error::database(format!("invalid {} column: {}", column, error)))?;
+        .map_err(|error| Error::database(format!("invalid {column} column: {error}")))?;
     value
         .map(|value| {
             DateTime::parse_from_rfc3339(&value)
                 .map(|date| date.with_timezone(&Utc))
-                .map_err(|error| {
-                    Error::database(format!("invalid timestamp in {}: {}", column, error))
-                })
+                .map_err(|error| Error::database(format!("invalid timestamp in {column}: {error}")))
         })
         .transpose()
 }
@@ -52,15 +50,15 @@ fn hydrate_pipeline(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Pipel
         repo_id: RepoId::from(parse_uuid_column(&row, "repo_id")?),
         name: row
             .try_get("name")
-            .map_err(|error| Error::database(format!("invalid pipeline name: {}", error)))?,
-        trigger_type: row.try_get("trigger_type").map_err(|error| {
-            Error::database(format!("invalid pipeline trigger type: {}", error))
-        })?,
+            .map_err(|error| Error::database(format!("invalid pipeline name: {error}")))?,
+        trigger_type: row
+            .try_get("trigger_type")
+            .map_err(|error| Error::database(format!("invalid pipeline trigger type: {error}")))?,
         config: serde_json::from_str(
             &row.try_get::<String, _>("config")
-                .map_err(|error| Error::database(format!("invalid pipeline config: {}", error)))?,
+                .map_err(|error| Error::database(format!("invalid pipeline config: {error}")))?,
         )
-        .map_err(|error| Error::database(format!("invalid pipeline config JSON: {}", error)))?,
+        .map_err(|error| Error::database(format!("invalid pipeline config JSON: {error}")))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
     })
 }
@@ -70,14 +68,14 @@ fn hydrate_repository(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Rep
         id: RepoId::from(parse_uuid_column(&row, "id")?),
         name: row
             .try_get("name")
-            .map_err(|error| Error::database(format!("invalid repository name: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid repository name: {error}")))?,
         owner_id: UserId::from(parse_uuid_column(&row, "owner_id")?),
-        visibility: row.try_get("visibility").map_err(|error| {
-            Error::database(format!("invalid repository visibility: {}", error))
-        })?,
+        visibility: row
+            .try_get("visibility")
+            .map_err(|error| Error::database(format!("invalid repository visibility: {error}")))?,
         git_path: row
             .try_get("git_path")
-            .map_err(|error| Error::database(format!("invalid repository git path: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid repository git path: {error}")))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
         updated_at: parse_timestamp_column(&row, "updated_at")?,
     })
@@ -88,13 +86,13 @@ fn hydrate_user(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::User> {
         id: UserId::from(parse_uuid_column(&row, "id")?),
         username: row
             .try_get("username")
-            .map_err(|error| Error::database(format!("invalid username: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid username: {error}")))?,
         email: row
             .try_get("email")
-            .map_err(|error| Error::database(format!("invalid user email: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid user email: {error}")))?,
         password_hash: row
             .try_get("password_hash")
-            .map_err(|error| Error::database(format!("invalid password hash: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid password hash: {error}")))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
     })
 }
@@ -105,13 +103,13 @@ fn hydrate_ssh_key(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::SshKey
         user_id: UserId::from(parse_uuid_column(&row, "user_id")?),
         name: row
             .try_get("name")
-            .map_err(|error| Error::database(format!("invalid ssh key name: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid ssh key name: {error}")))?,
         fingerprint: row
             .try_get("fingerprint")
-            .map_err(|error| Error::database(format!("invalid ssh key fingerprint: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid ssh key fingerprint: {error}")))?,
         public_key: row
             .try_get("public_key")
-            .map_err(|error| Error::database(format!("invalid ssh key material: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid ssh key material: {error}")))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
     })
 }
@@ -123,13 +121,13 @@ fn hydrate_pipeline_run(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::P
         repo_id: RepoId::from(parse_uuid_column(&row, "repo_id")?),
         status: row
             .try_get("status")
-            .map_err(|error| Error::database(format!("invalid pipeline run status: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid pipeline run status: {error}")))?,
         triggered_by: row
             .try_get("triggered_by")
-            .map_err(|error| Error::database(format!("invalid pipeline run actor: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid pipeline run actor: {error}")))?,
         commit_hash: row
             .try_get("commit_hash")
-            .map_err(|error| Error::database(format!("invalid pipeline run commit: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid pipeline run commit: {error}")))?,
         started_at: parse_optional_timestamp_column(&row, "started_at")?,
         finished_at: parse_optional_timestamp_column(&row, "finished_at")?,
         created_at: parse_timestamp_column(&row, "created_at")?,
@@ -139,48 +137,48 @@ fn hydrate_pipeline_run(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::P
 fn hydrate_job(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Job> {
     let commands: Option<String> = row
         .try_get("commands")
-        .map_err(|error| Error::database(format!("invalid job commands column: {}", error)))?;
+        .map_err(|error| Error::database(format!("invalid job commands column: {error}")))?;
     Ok(crate::models::Job {
         id: JobId::from(parse_uuid_column(&row, "id")?),
         pipeline_run_id: PipelineRunId::from(parse_uuid_column(&row, "pipeline_run_id")?),
         name: row
             .try_get("name")
-            .map_err(|error| Error::database(format!("invalid job name: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid job name: {error}")))?,
         status: row
             .try_get("status")
-            .map_err(|error| Error::database(format!("invalid job status: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid job status: {error}")))?,
         runner_id: row
             .try_get::<Option<String>, _>("runner_id")
-            .map_err(|error| Error::database(format!("invalid job runner ID: {}", error)))?
+            .map_err(|error| Error::database(format!("invalid job runner ID: {error}")))?
             .map(|value| {
                 Uuid::parse_str(&value)
                     .map(RunnerId::from)
-                    .map_err(|error| Error::database(format!("invalid job runner ID: {}", error)))
+                    .map_err(|error| Error::database(format!("invalid job runner ID: {error}")))
             })
             .transpose()?,
         started_at: parse_optional_timestamp_column(&row, "started_at")?,
         finished_at: parse_optional_timestamp_column(&row, "finished_at")?,
         retry_count: row
             .try_get("retry_count")
-            .map_err(|error| Error::database(format!("invalid job retry count: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid job retry count: {error}")))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
         commands: serde_json::from_str(&commands.unwrap_or_else(|| "[]".to_string()))
-            .map_err(|error| Error::database(format!("invalid job commands JSON: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid job commands JSON: {error}")))?,
         image: row
             .try_get::<Option<String>, _>("image")
-            .map_err(|error| Error::database(format!("invalid job image: {}", error)))?
+            .map_err(|error| Error::database(format!("invalid job image: {error}")))?
             .unwrap_or_else(|| "rust:latest".to_string()),
-        working_dir: row.try_get("working_dir").map_err(|error| {
-            Error::database(format!("invalid job working directory: {}", error))
-        })?,
+        working_dir: row
+            .try_get("working_dir")
+            .map_err(|error| Error::database(format!("invalid job working directory: {error}")))?,
         timeout_secs: row
             .try_get::<i64, _>("timeout_secs")
-            .map_err(|error| Error::database(format!("invalid job timeout: {}", error)))?
+            .map_err(|error| Error::database(format!("invalid job timeout: {error}")))?
             .try_into()
             .map_err(|_| Error::database("job timeout cannot be negative"))?,
         result_json: row
             .try_get("result_json")
-            .map_err(|error| Error::database(format!("invalid job result: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid job result: {error}")))?,
     })
 }
 
@@ -189,17 +187,17 @@ fn hydrate_runner(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Runner>
         id: RunnerId::from(parse_uuid_column(&row, "id")?),
         name: row
             .try_get("name")
-            .map_err(|error| Error::database(format!("invalid runner name: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid runner name: {error}")))?,
         runner_type: row
             .try_get("runner_type")
-            .map_err(|error| Error::database(format!("invalid runner type: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid runner type: {error}")))?,
         status: row
             .try_get("status")
-            .map_err(|error| Error::database(format!("invalid runner status: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid runner status: {error}")))?,
         last_heartbeat: parse_optional_timestamp_column(&row, "last_heartbeat")?,
         capacity: row
             .try_get("capacity")
-            .map_err(|error| Error::database(format!("invalid runner capacity: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid runner capacity: {error}")))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
     })
 }
@@ -207,14 +205,14 @@ fn hydrate_runner(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Runner>
 fn hydrate_event(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Event> {
     let payload: String = row
         .try_get("payload")
-        .map_err(|error| Error::database(format!("invalid event payload column: {}", error)))?;
+        .map_err(|error| Error::database(format!("invalid event payload column: {error}")))?;
     Ok(crate::models::Event {
         id: parse_uuid_column(&row, "id")?,
         event_type: row
             .try_get("event_type")
-            .map_err(|error| Error::database(format!("invalid event type: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid event type: {error}")))?,
         payload: serde_json::from_str(&payload)
-            .map_err(|error| Error::database(format!("invalid event payload JSON: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid event payload JSON: {error}")))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
     })
 }
@@ -243,7 +241,7 @@ impl RepoQueries {
         .bind(repo.updated_at.to_rfc3339())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to create repository: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create repository: {e}")))?;
         Ok(())
     }
 
@@ -253,7 +251,7 @@ impl RepoQueries {
             .bind(id.to_string())
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get repository: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get repository: {e}")))?;
 
         match row {
             Some(row) => hydrate_repository(row).map(Some),
@@ -270,7 +268,7 @@ impl RepoQueries {
             .bind(owner_id.to_string())
             .fetch_all(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to list repositories: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to list repositories: {e}")))?;
 
         let repos = rows
             .into_iter()
@@ -287,10 +285,11 @@ impl RepoQueries {
         // with completed or failed CI runs can be deleted just like an empty
         // repository. The schema intentionally keeps these foreign keys
         // restrictive to protect history during ordinary mutations.
-        let mut tx =
-            pool.pool().begin().await.map_err(|e| {
-                Error::database(format!("failed to begin repository delete: {}", e))
-            })?;
+        let mut tx = pool
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| Error::database(format!("failed to begin repository delete: {e}")))?;
         let repo_id = id.to_string();
         for statement in [
             "DELETE FROM artifacts WHERE job_id IN (SELECT id FROM jobs WHERE pipeline_run_id IN (SELECT id FROM pipeline_runs WHERE repo_id = ?))",
@@ -304,11 +303,11 @@ impl RepoQueries {
                 .bind(&repo_id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| Error::database(format!("failed to delete repository: {}", e)))?;
+                .map_err(|e| Error::database(format!("failed to delete repository: {e}")))?;
         }
         tx.commit()
             .await
-            .map_err(|e| Error::database(format!("failed to commit repository delete: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to commit repository delete: {e}")))?;
         Ok(())
     }
 
@@ -317,7 +316,7 @@ impl RepoQueries {
         let rows = sqlx::query("SELECT * FROM repositories ORDER BY created_at DESC")
             .fetch_all(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to list repositories: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to list repositories: {e}")))?;
 
         let repos = rows
             .into_iter()
@@ -344,9 +343,7 @@ impl RepoQueries {
         .bind(repo_name)
         .fetch_optional(pool.pool())
         .await
-        .map_err(|e| {
-            Error::database(format!("failed to get repository by owner and name: {}", e))
-        })?;
+        .map_err(|e| Error::database(format!("failed to get repository by owner and name: {e}")))?;
 
         match row {
             Some(row) => hydrate_repository(row).map(Some),
@@ -370,7 +367,7 @@ impl UserQueries {
             .bind(id.to_string())
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get user role: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get user role: {e}")))?;
         Ok(row.map(|row| row.get::<String, _>("role")))
     }
 
@@ -381,7 +378,7 @@ impl UserQueries {
             .bind(id.to_string())
             .execute(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to set user role: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to set user role: {e}")))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -391,7 +388,7 @@ impl UserQueries {
             .bind(role)
             .fetch_one(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to count user roles: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to count user roles: {e}")))?;
         Ok(row.get::<i64, _>("count"))
     }
 
@@ -410,7 +407,7 @@ impl UserQueries {
         .bind(user.created_at.to_rfc3339())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to create user: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create user: {e}")))?;
         Ok(())
     }
 
@@ -443,7 +440,7 @@ impl UserQueries {
         .bind(user.created_at.to_rfc3339())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to create user with role: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create user with role: {e}")))?;
         Ok(())
     }
 
@@ -453,7 +450,7 @@ impl UserQueries {
             .bind(id.to_string())
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get user: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get user: {e}")))?;
 
         row.map(hydrate_user).transpose()
     }
@@ -467,7 +464,7 @@ impl UserQueries {
             .bind(username)
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get user by username: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get user by username: {e}")))?;
 
         row.map(hydrate_user).transpose()
     }
@@ -477,7 +474,7 @@ impl UserQueries {
         let rows = sqlx::query("SELECT * FROM users ORDER BY created_at DESC")
             .fetch_all(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to list users: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to list users: {e}")))?;
 
         let users = rows
             .into_iter()
@@ -519,7 +516,7 @@ impl SshKeyQueries {
                     key.fingerprint
                 ))
             } else {
-                Error::database(format!("failed to create ssh key: {}", e))
+                Error::database(format!("failed to create ssh key: {e}"))
             }
         })?;
         Ok(())
@@ -531,7 +528,7 @@ impl SshKeyQueries {
             .bind(id.to_string())
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get ssh key: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get ssh key: {e}")))?;
 
         row.map(hydrate_ssh_key).transpose()
     }
@@ -547,7 +544,7 @@ impl SshKeyQueries {
             .fetch_optional(pool.pool())
             .await
             .map_err(|e| {
-                Error::database(format!("failed to look up ssh key by fingerprint: {}", e))
+                Error::database(format!("failed to look up ssh key by fingerprint: {e}"))
             })?;
 
         row.map(hydrate_ssh_key).transpose()
@@ -559,7 +556,7 @@ impl SshKeyQueries {
             .bind(user_id.to_string())
             .fetch_all(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to list ssh keys: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to list ssh keys: {e}")))?;
 
         rows.into_iter().map(hydrate_ssh_key).collect()
     }
@@ -572,7 +569,7 @@ impl SshKeyQueries {
             .bind(user_id.to_string())
             .execute(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to delete ssh key: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to delete ssh key: {e}")))?;
         Ok(result.rows_affected() == 1)
     }
 }
@@ -600,7 +597,7 @@ impl PipelineQueries {
         .bind(pipeline.created_at.to_rfc3339())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to create pipeline: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create pipeline: {e}")))?;
         Ok(())
     }
 
@@ -619,7 +616,7 @@ impl PipelineQueries {
         .bind(name)
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to deactivate pipeline: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to deactivate pipeline: {e}")))?;
         Ok(())
     }
 
@@ -633,7 +630,7 @@ impl PipelineQueries {
         .bind(name)
         .fetch_one(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to count active pipelines: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to count active pipelines: {e}")))?;
         Ok(count)
     }
 
@@ -643,7 +640,7 @@ impl PipelineQueries {
             .bind(id.to_string())
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get pipeline: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get pipeline: {e}")))?;
 
         match row {
             Some(row) => hydrate_pipeline(row).map(Some),
@@ -661,7 +658,7 @@ impl PipelineQueries {
                 .bind(repo_id.to_string())
                 .fetch_all(pool.pool())
                 .await
-                .map_err(|e| Error::database(format!("failed to list pipelines: {}", e)))?;
+                .map_err(|e| Error::database(format!("failed to list pipelines: {e}")))?;
 
         let pipelines = rows
             .into_iter()
@@ -676,7 +673,7 @@ impl PipelineQueries {
         let rows = sqlx::query("SELECT * FROM pipelines ORDER BY created_at DESC")
             .fetch_all(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to list pipelines: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to list pipelines: {e}")))?;
 
         let pipelines = rows
             .into_iter()
@@ -713,7 +710,7 @@ impl PipelineRunQueries {
         .bind(run.created_at.to_rfc3339())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to create pipeline run: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create pipeline run: {e}")))?;
         Ok(())
     }
 
@@ -723,7 +720,7 @@ impl PipelineRunQueries {
             .bind(id.to_string())
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get pipeline run: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get pipeline run: {e}")))?;
 
         match row {
             Some(row) => hydrate_pipeline_run(row).map(Some),
@@ -746,7 +743,7 @@ impl PipelineRunQueries {
             .bind(id.to_string())
             .execute(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to update pipeline run status: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to update pipeline run status: {e}")))?;
         Ok(())
     }
 
@@ -761,7 +758,7 @@ impl PipelineRunQueries {
         .bind(pipeline_id.to_string())
         .fetch_all(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to list pipeline runs: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to list pipeline runs: {e}")))?;
 
         let runs = rows
             .into_iter()
@@ -776,7 +773,7 @@ impl PipelineRunQueries {
         let rows = sqlx::query("SELECT * FROM pipeline_runs ORDER BY created_at DESC")
             .fetch_all(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to list pipeline runs: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to list pipeline runs: {e}")))?;
 
         let runs = rows
             .into_iter()
@@ -857,8 +854,7 @@ impl JobQueries {
         }
         if chunk.len() > MAX_JOB_LOG_CHUNK_BYTES {
             return Err(Error::invalid_input(format!(
-                "job log chunk exceeds {} bytes",
-                MAX_JOB_LOG_CHUNK_BYTES
+                "job log chunk exceeds {MAX_JOB_LOG_CHUNK_BYTES} bytes"
             )));
         }
 
@@ -870,17 +866,17 @@ impl JobQueries {
         // append transaction and keeps the lease check plus sequence
         // allocation atomic.
         let mut conn = pool.pool().acquire().await.map_err(|e| {
-            Error::database(format!("failed to acquire log append connection: {}", e))
+            Error::database(format!("failed to acquire log append connection: {e}"))
         })?;
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *conn)
             .await
-            .map_err(|e| Error::database(format!("failed to begin log append: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to begin log append: {e}")))?;
         let Some(job) = sqlx::query("SELECT runner_id, lease_token, status FROM jobs WHERE id = ?")
             .bind(id.to_string())
             .fetch_optional(&mut *conn)
             .await
-            .map_err(|e| Error::database(format!("failed to authorize log append: {}", e)))?
+            .map_err(|e| Error::database(format!("failed to authorize log append: {e}")))?
         else {
             let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
             return Ok(None);
@@ -903,12 +899,11 @@ impl JobQueries {
         .bind(id.to_string())
         .fetch_one(&mut *conn)
         .await
-        .map_err(|e| Error::database(format!("failed to measure job logs: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to measure job logs: {e}")))?;
         if total + chunk.len() as i64 > MAX_JOB_LOG_BYTES {
             let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
             return Err(Error::invalid_input(format!(
-                "job logs exceed {} bytes",
-                MAX_JOB_LOG_BYTES
+                "job logs exceed {MAX_JOB_LOG_BYTES} bytes"
             )));
         }
 
@@ -918,7 +913,7 @@ impl JobQueries {
         .bind(id.to_string())
         .fetch_one(&mut *conn)
         .await
-        .map_err(|e| Error::database(format!("failed to allocate log sequence: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to allocate log sequence: {e}")))?;
         sqlx::query(
             "INSERT INTO job_log_chunks (job_id, sequence, chunk, created_at) VALUES (?, ?, ?, ?)",
         )
@@ -928,11 +923,11 @@ impl JobQueries {
         .bind(Utc::now().to_rfc3339())
         .execute(&mut *conn)
         .await
-        .map_err(|e| Error::database(format!("failed to append job log: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to append job log: {e}")))?;
         sqlx::query("COMMIT")
             .execute(&mut *conn)
             .await
-            .map_err(|e| Error::database(format!("failed to commit log append: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to commit log append: {e}")))?;
         Ok(Some(sequence))
     }
 
@@ -944,7 +939,7 @@ impl JobQueries {
         .bind(id.to_string())
         .fetch_all(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to list job logs: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to list job logs: {e}")))?;
         Ok(rows
             .into_iter()
             .map(|row| JobLogChunk {
@@ -970,7 +965,7 @@ impl JobQueries {
         .bind(lease_token)
         .fetch_optional(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to check job lease: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to check job lease: {e}")))?;
         Ok(row.is_some())
     }
 
@@ -991,7 +986,7 @@ impl JobQueries {
         .bind(id.to_string())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to sync job lease: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to sync job lease: {e}")))?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -1008,11 +1003,11 @@ impl JobQueries {
         .bind(idempotency_key)
         .fetch_optional(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to get job idempotency key: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to get job idempotency key: {e}")))?;
         row.map(|row| {
             let job_id = Uuid::parse_str(&row.get::<String, _>("job_id"))
                 .map(JobId::from)
-                .map_err(|e| Error::database(format!("invalid stored idempotent job ID: {}", e)))?;
+                .map_err(|e| Error::database(format!("invalid stored idempotent job ID: {e}")))?;
             Ok((job_id, row.get("request_fingerprint")))
         })
         .transpose()
@@ -1037,7 +1032,7 @@ impl JobQueries {
         .bind(Utc::now().to_rfc3339())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to reserve job idempotency key: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to reserve job idempotency key: {e}")))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1050,9 +1045,7 @@ impl JobQueries {
             .bind(idempotency_key)
             .execute(pool.pool())
             .await
-            .map_err(|e| {
-                Error::database(format!("failed to release job idempotency key: {}", e))
-            })?;
+            .map_err(|e| Error::database(format!("failed to release job idempotency key: {e}")))?;
         Ok(())
     }
 
@@ -1080,7 +1073,7 @@ impl JobQueries {
         .bind(&job.result_json)
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to create job: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create job: {e}")))?;
         Ok(())
     }
 
@@ -1090,7 +1083,7 @@ impl JobQueries {
             .bind(id.to_string())
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get job: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get job: {e}")))?;
 
         row.map(hydrate_job).transpose()
     }
@@ -1102,7 +1095,7 @@ impl JobQueries {
             .bind(id.to_string())
             .execute(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to update job status: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to update job status: {e}")))?;
         Ok(())
     }
 
@@ -1119,7 +1112,29 @@ impl JobQueries {
         .bind(id.to_string())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to requeue job: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to requeue job: {e}")))?;
+        Ok(())
+    }
+
+    /// Grade a running job as failed after its runner was lost.
+    ///
+    /// Runner-loss handling must never requeue a `running` row: the original
+    /// sandbox may still be executing, and a second execution of the same job
+    /// would race it (duplicate containers, duelling log appends, rejected
+    /// completions). Fencing the row as failed matches the recovery contract
+    /// of `requeue_inflight` for running rows and lets the pipeline finalize
+    /// deterministically; the abandoned-container reconciler collects the
+    /// orphaned sandbox after its grace period.
+    pub async fn fail_lost(pool: &Pool, id: JobId) -> Result<()> {
+        sqlx::query(
+            "UPDATE jobs SET status = 'failed', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE id = ? AND status = 'running'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(r#"{"status":"failed","reason":"runner_lost_while_running"}"#)
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to fence lost job: {e}")))?;
         Ok(())
     }
 
@@ -1154,7 +1169,7 @@ impl JobQueries {
         timeout_secs: u64,
     ) -> Result<()> {
         let commands_json = serde_json::to_string(commands)
-            .map_err(|e| Error::database(format!("failed to encode job commands: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to encode job commands: {e}")))?;
         let timeout_secs = i64::try_from(timeout_secs)
             .map_err(|_| Error::invalid_input("job timeout exceeds database range"))?;
         sqlx::query(
@@ -1167,7 +1182,7 @@ impl JobQueries {
             .bind(id.to_string())
             .execute(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to persist job definition: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to persist job definition: {e}")))?;
         Ok(())
     }
 
@@ -1197,7 +1212,7 @@ impl JobQueries {
             .bind(id.to_string())
             .execute(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to persist job receipt: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to persist job receipt: {e}")))?;
         Ok(())
     }
 
@@ -1208,7 +1223,7 @@ impl JobQueries {
             .bind(id.to_string())
             .execute(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to assign job: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to assign job: {e}")))?;
         Ok(())
     }
 
@@ -1228,7 +1243,7 @@ impl JobQueries {
         .bind(id.to_string())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to assign job lease: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to assign job lease: {e}")))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1241,7 +1256,7 @@ impl JobQueries {
         .bind(id.to_string())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to start job: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to start job: {e}")))?;
         Ok(())
     }
 
@@ -1261,7 +1276,7 @@ impl JobQueries {
         .bind(lease_token)
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to start job with lease: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to start job with lease: {e}")))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1287,7 +1302,7 @@ impl JobQueries {
         .bind(lease_token)
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to complete job with lease: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to complete job with lease: {e}")))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1314,7 +1329,7 @@ impl JobQueries {
             .pool()
             .begin()
             .await
-            .map_err(|e| Error::database(format!("failed to begin completion: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to begin completion: {e}")))?;
         let updated = sqlx::query(
             "UPDATE jobs SET status = ?, finished_at = ?, result_json = ?, lease_token = NULL WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
         )
@@ -1326,7 +1341,7 @@ impl JobQueries {
         .bind(lease_token)
         .execute(&mut *tx)
         .await
-        .map_err(|e| Error::database(format!("failed to complete job: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to complete job: {e}")))?;
         if updated.rows_affected() != 1 {
             return Ok(false);
         }
@@ -1344,7 +1359,7 @@ impl JobQueries {
         .bind(&now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| Error::database(format!("failed to enqueue publication: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to enqueue publication: {e}")))?;
         let stored: String = sqlx::query_scalar(
             "SELECT payload FROM publication_outbox WHERE job_id = ? AND provider = ? AND kind = ?",
         )
@@ -1353,7 +1368,7 @@ impl JobQueries {
         .bind(kind)
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| Error::database(format!("failed to verify publication: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to verify publication: {e}")))?;
         if stored != payload {
             return Err(Error::invalid_input(
                 "publication already exists with a conflicting payload",
@@ -1361,7 +1376,7 @@ impl JobQueries {
         }
         tx.commit()
             .await
-            .map_err(|e| Error::database(format!("failed to commit completion: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to commit completion: {e}")))?;
         Ok(true)
     }
 
@@ -1385,7 +1400,7 @@ impl JobQueries {
         .bind(id.to_string())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to cancel job: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to cancel job: {e}")))?;
         Ok(())
     }
 
@@ -1399,7 +1414,7 @@ impl JobQueries {
                 .bind(run_id.to_string())
                 .fetch_all(pool.pool())
                 .await
-                .map_err(|e| Error::database(format!("failed to list jobs: {}", e)))?;
+                .map_err(|e| Error::database(format!("failed to list jobs: {e}")))?;
 
         let jobs = rows
             .into_iter()
@@ -1416,7 +1431,7 @@ impl JobQueries {
         )
         .fetch_all(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to list pending jobs: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to list pending jobs: {e}")))?;
 
         let jobs = rows
             .into_iter()
@@ -1436,19 +1451,19 @@ impl JobQueries {
             .pool()
             .begin()
             .await
-            .map_err(|e| Error::database(format!("failed to begin recovery: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to begin recovery: {e}")))?;
         let queued_with_runner = sqlx::query(
             "UPDATE jobs SET runner_id = NULL, started_at = NULL, lease_token = NULL WHERE status = 'queued' AND runner_id IS NOT NULL",
         )
         .execute(&mut *transaction)
         .await
-        .map_err(|e| Error::database(format!("failed to clear queued runner assignments: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to clear queued runner assignments: {e}")))?;
         let assigned = sqlx::query(
             "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE status = 'assigned'",
         )
         .execute(&mut *transaction)
         .await
-        .map_err(|e| Error::database(format!("failed to requeue assigned jobs: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to requeue assigned jobs: {e}")))?;
         let running = sqlx::query(
             "UPDATE jobs SET status = 'failed', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE status = 'running'",
         )
@@ -1456,11 +1471,11 @@ impl JobQueries {
         .bind(r#"{"status":"failed","reason":"scheduler_restart_fenced_running_job"}"#)
         .execute(&mut *transaction)
         .await
-        .map_err(|e| Error::database(format!("failed to fence running jobs: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to fence running jobs: {e}")))?;
         transaction
             .commit()
             .await
-            .map_err(|e| Error::database(format!("failed to commit recovery: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to commit recovery: {e}")))?;
         Ok(queued_with_runner.rows_affected() + assigned.rows_affected() + running.rows_affected())
     }
 
@@ -1475,7 +1490,7 @@ impl JobQueries {
         .bind(r#"{"status":"timed_out","reason":"job_timeout_reconciled_by_watchdog"}"#)
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to reconcile expired jobs: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to reconcile expired jobs: {e}")))?;
         Ok(result.rows_affected())
     }
 }
@@ -1493,6 +1508,15 @@ pub enum RunnerRetirement {
     AlreadyRetired,
     ActiveJobs(i64),
     NotFound,
+}
+
+/// Outcome of a name-keyed runner registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerRegistration {
+    /// A new registry row was created for this runner.
+    Created,
+    /// An existing row carrying the same name was adopted and refreshed.
+    Refreshed,
 }
 
 impl RunnerQueries {
@@ -1515,53 +1539,70 @@ impl RunnerQueries {
         .bind(runner.created_at.to_rfc3339()) // updated_at same as created_at for new runner
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to create runner: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create runner: {e}")))?;
         Ok(())
     }
 
     /// Register a runner by its stable operator-facing name.
     ///
-    /// Runner processes are routinely restarted by systemd. Registration must
-    /// therefore refresh the existing identity instead of inserting a new UUID
-    /// on every restart, otherwise the registry accumulates stale capacity.
+    /// Runner processes are routinely restarted. Registration must therefore
+    /// adopt the existing identity instead of inserting a new UUID on every
+    /// restart, otherwise the registry accumulates stale capacity. The
+    /// unique index on `runners(name)` backs this up under concurrency: the
+    /// SELECT-then-INSERT sequence has a race window, and the losing
+    /// registration's INSERT trips the index, sending it around the loop
+    /// into the refresh path. Exactly one row per name results either way.
     pub async fn register_or_refresh(
         pool: &Pool,
         runner: &crate::models::Runner,
-    ) -> Result<crate::models::Runner> {
-        let existing = sqlx::query(
-            "SELECT * FROM runners WHERE name = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
-        )
-            .bind(&runner.name)
-            .fetch_optional(pool.pool())
+    ) -> Result<(crate::models::Runner, RunnerRegistration)> {
+        for _ in 0..3 {
+            let existing = sqlx::query(
+                "SELECT * FROM runners WHERE name = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+            )
+                .bind(&runner.name)
+                .fetch_optional(pool.pool())
+                .await
+                .map_err(|error| {
+                    Error::database(format!("failed to find runner by name: {error}"))
+                })?
+                .map(hydrate_runner)
+                .transpose()?;
+
+            let Some(mut existing) = existing else {
+                match Self::create(pool, runner).await {
+                    Ok(()) => return Ok((runner.clone(), RunnerRegistration::Created)),
+                    // Lost the race: another registration created the name
+                    // first. Loop and refresh that row instead.
+                    Err(error) if error.message.contains("UNIQUE constraint failed") => continue,
+                    Err(error) => return Err(error),
+                }
+            };
+
+            sqlx::query(
+                "UPDATE runners SET runner_type = ?, status = ?, capacity = ?, labels = ?, last_heartbeat = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(&runner.runner_type)
+            .bind(&runner.status)
+            .bind(runner.capacity)
+            .bind("[]")
+            .bind(runner.last_heartbeat.map(|date| date.to_rfc3339()))
+            .bind(Utc::now().to_rfc3339())
+            .bind(existing.id.to_string())
+            .execute(pool.pool())
             .await
-            .map_err(|error| Error::database(format!("failed to find runner by name: {}", error)))?
-            .map(hydrate_runner)
-            .transpose()?;
+            .map_err(|error| Error::database(format!("failed to refresh runner: {error}")))?;
 
-        let Some(mut existing) = existing else {
-            Self::create(pool, runner).await?;
-            return Ok(runner.clone());
-        };
+            existing.runner_type = runner.runner_type.clone();
+            existing.status = runner.status.clone();
+            existing.capacity = runner.capacity;
+            existing.last_heartbeat = runner.last_heartbeat;
+            return Ok((existing, RunnerRegistration::Refreshed));
+        }
 
-        sqlx::query(
-            "UPDATE runners SET runner_type = ?, status = ?, capacity = ?, labels = ?, last_heartbeat = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(&runner.runner_type)
-        .bind(&runner.status)
-        .bind(runner.capacity)
-        .bind("[]")
-        .bind(runner.last_heartbeat.map(|date| date.to_rfc3339()))
-        .bind(Utc::now().to_rfc3339())
-        .bind(existing.id.to_string())
-        .execute(pool.pool())
-        .await
-        .map_err(|error| Error::database(format!("failed to refresh runner: {}", error)))?;
-
-        existing.runner_type = runner.runner_type.clone();
-        existing.status = runner.status.clone();
-        existing.capacity = runner.capacity;
-        existing.last_heartbeat = runner.last_heartbeat;
-        Ok(existing)
+        Err(Error::database(
+            "runner registration raced on the same name repeatedly; giving up",
+        ))
     }
 
     /// Get a runner by ID
@@ -1570,7 +1611,7 @@ impl RunnerQueries {
             .bind(id.to_string())
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get runner: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get runner: {e}")))?;
 
         row.map(hydrate_runner).transpose()
     }
@@ -1582,7 +1623,7 @@ impl RunnerQueries {
             .bind(id.to_string())
             .execute(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to update heartbeat: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to update heartbeat: {e}")))?;
         Ok(())
     }
 
@@ -1593,7 +1634,7 @@ impl RunnerQueries {
             .bind(id.to_string())
             .execute(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to update runner status: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to update runner status: {e}")))?;
         Ok(())
     }
 
@@ -1605,16 +1646,17 @@ impl RunnerQueries {
     /// operations. Retired runners are already excluded by scheduler
     /// policies that select only `online` runners.
     pub async fn retire_if_idle(pool: &Pool, id: RunnerId) -> Result<RunnerRetirement> {
-        let mut transaction =
-            pool.pool().begin().await.map_err(|e| {
-                Error::database(format!("failed to begin runner retirement: {}", e))
-            })?;
+        let mut transaction = pool
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| Error::database(format!("failed to begin runner retirement: {e}")))?;
 
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM runners WHERE id = ?")
             .bind(id.to_string())
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|e| Error::database(format!("failed to load runner for retirement: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to load runner for retirement: {e}")))?;
 
         let Some(status) = status else {
             transaction.rollback().await.ok();
@@ -1631,7 +1673,7 @@ impl RunnerQueries {
         .bind(id.to_string())
         .fetch_one(&mut *transaction)
         .await
-        .map_err(|e| Error::database(format!("failed to inspect runner jobs: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to inspect runner jobs: {e}")))?;
 
         if active_jobs > 0 {
             transaction.rollback().await.ok();
@@ -1643,12 +1685,12 @@ impl RunnerQueries {
             .bind(id.to_string())
             .execute(&mut *transaction)
             .await
-            .map_err(|e| Error::database(format!("failed to retire runner: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to retire runner: {e}")))?;
 
         transaction
             .commit()
             .await
-            .map_err(|e| Error::database(format!("failed to commit runner retirement: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to commit runner retirement: {e}")))?;
         Ok(RunnerRetirement::Retired)
     }
 
@@ -1657,7 +1699,7 @@ impl RunnerQueries {
         let rows = sqlx::query("SELECT * FROM runners ORDER BY created_at DESC")
             .fetch_all(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to list runners: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to list runners: {e}")))?;
 
         let runners = rows
             .into_iter()
@@ -1673,7 +1715,7 @@ impl RunnerQueries {
             sqlx::query("SELECT * FROM runners WHERE status = 'online' ORDER BY created_at DESC")
                 .fetch_all(pool.pool())
                 .await
-                .map_err(|e| Error::database(format!("failed to list online runners: {}", e)))?;
+                .map_err(|e| Error::database(format!("failed to list online runners: {e}")))?;
 
         let runners = rows
             .into_iter()
@@ -1705,7 +1747,7 @@ impl EventQueries {
         .bind(event.created_at.to_rfc3339())
         .execute(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to create event: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to create event: {e}")))?;
         Ok(())
     }
 
@@ -1722,7 +1764,7 @@ impl EventQueries {
         .bind(limit)
         .fetch_all(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to list events: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to list events: {e}")))?;
 
         let events = rows
             .into_iter()
@@ -1738,7 +1780,7 @@ impl EventQueries {
             .bind(limit)
             .fetch_all(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to list events: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to list events: {e}")))?;
 
         let events = rows
             .into_iter()
@@ -1845,13 +1887,13 @@ pub enum FindingInsertOutcome {
 fn parse_review_run_state(value: String) -> Result<gitforge_review::domain::ReviewRunState> {
     value
         .parse()
-        .map_err(|e: String| Error::database(format!("invalid review run status: {}", e)))
+        .map_err(|e: String| Error::database(format!("invalid review run status: {e}")))
 }
 
 fn parse_position_status(value: String) -> Result<gitforge_review::domain::PositionStatus> {
     value
         .parse()
-        .map_err(|e: String| Error::database(format!("invalid position status: {}", e)))
+        .map_err(|e: String| Error::database(format!("invalid position status: {e}")))
 }
 
 fn hydrate_review_run(row: sqlx::sqlite::SqliteRow) -> Result<ReviewRun> {
@@ -1859,33 +1901,32 @@ fn hydrate_review_run(row: sqlx::sqlite::SqliteRow) -> Result<ReviewRun> {
         id: parse_uuid_column(&row, "id")?,
         repo_id: row
             .try_get::<Option<String>, _>("repo_id")
-            .map_err(|error| Error::database(format!("invalid review run repo_id: {}", error)))?
+            .map_err(|error| Error::database(format!("invalid review run repo_id: {error}")))?
             .map(|value| {
                 Uuid::parse_str(&value).map_err(|error| {
-                    Error::database(format!("invalid review run repo_id: {}", error))
+                    Error::database(format!("invalid review run repo_id: {error}"))
                 })
             })
             .transpose()?,
         base_sha: row
             .try_get("base_sha")
-            .map_err(|error| Error::database(format!("invalid review run base SHA: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid review run base SHA: {error}")))?,
         head_sha: row
             .try_get("head_sha")
-            .map_err(|error| Error::database(format!("invalid review run head SHA: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid review run head SHA: {error}")))?,
         idempotency_key: row.try_get("idempotency_key").map_err(|error| {
-            Error::database(format!("invalid review run idempotency key: {}", error))
+            Error::database(format!("invalid review run idempotency key: {error}"))
         })?,
         status: parse_review_run_state(
-            row.try_get("status").map_err(|error| {
-                Error::database(format!("invalid review run status: {}", error))
-            })?,
+            row.try_get("status")
+                .map_err(|error| Error::database(format!("invalid review run status: {error}")))?,
         )?,
         attempt: row
             .try_get("attempt")
-            .map_err(|error| Error::database(format!("invalid review run attempt: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid review run attempt: {error}")))?,
         receipt_id: row
             .try_get("receipt_id")
-            .map_err(|error| Error::database(format!("invalid review run receipt: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid review run receipt: {error}")))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
         updated_at: parse_timestamp_column(&row, "updated_at")?,
     })
@@ -1897,40 +1938,40 @@ fn hydrate_review_finding(row: sqlx::sqlite::SqliteRow) -> Result<ReviewFinding>
         run_id: parse_uuid_column(&row, "run_id")?,
         source: row
             .try_get("source")
-            .map_err(|error| Error::database(format!("invalid finding source: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid finding source: {error}")))?,
         fingerprint: row
             .try_get("fingerprint")
-            .map_err(|error| Error::database(format!("invalid finding fingerprint: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid finding fingerprint: {error}")))?,
         path: row
             .try_get("path")
-            .map_err(|error| Error::database(format!("invalid finding path: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid finding path: {error}")))?,
         line: row
             .try_get("line")
-            .map_err(|error| Error::database(format!("invalid finding line: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid finding line: {error}")))?,
         severity: row
             .try_get("severity")
-            .map_err(|error| Error::database(format!("invalid finding severity: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid finding severity: {error}")))?,
         category: row
             .try_get("category")
-            .map_err(|error| Error::database(format!("invalid finding category: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid finding category: {error}")))?,
         title: row
             .try_get("title")
-            .map_err(|error| Error::database(format!("invalid finding title: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid finding title: {error}")))?,
         message: row
             .try_get("message")
-            .map_err(|error| Error::database(format!("invalid finding message: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid finding message: {error}")))?,
         evidence: row
             .try_get("evidence")
-            .map_err(|error| Error::database(format!("invalid finding evidence: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid finding evidence: {error}")))?,
         confidence: row
             .try_get("confidence")
-            .map_err(|error| Error::database(format!("invalid finding confidence: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid finding confidence: {error}")))?,
         position_status: parse_position_status(row.try_get("position_status").map_err(
-            |error| Error::database(format!("invalid finding position status: {}", error)),
+            |error| Error::database(format!("invalid finding position status: {error}")),
         )?)?,
         disposition: row
             .try_get("disposition")
-            .map_err(|error| Error::database(format!("invalid finding disposition: {}", error)))?,
+            .map_err(|error| Error::database(format!("invalid finding disposition: {error}")))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
         updated_at: parse_timestamp_column(&row, "updated_at")?,
     })
@@ -1978,8 +2019,7 @@ impl ReviewQueries {
                 let message = error.to_string();
                 if !message.contains("UNIQUE constraint failed") {
                     return Err(Error::database(format!(
-                        "failed to create review run: {}",
-                        error
+                        "failed to create review run: {error}"
                     )));
                 }
                 let existing = Self::get_run_by_idempotency_key(pool, &new_run.idempotency_key)
@@ -2008,7 +2048,7 @@ impl ReviewQueries {
             .bind(id.to_string())
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get review run: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get review run: {e}")))?;
         match row {
             Some(row) => hydrate_review_run(row).map(Some),
             None => Ok(None),
@@ -2024,7 +2064,7 @@ impl ReviewQueries {
             .bind(idempotency_key)
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get review run by key: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get review run by key: {e}")))?;
         match row {
             Some(row) => hydrate_review_run(row).map(Some),
             None => Ok(None),
@@ -2042,27 +2082,28 @@ impl ReviewQueries {
         id: Uuid,
         next: gitforge_review::domain::ReviewRunState,
     ) -> Result<Option<ReviewRun>> {
-        let mut tx =
-            pool.pool().begin().await.map_err(|e| {
-                Error::database(format!("failed to begin review transition: {}", e))
-            })?;
+        let mut tx = pool
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| Error::database(format!("failed to begin review transition: {e}")))?;
 
         let current = sqlx::query("SELECT status FROM review_runs WHERE id = ?")
             .bind(id.to_string())
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| Error::database(format!("failed to read review run status: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to read review run status: {e}")))?;
 
         let current = match current {
             Some(row) => {
                 let value: String = row
                     .try_get("status")
-                    .map_err(|e| Error::database(format!("missing status column: {}", e)))?;
+                    .map_err(|e| Error::database(format!("missing status column: {e}")))?;
                 parse_review_run_state(value)?
             }
             None => {
                 tx.rollback().await.map_err(|e| {
-                    Error::database(format!("failed to roll back review transition: {}", e))
+                    Error::database(format!("failed to roll back review transition: {e}"))
                 })?;
                 return Ok(None);
             }
@@ -2070,11 +2111,11 @@ impl ReviewQueries {
 
         if !current.can_transition_to(next) {
             tx.rollback().await.map_err(|e| {
-                Error::database(format!("failed to roll back review transition: {}", e))
+                Error::database(format!("failed to roll back review transition: {e}"))
             })?;
             return Err(Error::new(
                 gitforge_common::ErrorKind::InvalidInput,
-                format!("invalid review run transition: {} → {}", current, next),
+                format!("invalid review run transition: {current} → {next}"),
             ));
         }
 
@@ -2087,23 +2128,23 @@ impl ReviewQueries {
         .bind(current.to_string())
         .execute(&mut *tx)
         .await
-        .map_err(|e| Error::database(format!("failed to update review run status: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to update review run status: {e}")))?;
 
         if result.rows_affected() != 1 {
             // A concurrent writer moved the row between the read and the
             // guarded update; treat as a failed transition.
             tx.rollback().await.map_err(|e| {
-                Error::database(format!("failed to roll back review transition: {}", e))
+                Error::database(format!("failed to roll back review transition: {e}"))
             })?;
             return Err(Error::new(
                 gitforge_common::ErrorKind::InvalidInput,
-                format!("review run transition lost a race: {} → {}", current, next),
+                format!("review run transition lost a race: {current} → {next}"),
             ));
         }
 
         tx.commit()
             .await
-            .map_err(|e| Error::database(format!("failed to commit review transition: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to commit review transition: {e}")))?;
 
         Self::get_run(pool, id).await
     }
@@ -2151,7 +2192,7 @@ impl ReviewQueries {
             .pool()
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|e| Error::database(format!("failed to begin review claim: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to begin review claim: {e}")))?;
 
         // FIFO candidate selection. Held under the IMMEDIATE write lock so
         // no concurrent claimer can advance the same row before the
@@ -2166,11 +2207,11 @@ impl ReviewQueries {
         )
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| Error::database(format!("failed to select pending run: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to select pending run: {e}")))?;
 
         let Some(candidate_id) = candidate else {
             tx.rollback().await.map_err(|e| {
-                Error::database(format!("failed to roll back empty review claim: {}", e))
+                Error::database(format!("failed to roll back empty review claim: {e}"))
             })?;
             return Ok(None);
         };
@@ -2195,11 +2236,11 @@ impl ReviewQueries {
         .bind(&candidate_id)
         .execute(&mut *tx)
         .await
-        .map_err(|e| Error::database(format!("failed to claim review run: {}", e)))?;
+        .map_err(|e| Error::database(format!("failed to claim review run: {e}")))?;
 
         if updated.rows_affected() != 1 {
             tx.rollback().await.map_err(|e| {
-                Error::database(format!("failed to roll back review claim race: {}", e))
+                Error::database(format!("failed to roll back review claim race: {e}"))
             })?;
             return Ok(None);
         }
@@ -2208,11 +2249,11 @@ impl ReviewQueries {
             .bind(&candidate_id)
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| Error::database(format!("failed to read claimed review run: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to read claimed review run: {e}")))?;
 
         tx.commit()
             .await
-            .map_err(|e| Error::database(format!("failed to commit review claim: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to commit review claim: {e}")))?;
 
         hydrate_review_run(row).map(Some)
     }
@@ -2288,8 +2329,7 @@ impl ReviewQueries {
                     Ok(FindingInsertOutcome::Duplicate(existing))
                 } else {
                     Err(Error::database(format!(
-                        "failed to insert finding: {}",
-                        error
+                        "failed to insert finding: {error}"
                     )))
                 }
             }
@@ -2302,7 +2342,7 @@ impl ReviewQueries {
             .bind(id.to_string())
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get review finding: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get review finding: {e}")))?;
         match row {
             Some(row) => hydrate_review_finding(row).map(Some),
             None => Ok(None),
@@ -2320,7 +2360,7 @@ impl ReviewQueries {
             .bind(fingerprint)
             .fetch_optional(pool.pool())
             .await
-            .map_err(|e| Error::database(format!("failed to get review finding: {}", e)))?;
+            .map_err(|e| Error::database(format!("failed to get review finding: {e}")))?;
         match row {
             Some(row) => hydrate_review_finding(row).map(Some),
             None => Ok(None),
@@ -2334,7 +2374,7 @@ impl ReviewQueries {
                 .bind(run_id.to_string())
                 .fetch_all(pool.pool())
                 .await
-                .map_err(|e| Error::database(format!("failed to list review findings: {}", e)))?;
+                .map_err(|e| Error::database(format!("failed to list review findings: {e}")))?;
         rows.into_iter().map(hydrate_review_finding).collect()
     }
 }
@@ -2546,9 +2586,10 @@ mod tests {
             crate::models::RunnerType::Docker,
             2,
         );
-        let registered = RunnerQueries::register_or_refresh(&pool, &first)
+        let (registered, outcome) = RunnerQueries::register_or_refresh(&pool, &first)
             .await
             .unwrap();
+        assert_eq!(outcome, RunnerRegistration::Created);
 
         let mut restarted = crate::models::Runner::new(
             "stable-runner".to_string(),
@@ -2556,14 +2597,132 @@ mod tests {
             4,
         );
         restarted.set_busy();
-        let refreshed = RunnerQueries::register_or_refresh(&pool, &restarted)
+        let (refreshed, outcome) = RunnerQueries::register_or_refresh(&pool, &restarted)
             .await
             .unwrap();
+        assert_eq!(outcome, RunnerRegistration::Refreshed);
 
         assert_eq!(refreshed.id, registered.id);
         assert_eq!(refreshed.capacity, 4);
         assert_eq!(refreshed.status, "busy");
         assert_eq!(RunnerQueries::list(&pool).await.unwrap().len(), 1);
+    }
+
+    /// Concurrent registrations of one name must converge on a single row.
+    /// The SELECT-then-INSERT race window is closed by the unique index on
+    /// runners(name); losers of the insert race fall through to the refresh
+    /// path, so every caller succeeds and the registry stays honest.
+    #[tokio::test]
+    async fn test_runner_registration_converges_under_concurrency() {
+        let pool = std::sync::Arc::new(Pool::memory().await.unwrap());
+        pool.migrate().await.unwrap();
+
+        let mut handles = Vec::new();
+        for attempt in 0..8 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                let runner = crate::models::Runner::new(
+                    "shared-runner".to_string(),
+                    crate::models::RunnerType::Docker,
+                    attempt + 1,
+                );
+                RunnerQueries::register_or_refresh(&pool, &runner).await
+            }));
+        }
+
+        let mut ids = std::collections::HashSet::new();
+        for handle in handles {
+            let (runner, _) = handle.await.unwrap().unwrap();
+            ids.insert(runner.id);
+        }
+
+        assert_eq!(ids.len(), 1, "all registrations must adopt one row");
+        assert_eq!(
+            RunnerQueries::list(&pool).await.unwrap().len(),
+            1,
+            "registry must hold exactly one row for the name"
+        );
+    }
+
+    /// The unique index is the backstop: even a raw duplicate insert is
+    /// rejected, and migration renames pre-existing duplicates instead of
+    /// dropping their audit records.
+    #[tokio::test]
+    async fn test_runner_name_unique_index_rejects_duplicates() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let first = crate::models::Runner::new(
+            "indexed-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        RunnerQueries::create(&pool, &first).await.unwrap();
+
+        let duplicate = crate::models::Runner::new(
+            "indexed-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        let error = RunnerQueries::create(&pool, &duplicate)
+            .await
+            .expect_err("duplicate name must be rejected by the unique index");
+        assert!(
+            error.message.contains("UNIQUE constraint failed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Migration must heal databases that accumulated one row per runner
+    /// restart before names were unique: the newest row keeps the name and
+    /// older duplicates are renamed (audit preserved), then the index holds.
+    #[tokio::test]
+    async fn test_migration_renames_duplicate_runner_names() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        // Simulate a pre-index database: drop the index, insert duplicates.
+        sqlx::query("DROP INDEX idx_runners_name")
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        let now = Utc::now().to_rfc3339();
+        let older = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        for (id, updated) in [
+            ("11111111-1111-1111-1111-111111111111", older),
+            ("22222222-2222-2222-2222-222222222222", Utc::now()),
+        ] {
+            sqlx::query(
+                "INSERT INTO runners (id, name, runner_type, status, capacity, labels, last_heartbeat, created_at, updated_at) \
+                 VALUES (?, 'dup-runner', 'docker', 'offline', 1, '[]', NULL, ?, ?)",
+            )
+            .bind(id)
+            .bind(now.clone())
+            .bind(updated.to_rfc3339())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        }
+
+        // Re-running migration deduplicates and recreates the index.
+        pool.migrate().await.unwrap();
+
+        let runners = RunnerQueries::list(&pool).await.unwrap();
+        assert_eq!(runners.len(), 2, "audit records must be preserved");
+        let kept: Vec<_> = runners.iter().filter(|r| r.name == "dup-runner").collect();
+        assert_eq!(kept.len(), 1, "newest row keeps the operator-facing name");
+        assert_eq!(
+            kept[0].id.to_string(),
+            "22222222-2222-2222-2222-222222222222"
+        );
+        let legacy: Vec<_> = runners
+            .iter()
+            .filter(|r| r.name.contains("-legacy-"))
+            .collect();
+        assert_eq!(legacy.len(), 1);
+        assert!(legacy[0].name.starts_with("dup-runner-legacy-"));
     }
 
     #[tokio::test]

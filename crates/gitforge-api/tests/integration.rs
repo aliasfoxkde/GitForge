@@ -267,7 +267,7 @@ async fn test_auth_with_expired_claims() {
         .oneshot(
             Request::builder()
                 .uri("/api/repos")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -335,7 +335,7 @@ async fn test_create_repo_with_valid_auth() {
             Request::builder()
                 .method("POST")
                 .uri("/api/repos")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"name": "test-repo"}"#))
                 .unwrap(),
@@ -605,7 +605,7 @@ async fn test_get_nonexistent_repo() {
         .oneshot(
             Request::builder()
                 .uri("/api/repos/00000000-0000-0000-0000-000000000000")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -644,7 +644,7 @@ async fn test_delete_nonexistent_repo() {
             Request::builder()
                 .method("DELETE")
                 .uri("/api/repos/00000000-0000-0000-0000-000000000000")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -702,7 +702,7 @@ async fn test_api_pipeline_runs_endpoint() {
         .oneshot(
             Request::builder()
                 .uri("/api/ci/pipeline-runs")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -715,8 +715,7 @@ async fn test_api_pipeline_runs_endpoint() {
         status == StatusCode::OK
             || status == StatusCode::INTERNAL_SERVER_ERROR
             || status == StatusCode::NOT_FOUND,
-        "Unexpected status: {}",
-        status
+        "Unexpected status: {status}"
     );
 }
 
@@ -750,7 +749,7 @@ async fn test_api_artifacts_endpoint() {
         .oneshot(
             Request::builder()
                 .uri("/api/artifacts")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1125,7 +1124,7 @@ async fn test_api_runners_endpoint() {
         .oneshot(
             Request::builder()
                 .uri("/api/runners")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1137,6 +1136,154 @@ async fn test_api_runners_endpoint() {
         response.status() == StatusCode::OK
             || response.status() == StatusCode::INTERNAL_SERVER_ERROR
     );
+}
+
+#[tokio::test]
+async fn test_api_runner_registration_adopts_existing_name() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforge_db::models::User::new(
+        "runner-admin".to_string(),
+        "runner-admin@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+    let auth = ApiAuth::new("test-secret");
+    let token = auth
+        .generate_token(user.id, "runner-admin", "admin")
+        .unwrap();
+
+    let body = r#"{"name":"stable-api-runner","type":"docker","capacity":2}"#;
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runners")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+
+    // A restarted agent re-registers under the same name: the existing row
+    // is adopted, not duplicated.
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runners")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+    let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+
+    assert_eq!(
+        first_json["id"], second_json["id"],
+        "re-registration must return the adopted runner id"
+    );
+
+    let listed = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/runners")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let list_body = to_bytes(listed.into_body(), usize::MAX).await.unwrap();
+    let runners: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    let same_name = runners
+        .as_array()
+        .expect("runner list is a JSON array")
+        .iter()
+        .filter(|r| r["name"] == "stable-api-runner")
+        .count();
+    assert_eq!(same_name, 1, "registry must hold one row for the name");
+}
+
+#[tokio::test]
+async fn test_api_runner_list_derives_status_from_heartbeat() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforge_db::models::User::new(
+        "hb-admin".to_string(),
+        "hb-admin@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+
+    // A registry row left online whose heartbeat died long ago — the shape
+    // a scheduler restart leaves behind.
+    let mut stale = Runner::new("stale-runner".to_string(), RunnerType::Docker, 2);
+    stale.last_heartbeat = Some(chrono::Utc::now() - chrono::Duration::seconds(3600));
+    gitforge_db::queries::RunnerQueries::create(&pool, &stale)
+        .await
+        .unwrap();
+
+    let fresh = Runner::new("fresh-runner".to_string(), RunnerType::Docker, 2);
+    gitforge_db::queries::RunnerQueries::create(&pool, &fresh)
+        .await
+        .unwrap();
+
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+    let token = ApiAuth::new("test-secret")
+        .generate_token(user.id, "hb-admin", "admin")
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/runners")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let runners: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let by_name: std::collections::HashMap<String, String> = runners
+        .as_array()
+        .expect("runner list is a JSON array")
+        .iter()
+        .map(|r| {
+            (
+                r["name"].as_str().unwrap().to_string(),
+                r["status"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        by_name["stale-runner"], "offline",
+        "persisted online with a dead heartbeat must report offline"
+    );
+    assert_eq!(by_name["fresh-runner"], "online");
 }
 
 #[tokio::test]
@@ -1166,7 +1313,7 @@ async fn test_api_get_nonexistent_artifact() {
         .oneshot(
             Request::builder()
                 .uri("/api/artifacts/00000000-0000-0000-0000-000000000000")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1210,7 +1357,7 @@ async fn test_api_delete_nonexistent_artifact() {
             Request::builder()
                 .method("DELETE")
                 .uri("/api/artifacts/00000000-0000-0000-0000-000000000000")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1253,7 +1400,7 @@ async fn test_api_artifact_invalid_id() {
         .oneshot(
             Request::builder()
                 .uri("/api/artifacts/invalid-uuid")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1293,7 +1440,7 @@ async fn test_api_job_artifacts_empty() {
         .oneshot(
             Request::builder()
                 .uri("/api/jobs/00000000-0000-0000-0000-000000000000/artifacts")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1358,7 +1505,7 @@ async fn test_api_pipelines_endpoint_list() {
         .oneshot(
             Request::builder()
                 .uri("/api/pipelines")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1396,7 +1543,7 @@ async fn test_api_pipeline_runs_endpoint_list() {
         .oneshot(
             Request::builder()
                 .uri("/api/pipeline-runs")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1434,7 +1581,7 @@ async fn test_api_get_nonexistent_pipeline() {
         .oneshot(
             Request::builder()
                 .uri("/api/pipelines/00000000-0000-0000-0000-000000000000")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1472,7 +1619,7 @@ async fn test_api_get_nonexistent_pipeline_run() {
         .oneshot(
             Request::builder()
                 .uri("/api/pipeline-runs/00000000-0000-0000-0000-000000000000")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1510,7 +1657,7 @@ async fn test_api_pipeline_invalid_id() {
         .oneshot(
             Request::builder()
                 .uri("/api/pipelines/invalid-uuid")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1547,7 +1694,7 @@ async fn test_api_pipeline_run_invalid_id() {
         .oneshot(
             Request::builder()
                 .uri("/api/pipeline-runs/invalid-uuid")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1584,7 +1731,7 @@ async fn test_api_get_nonexistent_job() {
         .oneshot(
             Request::builder()
                 .uri("/api/jobs/00000000-0000-0000-0000-000000000000")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1622,7 +1769,7 @@ async fn test_api_job_invalid_id() {
         .oneshot(
             Request::builder()
                 .uri("/api/jobs/invalid-uuid")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1660,7 +1807,7 @@ async fn test_api_webhook_trigger_invalid_pipeline_id() {
             Request::builder()
                 .method("POST")
                 .uri("/api/webhook/trigger/invalid-uuid")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"repo_id":"550e8400-e29b-41d4-a716-446655440000","commit_hash":"abc123","branch":"main"}"#))
                 .unwrap(),
@@ -1697,8 +1844,8 @@ async fn test_api_webhook_trigger_not_found() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/webhook/trigger/{}", valid_uuid))
-                .header("Authorization", format!("Bearer {}", token))
+                .uri(format!("/api/webhook/trigger/{valid_uuid}"))
+                .header("Authorization", format!("Bearer {token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"repo_id":"550e8400-e29b-41d4-a716-446655440000","commit_hash":"abc123","branch":"main"}"#))
                 .unwrap(),
@@ -1725,7 +1872,7 @@ async fn test_api_webhook_trigger_unauthorized() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/webhook/trigger/{}", valid_uuid))
+                .uri(format!("/api/webhook/trigger/{valid_uuid}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"repo_id":"550e8400-e29b-41d4-a716-446655440000","commit_hash":"abc123","branch":"main"}"#))
                 .unwrap(),
@@ -1814,9 +1961,9 @@ async fn test_api_webhook_trigger_success() {
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/webhook/trigger/{}", pipeline.id))
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .header("Content-Type", "application/json")
-                .body(Body::from(format!(r#"{{"repo_id":"{}","commit_hash":"abc123","branch":"main","pipeline_name":"ci-pipeline"}}"#, repo_id)))
+                .body(Body::from(format!(r#"{{"repo_id":"{repo_id}","commit_hash":"abc123","branch":"main","pipeline_name":"ci-pipeline"}}"#)))
                 .unwrap(),
         )
         .await
@@ -1948,8 +2095,8 @@ async fn test_api_get_job_with_valid_auth() {
     let response = app
         .oneshot(
             Request::builder()
-                .uri(format!("/api/ci/jobs/{}", valid_uuid))
-                .header("Authorization", format!("Bearer {}", token))
+                .uri(format!("/api/ci/jobs/{valid_uuid}"))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2184,8 +2331,8 @@ async fn test_api_pipeline_runs_with_jobs() {
     let response = app
         .oneshot(
             Request::builder()
-                .uri(format!("/api/pipeline-runs/{}", run_id))
-                .header("Authorization", format!("Bearer {}", token))
+                .uri(format!("/api/pipeline-runs/{run_id}"))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2224,7 +2371,7 @@ async fn test_api_get_pipeline_run_not_found() {
         .oneshot(
             Request::builder()
                 .uri("/api/pipeline-runs/00000000-0000-0000-0000-000000000001")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2282,7 +2429,7 @@ async fn test_api_get_pipeline_with_invalid_id_format() {
         .oneshot(
             Request::builder()
                 .uri("/api/pipelines/not-a-uuid")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2359,7 +2506,7 @@ async fn review_post_json(
         .uri(uri)
         .header("content-type", "application/json");
     if let Some(token) = token {
-        builder = builder.header("authorization", format!("Bearer {}", token));
+        builder = builder.header("authorization", format!("Bearer {token}"));
     }
     app.oneshot(
         builder
@@ -2377,7 +2524,7 @@ async fn review_get(
 ) -> axum::http::Response<axum::body::Body> {
     let mut builder = Request::builder().method("GET").uri(uri);
     if let Some(token) = token {
-        builder = builder.header("authorization", format!("Bearer {}", token));
+        builder = builder.header("authorization", format!("Bearer {token}"));
     }
     app.oneshot(builder.body(Body::empty()).unwrap())
         .await
@@ -2438,7 +2585,7 @@ async fn test_review_run_submit_created_then_idempotent_retry() {
     let response = review_get(
         app,
         Some(&owner_token),
-        &format!("/api/review-runs/{}", run_id),
+        &format!("/api/review-runs/{run_id}"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -2487,7 +2634,7 @@ async fn test_review_run_submit_head_conflict() {
     let response = review_get(
         app,
         Some(&owner_token),
-        &format!("/api/review-runs/{}", existing_run_id),
+        &format!("/api/review-runs/{existing_run_id}"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -2559,8 +2706,7 @@ async fn test_review_run_submit_rejects_malformed_input() {
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
-            "expected 400 for case {}",
-            case_label
+            "expected 400 for case {case_label}"
         );
     }
 
@@ -2570,7 +2716,7 @@ async fn test_review_run_submit_rejects_malformed_input() {
             Request::builder()
                 .method("POST")
                 .uri("/api/review-runs")
-                .header("authorization", format!("Bearer {}", owner_token))
+                .header("authorization", format!("Bearer {owner_token}"))
                 .header("content-type", "application/json")
                 .body(Body::from("{not json"))
                 .unwrap(),
@@ -2654,15 +2800,14 @@ async fn test_review_run_access_is_owner_scoped() {
     let run_id = created["run"]["id"].as_str().unwrap().to_string();
 
     for uri in [
-        format!("/api/review-runs/{}", run_id),
-        format!("/api/review-runs/{}/findings", run_id),
+        format!("/api/review-runs/{run_id}"),
+        format!("/api/review-runs/{run_id}/findings"),
     ] {
         let response = review_get(app.clone(), Some(&other_token), &uri).await;
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
-            "non-owner must not observe run via {}",
-            uri
+            "non-owner must not observe run via {uri}"
         );
     }
 
@@ -2686,7 +2831,7 @@ async fn test_review_run_access_is_owner_scoped() {
     let response = review_get(
         app,
         Some(&owner_token),
-        &format!("/api/review-runs/{}", orphan_id),
+        &format!("/api/review-runs/{orphan_id}"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -2699,7 +2844,7 @@ async fn test_review_run_missing_returns_404() {
     let response = review_get(
         app,
         Some(&owner_token),
-        &format!("/api/review-runs/{}", missing),
+        &format!("/api/review-runs/{missing}"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -2733,8 +2878,8 @@ async fn test_review_findings_are_ordered_deterministic_and_bounded() {
         line,
         severity: "warning".to_string(),
         category: category.to_string(),
-        title: format!("finding {}", category),
-        message: format!("message {}", category),
+        title: format!("finding {category}"),
+        message: format!("message {category}"),
         evidence: None,
         confidence: "high".to_string(),
         position_status: if line.is_some() {
@@ -2784,7 +2929,7 @@ async fn test_review_findings_are_ordered_deterministic_and_bounded() {
     let response = review_get(
         app.clone(),
         Some(&owner_token),
-        &format!("{}?limit=2&offset=1", uri),
+        &format!("{uri}?limit=2&offset=1"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -2797,18 +2942,8 @@ async fn test_review_findings_are_ordered_deterministic_and_bounded() {
 
     // Invalid pagination is rejected.
     for query in ["limit=0", "limit=501"] {
-        let response = review_get(
-            app.clone(),
-            Some(&owner_token),
-            &format!("{}?{}", uri, query),
-        )
-        .await;
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "query {}",
-            query
-        );
+        let response = review_get(app.clone(), Some(&owner_token), &format!("{uri}?{query}")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "query {query}");
     }
 
     // Malformed run id.

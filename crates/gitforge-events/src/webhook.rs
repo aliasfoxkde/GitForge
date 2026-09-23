@@ -531,28 +531,28 @@ mod tests {
             WebhookEvent::PipelineCompleted,
             serde_json::json!({"id": "123"}),
         );
-        let debug_str = format!("{:?}", payload);
+        let debug_str = format!("{payload:?}");
         assert!(debug_str.contains("WebhookPayload"));
     }
 
     #[test]
     fn test_webhook_event_debug() {
         let event = WebhookEvent::PipelineCompleted;
-        let debug_str = format!("{:?}", event);
+        let debug_str = format!("{event:?}");
         assert!(debug_str.contains("PipelineCompleted"));
     }
 
     #[test]
     fn test_webhook_config_debug() {
         let config = WebhookConfig::default();
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
         assert!(debug_str.contains("WebhookConfig"));
     }
 
     #[test]
     fn test_webhook_error_debug() {
         let error = WebhookError::Network("test".to_string());
-        let debug_str = format!("{:?}", error);
+        let debug_str = format!("{error:?}");
         assert!(debug_str.contains("Network"));
     }
 

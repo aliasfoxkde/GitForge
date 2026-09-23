@@ -240,7 +240,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             let api_client = GitForgeClient::new(&server, token.clone());
 
             if let Some(username) = login {
-                println!("🔐 Authenticating as {} to {}", username, server);
+                println!("🔐 Authenticating as {username} to {server}");
                 println!("   Enter password: ");
 
                 // Read password from stdin
@@ -264,7 +264,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        println!("❌ Login failed: {}", e);
+                        println!("❌ Login failed: {e}");
                         println!("   Please check your username and password.");
                     }
                 }
@@ -272,7 +272,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 let mut config = config.clone();
                 config.token = None;
                 if let Err(e) = config.save() {
-                    println!("⚠️  Warning: Failed to clear credentials: {}", e);
+                    println!("⚠️  Warning: Failed to clear credentials: {e}");
                 }
                 println!("👋 Logged out. Credentials cleared.");
                 println!("   Run `gitforge auth login <username>` to authenticate again.");
@@ -280,21 +280,21 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 match api_client.auth_status().await {
                     Ok(status) => {
                         if status.authenticated {
-                            println!("✅ Authenticated to {}", server);
+                            println!("✅ Authenticated to {server}");
                             println!("   Username: {}", status.username.unwrap_or_default());
                             if let Some(role) = status.role {
-                                println!("   Role: {}", role);
+                                println!("   Role: {role}");
                             }
                         } else {
                             println!("❌ Not authenticated.");
                             if let Some(msg) = status.message {
-                                println!("   Reason: {}", msg);
+                                println!("   Reason: {msg}");
                             }
                             println!("   Run `gitforge auth login <username>` to authenticate.");
                         }
                     }
                     Err(e) => {
-                        println!("❌ Failed to check auth status: {}", e);
+                        println!("❌ Failed to check auth status: {e}");
                         if token.is_some() {
                             println!("   You have a token but the server may be unreachable.");
                         }
@@ -305,18 +305,18 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     Ok(status) => {
                         if status.authenticated {
                             println!("👤 Authenticated user");
-                            println!("   Server: {}", server);
+                            println!("   Server: {server}");
                             println!("   User ID: {}", status.user_id.unwrap_or_default());
                             println!("   Username: {}", status.username.unwrap_or_default());
                             if let Some(role) = status.role {
-                                println!("   Role: {}", role);
+                                println!("   Role: {role}");
                             }
                         } else {
                             println!("❌ Not authenticated.");
                         }
                     }
                     Err(e) => {
-                        println!("❌ Failed to get user info: {}", e);
+                        println!("❌ Failed to get user info: {e}");
                     }
                 }
             }
@@ -362,7 +362,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             if *list {
                 match api_client.list_repos().await {
                     Ok(repos) => {
-                        println!("📦 Repositories on {}:", server);
+                        println!("📦 Repositories on {server}:");
                         println!();
                         if repos.is_empty() {
                             println!("  No repositories found.");
@@ -378,11 +378,11 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("  Run `gitforge repo create <name>` to create a new repository.");
                     }
                     Err(e) => {
-                        println!("❌ Failed to list repositories: {}", e);
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(name) = create {
-                println!("📦 Creating repository '{}'...", name);
+                println!("📦 Creating repository '{name}'...");
                 match api_client
                     .create_repo(name, Some("private".to_string()))
                     .await
@@ -394,7 +394,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("   Visibility: {}", repo.visibility);
                     }
                     Err(e) => {
-                        println!("❌ Failed to create repository: {}", e);
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(id) = info {
@@ -408,27 +408,27 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("   Created: {}", repo.created_at);
                     }
                     Err(e) => {
-                        println!("❌ Failed to get repository: {}", e);
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(id) = delete {
-                println!("⚠️  Deleting repository '{}'...", id);
+                println!("⚠️  Deleting repository '{id}'...");
                 println!("   This action is irreversible!");
                 match api_client.delete_repo(id).await {
-                    Ok(_) => {
+                    Ok(()) => {
                         println!("✅ Repository deleted successfully.");
                     }
                     Err(e) => {
-                        println!("❌ Failed to delete repository: {}", e);
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(url_or_name) = clone {
                 println!("📥 Cloning repository...");
-                println!("   Source: {}", url_or_name);
+                println!("   Source: {url_or_name}");
                 println!("   (Use `gitforge git clone <repo>` for actual cloning)");
             } else if let Some(path) = init {
                 println!("🔧 Initializing directory as GitForge repository...");
-                println!("   Path: {}", path);
+                println!("   Path: {path}");
                 println!("   (API not yet wired)");
             }
         }
@@ -450,7 +450,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("   Adding GitForge remote...");
                 println!("   (Actual git init would be performed here)");
             } else if let Some(url) = clone {
-                println!("📥 Cloning from {}...", url);
+                println!("📥 Cloning from {url}...");
                 println!("   This will clone the repository to the current directory.");
                 println!("   (Actual git clone would be performed here)");
                 println!();
@@ -469,12 +469,12 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 if files == "." {
                     println!("📝 Staging all changes...");
                 } else {
-                    println!("📝 Staging: {}", files);
+                    println!("📝 Staging: {files}");
                 }
                 println!("   (Actual git add would be performed here)");
             } else if let Some(msg) = commit {
                 println!("💾 Committing...");
-                println!("   Message: {}", msg);
+                println!("   Message: {msg}");
                 println!("   (Actual git commit would be performed here)");
             } else if *log {
                 print!("{}", run_git(&["log", "-5", "--oneline", "--decorate"])?);
@@ -496,7 +496,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             if *list {
                 match api_client.list_pipelines().await {
                     Ok(pipelines) => {
-                        println!("⚙️  Pipelines on {}:", server);
+                        println!("⚙️  Pipelines on {server}:");
                         println!();
                         if pipelines.is_empty() {
                             println!("  No pipelines found.");
@@ -517,7 +517,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("  Run `gitforge pipeline create <name>` to create a pipeline.");
                     }
                     Err(e) => {
-                        println!("❌ Failed to list pipelines: {}", e);
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(id) = show {
@@ -529,14 +529,14 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("   Enabled: {}", pipeline.enabled);
                     }
                     Err(e) => {
-                        println!("❌ Failed to get pipeline: {}", e);
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(id) = run {
-                println!("🚀 Triggering pipeline: {}", id);
+                println!("🚀 Triggering pipeline: {id}");
                 println!("   (Pipeline trigger not yet implemented)");
             } else if let Some(id) = watch {
-                println!("👁️  Watching pipeline: {}", id);
+                println!("👁️  Watching pipeline: {id}");
                 println!("   (Pipeline watch not yet implemented)");
             } else if let Some(_name) = create {
                 println!("⚙️  Creating pipeline...");
@@ -559,7 +559,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             if *list {
                 match api_client.list_runners().await {
                     Ok(runners) => {
-                        println!("🤖 Runners on {}:", server);
+                        println!("🤖 Runners on {server}:");
                         println!();
                         if runners.is_empty() {
                             println!("  No runners registered.");
@@ -575,7 +575,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("  Run `gitforge runner register <name>` to register a runner.");
                     }
                     Err(e) => {
-                        println!("❌ Failed to list runners: {}", e);
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(id) = info {
@@ -587,26 +587,26 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("   Status: {}", runner.status);
                         println!("   Capacity: {}", runner.capacity);
                         if let Some(lhb) = runner.last_heartbeat {
-                            println!("   Last Heartbeat: {}", lhb);
+                            println!("   Last Heartbeat: {lhb}");
                         }
                     }
                     Err(e) => {
-                        println!("❌ Failed to get runner: {}", e);
+                        println!("❌ {e}");
                     }
                 }
             } else if let Some(name) = register {
                 let cap = capacity.unwrap_or(2);
-                println!("🤖 Registering runner: {}", name);
-                println!("   Server: {}", server);
-                println!("   Capacity: {} concurrent jobs", cap);
+                println!("🤖 Registering runner: {name}");
+                println!("   Server: {server}");
+                println!("   Capacity: {cap} concurrent jobs");
                 println!("   (Runner registration not yet implemented)");
             } else if let Some(id) = deregister {
                 match api_client.retire_runner(id).await {
-                    Ok(()) => println!("✅ Runner {} retired (audit record preserved)", id),
-                    Err(e) => println!("❌ Failed to retire runner: {}", e),
+                    Ok(()) => println!("✅ Runner {id} retired (audit record preserved)"),
+                    Err(e) => println!("❌ {e}"),
                 }
             } else if let Some(cap) = capacity {
-                println!("🤖 Updating runner capacity to: {}", cap);
+                println!("🤖 Updating runner capacity to: {cap}");
                 println!("   (Runner capacity update not yet implemented)");
             }
         }
@@ -622,7 +622,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             if let Some(directory) = init {
                 let path = PathBuf::from(directory);
                 if path.exists() {
-                    anyhow::bail!("Directory {} already exists", directory);
+                    anyhow::bail!("Directory {directory} already exists");
                 }
                 std::fs::create_dir_all(&path)?;
                 let init_client = sync::SyncClient::with_real_client(path.clone());
@@ -637,9 +637,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("   Local storage: {}", local_dir.display());
                 let sync_client = sync::SyncClient::with_real_client(local_dir.clone());
                 let sync_status = sync_client.status().await;
-                println!("   Sync state: {:?}", sync_status);
+                println!("   Sync state: {sync_status:?}");
                 println!();
-                println!("   Server: {}", server);
+                println!("   Server: {server}");
                 println!(
                     "   (Authenticated: {})",
                     if token.is_some() { "yes" } else { "no" }
@@ -660,7 +660,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         }
                         Err(e) => {
                             tracing::error!("Push failed: {}", e);
-                            println!("❌ Push failed: {}", e);
+                            println!("❌ Push failed: {e}");
                         }
                     }
                 } else {
@@ -679,7 +679,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         }
                         Err(e) => {
                             tracing::error!("Pull failed: {}", e);
-                            println!("❌ Pull failed: {}", e);
+                            println!("❌ Pull failed: {e}");
                         }
                     }
                 } else {
@@ -705,7 +705,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             };
 
             let provider_type = provider_type_from_name(provider).map_err(|e| {
-                eprintln!("❌ {}", e);
+                eprintln!("❌ {e}");
                 anyhow::anyhow!("invalid provider")
             })?;
 
@@ -731,10 +731,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
 
             let branch = get_current_branch(&repo_path).unwrap_or_else(|_| "unknown".to_string());
-            let repo_name = repo_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
+            let repo_name = repo_path.file_name().map_or_else(
+                || "unknown".to_string(),
+                |n| n.to_string_lossy().to_string(),
+            );
 
             let context_str = context.as_deref().unwrap_or("");
 
@@ -750,7 +750,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             print_diff_stats(&diff_text).ok();
             print_complexity(changes);
             println!();
-            println!("🔍 Running {} AI review...", provider);
+            println!("🔍 Running {provider} AI review...");
 
             match run_review(provider_type, &request).await {
                 Ok(response) => {
@@ -761,8 +761,8 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    println!("❌ Review failed: {}", e);
-                    anyhow::bail!("review generation failed: {}", e);
+                    println!("❌ Review failed: {e}");
+                    anyhow::bail!("review generation failed: {e}");
                 }
             }
         }
@@ -1296,8 +1296,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("Unknown provider") || err_msg.contains("invalid provider"),
-            "expected 'Unknown provider' or 'invalid provider' in error, got: {}",
-            err_msg
+            "expected 'Unknown provider' or 'invalid provider' in error, got: {err_msg}"
         );
     }
 
@@ -1319,8 +1318,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("--diff") || err_msg.contains("diff_content"),
-            "expected error to mention --diff or diff_content, got: {}",
-            err_msg
+            "expected error to mention --diff or diff_content, got: {err_msg}"
         );
     }
 
@@ -1392,10 +1390,10 @@ mod tests {
         let result = provider_type_from_name("not_a_provider");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Unknown provider"), "got: {}", err);
-        assert!(err.contains("not_a_provider"), "got: {}", err);
-        assert!(err.contains("anthropic"), "got: {}", err);
-        assert!(err.contains("openai"), "got: {}", err);
-        assert!(err.contains("ollama"), "got: {}", err);
+        assert!(err.contains("Unknown provider"), "got: {err}");
+        assert!(err.contains("not_a_provider"), "got: {err}");
+        assert!(err.contains("anthropic"), "got: {err}");
+        assert!(err.contains("openai"), "got: {err}");
+        assert!(err.contains("ollama"), "got: {err}");
     }
 }
