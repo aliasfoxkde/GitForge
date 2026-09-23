@@ -2,6 +2,53 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [0.6.6] - 2026-09-23
+
+Deployed release `gitforge-d821d44-20260922` (source `d821d44e`). Three
+CI-correctness fixes found by making GitForge's own pipeline actually run
+to completion on the refreshed CI image — each observed live before it was
+fixed. Includes the previously unreleased history (v0.6.2 shipped
+tag-only; v0.6.3–v0.6.5 bundles were never GitHub-released).
+
+### Fixed
+
+- **False-green reconciliation after a CI restart (#212)**: chained jobs
+  are enqueued lazily, so a `gitforge@ci` restart mid-pipeline left only
+  the head job as a durable row and orphaned-run reconciliation graded the
+  run `succeeded` with the rest of the pipeline never executed (observed:
+  two runs "succeeded" with 1 of 3 jobs). Reconciliation now compares
+  durable job rows against the run's persisted pipeline definition and
+  grades a shortfall `failed` (`incomplete_chain=true` in the finalize
+  log); unreadable/legacy definitions keep the row-only grading
+- **Build-daemon cargo resolution (#213)**: with `CARGO_REAL` unset every
+  submitted job ran through `rustup run stable cargo`, which fails where
+  the default toolchain is dated with no `stable` alias — including the
+  `dsc-ci-rust:6` image. The daemon now resolves the real cargo binary
+  once per lifetime via `rustup which cargo`; the bypass env still wins
+- **Docker-dependent agent tests (#214)**: nine `agent` tests constructed
+  `RunnerAgent` without the module's `docker_daemon_available()` guard and
+  panicked inside the CI container. They exercise registration and
+  lifecycle state, not containers; they still run wherever a docker
+  daemon exists
+
+### Added
+
+- In-repo CI image recipe `infrastructure/docker/ci-rust.Dockerfile`
+  (#208) with the cache contract: any `Cargo.lock` change ⇒ rebuild the
+  image and bump its tag (deployed at `dsc-ci-rust:6`, which also bakes
+  `openssh-client` for the hermetic ssh-protocol suite, #211)
+- `GITFORGE_SANDBOX_MEMORY_MB` runner env override (#210); fixes OOM
+  SIGKILL of debug codegen/linking under the hardcoded 4 GiB default
+- Scheduler queue fairness (#209): fixes job starvation where one repo's
+  queued job waited 30+ min while other repos' jobs took freed slots
+
+### Validation
+
+- `gitforge-ci` pipeline (fmt → clippy → test on `dsc-ci-rust:6`) fully
+  green on the released commit under the fixed control plane — run
+  `c68cd7a8`, the first complete honest green on the refreshed image
+- `scripts/gitforge-status`: all four services `current`, overall healthy
+
 ## [0.5.0] - 2026-09-21
 
 ### Added
