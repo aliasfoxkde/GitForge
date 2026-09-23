@@ -1019,6 +1019,27 @@ async fn reconcile_orphaned_runs_filtered(
         if unfinished {
             continue;
         }
+        // The durable job rows only cover the jobs an engine has already
+        // enqueued: chained jobs are enqueued lazily as their dependencies
+        // turn terminal, so a run whose control-plane process died mid-chain
+        // leaves only its head job behind. Grading the surviving rows alone
+        // graded such a run `succeeded` with the rest of its pipeline never
+        // executed (observed 2026-09-22: two gitforge-ci runs finalized
+        // "succeeded" with 1 of 3 jobs after a control-plane restart —
+        // scheduler recovery re-ran the queued head job, nothing re-advanced
+        // the chain, and this pass saw "all jobs terminal"). Compare the rows
+        // against the run's persisted pipeline definition and grade the
+        // shortfall as a failure; when the definition cannot be recovered,
+        // fall back to row-only grading rather than inventing a failure.
+        let incomplete_chain = match expected_job_names(pool, run.pipeline_id).await {
+            Some(expected) => {
+                let enqueued: HashSet<&str> = jobs.iter().map(|job| job.name.as_str()).collect();
+                expected
+                    .iter()
+                    .any(|name| !enqueued.contains(name.as_str()))
+            }
+            None => false,
+        };
         let status = if jobs.is_empty() {
             // No engine will ever enqueue work for this run.
             "cancelled"
@@ -1032,6 +1053,12 @@ async fn reconcile_orphaned_runs_filtered(
             // failure; grading it `succeeded` here would publish a green
             // run whose job never finished.
             "failed"
+        } else if incomplete_chain {
+            // Every enqueued job succeeded, but the definition expects more
+            // jobs than were ever enqueued: the chain stopped advancing when
+            // its engine was lost, and the unenqueued remainder will never
+            // run.
+            "failed"
         } else {
             "succeeded"
         };
@@ -1039,11 +1066,26 @@ async fn reconcile_orphaned_runs_filtered(
             .await
             .is_ok()
         {
-            tracing::info!(run = %run.id, status, "finalized orphaned run");
+            tracing::info!(run = %run.id, status, incomplete_chain, "finalized orphaned run");
             finalized += 1;
         }
     }
     finalized
+}
+
+/// Job names the run's persisted pipeline definition expects, or `None`
+/// when the definition cannot be recovered (a legacy row or an unreadable
+/// config blob) — the caller then grades from the durable rows alone.
+async fn expected_job_names(
+    pool: &gitforge_db::Pool,
+    pipeline_id: gitforge_common::PipelineId,
+) -> Option<Vec<String>> {
+    let pipeline = gitforge_db::queries::PipelineQueries::get(pool, pipeline_id)
+        .await
+        .ok()
+        .flatten()?;
+    let definition: PipelineDefinition = serde_json::from_value(pipeline.config).ok()?;
+    Some(definition.jobs.into_iter().map(|job| job.name).collect())
 }
 
 async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
@@ -2327,6 +2369,97 @@ mod tests {
 
         // Reconciliation is idempotent: a second pass finds nothing stranded.
         assert_eq!(reconcile_orphaned_runs(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_fails_run_with_unenqueued_chain_jobs() {
+        // A control-plane restart drops the in-memory engine that lazily
+        // enqueues chained jobs, so an interrupted run leaves only its head
+        // job behind. Grading the surviving rows alone published that run as
+        // "succeeded" with the rest of its pipeline never executed (the
+        // 2026-09-22 gitforge-ci false greens). The persisted definition is
+        // the missing half of the comparison.
+        let (pool, repo_id, _pipeline_id) = sweep_test_pool().await;
+        let definition = PipelineDefinition::parse(
+            r#"
+name: chain-check
+version: "1.0"
+trigger_on:
+  - push
+environment: {}
+jobs:
+  - name: fmt
+    image: ci:1
+    steps:
+      - name: check
+        run: cargo fmt --check
+    timeout: 5m
+
+  - name: test
+    image: ci:1
+    needs: [fmt]
+    steps:
+      - name: test
+        run: cargo test
+    timeout: 10m
+"#,
+        )
+        .unwrap();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &DbPipeline {
+                id: pipeline_id,
+                repo_id,
+                name: "chain-pipeline".to_string(),
+                trigger_type: "push".to_string(),
+                config: serde_json::to_value(&definition).unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Restart-interrupted shape: the engine enqueued and finished only
+        // the head job before the chain stopped advancing.
+        let interrupted = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, interrupted, "fmt", "succeeded").await;
+
+        // Identical statuses, but every definition job was enqueued: the
+        // full chain ran and grades succeeded exactly as before.
+        let complete = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, complete, "fmt", "succeeded").await;
+        seed_job(&pool, complete, "test", "succeeded").await;
+
+        reconcile_orphaned_runs(&pool).await;
+        assert_eq!(
+            run_status(&pool, interrupted).await,
+            "failed",
+            "a run whose definition has more jobs than were ever enqueued \
+             must not grade succeeded"
+        );
+        assert_eq!(
+            run_status(&pool, complete).await,
+            "succeeded",
+            "a run whose rows cover the definition still grades succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_row_only_fallback_when_definition_unreadable() {
+        // Legacy rows carry an empty config blob; the definition cannot be
+        // recovered, so grading falls back to the durable rows alone and a
+        // fully-succeeded partial row set still grades succeeded.
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        let legacy = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, legacy, "lint", "succeeded").await;
+
+        reconcile_orphaned_runs(&pool).await;
+        assert_eq!(
+            run_status(&pool, legacy).await,
+            "succeeded",
+            "an unreadable definition keeps the row-only grading"
+        );
     }
 
     #[tokio::test]
