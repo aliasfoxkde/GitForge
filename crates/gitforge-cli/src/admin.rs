@@ -60,15 +60,14 @@ mod tests {
     };
 
     fn test_artifact_directory() -> PathBuf {
-        let directory = env::var_os("CARGO_TARGET_DIR").map_or_else(
-            || {
-                env::current_dir()
-                    .expect("test working directory should be available")
-                    .join("target")
-            },
-            PathBuf::from,
-        );
-        directory.join("gitforge-cli-admin-tests")
+        // System temp (tmpfs on most deployments), NOT the cargo target
+        // directory: creating a fresh WAL-mode SQLite file costs 65-140s on
+        // compressed NAS mounts under load, which blows the pool's 30s
+        // acquire timeout and fails the suite (observed 2026-09-23), and a
+        // configured CARGO_TARGET_DIR would land right back on such a
+        // mount. Every other test in this crate uses `tempfile::tempdir()`
+        // for the same reason; the shared parent keeps leftovers findable.
+        env::temp_dir().join("gitforge-cli-admin-tests")
     }
 
     fn runtime_password() -> String {
