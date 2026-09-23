@@ -53,5 +53,12 @@ jobs:
     needs: [clippy]
     steps:
       - name: Workspace test suite
-        run: cargo test --workspace
+        # Bounded test parallelism: with the daemon's vfs storage driver the
+        # in-container fork/exec of the real `git` children spawned by the
+        # gitforge-core http tests is slow enough that at default parallelism
+        # (= host core count) the parent's request write races the child's
+        # readiness and fails with EPIPE — 3 of 4 runs lost that race while
+        # the same suite passed on the host. Two threads keeps the suite
+        # well inside the 60m timeout and makes the gate deterministic.
+        run: cargo test --workspace -- --test-threads=2
     timeout: 60m
