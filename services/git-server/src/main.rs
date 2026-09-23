@@ -596,14 +596,45 @@ async fn enqueue_ci_event(
         "old_hash": update.old_hash,
         "new_hash": update.new_hash,
     });
-    sqlx::query("INSERT INTO events (id, event_type, payload, created_at, delivery_attempts) VALUES (?, ?, ?, ?, 0)")
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind("ci.trigger.pending")
-        .bind(payload.to_string())
-        .bind(Utc::now().to_rfc3339())
-        .execute(pool.pool())
-        .await?;
-    Ok(())
+    // A lost trigger row is a lost pipeline: by this point the push is
+    // already accepted, so nothing else will ever retry this insert — the
+    // durable redelivery loop below only sees events that made it into the
+    // table. A single failed insert has been observed in production
+    // (2026-09-23): with a long transaction holding the database write
+    // lock, pushes were accepted while their CI triggers silently
+    // vanished, leaving no run and no retry. Bound the retry so a
+    // persistently broken database still surfaces an error instead of
+    // hanging the receive-pack response.
+    const ENQUEUE_ATTEMPTS: usize = 5;
+    const ENQUEUE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
+    let mut attempt = 1;
+    while attempt <= ENQUEUE_ATTEMPTS {
+        let result = sqlx::query("INSERT INTO events (id, event_type, payload, created_at, delivery_attempts) VALUES (?, ?, ?, ?, 0)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind("ci.trigger.pending")
+            .bind(payload.to_string())
+            .bind(Utc::now().to_rfc3339())
+            .execute(pool.pool())
+            .await;
+        match result {
+            Ok(_) => return Ok(()),
+            Err(error) if attempt < ENQUEUE_ATTEMPTS => {
+                tracing::warn!(
+                    repo_id = %repo_id,
+                    ref_name = %update.ref_name,
+                    attempt,
+                    error = %error,
+                    "ci trigger insert failed; retrying"
+                );
+                tokio::time::sleep(ENQUEUE_BACKOFF).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "ci trigger insert failed after {ENQUEUE_ATTEMPTS} attempts"
+    ))
 }
 
 async fn deliver_pending_ci_events(state: &AppState) -> anyhow::Result<()> {
