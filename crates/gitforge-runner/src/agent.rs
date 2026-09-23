@@ -2120,6 +2120,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_creation() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         assert!(agent.runner.is_none());
@@ -2158,6 +2162,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_register_unreachable_scheduler_allows_standalone() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // Legacy standalone fallback remains available behind an explicit
         // policy opt-in.
         let config = RunnerConfig {
@@ -2232,6 +2240,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_registration_retries_unavailable_scheduler_then_succeeds() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // The compose race: the scheduler is up but not ready (503) while the
         // runner is already registering. Registration must retry with backoff
         // and adopt the runner id once the scheduler accepts.
@@ -2254,6 +2266,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_registration_auth_rejection_is_not_retried() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // A rejected token does not heal by asking again: exactly one attempt
         // is made and the error names the authentication failure.
         let (url, connections) = spawn_status_server(&[401]).await;
@@ -2277,6 +2293,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_registration_exhausts_transport_retries() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // Nothing listens on the reserved port, so every attempt is a
         // transport error; the surfaced error must report the exhausted
         // attempt count.
@@ -2306,6 +2326,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_registration_policy_rejection_falls_back_only_when_allowed() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         // A 500 is a scheduler refusal, not "not ready yet": it is never
         // retried, it fails closed by default, and standalone fallback
         // requires the explicit opt-in.
@@ -2659,6 +2683,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_stop_when_not_running() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         // Stop without running should not panic
@@ -2851,6 +2879,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_is_running() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         assert!(!agent.is_running().await);
@@ -2897,6 +2929,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_run_requires_registration() {
+        if !docker_daemon_available() {
+            eprintln!("skipping: no Docker daemon for sandbox-backed agent test");
+            return;
+        }
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
 
