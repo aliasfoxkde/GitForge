@@ -961,6 +961,18 @@ const RECONCILE_INTERVAL_SECS: u64 = 60;
 /// handler enqueues seconds later.
 const RECONCILE_MIN_RUN_AGE_SECS: i64 = 600;
 
+/// Separately from the general grace window, the enqueue horizon governs
+/// only the jobless-run verdict. Chained jobs are enqueued lazily, so a run
+/// row can legitimately exist with zero durable job rows while the engine
+/// is still going to enqueue its head job — and under database write-lock
+/// contention that lag is not seconds: the 2026-09-23 docs push on the live
+/// instance had its head job enqueued 29 minutes after the run row, while
+/// the periodic sweep had already graded the run `cancelled` at minute 12.
+/// A jobless run younger than this horizon is left for the next pass; only
+/// a run that stays jobless past it is dead beyond any contention the
+/// enqueue has been observed to survive.
+const RECONCILE_EMPTY_RUN_HORIZON_SECS: i64 = 3600;
+
 /// Finalize non-terminal runs whose jobs are all terminal. `live_run_ids`
 /// and `min_age` guard the periodic pass against racing the push handler:
 /// a run with a registered engine still belongs to that engine, and a run
@@ -1041,8 +1053,18 @@ async fn reconcile_orphaned_runs_filtered(
             None => false,
         };
         let status = if jobs.is_empty() {
-            // No engine will ever enqueue work for this run.
-            "cancelled"
+            // Zero durable rows is the signature of an enqueue that has not
+            // happened yet, not proof it never will — see the enqueue
+            // horizon above. Cancelling inside that window killed a live
+            // run (2026-09-23, run 556dd836: graded cancelled at minute 12,
+            // head job enqueued at minute 29).
+            if Utc::now() - run.created_at
+                >= chrono::Duration::seconds(RECONCILE_EMPTY_RUN_HORIZON_SECS)
+            {
+                "cancelled"
+            } else {
+                continue;
+            }
         } else if jobs.iter().any(|job| job.status == "cancelled") {
             "cancelled"
         } else if jobs
@@ -2089,12 +2111,23 @@ mod tests {
         pipeline_id: gitforge_common::PipelineId,
         status: &str,
     ) -> gitforge_common::PipelineRunId {
-        let run = gitforge_db::models::PipelineRun::new(
+        seed_run_created_at(&pool, repo_id, pipeline_id, status, chrono::Utc::now()).await
+    }
+
+    async fn seed_run_created_at(
+        pool: &gitforge_db::Pool,
+        repo_id: gitforge_common::RepoId,
+        pipeline_id: gitforge_common::PipelineId,
+        status: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> gitforge_common::PipelineRunId {
+        let mut run = gitforge_db::models::PipelineRun::new(
             pipeline_id,
             repo_id,
             "push".to_string(),
             "abc123".to_string(),
         );
+        run.created_at = created_at;
         gitforge_db::queries::PipelineRunQueries::create(pool, &run)
             .await
             .unwrap();
@@ -2332,6 +2365,14 @@ mod tests {
         seed_job(&pool, still_active, "lint", "queued").await;
 
         let jobless = seed_run(&pool, repo_id, pipeline_id, "queued").await;
+        let jobless_beyond_enqueue_horizon = seed_run_created_at(
+            &pool,
+            repo_id,
+            pipeline_id,
+            "queued",
+            chrono::Utc::now() - chrono::Duration::seconds(RECONCILE_EMPTY_RUN_HORIZON_SECS + 60),
+        )
+        .await;
 
         let finalized = reconcile_orphaned_runs(&pool).await;
 
@@ -2357,8 +2398,13 @@ mod tests {
         );
         assert_eq!(
             run_status(&pool, jobless).await,
+            "queued",
+            "a fresh jobless run may still be awaiting its lazy enqueue; it is spared"
+        );
+        assert_eq!(
+            run_status(&pool, jobless_beyond_enqueue_horizon).await,
             "cancelled",
-            "a run with no jobs can never start; it is cancelled"
+            "a run still jobless past the enqueue horizon is dead"
         );
         assert_eq!(
             run_status(&pool, still_active).await,
@@ -2369,6 +2415,41 @@ mod tests {
 
         // Reconciliation is idempotent: a second pass finds nothing stranded.
         assert_eq!(reconcile_orphaned_runs(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_spares_fresh_jobless_run_for_lazy_enqueue() {
+        // The lazy enqueue can lag the run row far beyond the sweep's grace
+        // window: on 2026-09-23 the live instance's periodic pass graded a
+        // 12-minute-old jobless push run `cancelled` while the engine was
+        // still going to enqueue — its head job only materialized at minute
+        // 29 under database write-lock contention. Cancelling inside that
+        // window killed a live run and stranded its queued job, and the
+        // release gate then refused the commit because no green run existed
+        // for it — the gate doing its job on a control-plane defect.
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        let awaiting_enqueue = seed_run(&pool, repo_id, pipeline_id, "queued").await;
+        let dead = seed_run_created_at(
+            &pool,
+            repo_id,
+            pipeline_id,
+            "queued",
+            chrono::Utc::now() - chrono::Duration::seconds(RECONCILE_EMPTY_RUN_HORIZON_SECS * 2),
+        )
+        .await;
+
+        reconcile_orphaned_runs(&pool).await;
+
+        assert_eq!(
+            run_status(&pool, awaiting_enqueue).await,
+            "queued",
+            "a jobless run inside the enqueue horizon must not be graded"
+        );
+        assert_eq!(
+            run_status(&pool, dead).await,
+            "cancelled",
+            "a run jobless past the enqueue horizon is cancelled"
+        );
     }
 
     #[tokio::test]
@@ -2496,9 +2577,20 @@ jobs:
         assert_eq!(run_status(&pool, live_run).await, "running");
         drop(pool);
 
-        // Outside both guards the periodic pass finalizes the orphan.
+        // Outside both guards the periodic pass finalizes the orphan. The
+        // jobless verdict measures real elapsed time against the enqueue
+        // horizon, so the seed is backdated past it — a negative grace
+        // window alone cannot stand in for a run created long before this
+        // pass.
         let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
-        let stale_run = seed_run(&pool, repo_id, pipeline_id, "queued").await;
+        let stale_run = seed_run_created_at(
+            &pool,
+            repo_id,
+            pipeline_id,
+            "queued",
+            chrono::Utc::now() - chrono::Duration::seconds(RECONCILE_EMPTY_RUN_HORIZON_SECS + 60),
+        )
+        .await;
         let finalized = reconcile_orphaned_runs_filtered(
             &pool,
             &HashSet::new(),
