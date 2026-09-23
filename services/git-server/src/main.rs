@@ -510,6 +510,20 @@ async fn git_receive_pack(
     {
         Ok(response) => {
             for update in parse_receive_updates(&body) {
+                // A deletion push carries git's all-zero new hash and has no
+                // commit to build; forwarding it used to spawn a pipeline
+                // whose checkout failed immediately (observed 2026-09-24 as
+                // run 4b9497bb built at 000…0 after `feat/release-gate` was
+                // deleted). Branch creation (all-zero OLD hash) is real and
+                // still triggers.
+                if gitforge_common::is_zero_hash(&update.new_hash) {
+                    tracing::info!(
+                        repo_id = %repo_id,
+                        ref_name = %update.ref_name,
+                        "ref deleted; not triggering CI"
+                    );
+                    continue;
+                }
                 if let Err(error) = enqueue_ci_event(&state, repo_id, &update).await {
                     tracing::error!(
                         repo_id = %repo_id,
@@ -587,6 +601,16 @@ async fn enqueue_ci_event(
     repo_id: RepoId,
     update: &ReceiveUpdate,
 ) -> anyhow::Result<()> {
+    // Defense in depth for the deletion filter at the call site: no caller
+    // should publish a trigger with nothing to build, whatever the path.
+    if gitforge_common::is_zero_hash(&update.new_hash) {
+        tracing::warn!(
+            repo_id = %repo_id,
+            ref_name = %update.ref_name,
+            "refusing to enqueue CI trigger for all-zero new hash"
+        );
+        return Ok(());
+    }
     let Some(pool) = &state.db_pool else {
         anyhow::bail!("database is required for durable CI delivery");
     };
@@ -927,5 +951,66 @@ mod tests {
         std::env::set_var("GITFORGE_MAX_GIT_BODY_BYTES", "not-a-number");
         assert_eq!(max_git_body_bytes(), 512 * 1024 * 1024);
         std::env::remove_var("GITFORGE_MAX_GIT_BODY_BYTES");
+    }
+
+    // --- Ref-deletion trigger guard (F37) regression tests ---
+    //
+    // `git receive-pack` reports an all-zero new hash when a branch is
+    // deleted. Forwarding that as a CI trigger produced a pipeline run built
+    // at 000…0 whose checkout failed immediately (observed 2026-09-24 as run
+    // 4b9497bb after `feat/release-gate` was deleted). The tests below pin
+    // both halves of the fix: deletion updates survive wire parsing intact,
+    // and `enqueue_ci_event` refuses to publish them.
+
+    #[test]
+    fn test_parse_receive_updates_preserves_deletion_sentinel() {
+        let payload = "681fb4dfa3059321947bc3cfad93e11f0527f24a 0000000000000000000000000000000000000000 refs/heads/feat/gone\0report-status\n";
+        let input = format!("{:04x}{payload}0000", payload.len() + 4).into_bytes();
+        let updates = parse_receive_updates(&input);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].ref_name, "refs/heads/feat/gone");
+        // The deletion shape must reach the trigger path recognizable, or the
+        // enqueue guard could never classify it.
+        assert!(gitforge_common::is_zero_hash(&updates[0].new_hash));
+        assert!(!gitforge_common::is_zero_hash(&updates[0].old_hash));
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_ci_event_skips_all_zero_new_hash() {
+        let storage = Arc::new(FileStorageBackend::new("target/test-git-root-f37"));
+        let state = AppState {
+            http_handler: Arc::new(HttpGitHandler::new((*storage).clone())),
+            storage,
+            // Deliberately absent: the unguarded durable-delivery path bails
+            // without a pool, which is what makes the contrast case below a
+            // proof that the zero-hash branch really short-circuited.
+            db_pool: None,
+            ci_trigger_url: None,
+            ci_trigger_token: None,
+            http_client: reqwest::Client::new(),
+        };
+        let repo_id = RepoId::new();
+
+        let deletion = ReceiveUpdate {
+            old_hash: "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
+            new_hash: "0000000000000000000000000000000000000000".to_string(),
+            ref_name: "refs/heads/feat/gone".to_string(),
+        };
+        enqueue_ci_event(&state, repo_id, &deletion)
+            .await
+            .expect("a ref deletion has nothing to build; it must be a silent no-op");
+
+        // Same state, real hash: the guard does not fire, the function
+        // reaches the database requirement and fails loudly.
+        let real = ReceiveUpdate {
+            old_hash: deletion.old_hash,
+            new_hash: "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
+            ref_name: "refs/heads/feat/live".to_string(),
+        };
+        let result = enqueue_ci_event(&state, repo_id, &real).await;
+        assert!(
+            result.is_err(),
+            "a real commit hash must still require the durable database path"
+        );
     }
 }
