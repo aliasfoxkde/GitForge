@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Release gate: refuse a cut unless the live instance graded the exact
+# source commit with a full, honest pipeline run. This enforces the
+# master plan's F16 operating rule (never trust a green run whose durable
+# job count does not cover its pipeline definition) mechanically, instead
+# of relying on the operator remembering it.
+#
+# Evidence required, for one pipeline run of the source commit:
+#   - the run's status is succeeded
+#   - every durable job row of the run is succeeded
+#   - the durable job rows cover every job in the persisted pipeline
+#     definition, name for name (the lazy-enqueue false green left rows
+#     behind that graded green while the chain never advanced)
+#   - the persisted definition is readable — an unreadable definition
+#     cannot prove coverage, so the gate fails closed (unlike run
+#     reconciliation, which keeps row-only grading for legacy rows)
+#
+# Usage: gitforge-release-gate <40-hex-source-commit>
+# Environment:
+#   GITFORGE_RELEASE_DB         database to query (default <repo>/data/gitforge.db)
+#   GITFORGE_RELEASE_SKIP_GATE  set to 1 to skip the gate; the refusal to
+#                              pretend is printed loudly when used
+set -euo pipefail
+
+if [[ "${GITFORGE_RELEASE_SKIP_GATE:-}" == "1" ]]; then
+  printf 'release gate: SKIPPED via GITFORGE_RELEASE_SKIP_GATE=1; this cut is NOT gated on a green run\n' >&2
+  exit 0
+fi
+
+source_commit="${1:-}"
+if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'release gate: exact 40-hex source commit is required\n' >&2
+  exit 64
+fi
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+db_path="${GITFORGE_RELEASE_DB:-$repo_root/data/gitforge.db}"
+if [[ ! -f "$db_path" ]]; then
+  printf 'release gate: live database not found: %s (set GITFORGE_RELEASE_DB)\n' "$db_path" >&2
+  exit 1
+fi
+if ! command -v sqlite3 >/dev/null 2>&1; then
+  printf 'release gate: sqlite3 is required to read run evidence\n' >&2
+  exit 1
+fi
+
+# Read-only access with a busy timeout: the live services hold write locks
+# and the CLI default is to fail instantly instead of waiting.
+db_query() {
+  sqlite3 -batch -readonly "$db_path" ".timeout 15000" "$1"
+}
+
+refuse() {
+  printf 'release gate: REFUSED — %s\n' "$1" >&2
+  exit 1
+}
+
+runs=$(db_query "SELECT id || '|' || status FROM pipeline_runs WHERE commit_hash = '$source_commit' ORDER BY created_at DESC;")
+if [[ -z "$runs" ]]; then
+  refuse "no pipeline run exists on this instance for commit $source_commit"
+fi
+
+run_id=""
+while IFS='|' read -r candidate status; do
+  if [[ "$status" == "succeeded" ]]; then
+    run_id="$candidate"
+    break
+  fi
+done <<< "$runs"
+other_runs=$(awk -F'|' '{ printf "  %s=%s\n", substr($1, 1, 8), $2 }' <<< "$runs")
+if [[ -z "$run_id" ]]; then
+  refuse "no succeeded run for $source_commit; existing runs:
+$other_runs"
+fi
+if [[ ! "$run_id" =~ ^[0-9a-f-]+$ ]]; then
+  refuse "run id for $source_commit has an unexpected shape: $run_id"
+fi
+
+counts=$(db_query "SELECT
+  (SELECT json_array_length(p.config, '\$.jobs') FROM pipelines p WHERE p.id = r.pipeline_id),
+  (SELECT COUNT(*) FROM jobs j WHERE j.pipeline_run_id = r.id),
+  (SELECT COUNT(*) FROM jobs j WHERE j.pipeline_run_id = r.id AND j.status = 'succeeded')
+FROM pipeline_runs r WHERE r.id = '$run_id';")
+if [[ -z "$counts" ]]; then
+  refuse "run ${run_id:0:8} has no count evidence (query returned nothing)"
+fi
+IFS='|' read -r expected durable succeeded <<< "$counts"
+if [[ -z "$expected" || ! "$expected" =~ ^[0-9]+$ || "$expected" -eq 0 ]]; then
+  refuse "run ${run_id:0:8}: persisted pipeline definition is unreadable or has no jobs; coverage cannot be proven"
+fi
+
+# Coverage is matched on the definition jobs' step commands: durable rows
+# carry a generated name ('job-<uuid>' — step names are not persisted, plan
+# finding F12), but their commands column mirrors the definition's step
+# `run` strings in order. A definition job whose command list has no
+# matching durable row is exactly the lazy-enqueue false green.
+missing=$(db_query "SELECT json_extract(d.value, '\$.name')
+FROM pipelines p, json_each(json_extract(p.config, '\$.jobs')) d
+WHERE p.id = (SELECT pipeline_id FROM pipeline_runs WHERE id = '$run_id')
+  AND (SELECT json_group_array(json_extract(s.value, '\$.run'))
+       FROM json_each(json_extract(d.value, '\$.steps')) s)
+      NOT IN (SELECT commands FROM jobs WHERE pipeline_run_id = '$run_id');")
+missing_count=$(grep -c . <<< "$missing" || true)
+failing=$(db_query "SELECT '  ' || name || '=' || status FROM jobs
+WHERE pipeline_run_id = '$run_id' AND status <> 'succeeded';")
+
+if ((missing_count > 0)); then
+  refuse "run ${run_id:0:8}: $missing_count definition job(s) never got a durable row (the lazy-enqueue false green):
+$missing
+$other_runs"
+fi
+if ((durable != expected)); then
+  refuse "run ${run_id:0:8}: $durable durable job rows for $expected definition jobs"
+fi
+if ((succeeded != durable)); then
+  refuse "run ${run_id:0:8}: $succeeded of $durable jobs succeeded; failing jobs:
+$failing"
+fi
+
+printf 'release gate: PASSED — run %s green, %d/%d jobs covering the persisted definition\n' \
+  "${run_id:0:8}" "$succeeded" "$expected"

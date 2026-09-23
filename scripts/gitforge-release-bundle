@@ -31,6 +31,10 @@ if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
   exit 1
 fi
 
+# A cut may only assemble on top of a full, honest green for this exact
+# commit (see scripts/gitforge-release-gate).
+"$(dirname "$0")/gitforge-release-gate" "$source_commit"
+
 toolchain="${GITFORGE_TOOLCHAIN:-}"
 if [[ -z "$toolchain" ]]; then
   toolchain=$(rustc --version 2>/dev/null || true)
