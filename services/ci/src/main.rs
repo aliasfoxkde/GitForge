@@ -2111,7 +2111,7 @@ mod tests {
         pipeline_id: gitforge_common::PipelineId,
         status: &str,
     ) -> gitforge_common::PipelineRunId {
-        seed_run_created_at(&pool, repo_id, pipeline_id, status, chrono::Utc::now()).await
+        seed_run_created_at(pool, repo_id, pipeline_id, status, chrono::Utc::now()).await
     }
 
     async fn seed_run_created_at(
