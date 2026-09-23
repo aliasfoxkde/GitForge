@@ -270,7 +270,6 @@ Each finding: what was observed, why it matters, where the fix lands.
   terminal run must either stay terminal or log the reversal loudly —
   grade flips need an audit trail in the finalize log, and a queued job
   whose run is terminal should be cancelled, not dispatched).
->>>>>>> 6b8e905e (docs(plan): record F24 cancelled-run resurrection)
 
 ---
 
