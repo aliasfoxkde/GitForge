@@ -352,6 +352,54 @@ impl Default for BuildCoordinator {
 }
 
 /// Execute a cargo job
+/// Resolve the real cargo executable for daemon-submitted jobs, once per
+/// daemon lifetime.
+///
+/// The wrapper must never be invoked back (see `execute_cargo_job`), so
+/// without the bypass `CARGO_REAL` we ask rustup for the actual cargo
+/// binary of the resolved default toolchain and spawn that path directly.
+/// The old `rustup run stable cargo` fallback dies with "toolchain
+/// 'stable' is not installed" wherever the default toolchain is a dated
+/// one with no `stable` alias — the `rust:1-slim` CI image ships only
+/// `1.98.0-x86_64-unknown-linux-gnu` — and every daemon-submitted job
+/// failed with exit 1 there (observed in the 2026-09-23 gitforge-ci run
+/// `489204c9`: `test_submitted_job_runs_real_cargo_and_becomes_listed`).
+/// The `rustup`-fallback arm below keeps the historical behavior for hosts
+/// where even `rustup which` cannot resolve a binary.
+fn resolve_cargo_executable() -> String {
+    static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            let cargo_real = std::env::var("CARGO_REAL").ok();
+            let rustup_path = std::process::Command::new("rustup")
+                .args(["which", "cargo"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .filter(|path| !path.is_empty() && std::path::Path::new(path).exists());
+            resolve_cargo_from(cargo_real, rustup_path)
+        })
+        .clone()
+}
+
+/// Pick the daemon's cargo executable: the wrapper bypass `CARGO_REAL`
+/// wins, then the rustup-resolved real binary, then the historical
+/// `rustup run stable` fallback.
+fn resolve_cargo_from(cargo_real: Option<String>, rustup_path: Option<String>) -> String {
+    if let Some(real) = cargo_real {
+        if !real.trim().is_empty() {
+            return real;
+        }
+    }
+    if let Some(path) = rustup_path {
+        if !path.trim().is_empty() {
+            return path;
+        }
+    }
+    "rustup".to_string()
+}
+
 async fn execute_cargo_job(
     job: &BuildJob,
     active_pids: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
@@ -364,8 +412,9 @@ async fn execute_cargo_job(
     //
     // Strategy:
     // 1. CARGO_REAL env var (set by wrapper in bypass mode)
-    // 2. rustup run stable cargo (always uses real cargo)
-    let cargo_executable = std::env::var("CARGO_REAL").unwrap_or_else(|_| "rustup".to_string());
+    // 2. the real cargo binary rustup resolves for the default toolchain
+    // 3. rustup run stable cargo (always uses real cargo)
+    let cargo_executable = resolve_cargo_executable();
 
     let cargo_args = if cargo_executable == "rustup" {
         // rustup run stable cargo [cargo args...]
@@ -504,6 +553,45 @@ async fn execute_cargo_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_cargo_bypass_wins() {
+        assert_eq!(
+            resolve_cargo_from(
+                Some("/usr/bin/real-cargo".to_string()),
+                Some("/usr/local/cargo/bin/real-cargo".to_string()),
+            ),
+            "/usr/bin/real-cargo",
+            "the wrapper bypass CARGO_REAL takes precedence"
+        );
+    }
+
+    #[test]
+    fn test_resolve_cargo_empty_bypass_falls_through() {
+        assert_eq!(
+            resolve_cargo_from(Some("   ".to_string()), Some("/cargo/real".to_string())),
+            "/cargo/real",
+            "a blank CARGO_REAL must not shadow the resolved binary"
+        );
+        assert_eq!(
+            resolve_cargo_from(None, Some("/cargo/real".to_string())),
+            "/cargo/real"
+        );
+    }
+
+    #[test]
+    fn test_resolve_cargo_fallback_without_resolution() {
+        assert_eq!(
+            resolve_cargo_from(None, None),
+            "rustup",
+            "no bypass and no resolved binary keeps the rustup-run fallback"
+        );
+        assert_eq!(
+            resolve_cargo_from(Some(String::new()), Some(String::new())),
+            "rustup",
+            "blank values on every tier keep the rustup-run fallback"
+        );
+    }
 
     #[tokio::test]
     async fn test_coordinator_submit() {
