@@ -10,6 +10,7 @@ pub struct JobStateMachine {
     runner_id: Option<RunnerId>,
     exit_code: Option<i32>,
     error_message: Option<String>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl JobStateMachine {
@@ -21,12 +22,20 @@ impl JobStateMachine {
             runner_id: None,
             exit_code: None,
             error_message: None,
+            started_at: None,
         }
     }
 
     /// Get current status
     pub fn status(&self) -> JobStatus {
         self.status
+    }
+
+    /// When the job entered the running state, if it has.
+    /// The orchestrator's timeout backstop reads this to fence jobs whose
+    /// runner never reported a completion.
+    pub fn started_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.started_at
     }
 
     /// Get runner ID if assigned
@@ -65,6 +74,7 @@ impl JobStateMachine {
     pub fn start(&mut self) -> Result<()> {
         self.ensure_valid_transition(JobStatus::Running)?;
         self.status = JobStatus::Running;
+        self.started_at = Some(chrono::Utc::now());
         tracing::debug!("job {} started", self.job_id);
         Ok(())
     }
@@ -122,6 +132,7 @@ impl JobStateMachine {
             runner_id: self.runner_id,
             exit_code: self.exit_code,
             error_message: self.error_message.clone(),
+            started_at: self.started_at,
         }
     }
 
@@ -169,6 +180,7 @@ pub struct JobStateSummary {
     pub runner_id: Option<RunnerId>,
     pub exit_code: Option<i32>,
     pub error_message: Option<String>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[cfg(test)]
@@ -373,5 +385,40 @@ mod tests {
         let mut state = JobStateMachine::new(job_id);
         // Can't succeed directly from pending
         assert!(state.succeed(0).is_err());
+    }
+
+    #[test]
+    fn test_started_at_tracks_running_transition() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+        assert!(state.started_at().is_none());
+
+        state.queue().unwrap();
+        state.assign(RunnerId::new()).unwrap();
+        state.start().unwrap();
+
+        let started = state.started_at().expect("running job has started_at");
+        let age = chrono::Utc::now() - started;
+        assert!(age >= chrono::Duration::zero());
+        assert!(age < chrono::Duration::seconds(5));
+
+        // Terminal transitions leave the original start time alone: the
+        // timeout backstop compares it against the definition deadline.
+        state.fail(1, "late failure".to_string()).unwrap();
+        assert_eq!(state.started_at(), Some(started));
+    }
+
+    #[test]
+    fn test_summary_carries_started_at() {
+        let job_id = JobId::new();
+        let mut state = JobStateMachine::new(job_id);
+        assert!(state.summary().started_at.is_none());
+
+        state.queue().unwrap();
+        state.assign(RunnerId::new()).unwrap();
+        state.start().unwrap();
+
+        let summary = state.summary();
+        assert_eq!(summary.started_at, state.started_at());
     }
 }

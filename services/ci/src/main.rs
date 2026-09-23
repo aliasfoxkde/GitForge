@@ -13,6 +13,7 @@ use axum::{
 use chrono::Utc;
 use futures::StreamExt;
 use gitforge_ci::{
+    engine::{fence_actions, FenceAction},
     CiEngine, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
 };
 use gitforge_common::PipelineStatus;
@@ -41,6 +42,13 @@ type PipelineRegistry = HashMap<gitforge_common::PipelineRunId, Arc<CiEngine>>;
 
 /// Path of the pipeline definition inside a repository checkout.
 const PIPELINE_CONFIG_PATH: &str = ".gitforce.yml";
+
+/// Grace the orchestrator's timeout backstop adds on top of a job's
+/// definition deadline. The runner kills the job at the deadline itself;
+/// the extra window here only closes the case where that enforcement
+/// never produced a terminal row, so it can be generous without slowing
+/// healthy jobs.
+const BACKSTOP_GRACE_SECS: u64 = 300;
 
 struct TriggerState {
     event_bus: Arc<dyn EventBus>,
@@ -233,6 +241,8 @@ async fn main() -> anyhow::Result<()> {
     // Start runner-loss detection loop: check for stale runners and re-enqueue their jobs
     let runner_loss_scheduler = scheduler_arc.clone();
     let runner_loss_shutdown = shutdown.clone();
+    let fence_registry = pipeline_registry.clone();
+    let fence_db = scheduler_db.clone();
     let _runner_loss_handle = tokio::spawn(async move {
         // Runner is considered stale if no heartbeat for 90 seconds (3x the 30s interval)
         let stale_threshold_secs: i64 = 90;
@@ -246,29 +256,14 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
 
-                    // Mark stale runners as offline
+                    // Mark stale runners as offline. The assigner re-enqueues
+                    // their queued jobs and fences their running jobs as
+                    // failed; the engine-side convergence happens below.
                     let marked = runner_loss_scheduler.mark_stale_runners_offline(stale_threshold_secs).await;
                     if marked > 0 {
                         tracing::info!("marked {} stale runners as offline", marked);
                     }
-
-                    // Get list of offline runners and re-enqueue their jobs
-                    // We need to check which runners are now offline and requeue
-                    let assigned_jobs = runner_loss_scheduler.get_assigned_jobs().await;
-                    for (_job_id, runner_id, _pipeline_run_id) in assigned_jobs {
-                        // Check if the runner for this job assignment is now offline
-                        // by looking at the runner's current status
-                        let runner_offline = {
-                            // This is a simplified check - in production we'd track this properly
-                            // For now we rely on mark_stale_runners_offline having already
-                            // updated runner statuses
-                            false // Will be handled via the scheduler's internal tracking
-                        };
-                        if runner_offline {
-                            let requeued = runner_loss_scheduler.requeue_jobs_for_offline_runner(runner_id).await;
-                            tracing::warn!("re-enqueued {} jobs after runner {} went offline", requeued, runner_id);
-                        }
-                    }
+                    reconcile_fenced_engines(&fence_registry, &fence_db).await;
                 }
                 () = tokio::time::sleep(Duration::from_secs(1)) => {
                     if runner_loss_shutdown.load(Ordering::SeqCst) {
@@ -283,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
     // Start job timeout monitoring loop
     let timeout_registry = pipeline_registry.clone();
     let timeout_shutdown = shutdown.clone();
+    let timeout_db = scheduler_db.clone();
     let _timeout_handle = tokio::spawn(async move {
         // Check for stale running jobs every 60 seconds
         let check_interval = Duration::from_secs(60);
@@ -294,18 +290,50 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
 
+                    // Orchestrator-side backstop: the runner enforces the
+                    // definition deadline itself, but a wedged runner that
+                    // keeps heartbeating fences nothing, so the deadline is
+                    // also enforced here — settle the engine DAG, fence the
+                    // scheduler row, and let the run finalize.
                     let registry = timeout_registry.read().await;
                     for (run_id, engine) in registry.iter() {
                         let state = engine.state().await;
                         for (job_id, job_state) in state.jobs.iter() {
-                            if job_state.status() == gitforge_common::JobStatus::Running {
-                                // Check if job has been running too long
-                                // Note: we'd need started_at in the job state to do this properly
-                                // For now, this is a placeholder that would need the full job tracking
-                                tracing::debug!(
-                                    "job {} in pipeline {} has been running since state capture",
-                                    job_id, run_id
-                                );
+                            if job_state.status() != gitforge_common::JobStatus::Running {
+                                continue;
+                            }
+                            let Some(started_at) = job_state.started_at() else {
+                                continue;
+                            };
+                            let timeout_secs = engine
+                                .job_definition(*job_id)
+                                .and_then(|def| def.timeout_secs().ok())
+                                .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
+                            let limit = chrono::Duration::seconds(
+                                (timeout_secs + BACKSTOP_GRACE_SECS) as i64,
+                            );
+                            if Utc::now() - started_at <= limit {
+                                continue;
+                            }
+                            tracing::warn!(
+                                "job {} in pipeline {} exceeded its {}s deadline; fencing",
+                                job_id, run_id, timeout_secs
+                            );
+                            if let Err(error) = engine.timeout_job(*job_id).await {
+                                tracing::warn!(%error, %job_id, "backstop timeout transition failed");
+                            }
+                            if let Some(pool) = timeout_db.as_ref() {
+                                // Only rewrites rows still marked running;
+                                // a genuine completion between the state
+                                // read and here is left untouched.
+                                if let Err(error) =
+                                    gitforge_db::queries::JobQueries::fail_lost(pool, *job_id)
+                                        .await
+                                {
+                                    tracing::warn!(
+                                        %error, %job_id, "backstop could not fence scheduler row"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1467,6 +1495,59 @@ async fn handle_push_event(
     }
 
     Ok(state.run_id)
+}
+
+/// Converge engine job state with scheduler rows that went terminal
+/// without a completion event — the runner that would report the outcome
+/// was fenced, so nothing else ever drives the DAG forward. Only rows the
+/// scheduler marked terminal are consulted; queued or requeued jobs still
+/// belong to a live assignment path. Returns the number of engine jobs
+/// reconciled.
+async fn reconcile_fenced_engines(
+    registry: &tokio::sync::RwLock<PipelineRegistry>,
+    db: &Option<gitforge_db::Pool>,
+) -> usize {
+    let Some(pool) = db.as_ref() else {
+        return 0;
+    };
+    let engines = registry.read().await;
+    let mut reconciled = 0;
+    for engine in engines.values() {
+        let state = engine.state().await;
+        let mut statuses: HashMap<gitforge_common::JobId, String> = HashMap::new();
+        for job_id in state.jobs.keys() {
+            match gitforge_db::queries::JobQueries::get(pool, *job_id).await {
+                Ok(Some(job)) => {
+                    statuses.insert(*job_id, job.status);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "fence reconciliation could not read job row");
+                }
+            }
+        }
+        for (job_id, action) in fence_actions(&state, &statuses) {
+            let result = match action {
+                FenceAction::Fail => {
+                    engine
+                        .fail_job(job_id, 137, "runner lost while job was running".to_string())
+                        .await
+                }
+                FenceAction::Timeout => engine.timeout_job(job_id).await,
+                FenceAction::Cancel => engine.cancel_job(job_id).await,
+            };
+            match result {
+                Ok(()) => {
+                    reconciled += 1;
+                    tracing::warn!(%job_id, "engine job reconciled after scheduler fence");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %job_id, "engine fence reconciliation failed");
+                }
+            }
+        }
+    }
+    reconciled
 }
 
 async fn run_scheduler_event_consumer(
