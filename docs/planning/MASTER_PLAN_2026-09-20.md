@@ -246,7 +246,20 @@ Each finding: what was observed, why it matters, where the fix lands.
   Phase 1 (retry the durable write with bounded backoff, and do not
   dispatch a job that has no durable row — coordinate with the
   queue-idempotence lane).
->>>>>>> 6285d411 (docs(plan): record F21 in-memory-only job enqueue)
+- **F22 — `.env` with the live `JWT_SECRET` tracked in a public repo.**
+  `.env` is listed in `.gitignore`, but it was tracked before the ignore
+  rule existed, so every commit since kept publishing it — secret value
+  included — to the public GitHub mirror. Confirmed 2026-09-23
+  (`aliasfoxkde/GitForge` is publicly readable; `JWT_SECRET` carries a real
+  40-character value in history). Untracked going forward in the same
+  session; the exposed secret is rotated at the next service restart, which
+  invalidates outstanding tokens (re-login via `gitforge auth --login`).
+  History rewrite is deliberately not used. Verified while triaging this:
+  the API already fails fast on a missing `JWT_SECRET`
+  (`services/api/src/main.rs` — "no dev fallback in production"), so
+  rotation carries no code risk. **Fix lands in**: Phase 0 ops (rotation at
+  the v0.6.7 cutover) + untrack commit.
+>>>>>>> edc6cece (docs(plan): record F22 tracked-.env secret exposure)
 
 ---
 
