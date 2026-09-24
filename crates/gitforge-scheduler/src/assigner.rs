@@ -8,7 +8,7 @@ use gitforge_db::models::{
     RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS,
 };
 use gitforge_db::Pool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -19,6 +19,61 @@ use uuid::Uuid;
 /// durable job lease indefinitely. Shared with the API listings through the
 /// model constant so every consumer agrees on the threshold.
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS;
+
+/// Retry budget for one-shot durability writes in the job lifecycle
+/// (enqueue inserts, lease start/completion). SQLite write saturation —
+/// not a logic error — is the dominant transient failure here (F19–F23:
+/// 19–40 s COMMIT stalls under concurrent writers, observed live
+/// 2026-09-23), so failures get the same bounded retry the git server's
+/// trigger insert received in F20 before the job or lease is given up on.
+const DURABLE_WRITE_ATTEMPTS: usize = 5;
+const DURABLE_WRITE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run one durable write with bounded retry, mapping the final failure to
+/// an error that names the write. `what` appears in every log line and the
+/// returned error so operators can tell which durability step died. An
+/// `Ok` value is returned as-is — a definitive `Ok(false)` verdict (for
+/// example "lease no longer active") is never retried; only `Err` is.
+async fn persist_with_retry<W, Fut, T>(
+    what: &'static str,
+    job_id: JobId,
+    mut write: W,
+) -> anyhow::Result<T>
+where
+    W: FnMut() -> Fut,
+    Fut: std::future::Future<Output = gitforge_common::Result<T>>,
+{
+    for attempt in 1..=DURABLE_WRITE_ATTEMPTS {
+        match write().await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < DURABLE_WRITE_ATTEMPTS => {
+                tracing::warn!(
+                    %job_id,
+                    what,
+                    attempt,
+                    attempts = DURABLE_WRITE_ATTEMPTS,
+                    %error,
+                    "durable write failed; retrying"
+                );
+                tokio::time::sleep(DURABLE_WRITE_BACKOFF).await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    %job_id,
+                    what,
+                    attempts = DURABLE_WRITE_ATTEMPTS,
+                    %error,
+                    "durable write failed after retries"
+                );
+                return Err(anyhow::anyhow!(
+                    "durable {what} for job {job_id} failed after \
+                     {DURABLE_WRITE_ATTEMPTS} attempts: {error}"
+                ));
+            }
+        }
+    }
+    unreachable!("retry loop returns inside the loop body")
+}
 
 /// Scheduler command
 #[derive(Debug)]
@@ -273,9 +328,14 @@ impl Scheduler {
     }
 
     /// Enqueue a job
-    pub async fn enqueue(&self, job_id: JobId, pipeline_run_id: PipelineRunId, repo_id: RepoId) {
+    pub async fn enqueue(
+        &self,
+        job_id: JobId,
+        pipeline_run_id: PipelineRunId,
+        repo_id: RepoId,
+    ) -> anyhow::Result<()> {
         self.enqueue_with_definition(job_id, pipeline_run_id, repo_id, Vec::new(), None)
-            .await;
+            .await
     }
 
     /// Enqueue a job together with its executable definition.
@@ -286,7 +346,7 @@ impl Scheduler {
         repo_id: RepoId,
         commands: Vec<String>,
         working_dir: Option<String>,
-    ) {
+    ) -> anyhow::Result<()> {
         self.enqueue_with_definition_and_image(
             job_id,
             pipeline_run_id,
@@ -295,7 +355,7 @@ impl Scheduler {
             "rust:latest".to_string(),
             working_dir,
         )
-        .await;
+        .await
     }
 
     pub async fn enqueue_with_definition_and_image(
@@ -306,7 +366,7 @@ impl Scheduler {
         commands: Vec<String>,
         image: String,
         working_dir: Option<String>,
-    ) {
+    ) -> anyhow::Result<()> {
         self.enqueue_with_definition_and_image_and_timeout(
             job_id,
             pipeline_run_id,
@@ -318,18 +378,66 @@ impl Scheduler {
                 timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
             },
         )
-        .await;
+        .await
     }
 
     /// Enqueue a job with an explicit, bounded execution timeout.
+    ///
+    /// The durable writes happen **before** the in-memory dispatch, and a
+    /// job whose durable row could not be written is never dispatched: a
+    /// row that exists only in this process's queue is invisible to
+    /// restart recovery, watchdog reconciliation, and completion
+    /// persistence, and its loss silently eats the pipeline (F21, observed
+    /// live on 2026-09-23 when three consecutive head-job INSERTs failed
+    /// under SQLite write saturation). Each write is retried with bounded
+    /// backoff first, mirroring the trigger-insert retry in the git server
+    /// (F20). Callers must grade the run failed when this errors so a push
+    /// fails loudly instead of dangling.
     pub async fn enqueue_with_definition_and_image_and_timeout(
         &self,
         job_id: JobId,
         pipeline_run_id: PipelineRunId,
         repo_id: RepoId,
         definition: JobExecutionDefinition,
-    ) {
+    ) -> anyhow::Result<()> {
         let timeout_secs = definition.timeout_secs.clamp(5, 24 * 60 * 60);
+        if let Some(pool) = &self.db_pool {
+            let mut db_job = DbJob::new(pipeline_run_id, format!("job-{job_id}"));
+            db_job.id = job_id;
+            // The persist is an ensure, not a create: the CI service may
+            // have written the row already (tests rely on this, and a
+            // scheduler restart re-enqueues from durable state). A row that
+            // exists with this id IS the durable state we want — only
+            // insert when it is genuinely missing, so a duplicate never
+            // burns the retry budget or fails the enqueue.
+            if gitforge_db::queries::JobQueries::get(pool, job_id)
+                .await?
+                .is_none()
+            {
+                persist_with_retry("job insert", job_id, || {
+                    gitforge_db::queries::JobQueries::create(pool, &db_job)
+                })
+                .await?;
+            }
+            persist_with_retry("status update", job_id, || {
+                gitforge_db::queries::JobQueries::update_status(pool, job_id, "queued")
+            })
+            .await?;
+            let commands = definition.commands.clone();
+            let image = definition.image.clone();
+            let working_dir = definition.working_dir.clone();
+            persist_with_retry("definition write", job_id, || {
+                gitforge_db::queries::JobQueries::set_definition_with_image_and_timeout(
+                    pool,
+                    job_id,
+                    &commands,
+                    &image,
+                    working_dir.as_deref(),
+                    timeout_secs,
+                )
+            })
+            .await?;
+        }
         let job = QueuedJob::new(job_id, pipeline_run_id, repo_id);
         let mut state = self.state.write().await;
         state.queue.enqueue(job);
@@ -343,32 +451,7 @@ impl Scheduler {
             },
         );
         tracing::debug!("job {} enqueued", job_id);
-
-        // Persist to database if available
-        if let Some(pool) = &self.db_pool {
-            let mut db_job = DbJob::new(pipeline_run_id, format!("job-{job_id}"));
-            db_job.id = job_id;
-            if let Err(e) = gitforge_db::queries::JobQueries::create(pool, &db_job).await {
-                tracing::error!("failed to persist job to DB: {}", e);
-            }
-            if let Err(e) =
-                gitforge_db::queries::JobQueries::update_status(pool, job_id, "queued").await
-            {
-                tracing::error!("failed to update job status in DB: {}", e);
-            }
-            if let Err(e) = gitforge_db::queries::JobQueries::set_definition_with_image_and_timeout(
-                pool,
-                job_id,
-                &definition.commands,
-                &definition.image,
-                definition.working_dir.as_deref(),
-                timeout_secs,
-            )
-            .await
-            {
-                tracing::error!("failed to persist job definition: {}", e);
-            }
-        }
+        Ok(())
     }
 
     /// Submit an operator job exactly once across control-plane retries. This
@@ -422,7 +505,7 @@ impl Scheduler {
             return Ok((existing_id, false));
         }
         self.enqueue_with_definition(job_id, pipeline_run_id, repo_id, commands, working_dir)
-            .await;
+            .await?;
         Ok((job_id, true))
     }
 
@@ -610,6 +693,29 @@ impl Scheduler {
                         .await
                 {
                     tracing::warn!(%error, %runner_id, "failed to persist stale runner status");
+                }
+            }
+            // Durable-side sweep: rows registered by a previous scheduler
+            // process are not in `state.runners`, so the memory sweep above
+            // never sees them and their stale `online` status persists
+            // across restarts (F26, observed live 2026-09-22/24). One
+            // idempotent UPDATE closes that gap for every row at once.
+            match gitforge_db::queries::RunnerQueries::mark_stale_offline(
+                pool,
+                heartbeat_timeout_secs,
+            )
+            .await
+            {
+                Ok(durable) if durable > 0 => {
+                    tracing::warn!(
+                        durable,
+                        "marked durable-only stale runners offline (invisible to the in-memory sweep)"
+                    );
+                    marked_offline += durable as usize;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to sweep stale durable runner rows");
                 }
             }
         }
@@ -818,6 +924,56 @@ impl Scheduler {
                 }
             }
 
+            // F24: a queued job whose run is already terminal must never be
+            // dispatched. The orphan reconciler can grade a jobless run
+            // cancelled while its late head job still sits queued here;
+            // dispatching it resurrected the run's work (cancelled→succeeded
+            // with genuinely re-executed jobs, run 50b35e0b) and burned real
+            // containers on a dead verdict. Run statuses are cached per tick:
+            // a queue drains in run order, so distinct runs per tick is tiny.
+            let mut run_status_cache: HashMap<PipelineRunId, Option<String>> = HashMap::new();
+            let queued_jobs = {
+                let state = self.state.read().await;
+                state
+                    .queue
+                    .all()
+                    .into_iter()
+                    .map(|job| (job.job_id, job.pipeline_run_id))
+                    .collect::<Vec<_>>()
+            };
+            for (job_id, run_id) in queued_jobs {
+                let run_status = match run_status_cache.get(&run_id) {
+                    Some(cached) => cached.clone(),
+                    None => {
+                        let status = gitforge_db::queries::PipelineRunQueries::get(pool, run_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|run| run.status);
+                        run_status_cache.insert(run_id, status.clone());
+                        status
+                    }
+                };
+                let run_terminal = matches!(
+                    run_status.as_deref(),
+                    Some("succeeded")
+                        | Some("failed")
+                        | Some("cancelled")
+                        | Some("timed_out")
+                        | Some("timeout")
+                        | Some("timed-out")
+                );
+                if run_terminal {
+                    tracing::warn!(
+                        %job_id,
+                        %run_id,
+                        run_status = run_status.as_deref().unwrap_or("unknown"),
+                        "cancelling a queued job whose run is already terminal (F24)"
+                    );
+                    self.cancel(job_id).await;
+                }
+            }
+
             // API-side cancellation can race with assignment. Assigned jobs
             // are no longer present in the queue, so reconcile that mirror
             // separately; otherwise a cancelled job remains eligible for the
@@ -851,12 +1007,31 @@ impl Scheduler {
         // admission below may make the actual batch smaller.
         let mut processed = 0;
         let max_jobs_per_batch = available_capacity.max(1);
+        // Jobs the current runner roster cannot admit right now (typically an
+        // exclusive resource class already in flight). They stay queued while
+        // the batch walks past them: stopping at the first blocked head job
+        // stalled the whole runner whenever any `cargo test --workspace` job
+        // queued behind another, even with free capacity and classless work
+        // waiting.
+        let mut skipped: HashSet<JobId> = HashSet::new();
 
         while processed < max_jobs_per_batch {
-            // Peek at next job
-            let job = match state.queue.peek_fair() {
+            // Fairness counts in-flight jobs per repository, not queue depth:
+            // a multi-stage pipeline legitimately shows several queued DAG
+            // rows, so counting queued rows let one repo's visible backlog
+            // starve every other repository indefinitely. A burst monopolizes
+            // a runner through the jobs it keeps running; FIFO breaks the
+            // remaining ties. Recomputed each admission because the batch's
+            // own assignments change the load.
+            let mut running_by_repo: HashMap<RepoId, usize> = HashMap::new();
+            for (_, _, running_repo) in state.assigned_jobs.values() {
+                *running_by_repo.entry(*running_repo).or_default() += 1;
+            }
+
+            // Peek at next eligible job
+            let job = match state.queue.peek_fair(&skipped, &running_by_repo) {
                 Some(j) => j,
-                None => break, // No more jobs
+                None => break, // No more eligible jobs
             };
 
             let job_id = job.job_id;
@@ -932,9 +1107,14 @@ impl Scheduler {
                     let _ = self.event_tx.send(event);
                 }
                 None => {
-                    // No runner available for this job, skip remaining
-                    tracing::debug!("no runner available for job {}, stopping batch", job_id);
-                    break;
+                    // No runner can take this job right now. Leave it queued
+                    // and consider the next one so a single blocked job cannot
+                    // idle the runner's remaining capacity.
+                    tracing::debug!(
+                        "no runner available for job {}, skipping to next queued job",
+                        job_id
+                    );
+                    skipped.insert(job_id);
                 }
             }
         }
@@ -1160,12 +1340,22 @@ impl Scheduler {
             }
         }
         if let Some(pool) = &self.db_pool {
-            let accepted = gitforge_db::queries::JobQueries::start_with_lease(
-                pool,
-                job_id,
-                runner_id,
-                lease_token,
-            )
+            // The durable start is the write F23 lost: a single-shot INSERT
+            // under write saturation returned an error, the runner read the
+            // resulting 409 as a dead lease, and the scheduler reassigned a
+            // job that was actively executing — duplicate containers and a
+            // completion that could never land. Retry the transient failure
+            // here, where the in-memory lease is still valid and no runner
+            // has been misled, instead of at the runner behind an HTTP
+            // status that cannot distinguish "locked" from "superseded".
+            let accepted = persist_with_retry("lease start", job_id, || {
+                gitforge_db::queries::JobQueries::start_with_lease(
+                    pool,
+                    job_id,
+                    runner_id,
+                    lease_token,
+                )
+            })
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             if !accepted {
@@ -1275,17 +1465,24 @@ impl Scheduler {
         }
         if let Some(pool) = &self.db_pool {
             let status = if success { "succeeded" } else { "failed" };
-            let accepted = gitforge_db::queries::JobQueries::complete_with_lease_and_publication(
-                pool,
-                job_id,
-                runner_id,
-                lease_token,
-                status,
-                &result_json,
-                "github",
-                "job_receipt",
-                &result_json,
-            )
+            // Same F23 discipline as the lease start: the completion write is
+            // the durable record of the job's outcome. Losing it to a
+            // transient lock left job 21497438 finished-on-runner but
+            // assigned-in-database forever; the outcome is retried here so
+            // the receipt survives the write storm that killed it.
+            let accepted = persist_with_retry("job completion", job_id, || {
+                gitforge_db::queries::JobQueries::complete_with_lease_and_publication(
+                    pool,
+                    job_id,
+                    runner_id,
+                    lease_token,
+                    status,
+                    &result_json,
+                    "github",
+                    "job_receipt",
+                    &result_json,
+                )
+            })
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             if !accepted {
@@ -1421,6 +1618,43 @@ mod tests {
         }
     }
 
+    /// Create the durable parent chain (user → repo → pipeline → run) an
+    /// enqueued job's foreign keys point at, returning (run, repo) ids.
+    async fn seed_durable_run(pool: &gitforge_db::Pool) -> (PipelineRunId, RepoId) {
+        use gitforge_db::models::{Pipeline, PipelineRun, Repository, User};
+        use gitforge_db::queries::{PipelineQueries, PipelineRunQueries, RepoQueries, UserQueries};
+
+        let user = User::new(
+            "enqueue-owner".to_string(),
+            "enqueue-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(pool, &user).await.unwrap();
+        let repo = Repository::new(
+            "enqueue-repo".to_string(),
+            user.id,
+            "/git/enqueue-repo".to_string(),
+        );
+        RepoQueries::create(pool, &repo).await.unwrap();
+        let pipeline = Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: "enqueue-ci".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(pool, &pipeline).await.unwrap();
+        let run = PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "enqueue-owner".to_string(),
+            "enqueue-commit".to_string(),
+        );
+        PipelineRunQueries::create(pool, &run).await.unwrap();
+        (run.id, repo.id)
+    }
+
     #[tokio::test]
     async fn test_enqueue_dequeue() {
         let scheduler = Scheduler::new();
@@ -1428,7 +1662,7 @@ mod tests {
         let run_id = PipelineRunId::new();
         let job_id = JobId::new();
 
-        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
         assert_eq!(scheduler.queue_len().await, 1);
 
         // Register a runner
@@ -1437,6 +1671,148 @@ mod tests {
 
         // Process queue
         scheduler.process_queue().await;
+    }
+
+    fn workspace_test_definition() -> JobExecutionDefinition {
+        JobExecutionDefinition {
+            commands: vec!["cargo test --workspace".to_string()],
+            image: "rust:1".to_string(),
+            working_dir: None,
+            timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+        }
+    }
+
+    fn plain_definition() -> JobExecutionDefinition {
+        JobExecutionDefinition {
+            commands: vec!["echo plain".to_string()],
+            image: "rust:1".to_string(),
+            working_dir: None,
+            timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_class_job_does_not_block_the_batch() {
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+
+        let blocked_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                blocked_job,
+                run_id,
+                repo_id,
+                workspace_test_definition(),
+            )
+            .await
+            .unwrap();
+        // Queued after the blocked job; a classless job the same runner can
+        // always take.
+        let plain_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                plain_job,
+                run_id,
+                repo_id,
+                plain_definition(),
+            )
+            .await
+            .unwrap();
+
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+
+        // One workspace-cargo-test job already in flight on that runner: the
+        // class admits at most one at a time, so the queued test job cannot
+        // be admitted while the runner still has a free slot.
+        let running_test_job = JobId::new();
+        {
+            let mut state = scheduler.state.write().await;
+            state
+                .job_definitions
+                .insert(running_test_job, workspace_test_definition());
+            state
+                .assigned_jobs
+                .insert(running_test_job, (runner_id, run_id, repo_id));
+        }
+
+        scheduler.process_queue().await;
+
+        assert!(
+            scheduler.is_assigned(plain_job).await.is_some(),
+            "classless job behind a blocked head must still be assigned"
+        );
+        assert!(
+            scheduler.is_assigned(blocked_job).await.is_none(),
+            "exclusive-class job must stay queued while its class is running"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fairness_counts_running_jobs_not_visible_backlog() {
+        let scheduler = Scheduler::new();
+        let run_id = PipelineRunId::new();
+        let backlog_repo = RepoId::new();
+        let idle_repo = RepoId::new();
+
+        // backlog_repo's multi-stage pipeline shows three queued rows but
+        // runs nothing; idle_repo queued a single NEWER job. Counting queued
+        // rows preferred idle_repo forever and starved backlog_repo for
+        // hours; counting running jobs ties both at zero and FIFO wins.
+        let mut older_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                older_job,
+                run_id,
+                backlog_repo,
+                plain_definition(),
+            )
+            .await
+            .unwrap();
+        {
+            // Age the job so FIFO is decisive even within one millisecond.
+            let mut state = scheduler.state.write().await;
+            if let Some(mut aged) = state.queue.remove(older_job) {
+                aged.queued_at -= 1_000;
+                older_job = aged.job_id;
+                state.queue.enqueue(aged);
+            }
+        }
+        for _ in 0..2 {
+            scheduler
+                .enqueue_with_definition_and_image_and_timeout(
+                    JobId::new(),
+                    run_id,
+                    backlog_repo,
+                    plain_definition(),
+                )
+                .await
+                .unwrap();
+        }
+        let newer_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                newer_job,
+                run_id,
+                idle_repo,
+                plain_definition(),
+            )
+            .await
+            .unwrap();
+
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 1);
+        scheduler.register_runner(runner).await;
+
+        scheduler.process_queue().await;
+
+        let assigned = scheduler.get_assigned_jobs().await;
+        assert_eq!(assigned.len(), 1, "capacity 1 admits exactly one job");
+        assert_eq!(
+            assigned[0].0, older_job,
+            "equal running load must fall through to FIFO, not queue depth"
+        );
     }
 
     #[tokio::test]
@@ -1458,7 +1834,8 @@ mod tests {
                     timeout_secs: 900,
                 },
             )
-            .await;
+            .await
+            .unwrap();
 
         let state = scheduler.state.read().await;
         let definition = state.job_definitions.get(&job_id).unwrap();
@@ -1471,9 +1848,10 @@ mod tests {
     async fn test_idempotent_submission_replays_same_job_and_rejects_conflict() {
         let pool = gitforge_db::Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
+        // Durable parents must exist: F21 makes the enqueue persist real, so
+        // a dangling run id now fails the FK instead of being swallowed.
+        let (run_id, repo_id) = seed_durable_run(&pool).await;
         let scheduler = Scheduler::with_db(pool);
-        let run_id = PipelineRunId::new();
-        let repo_id = RepoId::new();
         let first = scheduler
             .submit_idempotent(
                 run_id,
@@ -1583,7 +1961,8 @@ mod tests {
                 vec!["cargo test".to_string()],
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         scheduler
             .register_runner(make_runner(RunnerId::new(), "runner", "online", 1))
             .await;
@@ -1611,7 +1990,7 @@ mod tests {
         let run_id = PipelineRunId::new();
         let job_id = JobId::new();
 
-        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
         assert_eq!(scheduler.queue_len().await, 1);
 
         scheduler.cancel(job_id).await;
@@ -1626,7 +2005,8 @@ mod tests {
         let job_id = JobId::new();
         scheduler
             .enqueue(job_id, PipelineRunId::new(), RepoId::new())
-            .await;
+            .await
+            .unwrap();
 
         scheduler.cancel(job_id).await;
         scheduler.process_queue().await;
@@ -1660,7 +2040,7 @@ mod tests {
         let run_id = PipelineRunId::new();
         let job_id = JobId::new();
 
-        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
         scheduler.process_queue().await;
 
         let assigned = scheduler.is_assigned(job_id).await;
@@ -1694,7 +2074,8 @@ mod tests {
                 vec!["cargo test".to_string()],
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         scheduler.process_queue().await;
         assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
 
@@ -1770,7 +2151,7 @@ mod tests {
         scheduler
             .register_runner(make_runner(runner_id, "fence-runner", "online", 1))
             .await;
-        scheduler.enqueue(job_id, run.id, repo.id).await;
+        scheduler.enqueue(job_id, run.id, repo.id).await.unwrap();
         scheduler.process_queue().await;
         let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
         scheduler
@@ -1891,7 +2272,7 @@ mod tests {
         scheduler
             .register_runner(make_runner(runner_id, "dead-lease-runner", "online", 1))
             .await;
-        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
         scheduler.process_queue().await;
         let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
         scheduler
@@ -1951,7 +2332,7 @@ mod tests {
         scheduler
             .register_runner(make_runner(runner_id, "dead-lease-runner", "online", 1))
             .await;
-        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
         scheduler.process_queue().await;
         let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
         scheduler
@@ -2000,7 +2381,8 @@ mod tests {
                 vec!["sleep 30".to_string()],
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         scheduler.process_queue().await;
         assert!(scheduler.is_assigned(job_id).await.is_none());
         assert_eq!(scheduler.queue_len().await, 1);
@@ -2026,10 +2408,12 @@ mod tests {
         let second_repo = RepoId::new();
         scheduler
             .enqueue(first_job, PipelineRunId::new(), first_repo)
-            .await;
+            .await
+            .unwrap();
         scheduler
             .enqueue(second_job, PipelineRunId::new(), second_repo)
-            .await;
+            .await
+            .unwrap();
         scheduler.process_queue().await;
         assert!(scheduler.is_assigned(first_job).await.is_some());
         assert!(scheduler.is_assigned(second_job).await.is_some());
@@ -2211,7 +2595,7 @@ mod tests {
             let job_id = JobId::new();
             let run_id = PipelineRunId::new();
             let repo_id = RepoId::new();
-            scheduler.enqueue(job_id, run_id, repo_id).await;
+            scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
         }
 
         assert_eq!(scheduler.queue_len().await, 5);
@@ -2229,7 +2613,7 @@ mod tests {
         let job_id = JobId::new();
         let run_id = PipelineRunId::new();
         let repo_id = RepoId::new();
-        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
 
         // Process queue twice - second time should be no-op since job is assigned
         scheduler.process_queue().await;
@@ -2260,7 +2644,8 @@ mod tests {
                     vec!["cargo test --workspace".to_string()],
                     Some("/workspace".to_string()),
                 )
-                .await;
+                .await
+                .unwrap();
         }
 
         scheduler.process_queue().await;
@@ -2294,7 +2679,7 @@ mod tests {
         let job_id = JobId::new();
         let run_id = PipelineRunId::new();
         let repo_id = RepoId::new();
-        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
 
         // Assign job
         scheduler.process_queue().await;
@@ -2314,7 +2699,7 @@ mod tests {
         let job_id = JobId::new();
         let run_id = PipelineRunId::new();
         let repo_id = RepoId::new();
-        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
         assert_eq!(scheduler.queue_len().await, 1);
 
         // Process queue - job should be dequeued
@@ -2376,7 +2761,7 @@ mod tests {
         let job_id = JobId::new();
         let run_id = PipelineRunId::new();
         let repo_id = RepoId::new();
-        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
 
         scheduler.process_queue().await;
         assert!(scheduler.is_assigned(job_id).await.is_some());
@@ -2392,7 +2777,7 @@ mod tests {
         let job_id = JobId::new();
         let run_id = PipelineRunId::new();
         let repo_id = RepoId::new();
-        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
 
         // Process queue with no runners - should emit NoRunnerAvailable
         scheduler.process_queue().await;
@@ -2416,7 +2801,7 @@ mod tests {
         let job_id = JobId::new();
         let run_id = PipelineRunId::new();
         let repo_id = RepoId::new();
-        scheduler.enqueue(job_id, run_id, repo_id).await;
+        scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
 
         // Process queue - should assign job
         scheduler.process_queue().await;
@@ -2440,7 +2825,8 @@ mod tests {
                 vec!["cargo test --workspace".to_string()],
                 Some("/workspace".to_string()),
             )
-            .await;
+            .await
+            .unwrap();
         scheduler.register_runner(runner).await;
         scheduler.process_queue().await;
 
@@ -2528,7 +2914,7 @@ mod tests {
         let runner = make_runner(RunnerId::new(), "durable-runner", "online", 1);
         let runner_id = runner.id;
         scheduler.register_runner(runner).await;
-        scheduler.enqueue(job_id, run.id, repo.id).await;
+        scheduler.enqueue(job_id, run.id, repo.id).await.unwrap();
         scheduler.process_queue().await;
 
         let persisted = gitforge_db::queries::JobQueries::get(&pool, job_id)
@@ -2627,5 +3013,66 @@ mod tests {
             .unwrap();
         assert_eq!(finalized.status, "cancelled");
         assert!(finalized.finished_at.is_some());
+    }
+
+    // --- persist_with_retry (F21/F23) ----------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_persist_with_retry_recovers_from_transient_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Two transient failures then success: the write must land and the
+        // caller must see the value, not the bumps along the way.
+        let attempts = AtomicUsize::new(0);
+        let result: anyhow::Result<()> = persist_with_retry("unit probe", JobId::new(), || {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(gitforge_common::Error::database("database is locked"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_persist_with_retry_exhausts_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A persistently failing write gives up after the bounded budget
+        // with an error naming the write, instead of hanging the enqueue
+        // path or silently dropping the row (F21).
+        let attempts = AtomicUsize::new(0);
+        let result: anyhow::Result<()> = persist_with_retry("unit probe", JobId::new(), || {
+            let _ = attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err(gitforge_common::Error::database("database is locked")) }
+        })
+        .await;
+        let error = result.expect_err("exhausted retries must surface");
+        assert!(error.to_string().contains("durable unit probe"));
+        assert!(error.to_string().contains("5 attempts"));
+        assert_eq!(attempts.load(Ordering::SeqCst), DURABLE_WRITE_ATTEMPTS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_persist_with_retry_never_retries_a_definitive_ok() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // `Ok(false)` from a lease write means "definitively not yours"
+        // (F23): retrying would invent work. The first Ok must short-
+        // circuit the loop and be returned as-is.
+        let attempts = AtomicUsize::new(0);
+        let accepted = persist_with_retry("lease start", JobId::new(), || {
+            let _ = attempts.fetch_add(1, Ordering::SeqCst);
+            async { Ok(false) }
+        })
+        .await
+        .expect("Ok verdict must pass through");
+        assert!(!accepted);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

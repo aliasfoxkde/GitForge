@@ -24,5 +24,10 @@ hex = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 
+[dev-dependencies]
+# Paused-time tests: the durable-write retry loop sleeps 2 s between
+# attempts; auto-advance keeps the exhaustion test out of real wall time.
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
 [lints]
 workspace = true

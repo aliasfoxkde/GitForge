@@ -38,6 +38,25 @@ RUN apt-get update \
 # Slim images ship the minimal rustup profile; the pipeline needs both linters.
 RUN rustup component add rustfmt clippy
 
+# Coverage gate: llvm-tools supplies llvm-profdata/llvm-cov and
+# cargo-llvm-cov drives them; both are baked so the pipeline's coverage
+# job stays inside the offline contract. Network use is build-time only.
+RUN rustup component add llvm-tools-preview \
+    && cargo install cargo-llvm-cov --locked
+
+# Toolchain contract (F25): the toolchain is frozen at image build time.
+# Jobs run with no egress — `rustup toolchain install` inside a job stalls
+# on the download and dies mid-run, which is exactly how run 6d5bac16
+# failed. The runner now refuses such steps at preflight, so the only way
+# to change the toolchain is to change it HERE, rebuild, and bump the tag:
+#
+#   RUN rustup toolchain install 1.95 --profile minimal
+#   ENV RUSTUP_TOOLCHAIN=1.95
+#
+# Remember the rust-toolchain.toml files in job workspaces override
+# RUSTUP_TOOLCHAIN and will trigger a silent download; pin them to the
+# baked version.
+
 # Warm the crate registry from the committed lockfile so runtime jobs never
 # hit crates.io. Must come before the offline flag: this is the one step
 # that is allowed to use the network.
