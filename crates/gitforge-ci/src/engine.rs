@@ -87,6 +87,12 @@ pub enum FenceAction {
     Timeout,
     /// The scheduler cancelled the job.
     Cancel,
+    /// The scheduler recorded the job as succeeded while the engine still
+    /// considers it running — the engine missed the completion event (a
+    /// dropped broadcast delivery). The durable row is only written by a
+    /// lease-verified completion, so converging on it advances the DAG
+    /// exactly as the lost event would have.
+    Succeed,
 }
 
 /// Compare the engine's running jobs against the scheduler's terminal job
@@ -95,6 +101,11 @@ pub enum FenceAction {
 /// Only `Running` engine jobs are considered: a job the engine already
 /// finished must not be re-judged from a stale scheduler row, and
 /// queued/assigned jobs legitimately have non-terminal scheduler rows.
+///
+/// Every terminal durable status maps to an action, `succeeded` included:
+/// an unmapped direction is a run the watchdog can never settle (a durable
+/// `succeeded` under a `Running` mirror previously fell through `_ => None`,
+/// leaving the run wedged non-terminal forever — run bccaa1be).
 pub fn fence_actions(
     state: &CiEngineState,
     db_status: &HashMap<JobId, String>,
@@ -110,6 +121,7 @@ pub fn fence_actions(
                     Some((*job_id, FenceAction::Timeout))
                 }
                 Some("cancelled") => Some((*job_id, FenceAction::Cancel)),
+                Some("succeeded") => Some((*job_id, FenceAction::Succeed)),
                 _ => None,
             },
         )
@@ -805,6 +817,19 @@ mod tests {
         assert!(actions.contains(&(a, FenceAction::Timeout)));
         assert!(actions.contains(&(b, FenceAction::Cancel)));
         assert_eq!(actions.len(), 2, "unknown job rows must be ignored");
+
+        // A durable `succeeded` row under a Running mirror maps to Succeed:
+        // the engine missed the completion event and the durable row is the
+        // authority. Every terminal durable status must converge — an
+        // unmapped direction is a run the watchdog can never settle
+        // (the run bccaa1be wedge fell through `_ => None` here).
+        assert_eq!(
+            fence_actions(
+                &state,
+                &[(b, "succeeded".to_string())].into_iter().collect()
+            ),
+            vec![(b, FenceAction::Succeed)]
+        );
 
         // A queued engine job with a terminal scheduler row is not
         // fenceable (nothing is running to converge); same for a job the

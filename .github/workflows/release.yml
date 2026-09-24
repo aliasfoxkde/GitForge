@@ -19,6 +19,12 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   build-linux:
     runs-on: [self-hosted, linux, x64, gitforge-github]
+    env:
+      # Same F40 rationale as rust-ci.yml: the test step touches the shared
+      # Docker daemon, whose ping times out at the 120 s client default when
+      # concurrent CI sandboxes hold it.
+      GITFORGE_DOCKER_TIMEOUT_SECS: "600"
+      GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

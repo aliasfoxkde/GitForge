@@ -434,6 +434,17 @@ async fn trigger_pipeline(
     Extension(trigger_state): Extension<Arc<TriggerState>>,
     Json(request): Json<PipelineTriggerRequest>,
 ) -> impl axum::response::IntoResponse {
+    // The manual API re-runs a real commit; a deletion sentinel has nothing
+    // to build and would only reproduce the doomed zero-hash runs (F37).
+    if gitforge_common::is_zero_hash(&request.new_hash) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_new_hash",
+                "message": "new_hash must identify a commit; an all-zero hash is a ref-deletion sentinel"
+            })),
+        );
+    }
     let repo_id = match uuid::Uuid::parse_str(&request.repo_id) {
         Ok(id) => gitforge_common::RepoId::from(id),
         Err(_) => {
@@ -1388,6 +1399,20 @@ async fn handle_push_event(
         return Ok(gitforge_common::PipelineRunId::new());
     };
 
+    // Belt-and-suspenders for the git-server's deletion filter (F37): an
+    // all-zero new hash means the ref no longer exists — there is no commit
+    // to check out, and building one used to produce a run that failed
+    // immediately at checkout. Branch creation (all-zero OLD hash) carries
+    // a real new hash and proceeds below.
+    if gitforge_common::is_zero_hash(&payload.new_hash) {
+        tracing::info!(
+            repo = %payload.repo_id,
+            ref_name = %payload.ref_name,
+            "ignoring ref-deletion push: nothing to build"
+        );
+        return Ok(gitforge_common::PipelineRunId::new());
+    }
+
     let repo_id = payload.repo_id;
     let ref_name = &payload.ref_name;
 
@@ -1639,6 +1664,11 @@ async fn reconcile_fenced_engines(
                 }
                 FenceAction::Timeout => engine.timeout_job(job_id).await,
                 FenceAction::Cancel => engine.cancel_job(job_id).await,
+                // The durable row is only written by a lease-verified
+                // completion, so a Running mirror against it means the
+                // engine missed the completion event; replaying it settles
+                // the DAG instead of wedging the run non-terminal.
+                FenceAction::Succeed => engine.succeed_job(job_id, 0).await,
             };
             match result {
                 Ok(()) => {
@@ -1814,12 +1844,26 @@ async fn finalize_run_if_terminal(
         _ => return,
     };
     if let Some(pool) = scheduler_db {
-        let _ = gitforge_db::queries::PipelineRunQueries::update_status(
+        // The durable row is the run's terminal record. If the write fails
+        // (SQLite contention can push writes past the busy timeout), LEAVE
+        // the engine in the registry and return: the watchdog's next sweep
+        // retries finalization for every live engine. Removing the engine
+        // on a failed write would leave a forever-'running' durable row no
+        // pass can ever settle (the run bccaa1be wedge).
+        if let Err(error) = gitforge_db::queries::PipelineRunQueries::update_status(
             pool,
             state.run_id,
             terminal_status,
         )
-        .await;
+        .await
+        {
+            tracing::error!(
+                %error,
+                run = %state.run_id,
+                "failed to persist terminal run status; keeping the engine live for a watchdog retry"
+            );
+            return;
+        }
     }
     let workspace_path = run_workspace_paths
         .lock()
@@ -3384,5 +3428,72 @@ jobs:
         assert!(lookup_workspace_for_run(&cache, run_b).is_none());
         assert!(lookup_workspace_for_run(&cache, run_a).is_some());
         assert!(lookup_workspace_for_run(&cache, run_c).is_some());
+    }
+
+    // --- Ref-deletion guard (F37) regression test ---
+    //
+    // The git-server filters deletion pushes before publishing, but an
+    // envelope that still reaches `handle_push_event` (replayed event, future
+    // caller, defense gap) must be dropped before any pipeline is planned:
+    // an all-zero new hash means the ref no longer exists, so there is no
+    // commit to check out. Building one produced a run that failed
+    // immediately at checkout (run 4b9497bb built at 000…0).
+
+    fn zero_hash_push_envelope() -> EventEnvelope {
+        let repo_id = gitforge_common::RepoId::new();
+        EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/feat/gone".to_string(),
+                old_hash: "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
+                new_hash: "0000000000000000000000000000000000000000".to_string(),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_event_ignores_ref_deletion() {
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<
+            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        handle_push_event(
+            &zero_hash_push_envelope(),
+            &scheduler,
+            &pipeline_cache,
+            None,
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        .expect("a deletion push is consumed silently, never an error");
+
+        // The strong assertion: the guard fired before any pipeline was
+        // resolved or planned for the deleted ref's repository.
+        assert!(
+            pipeline_cache
+                .lock()
+                .expect("pipeline cache lock poisoned")
+                .is_empty(),
+            "a ref-deletion push must not create or plan a pipeline"
+        );
+        assert!(
+            run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .is_empty(),
+            "a ref-deletion push must not prepare a run workspace"
+        );
     }
 }

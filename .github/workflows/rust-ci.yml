@@ -76,9 +76,20 @@ jobs:
           ~/go/bin/actionlint -color
 
   # ─── Testing ────────────────────────────────────────────────────────────────
+  # This runner shares the NAS Docker daemon with GitForge CI sandbox jobs.
+  # When those hold the daemon, `Docker::connect_required`'s ping times out
+  # under the bollard client's per-request timeout (default 120 s) and every
+  # sandbox-backed gitforge-runner test panics ("Docker daemon not
+  # available: Timeout error") — 16 failures in a 16-minute red suite
+  # (F40). GITFORGE_DOCKER_TIMEOUT_SECS raises that client timeout so the
+  # tests stay real — they still use Docker — while waiting out contention;
+  # GITFORGE_SANDBOX_ACQUIRE_SECS raises the acquire window alongside it.
   test:
     name: Test
     runs-on: [self-hosted, linux, x64, gitforge-github]
+    env:
+      GITFORGE_DOCKER_TIMEOUT_SECS: "600"
+      GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -94,6 +105,9 @@ jobs:
   test-serialized:
     name: Test (Serialized)
     runs-on: [self-hosted, linux, x64, gitforge-github]
+    env:
+      GITFORGE_DOCKER_TIMEOUT_SECS: "600"
+      GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -109,11 +123,17 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
   # ─── Coverage ───────────────────────────────────────────────────────────────
+  # Runs the same sandbox-backed tests as `test`/`test-serialized` above on
+  # the same self-hosted runner, so it needs the same F40 Docker-timeout
+  # dial (missed in the first F40 fix — Coverage went red with the identical
+  # 120 s-timeout signature on 2026-09-24 while the Test jobs stayed green).
   coverage:
     name: Coverage
     runs-on: [self-hosted, linux, x64, gitforge-github]
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      GITFORGE_DOCKER_TIMEOUT_SECS: "600"
+      GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust

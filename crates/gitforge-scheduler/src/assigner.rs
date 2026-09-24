@@ -8,7 +8,7 @@ use gitforge_db::models::{
     RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS,
 };
 use gitforge_db::Pool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -1007,12 +1007,31 @@ impl Scheduler {
         // admission below may make the actual batch smaller.
         let mut processed = 0;
         let max_jobs_per_batch = available_capacity.max(1);
+        // Jobs the current runner roster cannot admit right now (typically an
+        // exclusive resource class already in flight). They stay queued while
+        // the batch walks past them: stopping at the first blocked head job
+        // stalled the whole runner whenever any `cargo test --workspace` job
+        // queued behind another, even with free capacity and classless work
+        // waiting.
+        let mut skipped: HashSet<JobId> = HashSet::new();
 
         while processed < max_jobs_per_batch {
-            // Peek at next job
-            let job = match state.queue.peek_fair() {
+            // Fairness counts in-flight jobs per repository, not queue depth:
+            // a multi-stage pipeline legitimately shows several queued DAG
+            // rows, so counting queued rows let one repo's visible backlog
+            // starve every other repository indefinitely. A burst monopolizes
+            // a runner through the jobs it keeps running; FIFO breaks the
+            // remaining ties. Recomputed each admission because the batch's
+            // own assignments change the load.
+            let mut running_by_repo: HashMap<RepoId, usize> = HashMap::new();
+            for (_, _, running_repo) in state.assigned_jobs.values() {
+                *running_by_repo.entry(*running_repo).or_default() += 1;
+            }
+
+            // Peek at next eligible job
+            let job = match state.queue.peek_fair(&skipped, &running_by_repo) {
                 Some(j) => j,
-                None => break, // No more jobs
+                None => break, // No more eligible jobs
             };
 
             let job_id = job.job_id;
@@ -1088,9 +1107,14 @@ impl Scheduler {
                     let _ = self.event_tx.send(event);
                 }
                 None => {
-                    // No runner available for this job, skip remaining
-                    tracing::debug!("no runner available for job {}, stopping batch", job_id);
-                    break;
+                    // No runner can take this job right now. Leave it queued
+                    // and consider the next one so a single blocked job cannot
+                    // idle the runner's remaining capacity.
+                    tracing::debug!(
+                        "no runner available for job {}, skipping to next queued job",
+                        job_id
+                    );
+                    skipped.insert(job_id);
                 }
             }
         }
@@ -1647,6 +1671,143 @@ mod tests {
 
         // Process queue
         scheduler.process_queue().await;
+    }
+
+    fn workspace_test_definition() -> JobExecutionDefinition {
+        JobExecutionDefinition {
+            commands: vec!["cargo test --workspace".to_string()],
+            image: "rust:1".to_string(),
+            working_dir: None,
+            timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+        }
+    }
+
+    fn plain_definition() -> JobExecutionDefinition {
+        JobExecutionDefinition {
+            commands: vec!["echo plain".to_string()],
+            image: "rust:1".to_string(),
+            working_dir: None,
+            timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_class_job_does_not_block_the_batch() {
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+
+        let blocked_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                blocked_job,
+                run_id,
+                repo_id,
+                workspace_test_definition(),
+            )
+            .await;
+        // Queued after the blocked job; a classless job the same runner can
+        // always take.
+        let plain_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                plain_job,
+                run_id,
+                repo_id,
+                plain_definition(),
+            )
+            .await;
+
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+
+        // One workspace-cargo-test job already in flight on that runner: the
+        // class admits at most one at a time, so the queued test job cannot
+        // be admitted while the runner still has a free slot.
+        let running_test_job = JobId::new();
+        {
+            let mut state = scheduler.state.write().await;
+            state
+                .job_definitions
+                .insert(running_test_job, workspace_test_definition());
+            state
+                .assigned_jobs
+                .insert(running_test_job, (runner_id, run_id, repo_id));
+        }
+
+        scheduler.process_queue().await;
+
+        assert!(
+            scheduler.is_assigned(plain_job).await.is_some(),
+            "classless job behind a blocked head must still be assigned"
+        );
+        assert!(
+            scheduler.is_assigned(blocked_job).await.is_none(),
+            "exclusive-class job must stay queued while its class is running"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fairness_counts_running_jobs_not_visible_backlog() {
+        let scheduler = Scheduler::new();
+        let run_id = PipelineRunId::new();
+        let backlog_repo = RepoId::new();
+        let idle_repo = RepoId::new();
+
+        // backlog_repo's multi-stage pipeline shows three queued rows but
+        // runs nothing; idle_repo queued a single NEWER job. Counting queued
+        // rows preferred idle_repo forever and starved backlog_repo for
+        // hours; counting running jobs ties both at zero and FIFO wins.
+        let mut older_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                older_job,
+                run_id,
+                backlog_repo,
+                plain_definition(),
+            )
+            .await;
+        {
+            // Age the job so FIFO is decisive even within one millisecond.
+            let mut state = scheduler.state.write().await;
+            if let Some(mut aged) = state.queue.remove(older_job) {
+                aged.queued_at -= 1_000;
+                older_job = aged.job_id;
+                state.queue.enqueue(aged);
+            }
+        }
+        for _ in 0..2 {
+            scheduler
+                .enqueue_with_definition_and_image_and_timeout(
+                    JobId::new(),
+                    run_id,
+                    backlog_repo,
+                    plain_definition(),
+                )
+                .await;
+        }
+        let newer_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                newer_job,
+                run_id,
+                idle_repo,
+                plain_definition(),
+            )
+            .await;
+
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 1);
+        scheduler.register_runner(runner).await;
+
+        scheduler.process_queue().await;
+
+        let assigned = scheduler.get_assigned_jobs().await;
+        assert_eq!(assigned.len(), 1, "capacity 1 admits exactly one job");
+        assert_eq!(
+            assigned[0].0, older_job,
+            "equal running load must fall through to FIFO, not queue depth"
+        );
     }
 
     #[tokio::test]
