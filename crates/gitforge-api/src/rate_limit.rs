@@ -216,9 +216,15 @@ impl<S> Layer<S> for RateLimitLayer {
 }
 
 /// Extract client identifier from request
+///
+/// Proxy headers win (the instance sits behind nothing today, but a
+/// deployment that adds one must not bucket every client into the peer
+/// address of the proxy). The fallback is the real socket peer — served via
+/// `into_make_service_with_connect_info` — never a shared constant: a
+/// per-instance "unknown" bucket would let one noisy client lock out every
+/// other one (F9).
 fn extract_client_id<B>(request: &Request<B>) -> String {
-    // Try to get real IP from common headers
-    let ip = request
+    let forwarded = request
         .headers()
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
@@ -234,14 +240,19 @@ fn extract_client_id<B>(request: &Request<B>) -> String {
                 .get("cf-connecting-ip")
                 .and_then(|v| v.to_str().ok())
         })
-        .map_or_else(
-            || "unknown".to_string(),
-            |s| s.split(',').next().unwrap_or(s).trim().to_string(),
-        );
-
-    // If authenticated, could use user ID instead
-    // For now, use IP
-    ip
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+    match forwarded {
+        Some(client) => client,
+        // Key by IP only: the ephemeral port changes per connection, and a
+        // per-connection bucket would rate-limit nothing.
+        None => match request
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        {
+            Some(connect_info) => connect_info.0.ip().to_string(),
+            None => "unknown".to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +362,57 @@ mod tests {
         let request = Request::builder().body(axum::body::Body::empty()).unwrap();
         let client_id = extract_client_id(&request);
         assert_eq!(client_id, "unknown");
+    }
+
+    #[tokio::test]
+    async fn test_extract_client_id_peer_addr_fallback() {
+        use axum::http::Request;
+        use std::net::SocketAddr;
+
+        // Header-less clients must not collapse into one "unknown" bucket:
+        // the peer address injected by `into_make_service_with_connect_info`
+        // (F9) keys the bucket per connection source.
+        let mut request = Request::builder().body(axum::body::Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::new(
+                std::net::IpAddr::from([192, 168, 1, 42]),
+                51_234,
+            )));
+        let client_id = extract_client_id(&request);
+        assert_eq!(client_id, "192.168.1.42");
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_layer_denies_with_429() {
+        use axum::http::Request;
+        use tower::Service;
+
+        // End-to-end through the mounted layer: exhausting the burst must
+        // surface as HTTP 429 to the client, not a silent pass-through.
+        let limiter = RateLimiter::new(RateLimitConfig {
+            requests_per_minute: 60,
+            burst_size: 1,
+        });
+        let mut service = RateLimitLayer::new(limiter)
+            .layer(axum::routing::post(|| async { axum::http::StatusCode::OK }));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("x-real-ip", "10.9.9.9")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let allowed = service.call(request).await.unwrap();
+        assert_eq!(allowed.status(), axum::http::StatusCode::OK);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("x-real-ip", "10.9.9.9")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let denied = service.call(request).await.unwrap();
+        assert_eq!(denied.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]

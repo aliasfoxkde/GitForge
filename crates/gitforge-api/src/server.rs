@@ -23,10 +23,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::rate_limit::{RateLimitConfig, RateLimitLayer, RateLimiter};
+
 /// API server
 pub struct ApiServer {
     pub router: Router,
     pub port: u16,
+    /// Handles to every mounted rate-limit bucket so `start` can run the
+    /// entry eviction loop; without it the client map grows unbounded.
+    rate_limiters: Vec<crate::rate_limit::RateLimiter>,
 }
 
 impl ApiServer {
@@ -84,14 +89,34 @@ impl ApiServer {
         public_routes = public_routes.merge(metrics);
         public_routes = public_routes.merge(dashboard);
         public_routes = public_routes.merge(swagger);
+        // Runner registration is unauthenticated by design (the runner
+        // proves itself with its registration token inside the handler), so
+        // it is the other public write surface and gets its own rate-limit
+        // bucket (F9). Probes and metrics stay unlimited — scraping them
+        // must not fight a login flood for tokens.
+        let runner_registration_limiter = RateLimiter::new(RateLimitConfig {
+            requests_per_minute: 60,
+            burst_size: 20,
+        });
+        let runner_registration = public_runner_routes()
+            .layer(RateLimitLayer::new(runner_registration_limiter.clone()))
+            .layer(Extension(Arc::new(pool.clone())));
         public_routes = public_routes
-            .nest("/api", public_runner_routes())
+            .nest("/api", runner_registration)
             .layer(Extension(Arc::new(pool.clone())));
 
-        // Auth routes (public - no auth required for login)
+        // Auth routes (public - no auth required for login). The login
+        // endpoint is the brute-force surface, so it gets the tightest
+        // bucket (F9); /auth/status rides along — it is a cheap pre-login
+        // probe and one bucket keeps the middleware simple.
+        let auth_rate_limiter = RateLimiter::new(RateLimitConfig {
+            requests_per_minute: 30,
+            burst_size: 10,
+        });
         let auth_routes = Router::new()
             .route("/auth/login", post(crate::routes::login))
             .route("/auth/status", get(crate::routes::auth_status))
+            .layer(RateLimitLayer::new(auth_rate_limiter.clone()))
             .layer(Extension(Arc::new(auth.clone())))
             .layer(Extension(Arc::new(pool.clone())));
 
@@ -128,6 +153,7 @@ impl ApiServer {
         Self {
             router: app,
             port: 42780,
+            rate_limiters: vec![auth_rate_limiter, runner_registration_limiter],
         }
     }
 
@@ -178,8 +204,27 @@ impl ApiServer {
         tracing::info!("OpenAPI spec at /api-docs/openapi.json");
         tracing::info!("Metrics available at /metrics");
 
+        // The rate limiter buckets by real peer address (F9): serving with
+        // connect info is what puts the peer into every request's
+        // extensions. Without it, header-less clients would all share one
+        // "unknown" bucket.
+        let cleanup_limiters = self.rate_limiters.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                for limiter in &cleanup_limiters {
+                    limiter.cleanup().await;
+                }
+            }
+        });
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, self.router).await?;
+        axum::serve(
+            listener,
+            self.router
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await?;
 
         Ok(())
     }
