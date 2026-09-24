@@ -1705,7 +1705,8 @@ mod tests {
                 repo_id,
                 workspace_test_definition(),
             )
-            .await;
+            .await
+            .unwrap();
         // Queued after the blocked job; a classless job the same runner can
         // always take.
         let plain_job = JobId::new();
@@ -1716,7 +1717,8 @@ mod tests {
                 repo_id,
                 plain_definition(),
             )
-            .await;
+            .await
+            .unwrap();
 
         let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
         let runner_id = runner.id;
@@ -1767,7 +1769,8 @@ mod tests {
                 backlog_repo,
                 plain_definition(),
             )
-            .await;
+            .await
+            .unwrap();
         {
             // Age the job so FIFO is decisive even within one millisecond.
             let mut state = scheduler.state.write().await;
@@ -1785,7 +1788,8 @@ mod tests {
                     backlog_repo,
                     plain_definition(),
                 )
-                .await;
+                .await
+                .unwrap();
         }
         let newer_job = JobId::new();
         scheduler
@@ -1795,7 +1799,8 @@ mod tests {
                 idle_repo,
                 plain_definition(),
             )
-            .await;
+            .await
+            .unwrap();
 
         let runner = make_runner(RunnerId::new(), "test-runner", "online", 1);
         scheduler.register_runner(runner).await;
