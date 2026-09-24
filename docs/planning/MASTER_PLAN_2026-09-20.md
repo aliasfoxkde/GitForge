@@ -245,7 +245,13 @@ Each finding: what was observed, why it matters, where the fix lands.
   is the durable half of the queue-idempotence work. **Fix lands in**:
   Phase 1 (retry the durable write with bounded backoff, and do not
   dispatch a job that has no durable row — coordinate with the
-  queue-idempotence lane).
+  queue-idempotence lane). **RESOLVED 2026-09-24** (resilience campaign,
+  branch `claude/resilience-durable-writes-20260924`): the enqueue
+  persists first via `persist_with_retry` (5 attempts x 2 s) and returns
+  `anyhow::Result`; the CI service grades the run failed and evicts its
+  registries on head-enqueue failure, and chain enqueues fail the job
+  through the engine. The job insert is an ensure, not a create, so the
+  CI service's earlier row never trips the retry budget.
 - **F22 — `.env` with the live `JWT_SECRET` tracked in a public repo.**
   `.env` is listed in `.gitignore`, but it was tracked before the ignore
   rule existed, so every commit since kept publishing it — secret value
@@ -271,7 +277,10 @@ Each finding: what was observed, why it matters, where the fix lands.
   layer. **Fix lands in**: Phase 1 (retry the lease write with bounded
   backoff like F20's trigger retry; make completion reporting idempotent
   and reconcilable — coordinate with the queue-idempotence lane and the
-  F21 durable-write fix).
+  F21 durable-write fix). **RESOLVED 2026-09-24** (same branch): lease
+  start and completion go through `persist_with_retry` at the scheduler
+  layer where the in-memory lease is still valid; a definitive
+  `Ok(false)` verdict short-circuits the retry so no work is invented.
 - **F24 — A cancelled run can be resurrected to succeeded.** After the
   orphan sweep graded run `50b35e0b` `cancelled` (F19's jobless verdict),
   its late head-job row still sat `queued`; the scheduler dispatched it
@@ -283,6 +292,12 @@ Each finding: what was observed, why it matters, where the fix lands.
   terminal run must either stay terminal or log the reversal loudly —
   grade flips need an audit trail in the finalize log, and a queued job
   whose run is terminal should be cancelled, not dispatched).
+  **RESOLVED 2026-09-24** (same branch): `PipelineRunQueries::update_
+  status` is now a single conditional UPDATE that refuses any non-
+  matching terminal rewrite (idempotent same-verdict rewrites stay
+  allowed; `finished_at` is COALESCEd to its first value) and logs both
+  verdicts on a blocked write; dispatch-side, process_queue cancels
+  queued jobs whose run is terminal. Pinned by db integration tests.
 
 ---
 
@@ -523,7 +538,13 @@ for 627 — a coherent first sprint of table-driven error-path tests.
   toolchain not in the image must rebuild and bump the tag — plus a
   runner-side preflight that rejects a job whose toolchain request is not
   baked, with an error naming the image and the missing toolchain instead
-  of a 110-second connect timeout.
+  of a 110-second connect timeout. **RESOLVED 2026-09-24** (same branch):
+  the executor's preflight (`runtime_toolchain_fetch`) rejects steps
+  invoking `rustup toolchain install/update`, `rustup update/self
+  update`, or `rustup target add` before any sandbox is acquired, with
+  the remedy in the message; `rustup component add` stays allowed (an
+  installed component resolves offline). The ci-rust image contract
+  gained the toolchain clause.
 - **F26 — Registry pollution recurrence despite the healing migration.**
   The live `runners` table still holds **29 rows** (2 `online`, 1
   stale-`online`) after PR #202's upsert-by-name registration and healing
@@ -533,4 +554,58 @@ for 627 — a coherent first sprint of table-driven error-path tests.
   migration ran on the live DB (schema/row inspection), retire stale rows
   once via `DELETE /api/runners/{id}`, and add an assertion to
   `gitforge-status` that prints the registry row count vs live runners so
-  recurrence is visible without SQL.
+  recurrence is visible without SQL. **RESOLVED 2026-09-24**: the
+  healing migration had run — the 29 rows are retired history, not
+  recurrence; the one live stale-`online` row was flipped offline and
+  the durable-side gap closed (`RunnerQueries::mark_stale_offline`,
+  called by the scheduler janitor, which previously swept only its
+  in-memory mirror). `gitforge-status` now prints online/stale-online
+  counts (RFC3339 timestamps normalized through `datetime()` before
+  comparison — raw text comparison mis-sorts same-day rows) and
+  degrades its verdict on any stale row.
+
+## 9. SQLite write-path audit (2026-09-24, resilience campaign)
+
+Swept every connection site and write path for the systemic F19–F23
+disease. Findings and state after the campaign branch:
+
+- **Connection pragmas** (`crates/gitforge-db/src/connection.rs`): WAL +
+  `synchronous=NORMAL` + `foreign_keys=1`, pinned by
+  `test_file_pool_enables_concurrency_pragmas`. busy_timeout raised
+  15 s → **30 s**: the observed 19–40 s COMMIT stalls exceeded 15 s, so
+  victims abandoned locks they would eventually have been granted,
+  cascading into missed heartbeats and lost lease writes. Readers do not
+  block in WAL, so the longer writer ceiling costs nothing on read
+  paths.
+- **Deferred-transaction upgrade hazard**: sqlx `begin()` opens
+  `BEGIN DEFERRED`; a transaction that reads then writes under WAL can
+  fail with SQLITE_BUSY *immediately, without honoring busy_timeout*.
+  All five multi-statement write transactions (`repository delete`,
+  `job completion`, `requeue_inflight`, `retire_if_idle`,
+  `review transition`) now open `BEGIN IMMEDIATE` (via
+  `pool.begin_with`), joining the two pre-existing sites (log append,
+  review claim). IMMEDIATE acquires the write lock up front — the
+  busy handler applies, the lock-hold window shrinks (no read phase
+  under the lock), and upgrade-deadlock cannot occur.
+- **One-shot write survivors**: the remaining single-statement writes
+  (status updates, heartbeats) fail fast under saturation but are
+  either retried by callers (F19/F20/F21/F23 retry paths) or safe to
+  lose by design (heartbeats recur). No new retry loops added at this
+  layer — retry belongs to the operation's owner, not the query.
+- **Connection budget**: `max_connections(5)` per process x 4 service
+  processes = ≤20 connections on one file. WAL serializes writers, and
+  with IMMEDIATE transactions each write hold is short; no pool-size
+  change needed. Revisit only if write stalls reappear after the 30 s
+  ceiling — the correct next step would be a write-through queue, not a
+  bigger timeout.
+- **Verification**: paused-time unit tests cover the retry budget and
+  definitive-Ok short-circuit; db integration tests pin the terminal
+  verdict guard, the stale-runner sweep, and idempotent sweeps.
+
+Also shipped in the same branch: F9 (rate limiter mounted on login and
+runner registration, keyed by proxy header or peer IP — previously
+built but mounted nowhere), `JWT_SECRET_FILE` credential-file support
+(systemd `LoadCredential=` shape; file wins over env; unreadable or
+empty aborts startup), and the pipeline's own coverage job (hard gate
+87%, advisory warn below 89%, `dsc-ci-rust:7` bakes llvm-tools +
+cargo-llvm-cov for the offline contract).
