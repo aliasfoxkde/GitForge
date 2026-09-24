@@ -76,9 +76,17 @@ jobs:
           ~/go/bin/actionlint -color
 
   # ─── Testing ────────────────────────────────────────────────────────────────
+  # GITFORGE_SANDBOX_ACQUIRE_SECS: this runner shares the NAS Docker daemon
+  # with GitForge CI sandbox jobs. When those hold the daemon, a 60 s acquire
+  # timeout makes every sandbox-backed gitforge-runner test panic
+  # ("Docker daemon not available: Timeout error") instead of waiting its
+  # turn. 300 s keeps the tests real — they still use Docker — while
+  # tolerating daemon contention.
   test:
     name: Test
     runs-on: [self-hosted, linux, x64, gitforge-github]
+    env:
+      GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -94,6 +102,8 @@ jobs:
   test-serialized:
     name: Test (Serialized)
     runs-on: [self-hosted, linux, x64, gitforge-github]
+    env:
+      GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
