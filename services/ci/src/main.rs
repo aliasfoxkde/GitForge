@@ -1632,6 +1632,11 @@ async fn reconcile_fenced_engines(
                 }
                 FenceAction::Timeout => engine.timeout_job(job_id).await,
                 FenceAction::Cancel => engine.cancel_job(job_id).await,
+                // The durable row is only written by a lease-verified
+                // completion, so a Running mirror against it means the
+                // engine missed the completion event; replaying it settles
+                // the DAG instead of wedging the run non-terminal.
+                FenceAction::Succeed => engine.succeed_job(job_id, 0).await,
             };
             match result {
                 Ok(()) => {
@@ -1784,12 +1789,26 @@ async fn finalize_run_if_terminal(
         _ => return,
     };
     if let Some(pool) = scheduler_db {
-        let _ = gitforge_db::queries::PipelineRunQueries::update_status(
+        // The durable row is the run's terminal record. If the write fails
+        // (SQLite contention can push writes past the busy timeout), LEAVE
+        // the engine in the registry and return: the watchdog's next sweep
+        // retries finalization for every live engine. Removing the engine
+        // on a failed write would leave a forever-'running' durable row no
+        // pass can ever settle (the run bccaa1be wedge).
+        if let Err(error) = gitforge_db::queries::PipelineRunQueries::update_status(
             pool,
             state.run_id,
             terminal_status,
         )
-        .await;
+        .await
+        {
+            tracing::error!(
+                %error,
+                run = %state.run_id,
+                "failed to persist terminal run status; keeping the engine live for a watchdog retry"
+            );
+            return;
+        }
     }
     let workspace_path = run_workspace_paths
         .lock()
