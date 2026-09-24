@@ -612,11 +612,16 @@ mod tests {
             .expect("failed to spawn sh")
     }
 
-    /// Spawn `sh -c 'exit N'` as a stand-in git child so lifecycle tests run
-    /// anywhere the rest of this suite runs.
+    /// Spawn a stand-in git child that exits `N` after consuming stdin, so
+    /// lifecycle tests run anywhere the rest of this suite runs. The child
+    /// must outlive `drive`'s stdin write: a bare `exit N` can finish first
+    /// under host load, turning the write into a spurious EPIPE
+    /// ("Broken pipe") instead of the exit-status path being tested
+    /// (observed twice on 2026-09-23 in CI). `cat` holds the pipe open
+    /// until stdin is dropped, which `drive` does right after writing.
     #[cfg(unix)]
     fn spawn_test_child(exit_code: i32) -> GitRpcChild {
-        spawn_test_child_script(format!("exit {exit_code}"))
+        spawn_test_child_script(format!("cat > /dev/null; exit {exit_code}"))
     }
 
     /// Spawn a child that stays alive and silent until killed, so a dropped
