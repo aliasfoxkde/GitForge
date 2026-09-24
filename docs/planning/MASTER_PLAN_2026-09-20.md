@@ -219,7 +219,70 @@ Each finding: what was observed, why it matters, where the fix lands.
   invisible to the sweep's live filter. **Fix lands in**: an enqueue
   horizon for the jobless-run verdict (1 h, `RECONCILE_EMPTY_RUN_HORIZON_
   SECS`), plus the structural follow-up of registering the run with the
-  engine at trigger time rather than first job.
+  engine at trigger time rather than first job. **RESOLVED 2026-09-23**:
+  PR #220 (shipped in v0.6.7) adds the 1 h `RECONCILE_EMPTY_RUN_HORIZON_SECS`.
+- **F20 — A dropped trigger INSERT silently eats a push's CI.** The
+  git-server accepted a push and then inserted its `ci.trigger.pending`
+  event in a single shot; under write-lock contention that INSERT could
+  fail with the push already reported to the pusher — no run, no error,
+  nothing in the durable redelivery ledger. **Fix lands in**: bounded
+  retry inside `enqueue_ci_event`. **RESOLVED 2026-09-23**: PR #221
+  (shipped in v0.6.7) retries 5 times with 3 s backoff and surfaces the
+  error after the final attempt.
+- **F21 — Job persist failure leaves the enqueue in-memory-only.**
+  The scheduler assigner enqueues each job into its in-memory queue first
+  and then persists a durable row
+  (`crates/gitforge-scheduler/src/assigner.rs`,
+  `enqueue_with_definition_and_image_and_timeout`); when that INSERT fails
+  under SQLite write contention (`database is locked` after the 15 s busy
+  window), the failure path is a lone `tracing::error!` — the job proceeds
+  with **no durable row**, so completion persistence, watchdog
+  reconciliation, and restart recovery never see it. Observed live on
+  2026-09-23: run `8f63bfd8`'s head-job INSERT failed at 17:29:39Z after
+  slogging through a gauntlet of 19–40 s COMMIT stalls, 75 s after the
+  orphan sweep had already graded the jobless run `cancelled` (F19's
+  window — three consecutive branch runs were lost this way that day). This
+  is the durable half of the queue-idempotence work. **Fix lands in**:
+  Phase 1 (retry the durable write with bounded backoff, and do not
+  dispatch a job that has no durable row — coordinate with the
+  queue-idempotence lane).
+- **F22 — `.env` with the live `JWT_SECRET` tracked in a public repo.**
+  `.env` is listed in `.gitignore`, but it was tracked before the ignore
+  rule existed, so every commit since kept publishing it — secret value
+  included — to the public GitHub mirror. Confirmed 2026-09-23
+  (`aliasfoxkde/GitForge` is publicly readable; `JWT_SECRET` carries a real
+  40-character value in history). Untracked going forward in the same
+  session; the exposed secret is rotated at the next service restart, which
+  invalidates outstanding tokens (re-login via `gitforge auth --login`).
+  History rewrite is deliberately not used. Verified while triaging this:
+  the API already fails fast on a missing `JWT_SECRET`
+  (`services/api/src/main.rs` — "no dev fallback in production"), so
+  rotation carries no code risk. **Fix lands in**: Phase 0 ops (rotation at
+  the v0.6.7 cutover) + untrack commit.
+- **F23 — Lease write failure under contention churns assignments.**
+  The runner's "mark job started" write is single-shot; when it fails
+  with `database is locked` (409 to the runner), the lease looks dead to
+  the scheduler, which reassigns the same job — observed live on
+  2026-09-23 as a reassignment loop producing duplicate and zombie
+  containers, runner log chunks rejected with 500, and a completion
+  report lost (job `21497438` finished `failed` on the runner but stayed
+  `assigned` in the database). Same systemic disease as F19/F20/F21:
+  SQLite write saturation breaking one-shot durability writes at every
+  layer. **Fix lands in**: Phase 1 (retry the lease write with bounded
+  backoff like F20's trigger retry; make completion reporting idempotent
+  and reconcilable — coordinate with the queue-idempotence lane and the
+  F21 durable-write fix).
+- **F24 — A cancelled run can be resurrected to succeeded.** After the
+  orphan sweep graded run `50b35e0b` `cancelled` (F19's jobless verdict),
+  its late head-job row still sat `queued`; the scheduler dispatched it
+  ~50 minutes later, the chain advanced, and final grading flipped the run
+  to `succeeded` — with genuinely executed jobs (all three steps re-ran to
+  real completions), but a status timeline that read cancelled-then-
+  succeeded with no marker of the reversal. The work was honest in this
+  instance; the bookkeeping was not. **Fix lands in**: Phase 1 (a
+  terminal run must either stay terminal or log the reversal loudly —
+  grade flips need an audit trail in the finalize log, and a queued job
+  whose run is terminal should be cancelled, not dispatched).
 
 ---
 
