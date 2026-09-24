@@ -13,6 +13,7 @@ use axum::{
 use chrono::Utc;
 use futures::StreamExt;
 use gitforge_ci::{
+    engine::{fence_actions, FenceAction},
     CiEngine, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
 };
 use gitforge_common::PipelineStatus;
@@ -315,6 +316,14 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await;
                     }
+
+                    // Scheduler-fenced rows (lost runner, lost lease) never
+                    // emit a completion event, so their live engines would
+                    // sit Running forever even though the durable row is
+                    // terminal; converge those engines the same way the
+                    // timeout mirror above does, then let the finalizer
+                    // settle any run this completes.
+                    reconcile_fenced_engines(&watchdog_registry, &watchdog_db).await;
                 }
                 () = tokio::time::sleep(Duration::from_secs(1)) => {
                     if watchdog_shutdown.load(Ordering::SeqCst) {
@@ -1558,6 +1567,59 @@ async fn handle_push_event(
     }
 
     Ok(state.run_id)
+}
+
+/// Converge engine job state with scheduler rows that went terminal
+/// without a completion event — the runner that would report the outcome
+/// was fenced, so nothing else ever drives the DAG forward. Only rows the
+/// scheduler marked terminal are consulted; queued or requeued jobs still
+/// belong to a live assignment path. Returns the number of engine jobs
+/// reconciled.
+async fn reconcile_fenced_engines(
+    registry: &tokio::sync::RwLock<PipelineRegistry>,
+    db: &Option<gitforge_db::Pool>,
+) -> usize {
+    let Some(pool) = db.as_ref() else {
+        return 0;
+    };
+    let engines = registry.read().await;
+    let mut reconciled = 0;
+    for engine in engines.values() {
+        let state = engine.state().await;
+        let mut statuses: HashMap<gitforge_common::JobId, String> = HashMap::new();
+        for job_id in state.jobs.keys() {
+            match gitforge_db::queries::JobQueries::get(pool, *job_id).await {
+                Ok(Some(job)) => {
+                    statuses.insert(*job_id, job.status);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "fence reconciliation could not read job row");
+                }
+            }
+        }
+        for (job_id, action) in fence_actions(&state, &statuses) {
+            let result = match action {
+                FenceAction::Fail => {
+                    engine
+                        .fail_job(job_id, 137, "runner lost while job was running".to_string())
+                        .await
+                }
+                FenceAction::Timeout => engine.timeout_job(job_id).await,
+                FenceAction::Cancel => engine.cancel_job(job_id).await,
+            };
+            match result {
+                Ok(()) => {
+                    reconciled += 1;
+                    tracing::warn!(%job_id, "engine job reconciled after scheduler fence");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %job_id, "engine fence reconciliation failed");
+                }
+            }
+        }
+    }
+    reconciled
 }
 
 async fn run_scheduler_event_consumer(

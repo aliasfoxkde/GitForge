@@ -75,6 +75,47 @@ impl CiEngineState {
     }
 }
 
+/// The action the orchestrator should apply to an engine job whose
+/// scheduler row already reached a terminal state without a completion
+/// event arriving — the runner that would have reported the outcome is
+/// gone, so nothing else will ever drive the DAG forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceAction {
+    /// The scheduler fenced the job as failed (typically a lost runner).
+    Fail,
+    /// The scheduler recorded the job as timed out.
+    Timeout,
+    /// The scheduler cancelled the job.
+    Cancel,
+}
+
+/// Compare the engine's running jobs against the scheduler's terminal job
+/// statuses and return the (job, action) pairs required to converge.
+///
+/// Only `Running` engine jobs are considered: a job the engine already
+/// finished must not be re-judged from a stale scheduler row, and
+/// queued/assigned jobs legitimately have non-terminal scheduler rows.
+pub fn fence_actions(
+    state: &CiEngineState,
+    db_status: &HashMap<JobId, String>,
+) -> Vec<(JobId, FenceAction)> {
+    state
+        .jobs
+        .iter()
+        .filter(|(_, job_state)| job_state.status() == JobStatus::Running)
+        .filter_map(
+            |(job_id, _)| match db_status.get(job_id).map(String::as_str) {
+                Some("failed") => Some((*job_id, FenceAction::Fail)),
+                Some("timed_out" | "timeout" | "timed-out") => {
+                    Some((*job_id, FenceAction::Timeout))
+                }
+                Some("cancelled") => Some((*job_id, FenceAction::Cancel)),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
 /// CI Engine
 pub struct CiEngine {
     state: Arc<RwLock<CiEngineState>>,
@@ -674,5 +715,103 @@ mod tests {
 
         let state = engine.state().await;
         assert!(!state.failed_jobs().is_empty());
+    }
+
+    /// A scheduler row that went terminal behind the engine's back (a
+    /// runner was fenced while its job was running) must map to exactly
+    /// one action, and only for jobs the engine still believes are
+    /// running.
+    #[tokio::test]
+    async fn test_fence_actions_maps_terminal_scheduler_rows() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, make_parallel_pipeline())
+            .await
+            .unwrap();
+        engine.start().await.unwrap();
+
+        let ready = engine.ready_jobs().await;
+        assert_eq!(ready.len(), 2);
+        let runner_id = gitforge_common::RunnerId::new();
+        for job in &ready {
+            engine.assign_job(*job, runner_id).await.unwrap();
+            engine.start_job(*job).await.unwrap();
+        }
+
+        let state = engine.state().await;
+        let (a, b) = (ready[0], ready[1]);
+        let db_status: HashMap<JobId, String> =
+            [(a, "failed".to_string()), (b, "running".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            fence_actions(&state, &db_status),
+            vec![(a, FenceAction::Fail)]
+        );
+
+        // Applying the action converges the DAG exactly like a runner-
+        // reported failure: the fenced job fails, the run waits for the
+        // sibling.
+        engine
+            .fail_job(a, 137, "runner lost; job fenced".to_string())
+            .await
+            .unwrap();
+        let state = engine.state().await;
+        assert_eq!(state.status, PipelineStatus::Running);
+
+        // The sibling finishing settles the run as failed, not hung.
+        engine.succeed_job(b, 0).await.unwrap();
+        let state = engine.state().await;
+        assert_eq!(state.status, PipelineStatus::Failed);
+        assert!(state.finished_at.is_some());
+    }
+
+    /// Timeout and cancelled scheduler rows map to their own actions;
+    /// non-terminal rows and engine-finished jobs map to none.
+    #[tokio::test]
+    async fn test_fence_actions_action_and_noise_mapping() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, make_parallel_pipeline())
+            .await
+            .unwrap();
+        engine.start().await.unwrap();
+
+        let ready = engine.ready_jobs().await;
+        let (a, b, c) = (ready[0], ready[1], JobId::new());
+        let runner_id = gitforge_common::RunnerId::new();
+        for job in &ready {
+            engine.assign_job(*job, runner_id).await.unwrap();
+            engine.start_job(*job).await.unwrap();
+        }
+
+        let state = engine.state().await;
+        let db_status: HashMap<JobId, String> = [
+            (a, "timed_out".to_string()),
+            (b, "cancelled".to_string()),
+            (c, "failed".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let actions = fence_actions(&state, &db_status);
+        assert!(actions.contains(&(a, FenceAction::Timeout)));
+        assert!(actions.contains(&(b, FenceAction::Cancel)));
+        assert_eq!(actions.len(), 2, "unknown job rows must be ignored");
+
+        // A queued engine job with a terminal scheduler row is not
+        // fenceable (nothing is running to converge); same for a job the
+        // engine already finished.
+        engine.succeed_job(a, 0).await.unwrap();
+        let state = engine.state().await;
+        let db_status: HashMap<JobId, String> = [(a, "failed".to_string())].into_iter().collect();
+        assert!(fence_actions(&state, &db_status).is_empty());
     }
 }
