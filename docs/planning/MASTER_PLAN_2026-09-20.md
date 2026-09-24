@@ -655,3 +655,18 @@ failed the new coverage job. Diagnosis, all four layers of it:
   With them, the failure reproduces deterministically; without them
   you debug a fiction (the first repro "found" three CLI test failures
   that do not occur in real jobs).
+- **F29 (host /tmp tmpfs saturation, OPEN — infrastructure, not
+  code).** The gate-recalibration run's fmt job failed in 12 seconds
+  with `OCI runtime exec failed: write /tmp/runc-process<rand>: no
+  space left on device` — docker's runc writes exec process specs
+  under `/tmp`, which on this host is a size-capped tmpfs (16G, shared
+  with jellyfin transcodes and other tooling). When it fills, EVERY
+  `docker exec` fails and the runner grades an innocent commit as
+  failed; nothing in the job log points at the host. Mitigations:
+  `scripts/gitforge-status` now reports `/tmp` utilization and
+  degrades the verdict at ≥90%; the step capture already preserves the
+  OCI error verbatim, which is what made this diagnosable in one step.
+  Longer term the runner could classify ENOSPC/OCI-runtime step errors
+  as infrastructure failures (distinct run status) instead of
+  charging them to the commit — noted for the F27 scheduler/runner
+  truthfulness follow-up.
