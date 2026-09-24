@@ -607,5 +607,51 @@ runner registration, keyed by proxy header or peer IP — previously
 built but mounted nowhere), `JWT_SECRET_FILE` credential-file support
 (systemd `LoadCredential=` shape; file wins over env; unreadable or
 empty aborts startup), and the pipeline's own coverage job (hard gate
-87%, advisory warn below 89%, `dsc-ci-rust:7` bakes llvm-tools +
+82%, advisory warn below 84%, `dsc-ci-rust:7` bakes llvm-tools +
 cargo-llvm-cov for the offline contract).
+
+## 10. Findings from the first pipeline run of the coverage gate (2026-09-24)
+
+The branch run (commit df316234) went fmt → clippy → test green and
+failed the new coverage job. Diagnosis, all four layers of it:
+
+- **F28 (the real one — gate miscalibration, FIXED in-branch).** The 87%
+  hard gate was calibrated from a HOST sweep (87.56% measured in
+  `gitforge-resil`), not from the sandbox the job actually runs in.
+  Two identical in-sandbox sweeps measured 82.80% (bridge network) and
+  82.82% (`--network none`) — the number is stable and network mode is
+  irrelevant; the host simply inflates coverage ~4.8pp because ambient
+  services (live GitForge API on localhost, docker socket, host git
+  config) let integration tests exercise real code paths that stay
+  dark in the sandbox. A gate must be measured where it runs. Gate
+  reset to 82 hard / 84 advisory. Lesson recorded: never calibrate a
+  CI gate from a host measurement.
+- **Runner log cap (fixed in-branch, step design).** The runner
+  truncates captured step output at 64 KB (oldest bytes dropped, full
+  size logged at WARNING in `gitforge_storage::job_logs`). llvm-cov
+  chatter alone exceeds that, so printing the full summary would
+  truncate away the gate verdict exactly when it matters. The step now
+  prints only the verdict lines plus, on failure, the last 40 lines of
+  the capture.
+- **F27 (scheduler head-of-line stall, OPEN).** While any
+  `workspace-cargo-test`-class job runs, the entire CI queue freezes:
+  the class is exclusive per runner, `peek_fair` puts the repo with the
+  fewest queued jobs at the head every tick, and the dispatch batch
+  loop `break`s when the head finds no capacity — so nothing else
+  dispatches either. Observed live: one VIVERE cargo test stalled the
+  whole fleet; cancelling my own superseded duplicate branch run (its
+  test job would have run first on fairness) freed the slot in four
+  seconds. Proposed fix: track per-tick skipped jobs and peek the best
+  job EXCLUDING the skipped set, so non-conflicting jobs flow past a
+  blocked head. Deferred past this branch to keep the CI-validated
+  commit stable.
+- **Diagnosis hygiene note.** Two reproduction attempts failed before
+  the right one: a naive `docker run -w /job` hits git's
+  `safe.directory` (dubious ownership) because the runner mounts
+  workspaces at `/workspace` and injects
+  `GIT_CONFIG_{COUNT,KEY_0,VALUE_0}` to trust exactly that path — any
+  faithful job reproduction must replicate those three env vars and the
+  mount point, plus `--memory 6144m` (GITFORGE_SANDBOX_MEMORY_MB).
+  With them, the failure reproduces deterministically; without them
+  you debug a fiction (the first repro "found" three CLI test failures
+  that do not occur in real jobs).
