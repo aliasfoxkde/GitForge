@@ -63,3 +63,9 @@ re-push only after confirming no one else base-lined the old head).
 - 2026-09-22 — standing directive: move all pipelines to GitForge.
 - 2026-09-24 — policy written; GitForge's own pipeline gained the
   coverage gate in PR #229 (v0.6.8 line).
+- 2026-09-24 — v0.6.8 tagged at merge 47a3ac43 and deployed
+  (release `gitforge-47a3ac43-20260924`, gate run 88148271). The
+  coverage baseline is what the pipeline itself measures on the tag:
+  **83.06% lines** (82 hard gate / 84 advisory), replicated at 83.02%
+  on the follow-up branch — the gate's evidence is the durable run,
+  not a separate sweep.
