@@ -332,6 +332,16 @@ else
             overall=1
         fi
     fi
+    # Host /tmp saturation (F29): docker's runc writes exec process specs
+    # under /tmp, and on hosts where /tmp is a size-capped tmpfs a full /tmp
+    # makes every `docker exec` fail with "no space left on device" — which
+    # grades innocent commits' CI jobs as failed. A saturated /tmp is a
+    # degraded deployment even though every unit answers HTTP.
+    tmp_pcent=$(df --output=pcent /tmp 2>/dev/null | tail -1 | tr -dc '0-9')
+    printf 'host /tmp: %s%% used\n' "${tmp_pcent:-?}"
+    if [[ -n "$tmp_pcent" && "$tmp_pcent" -ge 90 ]]; then
+        overall=1
+    fi
     if ((overall == 0)); then
         printf 'overall: healthy\n'
     else
