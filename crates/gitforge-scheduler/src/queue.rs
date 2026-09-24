@@ -2,7 +2,7 @@
 
 use gitforge_common::{JobId, PipelineRunId, RepoId};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 /// Job priority
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -137,30 +137,38 @@ impl JobQueue {
     /// Peek at the next active job using bounded repository fairness.
     ///
     /// Priority remains the first ordering key. Within one priority, the
-    /// repository with fewer queued jobs is preferred, preventing a burst
-    /// from monopolizing a single runner while work from another repository
-    /// waits indefinitely. FIFO remains the final tie-breaker.
-    pub fn peek_fair(&self) -> Option<&QueuedJob> {
-        let mut queued_by_repo: HashMap<RepoId, usize> = HashMap::new();
-        for job in self.by_id.values() {
-            *queued_by_repo.entry(job.repo_id).or_default() += 1;
-        }
-
-        self.by_id.values().max_by(|left, right| {
-            left.priority
-                .cmp(&right.priority)
-                .then_with(|| {
-                    queued_by_repo
-                        .get(&right.repo_id)
-                        .cmp(&queued_by_repo.get(&left.repo_id))
-                })
-                .then_with(|| right.queued_at.cmp(&left.queued_at))
-                .then_with(|| {
-                    self.insertion_order
-                        .get(&right.job_id)
-                        .cmp(&self.insertion_order.get(&left.job_id))
-                })
-        })
+    /// repository with fewer *running* jobs is preferred — the caller passes
+    /// that load map because only the scheduler knows what is in flight.
+    /// Counting running rather than queued jobs matters: a multi-stage
+    /// pipeline legitimately shows several queued DAG rows at once, so a
+    /// queue-depth metric lets one repo's visible backlog starve every other
+    /// repository indefinitely, while a burst actually monopolizes a runner
+    /// through the jobs it keeps running. FIFO (then insertion order) breaks
+    /// the remaining ties. Jobs in `skip` are excluded so the caller can walk
+    /// past a head job its runner roster cannot currently admit.
+    pub fn peek_fair(
+        &self,
+        skip: &HashSet<JobId>,
+        load_by_repo: &HashMap<RepoId, usize>,
+    ) -> Option<&QueuedJob> {
+        self.by_id
+            .values()
+            .filter(|job| !skip.contains(&job.job_id))
+            .max_by(|left, right| {
+                left.priority
+                    .cmp(&right.priority)
+                    .then_with(|| {
+                        let left_load = load_by_repo.get(&left.repo_id).copied().unwrap_or(0);
+                        let right_load = load_by_repo.get(&right.repo_id).copied().unwrap_or(0);
+                        right_load.cmp(&left_load)
+                    })
+                    .then_with(|| right.queued_at.cmp(&left.queued_at))
+                    .then_with(|| {
+                        self.insertion_order
+                            .get(&right.job_id)
+                            .cmp(&self.insertion_order.get(&left.job_id))
+                    })
+            })
     }
 
     /// Remove a specific job from the queue
@@ -294,28 +302,97 @@ mod tests {
     }
 
     #[test]
-    fn test_fair_peek_prefers_repository_with_smaller_backlog() {
+    fn test_fair_peek_prefers_repository_with_smaller_running_load() {
         let mut queue = JobQueue::new();
-        let burst_repo = RepoId::new();
-        let waiting_repo = RepoId::new();
+        let busy_repo = RepoId::new();
+        let idle_repo = RepoId::new();
 
         queue.enqueue(QueuedJob::new(
             JobId::new(),
             PipelineRunId::new(),
-            burst_repo,
+            busy_repo,
         ));
         queue.enqueue(QueuedJob::new(
             JobId::new(),
             PipelineRunId::new(),
-            burst_repo,
+            busy_repo,
         ));
-        let waiting_job = QueuedJob::new(JobId::new(), PipelineRunId::new(), waiting_repo);
+        let waiting_job = QueuedJob::new(JobId::new(), PipelineRunId::new(), idle_repo);
         queue.enqueue(waiting_job.clone());
 
+        // busy_repo holds more queued rows but the load the scheduler cares
+        // about is what each repo keeps *running*: idle_repo runs nothing,
+        // so its newer job is the fair pick.
+        let load = loads(&[(busy_repo, 2), (idle_repo, 0)]);
+
         assert_eq!(
-            queue.peek_fair().map(|job| job.job_id),
+            queue
+                .peek_fair(&HashSet::new(), &load)
+                .map(|job| job.job_id),
             Some(waiting_job.job_id)
         );
+    }
+
+    #[test]
+    fn test_fair_peek_ties_on_running_load_break_by_fifo() {
+        let mut queue = JobQueue::new();
+        let backlog_repo = RepoId::new();
+        let idle_repo = RepoId::new();
+
+        // backlog_repo shows three queued rows (a multi-stage pipeline's
+        // visible DAG) but runs nothing; idle_repo queued one NEWER job.
+        // Queue depth would pick idle_repo forever and starve backlog_repo;
+        // equal running load falls through to FIFO instead.
+        let mut older_job = QueuedJob::new(JobId::new(), PipelineRunId::new(), backlog_repo);
+        let newer_job = QueuedJob::new(JobId::new(), PipelineRunId::new(), idle_repo);
+        older_job.queued_at = newer_job.queued_at - 1_000;
+        queue.enqueue(older_job.clone());
+        queue.enqueue(newer_job.clone());
+        for _ in 0..2 {
+            queue.enqueue(QueuedJob::new(
+                JobId::new(),
+                PipelineRunId::new(),
+                backlog_repo,
+            ));
+        }
+
+        let load = loads(&[(backlog_repo, 0), (idle_repo, 0)]);
+
+        assert_eq!(
+            queue
+                .peek_fair(&HashSet::new(), &load)
+                .map(|job| job.job_id),
+            Some(older_job.job_id)
+        );
+    }
+
+    #[test]
+    fn test_fair_peek_skips_excluded_jobs() {
+        let mut queue = JobQueue::new();
+        let repo_id = RepoId::new();
+
+        let blocked = QueuedJob::new(JobId::new(), PipelineRunId::new(), repo_id);
+        queue.enqueue(blocked.clone());
+        let next = QueuedJob::new(JobId::new(), PipelineRunId::new(), repo_id);
+        queue.enqueue(next.clone());
+
+        let mut skip = HashSet::new();
+        skip.insert(blocked.job_id);
+        let load = loads(&[(repo_id, 0)]);
+
+        assert_eq!(
+            queue.peek_fair(&skip, &load).map(|job| job.job_id),
+            Some(next.job_id)
+        );
+        // Every job excluded means no candidate at all — the caller stops
+        // instead of looping.
+        skip.insert(next.job_id);
+        assert!(queue.peek_fair(&skip, &load).is_none());
+    }
+
+    /// Build a running-load map from `(repo, running jobs)` pairs.
+    fn loads(pairs: &[(RepoId, usize)]) -> HashMap<RepoId, usize> {
+        pairs.iter().copied().collect()
     }
 
     #[test]
@@ -335,8 +412,12 @@ mod tests {
             .with_priority(Priority::High);
         queue.enqueue(urgent_job.clone());
 
+        let load = loads(&[(burst_repo, 0), (urgent_repo, 0)]);
+
         assert_eq!(
-            queue.peek_fair().map(|job| job.job_id),
+            queue
+                .peek_fair(&HashSet::new(), &load)
+                .map(|job| job.job_id),
             Some(urgent_job.job_id)
         );
     }
