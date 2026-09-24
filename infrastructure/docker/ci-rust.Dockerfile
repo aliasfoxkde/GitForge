@@ -38,6 +38,12 @@ RUN apt-get update \
 # Slim images ship the minimal rustup profile; the pipeline needs both linters.
 RUN rustup component add rustfmt clippy
 
+# Coverage gate: llvm-tools supplies llvm-profdata/llvm-cov and
+# cargo-llvm-cov drives them; both are baked so the pipeline's coverage
+# job stays inside the offline contract. Network use is build-time only.
+RUN rustup component add llvm-tools-preview \
+    && cargo install cargo-llvm-cov --locked
+
 # Toolchain contract (F25): the toolchain is frozen at image build time.
 # Jobs run with no egress — `rustup toolchain install` inside a job stalls
 # on the download and dies mid-run, which is exactly how run 6d5bac16

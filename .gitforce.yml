@@ -12,14 +12,16 @@
 #   directory and corrupt each other's build locks.
 # - `environment: {}` is required by the parser (PipelineDefinition has no
 #   serde default) even though it is never forwarded.
-# - The image is pre-built on the host (dsc-ci-rust:6 — cargo, clippy,
-#   rustfmt, and the GitForge workspace cargo registry cache baked in for
-#   offline builds). Rebuild and bump the tag whenever Cargo.lock changes —
-#   a stale cache fails every cargo job in seconds with "candidate versions
-#   found which didn't match" (v6 exists because v5 dropped openssh-client,
-#   which the hermetic ssh-protocol tests spawn via ssh-keygen; v5 itself
-#   existed because the audited-deps bump moved jsonwebtoken to 11.1.0
-#   ahead of v4's cache). The recipe lives at
+# - The image is pre-built on the host (dsc-ci-rust:7 — cargo, clippy,
+#   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, and the
+#   GitForge workspace cargo registry cache baked in for offline builds).
+#   Rebuild and bump the tag whenever Cargo.lock changes or the baked
+#   tooling changes — a stale cache fails every cargo job in seconds with
+#   "candidate versions found which didn't match" (v7 adds the coverage
+#   toolchain; v6 existed because v5 dropped openssh-client, which the
+#   hermetic ssh-protocol tests spawn via ssh-keygen; v5 itself existed
+#   because the audited-deps bump moved jsonwebtoken to 11.1.0 ahead of
+#   v4's cache). The recipe lives at
 #   infrastructure/docker/ci-rust.Dockerfile. The image must exist before
 #   the first run: the NAS daemon's vfs storage driver plus the runner's
 #   hard 60-second sandbox-acquisition cap make a pull-at-run-time a
@@ -34,14 +36,14 @@ trigger_on:
 environment: {}
 jobs:
   - name: fmt
-    image: dsc-ci-rust:6
+    image: dsc-ci-rust:7
     steps:
       - name: Check formatting
         run: cargo fmt --all -- --check
     timeout: 15m
 
   - name: clippy
-    image: dsc-ci-rust:6
+    image: dsc-ci-rust:7
     needs: [fmt]
     steps:
       - name: Strict lint (zero warnings)
@@ -49,7 +51,7 @@ jobs:
     timeout: 60m
 
   - name: test
-    image: dsc-ci-rust:6
+    image: dsc-ci-rust:7
     needs: [clippy]
     steps:
       - name: Workspace test suite
@@ -62,3 +64,37 @@ jobs:
         # well inside the 60m timeout and makes the gate deterministic.
         run: cargo test --workspace -- --test-threads=2
     timeout: 60m
+
+  - name: coverage
+    image: dsc-ci-rust:7
+    needs: [test]
+    steps:
+      - name: Line coverage gate (fail 87, warn 89)
+        # Same thresholds as the local sweep harvested 2026-09-23: hard
+        # gate at 87% (the merged baseline), advisory warn below the 89%
+        # target. llvm-cov re-runs the test suite instrumented, so it
+        # inherits the bounded test parallelism the test job documents.
+        # Steps run under sh (dash): no pipefail, and a `tee` pipeline
+        # would hide the gate's exit code, so the run is captured through
+        # an if-redirect and printed afterwards.
+        run: |
+          summary=$(mktemp)
+          if cargo llvm-cov --workspace --all-targets --summary-only \
+               --fail-under-lines 87 -- --test-threads=2 >"$summary" 2>&1
+          then gate=ok
+          else gate=fail
+          fi
+          cat "$summary"
+          pct=$(awk '$1=="TOTAL" {gsub(/%/,"",$10); print $10; exit}' "$summary")
+          [ -n "$pct" ] || { echo "FAIL: coverage summary unparsable"; exit 1; }
+          echo "line coverage: ${pct}%"
+          if [ "$gate" = fail ]; then
+            echo "FAIL: line coverage ${pct}% is below the 87% hard gate"
+            exit 1
+          fi
+          if awk "BEGIN{exit !($pct < 89.0)}"; then
+            echo "WARN: line coverage ${pct}% is below the 89% advisory target"
+          else
+            echo "line coverage ${pct}% meets the 89% target"
+          fi
+    timeout: 90m
