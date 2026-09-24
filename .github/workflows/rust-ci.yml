@@ -123,11 +123,17 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
   # ─── Coverage ───────────────────────────────────────────────────────────────
+  # Runs the same sandbox-backed tests as `test`/`test-serialized` above on
+  # the same self-hosted runner, so it needs the same F40 Docker-timeout
+  # dial (missed in the first F40 fix — Coverage went red with the identical
+  # 120 s-timeout signature on 2026-09-24 while the Test jobs stayed green).
   coverage:
     name: Coverage
     runs-on: [self-hosted, linux, x64, gitforge-github]
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      GITFORGE_DOCKER_TIMEOUT_SECS: "600"
+      GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
