@@ -888,7 +888,8 @@ async fn test_scheduler_upload_is_downloadable_through_authenticated_api() {
             vec!["echo boundary".to_string()],
             None,
         )
-        .await;
+        .await
+        .unwrap();
     let artifact_root = tempfile::tempdir().unwrap();
     let storage = std::sync::Arc::new(FileStorage::new(artifact_root.path()).await.unwrap());
     let scheduler_app = scheduler_routes_with_tokens(

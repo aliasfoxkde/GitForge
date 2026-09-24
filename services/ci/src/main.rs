@@ -1549,7 +1549,7 @@ async fn handle_push_event(
             let timeout_secs = definition
                 .timeout_secs()
                 .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
-            scheduler
+            if let Err(error) = scheduler
                 .enqueue_with_definition_and_image_and_timeout(
                     job_id,
                     state.run_id,
@@ -1561,7 +1561,39 @@ async fn handle_push_event(
                         timeout_secs,
                     },
                 )
-                .await;
+                .await
+            {
+                // F21: without a durable row the job is never dispatched and
+                // the push would dangle jobless until the reconciler's
+                // horizon grades it. Fail the run now, loudly, so the push
+                // author sees a red run with the persistence error in it.
+                tracing::error!(
+                    run = %state.run_id,
+                    %job_id,
+                    %error,
+                    "head job enqueue failed; grading run failed"
+                );
+                if let Some(pool) = scheduler_db {
+                    let _ = gitforge_db::queries::PipelineRunQueries::update_status(
+                        pool,
+                        state.run_id,
+                        "failed",
+                    )
+                    .await;
+                }
+                pipeline_registry.write().await.remove(&state.run_id);
+                if let Some(path) = run_workspace_paths
+                    .lock()
+                    .expect("workspace cache lock poisoned")
+                    .remove(&state.run_id)
+                    .flatten()
+                {
+                    tokio::spawn(async move {
+                        let _ = tokio::fs::remove_dir_all(path).await;
+                    });
+                }
+                return Err(anyhow::anyhow!("head job {job_id} enqueue failed: {error}"));
+            }
             tracing::debug!("enqueued job {} for pipeline run {}", job_id, state.run_id);
         }
     }
@@ -1710,7 +1742,7 @@ async fn run_scheduler_event_consumer(
                 let timeout_secs = definition
                     .timeout_secs()
                     .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
-                scheduler
+                if let Err(error) = scheduler
                     .enqueue_with_definition_and_image_and_timeout(
                         next_job_id,
                         state.run_id,
@@ -1722,7 +1754,30 @@ async fn run_scheduler_event_consumer(
                             timeout_secs,
                         },
                     )
-                    .await;
+                    .await
+                {
+                    // F21: the chain cannot advance through a job with no
+                    // durable row. Fail the upstream job so the run grades
+                    // `failed` with a visible cause instead of stalling as an
+                    // incomplete chain for the reconciler to sweep up later.
+                    tracing::error!(
+                        run = %state.run_id,
+                        job = %next_job_id,
+                        %error,
+                        "downstream job enqueue failed; failing the chain"
+                    );
+                    if let Err(fail_error) = engine
+                        .fail_job(next_job_id, -1, format!("durable enqueue failed: {error}"))
+                        .await
+                    {
+                        tracing::error!(
+                            run = %state.run_id,
+                            job = %next_job_id,
+                            error = %fail_error,
+                            "failed to mark enqueue failure on the engine"
+                        );
+                    }
+                }
             }
         }
 
