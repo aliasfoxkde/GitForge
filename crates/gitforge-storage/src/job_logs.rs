@@ -10,6 +10,30 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::receipt::LogReceipt;
 
+/// Marker prepended when a stored log exceeds the size bound. Fixed-size
+/// on purpose: the kept tail window is `max_bytes - marker.len()`, so a
+/// truncated log still stores exactly `max_bytes` and the receipt stays
+/// comparable across truncation events.
+pub const LOG_TRUNCATION_MARKER: &str = "[job log truncated: oldest content dropped, newest retained; the full output exceeded the storage bound]\n";
+
+/// Keep the tail of an oversized log, prefixed by the truncation marker.
+/// Step summaries and failure evidence sit at the END of job output, so
+/// the tail is the part worth keeping (F30).
+fn truncate_keeping_tail(data: Vec<u8>, max_bytes: usize) -> Vec<u8> {
+    let total = data.len();
+    if LOG_TRUNCATION_MARKER.len() >= max_bytes {
+        // Pathological bound smaller than the marker: keep a raw tail so
+        // the stored size still honors the bound exactly.
+        let mut tail = data;
+        let keep_from = total - max_bytes;
+        return tail.split_off(keep_from);
+    }
+    let keep = max_bytes - LOG_TRUNCATION_MARKER.len();
+    let mut stored = LOG_TRUNCATION_MARKER.as_bytes().to_vec();
+    stored.extend_from_slice(&data[total - keep..]);
+    stored
+}
+
 /// Job log metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobLogMeta {
@@ -119,9 +143,12 @@ impl FileJobLogStore {
 
     /// Store job logs with a size bound, returning a LogReceipt.
     ///
-    /// If `data` exceeds `max_bytes`, it is truncated and the returned receipt
-    /// reflects the truncated size. The SHA-256 is always computed over the
-    /// (potentially truncated) stored content.
+    /// If `data` exceeds `max_bytes`, the OLDEST bytes are dropped: a
+    /// marker naming the truncation is prepended and the NEWEST content
+    /// is kept, because step summaries and failure evidence sit at the
+    /// end of a job's output — the previous head-keeping truncation hid
+    /// exactly the bytes an operator needs (F30). The SHA-256 is always
+    /// computed over the (potentially truncated) stored content.
     pub async fn bounded_put(
         &self,
         job_id: JobId,
@@ -131,9 +158,8 @@ impl FileJobLogStore {
         let started_at = chrono::Utc::now();
         let original_len = data.len();
 
-        // Truncate if necessary
         let (stored_data, truncated) = if original_len as u64 > max_bytes {
-            (data[..max_bytes as usize].to_vec(), true)
+            (truncate_keeping_tail(data, max_bytes as usize), true)
         } else {
             (data, false)
         };
@@ -476,24 +502,51 @@ mod tests {
         let data: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
         let max_bytes = 4_000u64;
 
-        let receipt = store.bounded_put(job_id, data, max_bytes).await.unwrap();
+        let receipt = store
+            .bounded_put(job_id, data.clone(), max_bytes)
+            .await
+            .unwrap();
 
         assert_eq!(receipt.bytes, max_bytes, "receipt reflects the truncation");
         let stored = store.get(&job_id).await.unwrap().expect("stored log");
         assert_eq!(stored.len() as u64, max_bytes);
+        assert!(
+            stored.starts_with(LOG_TRUNCATION_MARKER.as_bytes()),
+            "a truncated log is introduced by the marker"
+        );
+        let keep = max_bytes as usize - LOG_TRUNCATION_MARKER.len();
         assert_eq!(
-            stored,
-            (0..=255u8)
-                .cycle()
-                .take(max_bytes as usize)
-                .collect::<Vec<u8>>(),
-            "the kept bytes are the head of the log"
+            &stored[LOG_TRUNCATION_MARKER.len()..],
+            &data[data.len() - keep..],
+            "the kept bytes are the TAIL of the log (F30: summaries and failure evidence live at the end)"
         );
         assert_eq!(receipt.sha256, expected_sha256(&stored));
 
         let entries = store.list().await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].size_bytes, max_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_bounded_put_raw_tail_when_bound_is_below_marker() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FileJobLogStore::new(temp_dir.path()).await.unwrap();
+        let job_id = JobId::new();
+        let data: Vec<u8> = (0..100u8).collect();
+        let max_bytes = (LOG_TRUNCATION_MARKER.len() as u64) / 2;
+
+        let receipt = store
+            .bounded_put(job_id, data.clone(), max_bytes)
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.bytes, max_bytes);
+        let stored = store.get(&job_id).await.unwrap().expect("stored log");
+        assert_eq!(
+            stored,
+            &data[data.len() - max_bytes as usize..],
+            "below the marker size the bound still holds via a raw tail"
+        );
     }
 
     #[tokio::test]

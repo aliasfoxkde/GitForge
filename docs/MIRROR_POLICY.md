@@ -53,7 +53,7 @@ re-push only after confirming no one else base-lined the old head).
 | Concern | Home |
 | --- | --- |
 | Pipeline definition | `.gitforce.yml` in the project repo |
-| Coverage / lint gates | `.gitforce.yml` jobs (e.g. GitForge at 87% fail / 89% warn) |
+| Coverage / lint gates | `.gitforce.yml` jobs (e.g. GitForge at 82% fail / 84% warn, calibrated in-sandbox — F28) |
 | CI images | `infrastructure/docker/*.Dockerfile`, pre-built, tag-bumped |
 | Release evidence | GitForge run of the exact source commit |
 | Secrets | `gitforge auth --login` (interactive) or credential files; never repo files, never the mirror |
@@ -63,3 +63,9 @@ re-push only after confirming no one else base-lined the old head).
 - 2026-09-22 — standing directive: move all pipelines to GitForge.
 - 2026-09-24 — policy written; GitForge's own pipeline gained the
   coverage gate in PR #229 (v0.6.8 line).
+- 2026-09-24 — v0.6.8 tagged at merge 47a3ac43 and deployed
+  (release `gitforge-47a3ac43-20260924`, gate run 88148271). The
+  coverage baseline is what the pipeline itself measures on the tag:
+  **83.06% lines** (82 hard gate / 84 advisory), replicated at 83.02%
+  on the follow-up branch — the gate's evidence is the durable run,
+  not a separate sweep.

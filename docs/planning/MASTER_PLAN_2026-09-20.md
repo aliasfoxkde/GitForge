@@ -626,25 +626,37 @@ failed the new coverage job. Diagnosis, all four layers of it:
   dark in the sandbox. A gate must be measured where it runs. Gate
   reset to 82 hard / 84 advisory. Lesson recorded: never calibrate a
   CI gate from a host measurement.
-- **Runner log cap (fixed in-branch, step design).** The runner
-  truncates captured step output at 64 KB (oldest bytes dropped, full
-  size logged at WARNING in `gitforge_storage::job_logs`). llvm-cov
-  chatter alone exceeds that, so printing the full summary would
-  truncate away the gate verdict exactly when it matters. The step now
-  prints only the verdict lines plus, on failure, the last 40 lines of
-  the capture.
-- **F27 (scheduler head-of-line stall, OPEN).** While any
-  `workspace-cargo-test`-class job runs, the entire CI queue freezes:
-  the class is exclusive per runner, `peek_fair` puts the repo with the
-  fewest queued jobs at the head every tick, and the dispatch batch
-  loop `break`s when the head finds no capacity — so nothing else
-  dispatches either. Observed live: one VIVERE cargo test stalled the
-  whole fleet; cancelling my own superseded duplicate branch run (its
-  test job would have run first on fairness) freed the slot in four
-  seconds. Proposed fix: track per-tick skipped jobs and peek the best
-  job EXCLUDING the skipped set, so non-conflicting jobs flow past a
-  blocked head. Deferred past this branch to keep the CI-validated
-  commit stable.
+- **Runner log cap (step design).** The runner truncates captured
+  step output at 64 KB (full size logged at WARNING in
+  `gitforge_storage::job_logs`). llvm-cov chatter alone exceeds that,
+  so the gate step redirects all llvm-cov output into a temp file and
+  prints only verdict lines — the captured step output stays tiny and
+  the verdict always survives.
+- **F30 (log truncation kept the wrong end, FIXED on the follow-up
+  branch).** `bounded_put` kept the FIRST 64 KB of an oversized job
+  log and silently dropped the newest — proven by union-branch test
+  job 81e7f23f, whose stored log ends mid-test-line with no
+  `test result:` summary (meta size_bytes=65536; exit_code=0 was only
+  recoverable from result_json). The first observed truncation
+  inverted the documented behavior ("older bytes dropped first").
+  `truncate_keeping_tail` now prepends a fixed-size marker and keeps
+  the newest bytes, so summaries and failure evidence survive; the
+  coverage step's file-redirect design meant the gate verdict was
+  never actually at risk.
+- **F27 (scheduler head-of-line stall, FIXED in this branch).** While
+  any `workspace-cargo-test`-class job ran, the entire CI queue
+  froze: the class is exclusive per runner, `peek_fair` put the repo
+  with the fewest queued jobs at the head every tick, and the dispatch
+  batch loop `break`s when the head finds no capacity — so nothing
+  else dispatched either. Observed live: one VIVERE cargo test
+  stalled the whole fleet; cancelling my own superseded duplicate
+  branch run (its test job would have run first on fairness) freed
+  the slot in four seconds. Resolution: the r5-ci-integrity branch
+  (PR #228, tip 1a045af0) implemented the per-tick skipped-set fix;
+  this branch absorbed it in merge 917002a4 (five enqueue test sites
+  adapted to the F21 durable-enqueue Result, scheduler+engine suites
+  green on the union), so branch CI validates the fix and v0.6.8
+  ships it.
 - **Diagnosis hygiene note.** Two reproduction attempts failed before
   the right one: a naive `docker run -w /job` hits git's
   `safe.directory` (dubious ownership) because the runner mounts

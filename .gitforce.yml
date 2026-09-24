@@ -85,12 +85,13 @@ jobs:
         # pipeline would hide the gate's exit code, so the run is
         # captured through an if-redirect and printed afterwards.
         #
-        # The runner caps the captured step log at 64 KB (older bytes are
-        # dropped first), and llvm-cov's compile+test chatter alone
-        # exceeds that — printing the full summary would truncate away
-        # the gate verdict exactly when someone needs it. Print only the
-        # verdict lines; on failure also print the tail of the capture
-        # (the failing test block) so the evidence survives the cap.
+        # The runner caps the captured step log at 64 KB (the OLDEST
+        # bytes are dropped and a truncation marker is prepended — F30),
+        # and llvm-cov's compile+test chatter alone exceeds that. This
+        # step never relies on the cap: all llvm-cov output is
+        # redirected into a temp file inside the container, so the
+        # captured step output is only the few verdict lines echoed
+        # here, and they always survive intact.
         run: |
           summary=$(mktemp)
           if cargo llvm-cov --workspace --all-targets --summary-only \
