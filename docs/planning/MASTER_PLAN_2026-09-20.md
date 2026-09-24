@@ -462,3 +462,75 @@ thin `systemctl restart` wrapper; the units are the single source of truth.
       without a green run id whose job count covers the pipeline
       definition *(scripts/gitforge-release-gate, invoked by
       gitforge-release-bundle before assembly)*
+
+## 7. Coverage sweep evidence (2026-09-23, harvested into Phase 3)
+
+Method: `CARGO_TARGET_DIR=<dedicated> cargo llvm-cov --workspace
+--all-targets --lcov --output-path <out>` (cargo-llvm-cov **0.9.0** — the
+flag is `--output-path`; `--output-file` is rejected). Measured tree:
+`cc24ead6` plus the uncommitted WIP present in the shared worktree at sweep
+time — treat the numbers as indicative, and re-pin a sweep to the release
+tag before using coverage as a merge gate.
+
+**Overall: 31,720/36,218 lines = 87.6%** across 94 files with machine
+code. The Phase 3.6 target ("raise the floor 79.9% → 85%") is already met
+on average — the real story is the spread, not the mean:
+
+| Crate | Lines | Cov |
+|---|---|---|
+| gitforge-runner | 2514/3248 | **77.4%** |
+| gitforge-build | 1629/2011 | **81.0%** |
+| services (bin mains) | 3329/3985 | 83.5% |
+| gitforge-cli | 2235/2662 | **84.0%** |
+| gitforge-api | 4066/4834 | 84.1% |
+| gitforge-sandbox | 1418/1678 | 84.5% |
+| gitforge-scheduler | 3535/3970 | 89.0% |
+| gitforge-db | 3815/4220 | 90.4% |
+| gitforge-ai | 831/905 | 91.8% |
+| gitforge-storage | 1931/2087 | 92.5% |
+| gitforge-process / core / ci / events / common / review | — | 94–99.5% |
+
+Worst files (the Phase 3 target list, replacing guesswork with data):
+
+| File | Cov | Missing lines |
+|---|---|---|
+| `crates/gitforge-runner/src/executor.rs` | **37.7%** | 402 (container exec error paths) |
+| `services/runner/src/main.rs` | **60.4%** | 82 (boot/CLI paths) |
+| `crates/gitforge-cli/src/review.rs` | **66.4%** | 145 (review output paths) |
+| `crates/gitforge-build/src/cli.rs` | **67.1%** | 127 (build CLI paths) |
+| `crates/gitforge-api/src/routes/repo.rs` | 71.2% | 109 |
+| `crates/gitforge-api/src/routes/artifacts.rs` | 71.9% | 126 |
+| `crates/gitforge-api/src/routes/users.rs` | 73.9% | 29 |
+| `crates/gitforge-api/src/routes/webhook.rs` | 74.5% | 113 |
+| `crates/gitforge-sandbox/src/docker.rs` | 76.6% | 213 |
+
+Phase 3.6 replacement: gate the workspace at **87% fail / 89% warn**,
+and drive the runner + build + cli crates to ≥90% by testing the files
+above — executor.rs alone carries 402 uncovered lines; the top three
+files (executor, `services/runner/src/main.rs`, cli `review.rs`) account
+for 627 — a coherent first sprint of table-driven error-path tests.
+
+## 8. Findings ledger additions (2026-09-23/24)
+
+- **F25 — CI jobs that fetch toolchains fail on container egress.**
+  Observed 2026-09-24T03:05Z on the live instance: a project's head job
+  ran `rustup` for toolchain `1.95` inside the sandbox and died with
+  `Connection timed out` to `static.rust-lang.org` (run `6d5bac16`, job
+  `2bb48a38`); its sibling run failed the same way. Same family as
+  F17/F18: the sandbox has no general egress, so anything not baked into
+  the image must fail fast, not after a network timeout. **Fix lands in**:
+  the image contract (F17) gains a toolchain clause — a project pinning a
+  toolchain not in the image must rebuild and bump the tag — plus a
+  runner-side preflight that rejects a job whose toolchain request is not
+  baked, with an error naming the image and the missing toolchain instead
+  of a 110-second connect timeout.
+- **F26 — Registry pollution recurrence despite the healing migration.**
+  The live `runners` table still holds **29 rows** (2 `online`, 1
+  stale-`online`) after PR #202's upsert-by-name registration and healing
+  migration were checked off in §6. Either the migration has not run
+  against this database, or rows re-accumulate through a path that
+  bypasses the upsert. **Fix lands in**: Phase 0 verify — confirm the
+  migration ran on the live DB (schema/row inspection), retire stale rows
+  once via `DELETE /api/runners/{id}`, and add an assertion to
+  `gitforge-status` that prints the registry row count vs live runners so
+  recurrence is visible without SQL.
