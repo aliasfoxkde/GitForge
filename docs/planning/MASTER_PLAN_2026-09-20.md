@@ -633,18 +633,20 @@ failed the new coverage job. Diagnosis, all four layers of it:
   truncate away the gate verdict exactly when it matters. The step now
   prints only the verdict lines plus, on failure, the last 40 lines of
   the capture.
-- **F27 (scheduler head-of-line stall, OPEN).** While any
-  `workspace-cargo-test`-class job runs, the entire CI queue freezes:
-  the class is exclusive per runner, `peek_fair` puts the repo with the
-  fewest queued jobs at the head every tick, and the dispatch batch
-  loop `break`s when the head finds no capacity — so nothing else
-  dispatches either. Observed live: one VIVERE cargo test stalled the
-  whole fleet; cancelling my own superseded duplicate branch run (its
-  test job would have run first on fairness) freed the slot in four
-  seconds. Proposed fix: track per-tick skipped jobs and peek the best
-  job EXCLUDING the skipped set, so non-conflicting jobs flow past a
-  blocked head. Deferred past this branch to keep the CI-validated
-  commit stable.
+- **F27 (scheduler head-of-line stall, FIXED in this branch).** While
+  any `workspace-cargo-test`-class job ran, the entire CI queue
+  froze: the class is exclusive per runner, `peek_fair` put the repo
+  with the fewest queued jobs at the head every tick, and the dispatch
+  batch loop `break`s when the head finds no capacity — so nothing
+  else dispatched either. Observed live: one VIVERE cargo test
+  stalled the whole fleet; cancelling my own superseded duplicate
+  branch run (its test job would have run first on fairness) freed
+  the slot in four seconds. Resolution: the r5-ci-integrity branch
+  (PR #228, tip 1a045af0) implemented the per-tick skipped-set fix;
+  this branch absorbed it in merge 917002a4 (five enqueue test sites
+  adapted to the F21 durable-enqueue Result, scheduler+engine suites
+  green on the union), so branch CI validates the fix and v0.6.8
+  ships it.
 - **Diagnosis hygiene note.** Two reproduction attempts failed before
   the right one: a naive `docker run -w /job` hits git's
   `safe.directory` (dubious ownership) because the runner mounts

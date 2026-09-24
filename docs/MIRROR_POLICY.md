@@ -53,7 +53,7 @@ re-push only after confirming no one else base-lined the old head).
 | Concern | Home |
 | --- | --- |
 | Pipeline definition | `.gitforce.yml` in the project repo |
-| Coverage / lint gates | `.gitforce.yml` jobs (e.g. GitForge at 87% fail / 89% warn) |
+| Coverage / lint gates | `.gitforce.yml` jobs (e.g. GitForge at 82% fail / 84% warn, calibrated in-sandbox — F28) |
 | CI images | `infrastructure/docker/*.Dockerfile`, pre-built, tag-bumped |
 | Release evidence | GitForge run of the exact source commit |
 | Secrets | `gitforge auth --login` (interactive) or credential files; never repo files, never the mirror |
