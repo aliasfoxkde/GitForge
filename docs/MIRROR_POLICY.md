@@ -31,9 +31,14 @@ If a push to GitForge succeeds and the GitHub mirror push fails, the
 mirror may be repaired later; the reverse is never acceptable.
 
 Divergent mirrors are not reconciled unilaterally. Known case:
-`gitforge-ci`'s mirror `main` tracks codex's integration line; force
+`gitforge-ci`'s mirror `main` tracked codex's integration line; force
 pushes are forbidden (`--force-with-lease` included — use delete +
 re-push only after confirming no one else base-lined the old head).
+Resolved 2026-09-24 by absorbing the diverged line through GitHub PR
+#232 (tree-identical merge commit 9795b786) and fast-forwarding both
+mains to 8404043d — merge, never force. The codex agent may resume
+pushing directly to gitforge-ci `main`, so re-check `git ls-remote`
+on both remotes before assuming they still agree.
 
 ## Merges
 
@@ -69,3 +74,7 @@ re-push only after confirming no one else base-lined the old head).
   **83.06% lines** (82 hard gate / 84 advisory), replicated at 83.02%
   on the follow-up branch — the gate's evidence is the durable run,
   not a separate sweep.
+- 2026-09-24 — v0.6.9 tagged at 8404043d and deployed (release
+  `gitforge-8404043d-20260924`): F30 log-tail fix. The GitForge
+  self-mirror divergence (above) was reconciled the same day through
+  PR #232, so gitforge-ci `main` and GitHub `main` agree again.

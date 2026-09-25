@@ -632,8 +632,8 @@ failed the new coverage job. Diagnosis, all four layers of it:
   so the gate step redirects all llvm-cov output into a temp file and
   prints only verdict lines — the captured step output stays tiny and
   the verdict always survives.
-- **F30 (log truncation kept the wrong end, FIXED on the follow-up
-  branch).** `bounded_put` kept the FIRST 64 KB of an oversized job
+- **F30 (log truncation kept the wrong end, FIXED — PR #230, shipped
+  in v0.6.9).** `bounded_put` kept the FIRST 64 KB of an oversized job
   log and silently dropped the newest — proven by union-branch test
   job 81e7f23f, whose stored log ends mid-test-line with no
   `test result:` summary (meta size_bytes=65536; exit_code=0 was only
@@ -643,7 +643,7 @@ failed the new coverage job. Diagnosis, all four layers of it:
   the newest bytes, so summaries and failure evidence survive; the
   coverage step's file-redirect design meant the gate verdict was
   never actually at risk.
-- **F27 (scheduler head-of-line stall, FIXED in this branch).** While
+- **F27 (scheduler head-of-line stall, FIXED — shipped in v0.6.8).** While
   any `workspace-cargo-test`-class job ran, the entire CI queue
   froze: the class is exclusive per runner, `peek_fair` put the repo
   with the fewest queued jobs at the head every tick, and the dispatch
@@ -655,8 +655,8 @@ failed the new coverage job. Diagnosis, all four layers of it:
   (PR #228, tip 1a045af0) implemented the per-tick skipped-set fix;
   this branch absorbed it in merge 917002a4 (five enqueue test sites
   adapted to the F21 durable-enqueue Result, scheduler+engine suites
-  green on the union), so branch CI validates the fix and v0.6.8
-  ships it.
+  green on the union); branch CI validated the fix and v0.6.8
+  shipped it.
 - **Diagnosis hygiene note.** Two reproduction attempts failed before
   the right one: a naive `docker run -w /job` hits git's
   `safe.directory` (dubious ownership) because the runner mounts
