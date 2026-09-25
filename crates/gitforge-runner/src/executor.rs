@@ -19,10 +19,12 @@ use tokio::time::{timeout, Duration, Instant};
 /// Default number of pre-warmed containers per image
 const POOL_SIZE: usize = 2;
 
-/// Sandbox acquisition ceiling in seconds. The pool copies whole layer
-/// stacks per container create (vfs storage), which on a loaded host can
+/// Sandbox acquisition ceiling in seconds. Container creation under load
+/// (whole layer-stack copies on the daemon's old vfs storage) could
 /// legitimately take minutes, so operators can raise the 60-second default
-/// instead of watching jobs fail before the daemon ever answered.
+/// instead of watching jobs fail before the daemon ever answered. Storage
+/// has since moved to overlay2 and creation is fast, but the escape hatch
+/// stays for loaded hosts.
 fn sandbox_acquire_timeout() -> Duration {
     const DEFAULT_SECS: u64 = 60;
     Duration::from_secs(

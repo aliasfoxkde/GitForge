@@ -149,10 +149,12 @@ impl DockerSandbox {
     /// Returns an error if Docker is not available or cannot be reached.
     pub async fn connect_required() -> Result<Self> {
         // The client's per-request timeout silently caps every operation,
-        // including container creation, which on vfs-backed storage can take
-        // minutes under load — a 120-second client timeout fails jobs before
-        // any acquisition window we grant can elapse. Keep bollard's default
-        // unless the operator raises it.
+        // including container creation, which on the daemon's old
+        // vfs-backed storage could take minutes under load — a 120-second
+        // client timeout failed jobs before any acquisition window we
+        // granted could elapse. (Storage has since moved to overlay2, but
+        // the rule stands: keep bollard's default unless the operator
+        // raises it.)
         let client_timeout = std::env::var("GITFORGE_DOCKER_TIMEOUT_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
