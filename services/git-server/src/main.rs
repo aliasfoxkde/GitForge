@@ -422,6 +422,10 @@ async fn git_upload_pack_standard(
             Body::from(format!("Repository not found: {repo_path}")),
         );
     }
+    let content_encoding = request
+        .headers()
+        .get(axum::http::header::CONTENT_ENCODING)
+        .cloned();
     let body = match axum::body::to_bytes(request.into_body(), max_git_body_bytes()).await {
         Ok(body) => body,
         Err(error) => {
@@ -432,7 +436,17 @@ async fn git_upload_pack_standard(
             );
         }
     };
-    match state.http_handler.upload_pack(repo_id, body.to_vec()).await {
+    let body = match decode_git_request_body(content_encoding.as_ref(), &body) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!("failed to decode upload-pack body: {}", error);
+            return finish_response(
+                Response::builder().status(StatusCode::BAD_REQUEST),
+                Body::from(format!("Bad request: {error}")),
+            );
+        }
+    };
+    match state.http_handler.upload_pack(repo_id, body).await {
         Ok(response) => finish_response(
             Response::builder()
                 .status(StatusCode::OK)
@@ -489,6 +503,10 @@ async fn git_receive_pack(
         );
     }
 
+    let content_encoding = request
+        .headers()
+        .get(axum::http::header::CONTENT_ENCODING)
+        .cloned();
     // Read request body. Oversized pushes are rejected explicitly instead of
     // being silently truncated to an empty pack, which used to hang up on
     // clients mid-send.
@@ -502,14 +520,23 @@ async fn git_receive_pack(
             );
         }
     };
+    let body = match decode_git_request_body(content_encoding.as_ref(), &body) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!("failed to decode receive-pack body: {}", error);
+            return finish_response(
+                Response::builder().status(StatusCode::BAD_REQUEST),
+                Body::from(format!("Receive-pack body rejected: {error}")),
+            );
+        }
+    };
+    // Parsed before `receive_pack` consumes `body` so the command list does
+    // not force a copy of what can be a multi-hundred-MB pack.
+    let updates = parse_receive_updates(&body);
 
-    match state
-        .http_handler
-        .receive_pack(repo_id, body.to_vec())
-        .await
-    {
+    match state.http_handler.receive_pack(repo_id, body).await {
         Ok(response) => {
-            for update in parse_receive_updates(&body) {
+            for update in updates {
                 // A deletion push carries git's all-zero new hash and has no
                 // commit to build; forwarding it used to spawn a pipeline
                 // whose checkout failed immediately (observed 2026-09-24 as
@@ -875,6 +902,46 @@ pub fn max_git_body_bytes() -> usize {
         .unwrap_or(512 * 1024 * 1024)
 }
 
+/// Decode a Git Smart HTTP request body per its `Content-Encoding` header.
+///
+/// Git compresses upload-pack request bodies with gzip once they exceed a
+/// small size threshold, so any clone/fetch whose negotiation crosses it
+/// arrives with `Content-Encoding: gzip`. Feeding the still-compressed bytes
+/// to `git upload-pack` fails with `fatal: protocol error: bad line length
+/// character` (the gzip magic `\x1f\x8b\x08` read as a pkt-line header),
+/// which surfaced 2026-09-25 as an HTTP 500 on every full clone of
+/// mkinney/gitforge. Mirrors git's own http-backend, which decompresses
+/// gzip request bodies before spawning the child process. `x-gzip` is
+/// accepted as the historical alias.
+pub(crate) fn decode_git_request_body(
+    content_encoding: Option<&axum::http::HeaderValue>,
+    body: &[u8],
+) -> Result<Vec<u8>, String> {
+    let encoding = content_encoding
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("identity");
+    if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
+        return Ok(body.to_vec());
+    }
+    if !(encoding.eq_ignore_ascii_case("gzip") || encoding.eq_ignore_ascii_case("x-gzip")) {
+        return Err(format!("unsupported Content-Encoding: {encoding}"));
+    }
+    let decoder = flate2::read::GzDecoder::new(body);
+    let mut decoded = Vec::new();
+    // Cap one byte past the raw-body limit so a gzip bomb cannot smuggle a
+    // decompressed payload past `max_git_body_bytes` undetected.
+    let mut limited = std::io::Read::take(decoder, max_git_body_bytes() as u64 + 1);
+    std::io::Read::read_to_end(&mut limited, &mut decoded)
+        .map_err(|error| format!("failed to decode gzip body: {error}"))?;
+    if decoded.len() > max_git_body_bytes() {
+        return Err(format!(
+            "decompressed body exceeds the {} byte limit",
+            max_git_body_bytes()
+        ));
+    }
+    Ok(decoded)
+}
+
 /// Create the shutdown future that waits for shutdown signal
 pub async fn create_shutdown_future(shutdown: Arc<AtomicBool>) {
     wait_for_shutdown(shutdown).await;
@@ -932,6 +999,45 @@ mod tests {
                 ref_name: "refs/heads/main".to_string(),
             }]
         );
+    }
+
+    /// A gzip-encoded request body (what git sends for any upload-pack
+    /// negotiation that crosses its compression threshold) must decode to
+    /// the raw pkt-line stream before it reaches the git child; feeding the
+    /// compressed bytes through used to fail with "bad line length
+    /// character" (F32). Identity/absent headers pass through untouched and
+    /// unknown encodings are rejected rather than misinterpreted.
+    #[test]
+    fn test_decode_git_request_body() {
+        let payload = b"009awant 1111111111111111111111111111111111111111 multi_ack\n0000";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, payload).expect("gzip write");
+        let gzipped = encoder.finish().expect("gzip finish");
+
+        let gzip = axum::http::HeaderValue::from_static("gzip");
+        assert_eq!(
+            decode_git_request_body(Some(&gzip), &gzipped).expect("gzip decode"),
+            payload.to_vec()
+        );
+
+        let x_gzip = axum::http::HeaderValue::from_static("x-gzip");
+        assert_eq!(
+            decode_git_request_body(Some(&x_gzip), &gzipped).expect("x-gzip decode"),
+            payload.to_vec()
+        );
+
+        let identity = axum::http::HeaderValue::from_static("identity");
+        assert_eq!(
+            decode_git_request_body(Some(&identity), payload).expect("identity passthrough"),
+            payload.to_vec()
+        );
+        assert_eq!(
+            decode_git_request_body(None, payload).expect("absent header passthrough"),
+            payload.to_vec()
+        );
+
+        let bogus = axum::http::HeaderValue::from_static("br");
+        assert!(decode_git_request_body(Some(&bogus), payload).is_err());
     }
 
     #[test]

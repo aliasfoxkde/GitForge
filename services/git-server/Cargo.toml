@@ -33,6 +33,9 @@ reqwest = { workspace = true }
 russh = "0.63.2"
 # Host key generation (ThreadRng implements CryptoRng for rand_core 0.10).
 rand = "0.10"
+# Git Smart HTTP request bodies arrive gzip-compressed (Content-Encoding:
+# gzip) whenever the client's negotiation crosses its compression threshold.
+flate2 = "1.1"
 tempfile = { workspace = true }
 
 [lints]
