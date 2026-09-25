@@ -1308,6 +1308,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "flate2",
  "futures",
  "gitforge-common",
  "gitforge-core",
