@@ -525,11 +525,15 @@ async fn git_receive_pack(
                     continue;
                 }
                 if let Err(error) = enqueue_ci_event(&state, repo_id, &update).await {
+                    // No longer a drop: the inline retry outlives measured
+                    // storms (F42) and anything beyond that hands off to a
+                    // background continuation that keeps inserting until the
+                    // row lands. This fires only when that deferral engaged.
                     tracing::error!(
                         repo_id = %repo_id,
                         ref_name = %update.ref_name,
                         error = %error,
-                        "failed to notify CI after accepted push"
+                        "ci trigger insert deferred; background redelivery engaged"
                     );
                 }
             }
@@ -626,39 +630,124 @@ async fn enqueue_ci_event(
     // table. A single failed insert has been observed in production
     // (2026-09-23): with a long transaction holding the database write
     // lock, pushes were accepted while their CI triggers silently
-    // vanished, leaving no run and no retry. Bound the retry so a
-    // persistently broken database still surfaces an error instead of
-    // hanging the receive-pack response.
-    const ENQUEUE_ATTEMPTS: usize = 5;
-    const ENQUEUE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
-    let mut attempt = 1;
-    while attempt <= ENQUEUE_ATTEMPTS {
+    // vanished, leaving no run and no retry. F42 then measured the bounded
+    // budget (4 attempts ≈ 60 s) against storms lasting 30+ minutes and
+    // dropped events anyway. The retry therefore has no attempt cap: it
+    // backs off exponentially (capped) and keeps going for as long as the
+    // receive-pack response can plausibly wait; if the storm outlives that
+    // window the insert hands off to a background continuation that keeps
+    // retrying for the life of the process, and the push still succeeds.
+    let persist_result = persist_ci_trigger(
+        pool,
+        &payload.to_string(),
+        CI_TRIGGER_SYNC_WINDOW,
+        CI_TRIGGER_MAX_BACKOFF,
+    )
+    .await;
+    match persist_result {
+        Ok(()) => Ok(()),
+        Err(made_attempts) => {
+            tracing::warn!(
+                repo_id = %repo_id,
+                ref_name = %update.ref_name,
+                attempts = made_attempts,
+                "ci trigger insert deferred to background redelivery while the database stays contended"
+            );
+            Err(anyhow::anyhow!(
+                "ci trigger insert still failing after {made_attempts} attempts; background redelivery continues"
+            ))
+        }
+    }
+}
+
+/// How long the receive-pack path keeps retrying the outbox insert inline
+/// before handing off to the background continuation. Generous by design —
+/// the git client is already waiting on the push response — but bounded so
+/// a persistently broken database cannot hang pushes forever.
+const CI_TRIGGER_SYNC_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Ceiling of the exponential insert backoff.
+const CI_TRIGGER_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Insert one `ci.trigger.pending` outbox row, retrying until it lands.
+///
+/// Returns `Ok(())` once the row is durable. If the database stays
+/// unwritable past `sync_window`, the retry continues in a spawned task
+/// (backing off `max_backoff` per attempt) and the number of inline
+/// attempts is returned as `Err` so the caller can log the deferral: the
+/// push is accepted either way, and this insert is the only durable record
+/// of the pipeline it must produce.
+async fn persist_ci_trigger(
+    pool: &gitforge_db::Pool,
+    payload: &str,
+    sync_window: std::time::Duration,
+    max_backoff: std::time::Duration,
+) -> Result<(), usize> {
+    let started = std::time::Instant::now();
+    let mut attempt: usize = 0;
+    loop {
+        attempt += 1;
         let result = sqlx::query("INSERT INTO events (id, event_type, payload, created_at, delivery_attempts) VALUES (?, ?, ?, ?, 0)")
             .bind(uuid::Uuid::new_v4().to_string())
             .bind("ci.trigger.pending")
-            .bind(payload.to_string())
+            .bind(payload)
             .bind(Utc::now().to_rfc3339())
             .execute(pool.pool())
             .await;
         match result {
             Ok(_) => return Ok(()),
-            Err(error) if attempt < ENQUEUE_ATTEMPTS => {
+            Err(error) => {
+                // Backoff doubles per attempt (2, 4, 8, …) up to the cap:
+                // retry pressure scales with however long the storm lasts
+                // instead of a fixed budget that measured storms blow
+                // through.
+                let backoff = std::cmp::min(
+                    max_backoff,
+                    std::time::Duration::from_secs(1 << attempt.min(6)),
+                );
                 tracing::warn!(
-                    repo_id = %repo_id,
-                    ref_name = %update.ref_name,
                     attempt,
+                    backoff_secs = backoff.as_secs(),
                     error = %error,
                     "ci trigger insert failed; retrying"
                 );
-                tokio::time::sleep(ENQUEUE_BACKOFF).await;
-                attempt += 1;
+                if started.elapsed() + backoff > sync_window {
+                    let pool = pool.clone();
+                    let payload = payload.to_string();
+                    tokio::spawn(async move {
+                        let mut deferred_attempt = 0;
+                        loop {
+                            deferred_attempt += 1;
+                            tokio::time::sleep(max_backoff).await;
+                            let result = sqlx::query("INSERT INTO events (id, event_type, payload, created_at, delivery_attempts) VALUES (?, ?, ?, ?, 0)")
+                                .bind(uuid::Uuid::new_v4().to_string())
+                                .bind("ci.trigger.pending")
+                                .bind(&payload)
+                                .bind(Utc::now().to_rfc3339())
+                                .execute(pool.pool())
+                                .await;
+                            match result {
+                                Ok(_) => {
+                                    tracing::info!(
+                                        deferred_attempt,
+                                        "deferred ci trigger row landed after the database recovered"
+                                    );
+                                    return;
+                                }
+                                Err(error) => tracing::warn!(
+                                    deferred_attempt,
+                                    error = %error,
+                                    "deferred ci trigger insert still failing"
+                                ),
+                            }
+                        }
+                    });
+                    return Err(attempt);
+                }
+                tokio::time::sleep(backoff).await;
             }
-            Err(error) => return Err(error.into()),
         }
     }
-    Err(anyhow::anyhow!(
-        "ci trigger insert failed after {ENQUEUE_ATTEMPTS} attempts"
-    ))
 }
 
 async fn deliver_pending_ci_events(state: &AppState) -> anyhow::Result<()> {
@@ -1012,5 +1101,162 @@ mod tests {
             result.is_err(),
             "a real commit hash must still require the durable database path"
         );
+    }
+
+    // --- F42 acceptance: the trigger outbox survives a real SQLITE_BUSY
+    // storm ---
+    //
+    // F42 observed 30+ minute SQLITE_BUSY storms during which every push
+    // was accepted by git but produced no pipeline, because the old insert
+    // budget (4 attempts ≈ 60 s) gave up long before the database
+    // recovered. The tests below hold the write lock past the pool's 15 s
+    // busy timeout — the real contention shape, not a mocked error — and
+    // pin both halves of the fix: the inline retry lands the row the moment
+    // the storm ends, and a storm that outlasts the sync window hands the
+    // retry to a background continuation instead of dropping the trigger.
+
+    /// Fresh file-backed pool on tmpfs. WAL file locking is what production
+    /// contends on; an in-memory shared-cache DB would not exercise the
+    /// same lock path.
+    async fn storm_pool(name: &str) -> (gitforge_db::Pool, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "gitforge-ci-trigger-storm-{}-{name}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let pool = gitforge_db::Pool::new(&format!("sqlite:{}?mode=rwc", path.display()))
+            .await
+            .expect("storm test pool must open");
+        pool.migrate().await.expect("storm test schema must create");
+        (pool, path)
+    }
+
+    /// Hold the database write lock for `secs` on a dedicated connection.
+    /// Every writer inside the pool then blocks on the 15 s busy timeout,
+    /// exactly as during the F42 storms. The returned receiver resolves
+    /// once the lock is provably held (a write inside the transaction has
+    /// been accepted), so the retry under test always starts inside the
+    /// storm.
+    async fn hold_write_lock(
+        pool: &gitforge_db::Pool,
+        secs: u64,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let pool = pool.clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let mut conn = pool.pool().acquire().await.expect("storm connection");
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *conn)
+                .await
+                .expect("storm must take the write lock");
+            sqlx::query(
+                "INSERT INTO events (id, event_type, payload, created_at)
+                 VALUES ('storm-holder', 'storm.marker', '{}', '2020-01-01T00:00:00Z')",
+            )
+            .execute(&mut *conn)
+            .await
+            .expect("storm marker write must prove the lock is held");
+            let _ = locked_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            sqlx::query("COMMIT")
+                .execute(&mut *conn)
+                .await
+                .expect("storm must release the write lock");
+        });
+        (locked_rx, handle)
+    }
+
+    async fn pending_trigger_count(pool: &gitforge_db::Pool) -> i64 {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = 'ci.trigger.pending'")
+                .fetch_one(pool.pool())
+                .await
+                .expect("trigger count query");
+        count
+    }
+
+    #[tokio::test]
+    async fn test_ci_trigger_survives_sqlite_busy_storm_inline() {
+        let (pool, path) = storm_pool("inline").await;
+        let (locked, storm) = hold_write_lock(&pool, 17).await;
+        locked.await.expect("storm lock signal");
+
+        let started = std::time::Instant::now();
+        let result = persist_ci_trigger(
+            &pool,
+            r#"{"repository":"storm","ref":"refs/heads/main"}"#,
+            CI_TRIGGER_SYNC_WINDOW,
+            CI_TRIGGER_MAX_BACKOFF,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        storm.await.expect("storm task");
+        assert!(
+            result.is_ok(),
+            "the trigger must land as soon as the storm ends: {result:?}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_secs(15),
+            "the first insert must have blocked past the 15 s busy timeout (took {elapsed:?})"
+        );
+        assert_eq!(
+            pending_trigger_count(&pool).await,
+            1,
+            "exactly one trigger row, no duplicate inserts across retries"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_ci_trigger_hands_off_to_background_when_storm_outlasts_window() {
+        let (pool, path) = storm_pool("handoff").await;
+        let (locked, storm) = hold_write_lock(&pool, 16).await;
+        locked.await.expect("storm lock signal");
+
+        // One-second window: the first attempt burns the entire busy
+        // timeout inside SQLite, so the next backoff step already lands
+        // past the window and the insert must move to the background
+        // continuation instead of failing the push.
+        let Err(attempts) = persist_ci_trigger(
+            &pool,
+            r#"{"repository":"storm","ref":"refs/heads/handoff"}"#,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .inspect_err(|&made| {
+            assert!(
+                made >= 1,
+                "the deferral report must carry the inline attempt count"
+            );
+        }) else {
+            panic!("a storm past the sync window must defer to background redelivery");
+        };
+        // Deterministic: the first attempt exhausts the busy timeout, and
+        // its very next backoff step already lands past the 1 s window.
+        assert_eq!(attempts, 1, "deferral must happen at the first failure");
+
+        // The spawned continuation keeps retrying every max_backoff; the
+        // storm releases at 16 s, so the row must land inside the poll
+        // window. Nothing else inserts this row — if it never appears, the
+        // trigger was dropped, which is the F42 defect itself.
+        let mut landed = false;
+        for _ in 0..30 {
+            if pending_trigger_count(&pool).await == 1 {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        storm.await.expect("storm task");
+        assert!(
+            landed,
+            "the background continuation must land the trigger row after the storm"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
