@@ -1,5 +1,6 @@
 //! Scheduler HTTP server
 
+use crate::assigner::JobOutcome;
 use crate::Scheduler;
 use axum::{
     body::Bytes,
@@ -894,11 +895,14 @@ async fn complete_job(
     }
 
     let assigned_runner = state.scheduler.is_assigned(job_id).await;
+    // An explicit, known `outcome` classifies the terminal row; anything
+    // else keeps the historical boolean mapping (older runners).
+    let outcome = JobOutcome::from_request(success, request["outcome"].as_str());
     let completion = match (runner_id, lease_token, assigned_runner) {
         (Some(runner_id), Some(lease_token), Some(_)) => {
             state
                 .scheduler
-                .complete_job_with_lease(job_id, runner_id, lease_token, success, receipt)
+                .complete_job_with_lease(job_id, runner_id, lease_token, outcome, receipt)
                 .await
         }
         // Credentialed completions for an unassigned job are the signature of
@@ -1529,6 +1533,96 @@ mod tests {
         .await;
         assert_status(response.into_response(), StatusCode::OK);
         assert_eq!(state.scheduler.is_assigned(job_id).await, None);
+    }
+
+    /// R6.3: an explicit `outcome` on the completion request lands the
+    /// durable row as infrastructure_failure instead of failed, while the
+    /// response stays a normal 200 for the runner.
+    #[tokio::test]
+    async fn test_complete_job_with_infrastructure_outcome_classifies_durable_row() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        // The durable job row carries FKs, so seed user → repo → pipeline →
+        // run before enqueueing; otherwise the upsert fails and the
+        // scheduler fences the assignment as already-won.
+        let user = gitforge_db::models::User::new(
+            "infra-owner".to_string(),
+            "infra-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            "infra-repo".to_string(),
+            user.id,
+            "/git/infra-repo".to_string(),
+        );
+        gitforge_db::queries::RepoQueries::create(&pool, &repo)
+            .await
+            .unwrap();
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: "infra-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "infra-owner".to_string(),
+            "infra-commit".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+
+        let scheduler = crate::Scheduler::with_db(pool.clone());
+        let runner = Runner::new("infra-runner".to_string(), RunnerType::Docker, 1);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(job_id, run.id, repo.id, vec!["/bin/true".to_string()], None)
+            .await;
+        scheduler.process_queue().await;
+        let lease = scheduler
+            .ensure_job_lease(job_id)
+            .await
+            .expect("assigned job must have a lease");
+        let state = create_state(scheduler);
+
+        let response = complete_job(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(serde_json::json!({
+                "runner_id": runner_id.to_string(),
+                "lease_token": lease,
+                "success": false,
+                "outcome": "infrastructure_failure",
+                "error": "container backend preflight failed: preflight exec error: \
+                          daemon unavailable; backend probe: ping did not answer within 10s",
+            })),
+        )
+        .await;
+        assert_status(response.into_response(), StatusCode::OK);
+        assert_eq!(state.scheduler.is_assigned(job_id).await, None);
+
+        let stored = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "infrastructure_failure");
+        assert!(stored
+            .result_json
+            .as_deref()
+            .unwrap_or_default()
+            .contains("ping did not answer within 10s"));
     }
 
     #[tokio::test]

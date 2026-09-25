@@ -1592,6 +1592,7 @@ dependencies = [
  "futures",
  "futures-util",
  "gitforge-common",
+ "rustix",
  "serde",
  "serde_json",
  "serial_test",

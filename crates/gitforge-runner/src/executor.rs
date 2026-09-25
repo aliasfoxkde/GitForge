@@ -52,6 +52,34 @@ fn sandbox_limits() -> SandboxLimits {
     }
 }
 
+/// Recognize a step failure as the container backend failing rather than
+/// the commit failing. When the OCI runtime cannot start or resume the
+/// process, the daemon surfaces the runtime's own diagnostic as the step's
+/// stderr and a non-zero exit code (F45's "OCI runtime exec failed: …
+/// no space left on device"). A compiler error never carries these
+/// markers, so honest code failures keep their red X.
+fn step_failed_by_infrastructure(stderr: &str) -> bool {
+    const OCI_MARKERS: [&str; 4] = [
+        "OCI runtime exec failed",
+        "no space left on device",
+        "runc create failed",
+        "runc run failed",
+    ];
+    OCI_MARKERS.iter().any(|marker| {
+        stderr
+            .to_ascii_lowercase()
+            .contains(&marker.to_ascii_lowercase())
+    })
+}
+
+/// First non-empty line of a diagnostic, for bounded error strings.
+fn first_line(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("<no diagnostic output>")
+}
+
 /// A pool of pre-warmed container instances
 pub struct ContainerPool {
     pools: Arc<RwLock<HashMap<String, Vec<SandboxInstance>>>>, // image -> instances
@@ -305,7 +333,10 @@ impl JobExecutor {
         let deadline = Instant::now() + job_timeout;
         tracing::info!("executing job {}", job_id);
 
-        // Acquire container from pool
+        // Acquire container from pool. Both failure shapes here are the
+        // container backend failing, not the commit (F40's wedged podman
+        // surfaced exactly as the Err arm), so they carry the backend
+        // probe delta and the infrastructure outcome.
         let acquire_timeout = job_timeout.min(sandbox_acquire_timeout());
         let instance = match timeout(
             acquire_timeout,
@@ -327,10 +358,13 @@ impl JobExecutor {
                     started_at,
                     completed_at,
                     error: Some(format!(
-                        "failed to create sandbox: acquisition timed out after {} seconds",
-                        acquire_timeout.as_secs()
+                        "failed to create sandbox: acquisition timed out after {} seconds; \
+                         backend probe: {}",
+                        acquire_timeout.as_secs(),
+                        self.pool.sandbox.backend_health().await.detail
                     )),
                     workspace_path: job.working_dir.clone(),
+                    infrastructure_failure: true,
                 };
             }
             Ok(Err(e)) => {
@@ -345,12 +379,52 @@ impl JobExecutor {
                     logs: None,
                     started_at,
                     completed_at,
-                    error: Some(format!("failed to create sandbox: {e}")),
+                    error: Some(format!(
+                        "failed to create sandbox: {e}; backend probe: {}",
+                        self.pool.sandbox.backend_health().await.detail
+                    )),
                     workspace_path: job.working_dir.clone(),
+                    infrastructure_failure: true,
                 };
             }
             Ok(Ok(instance)) => instance,
         };
+
+        // Preflight the acquired container with a real exec before charging
+        // the job with any step outcome (F45: with the host scratch fs
+        // full, the daemon still creates the container but every exec dies
+        // at the OCI layer — which previously read as a red X on the
+        // commit). A backend that cannot even run `:` fails as
+        // infrastructure, with the probe delta in the error.
+        if let Some(probe_error) = self.preflight_exec(&instance, deadline).await {
+            if timeout(
+                Duration::from_secs(15),
+                self.pool.sandbox.destroy(instance.clone()),
+            )
+            .await
+            .is_err()
+            {
+                tracing::error!(%job_id, "preflight-failed sandbox teardown exceeded 15 seconds");
+            }
+            let completed_at = chrono::Utc::now();
+            return JobResult {
+                job_id,
+                success: false,
+                exit_code: -1,
+                step_results: Vec::new(),
+                artifacts: Vec::new(),
+                logs: None,
+                started_at,
+                completed_at,
+                error: Some(format!(
+                    "container backend preflight failed: {probe_error}; \
+                     backend probe: {}",
+                    self.pool.sandbox.backend_health().await.detail
+                )),
+                workspace_path: job.working_dir.clone(),
+                infrastructure_failure: true,
+            };
+        }
 
         // Increment active job count
         {
@@ -372,6 +446,7 @@ impl JobExecutor {
         let mut success = true;
         let mut final_exit_code = 0;
         let mut timed_out = false;
+        let mut infrastructure_failure = false;
         let mut failure_error = None;
 
         for step in &job.steps {
@@ -401,6 +476,18 @@ impl JobExecutor {
                     if step_result.exit_code != 0 {
                         success = false;
                         final_exit_code = step_result.exit_code;
+                        // A non-zero exit is a code failure except when the
+                        // OCI runtime itself could not run the process —
+                        // exactly how F45's full-scratch host presented.
+                        if step_failed_by_infrastructure(&step_result.stderr) {
+                            infrastructure_failure = true;
+                            failure_error = Some(format!(
+                                "step {} failed at the container layer ({}); backend probe: {}",
+                                step.name,
+                                first_line(&step_result.stderr),
+                                self.pool.sandbox.backend_health().await.detail
+                            ));
+                        }
                         tracing::error!(
                             "step {} failed with exit code {}",
                             step.name,
@@ -413,7 +500,19 @@ impl JobExecutor {
                     success = false;
                     final_exit_code = -1;
                     timed_out = deadline <= Instant::now();
-                    failure_error = Some(format!("execution error: {e}"));
+                    // An exec that errors at the transport/OCI layer is the
+                    // backend failing, unless the job deadline already
+                    // passed (timeout wins — that is our kill, not a
+                    // backend fault).
+                    if !timed_out {
+                        infrastructure_failure = true;
+                        failure_error = Some(format!(
+                            "execution error: {e}; backend probe: {}",
+                            self.pool.sandbox.backend_health().await.detail
+                        ));
+                    } else {
+                        failure_error = Some(format!("execution error: {e}"));
+                    }
                     step_results.push(StepResult {
                         exit_code: -1,
                         stdout: String::new(),
@@ -488,6 +587,37 @@ impl JobExecutor {
                 failure_error.or_else(|| Some("job failed".to_string()))
             },
             workspace_path: job.working_dir.clone(),
+            infrastructure_failure,
+        }
+    }
+
+    /// Prove the acquired container can actually exec: run `:` (no-op) with
+    /// a bounded window. `Some(detail)` means the backend is unusable and
+    /// the job must fail as infrastructure before any real step runs.
+    async fn preflight_exec(
+        &self,
+        instance: &SandboxInstance,
+        deadline: Instant,
+    ) -> Option<String> {
+        let window =
+            Duration::from_secs(30).min(deadline.saturating_duration_since(Instant::now()));
+        let probe = timeout(
+            window,
+            self.pool.sandbox.execute(instance, &["sh", "-c", ":"]),
+        )
+        .await;
+        match probe {
+            Err(_) => Some(format!(
+                "preflight exec did not answer within {}s",
+                window.as_secs()
+            )),
+            Ok(Err(error)) => Some(format!("preflight exec error: {error}")),
+            Ok(Ok(step)) if step.exit_code != 0 => Some(format!(
+                "preflight exec exited {}: {}",
+                step.exit_code,
+                first_line(&step.stderr)
+            )),
+            Ok(Ok(_)) => None,
         }
     }
 
@@ -622,6 +752,10 @@ pub struct JobResult {
     pub error: Option<String>,
     /// Workspace path where the job executed
     pub workspace_path: Option<String>,
+    /// The container backend — not the commit — failed this job (R6.3):
+    /// acquisition failure, a failed preflight exec, an OCI-layer exec
+    /// error, or a step that died on the host's exhausted scratch fs.
+    pub infrastructure_failure: bool,
 }
 
 impl JobResult {
@@ -631,6 +765,8 @@ impl JobResult {
             ReceiptStatus::Succeeded
         } else if self.error.as_ref().is_some_and(|e| e.contains("timeout")) {
             ReceiptStatus::TimedOut
+        } else if self.infrastructure_failure {
+            ReceiptStatus::InfrastructureFailure
         } else {
             ReceiptStatus::Failed
         }
@@ -837,6 +973,7 @@ mod tests {
             completed_at: completed,
             error: None,
             workspace_path: None,
+            infrastructure_failure: false,
         };
         assert_eq!(success_result.status(), ReceiptStatus::Succeeded);
 
@@ -852,6 +989,7 @@ mod tests {
             completed_at: completed,
             error: Some("build failed".to_string()),
             workspace_path: None,
+            infrastructure_failure: false,
         };
         assert_eq!(failure_result.status(), ReceiptStatus::Failed);
 
@@ -867,8 +1005,58 @@ mod tests {
             completed_at: completed,
             error: Some("operation timeout exceeded".to_string()),
             workspace_path: None,
+            infrastructure_failure: false,
         };
         assert_eq!(timeout_result.status(), ReceiptStatus::TimedOut);
+
+        // Test infrastructure status (R6.3): the backend, not the commit,
+        // failed the job.
+        let infra_result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: -1,
+            step_results: vec![],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: Some(
+                "container backend preflight failed: preflight exec error: \
+                 daemon unavailable; backend probe: ping failed"
+                    .to_string(),
+            ),
+            workspace_path: None,
+            infrastructure_failure: true,
+        };
+        assert_eq!(infra_result.status(), ReceiptStatus::InfrastructureFailure);
+    }
+
+    #[test]
+    fn test_step_failed_by_infrastructure_recognizes_oci_markers() {
+        // F45's exact host-side signature.
+        assert!(step_failed_by_infrastructure(
+            "OCI runtime exec failed: write /tmp/runc-process…: \
+             no space left on device: unknown"
+        ));
+        assert!(step_failed_by_infrastructure(
+            "runc create failed: unable to apply cgroup configuration"
+        ));
+        // Case-insensitive: the daemon's casing is not contractual.
+        assert!(step_failed_by_infrastructure(
+            "oci runtime exec failed: something broke"
+        ));
+        // Compiler and tool failures must stay code failures.
+        assert!(!step_failed_by_infrastructure(
+            "error[E0425]: cannot find function `run` in this scope"
+        ));
+        assert!(!step_failed_by_infrastructure("npm ERR! Test failed"));
+        assert!(!step_failed_by_infrastructure(""));
+    }
+
+    #[test]
+    fn test_first_line_prefers_non_empty_diagnostics() {
+        assert_eq!(first_line("\n  boom: disk full\nmore"), "boom: disk full");
+        assert_eq!(first_line(""), "<no diagnostic output>");
     }
 
     #[test]

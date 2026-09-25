@@ -15,6 +15,8 @@ pub enum JobStatus {
     Failed,
     Cancelled,
     TimedOut,
+    /// The container backend — not the commit — failed the job (R6.3).
+    InfrastructureFailure,
 }
 
 impl JobStatus {
@@ -28,6 +30,7 @@ impl JobStatus {
             JobStatus::Failed => "failed",
             JobStatus::Cancelled => "cancelled",
             JobStatus::TimedOut => "timed_out",
+            JobStatus::InfrastructureFailure => "infrastructure_failure",
         }
     }
 
@@ -42,6 +45,7 @@ impl JobStatus {
             "failed" => Some(JobStatus::Failed),
             "cancelled" => Some(JobStatus::Cancelled),
             "timed_out" => Some(JobStatus::TimedOut),
+            "infrastructure_failure" => Some(JobStatus::InfrastructureFailure),
             _ => None,
         }
     }
@@ -50,7 +54,11 @@ impl JobStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled | JobStatus::TimedOut
+            JobStatus::Succeeded
+                | JobStatus::Failed
+                | JobStatus::Cancelled
+                | JobStatus::TimedOut
+                | JobStatus::InfrastructureFailure
         )
     }
 
@@ -70,6 +78,7 @@ impl JobStatus {
             JobStatus::Failed => gitforge_common::JobStatus::Failed,
             JobStatus::Cancelled => gitforge_common::JobStatus::Cancelled,
             JobStatus::TimedOut => gitforge_common::JobStatus::TimedOut,
+            JobStatus::InfrastructureFailure => gitforge_common::JobStatus::InfrastructureFailure,
         }
     }
 }

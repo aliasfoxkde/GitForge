@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 
 /// The receipt schema version exchanged with Control Center and other local
 /// consumers. Increment this when a breaking field/meaning change is made.
-pub const RECEIPT_VERSION: u32 = 2;
+/// v3: added `ReceiptStatus::InfrastructureFailure` (R6.3 backend probe).
+pub const RECEIPT_VERSION: u32 = 3;
 /// Prevent relational metadata from becoming an unbounded log/artifact sink.
 pub const MAX_LOG_BYTES: u64 = 64 * 1024;
 pub const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
@@ -21,6 +22,8 @@ pub enum ReceiptStatus {
     Failed,
     TimedOut,
     Cancelled,
+    /// The container backend — not the commit — failed the job (R6.3).
+    InfrastructureFailure,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

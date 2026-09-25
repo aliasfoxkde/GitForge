@@ -117,6 +117,11 @@ pub fn fence_actions(
         .filter_map(
             |(job_id, _)| match db_status.get(job_id).map(String::as_str) {
                 Some("failed") => Some((*job_id, FenceAction::Fail)),
+                // The backend failed this job (R6.3). The engine mirror only
+                // speaks success/failure, so converge as Fail — the durable
+                // row keeps the infrastructure classification, and leaving
+                // it unmapped here would wedge the run non-terminal forever.
+                Some("infrastructure_failure") => Some((*job_id, FenceAction::Fail)),
                 Some("timed_out" | "timeout" | "timed-out") => {
                     Some((*job_id, FenceAction::Timeout))
                 }
@@ -917,6 +922,19 @@ mod tests {
         assert!(actions.contains(&(a, FenceAction::Timeout)));
         assert!(actions.contains(&(b, FenceAction::Cancel)));
         assert_eq!(actions.len(), 2, "unknown job rows must be ignored");
+
+        // A durable `infrastructure_failure` row (R6.3) must converge too,
+        // as Fail: the engine mirror speaks success/failure only, and an
+        // unmapped terminal status wedges the run exactly like bccaa1be.
+        assert_eq!(
+            fence_actions(
+                &state,
+                &[(a, "infrastructure_failure".to_string())]
+                    .into_iter()
+                    .collect()
+            ),
+            vec![(a, FenceAction::Fail)]
+        );
 
         // A durable `succeeded` row under a Running mirror maps to Succeed:
         // the engine missed the completion event and the durable row is the

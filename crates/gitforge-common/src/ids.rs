@@ -297,6 +297,10 @@ pub enum JobStatus {
     Failed,
     Cancelled,
     TimedOut,
+    /// The container backend — not the commit — failed the job: wedged
+    /// daemon, unusable exec, exhausted host scratch (R6.3). Terminal and
+    /// alertable; never a red X on the code.
+    InfrastructureFailure,
 }
 
 impl JobStatus {
@@ -304,7 +308,11 @@ impl JobStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled | JobStatus::TimedOut
+            JobStatus::Succeeded
+                | JobStatus::Failed
+                | JobStatus::Cancelled
+                | JobStatus::TimedOut
+                | JobStatus::InfrastructureFailure
         )
     }
 }

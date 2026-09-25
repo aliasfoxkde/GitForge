@@ -16,7 +16,7 @@ use gitforge_common::{Error, JobId, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
 /// Sandbox instance handle
 #[derive(Debug, Clone)]
@@ -41,6 +41,70 @@ pub struct StepResult {
 pub enum OutputStream {
     Stdout,
     Stderr,
+}
+
+/// What the container-backend preflight actually measured (R6.3).
+///
+/// This is the F40/F45 remedy: `docker_daemon_available()` was a filesystem
+/// existence check that always passed while the real daemon hung (wedged
+/// rootless podman) or executed nothing (host scratch exhausted). The probe
+/// reports what it genuinely observed so a failing runner is alertable as
+/// infrastructure, never as a red X on a commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendHealth {
+    /// The daemon answered a `/_ping` inside the probe window.
+    pub daemon_ok: bool,
+    /// Free bytes on the filesystem backing the exec scratch directory
+    /// (`/tmp` per `std::env::temp_dir()` — the exact resource F45
+    /// exhausted, where runc stages per-exec state). `None` when it could
+    /// not be measured or the sandbox is a stub.
+    pub scratch_free_bytes: Option<u64>,
+    /// Free-scratch floor below which `healthy()` refuses new work.
+    /// Configurable via `GITFORGE_SCRATCH_MIN_FREE_BYTES`.
+    pub scratch_min_free_bytes: u64,
+    /// Human-readable probe delta for error messages.
+    pub detail: String,
+}
+
+impl BackendHealth {
+    pub fn healthy(&self) -> bool {
+        self.daemon_ok
+            && self
+                .scratch_free_bytes
+                .is_none_or(|free| free >= self.scratch_min_free_bytes)
+    }
+}
+
+/// Ceiling on how long the daemon ping may take before the backend counts
+/// as wedged. F40's signature was a ping that never returned.
+fn probe_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("GITFORGE_BACKEND_PROBE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(10),
+    )
+}
+
+/// Free-scratch floor for `BackendHealth::healthy` (default 2 GiB: the
+/// slack the F45 remediation asks operators to keep on `/tmp`).
+fn scratch_min_free_bytes() -> u64 {
+    std::env::var("GITFORGE_SCRATCH_MIN_FREE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2 * 1024 * 1024 * 1024)
+}
+
+/// Measure free bytes on the filesystem backing the exec scratch directory.
+fn scratch_free_bytes() -> Option<u64> {
+    match rustix::fs::statvfs(std::env::temp_dir()) {
+        Ok(stat) => Some(stat.f_bavail.saturating_mul(stat.f_frsize)),
+        Err(error) => {
+            tracing::debug!(%error, "could not stat the scratch filesystem");
+            None
+        }
+    }
 }
 
 /// Receives bounded output chunks while a sandbox command is running.
@@ -181,6 +245,62 @@ impl DockerSandbox {
             default_limits: SandboxLimits::default(),
             is_stub: false,
         })
+    }
+
+    /// Probe the container backend for real health: a daemon `/_ping` inside
+    /// the probe window plus a measurement of the free space on the exec
+    /// scratch filesystem. Replaces the filesystem-existence check that
+    /// F40 proved blind (wedged podman passed it) and gives the F45
+    /// full-scratch failure an observable warning before jobs die at the
+    /// OCI layer.
+    pub async fn backend_health(&self) -> BackendHealth {
+        if self.is_stub {
+            return BackendHealth {
+                daemon_ok: true,
+                scratch_free_bytes: None,
+                scratch_min_free_bytes: scratch_min_free_bytes(),
+                detail: "stub sandbox; probe skipped".to_string(),
+            };
+        }
+
+        let min_free = scratch_min_free_bytes();
+        let Some(docker) = &self.docker else {
+            return BackendHealth {
+                daemon_ok: false,
+                scratch_free_bytes: scratch_free_bytes(),
+                scratch_min_free_bytes: min_free,
+                detail: "sandbox has no daemon client".to_string(),
+            };
+        };
+
+        let ping = timeout(probe_timeout(), docker.ping()).await;
+        let (daemon_ok, ping_detail) = match ping {
+            Ok(Ok(_)) => (true, "ping ok".to_string()),
+            Ok(Err(error)) => (false, format!("ping failed: {error}")),
+            Err(_) => (
+                false,
+                format!(
+                    "ping did not answer within {}s (wedged backend signature)",
+                    probe_timeout().as_secs()
+                ),
+            ),
+        };
+        let scratch_free_bytes = scratch_free_bytes();
+        let scratch_detail = match scratch_free_bytes {
+            Some(free) => format!(
+                "scratch free {:.1} GiB (floor {:.1} GiB)",
+                free as f64 / (1024.0 * 1024.0 * 1024.0),
+                min_free as f64 / (1024.0 * 1024.0 * 1024.0)
+            ),
+            None => "scratch free space unavailable".to_string(),
+        };
+
+        BackendHealth {
+            daemon_ok,
+            scratch_free_bytes,
+            scratch_min_free_bytes: min_free,
+            detail: format!("{ping_detail}; {scratch_detail}"),
+        }
     }
 
     /// Create a stub sandbox for testing purposes.
@@ -832,6 +952,67 @@ mod tests {
         assert_eq!(env[0], "GIT_CONFIG_COUNT=1");
         assert_eq!(env[1], "GIT_CONFIG_KEY_0=safe.directory");
         assert_eq!(env[2], "GIT_CONFIG_VALUE_0=/workspace");
+    }
+
+    /// R6.3: the stub backend reports a healthy probe with the measurement
+    /// explicitly skipped, so test runners never alert on their own sandbox.
+    #[tokio::test]
+    async fn test_backend_health_stub_reports_healthy_skipped_probe() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let health = sandbox.backend_health().await;
+        assert!(health.healthy());
+        assert!(health.daemon_ok);
+        assert_eq!(health.scratch_free_bytes, None);
+        assert!(health.detail.contains("stub"));
+    }
+
+    /// The real probe must produce a measurement (not `None`) when the
+    /// scratch filesystem can be stated, and the healthy() verdict must
+    /// honor the floor. Runs against whatever daemon configuration the
+    /// host has; skipped silently when none is reachable.
+    #[tokio::test]
+    #[serial]
+    async fn test_backend_health_real_daemon_reports_measurements() {
+        if !std::path::Path::new("/var/run/docker.sock").exists()
+            && std::env::var_os("DOCKER_HOST").is_none()
+        {
+            eprintln!("skipping: no Docker daemon for backend health probe test");
+            return;
+        }
+        let Ok(sandbox) = DockerSandbox::connect_required().await else {
+            eprintln!("skipping: daemon could not be reached for backend health probe test");
+            return;
+        };
+        let health = sandbox.backend_health().await;
+        assert!(
+            health.daemon_ok,
+            "a backend that answered connect must answer the probe: {}",
+            health.detail
+        );
+        assert!(
+            health.scratch_free_bytes.is_some(),
+            "statvfs on the scratch dir must measure on a healthy host"
+        );
+        assert!(health.healthy(), "{}", health.detail);
+    }
+
+    /// The F45 shape directly: a daemon that pings fine but an exhausted
+    /// scratch fs must not count as healthy.
+    #[test]
+    fn test_backend_health_floor_rejects_exhausted_scratch() {
+        let exhausted = BackendHealth {
+            daemon_ok: true,
+            scratch_free_bytes: Some(300 * 1024 * 1024),
+            scratch_min_free_bytes: 2 * 1024 * 1024 * 1024,
+            detail: "scratch free 0.3 GiB (floor 2.0 GiB)".to_string(),
+        };
+        assert!(!exhausted.healthy());
+
+        let comfortable = BackendHealth {
+            scratch_free_bytes: Some(3 * 1024 * 1024 * 1024),
+            ..exhausted.clone()
+        };
+        assert!(comfortable.healthy());
     }
 
     #[async_trait]

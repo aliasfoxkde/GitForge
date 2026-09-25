@@ -506,10 +506,12 @@ impl Scheduler {
             .any(|job| JobStatus::from_str(&job.status) == Some(JobStatus::Cancelled))
         {
             "cancelled"
-        } else if jobs
-            .iter()
-            .any(|job| JobStatus::from_str(&job.status) == Some(JobStatus::Failed))
-        {
+        } else if jobs.iter().any(|job| {
+            matches!(
+                JobStatus::from_str(&job.status),
+                Some(JobStatus::Failed) | Some(JobStatus::InfrastructureFailure)
+            )
+        }) {
             "failed"
         } else {
             "succeeded"
@@ -1282,7 +1284,7 @@ impl Scheduler {
         job_id: JobId,
         runner_id: RunnerId,
         lease_token: &str,
-        success: bool,
+        outcome: JobOutcome,
         result_json: String,
     ) -> anyhow::Result<()> {
         {
@@ -1298,13 +1300,12 @@ impl Scheduler {
             }
         }
         if let Some(pool) = &self.db_pool {
-            let status = if success { "succeeded" } else { "failed" };
             let accepted = gitforge_db::queries::JobQueries::complete_with_lease_and_publication(
                 pool,
                 job_id,
                 runner_id,
                 lease_token,
-                status,
+                outcome.as_str(),
                 &result_json,
                 "github",
                 "job_receipt",
@@ -1320,7 +1321,7 @@ impl Scheduler {
                 anyhow::bail!("durable job lease is no longer active");
             }
         }
-        self.complete_job(job_id, success, result_json).await
+        self.complete_job(job_id, outcome, result_json).await
     }
 
     /// Append runner output to the durable log ledger under the active lease.
@@ -1377,18 +1378,22 @@ impl Scheduler {
     pub async fn complete_job(
         &self,
         job_id: JobId,
-        success: bool,
+        outcome: JobOutcome,
         result_json: String,
     ) -> anyhow::Result<()> {
-        let status = if success { "succeeded" } else { "failed" };
         let assignment = {
             let state = self.state.read().await;
             state.assigned_jobs.get(&job_id).copied()
         };
         if let Some(pool) = &self.db_pool {
-            gitforge_db::queries::JobQueries::complete(pool, job_id, status, &result_json)
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            gitforge_db::queries::JobQueries::complete(
+                pool,
+                job_id,
+                outcome.as_str(),
+                &result_json,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
         let mut state = self.state.write().await;
         if let Some(existing) = state.completed_receipts.get(&job_id) {
@@ -1406,10 +1411,57 @@ impl Scheduler {
                 job_id,
                 pipeline_run_id,
                 runner_id,
-                success,
+                success: outcome.success(),
             });
         }
         Ok(())
+    }
+}
+
+/// The terminal outcome a runner reports for a job (R6.3).
+///
+/// `success: bool` alone could not separate "the commit is broken" from
+/// "the container backend is broken" (F40/F45), so the wire carries an
+/// explicit outcome and the durable row records it verbatim. The
+/// completion event keeps its boolean shape: run grading only needs
+/// success/failure, while the infrastructure classification lives in the
+/// durable job row where operators alert on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
+    InfrastructureFailure,
+}
+
+impl JobOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobOutcome::Succeeded => "succeeded",
+            JobOutcome::Failed => "failed",
+            JobOutcome::TimedOut => "timed_out",
+            JobOutcome::InfrastructureFailure => "infrastructure_failure",
+        }
+    }
+
+    /// Whether the job's execution itself succeeded (only a clean pass
+    /// counts).
+    pub fn success(&self) -> bool {
+        matches!(self, JobOutcome::Succeeded)
+    }
+
+    /// Map a completion request onto an outcome. The explicit `outcome`
+    /// field wins when it is a known status; otherwise the historical
+    /// boolean mapping applies, keeping older runners wire-compatible.
+    pub fn from_request(success: bool, outcome: Option<&str>) -> Self {
+        match outcome {
+            Some("succeeded") => JobOutcome::Succeeded,
+            Some("failed") => JobOutcome::Failed,
+            Some("timed_out") => JobOutcome::TimedOut,
+            Some("infrastructure_failure") => JobOutcome::InfrastructureFailure,
+            _ if success => JobOutcome::Succeeded,
+            _ => JobOutcome::Failed,
+        }
     }
 }
 
@@ -2436,7 +2488,7 @@ mod tests {
                 first_job,
                 runner_id,
                 &first_lease,
-                true,
+                JobOutcome::Succeeded,
                 "{\"success\":true}".to_string(),
             )
             .await
@@ -2621,7 +2673,7 @@ mod tests {
                 job_id,
                 RunnerId::new(),
                 &lease,
-                true,
+                JobOutcome::Succeeded,
                 "{\"success\":true}".to_string(),
             )
             .await
@@ -2631,7 +2683,7 @@ mod tests {
                 job_id,
                 runner_id,
                 &lease,
-                true,
+                JobOutcome::Succeeded,
                 "{\"success\":true}".to_string(),
             )
             .await
@@ -2705,7 +2757,7 @@ mod tests {
                 job_id,
                 runner_id,
                 &lease,
-                true,
+                JobOutcome::Succeeded,
                 "{\"durable\":true}".to_string(),
             )
             .await
@@ -2788,5 +2840,129 @@ mod tests {
             .unwrap();
         assert_eq!(finalized.status, "cancelled");
         assert!(finalized.finished_at.is_some());
+    }
+
+    #[test]
+    fn test_job_outcome_from_request_prefers_explicit_classification() {
+        // The boolean mapping stays the default for older runners.
+        assert_eq!(JobOutcome::from_request(true, None), JobOutcome::Succeeded);
+        assert_eq!(JobOutcome::from_request(false, None), JobOutcome::Failed);
+        // An explicit outcome wins over the boolean, which is what lets the
+        // runner say "the backend failed, not the commit" (R6.3).
+        assert_eq!(
+            JobOutcome::from_request(false, Some("infrastructure_failure")),
+            JobOutcome::InfrastructureFailure
+        );
+        assert_eq!(
+            JobOutcome::from_request(true, Some("infrastructure_failure")),
+            JobOutcome::InfrastructureFailure
+        );
+        // Unknown classifications must not be trusted with the durable row.
+        assert_eq!(
+            JobOutcome::from_request(false, Some("actually-fine")),
+            JobOutcome::Failed
+        );
+        assert_eq!(
+            JobOutcome::from_request(false, Some("timed_out")),
+            JobOutcome::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn test_infrastructure_failure_rows_grade_the_run_failed() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "infra-owner".to_string(),
+            "infra-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            "infra-repo".to_string(),
+            user.id,
+            "/git/infra-repo".to_string(),
+        );
+        gitforge_db::queries::RepoQueries::create(&pool, &repo)
+            .await
+            .unwrap();
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: "infra-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "infra-owner".to_string(),
+            "infra-commit".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+
+        // One clean pass, one backend failure: the run must grade failed,
+        // and the failing row must keep its infrastructure classification
+        // so operators alert on it instead of debugging a green-looking
+        // diff.
+        let build = gitforge_db::models::Job::new(run.id, "build".to_string());
+        let test = gitforge_db::models::Job::new(run.id, "test".to_string());
+        gitforge_db::queries::JobQueries::create(&pool, &build)
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::create(&pool, &test)
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::complete(&pool, build.id, "succeeded", "{}")
+            .await
+            .unwrap();
+        let receipt = serde_json::json!({
+            "job_id": test.id.to_string(),
+            "success": false,
+            "error": "container backend preflight failed: preflight exec error: \
+                      OCI runtime exec failed: no space left on device; \
+                      backend probe: ping ok; scratch free 0.3 GiB (floor 2.0 GiB)",
+        })
+        .to_string();
+        gitforge_db::queries::JobQueries::complete(
+            &pool,
+            test.id,
+            JobOutcome::InfrastructureFailure.as_str(),
+            &receipt,
+        )
+        .await
+        .unwrap();
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        scheduler
+            .finalize_pipeline_if_terminal(&pool, run.id)
+            .await
+            .unwrap();
+
+        let graded = gitforge_db::queries::PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(graded.status, "failed");
+
+        let stored = gitforge_db::queries::JobQueries::get(&pool, test.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "infrastructure_failure");
+        let parsed = JobStatus::from_str(&stored.status).unwrap();
+        assert!(parsed.is_terminal());
+        assert_eq!(
+            parsed.to_common(),
+            gitforge_common::JobStatus::InfrastructureFailure
+        );
     }
 }

@@ -153,6 +153,10 @@ impl<'a> From<&'a TerminalPublication> for CheckRunRequest<'a> {
             ReceiptStatus::Failed => "failure",
             ReceiptStatus::TimedOut => "timed_out",
             ReceiptStatus::Cancelled => "cancelled",
+            // GitHub's check-conclusion vocabulary has no infrastructure
+            // value; "neutral" keeps the commit from wearing a red X while
+            // the receipt itself carries the real classification.
+            ReceiptStatus::InfrastructureFailure => "neutral",
         };
         Self {
             name: &publication.check_name,
