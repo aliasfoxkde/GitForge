@@ -794,3 +794,19 @@ the same day, plus the r6-platform-durability line deployed.
   restarts services every few minutes; promoting first made their
   loop converge onto this bundle (their restart at 20:03:03Z landed
   on gitforge-156e249a-20260925).
+
+- **F36 (restart resumption refuses its own workspaces — found during
+  post-deploy validation, fix in flight on
+  `fix/ci-rebuild-workspace-adoption-20260925`).** The 19:00Z ci boot
+  (r6 bundle) logged `engine rebuild skipped: workspace could not be
+  restored` EIGHT times: `rebuild_live_engines` treats a pre-existing
+  `workspaces/<run_id>` as fatal and never registers the rebuilt
+  engine, so every interrupted run drifts to the orphan reconciler and
+  gets graded `failed` with an intact workspace sitting right there.
+  This is the mechanism that amplified F35's false-RED burst into the
+  `incomplete_chain` gradings. Fix: adopt the existing workspace —
+  `git checkout --force --detach <run commit>` plus
+  `git clean -fdx` restores fresh-checkout state; unadoptable
+  workspaces stay errors. Regression test drives the adopt path
+  (dirty leftover files restored/cleared, HEAD preserved) and the
+  refusal path (bad commit).
