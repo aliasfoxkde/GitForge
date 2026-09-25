@@ -2858,6 +2858,17 @@ mod tests {
             .collect();
         assert_eq!(legacy.len(), 1);
         assert!(legacy[0].name.starts_with("dup-runner-legacy-"));
+
+        // The boot after deduplication must not touch the rows again: the
+        // migration skips its write entirely when no duplicates remain, so
+        // restarts stay read-only under concurrent writer churn.
+        pool.migrate().await.unwrap();
+        let runners_after = RunnerQueries::list(&pool).await.unwrap();
+        let after_names: std::collections::HashSet<_> =
+            runners_after.iter().map(|r| r.name.clone()).collect();
+        let before_names: std::collections::HashSet<_> =
+            runners.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(before_names, after_names, "second boot is a no-op");
     }
 
     #[tokio::test]
