@@ -1279,7 +1279,41 @@ async fn prepare_run_workspace(
     tokio::fs::create_dir_all(&root).await?;
     let workspace = root.join(run_id.to_string());
     if tokio::fs::try_exists(&workspace).await? {
-        return Err(anyhow::anyhow!("workspace already exists for run {run_id}"));
+        // The workspace was left behind by the previous ci process for this
+        // same run. Refusing to reuse it turns every restart into a lost
+        // resumption: the rebuild path treats the error as fatal and never
+        // registers the rebuilt engine, so the run drifts to the orphan
+        // reconciler and gets graded failed with an intact workspace sitting
+        // right there (the 2026-09-25 19:00Z boot skipped every interrupted
+        // run this way). Adopt the directory instead: force the tracked tree
+        // back to the run's commit and clear job leftovers so a resumed
+        // stage sees fresh-checkout state.
+        let repair = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["checkout", "--force", "--detach", commit_hash])
+            .output()
+            .await?;
+        if !repair.status.success() {
+            return Err(anyhow::anyhow!(
+                "workspace for run {run_id} exists but could not be adopted at commit {commit_hash}: {}",
+                String::from_utf8_lossy(&repair.stderr).trim()
+            ));
+        }
+        let clean = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["clean", "-fdx"])
+            .output()
+            .await?;
+        if !clean.status.success() {
+            return Err(anyhow::anyhow!(
+                "workspace for run {run_id} adopted but could not be cleaned: {}",
+                String::from_utf8_lossy(&clean.stderr).trim()
+            ));
+        }
+        tracing::info!(run = %run_id, commit = %commit_hash, "adopted existing run workspace");
+        return Ok(workspace.to_string_lossy().into_owned());
     }
 
     // Do not request Git's hard-link-based local clone optimization here.
@@ -2342,6 +2376,85 @@ mod tests {
                 .unwrap(),
             "checked out\n"
         );
+        tokio::fs::remove_dir_all(&test_root_path).await.unwrap();
+    }
+
+    // A restart leaves the previous process's workspace on disk. The second
+    // prepare for the same run must adopt it (restoring the tracked tree and
+    // clearing job leftovers), not fail — the failure path used to make the
+    // rebuild skip engine registration entirely, sending intact runs to the
+    // orphan reconciler to be graded failed.
+    #[tokio::test]
+    async fn test_prepare_run_workspace_adopts_existing_workspace() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let run_id = gitforge_common::PipelineRunId::new();
+        let test_root_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-workspace-tests")
+            .join(run_id.to_string());
+        let source = test_root_path.join("source.git");
+        let seed = test_root_path.join("seed");
+        tokio::fs::create_dir_all(&test_root_path).await.unwrap();
+        run_git(["init", "--bare", source.to_str().unwrap()], None).await;
+        tokio::fs::create_dir_all(&seed).await.unwrap();
+        run_git(["init", seed.to_str().unwrap()], None).await;
+        run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
+        run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
+        tokio::fs::write(seed.join("marker.txt"), "checked out\n")
+            .await
+            .unwrap();
+        run_git(["add", "marker.txt"], Some(&seed)).await;
+        run_git(["commit", "-m", "workspace fixture"], Some(&seed)).await;
+        let commit = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
+        run_git(
+            ["push", source.to_str().unwrap(), "HEAD:refs/heads/main"],
+            Some(&seed),
+        )
+        .await;
+
+        let (pool, repo_id) =
+            test_pool_with_repository(source.to_string_lossy().into_owned()).await;
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", test_root_path.join("workspaces"));
+        let workspace = prepare_run_workspace(&pool, repo_id, run_id, &commit)
+            .await
+            .unwrap();
+
+        // Leftovers from the interrupted attempt: an untracked file and a
+        // modified tracked file.
+        tokio::fs::write(
+            PathBuf::from(&workspace).join("job-leftover.txt"),
+            "stale\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(PathBuf::from(&workspace).join("marker.txt"), "dirtied\n")
+            .await
+            .unwrap();
+
+        let adopted = prepare_run_workspace(&pool, repo_id, run_id, &commit)
+            .await
+            .unwrap();
+        assert_eq!(adopted, workspace);
+        assert_eq!(
+            run_git(["rev-parse", "HEAD"], Some(std::path::Path::new(&adopted))).await,
+            commit
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(PathBuf::from(&adopted).join("marker.txt"))
+                .await
+                .unwrap(),
+            "checked out\n"
+        );
+        assert!(!PathBuf::from(&adopted).join("job-leftover.txt").exists());
+
+        // A workspace that cannot be checked out at the requested commit
+        // must still be an error, not a silent adoption.
+        let error = prepare_run_workspace(&pool, repo_id, run_id, "deadbeef")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("could not be adopted"));
         tokio::fs::remove_dir_all(&test_root_path).await.unwrap();
     }
 
