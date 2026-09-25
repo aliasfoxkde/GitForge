@@ -88,29 +88,58 @@ in the baseline; genuine hardening work is tracked in
 HIPAA/PCI/GDPR keyword mentions inside docs and the review engine's
 pattern tables.
 
-## Baseline refresh (2026-09-25) — two additions, both triaged accepted
+## Baseline refresh (2026-09-25) — triage of the post-merge tree
 
-Aegis 0.6.2 reports two findings the 2026-09-20 baseline (generated on
-0.6.1) did not contain. Neither is in code changed by the accompanying
-pipeline-management work; both were triaged and appended to the baseline
-fingerprint-precisely (`make aegis` re-verified green afterwards).
+Two things made the 2026-09-20 baseline stale; both were triaged and
+the baseline was regenerated with `make aegis-baseline` (aegis 0.6.3,
+which also stops the scanner reading `.aegis/` state directories).
+
+1. **Line shifts from the pipeline-management change.** Editing
+   `crates/gitforge-api` routes, `crates/gitforge-cli`, `services/ci`,
+   and (via the merged gzip fix) `services/git-server` shifted the line
+   component of ~190 already-accepted fingerprints. Content hashes are
+   unchanged — no finding corresponds to new code. Per-fingerprint
+   verification compared `sha256(content)` components against the old
+   baseline: every shifted finding matched accepted content exactly.
+2. **Two genuinely new-content findings, both accepted:**
+   - `email-address` [LOW] — `crates/gitforge-api/tests/ci_routes.rs`:
+     a fabricated address inside a new route-test fixture (assertion
+     data, not a real identity).
+   - `command-injection` [CRITICAL] — `services/git-server/src/main.rs`
+     (content introduced by `52657cd78`, in the deployed release
+     already; first baseline that covers it): a misfire on a
+     `tokio::spawn` retry closure that executes a **static** sqlx
+     `INSERT`. The file contains no `std::process::Command` / process
+     spawning at all (verified by grep); the flag is the generic
+     spawn-plus-string heuristic, not an injection path.
+
+Also re-confirmed accepted (from the earlier same-day triage, now part
+of the regenerated baseline): the static `sqlite3` diagnostic query in
+`scripts/gitforge-status` and the loopback CI-trigger URL in
+`.gitforce.yml:83`.
+
+## Historical note (2026-09-25, earlier same day)
+
+Before the full regeneration above, two findings were appended
+fingerprint-precisely as an interim step:
 
 1. `sql-query` [LOW] — `scripts/gitforge-status:323`: a static
-   `sqlite3` diagnostic query with no user input and no connection
-   string; a false positive of the generic SQL-injection shape matcher.
+   `sqlite3` diagnostic query with no user input; false positive of the
+   generic SQL-injection shape matcher.
 2. `ssrf-localhost` [MEDIUM] — `.gitforce.yml:83`: the pipeline's own
    CI-trigger step posting to the loopback orchestrator
    (`http://127.0.0.1:42781`), the documented, intended topology of the
-   single-host deployment. Loopback self-calls inside the trust boundary
-   are the accepted class for this pattern (same class as the gateway's
-   own `CiTriggerClient`).
+   single-host deployment.
 
-Note for future refreshes: since 0.6.2 fingerprints carry a
-`pattern:path:line:sha256(content)` form (this document's 2026-09-20
-section predates that; it described `pattern:path:line`), so a finding
+## Fingerprint format note (added 2026-09-25)
+
+Since Aegis 0.6.2, fingerprints carry a
+`pattern:path:line:sha256(content)` form (the 2026-09-20 section above
+predates that; it described `pattern:path:line`). A finding therefore
 re-flags when its line moves **or** its matched text changes — the
 content hash binds the baseline entry to the exact match. The
-line-shift and scan-root caveats above are unchanged.
+line-shift and scan-root caveats in the 2026-09-20 section are
+unchanged.
 
 ## Accepted deviations worth knowing about
 
