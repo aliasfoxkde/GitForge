@@ -19,6 +19,8 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 bollard = "0.21"
 futures-util = "0.3"
+# Scratch-space probing for the backend health report (R6.3).
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 serial_test = "4"

@@ -1109,6 +1109,48 @@ impl JobQueries {
         Ok(())
     }
 
+    /// Create the job row for an enqueue, or open the queue gate on the row
+    /// durable planning already wrote.
+    ///
+    /// Since durable DAG planning (R6.1), a run's full job set is persisted
+    /// as `pending` rows at trigger time; the enqueue that actually releases
+    /// a job to a runner must then fill in the execution definition and flip
+    /// the status rather than fail on the duplicate id. The conflict update
+    /// deliberately touches only the definition columns and the status: the
+    /// planned row's name, timestamps, and retry count stay authoritative.
+    pub async fn create_or_open_queue(pool: &Pool, job: &crate::models::Job) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, timeout_secs, result_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                status = 'queued',
+                commands = excluded.commands,
+                image = excluded.image,
+                working_dir = excluded.working_dir,
+                timeout_secs = excluded.timeout_secs
+            "#,
+        )
+        .bind(job.id.to_string())
+        .bind(job.pipeline_run_id.to_string())
+        .bind(&job.name)
+        .bind("queued")
+        .bind(job.runner_id.map(|id| id.to_string()))
+        .bind(job.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(job.finished_at.map(|dt| dt.to_rfc3339()))
+        .bind(job.retry_count)
+        .bind(job.created_at.to_rfc3339())
+        .bind(serde_json::to_string(&job.commands).unwrap_or_else(|_| "[]".to_string()))
+        .bind(&job.image)
+        .bind(&job.working_dir)
+        .bind(i64::try_from(job.timeout_secs).unwrap_or(i64::MAX))
+        .bind(&job.result_json)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to enqueue job: {e}")))?;
+        Ok(())
+    }
+
     /// Get a job by ID
     pub async fn get(pool: &Pool, id: JobId) -> Result<Option<crate::models::Job>> {
         let row = sqlx::query("SELECT * FROM jobs WHERE id = ?")
@@ -1456,14 +1498,19 @@ impl JobQueries {
         Ok(jobs)
     }
 
-    /// List all pending jobs
-    pub async fn list_pending(pool: &Pool) -> Result<Vec<crate::models::Job>> {
-        let rows = sqlx::query(
-            "SELECT * FROM jobs WHERE status IN ('pending', 'queued') ORDER BY created_at ASC",
-        )
-        .fetch_all(pool.pool())
-        .await
-        .map_err(|e| Error::database(format!("failed to list pending jobs: {e}")))?;
+    /// List jobs that are dispatchable right now: durably `queued` and
+    /// waiting for a runner.
+    ///
+    /// Planned rows (durable DAG planning) sit at `pending` until the engine
+    /// releases their dependency stage, so they are deliberately excluded —
+    /// scheduler recovery loads this list verbatim, and a planned row that
+    /// leaked into it would be dispatched before its predecessors finished.
+    pub async fn list_dispatchable(pool: &Pool) -> Result<Vec<crate::models::Job>> {
+        let rows =
+            sqlx::query("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC")
+                .fetch_all(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to list dispatchable jobs: {e}")))?;
 
         let jobs = rows
             .into_iter()
@@ -1471,6 +1518,36 @@ impl JobQueries {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(jobs)
+    }
+
+    /// The most recent job starts with their queued→started latency, newest
+    /// first — the bounded per-job dispatch-latency sample behind
+    /// `/queue/status` (R6.4). Latency is computed from the stored RFC 3339
+    /// timestamps; a row whose timestamps fail to parse is skipped rather
+    /// than corrupting the sample.
+    pub async fn recent_dispatch_latencies(pool: &Pool, limit: i64) -> Result<Vec<(JobId, i64)>> {
+        let rows = sqlx::query(
+            "SELECT j.id AS job_id, j.started_at AS started_at, j.created_at AS created_at \
+             FROM jobs j WHERE j.started_at IS NOT NULL \
+             ORDER BY j.started_at DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list dispatch latencies: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let job_id = parse_uuid_column(&row, "job_id").ok()?;
+                let started_at: String = row.try_get("started_at").ok()?;
+                let created_at: String = row.try_get("created_at").ok()?;
+                let started = DateTime::parse_from_rfc3339(&started_at).ok()?;
+                let created = DateTime::parse_from_rfc3339(&created_at).ok()?;
+                let latency = (started - created).num_seconds();
+                Some((JobId(job_id), latency))
+            })
+            .collect())
     }
 
     /// Recover jobs that were in flight when the scheduler stopped. Assigned
@@ -3059,7 +3136,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_job_queries_list_pending() {
+    async fn test_job_queries_list_dispatchable() {
         let pool = Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
 
@@ -3096,13 +3173,88 @@ mod tests {
         );
         PipelineRunQueries::create(&pool, &run).await.unwrap();
 
-        let job = crate::models::Job::new(run.id, "build".to_string());
-        JobQueries::create(&pool, &job).await.unwrap();
+        // A planned row (durable DAG planning) sits at `pending` until its
+        // dependency stage is released.
+        let planned = crate::models::Job::new(run.id, "planned-later".to_string());
+        JobQueries::create(&pool, &planned).await.unwrap();
 
-        // List pending jobs
-        let pending = JobQueries::list_pending(&pool).await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].name, "build");
+        // A released row is flipped to `queued` before it is enqueued.
+        let released = crate::models::Job::new(run.id, "build".to_string());
+        JobQueries::create(&pool, &released).await.unwrap();
+        JobQueries::update_status(&pool, released.id, "queued")
+            .await
+            .unwrap();
+
+        // Only the queued row is dispatchable; the planned row must never
+        // reach the scheduler's recovery scan.
+        let dispatchable = JobQueries::list_dispatchable(&pool).await.unwrap();
+        assert_eq!(dispatchable.len(), 1);
+        assert_eq!(dispatchable[0].name, "build");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_observability_reads() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "obs-owner".to_string(),
+            "obs-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+
+        let repo = crate::models::Repository::new(
+            "obs-repo".to_string(),
+            user.id,
+            "/git/obs-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "Obs Pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        // No started rows yet: the latency sample is honestly empty.
+        assert!(JobQueries::recent_dispatch_latencies(&pool, 20)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // One started job: the queued→started latency sample must be a
+        // non-negative integer number of seconds, per job.
+        let started = crate::models::Job::new(run.id, "started-job".to_string());
+        JobQueries::create(&pool, &started).await.unwrap();
+        JobQueries::start(&pool, started.id).await.unwrap();
+        let latencies = JobQueries::recent_dispatch_latencies(&pool, 20)
+            .await
+            .unwrap();
+        assert_eq!(latencies.len(), 1);
+        assert_eq!(latencies[0].0, started.id);
+        assert!(latencies[0].1 >= 0, "latency must not be negative");
+
+        // The limit is honored (bounded report, newest first).
+        let second = crate::models::Job::new(run.id, "second-started".to_string());
+        JobQueries::create(&pool, &second).await.unwrap();
+        JobQueries::start(&pool, second.id).await.unwrap();
+        let bounded = JobQueries::recent_dispatch_latencies(&pool, 1)
+            .await
+            .unwrap();
+        assert_eq!(bounded.len(), 1);
     }
 
     #[tokio::test]

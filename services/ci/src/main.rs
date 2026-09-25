@@ -162,6 +162,22 @@ async fn main() -> anyhow::Result<()> {
     // the sweep only ever touches run-owned directories of terminal runs,
     // never the checkout of a run the scheduler may requeue.
     if let Some(pool) = &scheduler_db {
+        // Rebuild engines for runs whose planning already happened but whose
+        // chain may still have unreleased stages. This runs BEFORE the
+        // reconciliation spawn on purpose: a rebuilt engine is registered in
+        // the pipeline registry, and reconciliation only ever touches runs no
+        // live engine owns.
+        let rebuilt = rebuild_live_engines(
+            pool,
+            &scheduler_arc,
+            &pipeline_registry,
+            &run_workspace_paths,
+        )
+        .await;
+        if rebuilt > 0 {
+            tracing::info!(rebuilt, "startup engine rebuild complete");
+        }
+
         let sweep_pool = pool.clone();
         let reconcile_registry = pipeline_registry.clone();
         tokio::spawn(async move {
@@ -1552,76 +1568,49 @@ async fn handle_push_event(
         .await
         .insert(state.run_id, engine.clone());
 
-    for job_id in ready_jobs {
-        if let Some(_job_state) = state.jobs.get(&job_id) {
-            let definition = engine
-                .job_definition(job_id)
-                .ok_or_else(|| anyhow::anyhow!("missing definition for job {job_id}"))?;
-            let commands = definition
-                .steps
-                .iter()
-                .map(|step| step.run.clone())
-                .collect();
-            let working_dir = definition
-                .steps
-                .iter()
-                .find_map(|step| step.working_directory.clone());
-            let working_dir = working_dir.or_else(|| workspace_path.clone());
-            // Honor the pipeline job's timeout instead of silently applying
-            // the legacy per-command default: long suites (a full pytest run
-            // easily exceeds 300 s) would otherwise time out mid-step even
-            // though the definition asked for more.
-            let timeout_secs = definition
-                .timeout_secs()
-                .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
-            if let Err(error) = scheduler
-                .enqueue_with_definition_and_image_and_timeout(
-                    job_id,
-                    state.run_id,
-                    repo_id,
-                    JobExecutionDefinition {
-                        commands,
-                        image: definition.image.clone(),
-                        working_dir,
-                        timeout_secs,
-                    },
-                )
-                .await
+    // Durable DAG planning: persist every planned job as a `pending` row
+    // before anything is dispatched. The scheduler used to learn a job only
+    // when its stage was released, so a control-plane restart mid-chain left
+    // the unenqueued tail with no durable trace and the run was graded
+    // complete with stages it never ran (F21). Planned rows carry the full
+    // execution definition so scheduler recovery can dispatch them verbatim
+    // once the engine releases their stage.
+    if let Some(pool) = scheduler_db {
+        if let Err(error) =
+            persist_planned_jobs(pool, &engine, state.run_id, workspace_path.as_deref()).await
+        {
+            // Without the planned rows a restart cannot resume this run; a
+            // half-planned run must not be left non-terminal.
+            tracing::error!(run = %state.run_id, %error, "failed to persist planned jobs");
+            let _ = gitforge_db::queries::PipelineRunQueries::update_status(
+                pool,
+                state.run_id,
+                "failed",
+            )
+            .await;
+            pipeline_registry.write().await.remove(&state.run_id);
+            if let Some(path) = run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .remove(&state.run_id)
+                .flatten()
             {
-                // F21: without a durable row the job is never dispatched and
-                // the push would dangle jobless until the reconciler's
-                // horizon grades it. Fail the run now, loudly, so the push
-                // author sees a red run with the persistence error in it.
-                tracing::error!(
-                    run = %state.run_id,
-                    %job_id,
-                    %error,
-                    "head job enqueue failed; grading run failed"
-                );
-                if let Some(pool) = scheduler_db {
-                    let _ = gitforge_db::queries::PipelineRunQueries::update_status(
-                        pool,
-                        state.run_id,
-                        "failed",
-                    )
-                    .await;
-                }
-                pipeline_registry.write().await.remove(&state.run_id);
-                if let Some(path) = run_workspace_paths
-                    .lock()
-                    .expect("workspace cache lock poisoned")
-                    .remove(&state.run_id)
-                    .flatten()
-                {
-                    tokio::spawn(async move {
-                        let _ = tokio::fs::remove_dir_all(path).await;
-                    });
-                }
-                return Err(anyhow::anyhow!("head job {job_id} enqueue failed: {error}"));
+                tokio::spawn(async move {
+                    let _ = tokio::fs::remove_dir_all(path).await;
+                });
             }
-            tracing::debug!("enqueued job {} for pipeline run {}", job_id, state.run_id);
+            return Err(error);
         }
     }
+
+    enqueue_ready_jobs(
+        scheduler,
+        &engine,
+        state.run_id,
+        repo_id,
+        workspace_path.clone(),
+    )
+    .await;
 
     Ok(state.run_id)
 }
@@ -1753,63 +1742,14 @@ async fn run_scheduler_event_consumer(
             .get(&state.run_id)
             .cloned()
             .flatten();
-        for next_job_id in engine.ready_jobs().await {
-            if let Some(definition) = engine.job_definition(next_job_id) {
-                let commands = definition
-                    .steps
-                    .iter()
-                    .map(|step| step.run.clone())
-                    .collect();
-                let working_dir = definition
-                    .steps
-                    .iter()
-                    .find_map(|step| step.working_directory.clone())
-                    .or_else(|| workspace_path.clone());
-                // Same contract as the initial enqueue: chained jobs keep
-                // the pipeline's per-job timeout. The legacy enqueue below
-                // silently applied a 300 s default — a 45 m test job queued
-                // after its neighbor finished was killed five minutes in.
-                let timeout_secs = definition
-                    .timeout_secs()
-                    .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
-                if let Err(error) = scheduler
-                    .enqueue_with_definition_and_image_and_timeout(
-                        next_job_id,
-                        state.run_id,
-                        state.repo_id,
-                        JobExecutionDefinition {
-                            commands,
-                            image: definition.image.clone(),
-                            working_dir,
-                            timeout_secs,
-                        },
-                    )
-                    .await
-                {
-                    // F21: the chain cannot advance through a job with no
-                    // durable row. Fail the upstream job so the run grades
-                    // `failed` with a visible cause instead of stalling as an
-                    // incomplete chain for the reconciler to sweep up later.
-                    tracing::error!(
-                        run = %state.run_id,
-                        job = %next_job_id,
-                        %error,
-                        "downstream job enqueue failed; failing the chain"
-                    );
-                    if let Err(fail_error) = engine
-                        .fail_job(next_job_id, -1, format!("durable enqueue failed: {error}"))
-                        .await
-                    {
-                        tracing::error!(
-                            run = %state.run_id,
-                            job = %next_job_id,
-                            error = %fail_error,
-                            "failed to mark enqueue failure on the engine"
-                        );
-                    }
-                }
-            }
-        }
+        enqueue_ready_jobs(
+            &scheduler,
+            &engine,
+            state.run_id,
+            state.repo_id,
+            workspace_path,
+        )
+        .await;
 
         // No-op until every job in the run is terminal; see
         // `finalize_run_if_terminal`.
@@ -1879,6 +1819,273 @@ async fn finalize_run_if_terminal(
         remove_run_workspace_dir(&root, run_id, workspace_path.as_deref()).await;
     });
     pipeline_registry.write().await.remove(&state.run_id);
+}
+
+/// Resolve a job definition into the scheduler's flat execution plan: the
+/// raw commands, the working directory (step override, else the run
+/// workspace), and the effective timeout.
+///
+/// Chained jobs keep the pipeline's per-job timeout. The legacy inline
+/// enqueue silently applied a 300 s default — a 45 m test job queued after
+/// its neighbor finished was killed five minutes in.
+fn execution_plan(
+    definition: &JobDefinition,
+    workspace_path: Option<&str>,
+) -> JobExecutionDefinition {
+    let commands = definition
+        .steps
+        .iter()
+        .map(|step| step.run.clone())
+        .collect();
+    let working_dir = definition
+        .steps
+        .iter()
+        .find_map(|step| step.working_directory.clone())
+        .or_else(|| workspace_path.map(str::to_string));
+    let timeout_secs = definition
+        .timeout_secs()
+        .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
+    JobExecutionDefinition {
+        commands,
+        image: definition.image.clone(),
+        working_dir,
+        timeout_secs,
+    }
+}
+
+/// Enqueue every job whose dependency stage the engine just released.
+///
+/// Shared by the trigger path, the completion consumer, and restart
+/// recovery so all three keep one enqueue contract (definition, working
+/// directory, timeout).
+async fn enqueue_ready_jobs(
+    scheduler: &Scheduler,
+    engine: &CiEngine,
+    run_id: gitforge_common::PipelineRunId,
+    repo_id: gitforge_common::RepoId,
+    workspace_path: Option<String>,
+) {
+    for job_id in engine.ready_jobs().await {
+        let Some(definition) = engine.job_definition(job_id) else {
+            tracing::error!(run = %run_id, %job_id, "missing definition for ready job");
+            continue;
+        };
+        let plan = execution_plan(&definition, workspace_path.as_deref());
+        if let Err(error) = scheduler
+            .enqueue_with_definition_and_image_and_timeout(job_id, run_id, repo_id, plan)
+            .await
+        {
+            // F21: the chain cannot advance through a job with no durable
+            // row. Fail the job so the run grades `failed` with a visible
+            // cause instead of stalling as an incomplete chain for the
+            // reconciler to sweep up later.
+            tracing::error!(
+                run = %run_id,
+                job = %job_id,
+                %error,
+                "ready job enqueue failed; failing the chain"
+            );
+            if let Err(fail_error) = engine
+                .fail_job(job_id, -1, format!("durable enqueue failed: {error}"))
+                .await
+            {
+                tracing::error!(
+                    run = %run_id,
+                    job = %job_id,
+                    error = %fail_error,
+                    "failed to mark enqueue failure on the engine"
+                );
+            }
+            continue;
+        }
+        tracing::debug!("enqueued job {} for pipeline run {}", job_id, run_id);
+    }
+}
+
+/// Persist one durable `pending` row per planned job, before any of them is
+/// dispatched.
+///
+/// Each row carries the full execution definition, so scheduler recovery can
+/// dispatch the job verbatim the moment the rebuilt engine releases its
+/// stage — nothing but the engine's in-memory graph holds the job set
+/// anymore. Enqueue later upserts the same row (`create_or_open_queue`)
+/// rather than inserting a second one.
+async fn persist_planned_jobs(
+    pool: &gitforge_db::Pool,
+    engine: &CiEngine,
+    run_id: gitforge_common::PipelineRunId,
+    workspace_path: Option<&str>,
+) -> anyhow::Result<usize> {
+    let planned = engine.planned_jobs();
+    for (job_id, name) in &planned {
+        let definition = engine
+            .job_definition(*job_id)
+            .ok_or_else(|| anyhow::anyhow!("missing definition for planned job {name}"))?;
+        let plan = execution_plan(&definition, workspace_path);
+        let mut db_job = gitforge_db::models::Job::new(run_id, name.clone());
+        db_job.id = *job_id;
+        db_job.commands = plan.commands;
+        db_job.image = plan.image;
+        db_job.working_dir = plan.working_dir;
+        db_job.timeout_secs = plan.timeout_secs;
+        gitforge_db::queries::JobQueries::create(pool, &db_job).await?;
+    }
+    tracing::info!(run = %run_id, planned = planned.len(), "persisted planned job rows");
+    Ok(planned.len())
+}
+
+/// Rebuild live engines for runs a previous process left behind.
+///
+/// Durable DAG planning persists every planned job at trigger time, so the
+/// restarted control plane can rebuild the engine for an interrupted run:
+/// graph nodes are grafted onto the durable job ids by name, statuses are
+/// restored from the rows, and the run's workspace checkout is recreated so
+/// dispatched jobs run against real sources. Without this, only the
+/// scheduler's queued rows were recovered — nothing re-advanced the chain,
+/// and reconciliation graded the run from its surviving rows alone.
+///
+/// Skipped runs and why:
+/// - terminal runs: nothing to resume;
+/// - missing or unreadable pipeline definition: a legacy row whose grading
+///   reconciliation already owns;
+/// - no durable job rows: the trigger never planned (pre-planning run, or
+///   planning failed and the run was failed) — the enqueue horizon in
+///   reconciliation decides;
+/// - all rows terminal: reconciliation grades the run, which also catches
+///   the incomplete-chain shortfall a rebuilt engine would wrongly
+///   finalize as success.
+async fn rebuild_live_engines(
+    pool: &gitforge_db::Pool,
+    scheduler: &Scheduler,
+    pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
+    run_workspace_paths: &Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
+) -> usize {
+    let runs = match gitforge_db::queries::PipelineRunQueries::list(pool).await {
+        Ok(runs) => runs,
+        Err(error) => {
+            tracing::warn!(%error, "engine rebuild skipped: run list unreadable");
+            return 0;
+        }
+    };
+
+    let mut rebuilt = 0;
+    for run in runs {
+        if matches!(
+            run.status.as_str(),
+            "succeeded" | "failed" | "cancelled" | "timed_out" | "timeout" | "timed-out"
+        ) {
+            continue;
+        }
+        let pipeline = match gitforge_db::queries::PipelineQueries::get(pool, run.pipeline_id).await
+        {
+            Ok(Some(pipeline)) => pipeline,
+            Ok(None) | Err(_) => {
+                tracing::warn!(
+                    run = %run.id,
+                    "engine rebuild skipped: pipeline definition row unavailable"
+                );
+                continue;
+            }
+        };
+        let definition: PipelineDefinition = match serde_json::from_value(pipeline.config) {
+            Ok(definition) => definition,
+            Err(error) => {
+                tracing::warn!(
+                    run = %run.id,
+                    %error,
+                    "engine rebuild skipped: pipeline config unreadable"
+                );
+                continue;
+            }
+        };
+        let rows = match gitforge_db::queries::JobQueries::list_by_run(pool, run.id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(run = %run.id, %error, "engine rebuild skipped: job list unreadable");
+                continue;
+            }
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let has_live_row = rows.iter().any(|job| {
+            gitforge_db::models::JobStatus::from_str(&job.status)
+                .is_some_and(|status| !status.is_terminal())
+        });
+        if !has_live_row {
+            continue;
+        }
+        let mut durable_rows = Vec::with_capacity(rows.len());
+        let mut graftable = true;
+        for job in rows {
+            match gitforge_db::models::JobStatus::from_str(&job.status) {
+                Some(status) => {
+                    durable_rows.push((job.id, job.name, status.to_common(), job.started_at))
+                }
+                None => {
+                    tracing::warn!(
+                        run = %run.id,
+                        job = %job.id,
+                        status = %job.status,
+                        "engine rebuild skipped: unknown durable job status"
+                    );
+                    graftable = false;
+                    break;
+                }
+            }
+        }
+        if !graftable {
+            continue;
+        }
+        let engine = match CiEngine::rebuild(
+            run.id,
+            run.pipeline_id,
+            run.repo_id,
+            definition,
+            &durable_rows,
+        )
+        .await
+        {
+            Ok(engine) => Arc::new(engine),
+            Err(error) => {
+                tracing::error!(run = %run.id, %error, "engine rebuild failed");
+                continue;
+            }
+        };
+        let workspace_path =
+            match prepare_run_workspace(pool, run.repo_id, run.id, &run.commit_hash).await {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    tracing::error!(
+                        run = %run.id,
+                        %error,
+                        "engine rebuild skipped: workspace could not be restored"
+                    );
+                    continue;
+                }
+            };
+        run_workspace_paths
+            .lock()
+            .expect("workspace cache lock poisoned")
+            .insert(run.id, workspace_path.clone());
+        pipeline_registry
+            .write()
+            .await
+            .insert(run.id, engine.clone());
+        // Re-drive the DAG. Rows the scheduler had already queued are
+        // re-enqueued (the upsert refreshes the durable row; the scheduler
+        // deduplicates its in-memory queue), and any stage whose
+        // predecessors all succeeded is released now.
+        if let Err(error) = engine.queue_ready_jobs().await {
+            tracing::warn!(run = %run.id, %error, "post-rebuild stage release failed");
+        }
+        enqueue_ready_jobs(scheduler, &engine, run.id, run.repo_id, workspace_path).await;
+        tracing::info!(run = %run.id, "rebuilt live engine for interrupted run");
+        rebuilt += 1;
+    }
+    rebuilt
 }
 
 /// Create a trigger event from push payload (extracted for testability)
@@ -2476,6 +2683,200 @@ mod tests {
             "non-run-owned directory must be kept"
         );
         assert!(tokio::fs::try_exists(&file).await.unwrap());
+    }
+
+    // The F21 scenario end to end: a trigger plans every stage durably, the
+    // control plane dies mid-chain, and on restart `rebuild_live_engines`
+    // reconstructs an engine that resumes the chain from the surviving rows
+    // instead of leaving the tail unenqueued.
+    #[tokio::test]
+    async fn test_durable_planning_survives_restart_and_advances_chain() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-planning-tests")
+            .join(gitforge_common::PipelineRunId::new().to_string());
+        let source = test_root.join("source.git");
+        let seed = test_root.join("seed");
+        tokio::fs::create_dir_all(&test_root).await.unwrap();
+        run_git(["init", "--bare", source.to_str().unwrap()], None).await;
+        tokio::fs::create_dir_all(&seed).await.unwrap();
+        run_git(["init", seed.to_str().unwrap()], None).await;
+        run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
+        run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
+        tokio::fs::write(seed.join("marker.txt"), "planned\n")
+            .await
+            .unwrap();
+        run_git(["add", "marker.txt"], Some(&seed)).await;
+        run_git(["commit", "-m", "planning fixture"], Some(&seed)).await;
+        let commit = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
+        run_git(
+            ["push", source.to_str().unwrap(), "HEAD:refs/heads/main"],
+            Some(&seed),
+        )
+        .await;
+
+        let workspace_root = test_root.join("workspaces");
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", &workspace_root);
+        let (pool, repo_id) =
+            test_pool_with_repository(source.to_string_lossy().into_owned()).await;
+
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let chained = |name: &str, needs: &[&str]| JobDefinition {
+            name: name.to_string(),
+            image: "rust:latest".to_string(),
+            needs: needs.iter().map(ToString::to_string).collect(),
+            env: HashMap::new(),
+            steps: vec![StepDefinition {
+                name: format!("{name}-step"),
+                run: "true".to_string(),
+                env: None,
+                working_directory: None,
+                condition: None,
+            }],
+            timeout: None,
+            retry: None,
+        };
+        let definition = PipelineDefinition {
+            name: "planning-test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![
+                chained("a", &[]),
+                chained("b", &["a"]),
+                chained("c", &["b"]),
+            ],
+        };
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: definition.name.clone(),
+                trigger_type: "push".to_string(),
+                config: serde_json::to_value(&definition).unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline_id,
+            repo_id,
+            "push".to_string(),
+            commit.clone(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+        gitforge_db::queries::PipelineRunQueries::update_status(&pool, run.id, "running")
+            .await
+            .unwrap();
+
+        // Trigger-time planning: every stage becomes a durable `pending` row
+        // carrying its full execution definition.
+        let event =
+            PipelineTriggerEvent::new(pipeline_id, repo_id, commit.clone(), TriggerType::Push);
+        let engine = CiEngine::new_with_run_id(event, definition.clone(), run.id)
+            .await
+            .unwrap();
+        let planned: HashMap<String, gitforge_common::JobId> = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(id, name)| (name, id))
+            .collect();
+        persist_planned_jobs(&pool, &engine, run.id, None)
+            .await
+            .unwrap();
+
+        let row = gitforge_db::queries::JobQueries::get(&pool, planned["c"])
+            .await
+            .unwrap()
+            .expect("planned row for stage c");
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.commands, vec!["true".to_string()]);
+        assert_eq!(row.image, "rust:latest");
+
+        // The crash: stage a finished and stage b was dispatched before the
+        // process died; stage c was never enqueued.
+        gitforge_db::queries::JobQueries::update_status(&pool, planned["a"], "succeeded")
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::update_status(&pool, planned["b"], "queued")
+            .await
+            .unwrap();
+
+        // Restart recovery: a fresh scheduler and registry, like a rebooted
+        // control plane.
+        let scheduler = Arc::new(Scheduler::with_db(pool.clone()));
+        let registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let run_workspaces: Arc<
+            std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let rebuilt = rebuild_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        assert_eq!(rebuilt, 1, "the interrupted run gets an engine back");
+
+        let engine = registry
+            .read()
+            .await
+            .get(&run.id)
+            .cloned()
+            .expect("rebuilt engine");
+        let state = engine.state().await;
+        assert_eq!(
+            state.jobs[&planned["a"]].status(),
+            gitforge_common::JobStatus::Succeeded
+        );
+        assert_eq!(
+            state.jobs[&planned["b"]].status(),
+            gitforge_common::JobStatus::Queued
+        );
+        assert_eq!(
+            state.jobs[&planned["c"]].status(),
+            gitforge_common::JobStatus::Pending
+        );
+
+        // The workspace checkout is restored so dispatched jobs run against
+        // real sources.
+        let workspace_path = run_workspaces
+            .lock()
+            .unwrap()
+            .get(&run.id)
+            .cloned()
+            .flatten()
+            .expect("restored workspace path");
+        assert!(tokio::fs::try_exists(&workspace_path).await.unwrap());
+
+        // Only the dispatched stage is dispatchable: the planned tail stays
+        // parked at `pending`, invisible to scheduler recovery.
+        let queue = scheduler.queue_status().await.unwrap();
+        assert_eq!(queue.in_memory_queued, 1);
+        assert_eq!(queue.durable_pending, Some(1));
+
+        // The completion consumer's advance path: stage b finishes, stage c
+        // is released and durably flipped to dispatchable.
+        let runner_id = gitforge_common::RunnerId::new();
+        engine.assign_job(planned["b"], runner_id).await.unwrap();
+        engine.start_job(planned["b"]).await.unwrap();
+        engine.succeed_job(planned["b"], 0).await.unwrap();
+        engine.queue_ready_jobs().await.unwrap();
+        enqueue_ready_jobs(&scheduler, &engine, run.id, repo_id, Some(workspace_path)).await;
+
+        let row = gitforge_db::queries::JobQueries::get(&pool, planned["c"])
+            .await
+            .unwrap()
+            .expect("planned row for stage c");
+        assert_eq!(row.status, "queued", "released stage becomes dispatchable");
+        let queue = scheduler.queue_status().await.unwrap();
+        assert_eq!(queue.in_memory_queued, 2);
+        assert_eq!(queue.durable_pending, Some(2));
+
+        tokio::fs::remove_dir_all(&test_root).await.unwrap();
     }
 
     async fn seed_job(

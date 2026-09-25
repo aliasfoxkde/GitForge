@@ -1417,7 +1417,7 @@ impl RunnerAgent {
             })
             .collect();
 
-        let complete_request = serde_json::json!({
+        let mut complete_request = serde_json::json!({
             "contract_version": "harness.job.v1",
             "runner_id": runner_id.to_string(),
             "lease_token": lease_token,
@@ -1427,6 +1427,13 @@ impl RunnerAgent {
             "step_results": step_results_json,
             "artifacts": uploaded_artifacts,
         });
+        // The backend, not the commit, failed this job: say so explicitly
+        // so the durable row lands as infrastructure_failure (R6.3), not as
+        // a code failure. Omitted for ordinary outcomes; the scheduler's
+        // default mapping keeps the wire contract backward compatible.
+        if result.infrastructure_failure {
+            complete_request["outcome"] = serde_json::json!("infrastructure_failure");
+        }
 
         let mut complete_request_builder = client.post(&complete_url).json(&complete_request);
         if let Some(token) = scheduler_token {

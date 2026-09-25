@@ -404,12 +404,14 @@ impl Scheduler {
         if let Some(pool) = &self.db_pool {
             let mut db_job = DbJob::new(pipeline_run_id, format!("job-{job_id}"));
             db_job.id = job_id;
-            // The persist is an ensure, not a create: the CI service may
-            // have written the row already (tests rely on this, and a
-            // scheduler restart re-enqueues from durable state). A row that
-            // exists with this id IS the durable state we want — only
-            // insert when it is genuinely missing, so a duplicate never
-            // burns the retry budget or fails the enqueue.
+            // The persist is an ensure, not a create: durable DAG planning
+            // writes every planned job as a `pending` row at trigger time,
+            // so enqueue flips that existing row to `queued` instead of
+            // inserting a duplicate (tests rely on this, and a scheduler
+            // restart re-enqueues from durable state). A row that exists
+            // with this id IS the durable state we want — only insert when
+            // it is genuinely missing, so a duplicate never burns the retry
+            // budget or fails the enqueue.
             if gitforge_db::queries::JobQueries::get(pool, job_id)
                 .await?
                 .is_none()
@@ -589,10 +591,12 @@ impl Scheduler {
             .any(|job| JobStatus::from_str(&job.status) == Some(JobStatus::Cancelled))
         {
             "cancelled"
-        } else if jobs
-            .iter()
-            .any(|job| JobStatus::from_str(&job.status) == Some(JobStatus::Failed))
-        {
+        } else if jobs.iter().any(|job| {
+            matches!(
+                JobStatus::from_str(&job.status),
+                Some(JobStatus::Failed) | Some(JobStatus::InfrastructureFailure)
+            )
+        }) {
             "failed"
         } else {
             "succeeded"
@@ -1131,7 +1135,7 @@ impl Scheduler {
             None => return Ok(0),
         };
 
-        let pending_jobs = gitforge_db::queries::JobQueries::list_pending(pool).await?;
+        let pending_jobs = gitforge_db::queries::JobQueries::list_dispatchable(pool).await?;
         let pending_rows = pending_jobs.len();
         let mut state = self.state.write().await;
 
@@ -1214,37 +1218,136 @@ impl Scheduler {
         state.queue.len()
     }
 
-    /// Return durable and in-memory queue counters for operator telemetry.
+    /// Return durable and in-memory queue counters plus the dispatch
+    /// observability report for operator telemetry (R6.4): what is queued,
+    /// since when, why next, and who is running — without DB access.
     pub async fn queue_status(&self) -> anyhow::Result<QueueStatus> {
+        const QUEUE_REPORT_LIMIT: usize = 64;
+        const LATENCY_SAMPLE_LIMIT: i64 = 20;
+
         let now = chrono::Utc::now();
-        let (in_memory_queued, assigned_jobs, online_runners) = {
+        let (fair_order, running_by_repo, in_memory_queued, assigned_jobs, online_runners) = {
             let state = self.state.read().await;
+            // The same per-repo load arithmetic admission uses, so the
+            // report's "why next" reproduces what the scheduler will
+            // actually dispatch.
+            let mut running_by_repo: HashMap<RepoId, usize> = HashMap::new();
+            for (_, _, running_repo) in state.assigned_jobs.values() {
+                *running_by_repo.entry(*running_repo).or_default() += 1;
+            }
+            let fair_order = state.queue.fair_order(&running_by_repo);
+            let online_runners = state
+                .runners
+                .values()
+                .filter(|runner| {
+                    runner.effective_status(now, RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS) == "online"
+                })
+                .count();
             (
+                fair_order,
+                running_by_repo,
                 state.queue.len(),
                 state.assigned_jobs.len(),
-                state
-                    .runners
-                    .values()
-                    .filter(|runner| {
-                        runner.effective_status(now, RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS)
-                            == "online"
-                    })
-                    .count(),
+                online_runners,
             )
         };
-        let durable_pending = match &self.db_pool {
-            Some(pool) => Some(
-                gitforge_db::queries::JobQueries::list_pending(pool)
-                    .await?
-                    .len(),
-            ),
-            None => None,
+
+        // Durable reads: the queued rows (for names and the recovery-
+        // divergence count) and the recent queued→started latency sample.
+        // Per-repo running load is NOT read from the database: the report
+        // quotes the same in-memory map admission dispatches with, so the
+        // "why next" answer can never disagree with what actually runs.
+        let (durable_queued, recent_dispatch) = match &self.db_pool {
+            Some(pool) => {
+                let durable_queued =
+                    gitforge_db::queries::JobQueries::list_dispatchable(pool).await?;
+                (
+                    durable_queued,
+                    gitforge_db::queries::JobQueries::recent_dispatch_latencies(
+                        pool,
+                        LATENCY_SAMPLE_LIMIT,
+                    )
+                    .await?,
+                )
+            }
+            None => (Vec::new(), Vec::new()),
         };
+        // An in-memory scheduler has no durable state to count: `None`
+        // serializes as null, honestly distinguishing "no durable store"
+        // from "a durable store reports zero pending".
+        let durable_pending = self.db_pool.as_ref().map(|_| durable_queued.len());
+
+        // Names for the in-memory view come from the durable rows; a job
+        // not yet persisted still reports with its scheduler-side fallback.
+        let names: HashMap<JobId, String> = durable_queued
+            .iter()
+            .map(|job| (job.id, job.name.clone()))
+            .collect();
+
+        let queued_total = fair_order.len();
+        let queued: Vec<QueuedJobReport> = fair_order
+            .iter()
+            .take(QUEUE_REPORT_LIMIT)
+            .map(|job| QueuedJobReport {
+                name: names
+                    .get(&job.job_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("job-{}", job.job_id)),
+                job_id: job.job_id,
+                pipeline_run_id: job.pipeline_run_id,
+                repo_id: job.repo_id,
+                priority: format!("{:?}", job.priority),
+                waited_secs: now
+                    .timestamp_millis()
+                    .saturating_sub(job.queued_at)
+                    .clamp(0, i64::MAX) as u64
+                    / 1000,
+            })
+            .collect();
+
+        // Recovery divergence: durable `queued` rows the live scheduler has
+        // not mirrored. Nonzero means a restart handoff is pending — the
+        // exact state that used to read as silent starvation.
+        let in_memory_ids: HashSet<JobId> = fair_order.iter().map(|job| job.job_id).collect();
+        let durable_queued_not_in_memory = durable_queued
+            .iter()
+            .filter(|job| !in_memory_ids.contains(&job.id))
+            .count();
+
+        let next_up = queued.first().cloned();
+        let next_up_reason = next_up.as_ref().map(|head| {
+            let load = running_by_repo.get(&head.repo_id).copied().unwrap_or(0);
+            format!(
+                "priority {} dispatches first; repo {} carries {} running job(s) under bounded fairness; {} queued job(s) behind it; FIFO age {}s",
+                head.priority,
+                head.repo_id,
+                load,
+                queued_total.saturating_sub(1),
+                head.waited_secs
+            )
+        });
+
         Ok(QueueStatus {
             durable_pending,
             in_memory_queued,
             assigned_jobs,
             online_runners,
+            queued,
+            queued_total,
+            durable_queued_not_in_memory,
+            next_up,
+            next_up_reason,
+            per_repo_running: running_by_repo
+                .into_iter()
+                .map(|(repo_id, running)| RepoLoadReport { repo_id, running })
+                .collect(),
+            recent_dispatch: recent_dispatch
+                .into_iter()
+                .map(|(job_id, latency_secs)| DispatchLatencyReport {
+                    job_id,
+                    latency_secs,
+                })
+                .collect(),
         })
     }
 
@@ -1448,7 +1551,7 @@ impl Scheduler {
         job_id: JobId,
         runner_id: RunnerId,
         lease_token: &str,
-        success: bool,
+        outcome: JobOutcome,
         result_json: String,
     ) -> anyhow::Result<()> {
         {
@@ -1464,7 +1567,6 @@ impl Scheduler {
             }
         }
         if let Some(pool) = &self.db_pool {
-            let status = if success { "succeeded" } else { "failed" };
             // Same F23 discipline as the lease start: the completion write is
             // the durable record of the job's outcome. Losing it to a
             // transient lock left job 21497438 finished-on-runner but
@@ -1476,7 +1578,7 @@ impl Scheduler {
                     job_id,
                     runner_id,
                     lease_token,
-                    status,
+                    outcome.as_str(),
                     &result_json,
                     "github",
                     "job_receipt",
@@ -1493,7 +1595,7 @@ impl Scheduler {
                 anyhow::bail!("durable job lease is no longer active");
             }
         }
-        self.complete_job(job_id, success, result_json).await
+        self.complete_job(job_id, outcome, result_json).await
     }
 
     /// Append runner output to the durable log ledger under the active lease.
@@ -1550,18 +1652,22 @@ impl Scheduler {
     pub async fn complete_job(
         &self,
         job_id: JobId,
-        success: bool,
+        outcome: JobOutcome,
         result_json: String,
     ) -> anyhow::Result<()> {
-        let status = if success { "succeeded" } else { "failed" };
         let assignment = {
             let state = self.state.read().await;
             state.assigned_jobs.get(&job_id).copied()
         };
         if let Some(pool) = &self.db_pool {
-            gitforge_db::queries::JobQueries::complete(pool, job_id, status, &result_json)
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            gitforge_db::queries::JobQueries::complete(
+                pool,
+                job_id,
+                outcome.as_str(),
+                &result_json,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
         let mut state = self.state.write().await;
         if let Some(existing) = state.completed_receipts.get(&job_id) {
@@ -1579,11 +1685,84 @@ impl Scheduler {
                 job_id,
                 pipeline_run_id,
                 runner_id,
-                success,
+                success: outcome.success(),
             });
         }
         Ok(())
     }
+}
+
+/// The terminal outcome a runner reports for a job (R6.3).
+///
+/// `success: bool` alone could not separate "the commit is broken" from
+/// "the container backend is broken" (F40/F45), so the wire carries an
+/// explicit outcome and the durable row records it verbatim. The
+/// completion event keeps its boolean shape: run grading only needs
+/// success/failure, while the infrastructure classification lives in the
+/// durable job row where operators alert on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
+    InfrastructureFailure,
+}
+
+impl JobOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobOutcome::Succeeded => "succeeded",
+            JobOutcome::Failed => "failed",
+            JobOutcome::TimedOut => "timed_out",
+            JobOutcome::InfrastructureFailure => "infrastructure_failure",
+        }
+    }
+
+    /// Whether the job's execution itself succeeded (only a clean pass
+    /// counts).
+    pub fn success(&self) -> bool {
+        matches!(self, JobOutcome::Succeeded)
+    }
+
+    /// Map a completion request onto an outcome. The explicit `outcome`
+    /// field wins when it is a known status; otherwise the historical
+    /// boolean mapping applies, keeping older runners wire-compatible.
+    pub fn from_request(success: bool, outcome: Option<&str>) -> Self {
+        match outcome {
+            Some("succeeded") => JobOutcome::Succeeded,
+            Some("failed") => JobOutcome::Failed,
+            Some("timed_out") => JobOutcome::TimedOut,
+            Some("infrastructure_failure") => JobOutcome::InfrastructureFailure,
+            _ if success => JobOutcome::Succeeded,
+            _ => JobOutcome::Failed,
+        }
+    }
+}
+
+/// One queued job in the dispatch report (R6.4): what is queued and since
+/// when, in the order fair dispatch would run it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedJobReport {
+    pub job_id: JobId,
+    pub pipeline_run_id: PipelineRunId,
+    pub repo_id: RepoId,
+    pub name: String,
+    pub priority: String,
+    pub waited_secs: u64,
+}
+
+/// Per-repository in-flight load — the bounded-fairness arithmetic itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoLoadReport {
+    pub repo_id: RepoId,
+    pub running: usize,
+}
+
+/// One job's queued→started latency, newest starts first (bounded sample).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchLatencyReport {
+    pub job_id: JobId,
+    pub latency_secs: i64,
 }
 
 /// Read-only queue admission telemetry exposed by the scheduler API.
@@ -1593,6 +1772,22 @@ pub struct QueueStatus {
     pub in_memory_queued: usize,
     pub assigned_jobs: usize,
     pub online_runners: usize,
+    /// Queued jobs in fair-dispatch order, head first (bounded).
+    pub queued: Vec<QueuedJobReport>,
+    /// Total queued jobs, including any beyond the bounded report.
+    pub queued_total: usize,
+    /// Durable `queued` rows the live scheduler has not mirrored — nonzero
+    /// means a restart handoff is pending, the state that used to read as
+    /// silent starvation.
+    pub durable_queued_not_in_memory: usize,
+    /// The job the next admission tick dispatches first, and the fair-order
+    /// arithmetic that selected it.
+    pub next_up: Option<QueuedJobReport>,
+    pub next_up_reason: Option<String>,
+    /// In-flight jobs per repository.
+    pub per_repo_running: Vec<RepoLoadReport>,
+    /// Recent queued→started latencies, newest first (bounded sample).
+    pub recent_dispatch: Vec<DispatchLatencyReport>,
 }
 
 impl Default for Scheduler {
@@ -2660,7 +2855,7 @@ mod tests {
                 first_job,
                 runner_id,
                 &first_lease,
-                true,
+                JobOutcome::Succeeded,
                 "{\"success\":true}".to_string(),
             )
             .await
@@ -2846,7 +3041,7 @@ mod tests {
                 job_id,
                 RunnerId::new(),
                 &lease,
-                true,
+                JobOutcome::Succeeded,
                 "{\"success\":true}".to_string(),
             )
             .await
@@ -2856,7 +3051,7 @@ mod tests {
                 job_id,
                 runner_id,
                 &lease,
-                true,
+                JobOutcome::Succeeded,
                 "{\"success\":true}".to_string(),
             )
             .await
@@ -2930,7 +3125,7 @@ mod tests {
                 job_id,
                 runner_id,
                 &lease,
-                true,
+                JobOutcome::Succeeded,
                 "{\"durable\":true}".to_string(),
             )
             .await
@@ -3015,6 +3210,130 @@ mod tests {
         assert!(finalized.finished_at.is_some());
     }
 
+    #[test]
+    fn test_job_outcome_from_request_prefers_explicit_classification() {
+        // The boolean mapping stays the default for older runners.
+        assert_eq!(JobOutcome::from_request(true, None), JobOutcome::Succeeded);
+        assert_eq!(JobOutcome::from_request(false, None), JobOutcome::Failed);
+        // An explicit outcome wins over the boolean, which is what lets the
+        // runner say "the backend failed, not the commit" (R6.3).
+        assert_eq!(
+            JobOutcome::from_request(false, Some("infrastructure_failure")),
+            JobOutcome::InfrastructureFailure
+        );
+        assert_eq!(
+            JobOutcome::from_request(true, Some("infrastructure_failure")),
+            JobOutcome::InfrastructureFailure
+        );
+        // Unknown classifications must not be trusted with the durable row.
+        assert_eq!(
+            JobOutcome::from_request(false, Some("actually-fine")),
+            JobOutcome::Failed
+        );
+        assert_eq!(
+            JobOutcome::from_request(false, Some("timed_out")),
+            JobOutcome::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn test_infrastructure_failure_rows_grade_the_run_failed() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "infra-owner".to_string(),
+            "infra-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            "infra-repo".to_string(),
+            user.id,
+            "/git/infra-repo".to_string(),
+        );
+        gitforge_db::queries::RepoQueries::create(&pool, &repo)
+            .await
+            .unwrap();
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: "infra-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "infra-owner".to_string(),
+            "infra-commit".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+
+        // One clean pass, one backend failure: the run must grade failed,
+        // and the failing row must keep its infrastructure classification
+        // so operators alert on it instead of debugging a green-looking
+        // diff.
+        let build = gitforge_db::models::Job::new(run.id, "build".to_string());
+        let test = gitforge_db::models::Job::new(run.id, "test".to_string());
+        gitforge_db::queries::JobQueries::create(&pool, &build)
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::create(&pool, &test)
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::complete(&pool, build.id, "succeeded", "{}")
+            .await
+            .unwrap();
+        let receipt = serde_json::json!({
+            "job_id": test.id.to_string(),
+            "success": false,
+            "error": "container backend preflight failed: preflight exec error: \
+                      OCI runtime exec failed: no space left on device; \
+                      backend probe: ping ok; scratch free 0.3 GiB (floor 2.0 GiB)",
+        })
+        .to_string();
+        gitforge_db::queries::JobQueries::complete(
+            &pool,
+            test.id,
+            JobOutcome::InfrastructureFailure.as_str(),
+            &receipt,
+        )
+        .await
+        .unwrap();
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        scheduler
+            .finalize_pipeline_if_terminal(&pool, run.id)
+            .await
+            .unwrap();
+
+        let graded = gitforge_db::queries::PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(graded.status, "failed");
+
+        let stored = gitforge_db::queries::JobQueries::get(&pool, test.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "infrastructure_failure");
+        let parsed = JobStatus::from_str(&stored.status).unwrap();
+        assert!(parsed.is_terminal());
+        assert_eq!(
+            parsed.to_common(),
+            gitforge_common::JobStatus::InfrastructureFailure
+        );
+    }
+
     // --- persist_with_retry (F21/F23) ----------------------------------
 
     #[tokio::test(start_paused = true)]
@@ -3074,5 +3393,92 @@ mod tests {
         .expect("Ok verdict must pass through");
         assert!(!accepted);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_queue_status_reports_dispatch_observability() {
+        let scheduler = Scheduler::new();
+        let busy_repo = RepoId::new(); // will carry a running job
+        let idle_repo = RepoId::new(); // stays unloaded
+        scheduler
+            .register_runner(make_runner(RunnerId::new(), "obs-runner", "online", 2))
+            .await;
+
+        // Two normal-priority jobs on different repos, one high-priority
+        // job on the busy repo. Capacity is 2, so dispatch assigns the
+        // high job and the idle repo's normal job, leaving one normal job
+        // on the busy repo queued.
+        let queued_normal = JobId::new();
+        let idle_normal = JobId::new();
+        let high = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                queued_normal,
+                PipelineRunId::new(),
+                busy_repo,
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        scheduler
+            .enqueue_with_definition(
+                idle_normal,
+                PipelineRunId::new(),
+                idle_repo,
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        scheduler
+            .enqueue_with_definition(high, PipelineRunId::new(), busy_repo, Vec::new(), None)
+            .await
+            .unwrap();
+        // The priority API re-enqueues over the same job id, raising it
+        // above the normal-priority pair.
+        scheduler
+            .enqueue_with_priority(high, PipelineRunId::new(), busy_repo, Priority::High)
+            .await;
+
+        scheduler.process_queue().await;
+
+        let status = scheduler.queue_status().await.unwrap();
+
+        // In-memory scheduler: no durable store is configured, so the
+        // pending count is None (null on the wire — "nothing consulted"),
+        // and the divergence count is honestly zero.
+        assert_eq!(status.durable_pending, None);
+        assert_eq!(status.durable_queued_not_in_memory, 0);
+        assert_eq!(status.in_memory_queued, 1);
+        assert_eq!(status.assigned_jobs, 2);
+
+        // The in-flight load IS the fairness arithmetic: both repos carry
+        // one running job.
+        let loads: Vec<(String, usize)> = status
+            .per_repo_running
+            .iter()
+            .map(|load| (load.repo_id.0.to_string(), load.running))
+            .collect();
+        assert_eq!(loads.len(), 2);
+        assert!(loads.iter().all(|(_, running)| *running == 1));
+
+        // The queued report names the one survivor, headed by the job
+        // dispatch would pick next, with a reason quoting that arithmetic.
+        assert_eq!(status.queued.len(), 1);
+        assert_eq!(status.queued[0].job_id, queued_normal);
+        assert_eq!(status.queued[0].repo_id, busy_repo);
+        assert_eq!(status.queued[0].priority, "Normal");
+        let next_up = status.next_up.expect("a queued job must have a next up");
+        assert_eq!(next_up.job_id, queued_normal);
+        let reason = status
+            .next_up_reason
+            .as_deref()
+            .expect("next up must carry a reason");
+        assert!(reason.contains("priority Normal"), "reason: {reason}");
+        assert!(reason.contains("1 running job(s)"), "reason: {reason}");
+
+        // Waited time is measured from enqueue and cannot be negative.
+        assert!(status.queued[0].waited_secs <= 5, "freshly enqueued");
     }
 }

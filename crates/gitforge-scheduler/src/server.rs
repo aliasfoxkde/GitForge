@@ -1,5 +1,6 @@
 //! Scheduler HTTP server
 
+use crate::assigner::JobOutcome;
 use crate::Scheduler;
 use axum::{
     body::Bytes,
@@ -529,17 +530,46 @@ async fn get_pending_jobs(
     Json(serde_json::json!(job_infos))
 }
 
-/// Return durable and in-memory queue counters for admission and operations.
+/// Return durable and in-memory queue counters plus the dispatch
+/// observability report (R6.4): what is queued, since when, why next, and
+/// who is running — without DB access.
 async fn get_queue_status(State(state): State<SchedulerServerState>) -> impl IntoResponse {
     match state.scheduler.queue_status().await {
         Ok(status) => (
             StatusCode::OK,
             Json(serde_json::json!({
-                "contract_version": "scheduler.queue.v1",
+                "contract_version": "scheduler.queue.v2",
                 "durable_pending": status.durable_pending,
                 "in_memory_queued": status.in_memory_queued,
                 "assigned_jobs": status.assigned_jobs,
                 "online_runners": status.online_runners,
+                "queued": status.queued.iter().map(|job| serde_json::json!({
+                    "job_id": job.job_id,
+                    "pipeline_run_id": job.pipeline_run_id,
+                    "repo_id": job.repo_id,
+                    "name": job.name,
+                    "priority": job.priority,
+                    "waited_secs": job.waited_secs,
+                })).collect::<Vec<_>>(),
+                "queued_total": status.queued_total,
+                "durable_queued_not_in_memory": status.durable_queued_not_in_memory,
+                "next_up": status.next_up.as_ref().map(|head| serde_json::json!({
+                    "job_id": head.job_id,
+                    "pipeline_run_id": head.pipeline_run_id,
+                    "repo_id": head.repo_id,
+                    "name": head.name,
+                    "priority": head.priority,
+                    "waited_secs": head.waited_secs,
+                })),
+                "next_up_reason": status.next_up_reason,
+                "per_repo_running": status.per_repo_running.iter().map(|load| serde_json::json!({
+                    "repo_id": load.repo_id,
+                    "running": load.running,
+                })).collect::<Vec<_>>(),
+                "recent_dispatch": status.recent_dispatch.iter().map(|sample| serde_json::json!({
+                    "job_id": sample.job_id,
+                    "latency_secs": sample.latency_secs,
+                })).collect::<Vec<_>>(),
             })),
         ),
         Err(error) => {
@@ -894,11 +924,14 @@ async fn complete_job(
     }
 
     let assigned_runner = state.scheduler.is_assigned(job_id).await;
+    // An explicit, known `outcome` classifies the terminal row; anything
+    // else keeps the historical boolean mapping (older runners).
+    let outcome = JobOutcome::from_request(success, request["outcome"].as_str());
     let completion = match (runner_id, lease_token, assigned_runner) {
         (Some(runner_id), Some(lease_token), Some(_)) => {
             state
                 .scheduler
-                .complete_job_with_lease(job_id, runner_id, lease_token, success, receipt)
+                .complete_job_with_lease(job_id, runner_id, lease_token, outcome, receipt)
                 .await
         }
         // Credentialed completions for an unassigned job are the signature of
@@ -1052,18 +1085,42 @@ mod tests {
             .await
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["contract_version"], "scheduler.queue.v1");
+        assert_eq!(payload["contract_version"], "scheduler.queue.v2");
         assert_eq!(payload["durable_pending"], serde_json::Value::Null);
         assert_eq!(payload["in_memory_queued"], 0);
         assert_eq!(payload["assigned_jobs"], 0);
         assert_eq!(payload["online_runners"], 0);
+        // The dispatch report is present and honestly empty in a fresh
+        // in-memory scheduler: nothing queued, nothing next, no divergence.
+        assert_eq!(payload["queued"], serde_json::json!([]));
+        assert_eq!(payload["queued_total"], 0);
+        assert_eq!(payload["next_up"], serde_json::Value::Null);
+        assert_eq!(payload["next_up_reason"], serde_json::Value::Null);
+        assert_eq!(payload["durable_queued_not_in_memory"], 0);
+        assert_eq!(payload["per_repo_running"], serde_json::json!([]));
+        assert_eq!(payload["recent_dispatch"], serde_json::json!([]));
     }
 
     #[tokio::test]
     async fn test_get_queue_status_handler_reports_durable_pending_rows() {
         let pool = gitforge_db::Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
-        let _ = seed_restart_scenario(&pool, "queue-status").await;
+        let (queued_job, planned_job) = seed_restart_scenario(&pool, "queue-status").await;
+        // durable_pending counts dispatchable rows only: the queued row is
+        // waiting for a runner, while the still-planned row (durable DAG
+        // planning parks unreleased stages at `pending`) must not read as
+        // queue depth.
+        gitforge_db::queries::JobQueries::update_status(&pool, queued_job, "queued")
+            .await
+            .unwrap();
+        assert_eq!(
+            gitforge_db::queries::JobQueries::get(&pool, planned_job)
+                .await
+                .unwrap()
+                .expect("planned row")
+                .status,
+            "pending"
+        );
         let state = create_state(crate::Scheduler::with_db(pool));
         let response = get_queue_status(axum::extract::State(state)).await;
         let response = response.into_response();
@@ -1072,8 +1129,15 @@ mod tests {
             .await
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["durable_pending"], 2);
+        assert_eq!(payload["durable_pending"], 1);
         assert_eq!(payload["in_memory_queued"], 0);
+        // The durable row is not mirrored in this scheduler's queue (fresh
+        // instance, recovery not run), so the report must say so: this is
+        // the divergence signature that used to read as silent starvation
+        // and is now visible without DB access (R6.4).
+        assert_eq!(payload["durable_queued_not_in_memory"], 1);
+        assert_eq!(payload["queued"], serde_json::json!([]));
+        assert_eq!(payload["next_up"], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -1516,6 +1580,97 @@ mod tests {
         .await;
         assert_status(response.into_response(), StatusCode::OK);
         assert_eq!(state.scheduler.is_assigned(job_id).await, None);
+    }
+
+    /// R6.3: an explicit `outcome` on the completion request lands the
+    /// durable row as infrastructure_failure instead of failed, while the
+    /// response stays a normal 200 for the runner.
+    #[tokio::test]
+    async fn test_complete_job_with_infrastructure_outcome_classifies_durable_row() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        // The durable job row carries FKs, so seed user → repo → pipeline →
+        // run before enqueueing; otherwise the upsert fails and the
+        // scheduler fences the assignment as already-won.
+        let user = gitforge_db::models::User::new(
+            "infra-owner".to_string(),
+            "infra-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo = gitforge_db::models::Repository::new(
+            "infra-repo".to_string(),
+            user.id,
+            "/git/infra-repo".to_string(),
+        );
+        gitforge_db::queries::RepoQueries::create(&pool, &repo)
+            .await
+            .unwrap();
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: repo.id,
+            name: "infra-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "infra-owner".to_string(),
+            "infra-commit".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+
+        let scheduler = crate::Scheduler::with_db(pool.clone());
+        let runner = Runner::new("infra-runner".to_string(), RunnerType::Docker, 1);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(job_id, run.id, repo.id, vec!["/bin/true".to_string()], None)
+            .await
+            .expect("enqueue must persist against the seeded run");
+        scheduler.process_queue().await;
+        let lease = scheduler
+            .ensure_job_lease(job_id)
+            .await
+            .expect("assigned job must have a lease");
+        let state = create_state(scheduler);
+
+        let response = complete_job(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(serde_json::json!({
+                "runner_id": runner_id.to_string(),
+                "lease_token": lease,
+                "success": false,
+                "outcome": "infrastructure_failure",
+                "error": "container backend preflight failed: preflight exec error: \
+                          daemon unavailable; backend probe: ping did not answer within 10s",
+            })),
+        )
+        .await;
+        assert_status(response.into_response(), StatusCode::OK);
+        assert_eq!(state.scheduler.is_assigned(job_id).await, None);
+
+        let stored = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "infrastructure_failure");
+        assert!(stored
+            .result_json
+            .as_deref()
+            .unwrap_or_default()
+            .contains("ping did not answer within 10s"));
     }
 
     #[tokio::test]

@@ -15,6 +15,8 @@ pub enum JobStatus {
     Failed,
     Cancelled,
     TimedOut,
+    /// The container backend — not the commit — failed the job (R6.3).
+    InfrastructureFailure,
 }
 
 impl JobStatus {
@@ -28,6 +30,7 @@ impl JobStatus {
             JobStatus::Failed => "failed",
             JobStatus::Cancelled => "cancelled",
             JobStatus::TimedOut => "timed_out",
+            JobStatus::InfrastructureFailure => "infrastructure_failure",
         }
     }
 
@@ -42,6 +45,7 @@ impl JobStatus {
             "failed" => Some(JobStatus::Failed),
             "cancelled" => Some(JobStatus::Cancelled),
             "timed_out" => Some(JobStatus::TimedOut),
+            "infrastructure_failure" => Some(JobStatus::InfrastructureFailure),
             _ => None,
         }
     }
@@ -50,8 +54,32 @@ impl JobStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled | JobStatus::TimedOut
+            JobStatus::Succeeded
+                | JobStatus::Failed
+                | JobStatus::Cancelled
+                | JobStatus::TimedOut
+                | JobStatus::InfrastructureFailure
         )
+    }
+
+    /// Map the durable status onto the engine's copy of the enum.
+    ///
+    /// Restart recovery grafts durable rows onto a rebuilt CI engine, whose
+    /// state machines speak `gitforge_common::JobStatus`; the duplicate enum
+    /// exists because the persistence layer must stay serializable while the
+    /// common type drives transitions.
+    pub fn to_common(&self) -> gitforge_common::JobStatus {
+        match self {
+            JobStatus::Pending => gitforge_common::JobStatus::Pending,
+            JobStatus::Queued => gitforge_common::JobStatus::Queued,
+            JobStatus::Assigned => gitforge_common::JobStatus::Assigned,
+            JobStatus::Running => gitforge_common::JobStatus::Running,
+            JobStatus::Succeeded => gitforge_common::JobStatus::Succeeded,
+            JobStatus::Failed => gitforge_common::JobStatus::Failed,
+            JobStatus::Cancelled => gitforge_common::JobStatus::Cancelled,
+            JobStatus::TimedOut => gitforge_common::JobStatus::TimedOut,
+            JobStatus::InfrastructureFailure => gitforge_common::JobStatus::InfrastructureFailure,
+        }
     }
 }
 
