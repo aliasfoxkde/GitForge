@@ -634,6 +634,20 @@ impl PipelineQueries {
         Ok(count)
     }
 
+    /// Delete a pipeline row outright.
+    ///
+    /// Only safe for definitions with no runs: runs reference their
+    /// pipeline by id, so removing a run-bearing row would orphan that
+    /// history. Callers decide (see the API delete route).
+    pub async fn delete(pool: &Pool, id: PipelineId) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM pipelines WHERE id = ?")
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to delete pipeline: {e}")))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Get a pipeline by ID
     pub async fn get(pool: &Pool, id: PipelineId) -> Result<Option<crate::models::Pipeline>> {
         let row = sqlx::query("SELECT * FROM pipelines WHERE id = ?")

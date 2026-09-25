@@ -39,8 +39,13 @@ use tower_http::trace::TraceLayer;
 type PipelineCache = HashMap<gitforge_common::RepoId, PipelineDefinition>;
 type PipelineRegistry = HashMap<gitforge_common::PipelineRunId, Arc<CiEngine>>;
 
-/// Path of the pipeline definition inside a repository checkout.
-const PIPELINE_CONFIG_PATH: &str = ".gitforce.yml";
+/// Paths of the pipeline definition inside a repository checkout, in
+/// resolution order. `.gitforge.yml` is the product spelling; the
+/// pre-rename `.gitforce.yml` stays as a fallback so repositories
+/// committed before the rename keep building. When both exist the first
+/// entry wins, so a repository cannot have its pipeline meaning split
+/// across the two files.
+const PIPELINE_CONFIG_PATHS: [&str; 2] = [".gitforge.yml", ".gitforce.yml"];
 
 /// How often the job timeout watchdog sweeps the durable rows for jobs whose
 /// `started_at + timeout_secs` deadline has elapsed, and drives the matching
@@ -601,42 +606,41 @@ async fn load_pipeline_from_commit(
         .await?
         .ok_or_else(|| anyhow::anyhow!("repository {repo_id} is not registered"))?;
 
-    let committed = tokio::process::Command::new("git")
-        .arg("--git-dir")
-        .arg(&repository.git_path)
-        .args([
-            "cat-file",
-            "-e",
-            &format!("{commit_hash}:{PIPELINE_CONFIG_PATH}"),
-        ])
-        .output()
-        .await?;
-    if !committed.status.success() {
-        return Ok(None);
-    }
+    // The first committed definition in PIPELINE_CONFIG_PATHS order wins;
+    // an absent file falls through to the next candidate.
+    for config_path in PIPELINE_CONFIG_PATHS {
+        let committed = tokio::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&repository.git_path)
+            .args(["cat-file", "-e", &format!("{commit_hash}:{config_path}")])
+            .output()
+            .await?;
+        if !committed.status.success() {
+            continue;
+        }
 
-    let show = tokio::process::Command::new("git")
-        .arg("--git-dir")
-        .arg(&repository.git_path)
-        .args(["show", &format!("{commit_hash}:{PIPELINE_CONFIG_PATH}")])
-        .output()
-        .await?;
-    if !show.status.success() {
-        anyhow::bail!(
-            "failed to read {} at {} for repo {}: {}",
-            PIPELINE_CONFIG_PATH,
-            commit_hash,
-            repo_id,
-            String::from_utf8_lossy(&show.stderr).trim()
-        );
-    }
+        let show = tokio::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&repository.git_path)
+            .args(["show", &format!("{commit_hash}:{config_path}")])
+            .output()
+            .await?;
+        if !show.status.success() {
+            anyhow::bail!(
+                "failed to read {config_path} at {commit_hash} for repo {}: {}",
+                repo_id,
+                String::from_utf8_lossy(&show.stderr).trim()
+            );
+        }
 
-    let yaml = String::from_utf8(show.stdout).map_err(|error| {
-        anyhow::anyhow!("{PIPELINE_CONFIG_PATH} at {commit_hash} is not valid UTF-8: {error}")
-    })?;
-    PipelineDefinition::parse(&yaml).map(Some).map_err(|error| {
-        anyhow::anyhow!("invalid {PIPELINE_CONFIG_PATH} at {commit_hash}: {error}")
-    })
+        let yaml = String::from_utf8(show.stdout).map_err(|error| {
+            anyhow::anyhow!("{config_path} at {commit_hash} is not valid UTF-8: {error}")
+        })?;
+        return PipelineDefinition::parse(&yaml)
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("invalid {config_path} at {commit_hash}: {error}"));
+    }
+    Ok(None)
 }
 
 /// Single source of truth for the run-workspace root, so workspace creation,
@@ -1454,8 +1458,7 @@ async fn handle_push_event(
     };
     let pipeline = if let Some(committed) = committed_pipeline {
         tracing::info!(
-            "using {} committed at {} for repo {}",
-            PIPELINE_CONFIG_PATH,
+            "using committed pipeline definition at {} for repo {}",
             payload.new_hash,
             repo_id
         );
@@ -2409,12 +2412,12 @@ mod tests {
         run_git(["commit", "-m", "without pipeline"], Some(&seed)).await;
         let without = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
         tokio::fs::write(
-            seed.join(PIPELINE_CONFIG_PATH),
+            seed.join(PIPELINE_CONFIG_PATHS[0]),
             "name: fixture-ci\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment:\n  CI: \"true\"\njobs:\n  - name: echo\n    image: busybox:latest\n    steps:\n      - name: echo\n        run: echo committed-config\n",
         )
         .await
         .unwrap();
-        run_git(["add", PIPELINE_CONFIG_PATH], Some(&seed)).await;
+        run_git(["add", PIPELINE_CONFIG_PATHS[0]], Some(&seed)).await;
         run_git(["commit", "-m", "with pipeline"], Some(&seed)).await;
         let with = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
         run_git(
@@ -3216,10 +3219,10 @@ jobs:
         run_git(["init", seed.to_str().unwrap()], None).await;
         run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
         run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
-        tokio::fs::write(seed.join(PIPELINE_CONFIG_PATH), "::: not a pipeline\n")
+        tokio::fs::write(seed.join(PIPELINE_CONFIG_PATHS[0]), "::: not a pipeline\n")
             .await
             .unwrap();
-        run_git(["add", PIPELINE_CONFIG_PATH], Some(&seed)).await;
+        run_git(["add", PIPELINE_CONFIG_PATHS[0]], Some(&seed)).await;
         run_git(["commit", "-m", "broken pipeline"], Some(&seed)).await;
         let commit = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
         run_git(
@@ -3232,7 +3235,78 @@ jobs:
         let error = load_pipeline_from_commit(&pool, repo_id, &commit)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("invalid .gitforce.yml"));
+        assert!(error.to_string().contains("invalid .gitforge.yml"));
+    }
+
+    /// Seed a bare repository whose HEAD commit carries a definition at
+    /// every name in `config_paths`, in order. Returns (bare path, commit).
+    async fn seed_pipeline_at_paths(config_paths: &[&str]) -> (PathBuf, String) {
+        let run_id = gitforge_common::PipelineRunId::new();
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-pipeline-config-tests")
+            .join(run_id.to_string());
+        let bare = test_root.join("source.git");
+        let seed = test_root.join("seed");
+        tokio::fs::create_dir_all(&test_root).await.unwrap();
+        run_git(["init", "--bare", bare.to_str().unwrap()], None).await;
+        tokio::fs::create_dir_all(&seed).await.unwrap();
+        run_git(["init", seed.to_str().unwrap()], None).await;
+        run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
+        run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
+        for (index, config_path) in config_paths.iter().enumerate() {
+            tokio::fs::write(
+                seed.join(config_path),
+                format!("name: fixture-{index}\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment: {{}}\njobs: []\n"),
+            )
+            .await
+            .unwrap();
+            run_git(["add", config_path], Some(&seed)).await;
+        }
+        run_git(["commit", "-m", "pipeline definitions"], Some(&seed)).await;
+        let commit = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
+        run_git(
+            ["push", bare.to_str().unwrap(), "HEAD:refs/heads/main"],
+            Some(&seed),
+        )
+        .await;
+        (bare, commit)
+    }
+
+    #[tokio::test]
+    async fn test_load_pipeline_from_commit_accepts_legacy_config_name() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let (bare, commit) = seed_pipeline_at_paths(&[".gitforce.yml"]).await;
+        let (pool, repo_id) = test_pool_with_repository(bare.to_string_lossy().into_owned()).await;
+
+        // The legacy name still resolves, so repositories committed before
+        // the rename keep building.
+        let loaded = load_pipeline_from_commit(&pool, repo_id, &commit)
+            .await
+            .unwrap()
+            .expect("legacy .gitforce.yml must load");
+        assert_eq!(loaded.name, "fixture-0");
+    }
+
+    #[tokio::test]
+    async fn test_load_pipeline_from_commit_prefers_current_config_name() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let (bare, commit) =
+            seed_pipeline_at_paths(&[PIPELINE_CONFIG_PATHS[0], PIPELINE_CONFIG_PATHS[1]]).await;
+        let (pool, repo_id) = test_pool_with_repository(bare.to_string_lossy().into_owned()).await;
+
+        // When both spellings are committed the current one wins; the
+        // pipeline must never be half of each.
+        let loaded = load_pipeline_from_commit(&pool, repo_id, &commit)
+            .await
+            .unwrap()
+            .expect("committed definition must load");
+        assert_eq!(loaded.name, "fixture-0");
     }
 
     #[tokio::test]

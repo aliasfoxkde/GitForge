@@ -243,6 +243,18 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     "responses": {
                         "200": {"description": "List of pipelines"}
                     }
+                },
+                "post": {
+                    "tags": ["ci"],
+                    "summary": "Register a pipeline definition",
+                    "description": "Validates the pipeline definition document and stores it as the active version for the repository; the previous active version with the same name is retired (history retained). Body: {\"repo\": \"owner/name\", \"config\": \"<pipeline YAML>\"}",
+                    "responses": {
+                        "201": {"description": "Pipeline created"},
+                        "400": {"description": "Repository must be in owner/name form"},
+                        "403": {"description": "Not the repository owner"},
+                        "404": {"description": "Repository not found"},
+                        "422": {"description": "Pipeline definition is not valid"}
+                    }
                 }
             },
             "/pipelines/{id}": {
@@ -255,6 +267,36 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     "responses": {
                         "200": {"description": "Pipeline found"},
                         "404": {"description": "Pipeline not found"}
+                    }
+                },
+                "delete": {
+                    "tags": ["ci"],
+                    "summary": "Delete or deactivate a pipeline",
+                    "description": "A pipeline with no runs is deleted; one with runs is deactivated instead so run history stays intact",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "200": {"description": "Pipeline deleted or deactivated"},
+                        "403": {"description": "Not the repository owner"},
+                        "404": {"description": "Pipeline not found"}
+                    }
+                }
+            },
+            "/pipelines/{id}/runs": {
+                "post": {
+                    "tags": ["ci"],
+                    "summary": "Trigger a pipeline run",
+                    "description": "Resolves the requested revision (default HEAD) and hands the run to the CI orchestrator. Body: {\"ref\": \"branch-or-commit\"} (optional)",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "202": {"description": "Run triggered"},
+                        "400": {"description": "Invalid or unresolvable ref"},
+                        "403": {"description": "Not the repository owner"},
+                        "404": {"description": "Pipeline or repository not found"},
+                        "503": {"description": "CI orchestrator trigger is not configured"}
                     }
                 }
             },
