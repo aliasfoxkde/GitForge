@@ -22,9 +22,11 @@
 # is shared with the dsc pipeline's toolchain naming, hence the dsc-ci-rust
 # prefix; the cache content is GitForge's workspace.
 #
-# Size guard: the NAS daemon uses the vfs storage driver, where every
-# `docker create` copies the image's full layer stack, and the runner has a
-# hard 60-second sandbox-acquisition cap. Keep the image under ~2.5GB.
+# Size guard: originally because the daemon's vfs storage driver copied the
+# image's full layer stack on every `docker create`, under the runner's hard
+# 60-second sandbox-acquisition cap. Storage has since moved to overlay2
+# (creation is fast now); the ~2.5GB cap stays as disk hygiene on a shared
+# NAS volume.
 FROM rust:1-slim-bookworm
 
 # openssl-sys needs pkg-config + libssl headers; git is a test dependency

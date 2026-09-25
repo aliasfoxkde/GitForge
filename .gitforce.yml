@@ -22,10 +22,12 @@
 #   hermetic ssh-protocol tests spawn via ssh-keygen; v5 itself existed
 #   because the audited-deps bump moved jsonwebtoken to 11.1.0 ahead of
 #   v4's cache). The recipe lives at
-#   infrastructure/docker/ci-rust.Dockerfile. The image must exist before
-#   the first run: the NAS daemon's vfs storage driver plus the runner's
-#   hard 60-second sandbox-acquisition cap make a pull-at-run-time a
-#   guaranteed failure.
+#   infrastructure/docker/ci-rust.Dockerfile. The image must exist on the
+#   host before the first run: the runner's hard 60-second
+#   sandbox-acquisition cap rules out building or pulling at run time.
+#   (The daemon moved from the vfs storage driver to overlay2 on
+#   2026-09-24 — container jobs got ~10x faster — but the pre-build rule
+#   stands.)
 # - Cargo state is cold in the container (no cache mount), so clippy and
 #   test each pay a full dependency compile; the generous timeouts absorb
 #   that rather than gating on a cache setup this repo doesn't own.
@@ -55,13 +57,16 @@ jobs:
     needs: [clippy]
     steps:
       - name: Workspace test suite
-        # Bounded test parallelism: with the daemon's vfs storage driver the
-        # in-container fork/exec of the real `git` children spawned by the
-        # gitforge-core http tests is slow enough that at default parallelism
-        # (= host core count) the parent's request write races the child's
-        # readiness and fails with EPIPE — 3 of 4 runs lost that race while
-        # the same suite passed on the host. Two threads keeps the suite
-        # well inside the 60m timeout and makes the gate deterministic.
+        # Bounded test parallelism. Under the daemon's old vfs storage
+        # driver, in-container fork/exec of the real `git` children spawned
+        # by the gitforge-core http tests was slow enough that at default
+        # parallelism (= host core count) the parent's request write raced
+        # the child's readiness and failed with EPIPE (3 of 4 runs lost
+        # that race while the same suite passed on the host). The daemon
+        # has since moved to overlay2 and jobs run ~10x faster, but the
+        # two-thread bound stays: it keeps the suite well inside the 60m
+        # timeout and the gate deterministic without re-litigating default
+        # parallelism on every image refresh.
         run: cargo test --workspace -- --test-threads=2
     timeout: 60m
 
