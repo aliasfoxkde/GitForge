@@ -137,8 +137,19 @@ pub struct CiEngine {
 impl CiEngine {
     /// Create a new CI engine from a trigger event and pipeline definition
     pub async fn new(event: PipelineTriggerEvent, pipeline: PipelineDefinition) -> Result<Self> {
-        let run_id = PipelineRunId::new();
+        Self::new_with_run_id(event, pipeline, PipelineRunId::new()).await
+    }
 
+    /// Create a new CI engine with an explicit run id.
+    ///
+    /// The normal trigger path generates a fresh id; the restart-recovery
+    /// path passes the durable run's id so completion reports and scheduler
+    /// rows keep routing to the rebuilt engine.
+    pub async fn new_with_run_id(
+        event: PipelineTriggerEvent,
+        pipeline: PipelineDefinition,
+        run_id: PipelineRunId,
+    ) -> Result<Self> {
         // Build DAG from pipeline
         let graph = DagBuilder::build(&pipeline, run_id)?;
 
@@ -155,6 +166,95 @@ impl CiEngine {
             state: Arc::new(RwLock::new(state)),
             graph,
         })
+    }
+
+    /// Rebuild an engine for a run whose control-plane process died.
+    ///
+    /// The fresh engine adopts the durable run id and grafts the job rows
+    /// that survived the restart onto the DAG: graph node ids are replaced
+    /// by the durable ids (matched by job name) and each state machine is
+    /// restored to the row's status, so completion events, fencing, and
+    /// chain advancement keep working against the rows that already exist.
+    ///
+    /// `rows` carries one entry per durable job: its id, the job name from
+    /// the pipeline definition, and the durable status. Names absent from
+    /// `rows` (a pre-durable-planning run that died before enqueueing its
+    /// tail) keep fresh ids and start at `Pending`, exactly as a live
+    /// engine would hold them.
+    pub async fn rebuild(
+        run_id: PipelineRunId,
+        pipeline_id: gitforge_common::PipelineId,
+        repo_id: RepoId,
+        pipeline: PipelineDefinition,
+        rows: &[(
+            JobId,
+            String,
+            JobStatus,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )],
+    ) -> Result<Self> {
+        let mut graph = DagBuilder::build(&pipeline, run_id)?;
+
+        let mut jobs: HashMap<JobId, JobStateMachine> = HashMap::new();
+        let by_name: HashMap<&str, (JobId, JobStatus, Option<chrono::DateTime<chrono::Utc>>)> =
+            rows.iter()
+                .map(|(id, name, status, started)| (name.as_str(), (*id, *status, *started)))
+                .collect();
+
+        // Grafting replaces node ids, so every dependency edge that points at
+        // a grafted node must be remapped too — readiness checks resolve
+        // dependencies through the state map, and a stale pre-graft id there
+        // would leave a restored stage permanently unready (observed as a
+        // rebuilt engine that never re-enqueued its queued stage).
+        let mut remap: HashMap<JobId, JobId> = HashMap::new();
+        for node in &graph.nodes {
+            if let Some(entry) = by_name.get(node.name.as_str()) {
+                remap.insert(node.id, entry.0);
+            }
+        }
+
+        for node in &mut graph.nodes {
+            if let Some(&(durable_id, status, started_at)) = by_name.get(node.name.as_str()) {
+                node.id = durable_id;
+                let mut machine = JobStateMachine::new(durable_id);
+                machine.restore(status, started_at);
+                jobs.insert(durable_id, machine);
+            } else {
+                jobs.insert(node.id, JobStateMachine::new(node.id));
+            }
+            for dep in &mut node.dependencies {
+                if let Some(durable) = remap.get(dep) {
+                    *dep = *durable;
+                }
+            }
+        }
+
+        let mut state = CiEngineState::new(run_id, pipeline_id, repo_id);
+        // A run that already has rows was started by a previous process; the
+        // engine mirror marks it running (the durable run row keeps the true
+        // start time).
+        state.status = PipelineStatus::Running;
+        state.started_at = Some(chrono::Utc::now());
+        state.jobs = jobs;
+
+        Ok(Self {
+            state: Arc::new(RwLock::new(state)),
+            graph,
+        })
+    }
+
+    /// Every planned (job id, job name) pair in the DAG.
+    ///
+    /// The trigger path persists one durable `pending` row per pair at
+    /// planning time so the full job set survives a control-plane restart
+    /// (the F21 failure class: a lost engine used to take its unenqueued
+    /// stages with it).
+    pub fn planned_jobs(&self) -> Vec<(JobId, String)> {
+        self.graph
+            .nodes
+            .iter()
+            .map(|node| (node.id, node.name.clone()))
+            .collect()
     }
 
     /// Get current engine state
@@ -838,5 +938,108 @@ mod tests {
         let state = engine.state().await;
         let db_status: HashMap<JobId, String> = [(a, "failed".to_string())].into_iter().collect();
         assert!(fence_actions(&state, &db_status).is_empty());
+    }
+
+    // Restart recovery grafts durable rows onto a rebuilt engine: graph node
+    // ids are replaced by the durable ids (matched by job name), statuses
+    // are restored verbatim — including ones no live transition from
+    // `Pending` could reach — and the DAG still advances from the grafted
+    // state. A run that died with its head done and its second stage queued
+    // must come back exactly there, not from scratch.
+    #[tokio::test]
+    async fn test_rebuild_grafts_durable_rows_by_name() {
+        let pipeline = make_pipeline();
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+
+        // The live engine's planned ids stand in for the durable ids a
+        // previous process persisted at trigger time.
+        let live = CiEngine::new_with_run_id(event, pipeline.clone(), PipelineRunId::new())
+            .await
+            .unwrap();
+        let planned: HashMap<String, JobId> = live
+            .planned_jobs()
+            .into_iter()
+            .map(|(id, name)| (name, id))
+            .collect();
+        let build_id = planned["build"];
+        let test_id = planned["test"];
+        let started = chrono::Utc::now() - chrono::Duration::seconds(45);
+
+        let rows = vec![
+            (build_id, "build".to_string(), JobStatus::Succeeded, None),
+            (
+                test_id,
+                "test".to_string(),
+                JobStatus::Queued,
+                Some(started),
+            ),
+        ];
+        let rebuilt = CiEngine::rebuild(
+            PipelineRunId::new(),
+            PipelineId::new(),
+            RepoId::new(),
+            pipeline,
+            &rows,
+        )
+        .await
+        .unwrap();
+
+        let state = rebuilt.state().await;
+        assert_eq!(state.status, PipelineStatus::Running);
+        assert_eq!(state.jobs[&build_id].status(), JobStatus::Succeeded);
+        assert_eq!(state.jobs[&test_id].status(), JobStatus::Queued);
+        assert_eq!(state.jobs[&test_id].started_at(), Some(started));
+
+        // The chain resumes exactly where it stopped: the queued stage whose
+        // dependency succeeded is ready, nothing else is.
+        assert_eq!(rebuilt.ready_jobs().await, vec![test_id]);
+
+        // The grafted machine keeps living a normal lifecycle.
+        let runner_id = gitforge_common::RunnerId::new();
+        rebuilt.assign_job(test_id, runner_id).await.unwrap();
+        rebuilt.start_job(test_id).await.unwrap();
+        rebuilt.succeed_job(test_id, 0).await.unwrap();
+        assert!(rebuilt.state().await.jobs[&test_id].is_terminal());
+    }
+
+    // A name with no durable row (a pre-durable-planning run that died
+    // before enqueueing its tail) keeps its fresh id and starts at Pending;
+    // it must be releasable once its grafted dependencies are terminal.
+    #[tokio::test]
+    async fn test_rebuild_keeps_fresh_ids_for_unplanned_stages() {
+        let pipeline = make_pipeline();
+        let build_id = JobId::new();
+        let rows = vec![(build_id, "build".to_string(), JobStatus::Succeeded, None)];
+
+        let rebuilt = CiEngine::rebuild(
+            PipelineRunId::new(),
+            PipelineId::new(),
+            RepoId::new(),
+            pipeline,
+            &rows,
+        )
+        .await
+        .unwrap();
+
+        let state = rebuilt.state().await;
+        assert_eq!(state.jobs[&build_id].status(), JobStatus::Succeeded);
+        let test_id = *state
+            .jobs
+            .iter()
+            .find(|(id, _)| **id != build_id)
+            .expect("unplanned stage keeps an id")
+            .0;
+        assert_eq!(state.jobs[&test_id].status(), JobStatus::Pending);
+
+        // The unplanned tail is released through the normal path once its
+        // dependency is terminal.
+        let queued = rebuilt.queue_ready_jobs().await.unwrap();
+        assert_eq!(queued, vec![test_id]);
+        assert_eq!(rebuilt.ready_jobs().await, vec![test_id]);
     }
 }

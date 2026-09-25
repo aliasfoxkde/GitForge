@@ -212,15 +212,17 @@ async fn test_pending_jobs() {
     let run = create_test_pipeline_run(pipeline.id, repo.id);
     PipelineRunQueries::create(&pool, &run).await.unwrap();
 
-    // Create multiple jobs
+    // Create multiple jobs: one planned (pending), one released (queued)
     let job1 = Job::new(run.id, "job1".to_string());
     let job2 = Job::new(run.id, "job2".to_string());
     JobQueries::create(&pool, &job1).await.unwrap();
     JobQueries::create(&pool, &job2).await.unwrap();
+    JobQueries::update_status(&pool, job1.id, "queued").await.unwrap();
 
-    // List pending (they're created with 'pending' status)
-    let pending = JobQueries::list_pending(&pool).await.unwrap();
-    assert!(pending.len() >= 2);
+    // Only the queued job is dispatchable; planned rows are withheld
+    let dispatchable = JobQueries::list_dispatchable(&pool).await.unwrap();
+    assert_eq!(dispatchable.len(), 1);
+    assert_eq!(dispatchable[0].id, job1.id);
 }
 
 /// Test runner operations

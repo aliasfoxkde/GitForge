@@ -344,17 +344,17 @@ impl Scheduler {
         );
         tracing::debug!("job {} enqueued", job_id);
 
-        // Persist to database if available
+        // Persist to database if available. Planned jobs are written as
+        // `pending` rows at trigger time (durable DAG planning), so enqueue
+        // is an upsert that flips the existing row to `queued` instead of a
+        // fresh insert.
         if let Some(pool) = &self.db_pool {
             let mut db_job = DbJob::new(pipeline_run_id, format!("job-{job_id}"));
             db_job.id = job_id;
-            if let Err(e) = gitforge_db::queries::JobQueries::create(pool, &db_job).await {
-                tracing::error!("failed to persist job to DB: {}", e);
-            }
             if let Err(e) =
-                gitforge_db::queries::JobQueries::update_status(pool, job_id, "queued").await
+                gitforge_db::queries::JobQueries::create_or_open_queue(pool, &db_job).await
             {
-                tracing::error!("failed to update job status in DB: {}", e);
+                tracing::error!("failed to persist job to DB: {}", e);
             }
             if let Err(e) = gitforge_db::queries::JobQueries::set_definition_with_image_and_timeout(
                 pool,
@@ -975,7 +975,7 @@ impl Scheduler {
             None => return Ok(0),
         };
 
-        let pending_jobs = gitforge_db::queries::JobQueries::list_pending(pool).await?;
+        let pending_jobs = gitforge_db::queries::JobQueries::list_dispatchable(pool).await?;
         let pending_rows = pending_jobs.len();
         let mut state = self.state.write().await;
 
@@ -1078,7 +1078,7 @@ impl Scheduler {
         };
         let durable_pending = match &self.db_pool {
             Some(pool) => Some(
-                gitforge_db::queries::JobQueries::list_pending(pool)
+                gitforge_db::queries::JobQueries::list_dispatchable(pool)
                     .await?
                     .len(),
             ),

@@ -1077,6 +1077,48 @@ impl JobQueries {
         Ok(())
     }
 
+    /// Create the job row for an enqueue, or open the queue gate on the row
+    /// durable planning already wrote.
+    ///
+    /// Since durable DAG planning (R6.1), a run's full job set is persisted
+    /// as `pending` rows at trigger time; the enqueue that actually releases
+    /// a job to a runner must then fill in the execution definition and flip
+    /// the status rather than fail on the duplicate id. The conflict update
+    /// deliberately touches only the definition columns and the status: the
+    /// planned row's name, timestamps, and retry count stay authoritative.
+    pub async fn create_or_open_queue(pool: &Pool, job: &crate::models::Job) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, timeout_secs, result_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                status = 'queued',
+                commands = excluded.commands,
+                image = excluded.image,
+                working_dir = excluded.working_dir,
+                timeout_secs = excluded.timeout_secs
+            "#,
+        )
+        .bind(job.id.to_string())
+        .bind(job.pipeline_run_id.to_string())
+        .bind(&job.name)
+        .bind("queued")
+        .bind(job.runner_id.map(|id| id.to_string()))
+        .bind(job.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(job.finished_at.map(|dt| dt.to_rfc3339()))
+        .bind(job.retry_count)
+        .bind(job.created_at.to_rfc3339())
+        .bind(serde_json::to_string(&job.commands).unwrap_or_else(|_| "[]".to_string()))
+        .bind(&job.image)
+        .bind(&job.working_dir)
+        .bind(i64::try_from(job.timeout_secs).unwrap_or(i64::MAX))
+        .bind(&job.result_json)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to enqueue job: {e}")))?;
+        Ok(())
+    }
+
     /// Get a job by ID
     pub async fn get(pool: &Pool, id: JobId) -> Result<Option<crate::models::Job>> {
         let row = sqlx::query("SELECT * FROM jobs WHERE id = ?")
@@ -1424,14 +1466,19 @@ impl JobQueries {
         Ok(jobs)
     }
 
-    /// List all pending jobs
-    pub async fn list_pending(pool: &Pool) -> Result<Vec<crate::models::Job>> {
-        let rows = sqlx::query(
-            "SELECT * FROM jobs WHERE status IN ('pending', 'queued') ORDER BY created_at ASC",
-        )
-        .fetch_all(pool.pool())
-        .await
-        .map_err(|e| Error::database(format!("failed to list pending jobs: {e}")))?;
+    /// List jobs that are dispatchable right now: durably `queued` and
+    /// waiting for a runner.
+    ///
+    /// Planned rows (durable DAG planning) sit at `pending` until the engine
+    /// releases their dependency stage, so they are deliberately excluded —
+    /// scheduler recovery loads this list verbatim, and a planned row that
+    /// leaked into it would be dispatched before its predecessors finished.
+    pub async fn list_dispatchable(pool: &Pool) -> Result<Vec<crate::models::Job>> {
+        let rows =
+            sqlx::query("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC")
+                .fetch_all(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to list dispatchable jobs: {e}")))?;
 
         let jobs = rows
             .into_iter()
@@ -3001,7 +3048,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_job_queries_list_pending() {
+    async fn test_job_queries_list_dispatchable() {
         let pool = Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
 
@@ -3038,13 +3085,23 @@ mod tests {
         );
         PipelineRunQueries::create(&pool, &run).await.unwrap();
 
-        let job = crate::models::Job::new(run.id, "build".to_string());
-        JobQueries::create(&pool, &job).await.unwrap();
+        // A planned row (durable DAG planning) sits at `pending` until its
+        // dependency stage is released.
+        let planned = crate::models::Job::new(run.id, "planned-later".to_string());
+        JobQueries::create(&pool, &planned).await.unwrap();
 
-        // List pending jobs
-        let pending = JobQueries::list_pending(&pool).await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].name, "build");
+        // A released row is flipped to `queued` before it is enqueued.
+        let released = crate::models::Job::new(run.id, "build".to_string());
+        JobQueries::create(&pool, &released).await.unwrap();
+        JobQueries::update_status(&pool, released.id, "queued")
+            .await
+            .unwrap();
+
+        // Only the queued row is dispatchable; the planned row must never
+        // reach the scheduler's recovery scan.
+        let dispatchable = JobQueries::list_dispatchable(&pool).await.unwrap();
+        assert_eq!(dispatchable.len(), 1);
+        assert_eq!(dispatchable[0].name, "build");
     }
 
     #[tokio::test]

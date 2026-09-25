@@ -1063,7 +1063,22 @@ mod tests {
     async fn test_get_queue_status_handler_reports_durable_pending_rows() {
         let pool = gitforge_db::Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
-        let _ = seed_restart_scenario(&pool, "queue-status").await;
+        let (queued_job, planned_job) = seed_restart_scenario(&pool, "queue-status").await;
+        // durable_pending counts dispatchable rows only: the queued row is
+        // waiting for a runner, while the still-planned row (durable DAG
+        // planning parks unreleased stages at `pending`) must not read as
+        // queue depth.
+        gitforge_db::queries::JobQueries::update_status(&pool, queued_job, "queued")
+            .await
+            .unwrap();
+        assert_eq!(
+            gitforge_db::queries::JobQueries::get(&pool, planned_job)
+                .await
+                .unwrap()
+                .expect("planned row")
+                .status,
+            "pending"
+        );
         let state = create_state(crate::Scheduler::with_db(pool));
         let response = get_queue_status(axum::extract::State(state)).await;
         let response = response.into_response();
@@ -1072,7 +1087,7 @@ mod tests {
             .await
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["durable_pending"], 2);
+        assert_eq!(payload["durable_pending"], 1);
         assert_eq!(payload["in_memory_queued"], 0);
     }
 

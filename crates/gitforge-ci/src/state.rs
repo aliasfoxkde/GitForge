@@ -61,6 +61,26 @@ impl JobStateMachine {
         Ok(())
     }
 
+    /// Adopt a durable status observed in the database instead of earning it
+    /// through local transitions.
+    ///
+    /// Engine rebuild after a control-plane restart grafts the job rows that
+    /// survived the old process onto a fresh state machine; those rows may
+    /// carry any status, including ones no single transition from `Pending`
+    /// can reach. The durable row is authoritative, so the status is set
+    /// directly. `started_at` is restored for running jobs so the timeout
+    /// backstop sees the original start rather than treating the job as
+    /// never-started.
+    pub fn restore(
+        &mut self,
+        status: JobStatus,
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        self.status = status;
+        self.started_at = started_at;
+        tracing::debug!("job {} restored at status {:?}", self.job_id, self.status);
+    }
+
     /// Transition to assigned state
     pub fn assign(&mut self, runner_id: RunnerId) -> Result<()> {
         self.ensure_valid_transition(JobStatus::Assigned)?;
@@ -465,5 +485,31 @@ mod tests {
 
         let summary = state.summary();
         assert_eq!(summary.started_at, state.started_at());
+    }
+
+    // Restart recovery grafts durable rows onto a fresh machine: the durable
+    // status may be one no live transition from `Pending` can reach, and the
+    // original start time must survive so the timeout backstop measures the
+    // job's real runtime rather than treating it as never-started.
+    #[test]
+    fn test_restore_adopts_durable_status_and_started_at() {
+        let started = chrono::Utc::now() - chrono::Duration::seconds(30);
+
+        let mut state = JobStateMachine::new(JobId::new());
+        state.restore(JobStatus::Queued, Some(started));
+        assert_eq!(state.status(), JobStatus::Queued);
+        assert_eq!(state.started_at(), Some(started));
+        assert!(!state.is_terminal());
+        assert_eq!(state.summary().status, JobStatus::Queued);
+
+        // A restored machine keeps transitioning normally afterwards.
+        state.assign(RunnerId::new()).unwrap();
+        state.start().unwrap();
+        assert_eq!(state.status(), JobStatus::Running);
+
+        // Terminal rows restore as terminal.
+        let mut done = JobStateMachine::new(JobId::new());
+        done.restore(JobStatus::Succeeded, Some(started));
+        assert!(done.is_terminal());
     }
 }
