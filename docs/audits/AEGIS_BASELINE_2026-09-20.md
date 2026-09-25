@@ -88,6 +88,30 @@ in the baseline; genuine hardening work is tracked in
 HIPAA/PCI/GDPR keyword mentions inside docs and the review engine's
 pattern tables.
 
+## Baseline refresh (2026-09-25) — two additions, both triaged accepted
+
+Aegis 0.6.2 reports two findings the 2026-09-20 baseline (generated on
+0.6.1) did not contain. Neither is in code changed by the accompanying
+pipeline-management work; both were triaged and appended to the baseline
+fingerprint-precisely (`make aegis` re-verified green afterwards).
+
+1. `sql-query` [LOW] — `scripts/gitforge-status:323`: a static
+   `sqlite3` diagnostic query with no user input and no connection
+   string; a false positive of the generic SQL-injection shape matcher.
+2. `ssrf-localhost` [MEDIUM] — `.gitforce.yml:83`: the pipeline's own
+   CI-trigger step posting to the loopback orchestrator
+   (`http://127.0.0.1:42781`), the documented, intended topology of the
+   single-host deployment. Loopback self-calls inside the trust boundary
+   are the accepted class for this pattern (same class as the gateway's
+   own `CiTriggerClient`).
+
+Note for future refreshes: since 0.6.2 fingerprints carry a
+`pattern:path:line:sha256(content)` form (this document's 2026-09-20
+section predates that; it described `pattern:path:line`), so a finding
+re-flags when its line moves **or** its matched text changes — the
+content hash binds the baseline entry to the exact match. The
+line-shift and scan-root caveats above are unchanged.
+
 ## Accepted deviations worth knowing about
 
 1. `make run-api` uses `JWT_SECRET="dev-secret"` — local development

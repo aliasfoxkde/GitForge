@@ -78,6 +78,27 @@ pub struct PipelineResponse {
     pub enabled: bool,
 }
 
+/// Create pipeline request
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreatePipelineRequest {
+    pub repo: String,
+    pub config: String,
+}
+
+/// Trigger pipeline run request
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TriggerPipelineRunRequest {
+    #[serde(rename = "ref")]
+    pub r#ref: Option<String>,
+}
+
+/// Trigger pipeline run response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerPipelineRunResponse {
+    pub pipeline_id: String,
+    pub pipeline_run_id: String,
+}
+
 /// Pipeline run response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineRunResponse {
@@ -314,6 +335,79 @@ impl ApiClient {
         let resp = ensure_success(resp, "get pipeline").await?;
         let pipeline: PipelineResponse = resp.json().await?;
         Ok(pipeline)
+    }
+
+    /// Create a pipeline from a definition document
+    pub async fn create_pipeline(&self, repo: &str, config: &str) -> Result<PipelineResponse> {
+        let url = format!("{}/api/pipelines", self.base_url);
+        let body = CreatePipelineRequest {
+            repo: repo.to_string(),
+            config: config.to_string(),
+        };
+
+        let mut req = self.http.post(&url).json(&body);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req.send().await?;
+        let resp = ensure_success(resp, "create pipeline").await?;
+        let pipeline: PipelineResponse = resp.json().await?;
+        Ok(pipeline)
+    }
+
+    /// Delete a pipeline (deactivated when it has runs)
+    pub async fn delete_pipeline(&self, id: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/api/pipelines/{}", self.base_url, id);
+        let mut req = self.http.delete(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req.send().await?;
+        let resp = ensure_success(resp, "delete pipeline").await?;
+        let body: serde_json::Value = resp.json().await?;
+        Ok(body)
+    }
+
+    /// Trigger a run of a pipeline at a revision (default: HEAD)
+    pub async fn run_pipeline(
+        &self,
+        id: &str,
+        revision: Option<&str>,
+    ) -> Result<TriggerPipelineRunResponse> {
+        let url = format!("{}/api/pipelines/{}/runs", self.base_url, id);
+        let body = TriggerPipelineRunRequest {
+            r#ref: revision.map(str::to_string),
+        };
+
+        let mut req = self.http.post(&url).json(&body);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req.send().await?;
+        let resp = ensure_success(resp, "trigger pipeline run").await?;
+        let triggered: TriggerPipelineRunResponse = resp.json().await?;
+        Ok(triggered)
+    }
+
+    /// Get a pipeline run by ID
+    pub async fn get_pipeline_run(&self, id: &str) -> Result<PipelineRunResponse> {
+        let url = format!("{}/api/pipeline-runs/{}", self.base_url, id);
+        let mut req = self.http.get(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req.send().await?;
+        let resp = ensure_success(resp, "get pipeline run").await?;
+        let run: PipelineRunResponse = resp.json().await?;
+        Ok(run)
     }
 
     /// List pipeline runs

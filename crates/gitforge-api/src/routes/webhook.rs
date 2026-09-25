@@ -130,7 +130,7 @@ impl CiTriggerClient {
         })
     }
 
-    async fn trigger(
+    pub(crate) async fn trigger(
         &self,
         repo_id: RepoId,
         branch: &str,

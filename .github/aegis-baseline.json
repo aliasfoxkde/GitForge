@@ -19032,6 +19032,26 @@
       "severity": "low",
       "stable_id": "aegis-f72650301f18929aa1e5589adf0fa0f784ea77f0a9a36f9a48467da747069958",
       "tags": []
+    },
+    {
+      "category": "security",
+      "fingerprint": "sql-query:./scripts/gitforge-status:323:7c4311a3faa04adb261e340a207e888578f710d0e8d8c12d520b6d9a3aa566a5",
+      "location": {
+        "file": "./scripts/gitforge-status",
+        "line": 323
+      },
+      "pattern": "sql-query",
+      "triage": "accepted \u2014 pre-existing at HEAD, false positive (static sqlite3 status query) / accepted class (loopback CI trigger endpoint), triaged 2026-09-25 in docs/audits/AEGIS_BASELINE_2026-09-20.md"
+    },
+    {
+      "category": "security",
+      "fingerprint": "ssrf-localhost:./.gitforce.yml:83:49960de5880e8c687434170f6476605b8fe4aeb9a28632c7995cf3ba831d9763",
+      "location": {
+        "file": "./.gitforce.yml",
+        "line": 83
+      },
+      "pattern": "ssrf-localhost",
+      "triage": "accepted \u2014 pre-existing at HEAD, false positive (static sqlite3 status query) / accepted class (loopback CI trigger endpoint), triaged 2026-09-25 in docs/audits/AEGIS_BASELINE_2026-09-20.md"
     }
   ],
   "stats": {
