@@ -1218,37 +1218,136 @@ impl Scheduler {
         state.queue.len()
     }
 
-    /// Return durable and in-memory queue counters for operator telemetry.
+    /// Return durable and in-memory queue counters plus the dispatch
+    /// observability report for operator telemetry (R6.4): what is queued,
+    /// since when, why next, and who is running — without DB access.
     pub async fn queue_status(&self) -> anyhow::Result<QueueStatus> {
+        const QUEUE_REPORT_LIMIT: usize = 64;
+        const LATENCY_SAMPLE_LIMIT: i64 = 20;
+
         let now = chrono::Utc::now();
-        let (in_memory_queued, assigned_jobs, online_runners) = {
+        let (fair_order, running_by_repo, in_memory_queued, assigned_jobs, online_runners) = {
             let state = self.state.read().await;
+            // The same per-repo load arithmetic admission uses, so the
+            // report's "why next" reproduces what the scheduler will
+            // actually dispatch.
+            let mut running_by_repo: HashMap<RepoId, usize> = HashMap::new();
+            for (_, _, running_repo) in state.assigned_jobs.values() {
+                *running_by_repo.entry(*running_repo).or_default() += 1;
+            }
+            let fair_order = state.queue.fair_order(&running_by_repo);
+            let online_runners = state
+                .runners
+                .values()
+                .filter(|runner| {
+                    runner.effective_status(now, RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS) == "online"
+                })
+                .count();
             (
+                fair_order,
+                running_by_repo,
                 state.queue.len(),
                 state.assigned_jobs.len(),
-                state
-                    .runners
-                    .values()
-                    .filter(|runner| {
-                        runner.effective_status(now, RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS)
-                            == "online"
-                    })
-                    .count(),
+                online_runners,
             )
         };
-        let durable_pending = match &self.db_pool {
-            Some(pool) => Some(
-                gitforge_db::queries::JobQueries::list_dispatchable(pool)
-                    .await?
-                    .len(),
-            ),
-            None => None,
+
+        // Durable reads: the queued rows (for names and the recovery-
+        // divergence count) and the recent queued→started latency sample.
+        // Per-repo running load is NOT read from the database: the report
+        // quotes the same in-memory map admission dispatches with, so the
+        // "why next" answer can never disagree with what actually runs.
+        let (durable_queued, recent_dispatch) = match &self.db_pool {
+            Some(pool) => {
+                let durable_queued =
+                    gitforge_db::queries::JobQueries::list_dispatchable(pool).await?;
+                (
+                    durable_queued,
+                    gitforge_db::queries::JobQueries::recent_dispatch_latencies(
+                        pool,
+                        LATENCY_SAMPLE_LIMIT,
+                    )
+                    .await?,
+                )
+            }
+            None => (Vec::new(), Vec::new()),
         };
+        // An in-memory scheduler has no durable state to count: `None`
+        // serializes as null, honestly distinguishing "no durable store"
+        // from "a durable store reports zero pending".
+        let durable_pending = self.db_pool.as_ref().map(|_| durable_queued.len());
+
+        // Names for the in-memory view come from the durable rows; a job
+        // not yet persisted still reports with its scheduler-side fallback.
+        let names: HashMap<JobId, String> = durable_queued
+            .iter()
+            .map(|job| (job.id, job.name.clone()))
+            .collect();
+
+        let queued_total = fair_order.len();
+        let queued: Vec<QueuedJobReport> = fair_order
+            .iter()
+            .take(QUEUE_REPORT_LIMIT)
+            .map(|job| QueuedJobReport {
+                name: names
+                    .get(&job.job_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("job-{}", job.job_id)),
+                job_id: job.job_id,
+                pipeline_run_id: job.pipeline_run_id,
+                repo_id: job.repo_id,
+                priority: format!("{:?}", job.priority),
+                waited_secs: now
+                    .timestamp_millis()
+                    .saturating_sub(job.queued_at)
+                    .clamp(0, i64::MAX) as u64
+                    / 1000,
+            })
+            .collect();
+
+        // Recovery divergence: durable `queued` rows the live scheduler has
+        // not mirrored. Nonzero means a restart handoff is pending — the
+        // exact state that used to read as silent starvation.
+        let in_memory_ids: HashSet<JobId> = fair_order.iter().map(|job| job.job_id).collect();
+        let durable_queued_not_in_memory = durable_queued
+            .iter()
+            .filter(|job| !in_memory_ids.contains(&job.id))
+            .count();
+
+        let next_up = queued.first().cloned();
+        let next_up_reason = next_up.as_ref().map(|head| {
+            let load = running_by_repo.get(&head.repo_id).copied().unwrap_or(0);
+            format!(
+                "priority {} dispatches first; repo {} carries {} running job(s) under bounded fairness; {} queued job(s) behind it; FIFO age {}s",
+                head.priority,
+                head.repo_id,
+                load,
+                queued_total.saturating_sub(1),
+                head.waited_secs
+            )
+        });
+
         Ok(QueueStatus {
             durable_pending,
             in_memory_queued,
             assigned_jobs,
             online_runners,
+            queued,
+            queued_total,
+            durable_queued_not_in_memory,
+            next_up,
+            next_up_reason,
+            per_repo_running: running_by_repo
+                .into_iter()
+                .map(|(repo_id, running)| RepoLoadReport { repo_id, running })
+                .collect(),
+            recent_dispatch: recent_dispatch
+                .into_iter()
+                .map(|(job_id, latency_secs)| DispatchLatencyReport {
+                    job_id,
+                    latency_secs,
+                })
+                .collect(),
         })
     }
 
@@ -1640,6 +1739,32 @@ impl JobOutcome {
     }
 }
 
+/// One queued job in the dispatch report (R6.4): what is queued and since
+/// when, in the order fair dispatch would run it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedJobReport {
+    pub job_id: JobId,
+    pub pipeline_run_id: PipelineRunId,
+    pub repo_id: RepoId,
+    pub name: String,
+    pub priority: String,
+    pub waited_secs: u64,
+}
+
+/// Per-repository in-flight load — the bounded-fairness arithmetic itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoLoadReport {
+    pub repo_id: RepoId,
+    pub running: usize,
+}
+
+/// One job's queued→started latency, newest starts first (bounded sample).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchLatencyReport {
+    pub job_id: JobId,
+    pub latency_secs: i64,
+}
+
 /// Read-only queue admission telemetry exposed by the scheduler API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueStatus {
@@ -1647,6 +1772,22 @@ pub struct QueueStatus {
     pub in_memory_queued: usize,
     pub assigned_jobs: usize,
     pub online_runners: usize,
+    /// Queued jobs in fair-dispatch order, head first (bounded).
+    pub queued: Vec<QueuedJobReport>,
+    /// Total queued jobs, including any beyond the bounded report.
+    pub queued_total: usize,
+    /// Durable `queued` rows the live scheduler has not mirrored — nonzero
+    /// means a restart handoff is pending, the state that used to read as
+    /// silent starvation.
+    pub durable_queued_not_in_memory: usize,
+    /// The job the next admission tick dispatches first, and the fair-order
+    /// arithmetic that selected it.
+    pub next_up: Option<QueuedJobReport>,
+    pub next_up_reason: Option<String>,
+    /// In-flight jobs per repository.
+    pub per_repo_running: Vec<RepoLoadReport>,
+    /// Recent queued→started latencies, newest first (bounded sample).
+    pub recent_dispatch: Vec<DispatchLatencyReport>,
 }
 
 impl Default for Scheduler {
@@ -3252,5 +3393,92 @@ mod tests {
         .expect("Ok verdict must pass through");
         assert!(!accepted);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_queue_status_reports_dispatch_observability() {
+        let scheduler = Scheduler::new();
+        let busy_repo = RepoId::new(); // will carry a running job
+        let idle_repo = RepoId::new(); // stays unloaded
+        scheduler
+            .register_runner(make_runner(RunnerId::new(), "obs-runner", "online", 2))
+            .await;
+
+        // Two normal-priority jobs on different repos, one high-priority
+        // job on the busy repo. Capacity is 2, so dispatch assigns the
+        // high job and the idle repo's normal job, leaving one normal job
+        // on the busy repo queued.
+        let queued_normal = JobId::new();
+        let idle_normal = JobId::new();
+        let high = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                queued_normal,
+                PipelineRunId::new(),
+                busy_repo,
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        scheduler
+            .enqueue_with_definition(
+                idle_normal,
+                PipelineRunId::new(),
+                idle_repo,
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        scheduler
+            .enqueue_with_definition(high, PipelineRunId::new(), busy_repo, Vec::new(), None)
+            .await
+            .unwrap();
+        // The priority API re-enqueues over the same job id, raising it
+        // above the normal-priority pair.
+        scheduler
+            .enqueue_with_priority(high, PipelineRunId::new(), busy_repo, Priority::High)
+            .await;
+
+        scheduler.process_queue().await;
+
+        let status = scheduler.queue_status().await.unwrap();
+
+        // In-memory scheduler: no durable store is configured, so the
+        // pending count is None (null on the wire — "nothing consulted"),
+        // and the divergence count is honestly zero.
+        assert_eq!(status.durable_pending, None);
+        assert_eq!(status.durable_queued_not_in_memory, 0);
+        assert_eq!(status.in_memory_queued, 1);
+        assert_eq!(status.assigned_jobs, 2);
+
+        // The in-flight load IS the fairness arithmetic: both repos carry
+        // one running job.
+        let loads: Vec<(String, usize)> = status
+            .per_repo_running
+            .iter()
+            .map(|load| (load.repo_id.0.to_string(), load.running))
+            .collect();
+        assert_eq!(loads.len(), 2);
+        assert!(loads.iter().all(|(_, running)| *running == 1));
+
+        // The queued report names the one survivor, headed by the job
+        // dispatch would pick next, with a reason quoting that arithmetic.
+        assert_eq!(status.queued.len(), 1);
+        assert_eq!(status.queued[0].job_id, queued_normal);
+        assert_eq!(status.queued[0].repo_id, busy_repo);
+        assert_eq!(status.queued[0].priority, "Normal");
+        let next_up = status.next_up.expect("a queued job must have a next up");
+        assert_eq!(next_up.job_id, queued_normal);
+        let reason = status
+            .next_up_reason
+            .as_deref()
+            .expect("next up must carry a reason");
+        assert!(reason.contains("priority Normal"), "reason: {reason}");
+        assert!(reason.contains("1 running job(s)"), "reason: {reason}");
+
+        // Waited time is measured from enqueue and cannot be negative.
+        assert!(status.queued[0].waited_secs <= 5, "freshly enqueued");
     }
 }

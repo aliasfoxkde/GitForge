@@ -154,21 +154,43 @@ impl JobQueue {
         self.by_id
             .values()
             .filter(|job| !skip.contains(&job.job_id))
-            .max_by(|left, right| {
-                left.priority
-                    .cmp(&right.priority)
-                    .then_with(|| {
-                        let left_load = load_by_repo.get(&left.repo_id).copied().unwrap_or(0);
-                        let right_load = load_by_repo.get(&right.repo_id).copied().unwrap_or(0);
-                        right_load.cmp(&left_load)
-                    })
-                    .then_with(|| right.queued_at.cmp(&left.queued_at))
-                    .then_with(|| {
-                        self.insertion_order
-                            .get(&right.job_id)
-                            .cmp(&self.insertion_order.get(&left.job_id))
-                    })
+            .max_by(|left, right| self.fair_cmp(left, right, load_by_repo))
+    }
+
+    /// The fair-dispatch ordering shared by `peek_fair` and `fair_order`:
+    /// priority first, then the repository with fewer running jobs, then
+    /// FIFO, then insertion order.
+    fn fair_cmp(
+        &self,
+        left: &QueuedJob,
+        right: &QueuedJob,
+        load_by_repo: &HashMap<RepoId, usize>,
+    ) -> Ordering {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| {
+                let left_load = load_by_repo.get(&left.repo_id).copied().unwrap_or(0);
+                let right_load = load_by_repo.get(&right.repo_id).copied().unwrap_or(0);
+                right_load.cmp(&left_load)
             })
+            .then_with(|| right.queued_at.cmp(&left.queued_at))
+            .then_with(|| {
+                self.insertion_order
+                    .get(&right.job_id)
+                    .cmp(&self.insertion_order.get(&left.job_id))
+            })
+    }
+
+    /// The full queue in fair-dispatch order, head first.
+    ///
+    /// This is the same arithmetic `peek_fair` selects from, exposed so
+    /// `/queue/status` can answer "what is queued, since when, why next"
+    /// with the queue's own ordering instead of a parallel approximation
+    /// that could disagree with what actually dispatches (R6.4).
+    pub fn fair_order(&self, load_by_repo: &HashMap<RepoId, usize>) -> Vec<QueuedJob> {
+        let mut jobs: Vec<QueuedJob> = self.by_id.values().cloned().collect();
+        jobs.sort_by(|left, right| self.fair_cmp(left, right, load_by_repo).reverse());
+        jobs
     }
 
     /// Remove a specific job from the queue
@@ -558,5 +580,39 @@ mod tests {
         assert_eq!(job.repo_id, repo_id);
         assert_eq!(job.priority, Priority::High);
         assert_eq!(job.queued_at, 1234567890);
+    }
+
+    #[test]
+    fn test_fair_order_matches_peek_fair_head() {
+        let mut queue = JobQueue::new();
+        let busy_repo = RepoId::new(); // carries running load
+        let idle_repo = RepoId::new(); // carries none
+
+        let normal_on_busy = QueuedJob::new(JobId::new(), PipelineRunId::new(), busy_repo);
+        let normal_on_idle = QueuedJob::new(JobId::new(), PipelineRunId::new(), idle_repo);
+        let high_on_busy = QueuedJob::new(JobId::new(), PipelineRunId::new(), busy_repo)
+            .with_priority(Priority::High);
+        queue.enqueue(normal_on_busy.clone());
+        queue.enqueue(normal_on_idle.clone());
+        queue.enqueue(high_on_busy.clone());
+
+        let mut load = HashMap::new();
+        load.insert(busy_repo, 2usize);
+        load.insert(idle_repo, 0usize);
+
+        // The report ordering must agree with what dispatch actually
+        // selects: priority first, then the unloaded repo, then FIFO.
+        let order = queue.fair_order(&load);
+        assert_eq!(order[0].job_id, high_on_busy.job_id);
+        assert_eq!(order[1].job_id, normal_on_idle.job_id);
+        assert_eq!(order[2].job_id, normal_on_busy.job_id);
+        assert_eq!(
+            queue.peek_fair(&HashSet::new(), &load).unwrap().job_id,
+            order[0].job_id,
+            "the report head and the dispatch head must be the same job"
+        );
+
+        // The full set is reported exactly once, in bounded order.
+        assert_eq!(order.len(), 3);
     }
 }

@@ -530,17 +530,46 @@ async fn get_pending_jobs(
     Json(serde_json::json!(job_infos))
 }
 
-/// Return durable and in-memory queue counters for admission and operations.
+/// Return durable and in-memory queue counters plus the dispatch
+/// observability report (R6.4): what is queued, since when, why next, and
+/// who is running — without DB access.
 async fn get_queue_status(State(state): State<SchedulerServerState>) -> impl IntoResponse {
     match state.scheduler.queue_status().await {
         Ok(status) => (
             StatusCode::OK,
             Json(serde_json::json!({
-                "contract_version": "scheduler.queue.v1",
+                "contract_version": "scheduler.queue.v2",
                 "durable_pending": status.durable_pending,
                 "in_memory_queued": status.in_memory_queued,
                 "assigned_jobs": status.assigned_jobs,
                 "online_runners": status.online_runners,
+                "queued": status.queued.iter().map(|job| serde_json::json!({
+                    "job_id": job.job_id,
+                    "pipeline_run_id": job.pipeline_run_id,
+                    "repo_id": job.repo_id,
+                    "name": job.name,
+                    "priority": job.priority,
+                    "waited_secs": job.waited_secs,
+                })).collect::<Vec<_>>(),
+                "queued_total": status.queued_total,
+                "durable_queued_not_in_memory": status.durable_queued_not_in_memory,
+                "next_up": status.next_up.as_ref().map(|head| serde_json::json!({
+                    "job_id": head.job_id,
+                    "pipeline_run_id": head.pipeline_run_id,
+                    "repo_id": head.repo_id,
+                    "name": head.name,
+                    "priority": head.priority,
+                    "waited_secs": head.waited_secs,
+                })),
+                "next_up_reason": status.next_up_reason,
+                "per_repo_running": status.per_repo_running.iter().map(|load| serde_json::json!({
+                    "repo_id": load.repo_id,
+                    "running": load.running,
+                })).collect::<Vec<_>>(),
+                "recent_dispatch": status.recent_dispatch.iter().map(|sample| serde_json::json!({
+                    "job_id": sample.job_id,
+                    "latency_secs": sample.latency_secs,
+                })).collect::<Vec<_>>(),
             })),
         ),
         Err(error) => {
@@ -1056,11 +1085,20 @@ mod tests {
             .await
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["contract_version"], "scheduler.queue.v1");
+        assert_eq!(payload["contract_version"], "scheduler.queue.v2");
         assert_eq!(payload["durable_pending"], serde_json::Value::Null);
         assert_eq!(payload["in_memory_queued"], 0);
         assert_eq!(payload["assigned_jobs"], 0);
         assert_eq!(payload["online_runners"], 0);
+        // The dispatch report is present and honestly empty in a fresh
+        // in-memory scheduler: nothing queued, nothing next, no divergence.
+        assert_eq!(payload["queued"], serde_json::json!([]));
+        assert_eq!(payload["queued_total"], 0);
+        assert_eq!(payload["next_up"], serde_json::Value::Null);
+        assert_eq!(payload["next_up_reason"], serde_json::Value::Null);
+        assert_eq!(payload["durable_queued_not_in_memory"], 0);
+        assert_eq!(payload["per_repo_running"], serde_json::json!([]));
+        assert_eq!(payload["recent_dispatch"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -1093,6 +1131,13 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["durable_pending"], 1);
         assert_eq!(payload["in_memory_queued"], 0);
+        // The durable row is not mirrored in this scheduler's queue (fresh
+        // instance, recovery not run), so the report must say so: this is
+        // the divergence signature that used to read as silent starvation
+        // and is now visible without DB access (R6.4).
+        assert_eq!(payload["durable_queued_not_in_memory"], 1);
+        assert_eq!(payload["queued"], serde_json::json!([]));
+        assert_eq!(payload["next_up"], serde_json::Value::Null);
     }
 
     #[tokio::test]

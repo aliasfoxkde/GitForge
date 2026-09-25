@@ -1520,6 +1520,36 @@ impl JobQueries {
         Ok(jobs)
     }
 
+    /// The most recent job starts with their queued→started latency, newest
+    /// first — the bounded per-job dispatch-latency sample behind
+    /// `/queue/status` (R6.4). Latency is computed from the stored RFC 3339
+    /// timestamps; a row whose timestamps fail to parse is skipped rather
+    /// than corrupting the sample.
+    pub async fn recent_dispatch_latencies(pool: &Pool, limit: i64) -> Result<Vec<(JobId, i64)>> {
+        let rows = sqlx::query(
+            "SELECT j.id AS job_id, j.started_at AS started_at, j.created_at AS created_at \
+             FROM jobs j WHERE j.started_at IS NOT NULL \
+             ORDER BY j.started_at DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list dispatch latencies: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let job_id = parse_uuid_column(&row, "job_id").ok()?;
+                let started_at: String = row.try_get("started_at").ok()?;
+                let created_at: String = row.try_get("created_at").ok()?;
+                let started = DateTime::parse_from_rfc3339(&started_at).ok()?;
+                let created = DateTime::parse_from_rfc3339(&created_at).ok()?;
+                let latency = (started - created).num_seconds();
+                Some((JobId(job_id), latency))
+            })
+            .collect())
+    }
+
     /// Recover jobs that were in flight when the scheduler stopped. Assigned
     /// jobs have not started execution and are safe to requeue. Running jobs
     /// are fenced as failed instead of being re-run automatically: the old
@@ -3160,6 +3190,71 @@ mod tests {
         let dispatchable = JobQueries::list_dispatchable(&pool).await.unwrap();
         assert_eq!(dispatchable.len(), 1);
         assert_eq!(dispatchable[0].name, "build");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_observability_reads() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "obs-owner".to_string(),
+            "obs-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+
+        let repo = crate::models::Repository::new(
+            "obs-repo".to_string(),
+            user.id,
+            "/git/obs-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "Obs Pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        // No started rows yet: the latency sample is honestly empty.
+        assert!(JobQueries::recent_dispatch_latencies(&pool, 20)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // One started job: the queued→started latency sample must be a
+        // non-negative integer number of seconds, per job.
+        let started = crate::models::Job::new(run.id, "started-job".to_string());
+        JobQueries::create(&pool, &started).await.unwrap();
+        JobQueries::start(&pool, started.id).await.unwrap();
+        let latencies = JobQueries::recent_dispatch_latencies(&pool, 20)
+            .await
+            .unwrap();
+        assert_eq!(latencies.len(), 1);
+        assert_eq!(latencies[0].0, started.id);
+        assert!(latencies[0].1 >= 0, "latency must not be negative");
+
+        // The limit is honored (bounded report, newest first).
+        let second = crate::models::Job::new(run.id, "second-started".to_string());
+        JobQueries::create(&pool, &second).await.unwrap();
+        JobQueries::start(&pool, second.id).await.unwrap();
+        let bounded = JobQueries::recent_dispatch_latencies(&pool, 1)
+            .await
+            .unwrap();
+        assert_eq!(bounded.len(), 1);
     }
 
     #[tokio::test]
