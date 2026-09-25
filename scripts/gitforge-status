@@ -312,6 +312,36 @@ else
             printf 'unsupervised: %s (%s)\n' "$entry" "${bin_name}"
         done
     done
+    # Runner registry truth (F26): a stale-`online` row — online status with
+    # a heartbeat older than the scheduler's janitor threshold — means the
+    # registry cannot be trusted for placement or display. Print the counts
+    # so recurrence is visible without SQL; a stale row degrades the verdict.
+    # Stored timestamps are RFC3339 TEXT, so normalize through datetime()
+    # before comparing (raw comparison mis-sorts same-day rows).
+    if [[ -r "$repo_dir/data/gitforge.db" ]] && command -v sqlite3 >/dev/null 2>&1; then
+        registry_status=$(sqlite3 -readonly "$repo_dir/data/gitforge.db" ".timeout 15000" \
+            "SELECT count(*) FROM runners WHERE status='online';
+             SELECT count(*) FROM runners WHERE status='online'
+               AND datetime(COALESCE(last_heartbeat, created_at)) < datetime('now','-90 seconds');" \
+            2>/dev/null | tr '\n' ' ')
+        online_count=$(echo "$registry_status" | awk '{print $1}')
+        stale_count=$(echo "$registry_status" | awk '{print $2}')
+        printf 'runner registry: %s online, %s stale-online\n' \
+            "${online_count:-?}" "${stale_count:-?}"
+        if [[ "${stale_count:-1}" -gt 0 ]]; then
+            overall=1
+        fi
+    fi
+    # Host /tmp saturation (F29): docker's runc writes exec process specs
+    # under /tmp, and on hosts where /tmp is a size-capped tmpfs a full /tmp
+    # makes every `docker exec` fail with "no space left on device" — which
+    # grades innocent commits' CI jobs as failed. A saturated /tmp is a
+    # degraded deployment even though every unit answers HTTP.
+    tmp_pcent=$(df --output=pcent /tmp 2>/dev/null | tail -1 | tr -dc '0-9')
+    printf 'host /tmp: %s%% used\n' "${tmp_pcent:-?}"
+    if [[ -n "$tmp_pcent" && "$tmp_pcent" -ge 90 ]]; then
+        overall=1
+    fi
     if ((overall == 0)); then
         printf 'overall: healthy\n'
     else

@@ -245,7 +245,13 @@ Each finding: what was observed, why it matters, where the fix lands.
   is the durable half of the queue-idempotence work. **Fix lands in**:
   Phase 1 (retry the durable write with bounded backoff, and do not
   dispatch a job that has no durable row — coordinate with the
-  queue-idempotence lane).
+  queue-idempotence lane). **RESOLVED 2026-09-24** (resilience campaign,
+  branch `claude/resilience-durable-writes-20260924`): the enqueue
+  persists first via `persist_with_retry` (5 attempts x 2 s) and returns
+  `anyhow::Result`; the CI service grades the run failed and evicts its
+  registries on head-enqueue failure, and chain enqueues fail the job
+  through the engine. The job insert is an ensure, not a create, so the
+  CI service's earlier row never trips the retry budget.
 - **F22 — `.env` with the live `JWT_SECRET` tracked in a public repo.**
   `.env` is listed in `.gitignore`, but it was tracked before the ignore
   rule existed, so every commit since kept publishing it — secret value
@@ -271,7 +277,10 @@ Each finding: what was observed, why it matters, where the fix lands.
   layer. **Fix lands in**: Phase 1 (retry the lease write with bounded
   backoff like F20's trigger retry; make completion reporting idempotent
   and reconcilable — coordinate with the queue-idempotence lane and the
-  F21 durable-write fix).
+  F21 durable-write fix). **RESOLVED 2026-09-24** (same branch): lease
+  start and completion go through `persist_with_retry` at the scheduler
+  layer where the in-memory lease is still valid; a definitive
+  `Ok(false)` verdict short-circuits the retry so no work is invented.
 - **F24 — A cancelled run can be resurrected to succeeded.** After the
   orphan sweep graded run `50b35e0b` `cancelled` (F19's jobless verdict),
   its late head-job row still sat `queued`; the scheduler dispatched it
@@ -283,6 +292,12 @@ Each finding: what was observed, why it matters, where the fix lands.
   terminal run must either stay terminal or log the reversal loudly —
   grade flips need an audit trail in the finalize log, and a queued job
   whose run is terminal should be cancelled, not dispatched).
+  **RESOLVED 2026-09-24** (same branch): `PipelineRunQueries::update_
+  status` is now a single conditional UPDATE that refuses any non-
+  matching terminal rewrite (idempotent same-verdict rewrites stay
+  allowed; `finished_at` is COALESCEd to its first value) and logs both
+  verdicts on a blocked write; dispatch-side, process_queue cancels
+  queued jobs whose run is terminal. Pinned by db integration tests.
 
 ---
 
@@ -523,7 +538,13 @@ for 627 — a coherent first sprint of table-driven error-path tests.
   toolchain not in the image must rebuild and bump the tag — plus a
   runner-side preflight that rejects a job whose toolchain request is not
   baked, with an error naming the image and the missing toolchain instead
-  of a 110-second connect timeout.
+  of a 110-second connect timeout. **RESOLVED 2026-09-24** (same branch):
+  the executor's preflight (`runtime_toolchain_fetch`) rejects steps
+  invoking `rustup toolchain install/update`, `rustup update/self
+  update`, or `rustup target add` before any sandbox is acquired, with
+  the remedy in the message; `rustup component add` stays allowed (an
+  installed component resolves offline). The ci-rust image contract
+  gained the toolchain clause.
 - **F26 — Registry pollution recurrence despite the healing migration.**
   The live `runners` table still holds **29 rows** (2 `online`, 1
   stale-`online`) after PR #202's upsert-by-name registration and healing
@@ -533,4 +554,131 @@ for 627 — a coherent first sprint of table-driven error-path tests.
   migration ran on the live DB (schema/row inspection), retire stale rows
   once via `DELETE /api/runners/{id}`, and add an assertion to
   `gitforge-status` that prints the registry row count vs live runners so
-  recurrence is visible without SQL.
+  recurrence is visible without SQL. **RESOLVED 2026-09-24**: the
+  healing migration had run — the 29 rows are retired history, not
+  recurrence; the one live stale-`online` row was flipped offline and
+  the durable-side gap closed (`RunnerQueries::mark_stale_offline`,
+  called by the scheduler janitor, which previously swept only its
+  in-memory mirror). `gitforge-status` now prints online/stale-online
+  counts (RFC3339 timestamps normalized through `datetime()` before
+  comparison — raw text comparison mis-sorts same-day rows) and
+  degrades its verdict on any stale row.
+
+## 9. SQLite write-path audit (2026-09-24, resilience campaign)
+
+Swept every connection site and write path for the systemic F19–F23
+disease. Findings and state after the campaign branch:
+
+- **Connection pragmas** (`crates/gitforge-db/src/connection.rs`): WAL +
+  `synchronous=NORMAL` + `foreign_keys=1`, pinned by
+  `test_file_pool_enables_concurrency_pragmas`. busy_timeout raised
+  15 s → **30 s**: the observed 19–40 s COMMIT stalls exceeded 15 s, so
+  victims abandoned locks they would eventually have been granted,
+  cascading into missed heartbeats and lost lease writes. Readers do not
+  block in WAL, so the longer writer ceiling costs nothing on read
+  paths.
+- **Deferred-transaction upgrade hazard**: sqlx `begin()` opens
+  `BEGIN DEFERRED`; a transaction that reads then writes under WAL can
+  fail with SQLITE_BUSY *immediately, without honoring busy_timeout*.
+  All five multi-statement write transactions (`repository delete`,
+  `job completion`, `requeue_inflight`, `retire_if_idle`,
+  `review transition`) now open `BEGIN IMMEDIATE` (via
+  `pool.begin_with`), joining the two pre-existing sites (log append,
+  review claim). IMMEDIATE acquires the write lock up front — the
+  busy handler applies, the lock-hold window shrinks (no read phase
+  under the lock), and upgrade-deadlock cannot occur.
+- **One-shot write survivors**: the remaining single-statement writes
+  (status updates, heartbeats) fail fast under saturation but are
+  either retried by callers (F19/F20/F21/F23 retry paths) or safe to
+  lose by design (heartbeats recur). No new retry loops added at this
+  layer — retry belongs to the operation's owner, not the query.
+- **Connection budget**: `max_connections(5)` per process x 4 service
+  processes = ≤20 connections on one file. WAL serializes writers, and
+  with IMMEDIATE transactions each write hold is short; no pool-size
+  change needed. Revisit only if write stalls reappear after the 30 s
+  ceiling — the correct next step would be a write-through queue, not a
+  bigger timeout.
+- **Verification**: paused-time unit tests cover the retry budget and
+  definitive-Ok short-circuit; db integration tests pin the terminal
+  verdict guard, the stale-runner sweep, and idempotent sweeps.
+
+Also shipped in the same branch: F9 (rate limiter mounted on login and
+runner registration, keyed by proxy header or peer IP — previously
+built but mounted nowhere), `JWT_SECRET_FILE` credential-file support
+(systemd `LoadCredential=` shape; file wins over env; unreadable or
+empty aborts startup), and the pipeline's own coverage job (hard gate
+82%, advisory warn below 84%, `dsc-ci-rust:7` bakes llvm-tools +
+cargo-llvm-cov for the offline contract).
+
+## 10. Findings from the first pipeline run of the coverage gate (2026-09-24)
+
+The branch run (commit df316234) went fmt → clippy → test green and
+failed the new coverage job. Diagnosis, all four layers of it:
+
+- **F28 (the real one — gate miscalibration, FIXED in-branch).** The 87%
+  hard gate was calibrated from a HOST sweep (87.56% measured in
+  `gitforge-resil`), not from the sandbox the job actually runs in.
+  Two identical in-sandbox sweeps measured 82.80% (bridge network) and
+  82.82% (`--network none`) — the number is stable and network mode is
+  irrelevant; the host simply inflates coverage ~4.8pp because ambient
+  services (live GitForge API on localhost, docker socket, host git
+  config) let integration tests exercise real code paths that stay
+  dark in the sandbox. A gate must be measured where it runs. Gate
+  reset to 82 hard / 84 advisory. Lesson recorded: never calibrate a
+  CI gate from a host measurement.
+- **Runner log cap (step design).** The runner truncates captured
+  step output at 64 KB (full size logged at WARNING in
+  `gitforge_storage::job_logs`). llvm-cov chatter alone exceeds that,
+  so the gate step redirects all llvm-cov output into a temp file and
+  prints only verdict lines — the captured step output stays tiny and
+  the verdict always survives.
+- **F30 (log truncation kept the wrong end, FIXED — PR #230, shipped
+  in v0.6.9).** `bounded_put` kept the FIRST 64 KB of an oversized job
+  log and silently dropped the newest — proven by union-branch test
+  job 81e7f23f, whose stored log ends mid-test-line with no
+  `test result:` summary (meta size_bytes=65536; exit_code=0 was only
+  recoverable from result_json). The first observed truncation
+  inverted the documented behavior ("older bytes dropped first").
+  `truncate_keeping_tail` now prepends a fixed-size marker and keeps
+  the newest bytes, so summaries and failure evidence survive; the
+  coverage step's file-redirect design meant the gate verdict was
+  never actually at risk.
+- **F27 (scheduler head-of-line stall, FIXED — shipped in v0.6.8).** While
+  any `workspace-cargo-test`-class job ran, the entire CI queue
+  froze: the class is exclusive per runner, `peek_fair` put the repo
+  with the fewest queued jobs at the head every tick, and the dispatch
+  batch loop `break`s when the head finds no capacity — so nothing
+  else dispatched either. Observed live: one VIVERE cargo test
+  stalled the whole fleet; cancelling my own superseded duplicate
+  branch run (its test job would have run first on fairness) freed
+  the slot in four seconds. Resolution: the r5-ci-integrity branch
+  (PR #228, tip 1a045af0) implemented the per-tick skipped-set fix;
+  this branch absorbed it in merge 917002a4 (five enqueue test sites
+  adapted to the F21 durable-enqueue Result, scheduler+engine suites
+  green on the union); branch CI validated the fix and v0.6.8
+  shipped it.
+- **Diagnosis hygiene note.** Two reproduction attempts failed before
+  the right one: a naive `docker run -w /job` hits git's
+  `safe.directory` (dubious ownership) because the runner mounts
+  workspaces at `/workspace` and injects
+  `GIT_CONFIG_{COUNT,KEY_0,VALUE_0}` to trust exactly that path — any
+  faithful job reproduction must replicate those three env vars and the
+  mount point, plus `--memory 6144m` (GITFORGE_SANDBOX_MEMORY_MB).
+  With them, the failure reproduces deterministically; without them
+  you debug a fiction (the first repro "found" three CLI test failures
+  that do not occur in real jobs).
+- **F29 (host /tmp tmpfs saturation, OPEN — infrastructure, not
+  code).** The gate-recalibration run's fmt job failed in 12 seconds
+  with `OCI runtime exec failed: write /tmp/runc-process<rand>: no
+  space left on device` — docker's runc writes exec process specs
+  under `/tmp`, which on this host is a size-capped tmpfs (16G, shared
+  with jellyfin transcodes and other tooling). When it fills, EVERY
+  `docker exec` fails and the runner grades an innocent commit as
+  failed; nothing in the job log points at the host. Mitigations:
+  `scripts/gitforge-status` now reports `/tmp` utilization and
+  degrades the verdict at ≥90%; the step capture already preserves the
+  OCI error verbatim, which is what made this diagnosable in one step.
+  Longer term the runner could classify ENOSPC/OCI-runtime step errors
+  as infrastructure failures (distinct run status) instead of
+  charging them to the commit — noted for the F27 scheduler/runner
+  truthfulness follow-up.

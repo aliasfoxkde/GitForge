@@ -2,7 +2,7 @@
 //!
 //! These tests use in-memory SQLite databases for testing.
 
-use gitforge_common::PipelineId;
+use gitforge_common::{PipelineId, RunnerId};
 use gitforge_db::models::{
     Event, Job, Pipeline, PipelineRun, Repository, Runner, RunnerType, User,
 };
@@ -1201,5 +1201,183 @@ async fn test_database_ssh_key_registry() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+// ============================================================================
+// Terminal-verdict guard (F24) — a finished run's verdict is final
+// ============================================================================
+
+#[tokio::test]
+async fn test_pipeline_run_terminal_verdict_guard() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = User::new(
+        "verdict-owner".to_string(),
+        "verdict-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "verdict-repo".to_string(),
+        user.id,
+        "/git/verdict-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+    let pipeline = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "verdict".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    PipelineQueries::create(&pool, &pipeline).await.unwrap();
+    let run = PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "alice".to_string(),
+        "abc123".to_string(),
+    );
+    PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+    // A normal progression reaches a terminal verdict and stamps finished_at.
+    PipelineRunQueries::update_status(&pool, run.id, "running")
+        .await
+        .unwrap();
+    PipelineRunQueries::update_status(&pool, run.id, "succeeded")
+        .await
+        .unwrap();
+    let finalized = PipelineRunQueries::get(&pool, run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(finalized.status, "succeeded");
+    let finished_at = finalized.finished_at.expect("terminal run has finished_at");
+
+    // A late grader must not resurrect a cancelled run to succeeded (F24:
+    // run 50b35e0b was rewritten after the fact) — the write is a no-op.
+    for verdict in ["failed", "cancelled", "running", "pending"] {
+        PipelineRunQueries::update_status(&pool, run.id, verdict)
+            .await
+            .unwrap();
+        let unchanged = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, "succeeded", "{verdict} must be refused");
+        assert_eq!(unchanged.finished_at, Some(finished_at));
+    }
+
+    // Re-writing the same terminal verdict stays allowed: graders may
+    // re-finalize after a restart without wedging.
+    PipelineRunQueries::update_status(&pool, run.id, "succeeded")
+        .await
+        .unwrap();
+    assert_eq!(
+        PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "succeeded"
+    );
+
+    // A non-terminal run is still free to move anywhere.
+    let fresh = PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "bob".to_string(),
+        "def456".to_string(),
+    );
+    PipelineRunQueries::create(&pool, &fresh).await.unwrap();
+    PipelineRunQueries::update_status(&pool, fresh.id, "running")
+        .await
+        .unwrap();
+    PipelineRunQueries::update_status(&pool, fresh.id, "failed")
+        .await
+        .unwrap();
+    assert_eq!(
+        PipelineRunQueries::get(&pool, fresh.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "failed"
+    );
+}
+
+// ============================================================================
+// Durable stale-runner sweep (F26) — online must not outlive its process
+// ============================================================================
+
+#[tokio::test]
+async fn test_runner_mark_stale_offline() {
+    use chrono::{Duration, Utc};
+
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let fresh = Runner::new("fresh".to_string(), RunnerType::Docker, 2);
+    RunnerQueries::create(&pool, &fresh).await.unwrap();
+
+    // Heartbeat present but older than the janitor threshold.
+    let stale_heartbeat = Runner::new("stale-heartbeat".to_string(), RunnerType::Docker, 2);
+    RunnerQueries::create(&pool, &stale_heartbeat)
+        .await
+        .unwrap();
+
+    // No heartbeat ever arrived; registration itself is the last activity.
+    let stale_registration = Runner::new("stale-registration".to_string(), RunnerType::Docker, 2);
+    RunnerQueries::create(&pool, &stale_registration)
+        .await
+        .unwrap();
+
+    // Already offline — must be left untouched.
+    let retired = Runner::new("retired".to_string(), RunnerType::Docker, 2);
+    RunnerQueries::create(&pool, &retired).await.unwrap();
+    RunnerQueries::update_status(&pool, retired.id, "offline")
+        .await
+        .unwrap();
+
+    // Backdate directly: the query layer owns the sweep threshold, the
+    // fixture owns the clock.
+    let old = (Utc::now() - Duration::minutes(10)).to_rfc3339();
+    sqlx::query("UPDATE runners SET last_heartbeat = ? WHERE id = ?")
+        .bind(&old)
+        .bind(stale_heartbeat.id.to_string())
+        .execute(pool.pool())
+        .await
+        .unwrap();
+    // Runner::new seeds a fresh heartbeat, so simulate the never-beat case
+    // explicitly: no heartbeat ever arrived, registration is the last
+    // activity and it predates the threshold.
+    sqlx::query(
+        "UPDATE runners SET last_heartbeat = NULL, created_at = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(&old)
+    .bind(&old)
+    .bind(stale_registration.id.to_string())
+    .execute(pool.pool())
+    .await
+    .unwrap();
+
+    let flipped = RunnerQueries::mark_stale_offline(&pool, 90).await.unwrap();
+    assert_eq!(flipped, 2, "exactly the two stale online rows flip");
+
+    let status = |id: RunnerId| {
+        let pool = pool.clone();
+        async move { RunnerQueries::get(&pool, id).await.unwrap().unwrap().status }
+    };
+    assert_eq!(status(fresh.id).await, "online");
+    assert_eq!(status(stale_heartbeat.id).await, "offline");
+    assert_eq!(status(stale_registration.id).await, "offline");
+    assert_eq!(status(retired.id).await, "offline");
+
+    // Idempotent: a second sweep finds nothing left to flip.
+    assert_eq!(
+        RunnerQueries::mark_stale_offline(&pool, 90).await.unwrap(),
+        0
     );
 }

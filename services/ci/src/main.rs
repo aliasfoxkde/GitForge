@@ -1588,6 +1588,17 @@ async fn handle_push_event(
                 "failed",
             )
             .await;
+            pipeline_registry.write().await.remove(&state.run_id);
+            if let Some(path) = run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .remove(&state.run_id)
+                .flatten()
+            {
+                tokio::spawn(async move {
+                    let _ = tokio::fs::remove_dir_all(path).await;
+                });
+            }
             return Err(error);
         }
     }
@@ -1860,9 +1871,33 @@ async fn enqueue_ready_jobs(
             continue;
         };
         let plan = execution_plan(&definition, workspace_path.as_deref());
-        scheduler
+        if let Err(error) = scheduler
             .enqueue_with_definition_and_image_and_timeout(job_id, run_id, repo_id, plan)
-            .await;
+            .await
+        {
+            // F21: the chain cannot advance through a job with no durable
+            // row. Fail the job so the run grades `failed` with a visible
+            // cause instead of stalling as an incomplete chain for the
+            // reconciler to sweep up later.
+            tracing::error!(
+                run = %run_id,
+                job = %job_id,
+                %error,
+                "ready job enqueue failed; failing the chain"
+            );
+            if let Err(fail_error) = engine
+                .fail_job(job_id, -1, format!("durable enqueue failed: {error}"))
+                .await
+            {
+                tracing::error!(
+                    run = %run_id,
+                    job = %job_id,
+                    error = %fail_error,
+                    "failed to mark enqueue failure on the engine"
+                );
+            }
+            continue;
+        }
         tracing::debug!("enqueued job {} for pipeline run {}", job_id, run_id);
     }
 }

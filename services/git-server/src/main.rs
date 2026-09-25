@@ -1214,7 +1214,13 @@ mod tests {
     #[tokio::test]
     async fn test_ci_trigger_hands_off_to_background_when_storm_outlasts_window() {
         let (pool, path) = storm_pool("handoff").await;
-        let (locked, storm) = hold_write_lock(&pool, 16).await;
+        // The hold MUST exceed the pool's 30 s busy timeout (connection.rs):
+        // a blocked single-statement insert waits inside SQLite's busy
+        // handler and simply succeeds when a shorter storm releases, which
+        // is honest behavior — but then no deferral ever happens and this
+        // test would assert the wrong path. A 35 s hold forces the first
+        // attempt to return SQLITE_BUSY at 30 s.
+        let (locked, storm) = hold_write_lock(&pool, 35).await;
         locked.await.expect("storm lock signal");
 
         // One-second window: the first attempt burns the entire busy
@@ -1241,7 +1247,7 @@ mod tests {
         assert_eq!(attempts, 1, "deferral must happen at the first failure");
 
         // The spawned continuation keeps retrying every max_backoff; the
-        // storm releases at 16 s, so the row must land inside the poll
+        // storm releases at 35 s, so the row must land inside the poll
         // window. Nothing else inserts this row — if it never appears, the
         // trigger was dropped, which is the F42 defect itself.
         let mut landed = false;

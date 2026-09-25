@@ -19,10 +19,12 @@ use tokio::time::{timeout, Duration, Instant};
 /// Default number of pre-warmed containers per image
 const POOL_SIZE: usize = 2;
 
-/// Sandbox acquisition ceiling in seconds. The pool copies whole layer
-/// stacks per container create (vfs storage), which on a loaded host can
+/// Sandbox acquisition ceiling in seconds. Container creation under load
+/// (whole layer-stack copies on the daemon's old vfs storage) could
 /// legitimately take minutes, so operators can raise the 60-second default
-/// instead of watching jobs fail before the daemon ever answered.
+/// instead of watching jobs fail before the daemon ever answered. Storage
+/// has since moved to overlay2 and creation is fast, but the escape hatch
+/// stays for loaded hosts.
 fn sandbox_acquire_timeout() -> Duration {
     const DEFAULT_SECS: u64 = 60;
     Duration::from_secs(
@@ -78,6 +80,44 @@ fn first_line(text: &str) -> &str {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("<no diagnostic output>")
+}
+
+/// Commands that unconditionally download over the network at job runtime.
+/// `rustup component add` is deliberately absent: rustup short-circuits an
+/// already-installed component without touching the network, so pipeline
+/// steps may keep using it.
+const RUNTIME_TOOLCHAIN_FETCHES: &[&str] = &[
+    "rustup toolchain install",
+    "rustup toolchain update",
+    "rustup update",
+    "rustup self update",
+    "rustup target add",
+];
+
+/// Return the first step whose command fetches a toolchain over the
+/// network, for the runner's preflight (F25). Scanning is line-based and
+/// skips comment lines; quoting is not parsed, so a quoted mention inside
+/// an executed command still trips it — a conservative trade for a check
+/// whose false negative is a stalled run.
+fn runtime_toolchain_fetch(steps: &[JobStep]) -> Option<String> {
+    for step in steps {
+        for line in step.run.lines() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            let lowered = line.to_ascii_lowercase();
+            for pattern in RUNTIME_TOOLCHAIN_FETCHES {
+                if lowered.contains(pattern) {
+                    return Some(format!(
+                        "step '{}' fetches a toolchain at runtime",
+                        step.name
+                    ));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// A pool of pre-warmed container instances
@@ -308,6 +348,12 @@ impl JobExecutor {
         self.execute_with_output(job, None).await
     }
 
+    /// Fail the job in seconds — before any sandbox is acquired — when a
+    /// step would fetch a toolchain over the network at runtime (F25).
+    fn job_preflight_failure(job: &ExecutableJob) -> Option<String> {
+        runtime_toolchain_fetch(&job.steps)
+    }
+
     /// Best-effort removal of containers left by a failed acquisition.
     ///
     /// When acquisition is abandoned (timeout or creation error) the Docker
@@ -332,6 +378,36 @@ impl JobExecutor {
         let job_timeout = Duration::from_secs(job.timeout_secs.clamp(5, 24 * 60 * 60));
         let deadline = Instant::now() + job_timeout;
         tracing::info!("executing job {}", job_id);
+
+        // Toolchain preflight (F25): the sandbox has no egress, so a step
+        // that tries to download a toolchain stalls mid-run and dies with a
+        // truncated-transfer error after burning the job's whole budget
+        // (run 6d5bac16 / job 2bb48a38). Refuse the job up front with the
+        // remedy in the message instead. This is a policy refusal, not a
+        // backend fault — the infrastructure flag stays false.
+        if let Some(violation) = Self::job_preflight_failure(&job) {
+            let completed_at = chrono::Utc::now();
+            tracing::warn!(%job_id, step = %violation, "toolchain preflight failed");
+            return JobResult {
+                job_id,
+                success: false,
+                exit_code: -1,
+                step_results: Vec::new(),
+                artifacts: Vec::new(),
+                logs: None,
+                started_at,
+                completed_at,
+                infrastructure_failure: false,
+                error: Some(format!(
+                    "toolchain preflight failed: {violation}. The job image is \
+                     offline by contract (CARGO_NET_OFFLINE=true, no egress); \
+                     toolchains must be baked into the image at build time. \
+                     Add the toolchain to infrastructure/docker/ci-rust.Dockerfile, \
+                     rebuild, and bump the image tag."
+                )),
+                workspace_path: job.working_dir.clone(),
+            };
+        }
 
         // Acquire container from pool. Both failure shapes here are the
         // container backend failing, not the commit (F40's wedged podman
@@ -1105,5 +1181,65 @@ mod tests {
         let (sha, bytes) = JobResult::compute_output_sha(&artifacts);
         assert!(!sha.is_empty());
         assert_eq!(bytes, 300); // 100 + 200
+    }
+
+    // --- toolchain preflight (F25) --------------------------------------
+
+    fn step(name: &str, run: &str) -> JobStep {
+        JobStep::new(name, run)
+    }
+
+    #[test]
+    fn test_preflight_flags_runtime_toolchain_fetch() {
+        // The exact F25 failure: rustup downloading a toolchain mid-run
+        // against a no-egress sandbox.
+        let job = ExecutableJob::new(
+            JobId::new(),
+            PipelineRunId::new(),
+            "dsc-ci-rust:5".to_string(),
+        )
+        .with_steps(vec![step(
+            "build",
+            "rustup toolchain install 1.95 && cargo build --locked",
+        )]);
+        let violation = runtime_toolchain_fetch(&job.steps);
+        assert!(violation.is_some(), "toolchain install must be refused");
+        assert!(violation.unwrap().contains("build"));
+
+        for run in [
+            "rustup update && cargo build",
+            "rustup self update",
+            "rustup target add wasm32-unknown-unknown",
+            "rustup toolchain update stable",
+        ] {
+            let steps = vec![step("sneaky", run)];
+            assert!(
+                runtime_toolchain_fetch(&steps).is_some(),
+                "must refuse: {run}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_preflight_allows_offline_contract_steps() {
+        // Normal pipeline steps, and rustup operations that resolve without
+        // the network (component already baked into the image).
+        let steps = vec![
+            step("fmt", "cargo fmt --all -- --check"),
+            step(
+                "lint",
+                "cargo clippy --workspace --all-targets -- -D warnings",
+            ),
+            step("build", "cargo build --locked --offline"),
+            step("components", "rustup component add clippy rustfmt"),
+            step(
+                "comment",
+                "# rustup toolchain install is forbidden\ncargo test",
+            ),
+        ];
+        assert!(
+            runtime_toolchain_fetch(&steps).is_none(),
+            "offline-contract steps must pass preflight"
+        );
     }
 }

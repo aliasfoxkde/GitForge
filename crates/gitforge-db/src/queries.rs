@@ -287,7 +287,7 @@ impl RepoQueries {
         // restrictive to protect history during ordinary mutations.
         let mut tx = pool
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| Error::database(format!("failed to begin repository delete: {e}")))?;
         let repo_id = id.to_string();
@@ -728,22 +728,54 @@ impl PipelineRunQueries {
         }
     }
 
-    /// Update pipeline run status
+    /// Update pipeline run status.
+    ///
+    /// A terminal verdict is final: once a run is `succeeded`, `failed`,
+    /// `cancelled`, or timed out, later graders cannot rewrite it (F24 — a
+    /// cancelled run whose late head job still executed was resurrected to
+    /// `succeeded` here, with honest work but dishonest bookkeeping). The
+    /// guard is a single conditional UPDATE so two graders racing cannot
+    /// both pass it; a blocked write is a no-op that logs both verdicts.
+    /// Re-writing the same terminal status stays allowed (idempotent
+    /// re-finalize after a restart).
     pub async fn update_status(pool: &Pool, id: PipelineRunId, status: &str) -> Result<()> {
         let finished_at = matches!(
             status,
             "succeeded" | "failed" | "cancelled" | "timed_out" | "timeout" | "timed-out"
         )
         .then(|| Utc::now().to_rfc3339());
-        sqlx::query(
-            "UPDATE pipeline_runs SET status = ?, finished_at = COALESCE(?, finished_at) WHERE id = ?",
+        let result = sqlx::query(
+            "UPDATE pipeline_runs SET status = ?, finished_at = COALESCE(finished_at, ?) \
+             WHERE id = ? AND (status IS NULL OR status NOT IN \
+             ('succeeded','failed','cancelled','timed_out','timeout','timed-out') OR status = ?)",
         )
-            .bind(status)
-            .bind(finished_at)
-            .bind(id.to_string())
-            .execute(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to update pipeline run status: {e}")))?;
+        .bind(status)
+        .bind(finished_at.clone())
+        .bind(id.to_string())
+        .bind(status)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to update pipeline run status: {e}")))?;
+        if result.rows_affected() == 0 {
+            let durable =
+                sqlx::query_scalar::<_, String>("SELECT status FROM pipeline_runs WHERE id = ?")
+                    .bind(id.to_string())
+                    .fetch_optional(pool.pool())
+                    .await
+                    .map_err(|e| {
+                        Error::database(format!("failed to read pipeline run status: {e}"))
+                    })?;
+            if let Some(durable) = durable {
+                if durable != status {
+                    tracing::warn!(
+                        run = %id,
+                        durable = %durable,
+                        attempted = %status,
+                        "refusing to rewrite a terminal run verdict (F24)"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1369,7 +1401,7 @@ impl JobQueries {
         }
         let mut tx = pool
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| Error::database(format!("failed to begin completion: {e}")))?;
         let updated = sqlx::query(
@@ -1496,7 +1528,7 @@ impl JobQueries {
     pub async fn requeue_inflight(pool: &Pool) -> Result<u64> {
         let mut transaction = pool
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| Error::database(format!("failed to begin recovery: {e}")))?;
         let queued_with_runner = sqlx::query(
@@ -1685,6 +1717,32 @@ impl RunnerQueries {
         Ok(())
     }
 
+    /// Mark every `online` runner whose last activity (heartbeat, or
+    /// registration when no heartbeat ever arrived) is older than
+    /// `timeout_secs` as `offline`, and return how many rows changed.
+    ///
+    /// This is the durable counterpart of the scheduler's in-memory sweep:
+    /// a row registered by a process that has since restarted is invisible
+    /// to the memory sweep forever, and its stale `online` status is
+    /// exactly the "online status lies" defect (F3/F26 — observed live as a
+    /// legacy row kept `online` for two days past its last heartbeat).
+    pub async fn mark_stale_offline(pool: &Pool, timeout_secs: i64) -> Result<u64> {
+        // Stored timestamps are RFC3339 TEXT: normalize through datetime()
+        // before comparing, or same-day rows sort wrong ('T' > ' ' makes a
+        // 10-minute-old heartbeat look newer than 90 seconds ago).
+        let result = sqlx::query(
+            "UPDATE runners SET status = 'offline' \
+             WHERE status = 'online' \
+               AND datetime(COALESCE(last_heartbeat, created_at)) < \
+                   datetime('now', '-' || ? || ' seconds')",
+        )
+        .bind(timeout_secs)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to mark stale runners offline: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
     /// Retire a runner without removing its audit record.
     ///
     /// Retirement is refused while the runner owns an assigned or running
@@ -1695,7 +1753,7 @@ impl RunnerQueries {
     pub async fn retire_if_idle(pool: &Pool, id: RunnerId) -> Result<RunnerRetirement> {
         let mut transaction = pool
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| Error::database(format!("failed to begin runner retirement: {e}")))?;
 
@@ -2131,7 +2189,7 @@ impl ReviewQueries {
     ) -> Result<Option<ReviewRun>> {
         let mut tx = pool
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| Error::database(format!("failed to begin review transition: {e}")))?;
 

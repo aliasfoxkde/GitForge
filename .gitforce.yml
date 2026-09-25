@@ -12,18 +12,22 @@
 #   directory and corrupt each other's build locks.
 # - `environment: {}` is required by the parser (PipelineDefinition has no
 #   serde default) even though it is never forwarded.
-# - The image is pre-built on the host (dsc-ci-rust:6 — cargo, clippy,
-#   rustfmt, and the GitForge workspace cargo registry cache baked in for
-#   offline builds). Rebuild and bump the tag whenever Cargo.lock changes —
-#   a stale cache fails every cargo job in seconds with "candidate versions
-#   found which didn't match" (v6 exists because v5 dropped openssh-client,
-#   which the hermetic ssh-protocol tests spawn via ssh-keygen; v5 itself
-#   existed because the audited-deps bump moved jsonwebtoken to 11.1.0
-#   ahead of v4's cache). The recipe lives at
-#   infrastructure/docker/ci-rust.Dockerfile. The image must exist before
-#   the first run: the NAS daemon's vfs storage driver plus the runner's
-#   hard 60-second sandbox-acquisition cap make a pull-at-run-time a
-#   guaranteed failure.
+# - The image is pre-built on the host (dsc-ci-rust:7 — cargo, clippy,
+#   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, and the
+#   GitForge workspace cargo registry cache baked in for offline builds).
+#   Rebuild and bump the tag whenever Cargo.lock changes or the baked
+#   tooling changes — a stale cache fails every cargo job in seconds with
+#   "candidate versions found which didn't match" (v7 adds the coverage
+#   toolchain; v6 existed because v5 dropped openssh-client, which the
+#   hermetic ssh-protocol tests spawn via ssh-keygen; v5 itself existed
+#   because the audited-deps bump moved jsonwebtoken to 11.1.0 ahead of
+#   v4's cache). The recipe lives at
+#   infrastructure/docker/ci-rust.Dockerfile. The image must exist on the
+#   host before the first run: the runner's hard 60-second
+#   sandbox-acquisition cap rules out building or pulling at run time.
+#   (The daemon moved from the vfs storage driver to overlay2 on
+#   2026-09-24 — container jobs got ~10x faster — but the pre-build rule
+#   stands.)
 # - Cargo state is cold in the container (no cache mount), so clippy and
 #   test each pay a full dependency compile; the generous timeouts absorb
 #   that rather than gating on a cache setup this repo doesn't own.
@@ -34,14 +38,14 @@ trigger_on:
 environment: {}
 jobs:
   - name: fmt
-    image: dsc-ci-rust:6
+    image: dsc-ci-rust:7
     steps:
       - name: Check formatting
         run: cargo fmt --all -- --check
     timeout: 15m
 
   - name: clippy
-    image: dsc-ci-rust:6
+    image: dsc-ci-rust:7
     needs: [fmt]
     steps:
       - name: Strict lint (zero warnings)
@@ -49,16 +53,73 @@ jobs:
     timeout: 60m
 
   - name: test
-    image: dsc-ci-rust:6
+    image: dsc-ci-rust:7
     needs: [clippy]
     steps:
       - name: Workspace test suite
-        # Bounded test parallelism: with the daemon's vfs storage driver the
-        # in-container fork/exec of the real `git` children spawned by the
-        # gitforge-core http tests is slow enough that at default parallelism
-        # (= host core count) the parent's request write races the child's
-        # readiness and fails with EPIPE — 3 of 4 runs lost that race while
-        # the same suite passed on the host. Two threads keeps the suite
-        # well inside the 60m timeout and makes the gate deterministic.
+        # Bounded test parallelism. Under the daemon's old vfs storage
+        # driver, in-container fork/exec of the real `git` children spawned
+        # by the gitforge-core http tests was slow enough that at default
+        # parallelism (= host core count) the parent's request write raced
+        # the child's readiness and failed with EPIPE (3 of 4 runs lost
+        # that race while the same suite passed on the host). The daemon
+        # has since moved to overlay2 and jobs run ~10x faster, but the
+        # two-thread bound stays: it keeps the suite well inside the 60m
+        # timeout and the gate deterministic without re-litigating default
+        # parallelism on every image refresh.
         run: cargo test --workspace -- --test-threads=2
     timeout: 60m
+
+  - name: coverage
+    image: dsc-ci-rust:7
+    needs: [test]
+    steps:
+      - name: Line coverage gate (fail 82, warn 84)
+        # Thresholds are calibrated AGAINST THE SANDBOX the job runs in:
+        # two identical in-sandbox sweeps of the campaign branch measured
+        # 82.80% (bridge network) and 82.82% (--network none) — stable to
+        # within noise. The original 87% came from a HOST sweep and was a
+        # calibration mistake: on the host, ambient services (a live
+        # GitForge API on localhost, the docker socket, host git config)
+        # let integration tests exercise real paths and inflate the
+        # number by ~4.8pp. A gate must be measured where it runs.
+        # Hard gate 82 (0.8pp below the measured floor), advisory target
+        # 84 to grow into. llvm-cov re-runs the test suite instrumented,
+        # so it inherits the bounded test parallelism the test job
+        # documents. Steps run under sh (dash): no pipefail, and a `tee`
+        # pipeline would hide the gate's exit code, so the run is
+        # captured through an if-redirect and printed afterwards.
+        #
+        # The runner caps the captured step log at 64 KB (the OLDEST
+        # bytes are dropped and a truncation marker is prepended — F30),
+        # and llvm-cov's compile+test chatter alone exceeds that. This
+        # step never relies on the cap: all llvm-cov output is
+        # redirected into a temp file inside the container, so the
+        # captured step output is only the few verdict lines echoed
+        # here, and they always survive intact.
+        run: |
+          summary=$(mktemp)
+          if cargo llvm-cov --workspace --all-targets --summary-only \
+               --fail-under-lines 82 -- --test-threads=2 >"$summary" 2>&1
+          then gate=ok
+          else gate=fail
+          fi
+          pct=$(awk '$1=="TOTAL" {gsub(/%/,"",$10); print $10; exit}' "$summary")
+          if [ -n "$pct" ]; then
+            echo "line coverage: ${pct}%"
+          else
+            echo "FAIL: coverage summary unparsable (no TOTAL row); capture tail follows"
+            tail -40 "$summary"
+            exit 1
+          fi
+          if [ "$gate" = fail ]; then
+            echo "FAIL: line coverage ${pct}% is below the 82% hard gate; capture tail follows"
+            tail -40 "$summary"
+            exit 1
+          fi
+          if awk "BEGIN{exit !($pct < 84.0)}"; then
+            echo "WARN: line coverage ${pct}% is below the 84% advisory target"
+          else
+            echo "line coverage ${pct}% meets the 84% target"
+          fi
+    timeout: 90m

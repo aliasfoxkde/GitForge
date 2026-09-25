@@ -1153,7 +1153,8 @@ mod tests {
                 vec!["cargo test".to_string()],
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         let artifact_root =
             std::env::temp_dir().join(format!("gitforge-scheduler-artifacts-{}", Uuid::new_v4()));
         let artifact_storage = Arc::new(FileStorage::new(&artifact_root).await.unwrap());
@@ -1465,7 +1466,8 @@ mod tests {
                 vec!["/bin/true".to_string()],
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         scheduler.process_queue().await;
         let lease_token = scheduler
             .ensure_job_lease(job_id)
@@ -1589,7 +1591,8 @@ mod tests {
         let job_id = JobId::new();
         scheduler
             .enqueue_with_definition(job_id, run.id, repo.id, vec!["/bin/true".to_string()], None)
-            .await;
+            .await
+            .expect("enqueue must persist against the seeded run");
         scheduler.process_queue().await;
         let lease = scheduler
             .ensure_job_lease(job_id)
@@ -1761,7 +1764,8 @@ mod tests {
                 gitforge_common::PipelineRunId::new(),
                 gitforge_common::RepoId::new(),
             )
-            .await;
+            .await
+            .unwrap();
         let app: Router = scheduler_routes_with_tokens(
             state,
             Some(Arc::from("runner-secret")),

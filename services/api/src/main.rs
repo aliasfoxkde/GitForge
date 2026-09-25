@@ -120,7 +120,7 @@ pub fn validate_cli_args(args: impl IntoIterator<Item = String>) -> anyhow::Resu
     }
 
     anyhow::bail!(
-        "unsupported API command-line arguments: {}; configure the service with environment variables (PORT, DATABASE_URL, JWT_SECRET)",
+        "unsupported API command-line arguments: {}; configure the service with environment variables (PORT, DATABASE_URL, JWT_SECRET or JWT_SECRET_FILE)",
         args.join(" ")
     )
 }
@@ -133,11 +133,44 @@ pub struct ServerConfig {
     pub database_url: String,
 }
 
+/// Resolve the JWT signing secret.
+///
+/// `JWT_SECRET_FILE` points at a file whose contents are the secret (the
+/// systemd `LoadCredential=`/docker-secrets pattern: the secret lives on
+/// disk at mode 0600 instead of in the unit environment, where
+/// `systemctl show -p Environment` and `/proc/<pid>/environ` leak it to
+/// every same-user process). It takes precedence over `JWT_SECRET` because
+/// mounting a credential file is the more deliberate deployment choice.
+/// Surrounding whitespace is trimmed — editors and `echo >>` append a
+/// newline that would otherwise silently become part of the HMAC key.
+/// Fails fast (panic at startup) when the variable is missing, the file is
+/// unreadable, or the result is empty: a server with no signing key must
+/// not come up at all.
+pub fn resolve_jwt_secret() -> String {
+    if let Ok(path) = std::env::var("JWT_SECRET_FILE") {
+        if !path.is_empty() {
+            let secret = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("JWT_SECRET_FILE {path} is unreadable: {error}"));
+            let secret = secret.trim();
+            assert!(
+                !secret.is_empty(),
+                "JWT_SECRET_FILE {path} must contain a non-empty secret"
+            );
+            return secret.to_string();
+        }
+    }
+    std::env::var("JWT_SECRET").unwrap_or_else(|_| {
+        panic!(
+            "JWT_SECRET (or JWT_SECRET_FILE) environment variable must be set \
+             - no dev fallback in production"
+        )
+    })
+}
+
 /// Load server configuration from environment
-/// Fails if JWT_SECRET is not set (no dev fallback in production)
+/// Fails if neither JWT_SECRET_FILE nor JWT_SECRET yields a secret
 pub fn load_config() -> ServerConfig {
-    let jwt_secret = std::env::var("JWT_SECRET")
-        .expect("JWT_SECRET environment variable must be set - no dev fallback in production");
+    let jwt_secret = resolve_jwt_secret();
 
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "42780".to_string())
@@ -190,6 +223,7 @@ mod tests {
 
     fn clear_env() {
         std::env::remove_var("JWT_SECRET");
+        std::env::remove_var("JWT_SECRET_FILE");
         std::env::remove_var("PORT");
         std::env::remove_var("DATABASE_URL");
     }
@@ -208,6 +242,56 @@ mod tests {
             result.is_err(),
             "load_config should panic without JWT_SECRET"
         );
+    }
+
+    #[test]
+    fn test_jwt_secret_file_takes_precedence_and_trims() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+
+        // The credential-file pattern (systemd LoadCredential=): secret on
+        // disk, and `echo >>` newline must not become part of the key.
+        let path = std::env::temp_dir().join("gitforge-test-jwt-secret-file");
+        std::fs::write(&path, "file-based-secret\n").unwrap();
+        std::env::set_var("JWT_SECRET_FILE", &path);
+        std::env::set_var("JWT_SECRET", "env-secret-should-lose");
+
+        let config = load_config();
+        assert_eq!(config.jwt_secret, "file-based-secret");
+
+        std::fs::remove_file(&path).ok();
+        clear_env();
+    }
+
+    #[test]
+    fn test_jwt_secret_file_missing_fails_fast() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        std::env::set_var("JWT_SECRET_FILE", "/nonexistent/gitforge/secret");
+        std::env::set_var("JWT_SECRET", "env-fallback-present");
+
+        // A configured-but-unreadable secret file must abort startup rather
+        // than silently falling back to the environment variable.
+        let result = std::panic::catch_unwind(load_config);
+        assert!(result.is_err(), "unreadable JWT_SECRET_FILE must fail fast");
+
+        clear_env();
+    }
+
+    #[test]
+    fn test_jwt_secret_file_empty_content_fails_fast() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+
+        let path = std::env::temp_dir().join("gitforge-test-jwt-secret-empty");
+        std::fs::write(&path, "\n").unwrap();
+        std::env::set_var("JWT_SECRET_FILE", &path);
+
+        let result = std::panic::catch_unwind(load_config);
+        assert!(result.is_err(), "empty secret file must fail fast");
+
+        std::fs::remove_file(&path).ok();
+        clear_env();
     }
 
     #[test]
