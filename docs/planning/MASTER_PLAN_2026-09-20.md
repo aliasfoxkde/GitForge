@@ -682,3 +682,115 @@ failed the new coverage job. Diagnosis, all four layers of it:
   as infrastructure failures (distinct run status) instead of
   charging them to the commit — noted for the F27 scheduler/runner
   truthfulness follow-up.
+## 11. Durability deploy + protocol findings (2026-09-25 validation campaign)
+
+A full validation pass over the freshly-cut services turned into a
+mini-campaign: three new defects found, root-caused, fixed, and shipped
+the same day, plus the r6-platform-durability line deployed.
+
+- **F29 (host /tmp tmpfs saturation) — FIXED, r6-platform-durability
+  3efe9426.** The parallel r6 campaign implemented the planned
+  infrastructure-failure classification (BackendHealth report; runner
+  grades container-backend failures as infrastructure instead of
+  charging the commit a red X). Shipped in v0.6.10 (bundle
+  gitforge-64da53b7-20260925, instance runs 5710ff8f and e9a7d325
+  green, 4/4 jobs each). My own F29 implementation was superseded
+  before it started — checked `git ls-remote gitforge-ci main` first
+  this time and pivoted to deploying the existing fix.
+
+- **F31 (durable runs strand non-terminal forever) — FIXED by r6's
+  reconciler; four live specimens repaired by hand.** Shapes observed
+  in the wild: (a) zero-job run never finalized — `finalize_pipeline_
+  if_terminal` no-ops on empty job lists (4fb04502, then 936a44ef
+  produced live the same afternoon, graded failed by hand); (b)
+  all-terminal run never graded — `fence_actions` only inspects
+  engine-Running jobs, so 89bbd51a (r6's own merge run) sat ungraded
+  for hours; (c) job row with finished_at + result_json written but
+  status/started_at lost (bd5c8664 — first wild specimen of the
+  F21/F23 one-shot-write-loss class). All repaired with evidence-
+  preserving SQL (status graded, finished_at stamped; no rows
+  rewritten). r6's `reconcile_orphaned_runs` + `sweep_terminal_
+  workspaces` + startup `rebuild_live_engines` finalize future strands
+  without operator help. Residual: `reconcile_expired` only covers
+  `running` rows with `started_at`, so shape-c queued-row evidence is
+  still not self-healing — verify post-swap whether the reconciler
+  grades it; if not, an evidence-aware repair query is the follow-up.
+
+- **F32 (gzip smart-HTTP request bodies, FIXED — PR #235, shipped in
+  v0.6.11, live-verified).** Every full clone of a large repository
+  failed with HTTP 500 in ~25 ms across the entire v0.6.x line: git
+  gzips the upload-pack POST body once the negotiation crosses its
+  compression threshold, and the server piped the still-compressed
+  bytes into `git upload-pack` stdin, which read the gzip magic
+  `\x1f\x8b\x08` as a pkt-line header ("bad line length character").
+  Small repos never crossed the threshold, which is why ls-remote,
+  pushes, and scratch-repo clones worked and the defect hid. Fix:
+  decode `Content-Encoding: gzip`/`x-gzip` bodies in both smart-HTTP
+  POST handlers (mirroring git's own http-backend), with a
+  decompressed-size cap equal to the raw-body limit. Verified live:
+  the 271 MB / 8745-object clone of mkinney/gitforge completes (exit
+  0, HEAD at merge commit) after failing 100% of attempts on
+  v0.6.9/v0.6.10.
+
+- **F33 (gateway boot takes a lock lottery, FIXED — PR #237).** The
+  startup migration ran an unconditional `UPDATE runners ...` every
+  boot; its read snapshot came from the `NOT IN (SELECT ...)` subquery,
+  so the read→write escalation could return the upgrade-to-write BUSY
+  that ignores the busy handler in WAL — the exact trap the pool's own
+  connection comment documents. Under CI write churn the gateway lost
+  the lottery 11 boots in a row (crash-loop, ~5 minutes). Concurrent
+  `BEGIN IMMEDIATE; COMMIT;` probes succeeded instantly, proving the
+  lock was never held long — the escalation just always lost. Fix:
+  check read-only first and skip the write when no duplicates exist
+  (normal boots now take no write lock at all); when duplicates exist,
+  run inside `BEGIN IMMEDIATE` like every other write path.
+
+- **F34 (shallow clones never worked over HTTP, FIXED — PR #237,
+  second commit).** `git clone --depth 1` failed on both protocol
+  versions: the hand-built upload-pack ref advertisement omitted the
+  `shallow` capability, and clients refuse to send depth requests
+  unless it is advertised ("Server does not support shallow clients").
+  The spawned upload-pack child fully implements shallow, so
+  advertising `shallow deepen-relative` is sufficient; an end-to-end
+  test drives a depth-1 request through the handler and asserts the
+  shallow boundary line and pack. (The earlier "shallow is broken"
+  note conflated this with F32's 500s — distinct root causes.)
+
+- **Earlier protocol findings resolved on v0.6.11.** HTTP push to a
+  brand-new repository (ref lands, then 500) no longer reproduces —
+  push exits 0 with clean output and the ref verifies via ls-remote.
+  SSH round-trip (register key → push → ls-remote) green on the new
+  git-server.
+
+- **F35 (host /tmp tmpfs exhaustion → CI-wide false-RED burst,
+  incident 2026-09-25 ~19:00–19:25Z, mitigation in place).** /tmp
+  (16G tmpfs shared with jellyfin and other tooling — the same F29
+  surface) hit 100%. Within minutes the DB showed 6–25 s statement
+  stalls; the v0.6.9 ci engine then received "completion received for
+  unknown pipeline run" and the orphan finalizer graded five runs
+  `failed` (`incomplete_chain=true`) — some with ALL their jobs green,
+  one (mine, a77c1191) with the chain cut between clippy and test.
+  Direction is safe (no false green — #212's failed-grading is the
+  designed anti-false-green behavior) but innocent commits were
+  charged. Mitigations: freed my own validation debris (truncate, not
+  unlink — /tmp deletion is operator-owned), restored 91%; re-ran the
+  gate run; the ci+runner swap onto the r6 line reduces the
+  engine-amnesia class (rebuild_live_engines), and r6's infrastructure
+  classification covers the OCI side. Open question for the operator:
+  what legitimately holds ~6.5G of deleted-but-open tmpfs (likely
+  jellyfin transcode buffers) — a service restart would reclaim it.
+
+- **Deploy state (final, 2026-09-25 ~20:15Z).** Both mains at e1b29a9c
+  (PR #234 r6 durability, #235 F32, #237 F33/F34). Release bundle
+  gitforge-156e249a-20260925 (gate run e814db76, 4/4 — fmt, clippy,
+  test, coverage) promoted; api + git-server live on it and
+  live-verified (F32 full clone exit 0; F34 shallow depth-1 clones
+  exit 0 on protocol v0 AND v2; F33 clean boots, zero
+  "database is locked" signatures). ci + runner follow via the drain
+  gate (running=0) to honor in-flight tenant jobs; queued work
+  survives the restart via durable enqueue and rebuild_live_engines.
+  Operational note: the drop-in ExecStart pin is contended — another
+  agent's deploy loop re-pins from the promote-current symlink and
+  restarts services every few minutes; promoting first made their
+  loop converge onto this bundle (their restart at 20:03:03Z landed
+  on gitforge-156e249a-20260925).
