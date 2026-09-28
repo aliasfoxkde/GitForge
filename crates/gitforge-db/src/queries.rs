@@ -1025,10 +1025,11 @@ impl JobQueries {
         lease_token: &str,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE jobs SET runner_id = ?, lease_token = ?, status = 'assigned' WHERE id = ? AND status IN ('queued', 'assigned')",
+            "UPDATE jobs SET runner_id = ?, lease_token = ?, status = 'assigned', assigned_at = COALESCE(assigned_at, ?) WHERE id = ? AND status IN ('queued', 'assigned')",
         )
         .bind(runner_id.to_string())
         .bind(lease_token)
+        .bind(Utc::now().to_rfc3339())
         .bind(id.to_string())
         .execute(pool.pool())
         .await
@@ -1195,7 +1196,7 @@ impl JobQueries {
     /// prevents the next scheduler tick from assigning the job elsewhere.
     pub async fn requeue(pool: &Pool, id: JobId) -> Result<()> {
         sqlx::query(
-            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE id = ? AND status IN ('pending', 'queued', 'assigned', 'running') AND runner_id IS NOT NULL",
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL, assigned_at = NULL WHERE id = ? AND status IN ('pending', 'queued', 'assigned', 'running') AND runner_id IS NOT NULL",
         )
         .bind(id.to_string())
         .execute(pool.pool())
@@ -1306,17 +1307,23 @@ impl JobQueries {
 
     /// Assign a runner to a job
     pub async fn assign(pool: &Pool, id: JobId, runner_id: RunnerId) -> Result<()> {
-        sqlx::query("UPDATE jobs SET runner_id = ?, status = 'assigned' WHERE id = ?")
-            .bind(runner_id.to_string())
-            .bind(id.to_string())
-            .execute(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to assign job: {e}")))?;
+        sqlx::query(
+            "UPDATE jobs SET runner_id = ?, status = 'assigned', assigned_at = ? WHERE id = ?",
+        )
+        .bind(runner_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to assign job: {e}")))?;
         Ok(())
     }
 
     /// Atomically assign a queued job and advance its durable fencing
     /// generation. A false result means another scheduler won the race.
+    /// `assigned_at` starts the never-started clock the assignment sweeper
+    /// reads; refreshing it here (not on lease re-syncs of an already
+    /// claimed job) keeps the sweep anchored to the claim moment.
     pub async fn assign_with_lease(
         pool: &Pool,
         id: JobId,
@@ -1324,10 +1331,11 @@ impl JobQueries {
         lease_token: &str,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE jobs SET runner_id = ?, status = 'assigned', lease_token = ?, lease_generation = lease_generation + 1 WHERE id = ? AND status IN ('pending', 'queued') AND runner_id IS NULL",
+            "UPDATE jobs SET runner_id = ?, status = 'assigned', lease_token = ?, lease_generation = lease_generation + 1, assigned_at = ? WHERE id = ? AND status IN ('pending', 'queued') AND runner_id IS NULL",
         )
         .bind(runner_id.to_string())
         .bind(lease_token)
+        .bind(Utc::now().to_rfc3339())
         .bind(id.to_string())
         .execute(pool.pool())
         .await
@@ -1582,7 +1590,7 @@ impl JobQueries {
         .await
         .map_err(|e| Error::database(format!("failed to clear queued runner assignments: {e}")))?;
         let assigned = sqlx::query(
-            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE status = 'assigned'",
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL, assigned_at = NULL WHERE status = 'assigned'",
         )
         .execute(&mut *transaction)
         .await
@@ -1614,6 +1622,37 @@ impl JobQueries {
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to reconcile expired jobs: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Requeue assigned jobs whose runner never reported start within the
+    /// grace window.
+    ///
+    /// A healthy runner starts an assigned job within seconds of the claim,
+    /// so an `assigned` row that outlives the grace window means the dispatch
+    /// was lost — and the runner row can look perfectly healthy while it
+    /// happens (a container that died right after claiming keeps the runner's
+    /// heartbeat fresh while its job never reports). These rows have no
+    /// `started_at`, so the timeout sweep cannot see them, and they are
+    /// invisible to every other reconciler: `requeue_inflight` only runs at
+    /// startup, and the stale-runner path only covers runners whose
+    /// heartbeat died. A row wedged here holds its resource-class slot
+    /// forever, starving every queued job behind it.
+    ///
+    /// Requeueing is safe for the same reason `requeue_inflight` requeues
+    /// assigned rows at startup: the job has not begun executing, so there
+    /// are no duplicate side effects, and clearing `lease_token` fences any
+    /// late start or completion report from the old claim. Rows with no
+    /// `assigned_at` (legacy rows predating the column) are left alone —
+    /// an unknown claim age must not be treated as expired.
+    pub async fn requeue_abandoned_assignments(pool: &Pool, grace_secs: i64) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL, assigned_at = NULL WHERE status = 'assigned' AND assigned_at IS NOT NULL AND datetime(assigned_at, '+' || ? || ' seconds') <= datetime('now')",
+        )
+        .bind(grace_secs)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to requeue abandoned assignments: {e}")))?;
         Ok(result.rows_affected())
     }
 }
@@ -3359,6 +3398,177 @@ mod tests {
             .unwrap();
         assert_eq!(queued_recovered.status, "queued");
         assert!(queued_recovered.runner_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_abandoned_assignment_sweep_requeues_never_started_claims() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "sweep-owner".to_string(),
+            "sweep@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "sweep-repo".to_string(),
+            user.id,
+            "/git/sweep".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "sweep-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "main".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        let backdate =
+            |seconds: i64| (Utc::now() - chrono::Duration::seconds(seconds)).to_rfc3339();
+        let make_job = |name: &str| -> crate::models::Job {
+            crate::models::Job::new(run.id, name.to_string())
+        };
+        // runner_id carries a foreign key, so every claimant needs a row.
+        let claimant = crate::models::Runner::new(
+            "sweep-claimant".to_string(),
+            crate::models::RunnerType::Docker,
+            2,
+        );
+        RunnerQueries::create(&pool, &claimant).await.unwrap();
+
+        // A claim whose runner never started it and whose claim has aged past
+        // the grace window: exactly what the sweep exists to repair.
+        let wedged = make_job("wedged");
+        JobQueries::create(&pool, &wedged).await.unwrap();
+        let wedged_runner = claimant.id;
+        let wedged_token = "token-wedged".to_string();
+        assert!(
+            JobQueries::assign_with_lease(&pool, wedged.id, wedged_runner, &wedged_token)
+                .await
+                .unwrap()
+        );
+        sqlx::query("UPDATE jobs SET assigned_at = ? WHERE id = ?")
+            .bind(backdate(600))
+            .bind(wedged.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        // A just-made claim inside the grace window must survive the sweep.
+        let fresh = make_job("fresh");
+        JobQueries::create(&pool, &fresh).await.unwrap();
+        let fresh_runner = claimant.id;
+        assert!(
+            JobQueries::assign_with_lease(&pool, fresh.id, fresh_runner, "token-fresh")
+                .await
+                .unwrap()
+        );
+
+        // A claim whose runner DID start the job is the timeout sweep's
+        // business, not this one — even with an ancient claim age.
+        let started = make_job("started");
+        JobQueries::create(&pool, &started).await.unwrap();
+        let started_runner = claimant.id;
+        assert!(
+            JobQueries::assign_with_lease(&pool, started.id, started_runner, "token-started")
+                .await
+                .unwrap()
+        );
+        sqlx::query("UPDATE jobs SET assigned_at = ? WHERE id = ?")
+            .bind(backdate(600))
+            .bind(started.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert!(
+            JobQueries::start_with_lease(&pool, started.id, started_runner, "token-started")
+                .await
+                .unwrap()
+        );
+
+        // Legacy rows predating assigned_at carry no claim age; the sweep
+        // must not guess one.
+        let legacy = make_job("legacy");
+        JobQueries::create(&pool, &legacy).await.unwrap();
+        assert!(
+            JobQueries::assign_with_lease(&pool, legacy.id, claimant.id, "token-legacy")
+                .await
+                .unwrap()
+        );
+        sqlx::query("UPDATE jobs SET assigned_at = NULL WHERE id = ?")
+            .bind(legacy.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            JobQueries::requeue_abandoned_assignments(&pool, 60)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let swept = JobQueries::get(&pool, wedged.id).await.unwrap().unwrap();
+        assert_eq!(swept.status, "queued");
+        assert!(swept.runner_id.is_none());
+        let (wedged_lease,): (Option<String>,) =
+            sqlx::query_as("SELECT lease_token FROM jobs WHERE id = ?")
+                .bind(wedged.id.to_string())
+                .fetch_one(pool.pool())
+                .await
+                .unwrap();
+        assert_eq!(wedged_lease, None);
+
+        // The cleared lease fences a late start report from the old claim.
+        assert!(
+            !JobQueries::start_with_lease(&pool, wedged.id, wedged_runner, &wedged_token)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            JobQueries::get(&pool, wedged.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "queued"
+        );
+
+        assert_eq!(
+            JobQueries::get(&pool, fresh.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "assigned"
+        );
+        assert_eq!(
+            JobQueries::get(&pool, started.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+        assert_eq!(
+            JobQueries::get(&pool, legacy.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "assigned"
+        );
     }
 
     #[tokio::test]

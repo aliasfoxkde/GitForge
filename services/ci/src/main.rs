@@ -52,6 +52,15 @@ const PIPELINE_CONFIG_PATHS: [&str; 2] = [".gitforge.yml", ".gitforce.yml"];
 /// live engines to the same terminal state.
 const JOB_TIMEOUT_SWEEP_SECS: u64 = 60;
 
+/// How long a job may sit in `assigned` without its runner reporting start
+/// before the watchdog requeues it. A healthy runner claims and starts within
+/// seconds, so a claim that outlives this grace lost its dispatch — and
+/// without this sweep it would hold its resource-class slot forever (the
+/// timeout sweep cannot see the row: it has no `started_at`). Generous
+/// enough for cold runner startup; short enough that one wedged assignment
+/// cannot starve the queue for hours.
+const JOB_ASSIGNMENT_GRACE_SECS: i64 = 300;
+
 struct TriggerState {
     event_bus: Arc<dyn EventBus>,
     workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
@@ -294,6 +303,27 @@ async fn main() -> anyhow::Result<()> {
                         Err(error) => {
                             tracing::error!(%error, "watchdog failed to reconcile expired jobs");
                             continue;
+                        }
+                    }
+                    // Dispatched-but-never-started claims carry no
+                    // started_at, so the timeout sweep above cannot see
+                    // them; without this sweep a lost dispatch wedges its
+                    // resource-class slot forever.
+                    match gitforge_db::queries::JobQueries::requeue_abandoned_assignments(
+                        pool,
+                        JOB_ASSIGNMENT_GRACE_SECS,
+                    )
+                    .await
+                    {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            tracing::warn!(count, "watchdog requeued assignments that never started");
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                "watchdog failed to requeue abandoned assignments"
+                            );
                         }
                     }
                     let live_run_ids: Vec<gitforge_common::PipelineRunId> =

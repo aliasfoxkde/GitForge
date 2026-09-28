@@ -276,6 +276,7 @@ impl Pool {
             "ALTER TABLE jobs ADD COLUMN result_json TEXT",
             "ALTER TABLE jobs ADD COLUMN lease_token TEXT",
             "ALTER TABLE jobs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN assigned_at TEXT",
         ] {
             if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
                 let message = error.to_string();
