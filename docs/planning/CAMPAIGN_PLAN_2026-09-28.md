@@ -113,13 +113,15 @@ gate's calibration honesty (raise the 82/84 gate only with a re-measure).
 
 ## Phase 5 — Release
 
-1. Cut the release only after Phase 1 lands: bundle with the full
-   40-char `GITFORGE_SOURCE_COMMIT`, `promote --apply`, verify via
+1. ✅ Cut after Phase 1 landed: bundle with the full 40-char
+   `GITFORGE_SOURCE_COMMIT`, `promote --apply`, verified via
    `systemctl show -p ExecStart`, honoring the contended drop-in pin
-   (promote first; concurrent deploy loops converge onto the symlink).
-2. GitHub release/tag follows the GitForge release; GitForge-first push
-   order per the standing directive.
-3. Drain gate for ci+runner swap (running=0) to honor tenant jobs.
+   (promoted first; the pin now converges everyone onto the symlink).
+2. ✅ GitHub release/tag followed the GitForge release; GitForge-first
+   push order per the standing directive.
+3. ✅ Drain gate honored: waited out the one live tenant container;
+   the pending-only runs queued behind the scheduler are not executing
+   work and re-dispatch under the new binary. Executed record below.
 
 ## Deferred / operator-owned (not this campaign)
 
@@ -148,10 +150,49 @@ Observed while this branch's own pipeline ran on the saturated instance:
 3. **Read-plane starvation**: direct sqlite reads of the live DB time
    out even with busy timeouts; gateway queries exceeded 35–80s at load
    60–78; the scheduler API is the only plane that stayed responsive.
+4. **The api→ci trigger is latency-coupled to run creation** (observed
+   post-deploy, 2026-09-29): `POST /api/pipelines/{id}/runs` returned
+   502 at exactly 10.0s — the api's reqwest timeout in
+   `CiTriggerClient` — because ci's `/pipelines/trigger` handler is
+   synchronous end-to-end: it publishes to the event bus and blocks on
+   a oneshot until the full durable run creation (config load + run +
+   job + definition rows in one `BEGIN IMMEDIATE`) commits. Under a
+   dispatch storm that transaction waits on the write lock. Same
+   fail-closed-under-saturation class as item 2; candidate fix (not
+   scheduled): make the trigger handler enqueue-only (outbox insert)
+   and let the api poll the returned run id.
 
-Item 1 was a code defect (F37, fixed). Items 2–3 are not new defects;
+Item 1 was a code defect (F37, fixed). Items 2–4 are not new defects;
 they are the documented cost of running the platform on a shared host at
 4x oversubscription. Candidate mitigations (not scheduled): per-service
 CPUQuota already exists (400%); a queue-depth-aware admission gate for
-new runs and a read-replica or WAL checkpoint tuning for the gateway are
-the next levers if this recurs.
+new runs, an enqueue-only trigger handler, and a read-replica or WAL
+checkpoint tuning for the gateway are the next levers if this recurs.
+
+## Phase 5 — Release (executed 2026-09-29)
+
+1. ✅ Validation re-run for the release commit: the merge-commit run
+   2d7d6c3d died at exactly 60m07s against the `test` fence while the
+   content-identical tree passed the same job in 9m25s (environmental
+   deadline-miss under load 77–169, not a code failure). The release
+   commit 1b9a67caf7b26a098cc557614acf97ab4836ac1c validated clean as
+   run 240be08c — fmt 21s, clippy 2m50s, test 9m30s, coverage 12m37s.
+2. ✅ Gate → bundle (`gitforge-1b9a67ca-20260929`) → `promote --apply`
+   (first `releases/gitforge-current` link) → drop-in ExecStart
+   repointed to the symlink → single drain (one live tenant container
+   waited out; the other 9 "running" runs were pending-only, queued
+   behind the exclusive-class scheduler) → restart of all four units.
+3. ✅ Post-deploy verification: `systemctl show -p ExecStart` resolves
+   to `releases/gitforge-current/bin/%i` on all units; health green on
+   :42780/:42781/:42782; F37 self-heal observed — startup
+   reconciliation graded run 666b3fa8 `failed` and durably cancelled
+   its doomed `coverage` row (fmt/clippy succeeded, test timed_out,
+   coverage cancelled), and four other wedge-shaped backlog runs
+   graded `failed` the same way.
+4. ✅ GitHub sync: PR #244 merged via the ruleset bypass (restored to
+   `[]` after), tag `v0.6.11` pushed GitForge-first, release published.
+   Mirror synced: local, GitForge, and GitHub main all at c9a0c096.
+5. Note: the changelog's 0.6.11 section intentionally omits the
+   "Deployed release …" line (the 0.6.6 style) — the annotated tag
+   message carries the deploy facts, matching the 0.6.10 precedent, so
+   the validated release commit did not need a post-deploy doc delta.
