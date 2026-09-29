@@ -235,7 +235,11 @@ impl<S: StorageBackend> HttpGitHandler<S> {
             // cannot learn the ref update result and misreports the push.
             "report-status-v2 report-status delete-refs side-band-64k quiet atomic ofs-delta agent=gitforge/0.1.0"
         } else {
-            "multi_ack_detailed no-done side-band-64k ofs-delta agent=gitforge/0.1.0"
+            // shallow + deepen-relative must be advertised: the client
+            // refuses to send depth requests unless the server lists
+            // `shallow` ("Server does not support shallow clients"), even
+            // though the real git-upload-pack child fully implements it.
+            "multi_ack_detailed no-done side-band-64k ofs-delta shallow deepen-relative agent=gitforge/0.1.0"
         }
         .to_string();
         // Clone/fetch need the HEAD symref to pick the default branch;
@@ -526,6 +530,77 @@ mod tests {
 
         let response = handler.receive_pack_advertisement(repo_id).await.unwrap();
         assert!(response.starts_with(b"001f# service=git-receive-pack\n0000"));
+    }
+
+    /// Shallow clones require the server to advertise `shallow` (clients
+    /// refuse to send depth requests otherwise) and the real upload-pack
+    /// child to honor them. Two commits give the depth cut a boundary.
+    #[tokio::test]
+    async fn test_upload_pack_advertises_and_serves_shallow() {
+        use crate::storage::FileStorageBackend;
+        use std::process::Stdio;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let storage = FileStorageBackend::new(dir.path());
+        let handler = HttpGitHandler::new(storage.clone());
+        let repo_id = RepoId::new();
+        let repo_path = storage.create(repo_id).await.unwrap();
+
+        let run = |args: &[&str], stdin: &str| -> String {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_path)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn git");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(stdin.as_bytes())
+                .expect("write git stdin");
+            let out = child.wait_with_output().expect("wait git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        std::fs::write(repo_path.join("f.txt"), "one\n").unwrap();
+        let blob = run(&["hash-object", "-w", "f.txt"], "");
+        let tree = run(&["mktree"], &format!("100644 blob {blob}\tf.txt\n"));
+        let root = run(&["commit-tree", &tree], "one\n");
+        let second = run(&["commit-tree", "-p", &root, &tree], "two\n");
+        run(&["update-ref", "refs/heads/main", &second], "");
+
+        let advertisement = handler.upload_pack(repo_id, vec![]).await.unwrap();
+        let caps = String::from_utf8_lossy(&advertisement);
+        assert!(caps.contains(" shallow "), "caps must advertise shallow");
+        assert!(caps.contains("deepen-relative"));
+
+        let pkt = |payload: String| -> String { format!("{:04x}{}", payload.len() + 4, payload) };
+        let request = pkt(format!(
+            "want {second} multi_ack_detailed side-band-64k ofs-delta shallow\n"
+        )) + &pkt("deepen 1\n".to_string())
+            + "0000"
+            + &pkt("done\n".to_string());
+        let response = handler.upload_pack(repo_id, request.into_bytes()).await;
+        let response = response.expect("upload-pack should serve a shallow request");
+        let body = String::from_utf8_lossy(&response);
+        assert!(
+            body.contains("shallow "),
+            "depth cut must mark a shallow boundary"
+        );
+        assert!(response.windows(4).any(|w| w == b"PACK"), "a pack follows");
     }
 
     #[tokio::test]

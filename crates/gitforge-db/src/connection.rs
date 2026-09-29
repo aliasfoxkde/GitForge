@@ -222,17 +222,44 @@ impl Pool {
         // records survive the unique index below. RFC3339 timestamps compare
         // lexicographically, so the concatenated key orders by recency with
         // the row id as a deterministic tiebreaker.
-        sqlx::query(
-            r#"
-            UPDATE runners SET name = name || '-legacy-' || id
-            WHERE updated_at || id NOT IN (
-                SELECT MAX(updated_at || id) FROM runners GROUP BY name
-            )
-            "#,
+        //
+        // This runs on every boot, so it must not write when there is nothing
+        // to do: the old unconditional UPDATE read its snapshot from the
+        // `NOT IN (SELECT ...)` subquery and then escalated to the write lock,
+        // and that upgrade-to-write BUSY ignores the busy handler in WAL.
+        // Under CI write churn the gateway lost that lottery on every boot
+        // and crash-looped (observed 2026-09-25, 11 consecutive restarts).
+        // Check read-only first, and when duplicates exist take the write
+        // lock up front via BEGIN IMMEDIATE like every other write path.
+        let duplicate_names = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM (SELECT name FROM runners GROUP BY name HAVING COUNT(*) > 1)",
         )
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
-        .map_err(|e| Error::database(format!("failed to rename duplicate runner names: {e}")))?;
+        .map_err(|e| Error::database(format!("failed to check duplicate runner names: {e}")))?;
+        if duplicate_names > 0 {
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(|e| Error::database(format!("failed to begin runner rename: {e}")))?;
+            sqlx::query(
+                r#"
+                UPDATE runners SET name = name || '-legacy-' || id
+                WHERE updated_at || id NOT IN (
+                    SELECT MAX(updated_at || id) FROM runners GROUP BY name
+                )
+                "#,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                Error::database(format!("failed to rename duplicate runner names: {e}"))
+            })?;
+            tx.commit()
+                .await
+                .map_err(|e| Error::database(format!("failed to commit runner rename: {e}")))?;
+        }
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_runners_name ON runners(name)")
             .execute(&self.pool)
             .await
