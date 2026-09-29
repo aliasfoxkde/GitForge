@@ -711,10 +711,17 @@ the same day, plus the r6-platform-durability line deployed.
   preserving SQL (status graded, finished_at stamped; no rows
   rewritten). r6's `reconcile_orphaned_runs` + `sweep_terminal_
   workspaces` + startup `rebuild_live_engines` finalize future strands
-  without operator help. Residual: `reconcile_expired` only covers
-  `running` rows with `started_at`, so shape-c queued-row evidence is
-  still not self-healing — verify post-swap whether the reconciler
-  grades it; if not, an evidence-aware repair query is the follow-up.
+  without operator help. Residual FIXED 2026-09-28 (r6-platform-
+  durability): `reconcile_evidence_rows` grades any pre-terminal row
+  that already carries terminal evidence (`finished_at` + `result_json`)
+  from its own recorded receipt — a recognized verdict wins, unparseable
+  evidence fails closed to `failed`, and the evidence columns are never
+  rewritten. It runs on the CI watchdog tick and after scheduler
+  recovery, so shape-c rows self-heal and their runs finalize without
+  operator help. Pinned by
+  `test_reconcile_evidence_rows_grades_stranded_rows` (pending + assigned
+  strand shapes, fail-closed verdicts, evidence preservation,
+  idempotence).
 
 - **F32 (gzip smart-HTTP request bodies, FIXED — PR #235, shipped in
   v0.6.11, live-verified).** Every full clone of a large repository

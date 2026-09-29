@@ -868,6 +868,17 @@ impl Scheduler {
                         tracing::error!(%error, "failed to reconcile expired jobs");
                     }
                 }
+                // F31 residual: grade rows carrying a completion receipt but
+                // no terminal status so their runs can finalize.
+                match gitforge_db::queries::JobQueries::reconcile_evidence_rows(pool).await {
+                    Ok(count) if count > 0 => {
+                        tracing::warn!(count, "graded evidence-stranded jobs after recovery");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "failed to grade evidence-stranded jobs");
+                    }
+                }
             }
             if let Err(error) = self.load_pending_jobs().await {
                 tracing::error!(%error, "failed to load durable jobs after scheduler recovery");

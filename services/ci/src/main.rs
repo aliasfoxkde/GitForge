@@ -296,6 +296,18 @@ async fn main() -> anyhow::Result<()> {
                             continue;
                         }
                     }
+                    // F31 residual: rows stranded with terminal evidence but a
+                    // lost status write never turn terminal, so their runs can
+                    // never finalize. Grade them from their own receipts.
+                    match gitforge_db::queries::JobQueries::reconcile_evidence_rows(pool).await {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            tracing::warn!(count, "watchdog graded evidence-stranded jobs");
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "watchdog failed to grade evidence-stranded jobs");
+                        }
+                    }
                     let live_run_ids: Vec<gitforge_common::PipelineRunId> =
                         watchdog_registry.read().await.keys().copied().collect();
                     for run_id in live_run_ids {

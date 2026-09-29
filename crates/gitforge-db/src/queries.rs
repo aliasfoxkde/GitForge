@@ -1398,7 +1398,6 @@ impl JobQueries {
     /// Both writes share one SQLite transaction, so a publication enqueue
     /// failure cannot leave a terminal job without durable publication work.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub async fn complete_with_lease_and_publication(
         pool: &Pool,
         id: JobId,
@@ -1615,6 +1614,58 @@ impl JobQueries {
         .await
         .map_err(|e| Error::database(format!("failed to reconcile expired jobs: {e}")))?;
         Ok(result.rows_affected())
+    }
+
+    /// Grade non-terminal job rows that already carry terminal evidence.
+    ///
+    /// The F21/F23 one-shot-write-loss class could strand a row with its
+    /// completion receipt (`finished_at` + `result_json`) persisted while the
+    /// status/started-at write was lost; the job never turns terminal, so
+    /// `finalize_pipeline_if_terminal` skips the run forever (F31's residual,
+    /// repaired by hand for bd5c8664). The verdict is read from the row's own
+    /// recorded receipt and the evidence columns are never rewritten;
+    /// unrecognized or unparseable evidence fails closed to `failed` so a
+    /// stranded run always reaches a terminal grade.
+    pub async fn reconcile_evidence_rows(pool: &Pool) -> Result<u64> {
+        let stranded: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, result_json FROM jobs WHERE status IN ('pending', 'queued', 'assigned', 'running') AND finished_at IS NOT NULL AND result_json IS NOT NULL",
+        )
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list evidence-stranded jobs: {e}")))?;
+        let mut repaired = 0u64;
+        for (job_id, result_json) in stranded {
+            let verdict = result_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .and_then(|receipt| {
+                    receipt
+                        .get("status")
+                        .and_then(|status| status.as_str())
+                        .and_then(JobStatus::from_str)
+                })
+                .filter(JobStatus::is_terminal)
+                .unwrap_or(JobStatus::Failed);
+            let result = sqlx::query(
+                "UPDATE jobs SET status = ?, runner_id = NULL, lease_token = NULL WHERE id = ? AND status IN ('pending', 'queued', 'assigned', 'running') AND finished_at IS NOT NULL",
+            )
+            .bind(verdict.as_str())
+            .bind(&job_id)
+            .execute(pool.pool())
+            .await
+            .map_err(|e| {
+                Error::database(format!("failed to grade evidence-stranded job {job_id}: {e}"))
+            })?;
+            if result.rows_affected() > 0 {
+                tracing::warn!(
+                    job = %job_id,
+                    verdict = verdict.as_str(),
+                    "graded evidence-stranded job from its recorded completion receipt"
+                );
+                repaired += result.rows_affected();
+            }
+        }
+        Ok(repaired)
     }
 }
 
@@ -3158,6 +3209,121 @@ mod tests {
             .unwrap();
         assert!(JobQueries::get(&pool, job.id).await.is_err());
         assert!(JobQueries::list_by_run(&pool, run.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_evidence_rows_grades_stranded_rows() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "owner".to_string(),
+            "owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "evidence-repo".to_string(),
+            user.id,
+            "/git/evidence-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "Evidence Pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        // Simulate the F21/F23 one-shot-write-loss shape: the completion
+        // receipt (finished_at + result_json) persisted while the status and
+        // started-at writes were lost, stranding the rows non-terminal. New
+        // rows default to `pending`, and the lease write can fail from
+        // `assigned` too, so both shapes must be covered.
+        let mut succeeded_receipt =
+            crate::models::Job::new(run.id, "receipt-succeeded".to_string());
+        let mut unknown_receipt = crate::models::Job::new(run.id, "receipt-unknown".to_string());
+        let mut garbage_receipt = crate::models::Job::new(run.id, "receipt-garbage".to_string());
+        let mut live_queued = crate::models::Job::new(run.id, "still-queued".to_string());
+        for job in [
+            &mut succeeded_receipt,
+            &mut unknown_receipt,
+            &mut garbage_receipt,
+            &mut live_queued,
+        ] {
+            JobQueries::create(&pool, job).await.unwrap();
+        }
+        let runner = crate::models::Runner::new(
+            "evidence-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        RunnerQueries::create(&pool, &runner).await.unwrap();
+        let assigned_receipt = crate::models::Job::new(run.id, "receipt-assigned".to_string());
+        JobQueries::create(&pool, &assigned_receipt).await.unwrap();
+        JobQueries::assign(&pool, assigned_receipt.id, runner.id)
+            .await
+            .unwrap();
+
+        let tear = |job_id: gitforge_common::JobId, receipt: &str| {
+            let pool = &pool;
+            let job_id = job_id.to_string();
+            let receipt = receipt.to_string();
+            async move {
+                sqlx::query("UPDATE jobs SET finished_at = ?, result_json = ? WHERE id = ?")
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(receipt)
+                    .bind(job_id)
+                    .execute(pool.pool())
+                    .await
+                    .unwrap();
+            }
+        };
+        tear(
+            succeeded_receipt.id,
+            r#"{"status":"succeeded","exit_code":0}"#,
+        )
+        .await;
+        tear(unknown_receipt.id, r#"{"status":"exploded"}"#).await;
+        tear(garbage_receipt.id, "runner died mid-write").await;
+        tear(assigned_receipt.id, r#"{"status":"failed"}"#).await;
+
+        assert_eq!(JobQueries::reconcile_evidence_rows(&pool).await.unwrap(), 4);
+
+        let graded = |job_id: gitforge_common::JobId| {
+            let pool = &pool;
+            async move { JobQueries::get(pool, job_id).await.unwrap().unwrap() }
+        };
+        assert_eq!(graded(succeeded_receipt.id).await.status, "succeeded");
+        // Unrecognized and unparseable evidence fail closed.
+        assert_eq!(graded(unknown_receipt.id).await.status, "failed");
+        assert_eq!(graded(garbage_receipt.id).await.status, "failed");
+        assert_eq!(graded(assigned_receipt.id).await.status, "failed");
+
+        // The repair grades from evidence without rewriting it: the receipt
+        // columns keep their values and no start time is invented.
+        let repaired = graded(succeeded_receipt.id).await;
+        assert_eq!(
+            repaired.result_json.as_deref(),
+            Some(r#"{"status":"succeeded","exit_code":0}"#)
+        );
+        assert!(repaired.finished_at.is_some());
+        assert!(repaired.started_at.is_none());
+
+        // A live pre-terminal row without terminal evidence is left alone,
+        // and a second sweep is a no-op (the repair is idempotent).
+        assert_eq!(graded(live_queued.id).await.status, "pending");
+        assert_eq!(JobQueries::reconcile_evidence_rows(&pool).await.unwrap(), 0);
     }
 
     #[tokio::test]
