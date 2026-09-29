@@ -2,6 +2,7 @@
 
 use crate::auth::Claims;
 use crate::middleware::AuthenticatedUser;
+use crate::routes::webhook::CiTriggerClient;
 use axum::{
     extract::{Extension, Path},
     http::StatusCode,
@@ -55,11 +56,37 @@ pub struct SubmitJobRequest {
     pub timeout: Option<String>,
 }
 
+/// Request to register a pipeline definition for a repository.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CreatePipelineRequest {
+    /// Repository in `owner/name` form.
+    pub repo: String,
+    /// Pipeline definition document (the committed `.gitforge.yml`
+    /// contents).
+    pub config: String,
+}
+
+/// Request to trigger a run of a stored pipeline.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TriggerPipelineRunRequest {
+    /// Branch, tag, or commit to run. Defaults to the repository HEAD.
+    #[serde(rename = "ref")]
+    pub revision: Option<String>,
+}
+
+/// Response to a successful pipeline-run trigger.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TriggerPipelineRunResponse {
+    pub pipeline_id: String,
+    pub pipeline_run_id: String,
+}
+
 /// CI routes
 pub fn ci_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
-        .route("/pipelines", get(list_pipelines))
-        .route("/pipelines/{id}", get(get_pipeline))
+        .route("/pipelines", get(list_pipelines).post(create_pipeline))
+        .route("/pipelines/{id}", get(get_pipeline).delete(delete_pipeline))
+        .route("/pipelines/{id}/runs", post(trigger_pipeline_run))
         .route("/pipeline-runs", get(list_pipeline_runs))
         .route("/pipeline-runs/{id}", get(get_pipeline_run))
         .route("/pipeline-runs/{id}/jobs", get(get_pipeline_run_jobs))
@@ -215,6 +242,445 @@ async fn get_pipeline(
             })),
         )
             .into_response(),
+    }
+}
+
+/// Whether a revision expression is safe to hand to `git rev-parse`.
+///
+/// The value travels as a single argv element, so this is not a shell
+/// risk; the remaining hazard is option smuggling, which the leading
+/// `-` rejection closes. The character set covers branches, tags,
+/// `refs/...` paths, commit hashes, and `~`/`^` history expressions.
+fn is_safe_revision(revision: &str) -> bool {
+    !revision.is_empty()
+        && !revision.starts_with('-')
+        && revision.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'/' | b'-' | b'~' | b'^' | b':')
+        })
+}
+
+/// Resolve a revision to a commit hash in the repository's bare storage.
+async fn resolve_revision(git_path: &str, revision: &str) -> Result<String, String> {
+    let output = tokio::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(git_path)
+        .args(["rev-parse", "--verify", &format!("{revision}^{{commit}}")])
+        .output()
+        .await
+        .map_err(|error| format!("failed to run git rev-parse: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "revision {revision:?} does not resolve to a commit: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|hash| hash.trim().to_string())
+        .map_err(|error| format!("git rev-parse produced invalid UTF-8: {error}"))
+}
+
+/// Register a pipeline definition for a repository.
+///
+/// The document is parsed and validated before anything is stored.
+/// Registering a definition with the name it declares retires the
+/// currently active version for that (repository, name) pair — the same
+/// single-active-version invariant pushes maintain — while the superseded
+/// rows stay as history.
+async fn create_pipeline(
+    Extension(pool): Extension<Arc<Pool>>,
+    user: AuthenticatedUser,
+    Json(request): Json<CreatePipelineRequest>,
+) -> impl IntoResponse {
+    let claims = user.claims;
+    let Some((owner, repo_name)) = request.repo.rsplit_once('/') else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_repo",
+                "message": "repository must be in owner/name form"
+            })),
+        )
+            .into_response();
+    };
+
+    let repo = match RepoQueries::get_by_owner_and_name(&pool, owner, repo_name).await {
+        Ok(Some(repo)) => repo,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "not_found",
+                    "message": "repository not found"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to resolve repository for pipeline creation");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "failed to resolve repository"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(status) = authorize_repo(&pool, &claims, repo.id).await {
+        return status.into_response();
+    }
+
+    let definition = match gitforge_ci::PipelineDefinition::parse(&request.config) {
+        Ok(definition) => definition,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "invalid_pipeline",
+                    "message": format!("pipeline definition is not valid: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let config = match serde_json::to_value(&definition) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(%error, "failed to serialize pipeline definition");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "internal_error",
+                    "message": "failed to serialize pipeline definition"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let pipeline = gitforge_db::models::Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: definition.name,
+        trigger_type: "manual".to_string(),
+        config,
+        created_at: chrono::Utc::now(),
+    };
+
+    // idx_pipelines_active_repo_name admits one active version per
+    // (repo, name); retire the predecessor before inserting, exactly as
+    // the push path does.
+    if let Err(error) = PipelineQueries::deactivate_active(&pool, repo.id, &pipeline.name).await {
+        tracing::error!(%error, "failed to deactivate previous pipeline version");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "database_error",
+                "message": "failed to deactivate previous pipeline version"
+            })),
+        )
+            .into_response();
+    }
+    if let Err(error) = PipelineQueries::create(&pool, &pipeline).await {
+        tracing::error!(%error, "failed to create pipeline");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "database_error",
+                "message": "failed to create pipeline"
+            })),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": pipeline.id.to_string(),
+            "repo_id": pipeline.repo_id.to_string(),
+            "name": pipeline.name,
+            "trigger_type": pipeline.trigger_type,
+            "created_at": pipeline.created_at.to_rfc3339()
+        })),
+    )
+        .into_response()
+}
+
+/// Trigger a run of a stored pipeline at a revision.
+///
+/// Run execution belongs to the CI orchestrator, so the gateway resolves
+/// the requested revision (default HEAD) against the repository's bare
+/// storage and hands the trigger to CI — the same delegation a push
+/// event takes.
+async fn trigger_pipeline_run(
+    Extension(pool): Extension<Arc<Pool>>,
+    user: AuthenticatedUser,
+    ci_trigger: Option<Extension<Arc<CiTriggerClient>>>,
+    Path(id): Path<String>,
+    Json(request): Json<TriggerPipelineRunRequest>,
+) -> impl IntoResponse {
+    let claims = user.claims;
+    let Ok(uuid) = Uuid::parse_str(&id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_id",
+                "message": "Invalid pipeline ID format"
+            })),
+        )
+            .into_response();
+    };
+
+    let pipeline = match PipelineQueries::get(&pool, PipelineId::from(uuid)).await {
+        Ok(Some(pipeline)) => pipeline,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "not_found",
+                    "message": "Pipeline not found"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to load pipeline for run trigger");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "failed to load pipeline"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(status) = authorize_repo(&pool, &claims, pipeline.repo_id).await {
+        return status.into_response();
+    }
+
+    let repo = match RepoQueries::get(&pool, pipeline.repo_id).await {
+        Ok(Some(repo)) => repo,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "not_found",
+                    "message": "repository not found"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, %pipeline.repo_id, "failed to load repository for run trigger");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "failed to load repository"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let revision = request.revision.unwrap_or_else(|| "HEAD".to_string());
+    if !is_safe_revision(&revision) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_ref",
+                "message": "ref must be a branch, tag, or commit hash"
+            })),
+        )
+            .into_response();
+    }
+
+    if !std::path::Path::new(&repo.git_path).exists() {
+        tracing::error!(git_path = %repo.git_path, "repository storage unavailable for run trigger");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "storage_unavailable",
+                "message": "repository storage is unavailable"
+            })),
+        )
+            .into_response();
+    }
+
+    let commit = match resolve_revision(&repo.git_path, &revision).await {
+        Ok(commit) => commit,
+        Err(error) => {
+            tracing::info!(%error, "run trigger referenced an unresolvable revision");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "unknown_revision",
+                    "message": error
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(Extension(client)) = ci_trigger else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "ci_unavailable",
+                "message": "CI orchestrator trigger is not configured"
+            })),
+        )
+            .into_response();
+    };
+
+    match client
+        .trigger(pipeline.repo_id, &revision, None, &commit)
+        .await
+    {
+        Ok(Some(pipeline_run_id)) => (
+            StatusCode::ACCEPTED,
+            Json(TriggerPipelineRunResponse {
+                pipeline_id: pipeline.id.to_string(),
+                pipeline_run_id,
+            }),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "pipeline_id": pipeline.id.to_string(),
+                "pipeline_run_id": serde_json::Value::Null
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "CI orchestrator rejected the run trigger");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "ci_trigger_failed",
+                    "message": error
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Delete a pipeline definition.
+///
+/// Rows referenced by runs are retained as history (runs join on the
+/// pipeline id), so deletion there means deactivation: the definition
+/// stops being runnable but every historical run stays intact. A
+/// pipeline with no runs is removed outright.
+async fn delete_pipeline(
+    Extension(pool): Extension<Arc<Pool>>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let claims = user.claims;
+    let Ok(uuid) = Uuid::parse_str(&id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_id",
+                "message": "Invalid pipeline ID format"
+            })),
+        )
+            .into_response();
+    };
+
+    let pipeline = match PipelineQueries::get(&pool, PipelineId::from(uuid)).await {
+        Ok(Some(pipeline)) => pipeline,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "not_found",
+                    "message": "Pipeline not found"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to load pipeline for deletion");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "failed to load pipeline"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(status) = authorize_repo(&pool, &claims, pipeline.repo_id).await {
+        return status.into_response();
+    }
+
+    match PipelineRunQueries::list_by_pipeline(&pool, pipeline.id).await {
+        Ok(runs) if runs.is_empty() => {
+            if let Err(error) = PipelineQueries::delete(&pool, pipeline.id).await {
+                tracing::error!(%error, "failed to delete pipeline");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "database_error",
+                        "message": "failed to delete pipeline"
+                    })),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "deleted": true,
+                    "message": "pipeline deleted"
+                })),
+            )
+                .into_response()
+        }
+        Ok(_) => {
+            if let Err(error) =
+                PipelineQueries::deactivate_active(&pool, pipeline.repo_id, &pipeline.name).await
+            {
+                tracing::error!(%error, "failed to deactivate pipeline");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "database_error",
+                        "message": "failed to deactivate pipeline"
+                    })),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "deleted": false,
+                    "message": "pipeline has runs; it was deactivated and its run history retained"
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to list runs before pipeline deletion");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "failed to list pipeline runs"
+                })),
+            )
+                .into_response()
+        }
     }
 }
 

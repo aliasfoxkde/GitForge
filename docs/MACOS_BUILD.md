@@ -81,8 +81,10 @@ rustup target add x86_64-apple-darwin aarch64-apple-darwin
 #### 2. Install Dependencies
 
 ```bash
-# Install required tools
-brew install git go docker
+# Install required tools (Rust toolchain via rustup; no Go needed)
+brew install git docker
+brew install rustup
+rustup-init -y --default-toolchain stable
 
 # For container builds (if using Docker)
 brew install --cask docker

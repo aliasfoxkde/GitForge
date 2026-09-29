@@ -823,3 +823,415 @@ async fn webhook_delegation_fails_closed_when_ci_cannot_accept_the_trigger() {
         "delegation happens before any run is persisted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pipeline registration (POST /api/pipelines)
+// ---------------------------------------------------------------------------
+
+/// Minimal valid pipeline definition document, matching what a push-flow
+/// repository would commit as `.gitforge.yml`.
+fn pipeline_yaml(name: &str) -> String {
+    format!("name: {name}\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment: {{}}\njobs: []\n")
+}
+
+#[tokio::test]
+async fn pipeline_create_registers_active_definition_for_owner() {
+    let f = seed().await;
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/pipelines",
+        Some(&f.owner_token),
+        Some(json!({"repo": format!("ci-owner/{}", "ci-routes-repo"), "config": pipeline_yaml("registered-pipeline")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["name"], "registered-pipeline");
+    assert_eq!(body["trigger_type"], "manual");
+    assert_eq!(body["repo_id"], f.repo_id.to_string());
+
+    let pipelines = PipelineQueries::list_by_repo(&f.pool, f.repo_id)
+        .await
+        .unwrap();
+    let registered: Vec<_> = pipelines
+        .iter()
+        .filter(|p| p.name == "registered-pipeline")
+        .collect();
+    assert_eq!(registered.len(), 1);
+    // The seed pipeline keeps its own active version.
+    assert_eq!(
+        PipelineQueries::count_active(&f.pool, f.repo_id, "registered-pipeline")
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn pipeline_create_replaces_the_active_version_of_the_same_name() {
+    let f = seed().await;
+    let body = json!({
+        "repo": "ci-owner/ci-routes-repo",
+        "config": pipeline_yaml("registered-pipeline")
+    });
+    let (status, first) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/pipelines",
+        Some(&f.owner_token),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+
+    let (status, second) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/pipelines",
+        Some(&f.owner_token),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    assert_ne!(first["id"], second["id"], "each registration is a new row");
+    assert_eq!(
+        PipelineQueries::count_active(&f.pool, f.repo_id, "registered-pipeline")
+            .await
+            .unwrap(),
+        1,
+        "only one active version may survive per (repo, name)"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_create_rejects_invalid_definitions() {
+    let f = seed().await;
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/pipelines",
+        Some(&f.owner_token),
+        Some(json!({"repo": "ci-owner/ci-routes-repo", "config": "::: not a pipeline"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], "invalid_pipeline");
+
+    // Nothing was stored.
+    let pipelines = PipelineQueries::list_by_repo(&f.pool, f.repo_id)
+        .await
+        .unwrap();
+    assert_eq!(pipelines.len(), 1, "only the seeded pipeline exists");
+}
+
+#[tokio::test]
+async fn pipeline_create_enforces_authorization_and_shape() {
+    let f = seed().await;
+
+    // An unrelated developer may not register pipelines on someone else's
+    // repository.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/pipelines",
+        Some(&f.intruder_token),
+        Some(json!({"repo": "ci-owner/ci-routes-repo", "config": pipeline_yaml("intruder")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Administrators act on any repository.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/pipelines",
+        Some(&f.admin_token),
+        Some(json!({"repo": "ci-owner/ci-routes-repo", "config": pipeline_yaml("admin-made")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Unknown repository and malformed references.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/pipelines",
+        Some(&f.owner_token),
+        Some(json!({"repo": "ci-owner/missing-repo", "config": pipeline_yaml("x")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/pipelines",
+        Some(&f.owner_token),
+        Some(json!({"repo": "not-a-repo-reference", "config": pipeline_yaml("x")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_repo");
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline run trigger (POST /api/pipelines/{id}/runs)
+// ---------------------------------------------------------------------------
+
+/// Seed a second repository whose storage is a real bare repository with
+/// one commit, plus an active pipeline for it. Returns (bare path, commit).
+async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, PipelineId, String) {
+    let bare = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .expect("git must be available")
+    };
+    assert!(
+        git(&["init", "--bare", bare.path().to_str().unwrap()])
+            .status
+            .success(),
+        "git init --bare"
+    );
+    let seed_dir = tempfile::tempdir().unwrap();
+    let seed_path = seed_dir.path().to_str().unwrap();
+    for args in [
+        vec!["init", seed_path],
+        vec!["-C", seed_path, "config", "user.email", "seed@example.test"],
+        vec!["-C", seed_path, "config", "user.name", "seed"],
+    ] {
+        let out = git(&args);
+        assert!(out.status.success(), "git {args:?}");
+    }
+    std::fs::write(seed_dir.path().join("README.md"), "seed\n").unwrap();
+    for args in [
+        vec!["-C", seed_path, "add", "."],
+        vec!["-C", seed_path, "commit", "-m", "seed"],
+        vec![
+            "-C",
+            seed_path,
+            "push",
+            bare.path().to_str().unwrap(),
+            "HEAD:refs/heads/main",
+        ],
+    ] {
+        let out = git(&args);
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = git(&["-C", seed_path, "rev-parse", "HEAD"]);
+    assert!(out.status.success(), "rev-parse HEAD");
+    let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    // Register a repository of the same owner whose storage is the bare
+    // repository, plus one active pipeline to run against it.
+    let owner_id = RepoQueries::get(&f.pool, f.repo_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .owner_id;
+    let repo = Repository::new(
+        "run-storage-repo".to_string(),
+        owner_id,
+        bare.path().to_string_lossy().into_owned(),
+    );
+    let repo_id = repo.id;
+    RepoQueries::create(&f.pool, &repo).await.unwrap();
+    let pipeline = Pipeline {
+        id: PipelineId::new(),
+        repo_id,
+        name: "run-storage-pipeline".to_string(),
+        trigger_type: "manual".to_string(),
+        config: json!({"name": "run-storage-pipeline", "version": "1.0", "jobs": []}),
+        created_at: chrono::Utc::now(),
+    };
+    let pipeline_id = pipeline.id;
+    PipelineQueries::create(&f.pool, &pipeline).await.unwrap();
+    (bare, pipeline_id, commit)
+}
+
+#[tokio::test]
+async fn pipeline_run_trigger_rejects_hostile_refs_before_any_git_call() {
+    let f = seed().await;
+    for hostile in ["--upload-pack=/tmp/x", "-o", " "] {
+        let (status, body) = request_json(
+            f.app.clone(),
+            "POST",
+            &format!("/api/pipelines/{}/runs", f.pipeline_id),
+            Some(&f.owner_token),
+            Some(json!({"ref": hostile})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "ref {hostile:?}: {body}");
+        assert_eq!(body["error"], "invalid_ref");
+    }
+    // The seeded repository's storage path does not exist, so any valid
+    // ref must report the storage problem instead of running git.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipelines/{}/runs", f.pipeline_id),
+        Some(&f.owner_token),
+        Some(json!({"ref": "main"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "storage_unavailable");
+}
+
+#[tokio::test]
+async fn pipeline_run_trigger_resolves_revisions_in_repository_storage() {
+    let f = seed().await;
+    let (_bare, pipeline_id, commit) = seed_real_storage_repo(&f).await;
+
+    // The fixture repository's storage path does not exist, so its runs
+    // must report the storage problem instead of running git.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipelines/{}/runs", f.pipeline_id),
+        Some(&f.owner_token),
+        Some(json!({"ref": "main"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "storage_unavailable");
+
+    // Unknown revisions are a request error, not a server fault.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipelines/{pipeline_id}/runs"),
+        Some(&f.owner_token),
+        Some(json!({"ref": "no-such-branch"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "unknown_revision");
+
+    // With CI unconfigured, a resolvable revision surfaces the missing
+    // orchestrator instead of pretending a run was created.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipelines/{pipeline_id}/runs"),
+        Some(&f.owner_token),
+        Some(json!({"ref": commit})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "ci_unavailable");
+
+    // Authorization still applies before anything else runs.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipelines/{pipeline_id}/runs"),
+        Some(&f.intruder_token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn pipeline_run_trigger_validates_pipeline_and_id() {
+    let f = seed().await;
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipelines/{}/runs", gitforge_common::PipelineId::new()),
+        Some(&f.owner_token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/pipelines/not-a-uuid/runs",
+        Some(&f.owner_token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_id");
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline deletion (DELETE /api/pipelines/{id})
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pipeline_delete_removes_runless_definitions() {
+    let f = seed().await;
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/pipelines",
+        Some(&f.owner_token),
+        Some(json!({"repo": "ci-owner/ci-routes-repo", "config": pipeline_yaml("disposable")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = request_json(
+        f.app.clone(),
+        "DELETE",
+        &format!("/api/pipelines/{id}"),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["deleted"], true);
+
+    let (status, _) = request_json(
+        f.app.clone(),
+        "GET",
+        &format!("/api/pipelines/{id}"),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn pipeline_delete_deactivates_definitions_with_run_history() {
+    let f = seed().await;
+    // The seeded pipeline owns a seeded run, so deletion must degrade to
+    // deactivation instead of orphaning the run.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "DELETE",
+        &format!("/api/pipelines/{}", f.pipeline_id),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["deleted"], false);
+
+    let pipeline = PipelineQueries::get(&f.pool, f.pipeline_id).await.unwrap();
+    assert!(
+        pipeline.is_some(),
+        "run history requires the row to survive"
+    );
+
+    let (status, body) = request_json(
+        f.app.clone(),
+        "DELETE",
+        &format!("/api/pipelines/{}", f.pipeline_id),
+        Some(&f.intruder_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}

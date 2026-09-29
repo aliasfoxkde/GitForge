@@ -137,13 +137,19 @@ enum Commands {
         /// Trigger a pipeline run
         #[arg(short, long)]
         run: Option<String>,
-        /// Watch pipeline execution
+        /// Branch, tag, or commit for --run (default: HEAD)
+        #[arg(long = "ref", requires = "run")]
+        ref_: Option<String>,
+        /// Watch a pipeline run until it reaches a terminal state
         #[arg(short, long)]
         watch: Option<String>,
-        /// Create a new pipeline
+        /// Create a pipeline for owner/name from the --file definition
         #[arg(short, long)]
         create: Option<String>,
-        /// Delete a pipeline
+        /// Pipeline definition file for --create (default: .gitforge.yml)
+        #[arg(long, requires = "create")]
+        file: Option<String>,
+        /// Delete a pipeline (deactivated when it has run history)
         #[arg(short, long)]
         delete: Option<String>,
     },
@@ -222,6 +228,26 @@ fn run_git(args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Poll a pipeline run until it reaches a terminal status.
+///
+/// Bounded so a wedged orchestrator cannot hang the CLI forever: 900
+/// polls at a 2-second interval is a 30-minute watch window.
+const WATCH_POLL_SECS: u64 = 2;
+const WATCH_MAX_POLLS: u64 = 900;
+
+async fn watch_pipeline_run(client: &GitForgeClient, run_id: &str) -> Result<String> {
+    let terminal = ["succeeded", "failed", "cancelled"];
+    for _ in 0..WATCH_MAX_POLLS {
+        let run = client.get_pipeline_run(run_id).await?;
+        println!("   run {} — {}", run.id, run.status);
+        if terminal.contains(&run.status.as_str()) {
+            return Ok(run.status);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(WATCH_POLL_SECS)).await;
+    }
+    anyhow::bail!("run {run_id} did not reach a terminal state within the watch window")
 }
 
 /// Run the CLI command handler (extracted for testing)
@@ -487,8 +513,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             list,
             show,
             run,
+            ref_: cli_ref,
             watch,
             create,
+            file: create_file,
             delete,
         } => {
             let api_client = GitForgeClient::new(&server, token.clone());
@@ -533,17 +561,46 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     }
                 }
             } else if let Some(id) = run {
-                println!("🚀 Triggering pipeline: {id}");
-                println!("   (Pipeline trigger not yet implemented)");
-            } else if let Some(id) = watch {
-                println!("👁️  Watching pipeline: {id}");
-                println!("   (Pipeline watch not yet implemented)");
-            } else if let Some(_name) = create {
-                println!("⚙️  Creating pipeline...");
-                println!("   (Pipeline creation not yet implemented)");
-            } else if let Some(_id) = delete {
-                println!("⚠️  Deleting pipeline...");
-                println!("   (Pipeline deletion not yet implemented)");
+                match api_client.run_pipeline(id, cli_ref.as_deref()).await {
+                    Ok(triggered) => {
+                        println!("🚀 Triggered pipeline: {id}");
+                        println!("   Run: {}", triggered.pipeline_run_id);
+                        println!(
+                            "   Watch it: gitforge pipeline --watch {}",
+                            triggered.pipeline_run_id
+                        );
+                    }
+                    Err(e) => println!("❌ {e}"),
+                }
+            } else if let Some(run_id) = watch {
+                match watch_pipeline_run(&api_client, run_id).await {
+                    Ok(status) => println!("👁️  Run {run_id} finished: {status}"),
+                    Err(e) => println!("❌ {e}"),
+                }
+            } else if let Some(repo) = create {
+                let path = create_file.as_deref().unwrap_or(".gitforge.yml");
+                match tokio::fs::read_to_string(path).await {
+                    Ok(config) => match api_client.create_pipeline(repo, &config).await {
+                        Ok(pipeline) => {
+                            println!("⚙️  Created pipeline '{}' for {repo}", pipeline.name);
+                            println!("   ID: {}", pipeline.id);
+                            println!("   Run it: gitforge pipeline --run {}", pipeline.id);
+                        }
+                        Err(e) => println!("❌ {e}"),
+                    },
+                    Err(e) => println!("❌ Failed to read {path}: {e}"),
+                }
+            } else if let Some(id) = delete {
+                match api_client.delete_pipeline(id).await {
+                    Ok(body) => {
+                        let message = body
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("pipeline removed");
+                        println!("🗑️  Pipeline {id}: {message}");
+                    }
+                    Err(e) => println!("❌ {e}"),
+                }
             }
         }
 
@@ -900,8 +957,10 @@ mod tests {
             list: true,
             show: None,
             run: None,
+            ref_: None,
             watch: None,
             create: None,
+            file: None,
             delete: None,
         });
         assert!(run_cli(cli).await.is_ok());
@@ -1070,8 +1129,10 @@ mod tests {
             list: false,
             show: Some("pipeline-123".to_string()),
             run: None,
+            ref_: None,
             watch: None,
             create: None,
+            file: None,
             delete: None,
         });
         assert!(run_cli(cli).await.is_ok());
@@ -1083,8 +1144,10 @@ mod tests {
             list: false,
             show: None,
             run: Some("pipeline-123".to_string()),
+            ref_: None,
             watch: None,
             create: None,
+            file: None,
             delete: None,
         });
         assert!(run_cli(cli).await.is_ok());
@@ -1096,8 +1159,10 @@ mod tests {
             list: false,
             show: None,
             run: None,
+            ref_: None,
             watch: Some("pipeline-123".to_string()),
             create: None,
+            file: None,
             delete: None,
         });
         assert!(run_cli(cli).await.is_ok());
@@ -1109,8 +1174,10 @@ mod tests {
             list: false,
             show: None,
             run: None,
+            ref_: None,
             watch: None,
             create: Some("new-pipeline".to_string()),
+            file: None,
             delete: None,
         });
         assert!(run_cli(cli).await.is_ok());
@@ -1122,8 +1189,10 @@ mod tests {
             list: false,
             show: None,
             run: None,
+            ref_: None,
             watch: None,
             create: None,
+            file: None,
             delete: Some("pipeline-123".to_string()),
         });
         assert!(run_cli(cli).await.is_ok());

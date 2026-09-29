@@ -39,8 +39,13 @@ use tower_http::trace::TraceLayer;
 type PipelineCache = HashMap<gitforge_common::RepoId, PipelineDefinition>;
 type PipelineRegistry = HashMap<gitforge_common::PipelineRunId, Arc<CiEngine>>;
 
-/// Path of the pipeline definition inside a repository checkout.
-const PIPELINE_CONFIG_PATH: &str = ".gitforce.yml";
+/// Paths of the pipeline definition inside a repository checkout, in
+/// resolution order. `.gitforge.yml` is the product spelling; the
+/// pre-rename `.gitforce.yml` stays as a fallback so repositories
+/// committed before the rename keep building. When both exist the first
+/// entry wins, so a repository cannot have its pipeline meaning split
+/// across the two files.
+const PIPELINE_CONFIG_PATHS: [&str; 2] = [".gitforge.yml", ".gitforce.yml"];
 
 /// How often the job timeout watchdog sweeps the durable rows for jobs whose
 /// `started_at + timeout_secs` deadline has elapsed, and drives the matching
@@ -158,15 +163,17 @@ async fn main() -> anyhow::Result<()> {
     // reclaim workspaces of already-terminal runs, then keep reconciling
     // periodically so runs stranded while running are finalized without
     // waiting for the next restart. Spawned so a large sweep cannot delay
-    // startup; reconciliation only touches runs no live engine owns, and
-    // the sweep only ever touches run-owned directories of terminal runs,
-    // never the checkout of a run the scheduler may requeue.
+    // startup; reconciliation grades from the durable rows (a run whose
+    // rows are all terminal is finalizable no matter which engine thinks
+    // it still owns it — the 666b3fa8 custody deadlock), and the sweep only
+    // ever touches run-owned directories of terminal runs, never the
+    // checkout of a run the scheduler may requeue.
     if let Some(pool) = &scheduler_db {
         // Rebuild engines for runs whose planning already happened but whose
         // chain may still have unreleased stages. This runs BEFORE the
-        // reconciliation spawn on purpose: a rebuilt engine is registered in
-        // the pipeline registry, and reconciliation only ever touches runs no
-        // live engine owns.
+        // reconciliation spawn on purpose: a rebuilt engine can re-release
+        // ready stages, and a run it still owns is protected from grading by
+        // its unfinished durable rows rather than by registry custody.
         let rebuilt = rebuild_live_engines(
             pool,
             &scheduler_arc,
@@ -179,7 +186,6 @@ async fn main() -> anyhow::Result<()> {
         }
 
         let sweep_pool = pool.clone();
-        let reconcile_registry = pipeline_registry.clone();
         tokio::spawn(async move {
             let finalized = reconcile_orphaned_runs(&sweep_pool).await;
             if finalized > 0 {
@@ -189,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
             if removed > 0 {
                 tracing::info!(removed, "startup workspace sweep complete");
             }
-            run_reconciliation_loop(sweep_pool, reconcile_registry).await;
+            run_reconciliation_loop(sweep_pool).await;
         });
     }
 
@@ -289,6 +295,18 @@ async fn main() -> anyhow::Result<()> {
                         Err(error) => {
                             tracing::error!(%error, "watchdog failed to reconcile expired jobs");
                             continue;
+                        }
+                    }
+                    // F31 residual: rows stranded with terminal evidence but a
+                    // lost status write never turn terminal, so their runs can
+                    // never finalize. Grade them from their own receipts.
+                    match gitforge_db::queries::JobQueries::reconcile_evidence_rows(pool).await {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            tracing::warn!(count, "watchdog graded evidence-stranded jobs");
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "watchdog failed to grade evidence-stranded jobs");
                         }
                     }
                     let live_run_ids: Vec<gitforge_common::PipelineRunId> =
@@ -601,42 +619,41 @@ async fn load_pipeline_from_commit(
         .await?
         .ok_or_else(|| anyhow::anyhow!("repository {repo_id} is not registered"))?;
 
-    let committed = tokio::process::Command::new("git")
-        .arg("--git-dir")
-        .arg(&repository.git_path)
-        .args([
-            "cat-file",
-            "-e",
-            &format!("{commit_hash}:{PIPELINE_CONFIG_PATH}"),
-        ])
-        .output()
-        .await?;
-    if !committed.status.success() {
-        return Ok(None);
-    }
+    // The first committed definition in PIPELINE_CONFIG_PATHS order wins;
+    // an absent file falls through to the next candidate.
+    for config_path in PIPELINE_CONFIG_PATHS {
+        let committed = tokio::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&repository.git_path)
+            .args(["cat-file", "-e", &format!("{commit_hash}:{config_path}")])
+            .output()
+            .await?;
+        if !committed.status.success() {
+            continue;
+        }
 
-    let show = tokio::process::Command::new("git")
-        .arg("--git-dir")
-        .arg(&repository.git_path)
-        .args(["show", &format!("{commit_hash}:{PIPELINE_CONFIG_PATH}")])
-        .output()
-        .await?;
-    if !show.status.success() {
-        anyhow::bail!(
-            "failed to read {} at {} for repo {}: {}",
-            PIPELINE_CONFIG_PATH,
-            commit_hash,
-            repo_id,
-            String::from_utf8_lossy(&show.stderr).trim()
-        );
-    }
+        let show = tokio::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&repository.git_path)
+            .args(["show", &format!("{commit_hash}:{config_path}")])
+            .output()
+            .await?;
+        if !show.status.success() {
+            anyhow::bail!(
+                "failed to read {config_path} at {commit_hash} for repo {}: {}",
+                repo_id,
+                String::from_utf8_lossy(&show.stderr).trim()
+            );
+        }
 
-    let yaml = String::from_utf8(show.stdout).map_err(|error| {
-        anyhow::anyhow!("{PIPELINE_CONFIG_PATH} at {commit_hash} is not valid UTF-8: {error}")
-    })?;
-    PipelineDefinition::parse(&yaml).map(Some).map_err(|error| {
-        anyhow::anyhow!("invalid {PIPELINE_CONFIG_PATH} at {commit_hash}: {error}")
-    })
+        let yaml = String::from_utf8(show.stdout).map_err(|error| {
+            anyhow::anyhow!("{config_path} at {commit_hash} is not valid UTF-8: {error}")
+        })?;
+        return PipelineDefinition::parse(&yaml)
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("invalid {config_path} at {commit_hash}: {error}"));
+    }
+    Ok(None)
 }
 
 /// Single source of truth for the run-workspace root, so workspace creation,
@@ -1009,15 +1026,28 @@ const RECONCILE_MIN_RUN_AGE_SECS: i64 = 600;
 /// enqueue has been observed to survive.
 const RECONCILE_EMPTY_RUN_HORIZON_SECS: i64 = 3600;
 
-/// Finalize non-terminal runs whose jobs are all terminal. `live_run_ids`
-/// and `min_age` guard the periodic pass against racing the push handler:
-/// a run with a registered engine still belongs to that engine, and a run
-/// younger than the grace window may not have its engine registered yet.
-/// The startup pass passes an empty set and a zero window because nothing
-/// can be mid-trigger while the process is starting.
+/// Finalize non-terminal runs whose jobs are all terminal, first cancelling
+/// (durably) every not-yet-dispatched job that can never run because a
+/// pipeline ancestor already failed. `min_age` guards the periodic pass
+/// against racing the push handler: a run younger than the grace window may
+/// not have its engine registered or its jobs enqueued yet. The startup pass
+/// passes a zero window because nothing can be mid-trigger while the process
+/// is starting.
+///
+/// Registry custody deliberately does not protect a run here. Custody used
+/// to: the pass skipped anything a live engine held. That deferred forever
+/// to an engine that could never converge — a rebuilt engine grafts an
+/// already-terminal failure from the durable rows, so the watchdog mirror's
+/// non-terminal guard skips `timeout_job` and the in-memory
+/// `cancel_descendants` cascade never fires (live run 666b3fa8: `test`
+/// reaped by the watchdog while `coverage` stayed `pending` and the run
+/// non-terminal for hours, each finalizer deferring to the other). The
+/// durable rows are the expiry authority, so once every row is terminal the
+/// run is finalizable regardless of what a zombie engine believes; a run
+/// with real in-flight work still has non-terminal rows and is skipped on
+/// that ground alone.
 async fn reconcile_orphaned_runs_filtered(
     pool: &gitforge_db::Pool,
-    live_run_ids: &HashSet<gitforge_common::PipelineRunId>,
     min_age: chrono::Duration,
 ) -> usize {
     let runs = match gitforge_db::queries::PipelineRunQueries::list(pool).await {
@@ -1034,9 +1064,6 @@ async fn reconcile_orphaned_runs_filtered(
             run.status.as_str(),
             "succeeded" | "failed" | "cancelled" | "timed_out" | "timeout" | "timed-out"
         ) {
-            continue;
-        }
-        if live_run_ids.contains(&run.id) {
             continue;
         }
         if Utc::now() - run.created_at < min_age {
@@ -1060,9 +1087,21 @@ async fn reconcile_orphaned_runs_filtered(
                 continue;
             }
         };
+        let definition = run_definition(pool, run.pipeline_id).await;
+        // Make doom durable before measuring the run: a failed, timed-out,
+        // or cancelled row dooms every not-yet-dispatched row downstream of
+        // it. The engine performs this cascade in memory
+        // (`cancel_descendants`), but only while it lives and only when its
+        // own mirror state can still drive the failure — the durable record
+        // must not depend on that.
+        let cancelled_now = match &definition {
+            Some(definition) => cancel_doomed_rows(pool, &run, &jobs, definition).await,
+            None => HashSet::new(),
+        };
         let unfinished = jobs.iter().any(|job| {
-            gitforge_db::models::JobStatus::from_str(&job.status)
-                .is_some_and(|status| !status.is_terminal())
+            !cancelled_now.contains(&job.id)
+                && gitforge_db::models::JobStatus::from_str(&job.status)
+                    .is_some_and(|status| !status.is_terminal())
         });
         if unfinished {
             continue;
@@ -1079,12 +1118,15 @@ async fn reconcile_orphaned_runs_filtered(
         // against the run's persisted pipeline definition and grade the
         // shortfall as a failure; when the definition cannot be recovered,
         // fall back to row-only grading rather than inventing a failure.
-        let incomplete_chain = match expected_job_names(pool, run.pipeline_id).await {
-            Some(expected) => {
-                let enqueued: HashSet<&str> = jobs.iter().map(|job| job.name.as_str()).collect();
-                expected
+        let incomplete_chain = match &definition {
+            Some(definition) => {
+                let expected: HashSet<&str> = definition
+                    .jobs
                     .iter()
-                    .any(|name| !enqueued.contains(name.as_str()))
+                    .map(|job| job.name.as_str())
+                    .collect();
+                let enqueued: HashSet<&str> = jobs.iter().map(|job| job.name.as_str()).collect();
+                expected.iter().any(|name| !enqueued.contains(name))
             }
             None => false,
         };
@@ -1101,16 +1143,19 @@ async fn reconcile_orphaned_runs_filtered(
             } else {
                 continue;
             }
-        } else if jobs.iter().any(|job| job.status == "cancelled") {
-            "cancelled"
         } else if jobs
             .iter()
             .any(|job| job.status == "failed" || job.status == "timed_out")
         {
             // A watchdog-reaped job dooms the run just like a reported
             // failure; grading it `succeeded` here would publish a green
-            // run whose job never finished.
+            // run whose job never finished. Failure deliberately outranks
+            // cancellation: a run that genuinely lost a job grades failed
+            // even when the remaining rows were cancelled afterwards (by an
+            // operator or by the doom cascade above).
             "failed"
+        } else if jobs.iter().any(|job| job.status == "cancelled") {
+            "cancelled"
         } else if incomplete_chain {
             // Every enqueued job succeeded, but the definition expects more
             // jobs than were ever enqueued: the chain stopped advancing when
@@ -1131,47 +1176,121 @@ async fn reconcile_orphaned_runs_filtered(
     finalized
 }
 
-/// Job names the run's persisted pipeline definition expects, or `None`
-/// when the definition cannot be recovered (a legacy row or an unreadable
-/// config blob) — the caller then grades from the durable rows alone.
-async fn expected_job_names(
+/// The run's persisted pipeline definition, or `None` when it cannot be
+/// recovered (a legacy row or an unreadable config blob) — the caller then
+/// grades from the durable rows alone and never invents a doom the
+/// definition cannot witness.
+async fn run_definition(
     pool: &gitforge_db::Pool,
     pipeline_id: gitforge_common::PipelineId,
-) -> Option<Vec<String>> {
+) -> Option<PipelineDefinition> {
     let pipeline = gitforge_db::queries::PipelineQueries::get(pool, pipeline_id)
         .await
         .ok()
         .flatten()?;
-    let definition: PipelineDefinition = serde_json::from_value(pipeline.config).ok()?;
-    Some(definition.jobs.into_iter().map(|job| job.name).collect())
+    serde_json::from_value(pipeline.config).ok()
+}
+
+/// Durably cancel every not-yet-dispatched job that transitively depends on
+/// a failed, timed-out, or cancelled one, and return the ids cancelled.
+///
+/// `ready_jobs` requires all dependencies to have succeeded, so these rows
+/// can never be dispatched again — leaving them `pending`/`queued` keeps
+/// the run non-terminal forever. Only rows a runner has never touched are
+/// cancelled (`pending`/`queued`); `assigned`/`running` rows belong to the
+/// runner lifecycle and are reaped by the lease and timeout machinery. The
+/// cascade is computed over the definition's `needs` edges, so an unreadable
+/// definition cancels nothing — doom is never invented without a witness.
+async fn cancel_doomed_rows(
+    pool: &gitforge_db::Pool,
+    run: &gitforge_db::models::PipelineRun,
+    jobs: &[gitforge_db::models::Job],
+    definition: &PipelineDefinition,
+) -> HashSet<gitforge_common::JobId> {
+    let failed: HashSet<&str> = jobs
+        .iter()
+        .filter(|job| matches!(job.status.as_str(), "failed" | "timed_out" | "cancelled"))
+        .map(|job| job.name.as_str())
+        .collect();
+    if failed.is_empty() {
+        return HashSet::new();
+    }
+
+    // Transitive closure over the definition's dependency edges.
+    let mut doomed: HashSet<String> = failed.iter().map(|name| (*name).to_string()).collect();
+    loop {
+        let mut grew = false;
+        for job in &definition.jobs {
+            if doomed.contains(&job.name) {
+                continue;
+            }
+            if job.needs.iter().any(|need| doomed.contains(need)) {
+                doomed.insert(job.name.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let mut cancelled = HashSet::new();
+    for job in jobs.iter().filter(|job| {
+        doomed.contains(&job.name) && matches!(job.status.as_str(), "pending" | "queued")
+    }) {
+        let receipt = serde_json::json!({
+            "status": "cancelled",
+            "reason": "pipeline ancestor failed; this job can never be dispatched",
+        })
+        .to_string();
+        match gitforge_db::queries::JobQueries::cancel(pool, job.id, &receipt).await {
+            Ok(()) => {
+                tracing::info!(
+                    job = %job.id,
+                    run = %run.id,
+                    name = %job.name,
+                    "cancelled doomed job: its pipeline ancestor already failed"
+                );
+                cancelled.insert(job.id);
+            }
+            Err(error) => {
+                // Leave it for the next pass rather than grading the run
+                // while a doomed row is still unfinished.
+                tracing::warn!(%error, job = %job.id, run = %run.id, "failed to cancel doomed job");
+            }
+        }
+    }
+    cancelled
 }
 
 async fn reconcile_orphaned_runs(pool: &gitforge_db::Pool) -> usize {
-    reconcile_orphaned_runs_filtered(pool, &HashSet::new(), chrono::Duration::zero()).await
+    reconcile_orphaned_runs_filtered(pool, chrono::Duration::zero()).await
 }
 
 /// Re-run reconciliation on an interval so runs stranded while the control
 /// plane is up are finalized without waiting for the next restart. Runs
-/// owned by a live engine and runs still inside the creation grace window
-/// are never touched.
-async fn run_reconciliation_loop(
-    pool: gitforge_db::Pool,
-    pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
-) {
+/// still inside the creation grace window are never touched, and runs with
+/// unfinished durable rows are left to the machinery that owns them
+/// (scheduler recovery, the lease and timeout sweeps). Finalization here
+/// bypasses the completion consumer, so the workspaces it would have freed
+/// are reclaimed on this loop too — the sweep only touches run-owned
+/// directories of already-terminal runs.
+async fn run_reconciliation_loop(pool: gitforge_db::Pool) {
     let mut interval = tokio::time::interval(Duration::from_secs(RECONCILE_INTERVAL_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        let live_run_ids: HashSet<gitforge_common::PipelineRunId> =
-            pipeline_registry.read().await.keys().copied().collect();
         let finalized = reconcile_orphaned_runs_filtered(
             &pool,
-            &live_run_ids,
             chrono::Duration::seconds(RECONCILE_MIN_RUN_AGE_SECS),
         )
         .await;
         if finalized > 0 {
             tracing::info!(finalized, "periodic run reconciliation complete");
+            let removed = sweep_terminal_workspaces(&pool).await;
+            if removed > 0 {
+                tracing::info!(removed, "periodic workspace sweep complete");
+            }
         }
     }
 }
@@ -1488,8 +1607,7 @@ async fn handle_push_event(
     };
     let pipeline = if let Some(committed) = committed_pipeline {
         tracing::info!(
-            "using {} committed at {} for repo {}",
-            PIPELINE_CONFIG_PATH,
+            "using committed pipeline definition at {} for repo {}",
             payload.new_hash,
             repo_id
         );
@@ -2522,12 +2640,12 @@ mod tests {
         run_git(["commit", "-m", "without pipeline"], Some(&seed)).await;
         let without = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
         tokio::fs::write(
-            seed.join(PIPELINE_CONFIG_PATH),
+            seed.join(PIPELINE_CONFIG_PATHS[0]),
             "name: fixture-ci\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment:\n  CI: \"true\"\njobs:\n  - name: echo\n    image: busybox:latest\n    steps:\n      - name: echo\n        run: echo committed-config\n",
         )
         .await
         .unwrap();
-        run_git(["add", PIPELINE_CONFIG_PATH], Some(&seed)).await;
+        run_git(["add", PIPELINE_CONFIG_PATHS[0]], Some(&seed)).await;
         run_git(["commit", "-m", "with pipeline"], Some(&seed)).await;
         let with = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
         run_git(
@@ -3229,7 +3347,6 @@ jobs:
         let fresh_run = seed_run(&pool, repo_id, pipeline_id, "queued").await;
         let finalized = reconcile_orphaned_runs_filtered(
             &pool,
-            &HashSet::new(),
             chrono::Duration::seconds(RECONCILE_MIN_RUN_AGE_SECS),
         )
         .await;
@@ -3240,16 +3357,20 @@ jobs:
         assert_eq!(run_status(&pool, fresh_run).await, "queued");
         drop(pool);
 
-        // Live-engine guard: a run whose engine is registered is never
-        // touched, even when all of its jobs are already terminal.
+        // Terminal rows outrank registry custody: a run whose engine is
+        // still registered but whose durable rows are all terminal is
+        // graded from those rows. Custody used to shield such runs and the
+        // deferral wedged them forever when the engine could not converge
+        // (run 666b3fa8).
         let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
         let live_run = seed_run(&pool, repo_id, pipeline_id, "running").await;
         seed_job(&pool, live_run, "lint", "succeeded").await;
-        let live: HashSet<gitforge_common::PipelineRunId> = [live_run].into_iter().collect();
-        let finalized =
-            reconcile_orphaned_runs_filtered(&pool, &live, chrono::Duration::zero()).await;
-        assert_eq!(finalized, 0, "runs with a live engine are not orphaned");
-        assert_eq!(run_status(&pool, live_run).await, "running");
+        let finalized = reconcile_orphaned_runs_filtered(&pool, chrono::Duration::zero()).await;
+        assert_eq!(
+            finalized, 1,
+            "all-terminal durable rows finalize even under live custody"
+        );
+        assert_eq!(run_status(&pool, live_run).await, "succeeded");
         drop(pool);
 
         // Outside both guards the periodic pass finalizes the orphan. The
@@ -3268,7 +3389,6 @@ jobs:
         .await;
         let finalized = reconcile_orphaned_runs_filtered(
             &pool,
-            &HashSet::new(),
             // A negative window treats every run as older than the grace
             // period, standing in for a run created long before this pass.
             chrono::Duration::seconds(-1),
@@ -3276,6 +3396,128 @@ jobs:
         .await;
         assert_eq!(finalized, 1, "the stale jobless orphan is cancelled");
         assert_eq!(run_status(&pool, stale_run).await, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_cancels_doomed_descendants_of_reaped_job() {
+        // The 666b3fa8 shape: a chain fmt → clippy → test → coverage whose
+        // test job was reaped by the timeout watchdog while coverage was
+        // never dispatched. The doom cascade must grade coverage cancelled
+        // from the durable record alone, evidence intact, so the run can
+        // finally grade failed.
+        let (pool, repo_id, _) = sweep_test_pool().await;
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let definition = serde_json::json!({
+            "name": "chain",
+            "version": "1.0",
+            "trigger_on": ["push"],
+            "environment": {},
+            "jobs": [
+                {"name": "fmt", "image": "dsc-ci-rust:7", "needs": [], "env": {},
+                 "steps": [{"name": "fmt", "run": "cargo fmt --all -- --check"}]},
+                {"name": "clippy", "image": "dsc-ci-rust:7", "needs": ["fmt"], "env": {},
+                 "steps": [{"name": "clippy", "run": "cargo clippy"}]},
+                {"name": "test", "image": "dsc-ci-rust:7", "needs": ["clippy"], "env": {},
+                 "steps": [{"name": "test", "run": "cargo test"}]},
+                {"name": "coverage", "image": "dsc-ci-rust:7", "needs": ["test"], "env": {},
+                 "steps": [{"name": "coverage", "run": "cargo llvm-cov"}]}
+            ]
+        });
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: "chain-pipeline".to_string(),
+                trigger_type: "push".to_string(),
+                config: definition,
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let run_id = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, run_id, "fmt", "succeeded").await;
+        seed_job(&pool, run_id, "clippy", "succeeded").await;
+        seed_job(&pool, run_id, "test", "timed_out").await;
+        seed_job(&pool, run_id, "coverage", "pending").await;
+
+        assert_eq!(reconcile_orphaned_runs(&pool).await, 1);
+        assert_eq!(
+            run_status(&pool, run_id).await,
+            "failed",
+            "the reaped test job dooms the run"
+        );
+
+        let jobs = gitforge_db::queries::JobQueries::list_by_run(&pool, run_id)
+            .await
+            .unwrap();
+        let by_name: std::collections::HashMap<&str, &gitforge_db::models::Job> =
+            jobs.iter().map(|job| (job.name.as_str(), job)).collect();
+        let coverage = by_name.get("coverage").expect("coverage row");
+        assert_eq!(coverage.status, "cancelled", "the doomed row is graded");
+        assert!(
+            coverage.finished_at.is_some(),
+            "the cascade writes a completion receipt"
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_str(coverage.result_json.as_deref().unwrap_or_default())
+                .expect("cascade receipt parses");
+        assert_eq!(
+            receipt["reason"], "pipeline ancestor failed; this job can never be dispatched",
+            "the receipt records why the row was cancelled"
+        );
+        let test_row = by_name.get("test").expect("test row");
+        assert_eq!(test_row.status, "timed_out", "the reap evidence is kept");
+        assert!(
+            test_row.result_json.is_none() && test_row.finished_at.is_none(),
+            "the cascade must not rewrite other rows' evidence"
+        );
+
+        // Idempotent: the second pass finds nothing stranded.
+        assert_eq!(reconcile_orphaned_runs(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_never_cascades_into_dispatched_rows() {
+        // A doomed row a runner has already picked up belongs to the runner
+        // lifecycle (lease + timeout sweeps own it). The cascade leaves it,
+        // and the run with a live row stays ungraded for a later pass.
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        let run_id = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, run_id, "lint", "failed").await;
+        seed_job(&pool, run_id, "publish", "running").await;
+
+        assert_eq!(reconcile_orphaned_runs(&pool).await, 0);
+        assert_eq!(run_status(&pool, run_id).await, "running");
+        let jobs = gitforge_db::queries::JobQueries::list_by_run(&pool, run_id)
+            .await
+            .unwrap();
+        let publish = jobs.iter().find(|job| job.name == "publish").unwrap();
+        assert_eq!(
+            publish.status, "running",
+            "a dispatched row is never cascade-cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_never_invents_doom_without_a_definition() {
+        // An unreadable definition cannot witness the dependency edges, so
+        // the cascade cancels nothing and the run with a failed ancestor and
+        // an unfinished descendant is left for a pass that can read it.
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        let run_id = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, run_id, "test", "failed").await;
+        seed_job(&pool, run_id, "coverage", "pending").await;
+
+        assert_eq!(reconcile_orphaned_runs(&pool).await, 0);
+        assert_eq!(run_status(&pool, run_id).await, "running");
+        let jobs = gitforge_db::queries::JobQueries::list_by_run(&pool, run_id)
+            .await
+            .unwrap();
+        let coverage = jobs.iter().find(|job| job.name == "coverage").unwrap();
+        assert_eq!(coverage.status, "pending", "no doom without a witness");
     }
 
     #[tokio::test]
@@ -3329,10 +3571,10 @@ jobs:
         run_git(["init", seed.to_str().unwrap()], None).await;
         run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
         run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
-        tokio::fs::write(seed.join(PIPELINE_CONFIG_PATH), "::: not a pipeline\n")
+        tokio::fs::write(seed.join(PIPELINE_CONFIG_PATHS[0]), "::: not a pipeline\n")
             .await
             .unwrap();
-        run_git(["add", PIPELINE_CONFIG_PATH], Some(&seed)).await;
+        run_git(["add", PIPELINE_CONFIG_PATHS[0]], Some(&seed)).await;
         run_git(["commit", "-m", "broken pipeline"], Some(&seed)).await;
         let commit = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
         run_git(
@@ -3345,7 +3587,78 @@ jobs:
         let error = load_pipeline_from_commit(&pool, repo_id, &commit)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("invalid .gitforce.yml"));
+        assert!(error.to_string().contains("invalid .gitforge.yml"));
+    }
+
+    /// Seed a bare repository whose HEAD commit carries a definition at
+    /// every name in `config_paths`, in order. Returns (bare path, commit).
+    async fn seed_pipeline_at_paths(config_paths: &[&str]) -> (PathBuf, String) {
+        let run_id = gitforge_common::PipelineRunId::new();
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-pipeline-config-tests")
+            .join(run_id.to_string());
+        let bare = test_root.join("source.git");
+        let seed = test_root.join("seed");
+        tokio::fs::create_dir_all(&test_root).await.unwrap();
+        run_git(["init", "--bare", bare.to_str().unwrap()], None).await;
+        tokio::fs::create_dir_all(&seed).await.unwrap();
+        run_git(["init", seed.to_str().unwrap()], None).await;
+        run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
+        run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
+        for (index, config_path) in config_paths.iter().enumerate() {
+            tokio::fs::write(
+                seed.join(config_path),
+                format!("name: fixture-{index}\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment: {{}}\njobs: []\n"),
+            )
+            .await
+            .unwrap();
+            run_git(["add", config_path], Some(&seed)).await;
+        }
+        run_git(["commit", "-m", "pipeline definitions"], Some(&seed)).await;
+        let commit = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
+        run_git(
+            ["push", bare.to_str().unwrap(), "HEAD:refs/heads/main"],
+            Some(&seed),
+        )
+        .await;
+        (bare, commit)
+    }
+
+    #[tokio::test]
+    async fn test_load_pipeline_from_commit_accepts_legacy_config_name() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let (bare, commit) = seed_pipeline_at_paths(&[".gitforce.yml"]).await;
+        let (pool, repo_id) = test_pool_with_repository(bare.to_string_lossy().into_owned()).await;
+
+        // The legacy name still resolves, so repositories committed before
+        // the rename keep building.
+        let loaded = load_pipeline_from_commit(&pool, repo_id, &commit)
+            .await
+            .unwrap()
+            .expect("legacy .gitforce.yml must load");
+        assert_eq!(loaded.name, "fixture-0");
+    }
+
+    #[tokio::test]
+    async fn test_load_pipeline_from_commit_prefers_current_config_name() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let (bare, commit) =
+            seed_pipeline_at_paths(&[PIPELINE_CONFIG_PATHS[0], PIPELINE_CONFIG_PATHS[1]]).await;
+        let (pool, repo_id) = test_pool_with_repository(bare.to_string_lossy().into_owned()).await;
+
+        // When both spellings are committed the current one wins; the
+        // pipeline must never be half of each.
+        let loaded = load_pipeline_from_commit(&pool, repo_id, &commit)
+            .await
+            .unwrap()
+            .expect("committed definition must load");
+        assert_eq!(loaded.name, "fixture-0");
     }
 
     #[tokio::test]

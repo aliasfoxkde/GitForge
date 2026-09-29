@@ -35,9 +35,11 @@ perf: performance improvements
 
 - [ ] Conventional commit format in title
 - [ ] Root cause analysis in PR description (for `fix:` prefixes)
-- [ ] `make lint` passes — formatting, `go vet`-equivalent checks, and
+- [ ] `make lint` passes — `cargo fmt --check`, `cargo vet`, and
       `cargo clippy --workspace --all-targets -- -D warnings` (which
-      also enforces the workspace's promoted pedantic lints)
+      also enforces the workspace's promoted pedantic lints), plus
+      ShellCheck on repo scripts and the aegis scan against the
+      triaged baseline
 - [ ] `make test` passes (`cargo test --workspace`; the pre-push hook
       additionally runs the coverage gate)
 - [ ] Coverage maintained or improved (`make coverage`)

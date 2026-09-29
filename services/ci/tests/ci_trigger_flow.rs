@@ -4,7 +4,7 @@
 //! database, bare git repository, workspace root, and artifact root, then
 //! drives the same HTTP trigger endpoint the git-server calls after a
 //! successful push. Nothing is mocked: the trigger auth middleware, the
-//! in-process event consumer, the committed `.gitforce.yml` loader, the
+//! in-process event consumer, the committed `.gitforge.yml` loader, the
 //! workspace clone, and the durable scheduler enqueue all run in the real
 //! service, and the run and job rows are asserted in the database the
 //! service itself wrote.
@@ -74,7 +74,7 @@ fn run_git(args: &[&str], cwd: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// Prepare the database, bare repository with a committed `.gitforce.yml`,
+/// Prepare the database, bare repository with a committed `.gitforge.yml`,
 /// and directory layout the service expects, then spawn the real ci binary.
 async fn spawn_ci() -> CiService {
     let unique = uuid::Uuid::new_v4();
@@ -121,7 +121,7 @@ async fn spawn_ci() -> CiService {
     run_git(&["init", "--initial-branch=main"], &seed);
     run_git(&["config", "user.email", "dev@example.com"], &seed);
     run_git(&["config", "user.name", "CI Trigger Harness"], &seed);
-    std::fs::write(seed.join(".gitforce.yml"), COMMITTED_PIPELINE).expect("write pipeline");
+    std::fs::write(seed.join(".gitforge.yml"), COMMITTED_PIPELINE).expect("write pipeline");
     run_git(&["add", "."], &seed);
     run_git(&["commit", "-m", "seed commit with pipeline"], &seed);
     run_git(&["remote", "add", "origin", bare.to_str().unwrap()], &seed);
@@ -270,7 +270,7 @@ async fn test_trigger_requires_token_and_runs_committed_pipeline() {
         workspace.display()
     );
     let checked_out =
-        std::fs::read_to_string(workspace.join(".gitforce.yml")).expect("workspace pipeline file");
+        std::fs::read_to_string(workspace.join(".gitforge.yml")).expect("workspace pipeline file");
     assert_eq!(checked_out, COMMITTED_PIPELINE);
 
     common::shutdown_gracefully(&mut service.child).await;
