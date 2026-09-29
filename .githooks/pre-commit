@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Dark Factory pre-commit hook
-# Runs: gofmt, goimports, go vet, selective tests, coverage gate, bundle rebuild
+# GitForge pre-commit hook
+# Runs: cargo fmt --check + strict clippy when Rust sources are staged.
+# (The full workspace test suite runs in pre-push; CI reruns everything.)
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -18,84 +19,24 @@ INFO() { echo -e "${GREEN}[pre-commit]${NC} $*"; }
 WARN() { echo -e "${YELLOW}[pre-commit]${NC} $*"; }
 ERROR() { echo -e "${RED}[pre-commit]${NC} $*"; }
 
-# ─── Go format check ─────────────────────────────────────────────────────────
-INFO "Checking Go format..."
-UNFORMATTED=$(gofmt -l .)
-if [ -n "$UNFORMATTED" ]; then
-    ERROR "gofmt must format these files:"
-    echo "$UNFORMATTED"
-    ERROR "Run: gofmt -w ."
-    exit 1
-fi
-
-# ─── Goimports ───────────────────────────────────────────────────────────────
-if command -v goimports &>/dev/null; then
-    INFO "Checking goimports..."
-    UNIMPORTED=$(goimports -l .)
-    if [ -n "$UNIMPORTED" ]; then
-        ERROR "goimports must format these files:"
-        echo "$UNIMPORTED"
-        exit 1
-    fi
-fi
-
-# ─── Go vet ───────────────────────────────────────────────────────────────────
-INFO "Running go vet..."
-if ! go vet ./... 2>&1; then
-    ERROR "go vet failed"
-    exit 1
-fi
-
-# ─── Staged files check ──────────────────────────────────────────────────────
-STAGED_GO=$(git diff --cached --name-only --diff-filter=ACM | grep '\.go$' || true)
-if [ -z "$STAGED_GO" ]; then
-    INFO "No Go files staged — skipping test/coverage check"
+# Rust gates only make sense when Rust sources (or the manifest) changed.
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -q '\.rs$\|Cargo\.toml$\|Cargo\.lock$'; then
+    INFO "No Rust sources staged — skipping cargo gates"
     exit 0
 fi
 
-# ─── Selective test (only if core/ changed) ─────────────────────────────────
-CORE_CHANGED=$(git diff --cached --name-only | grep -q '^core/' && echo "yes" || echo "no")
-if [ "$CORE_CHANGED" == "yes" ]; then
-    INFO "core/ changed — running full test suite..."
-    COVERAGE_THRESHOLD="${COVERAGE_THRESHOLD:-70}"
-
-    # Full test with coverage
-    COVERAGE_OUT=$(mktemp)
-    if ! go test -p 1 -timeout 15m -coverprofile="$COVERAGE_OUT" ./... 2>&1; then
-        ERROR "Tests failed"
-        rm -f "$COVERAGE_OUT"
-        exit 1
-    fi
-
-    COV=$(go tool cover -func="$COVERAGE_OUT" | grep total | awk '{print $3}' | tr -d '%')
-    rm -f "$COVERAGE_OUT"
-
-    INFO "Coverage: ${COV}%"
-
-    if (( $(echo "$COV < $COVERAGE_THRESHOLD" | bc -l) )); then
-        ERROR "Coverage ${COV}% is below threshold ${COVERAGE_THRESHOLD}%"
-        exit 1
-    fi
-else
-    INFO "Running tests for staged packages only..."
-    STAGED_DIRS=$(git diff --cached --name-only --diff-filter=ACM | xargs -I{} dirname {} | sort -u | grep '\.go$' | xargs -I{} dirname {} | sort -u)
-    if [ -n "$STAGED_DIRS" ]; then
-        go test -p 1 -timeout 5m $STAGED_DIRS 2>&1 || {
-            ERROR "Tests failed for staged packages"
-            exit 1
-        }
-    fi
+# ─── Format check ────────────────────────────────────────────────────────────
+INFO "Checking formatting (cargo fmt --check)..."
+if ! cargo fmt --all -- --check; then
+    ERROR "cargo fmt --check failed — run: cargo fmt --all"
+    exit 1
 fi
 
-# ─── Bundle rebuild (if pattern files staged) ─────────────────────────────────
-PATTERN_STAGED=$(git diff --cached --name-only | grep -qE '(community/|patterns/)' && echo "yes" || echo "no")
-if [ "$PATTERN_STAGED" == "yes" ]; then
-    INFO "Pattern files staged — rebuilding bundle..."
-    if command -v go &>/dev/null && [ -f ./bundler/main.go ] || [ -f ./bundler.go ]; then
-        go run ./bundler 2>&1 || {
-            WARN "Bundle rebuild failed — ensure patterns are valid"
-        }
-    fi
+# ─── Strict clippy ───────────────────────────────────────────────────────────
+INFO "Running clippy (workspace, all targets, -D warnings)..."
+if ! cargo clippy --workspace --all-targets -- -D warnings; then
+    ERROR "clippy failed — fix the warnings before committing"
+    exit 1
 fi
 
-INFO "All pre-commit checks passed"
+INFO "Pre-commit checks passed."

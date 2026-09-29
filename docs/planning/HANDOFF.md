@@ -1,5 +1,12 @@
 # GitForge Handoff
 
+> **Currency note (2026-09-28):** this is a point-in-time handoff
+> snapshot (2026-09-20). For live state, read the master-plan ledger's
+> deploy/findings sections — `MASTER_PLAN_2026-09-20.md` §F31–F36 and
+> §Deploy state — and [CAMPAIGN_PLAN_2026-09-28.md](CAMPAIGN_PLAN_2026-09-28.md).
+> The "Critical Issue: Runner Not Executing Jobs" section below is
+> historical (resolved by the 0.4.0-era fixes); do not re-escalate it.
+
 **Last Updated:** 2026-09-20
 **Current state:** `origin/main` was reconciled with the promoted
 branch history on 2026-09-20 (PR #175) — main now carries both the

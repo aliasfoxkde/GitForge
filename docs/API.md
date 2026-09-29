@@ -125,7 +125,38 @@ PATCH /api/users/{id}/role
 
 ```
 GET /api/pipelines
+POST /api/pipelines
 GET /api/pipelines/{id}
+DELETE /api/pipelines/{id}
+POST /api/pipelines/{id}/runs
+```
+
+`POST /api/pipelines` registers a pipeline definition for a repository —
+the request carries the repository in `owner/name` form and the pipeline
+definition document (the committed `.gitforge.yml` contents) as `config`.
+The document must parse with a single active version; the caller must own
+the repository (admin/maintainer override applies).
+
+`POST /api/pipelines/{id}/runs` triggers a run of the stored definition,
+resolving the optional `ref` (default: repository HEAD) to a commit and
+rejecting ambiguous or hostile refs.
+
+`DELETE /api/pipelines/{id}` deletes a runless pipeline outright and
+deactivates one with run history (the history stays queryable).
+
+**Register Pipeline Request:**
+```json
+{
+  "repo": "owner/name",
+  "config": "name: ci\nversion: \"1.0\"\n..."
+}
+```
+
+**Trigger Run Request:**
+```json
+{
+  "ref": "main"
+}
 ```
 
 #### Pipeline Runs

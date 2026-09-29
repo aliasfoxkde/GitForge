@@ -2,6 +2,33 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **F31 residual — evidence-torn job rows now self-heal**: a job row that
+  carries its completion receipt (`finished_at` + `result_json`) but lost
+  the status/started-at write (the F21/F23 one-shot-write-loss class,
+  observed live as bd5c8664 and repaired by hand twice) stranded its run
+  non-terminal forever. `JobQueries::reconcile_evidence_rows` grades such
+  rows from their own recorded receipt — a recognized verdict wins,
+  unparseable evidence fails closed to `failed`, and the evidence columns
+  are never rewritten. Runs on the CI watchdog tick and after scheduler
+  recovery. Pinned by
+  `test_reconcile_evidence_rows_grades_stranded_rows`.
+
+### Changed
+
+- The `pre-commit` hook (installed by `make setup`) ran Go gates
+  (gofmt/goimports/go vet) against this Rust workspace — a template
+  leftover that either no-op'd or failed spuriously. It now runs
+  `cargo fmt --all -- --check` and strict clippy when Rust sources or the
+  manifest are staged; the full suite stays in `pre-push`.
+- Project `CLAUDE.md` rewritten for the actual Rust workspace (Makefile
+  targets, the `.gitforge.yml` chain as the authoritative gate, real
+  conventions and coverage calibration) — it previously documented a Go
+  repository end to end.
+
 ## [0.6.6] - 2026-09-23
 
 Deployed release `gitforge-d821d44-20260922` (source `d821d44e`). Three
