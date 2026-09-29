@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Dark Factory pre-push hook
-# Runs: full test suite with coverage gate before first push
+# GitForge pre-push hook
+# Runs the full workspace test suite before first push.
+#
+# The 2-thread bound mirrors the CI test job (.gitforge.yml): unbounded
+# test parallelism on this host loses spawned-binary protocol tests to
+# load races (the git_http_edges / ci_trigger_flow flake class), while
+# the bound keeps the suite deterministic well inside CI timeouts.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -18,8 +23,7 @@ WARN() { echo -e "${YELLOW}[pre-push]${NC} $*"; }
 ERROR() { echo -e "${RED}[pre-push]${NC} $*"; }
 
 INFO "Running full test suite before push..."
-cd "$REPO_ROOT"
-if ! cargo test --workspace --no-fail-fast 2>&1; then
+if ! cargo test --workspace --no-fail-fast -- --test-threads=2 2>&1; then
     ERROR "Tests failed — fix before pushing"
     exit 1
 fi

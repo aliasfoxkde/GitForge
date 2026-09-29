@@ -1,46 +1,22 @@
-# Dark Factory pre-commit configuration
+# GitForge pre-commit configuration
 # ─────────────────────────────────────────────────────────────────────────────
 # Installation: pip install pre-commit && pre-commit install
+#
+# The Rust gates (cargo fmt --check + strict clippy) live in the git
+# pre-commit hook (.githooks/pre-commit, installed by `make setup`), which
+# is staged-file-gated so docs-only commits stay fast. This framework layer
+# runs the repo-generic hygiene hooks.
 # ─────────────────────────────────────────────────────────────────────────────
 repos:
-  # ─── Local Go hooks ─────────────────────────────────────────────────────
+  # ─── Local Rust hooks ───────────────────────────────────────────────────
   - repo: local
     hooks:
-      - id: go-test
-        name: go test
-        entry: go test -p 1 -timeout 5m ./...
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
         language: system
         pass_filenames: false
-        types: [go]
-
-      - id: go-vet
-        name: go vet
-        entry: go vet ./...
-        language: system
-        pass_filenames: false
-        types: [go]
-
-      - id: go-fmt
-        name: gofmt
-        entry: gofmt -l .
-        language: system
-        pass_filenames: false
-        types: [go]
-        stages: [commit]
-
-      - id: go-build
-        name: go build
-        entry: go build ./...
-        language: system
-        pass_filenames: false
-        types: [go]
-
-      - id: go-mod-tidy
-        name: go mod tidy
-        entry: go mod tidy
-        language: system
-        pass_filenames: false
-        stages: [commit]
+        files: '\.rs$'
 
   # ─── Remote hooks ───────────────────────────────────────────────────────
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -70,11 +46,3 @@ repos:
       - id: mixed-line-ending
         args: ['--fix=no']
         description: Detect and report mixed line endings (does not fix)
-
-  # ─── Golangci-lint via pre-commit ────────────────────────────────────────
-  - repo: https://github.com/golangci-lint/golangci-lint
-    rev: v2.1.6
-    hooks:
-      - id: golangci-lint
-        args: ['--timeout=5m']
-        description: Run golangci-lint linter
