@@ -57,9 +57,18 @@ Verified at campaign start, on the pre-merge tree:
    lease-start/completion all wrapped; unit probe test at assigner.rs).
 5. ⏳ Full gates: fmt → clippy `-D warnings` → `cargo test --workspace
    -- --test-threads=2` → aegis.
-6. ⏳ Push; validate through the self-hosted GitForge pipeline
+6. ✅ Fix F37 (found validating this branch, live repro run 666b3fa8):
+   the watchdog reaped a hung `test` job but the run never finalized —
+   the failure→cancel cascade existed only in engine memory, the
+   rebuilt engine never fired it, and the periodic reconciler deferred
+   to the live engine forever (custody deadlock). The doom cascade is
+   now durable (`cancel_doomed_rows` over the persisted definition's
+   `needs`), registry custody no longer shields all-terminal runs, and
+   the periodic loop reclaims pass-finalized workspaces. See F37 in
+   the master-plan ledger.
+7. ⏳ Push; validate through the self-hosted GitForge pipeline
    (`.gitforge.yml`: fmt → clippy → test → coverage on `dsc-ci-rust:7`).
-7. ⏳ Merge PR #236 (GitHub main requires the ruleset-bypass procedure:
+8. ⏳ Merge PR #236 (GitHub main requires the ruleset-bypass procedure:
    temporary bypass grant + `gh pr merge --admin`).
 
 ## Phase 2 — Documentation currency
@@ -122,3 +131,27 @@ gate's calibration honesty (raise the 82/84 gate only with a re-measure).
   Docker-gated and `main.rs` binaries need live infra; the documented
   ceiling with current harnesses is ~88-90% workspace-wide. Chasing the
   number by de-testing infrastructure paths would be dishonest metrics.
+
+## Live observations during validation (2026-09-29, host at load 45–78)
+
+Observed while this branch's own pipeline ran on the saturated instance:
+
+1. **Run 666b3fa8 stayed non-terminal after its `test` job was reaped** —
+   initially read as watchdog starvation, but the reap HAD succeeded
+   (`timed_out`, correct evidence); the run stayed `running` because of
+   F37 (custody deadlock between the periodic reconciler and a
+   never-converging engine), which is now fixed. The lesson stands: read
+   the job rows before blaming the write plane.
+2. **Cancellation is also a durable write**: `POST /jobs/{id}/cancel`
+   for a superseded job returned 500 `database_error` at load 60+ —
+   control-plane actions fail closed under saturation.
+3. **Read-plane starvation**: direct sqlite reads of the live DB time
+   out even with busy timeouts; gateway queries exceeded 35–80s at load
+   60–78; the scheduler API is the only plane that stayed responsive.
+
+Item 1 was a code defect (F37, fixed). Items 2–3 are not new defects;
+they are the documented cost of running the platform on a shared host at
+4x oversubscription. Candidate mitigations (not scheduled): per-service
+CPUQuota already exists (400%); a queue-depth-aware admission gate for
+new runs and a read-replica or WAL checkpoint tuning for the gateway are
+the next levers if this recurs.

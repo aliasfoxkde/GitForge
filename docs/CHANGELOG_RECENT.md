@@ -6,6 +6,23 @@ All notable changes to GitForge will be documented in this file.
 
 ### Fixed
 
+- **F37 — watchdog-reaped timeouts no longer strand runs (custody
+  deadlock)**: when the timeout watchdog reaped a hung job, the
+  failure→cancel cascade existed only in the engine's memory, and a
+  rebuilt engine grafts the reap from the durable rows so it never fired
+  it — the doomed downstream job stayed `pending`, the run stayed
+  `running`, and neither finalizer would act (the periodic pass deferred
+  to the live engine; the engine had already converged its own mirror).
+  The doom cascade is now durable: `cancel_doomed_rows` grades every
+  never-dispatched row that transitively depends on a failed,
+  timed-out, or cancelled row as `cancelled`, using the persisted
+  definition's `needs` edges (dispatched rows are left to the runner
+  lifecycle; an unreadable definition cancels nothing). Registry custody
+  no longer shields a run whose durable rows are all terminal, a genuine
+  failure outranks cleanup cancellations in the verdict, and the
+  periodic loop reclaims pass-finalized workspaces. Live repro: run
+  666b3fa8. Pinned by
+  `test_reconcile_cancels_doomed_descendants_of_reaped_job` and friends.
 - **F31 residual — evidence-torn job rows now self-heal**: a job row that
   carries its completion receipt (`finished_at` + `result_json`) but lost
   the status/started-at write (the F21/F23 one-shot-write-loss class,

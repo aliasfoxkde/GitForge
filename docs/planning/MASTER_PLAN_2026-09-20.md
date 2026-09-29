@@ -817,3 +817,37 @@ the same day, plus the r6-platform-durability line deployed.
   workspaces stay errors. Regression test drives the adopt path
   (dirty leftover files restored/cleared, HEAD preserved) and the
   refusal path (bad commit).
+
+- **F37 (watchdog-reaped timeout strands pending descendants — found
+  2026-09-29 during r6-platform-durability validation; live repro run
+  666b3fa8, commit 9b67f1fd).** The timeout watchdog's
+  `reconcile_expired` correctly reaped a hung `test` job
+  (`timed_out`, 06:52Z), but the run never finalized: `coverage`
+  stayed `pending` forever. The failure→cancel cascade
+  (`CiEngine::cancel_descendants`) exists only in the engine's
+  in-memory state, and the watchdog mirror skips driving an engine
+  job that is already terminal — which a rebuilt engine is, because
+  `CiEngine::rebuild` grafts the reap from the durable rows. Neither
+  finalizer could act: the periodic pass skipped the run for having
+  unfinished rows AND deferred to the live engine, while the engine
+  never converged. Two finalizers deferring to each other = custody
+  deadlock; the run stayed `running`, its workspace never freed.
+  Fix (r6-platform-durability): the doom cascade is now durable —
+  `cancel_doomed_rows` grades every `pending`/`queued` row that
+  transitively depends on a failed/timed_out/cancelled row as
+  `cancelled` (receipt records the reason; dispatched
+  `assigned`/`running` rows belong to the runner lifecycle and are
+  left to the lease/timeout sweeps; an unreadable definition cancels
+  nothing — doom is never invented without a witness), computed over
+  the persisted definition's `needs` edges. Registry custody no
+  longer shields a run: all-terminal durable rows finalize under a
+  live engine too, and the verdict ranks a genuine failure above
+  cleanup cancellations. The periodic loop now also reclaims
+  pass-finalized workspaces. Residual: a run whose pipeline row
+  predates persisted definitions (unreadable config) still needs an
+  operator — row-only grading cannot invent doom. Pinned by
+  `test_reconcile_cancels_doomed_descendants_of_reaped_job`,
+  `test_reconcile_never_cascades_into_dispatched_rows`,
+  `test_reconcile_never_invents_doom_without_a_definition`, and the
+  rewritten custody assertion in
+  `test_periodic_reconciliation_skips_live_and_fresh_runs`.

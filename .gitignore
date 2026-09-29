@@ -6,6 +6,13 @@ bin/
 dist/
 !template-parts/atheon-enhanced/
 
+# ─── Release-bundling leftovers (cp target/release/<svc> to root) ────────────
+/api
+/ci
+/git-server
+/runner
+/gitforge.db
+
 # ─── Generated ────────────────────────────────────────────────────────────────
 *.out
 coverage.out

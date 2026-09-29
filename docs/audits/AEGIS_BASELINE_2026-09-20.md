@@ -118,6 +118,36 @@ of the regenerated baseline): the static `sqlite3` diagnostic query in
 `scripts/gitforge-status` and the loopback CI-trigger URL in
 `.gitforce.yml:83`.
 
+## Baseline refresh (2026-09-29) — triage of the r6-platform-durability tree
+
+Two refreshes on this date; both findings sets triaged before
+regenerating with `make aegis-baseline` (aegis 0.6.3).
+
+1. **F31 residual work (commit 5b3d24ca).** Adding
+   `reconcile_evidence_rows` and its pinned test to
+   `crates/gitforge-db/src/queries.rs` shifted three already-accepted
+   `sql-query` [LOW] fingerprints in that file's test fixtures (the
+   scanner's parameterized-SQL heuristic tripped by test-fixture
+   `UPDATE jobs SET finished_at …` statements under `#[cfg(test)]`).
+   Content hashes matched the previously accepted findings; nothing new.
+2. **F37 work (commit 1ba3287b).** The reconciliation rewrite inserted
+   ~103 lines above `services/ci/src/main.rs`'s `trigger_token_matches`
+   tests, shifting two already-accepted `bearer-token-url` [MEDIUM]
+   fingerprints (2250→2353, 2267→2370 — an exactly equal shift). The
+   matched content is unchanged: negative assertions in `#[cfg(test)]`
+   proving the trigger-token matcher REJECTS `Bearer`-prefixed wrong
+   tokens against a fabricated `shared-secret`. No credential.
+3. **Docs edit shifted `docs/MACOS_BUILD.md` content.** The rustup
+   install-step edit moved two pre-existing findings +3 lines; both are
+   documentation examples, not code:
+   - `xml-external-entity` / `security-hardening-xml-external-entity`
+     [CRITICAL] at the launchd plist heredoc — the standard
+     `<!DOCTYPE plist PUBLIC …>` header every macOS `.plist` file
+     carries. There is no XML parser in that path; the flag is the
+     DOCTYPE literal inside a documented copy-paste template.
+   - `email-address` [LOW] at the `notarytool submit` example — the
+     placeholder `your@email.com` in the codesigning walkthrough.
+
 ## Historical note (2026-09-25, earlier same day)
 
 Before the full regeneration above, two findings were appended
