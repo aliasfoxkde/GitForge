@@ -4,7 +4,45 @@ All notable changes to GitForge will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.11] - 2026-09-29
+
+### Added
+
+- **Pipeline management API + CLI**: stored pipelines can be created,
+  listed, triggered, and deleted through the gateway (`POST
+  /api/pipelines/{id}/runs` runs a stored pipeline at a given `ref`),
+  and pipeline runs plus their job rows are queryable (`GET
+  /api/pipeline-runs`, `GET /api/pipeline-runs/{id}`,
+  `GET /api/pipeline-runs/{id}/jobs`). Mirrored in the `gitforge` CLI.
+
 ### Fixed
+
+- **Git HTTP: gzip request bodies are decoded (F32)**: full clones of
+  large repositories failed with HTTP 500 ("bad line length
+  character") because git compresses upload-pack request bodies past a
+  negotiation threshold and the server piped the still-compressed
+  bytes into `git upload-pack`. `Content-Encoding: gzip`/`x-gzip`
+  bodies are now inflated in both smart-HTTP POST handlers (with the
+  same size cap as raw bodies), and receive-pack commands are parsed
+  before the body is consumed.
+- **Shallow clones over HTTP**: the hand-built upload-pack ref
+  advertisement omitted the `shallow` capability, so every
+  depth-limited fetch died with "Server does not support shallow
+  clients". `shallow` and `deepen-relative` are now advertised (the
+  spawned git child already implemented shallow), with an end-to-end
+  depth-1 test.
+- **Gateway boot no longer crash-loops on a no-op runner rename**
+  (observed live 2026-09-25 as 11 consecutive restart failures): the
+  startup duplicate-name migration ran an unconditional UPDATE whose
+  lock escalation could return the WAL upgrade-to-write BUSY that
+  ignores the busy handler. It now checks read-only first and takes
+  `BEGIN IMMEDIATE` up front only when duplicates exist.
+- **F36 — engine rebuild adopts existing workspaces**: a rebuilt CI
+  engine treated a pre-existing `workspaces/<run_id>` as fatal and
+  never registered itself, drifting every interrupted run to the
+  orphan reconciler for a false `failed` grade with an intact
+  workspace sitting on disk. Rebuild now adopts the workspace and
+  resumes the run.
 
 - **F37 — watchdog-reaped timeouts no longer strand runs (custody
   deadlock)**: when the timeout watchdog reaped a hung job, the
@@ -45,6 +83,34 @@ All notable changes to GitForge will be documented in this file.
   targets, the `.gitforge.yml` chain as the authoritative gate, real
   conventions and coverage calibration) — it previously documented a Go
   repository end to end.
+
+## [0.6.10] - 2026-09-25
+
+Durable DAG planning across control-plane restart, storm-scale CI
+trigger outbox insert, container-backend failure classification
+(infrastructure vs code), queue dispatch observability, and the
+stranded-run reconciliation loop. Validated on the instance (runs
+5710ff8f, e9a7d325 — 4/4 jobs each); deployed as
+`gitforge-64da53b7-20260925`.
+
+## [0.6.9] - 2026-09-24
+
+`bounded_put` keeps the newest bytes behind a fixed-size marker (F30 —
+run summaries and failure evidence survive unbounded-growth truncation);
+ledger corrections (F27 resolution, in-sandbox coverage-gate
+calibration).
+
+## [0.6.8] - 2026-09-24
+
+F21/F23/F24 durable-write fixes; F25 toolchain preflight; F26 durable
+runner registry; F9 rate limiter mounted; `JWT_SECRET_FILE`; SQLite
+`BEGIN IMMEDIATE` write discipline; F28 coverage gate calibrated
+in-sandbox (82 hard / 84 warn).
+
+## [0.6.7] - 2026-09-23
+
+Interrupted pipeline chains are graded `failed` (`incomplete_chain`)
+instead of silently `succeeded` (#212, F19/F20).
 
 ## [0.6.6] - 2026-09-23
 
