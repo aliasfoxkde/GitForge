@@ -22,6 +22,17 @@ use std::time::Duration;
 
 const CI_TRIGGER_URL: &str = "http://127.0.0.1:42781/pipelines/trigger";
 
+/// Extra budget over the orchestrator's correlation window, covering its
+/// request parsing, the response write, and loopback connect latency.
+const CI_TRIGGER_TIMEOUT_MARGIN: Duration = Duration::from_secs(10);
+
+/// Total request budget for the trigger endpoint: the orchestrator's
+/// correlation window plus margin. Derived from the shared constant so the
+/// two services cannot drift apart silently.
+fn trigger_client_timeout() -> Duration {
+    gitforge_common::CI_TRIGGER_CORRELATION_WINDOW + CI_TRIGGER_TIMEOUT_MARGIN
+}
+
 /// Webhook payload for triggering a pipeline
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WebhookTriggerPayload {
@@ -123,11 +134,24 @@ impl CiTriggerClient {
         Ok(Self {
             token: token.into(),
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
+                // Must outlast the orchestrator's run-creation correlation
+                // window: the trigger handler is synchronous end-to-end and
+                // answers `queued` (no run id) when that window elapses
+                // under write contention. A budget at or below the window
+                // made this client die first, manufacturing a 502 for
+                // triggers that actually succeeded (observed live
+                // 2026-09-29 under a dispatch-storm backlog).
+                .timeout(trigger_client_timeout())
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|error| format!("failed to build CI trigger client: {error}"))?,
         })
+    }
+
+    /// The total request budget this client grants the orchestrator. Exposed
+    /// so tests can pin the derived-timeout contract.
+    pub fn request_timeout(&self) -> Duration {
+        trigger_client_timeout()
     }
 
     pub(crate) async fn trigger(

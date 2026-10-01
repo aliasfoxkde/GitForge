@@ -27,6 +27,20 @@ pub fn is_zero_hash(hash: &str) -> bool {
     hash.is_empty() || hash.bytes().all(|byte| byte == b'0')
 }
 
+/// How long the CI orchestrator's `POST /pipelines/trigger` handler waits
+/// for the pipeline bus consumer to durably create the run and correlate
+/// its id before answering `queued` (202 without a run id). The trigger is
+/// latency-coupled to a durable `BEGIN IMMEDIATE` write, so under dispatch
+/// storms the window can elapse honestly; the run is still created by the
+/// consumer either way.
+///
+/// Clients of that endpoint MUST budget more than this window. The api
+/// gateway's `CiTriggerClient` derives its request timeout from it (+ a
+/// margin) so a slow-but-successful trigger surfaces as the orchestrator's
+/// own `queued` response rather than a manufactured gateway 502 for a
+/// trigger that in fact succeeded.
+pub const CI_TRIGGER_CORRELATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[cfg(test)]
 mod tests {
     use super::is_zero_hash;
