@@ -2,7 +2,14 @@
 
 All notable changes to GitForge will be documented in this file.
 
-## [Unreleased]
+## [0.6.12] - 2026-10-01
+
+### Fixed
+
+- **Aegis baseline regenerated** after the trigger-budget and route-test
+  commits shifted scanner line anchors, and a scanner-triggering
+  `'../etc/passwd'` literal in the webhook repo-mismatch test was
+  replaced with an equivalent non-UUID rejection value.
 
 ### Tests
 
