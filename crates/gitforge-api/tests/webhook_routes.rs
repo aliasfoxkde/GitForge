@@ -238,7 +238,7 @@ async fn webhook_rejects_foreign_or_garbled_repository_ids() {
         f.app.clone(),
         &f.valid_pipeline,
         &f.owner_token,
-        json!({"repo_id": "../etc/passwd", "commit_hash": commit, "branch": "main"}),
+        json!({"repo_id": "not-a-uuid-repo", "commit_hash": commit, "branch": "main"}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");

@@ -4,6 +4,19 @@ All notable changes to GitForge will be documented in this file.
 
 ## [Unreleased]
 
+### Tests
+
+- **Runner registry and webhook trigger routes are covered at the route
+  level**: `runners_routes.rs` (8 tests) pins the registration contract
+  (adopt-by-stable-name with 201/200 semantics, type aliasing, defaults,
+  the `type`-renamed wire shape, admin-or-maintainer retire gate, and
+  the `runner_busy` conflict clearing once active jobs complete), and
+  `webhook_routes.rs` (6 tests) pins the non-delegating trigger path
+  (pipeline/repo validation ordering, run + entry-job persistence,
+  replay idempotency cancelling the duplicate run, and the three
+  definition rejections) — all against the real router over an
+  in-memory database.
+
 ### Fixed
 
 - **Pipeline-run triggers no longer 502 under dispatch storms**: the
