@@ -541,13 +541,16 @@ async fn trigger_pipeline(
             // the observed cold-path on the Fedora runner, causing a valid
             // accepted event to be returned as `queued` without a run ID;
             // consumers that require a correlated run then failed with a
-            // false 500. Keep the synchronous correlation window generous
-            // while retaining the explicit queued response for a genuinely
-            // slow scheduler.
-            let pipeline_run_id = tokio::time::timeout(Duration::from_secs(15), run_rx)
-                .await
-                .ok()
-                .and_then(std::result::Result::ok);
+            // false 500. The window is shared with api clients
+            // (`gitforge_common::CI_TRIGGER_CORRELATION_WINDOW`) so their
+            // request budgets are derived from this one; a window that
+            // elapses under write contention still answers `queued` — the
+            // run is created by the consumer either way.
+            let pipeline_run_id =
+                tokio::time::timeout(gitforge_common::CI_TRIGGER_CORRELATION_WINDOW, run_rx)
+                    .await
+                    .ok()
+                    .and_then(std::result::Result::ok);
             if pipeline_run_id.is_none() {
                 trigger_state
                     .run_waiters

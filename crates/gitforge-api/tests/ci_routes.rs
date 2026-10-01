@@ -824,6 +824,25 @@ async fn webhook_delegation_fails_closed_when_ci_cannot_accept_the_trigger() {
     );
 }
 
+/// The trigger client's request budget must outlast the orchestrator's
+/// run-creation correlation window: when that window elapses under write
+/// contention the orchestrator answers `queued` honestly, and this client
+/// must still be alive to relay that response instead of manufacturing a
+/// 502 for a trigger that in fact succeeded (observed live 2026-09-29 as
+/// POST /api/pipelines/{id}/runs 502ing at exactly 10s while the
+/// orchestrator's window is 15s).
+#[test]
+fn trigger_client_timeout_exceeds_ci_correlation_window() {
+    let client =
+        CiTriggerClient::new("http://127.0.0.1:42781/pipelines/trigger", "test-token").unwrap();
+    assert!(
+        client.request_timeout() > gitforge_common::CI_TRIGGER_CORRELATION_WINDOW,
+        "client timeout {:?} must exceed the orchestrator correlation window {:?}",
+        client.request_timeout(),
+        gitforge_common::CI_TRIGGER_CORRELATION_WINDOW
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline registration (POST /api/pipelines)
 // ---------------------------------------------------------------------------

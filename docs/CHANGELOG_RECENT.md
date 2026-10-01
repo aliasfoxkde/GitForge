@@ -4,6 +4,21 @@ All notable changes to GitForge will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pipeline-run triggers no longer 502 under dispatch storms**: the
+  gateway's trigger client allowed 10s while the orchestrator's trigger
+  handler waits up to 15s to correlate the run id from its durable
+  creation path — so the gateway died first and reported a failure for
+  triggers that in fact succeeded (observed live 2026-09-29: `POST
+  /api/pipelines/{id}/runs` 502ing at exactly 10.0s during a backlog
+  storm). The correlation window is now a shared constant
+  (`gitforge_common::CI_TRIGGER_CORRELATION_WINDOW`) and the client's
+  budget is derived from it with an explicit margin, pinned by
+  `trigger_client_timeout_exceeds_ci_correlation_window`; a window that
+  elapses under write contention now surfaces as the orchestrator's own
+  honest `queued` (202, null run id) instead of a manufactured 502.
+
 ## [0.6.11] - 2026-09-29
 
 ### Added
