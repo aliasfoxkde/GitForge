@@ -196,3 +196,44 @@ checkpoint tuning for the gateway are the next levers if this recurs.
    "Deployed release …" line (the 0.6.6 style) — the annotated tag
    message carries the deploy facts, matching the 0.6.10 precedent, so
    the validated release commit did not need a post-deploy doc delta.
+
+## Phase 5 — Release v0.6.12 (executed 2026-10-01)
+
+1. ✅ Validation, twice per the exact-SHA rule: run `531e1f23` green
+   (4/4, 46 min) on the release tree `383f94b4`, then after the PR
+   merge run `5d55c6d9` green (4/4, ~40 min) on the exact merge commit
+   `74f2226d` — the tree is identical but the gate requires the run on
+   the tagged SHA, matching the v0.6.11 precedent.
+2. ✅ PR #246 merged via `gh pr merge --merge --admin` under a
+   temporary ruleset bypass. Procedure notes: rulesets update by full
+   -body `PUT` (a `PATCH` 404s); backup taken first, `bypass_actors`
+   restored to `[]` immediately after the merge — the window was open
+   only for the merge call.
+3. ✅ Gate → bundle: `gitforge-release-gate` passed mechanically
+   ("run 5d55c6d9 green, 4/4 jobs covering the persisted definition"),
+   bundle `gitforge-74f2226d-20261001` assembled, `promote --apply`
+   switched `releases/gitforge-current` atomically (previous:
+   `gitforge-1b9a67ca-20260929`).
+4. ⚠️ Drain: the co-tenant queue refilled continuously (2→4→3 live
+   containers over 30 min, never zero), so the master plan's documented
+   "accept the recovery" path was taken for ci+runner (api/git-server
+   are stateless and restarted any time). Recovery behaved better than
+   fencing: in-flight `build` completed and graded `succeeded` through
+   its persisted receipt; `test-py310` was requeued and re-delivered
+   (fresh assignment at 20:12:51Z) — no job was lost or falsely failed.
+5. ✅ Post-deploy verification: all four units run from
+   `gitforge-74f2226d-20261001/bin/*`; health 200 on :42780/:42781/
+   :42782; `overall: healthy`. Gotcha recorded: `gitforge-status`
+   defaults `GITFORGE_RELEASE_ROOT` to `/home/gitforge/work/
+   gitforge-current` and reports false drift/degraded on this instance
+   unless pointed at `/nas/Temp/repos/GitForge/releases/gitforge-current`.
+6. ✅ GitHub sync: tag `v0.6.12` pushed GitForge-first then origin,
+   release published. Local main, origin/main, and gitforge-ci main all
+   at `74f2226d`.
+7. Incident records from this cycle: a lock-storm trigger produced a
+   run-without-jobs ghost (run row committed, planned-jobs write lost);
+   the jobless-run reconciler graded it `cancelled` at horizon+2 min,
+   validating the 1h `RECONCILE_EMPTY_RUN_HORIZON_SECS` design. Post-
+   storm trigger delivery can lag minutes (dispatcher marks `delivered`
+   on ci's honest 202 before the consumer creates the run) — re-query
+   before diagnosing.
