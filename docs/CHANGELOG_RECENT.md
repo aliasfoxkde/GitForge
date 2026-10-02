@@ -15,6 +15,12 @@ All notable changes to GitForge will be documented in this file.
   honor a prefix), and the CLI accepts `owner/name` per the
   documented syntax while sending only the bare name (43833379).
 
+- **Pipeline listings only include active pipelines**: the pipeline
+  query and its route-contract tests now filter inactive rows, ending
+  the accumulation of per-push duplicate pipeline records in list
+  output (752ea428, absorbed into this cut from
+  `fix/pipeline-list-active-20261002`).
+
 ## [0.6.12] - 2026-10-01
 
 ### Fixed
