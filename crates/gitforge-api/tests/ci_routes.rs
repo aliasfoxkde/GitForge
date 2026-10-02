@@ -920,6 +920,26 @@ async fn pipeline_create_replaces_the_active_version_of_the_same_name() {
         1,
         "only one active version may survive per (repo, name)"
     );
+
+    // The catalog endpoint reflects the single-active-version invariant:
+    // the listing shows the successor, never the retired predecessor.
+    let (status, view) = request_json(
+        f.app.clone(),
+        "GET",
+        "/api/pipelines",
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let registered: Vec<_> = view
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"] == "registered-pipeline")
+        .collect();
+    assert_eq!(registered.len(), 1, "{view}");
+    assert_eq!(registered[0]["id"], second["id"]);
 }
 
 #[tokio::test]
