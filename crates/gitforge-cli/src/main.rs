@@ -250,6 +250,16 @@ async fn watch_pipeline_run(client: &GitForgeClient, run_id: &str) -> Result<Str
     anyhow::bail!("run {run_id} did not reach a terminal state within the watch window")
 }
 
+/// Reduce a repo-create argument to the bare repository name.
+///
+/// The API derives the owner from the auth token, so `--create` accepts
+/// either `name` or `owner/name`; only the final segment names the
+/// repository. Passing the full path through would store `owner/name` as
+/// the name and make the repo unresolvable for git serving.
+fn bare_repo_name(arg: &str) -> &str {
+    arg.trim_matches('/').rsplit('/').next().unwrap_or(arg)
+}
+
 /// Run the CLI command handler (extracted for testing)
 pub async fn run_cli(cli: Cli) -> Result<()> {
     let config = Config::load().unwrap_or_default();
@@ -408,9 +418,15 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     }
                 }
             } else if let Some(name) = create {
-                println!("📦 Creating repository '{name}'...");
+                let bare = bare_repo_name(name.as_str());
+                if bare != name.as_str() {
+                    println!(
+                        "   Owner prefix given — creating repository '{bare}' (owner comes from your credentials)"
+                    );
+                }
+                println!("📦 Creating repository '{bare}'...");
                 match api_client
-                    .create_repo(name, Some("private".to_string()))
+                    .create_repo(bare, Some("private".to_string()))
                     .await
                 {
                     Ok(repo) => {
@@ -877,6 +893,21 @@ mod tests {
             whoami: false,
         });
         assert!(run_cli(cli).await.is_ok());
+    }
+
+    #[test]
+    fn test_bare_repo_name_strips_owner_prefix() {
+        assert_eq!(bare_repo_name("mkinney/kubix"), "kubix");
+    }
+
+    #[test]
+    fn test_bare_repo_name_passthrough() {
+        assert_eq!(bare_repo_name("kubix"), "kubix");
+    }
+
+    #[test]
+    fn test_bare_repo_name_trims_surrounding_slashes() {
+        assert_eq!(bare_repo_name("/kubix/"), "kubix");
     }
 
     #[tokio::test]
