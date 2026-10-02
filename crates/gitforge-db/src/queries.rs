@@ -682,9 +682,13 @@ impl PipelineQueries {
         Ok(pipelines)
     }
 
-    /// List all pipelines
+    /// List the active pipelines, one per (repository, name).
+    ///
+    /// Retired versions remain as history and are addressable by id, but
+    /// they are definitions, not endpoints: returning them here made
+    /// `GET /api/pipelines` scan every superseded row ever recorded.
     pub async fn list(pool: &Pool) -> Result<Vec<crate::models::Pipeline>> {
-        let rows = sqlx::query("SELECT * FROM pipelines ORDER BY created_at DESC")
+        let rows = sqlx::query("SELECT * FROM pipelines WHERE active = 1 ORDER BY created_at DESC")
             .fetch_all(pool.pool())
             .await
             .map_err(|e| Error::database(format!("failed to list pipelines: {e}")))?;
