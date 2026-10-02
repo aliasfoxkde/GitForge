@@ -188,7 +188,8 @@ async fn test_pipeline_versioning_active_uniqueness() {
     PipelineQueries::deactivate_active(&pool, repo.id, "gates")
         .await
         .unwrap();
-    PipelineQueries::create(&pool, &pipeline(PipelineId::new()))
+    let successor = PipelineId::new();
+    PipelineQueries::create(&pool, &pipeline(successor))
         .await
         .unwrap();
     assert_eq!(
@@ -197,6 +198,15 @@ async fn test_pipeline_versioning_active_uniqueness() {
             .unwrap(),
         1
     );
+
+    // The catalog-style list surfaces the active definition only: the
+    // retired predecessor stays addressable by id but must not re-enter
+    // `GET /api/pipelines` responses.
+    let listed = PipelineQueries::list(&pool).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, successor);
+    let retired = PipelineQueries::list_by_repo(&pool, repo.id).await.unwrap();
+    assert_eq!(retired.len(), 2);
 }
 
 #[tokio::test]
