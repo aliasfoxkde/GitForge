@@ -2,6 +2,19 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [0.6.13] - 2026-10-02
+
+### Fixed
+
+- **Owner-prefixed repo names no longer create unresolvable repos**:
+  `gitforge repo --create mkinney/kubix` stored the full path as the
+  repository name, but git serving resolves repos by (owner username,
+  bare name) — the repo row existed yet never resolved, 404ing every
+  clone/push. The API now rejects `/` in repo names outright (the
+  owner is derived from the auth token; no org handling exists to
+  honor a prefix), and the CLI accepts `owner/name` per the
+  documented syntax while sending only the bare name (43833379).
+
 ## [0.6.12] - 2026-10-01
 
 ### Fixed
