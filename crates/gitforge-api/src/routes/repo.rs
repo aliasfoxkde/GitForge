@@ -27,13 +27,16 @@ fn validate_repo_name(name: &str) -> Result<(), String> {
         return Err("Repository name cannot contain '..'".to_string());
     }
 
-    // Check for path separators that could create directories
-    if name.contains('/') && !name.contains("./") {
-        // Allow org/repo format but validate each part
-        for part in name.split('/') {
-            validate_repo_name(part)?;
-        }
-        return Ok(());
+    // Reject path separators outright: repos resolve by (owner username,
+    // bare name) and create_repo derives the owner from the auth token, so
+    // an `org/repo` name would be stored verbatim and never resolve for
+    // git serving (the kubix activation failure).
+    if name.contains('/') {
+        return Err(
+            "Repository name must be a bare name without '/' — the owner \
+             is derived from the authenticated user"
+                .to_string(),
+        );
     }
 
     // Check length
@@ -453,8 +456,11 @@ mod tests {
 
     #[test]
     fn test_validate_repo_name_with_org_format() {
+        // owner/name is rejected: the owner comes from the auth token, and
+        // a slash in the stored name would be unresolvable for git serving
         let result = validate_repo_name("org/repo");
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("bare name"));
     }
 
     #[test]
@@ -500,13 +506,13 @@ mod tests {
 
     #[test]
     fn test_validate_repo_name_org_format_valid() {
+        // any slash-containing form is rejected, valid segments or not
         let result = validate_repo_name("my-org/my-repo");
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_repo_name_org_format_invalid_second_part() {
-        // org/repo where second part starts with dash
         let result = validate_repo_name("org/-invalid");
         assert!(result.is_err());
     }
