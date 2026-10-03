@@ -103,7 +103,8 @@ impl TriggerType {
     }
 }
 
-/// Pipeline definition (loaded from .gitforce.yml)
+/// Pipeline definition (loaded from `.gitforge.yml`; legacy `.gitforce.yml`
+/// accepted)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineDefinition {
     pub name: String,

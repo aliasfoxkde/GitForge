@@ -2,91 +2,109 @@
 
 ## Overview
 
-Dark Factory uses a simplified trunk-based development model with short-lived feature branches.
-
-## Branch Types
+GitForge uses a trunk-based model with short-lived feature branches off
+`main`. There is no `develop` line and no long-lived release branches.
 
 ```
 main (production)
-  └── [short-lived feature/fix/docs/test/refactor branches]
+  └── [short-lived feature/fix/docs/test/chore branches]
        ↓
-       PR → review → squash-merge → main
+       PR → GitForge pipeline green → merge commit → main
 ```
 
 ### Main Branch
 
 - **Name:** `main`
-- **Protection:** Strict branch protection, required CI checks, 1 review
-- **State:** Always production-ready
-- **History:** Preserved via merge commits
+- **Protection:** GitHub ruleset (Safeguards) + the repo's own GitForge
+  pipeline as the authoritative gate (see below)
+- **State:** Always production-ready; a green run on the exact HEAD
+  commit is the standing invariant
+- **History:** Preserved via merge commits — never squash
 
-### Feature Branches
+## The Gate Is GitForge, Not GitHub
+
+The authoritative CI chain is this repo's self-hosted pipeline
+(`.gitforge.yml`: `fmt → clippy → test → coverage` on `dsc-ci-rust:7`,
+linear chain, one shared workspace per run). A push to the GitForge
+remote triggers it automatically.
+
+GitHub Actions workflows mirror the checks for the public record, but a
+red GitHub run is **not** a code-failure signal on this instance (the
+GitHub account is billing-blocked; NAS-contended runners). Validate
+through the GitForge pipeline before merging.
+
+Before pushing, mirror the chain locally:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace -- --test-threads=2   # the 2-thread bound is deliberate
+```
+
+## Branch Types
 
 | Prefix | Purpose | Example |
 |--------|---------|---------|
-| `feature/` | New functionality | `feature/oauth-authentication` |
-| `fix/` | Bug fixes | `fix/jwt-token-detection` |
-| `docs/` | Documentation only | `docs/api-reference` |
-| `test/` | Test improvements | `test/increase-pattern-coverage` |
-| `refactor/` | Code restructuring | `refactor/scanner-interface` |
-| `ci/` | CI/CD improvements | `ci/add-codecov` |
-| `perf/` | Performance work | `perf/regex-compilation` |
-
-### Dev Branches
-
-| Prefix | Purpose | Gates |
-|--------|---------|-------|
-| `dev/` | Experimental work | Dev-testing workflow (50% coverage, non-blocking lint) |
-| `dev-testing/` | Integration testing | Dev-testing workflow |
-| `development/` | Staging integration | Dev-testing workflow |
+| `feat/` / `feature/` | New functionality | `feat/release-gate` |
+| `fix/` | Bug fixes | `fix/repo-create-owner-prefix` |
+| `docs/` | Documentation only | `docs-v0612-release-record` |
+| `test/` | Test improvements | `test/api-route-coverage-20261002` |
+| `chore/` | Maintenance, supply chain | `chore/close-window-rehearsal` |
+| `refactor/`, `perf/`, `ci/` | Code restructuring / performance / pipeline work | `refactor/scanner-interface` |
+| `<campaign>-*` | Multi-commit campaign branches | `r6-platform-durability` |
 
 ## Workflow
 
-### Creating a Feature Branch
+### Creating a Branch
 
 ```bash
-git checkout main
-git pull
-git checkout -b feature/my-feature
+git checkout main && git pull
+git checkout -b fix/my-fix
 # ... work ...
-git push -u origin feature/my-feature
+git push -u gitforge-ci fix/my-fix   # GitForge first — this triggers the pipeline
+git push -u origin fix/my-fix        # then the GitHub mirror
 ```
 
 ### Merging
 
-1. Ensure all CI checks pass
-2. Open PR against `main`
-3. CODEOWNERS review
-4. Squash and merge
-5. Branch auto-deleted
+1. GitForge pipeline green on the branch (all four jobs, including the
+   coverage gate — fail < 82%, warn < 84% lines, calibrated in-sandbox).
+2. Open the PR against `main`.
+3. Merge with a **merge commit** (`gh pr merge --merge --admin`).
+   `main`'s ruleset requires the temporary-bypass procedure: back up
+   `bypass_actors` via GET, PUT the bypass in, merge, PUT restore to
+   `[]` immediately — see `docs/MIRROR_POLICY.md`. The bypass window
+   is two API calls, never a standing state.
+4. If the change is release-bound, a green run of the **merge commit
+   itself** is required before cutting (the release gate checks the
+   exact SHA).
 
 ### Hotfix Process
 
-```bash
-git checkout main
-git pull
-git checkout -b fix/critical-issue
-# Fix...
-git push -u origin fix/critical-issue
-# PR → expedite review → squash-merge
-# Then tag and release
-```
+Same flow, expedited: branch from `main`, fix with a pinned regression
+test, validate through the pipeline, merge, tag, and release. Tag
+pushes follow the release sequence in `docs/RUNBOOK.md`.
 
-## Release Branches
+## Releases
 
-We do **not** maintain long-lived release branches. Every tag on `main` is a release candidate.
-
-```bash
-git tag v1.2.3
-git push origin v1.2.3
-# → GoReleaser builds and publishes
-```
+Tags are cut on `main` only after the exact-SHA pipeline run is green.
+The release sequence is: `scripts/gitforge-release-gate` (refuses a cut
+without a green run of the exact source commit) →
+`scripts/gitforge-release-bundle` → `gitforge-release-promote --apply`
+→ drain-gated restart of the `gitforge@*` units → GitHub tag + release
+pushed GitForge-first, then mirrored. See `docs/RUNBOOK.md` for the
+authoritative steps and `docs/MIRROR_POLICY.md` for what belongs where.
 
 ## Best Practices
 
-- **Short-lived branches** — PRs should be merged within 1-2 days
-- **Atomic commits** — One logical change per commit
-- **Conventional commits** — `feat:`, `fix:`, `docs:`, etc.
-- **Reference issues** — Link PRs to issues: `Closes #123`
-- **No force-pushes** to `main` or protected branches
-- **Delete old branches** — Auto-deleted on merge (if configured)
+- **Short-lived branches** — land within a day or two; rebase onto
+  `main` rather than letting the branch drift
+- **Atomic commits** — one logical change per commit
+- **Conventional commits** — `feat:`, `fix:`, `docs:`, `test:`,
+  `refactor:`, `chore:`, `ci:`
+- **Pinned regression tests** — every fixed defect gets a test that
+  fails without the fix
+- **No force-pushes** to `main` (`--force-with-lease` only, and only
+  for your own just-pushed branch)
+- **Delete merged branches** — after verifying the merge actually
+  landed on `main` (ancestry check, not branch absence)
