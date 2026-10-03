@@ -309,3 +309,36 @@ against contention. A contributing environment factor: co-tenant
 /tmp-tmpfs exhaustion caused container-start failures the same night
 (see the v0.6.13 release record above); my run's container died at
 /tmp 100%. Re-validation will retry when host load clears.
+
+## Phase 3 — artifact routes + trigger-path coverage (2026-10-03)
+
+Measured per-line gaps in `crates/gitforge-api/src/routes/` (host
+llvm-cov on `e112e41c`) and closed the testable ones:
+
+- New `tests/artifact_routes.rs` (8 tests): the artifact endpoints
+  previously had only DTO unit tests — every handler body
+  (`list`, `get`, `content`, `delete`, `list_by_job`, `authorize_job`)
+  was uncovered. The suite drives the real router with an in-memory DB
+  and a temp-dir `FileStorage`, covering the owner/admin/intruder
+  authorization matrix, ID validation, download bytes/headers, and the
+  delete lifecycle.
+- New `tests/common/mod.rs`: the stub CI orchestrator moved out of
+  `webhook_routes.rs` so both the webhook and the pipeline-run trigger
+  routes can drive the pinned-endpoint delegation ladder (the stub
+  binds `127.0.0.1:42781` and skips when the live orchestrator owns the
+  port — coverage is collected in the CI sandbox where it is free).
+- `tests/ci_routes.rs` (+3 tests, 22→25): run-trigger validation order
+  (option-smuggling `ref` → 400 `invalid_ref`; missing storage → 500
+  `storage_unavailable`; unknown revision against a real bare repo →
+  400 `unknown_revision`; no orchestrator configured → 503
+  `ci_unavailable`), pipeline delete ID handling (400/404), and the
+  run-trigger delegation ladder (202 relay, 202 `queued`→null run id,
+  502 on orchestrator failure, zero local runs persisted).
+- `tests/webhook_routes.rs` (+1 test): pre-seeded idempotency key with
+  a different fingerprint → 409, run graded `failed`, no job persisted.
+
+Local gates on this tip: fmt clean, `clippy -p gitforge-api
+--all-targets -- -D warnings` clean, 41/41 tests green (the two
+port-gated ladders skip on this host by design). The remaining
+uncovered lines in these files are DB-error arms that require fault
+injection — out of scope without a seam for it.
