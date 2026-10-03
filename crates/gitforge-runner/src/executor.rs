@@ -529,6 +529,16 @@ impl JobExecutor {
             tracing::debug!("executing step: {}", step.name);
             let cmd = vec!["sh", "-c", &step.run];
 
+            // Job-level env first, step-level env layered over it (step wins).
+            let mut env_pairs: Vec<String> = job
+                .env
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect();
+            if let Some(step_env) = &step.env {
+                env_pairs.extend(step_env.iter().map(|(key, value)| format!("{key}={value}")));
+            }
+
             let remaining = deadline.saturating_duration_since(Instant::now());
             let result = if remaining.is_zero() {
                 Err(gitforge_common::Error::timeout(
@@ -537,9 +547,12 @@ impl JobExecutor {
             } else {
                 timeout(
                     remaining,
-                    self.pool
-                        .sandbox
-                        .execute_with_output(&instance, &cmd, output_sink.clone()),
+                    self.pool.sandbox.execute_with_env(
+                        &instance,
+                        &cmd,
+                        &env_pairs,
+                        output_sink.clone(),
+                    ),
                 )
                 .await
                 .map_err(|_| gitforge_common::Error::timeout("job timed out"))

@@ -416,33 +416,37 @@ pub trait Sandbox: Send + Sync {
         command: &[&str],
         sink: Option<Arc<dyn OutputSink>>,
     ) -> Result<StepResult> {
-        let result = self.execute(instance, command).await?;
-        if let Some(sink) = sink {
-            if !result.stdout.is_empty() {
-                sink.on_output(OutputStream::Stdout, result.stdout.as_bytes().to_vec())
-                    .await?;
-            }
-            if !result.stderr.is_empty() {
-                sink.on_output(OutputStream::Stderr, result.stderr.as_bytes().to_vec())
-                    .await?;
-            }
-        }
-        Ok(result)
+        self.execute_with_env(instance, command, &[], sink).await
     }
+
+    /// Execute a command with additional `KEY=VALUE` environment variables
+    /// layered over the container's own environment, streaming output to
+    /// `sink` as it arrives. This is how pipeline `environment`/`env` reach
+    /// a step: exec-level env composes per step and never requires
+    /// recreating the container.
+    async fn execute_with_env(
+        &self,
+        instance: &SandboxInstance,
+        command: &[&str],
+        env: &[String],
+        sink: Option<Arc<dyn OutputSink>>,
+    ) -> Result<StepResult>;
 
     /// Destroy a sandbox instance
     async fn destroy(&self, instance: SandboxInstance) -> Result<()>;
 }
 
-/// Env vars granting the in-container git client trust for the host-owned
-/// workspace mount — see `DockerSandbox`'s `create_with_workspace`. Extracted
-/// as a free function so a unit test can pin the exact injection contract.
-fn workspace_git_env() -> Vec<String> {
-    vec![
-        "GIT_CONFIG_COUNT=1".to_owned(),
-        "GIT_CONFIG_KEY_0=safe.directory".to_owned(),
-        "GIT_CONFIG_VALUE_0=/workspace".to_owned(),
-    ]
+/// Compose the env for one docker exec: workspace git trust vars first (when
+/// the instance mounts a workspace), then the caller's `KEY=VALUE` pairs.
+/// Caller env is layered over the container environment; it can add or
+/// override ordinary variables but never displaces the git trust vars.
+fn compose_exec_env(has_workspace: bool, env: &[String]) -> Vec<String> {
+    let mut exec_env: Vec<String> = Vec::with_capacity(env.len() + 3);
+    if has_workspace {
+        exec_env.extend(workspace_exec_git_env().into_iter().map(String::from));
+    }
+    exec_env.extend(env.iter().cloned());
+    exec_env
 }
 
 #[async_trait]
@@ -613,18 +617,18 @@ impl Sandbox for DockerSandbox {
         }
     }
 
-    async fn execute(&self, instance: &SandboxInstance, command: &[&str]) -> Result<StepResult> {
-        self.execute_with_output(instance, command, None).await
-    }
-
-    async fn execute_with_output(
+    async fn execute_with_env(
         &self,
         instance: &SandboxInstance,
         command: &[&str],
+        env: &[String],
         sink: Option<Arc<dyn OutputSink>>,
     ) -> Result<StepResult> {
         if let Some(ref docker) = self.docker {
-            // Create exec instance
+            // Create exec instance. The workspace git trust vars are always
+            // layered in for workspace execs; caller env (`KEY=VALUE` pairs)
+            // rides alongside them and never displaces them.
+            let exec_env = compose_exec_env(instance.workspace_path.is_some(), env);
             let config = CreateExecOptions {
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
@@ -638,11 +642,7 @@ impl Sandbox for DockerSandbox {
                 } else {
                     None
                 },
-                env: if instance.workspace_path.is_some() {
-                    Some(workspace_exec_git_env())
-                } else {
-                    None
-                },
+                env: Some(exec_env.iter().map(String::as_str).collect()),
                 ..Default::default()
             };
 
@@ -841,6 +841,15 @@ fn workspace_exec_git_env() -> Vec<&'static str> {
     ]
 }
 
+/// Container-level variant of `workspace_exec_git_env` (owned strings for
+/// `CreateContainerOptions`).
+fn workspace_git_env() -> Vec<String> {
+    workspace_exec_git_env()
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Workspace cleanup
 // ---------------------------------------------------------------------------
@@ -954,6 +963,22 @@ mod tests {
         assert_eq!(env[0], "GIT_CONFIG_COUNT=1");
         assert_eq!(env[1], "GIT_CONFIG_KEY_0=safe.directory");
         assert_eq!(env[2], "GIT_CONFIG_VALUE_0=/workspace");
+    }
+
+    /// Pipeline env reaches the exec as `KEY=VALUE` pairs layered after the
+    /// git trust vars; with no workspace mount the caller env stands alone.
+    #[test]
+    fn test_compose_exec_env_layers_caller_env_over_git_trust() {
+        let caller = vec!["PYTHONPATH=src".to_string(), "DI_ENV=test".to_string()];
+
+        let with_workspace = compose_exec_env(true, &caller);
+        assert_eq!(with_workspace.len(), 5);
+        assert_eq!(with_workspace[0], "GIT_CONFIG_COUNT=1");
+        assert_eq!(with_workspace[3], "PYTHONPATH=src");
+        assert_eq!(with_workspace[4], "DI_ENV=test");
+
+        let without_workspace = compose_exec_env(false, &caller);
+        assert_eq!(without_workspace, caller);
     }
 
     /// R6.3: the stub backend reports a healthy probe with the measurement

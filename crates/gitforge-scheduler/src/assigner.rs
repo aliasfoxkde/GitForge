@@ -142,6 +142,10 @@ pub struct JobExecutionDefinition {
     /// Maximum seconds allowed for each runner step. Older callers that do
     /// not provide a value retain the safe legacy default.
     pub timeout_secs: u64,
+    /// Environment variables injected into every step exec. Merged from the
+    /// pipeline `environment` map and the job `env` map by the DAG builder;
+    /// job-level keys win.
+    pub env: HashMap<String, String>,
 }
 
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 300;
@@ -376,6 +380,7 @@ impl Scheduler {
                 image,
                 working_dir,
                 timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+                env: HashMap::new(),
             },
         )
         .await
@@ -450,6 +455,7 @@ impl Scheduler {
                 image: definition.image.clone(),
                 working_dir: definition.working_dir.clone(),
                 timeout_secs,
+                env: definition.env.clone(),
             },
         );
         tracing::debug!("job {} enqueued", job_id);
@@ -1179,6 +1185,13 @@ impl Scheduler {
                         image: db_job.image,
                         working_dir: db_job.working_dir,
                         timeout_secs: db_job.timeout_secs,
+                        // The durable jobs table has no env column, so a
+                        // scheduler-recovered job runs without pipeline
+                        // environment. The CI service's own rebuild path
+                        // re-plans from the stored pipeline definition and
+                        // restores env; this row-level recovery is only the
+                        // fallback when that engine rebuild did not happen.
+                        env: HashMap::new(),
                     },
                 );
                 loaded += 1;
@@ -1885,6 +1898,7 @@ mod tests {
             image: "rust:1".to_string(),
             working_dir: None,
             timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+            env: HashMap::new(),
         }
     }
 
@@ -1894,6 +1908,7 @@ mod tests {
             image: "rust:1".to_string(),
             working_dir: None,
             timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+            env: HashMap::new(),
         }
     }
 
@@ -2038,6 +2053,7 @@ mod tests {
                     image: "node:22".to_string(),
                     working_dir: Some("/workspace".to_string()),
                     timeout_secs: 900,
+                    env: HashMap::new(),
                 },
             )
             .await
