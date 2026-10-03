@@ -63,6 +63,10 @@ capacity = 4
 # Heartbeat interval in seconds
 heartbeat_interval_secs = 30
 
+# Per-job lease heartbeat interval in seconds (issue #243): proves a running
+# job is still driven so fencing waits for the job to go quiet.
+job_heartbeat_interval_secs = 15
+
 # Job fetch interval in seconds
 fetch_interval_secs = 5
 
@@ -75,6 +79,10 @@ port = 8081
 
 # Maximum jobs to assign per runner
 max_jobs_per_runner = 10
+
+# Fence grace in seconds (issue #243): how long a running job's liveness
+# proof may be silent before the scheduler fences it (default 300).
+fence_grace_secs = 300
 
 # =============================================================================
 # Storage Configuration

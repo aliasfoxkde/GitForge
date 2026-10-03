@@ -34,6 +34,11 @@ pub struct RunnerConfig {
     pub capacity: i32,
     /// Heartbeat interval in seconds
     pub heartbeat_interval_secs: u64,
+    /// Per-job lease-heartbeat interval in seconds (#243). Sent while a job
+    /// executes, this proves the execution is still driven and renews the
+    /// job's fence grace; the scheduler-side default grace (300 s) tolerates
+    /// many missed beats before any fence can fire.
+    pub job_heartbeat_interval_secs: u64,
     /// Job fetch interval in seconds
     pub fetch_interval_secs: u64,
     /// Bearer token used for scheduler service authentication.
@@ -76,6 +81,10 @@ impl fmt::Debug for RunnerConfig {
             .field("runner_type", &self.runner_type)
             .field("capacity", &self.capacity)
             .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field(
+                "job_heartbeat_interval_secs",
+                &self.job_heartbeat_interval_secs,
+            )
             .field("fetch_interval_secs", &self.fetch_interval_secs)
             .field(
                 "scheduler_token",
@@ -98,6 +107,7 @@ impl Default for RunnerConfig {
             runner_type: "docker".to_string(),
             capacity: 2,
             heartbeat_interval_secs: 30,
+            job_heartbeat_interval_secs: 15,
             fetch_interval_secs: 5,
             scheduler_token: None,
             register_attempts: 6,
@@ -117,6 +127,7 @@ impl RunnerConfig {
     /// - `GITFORGE_RUNNER_NAME` (optional, default: `"runner"`)
     /// - `GITFORGE_RUNNER_CAPACITY` (optional, default: `2`)
     /// - `GITFORGE_HEARTBEAT_INTERVAL` (optional, default: `30`)
+    /// - `GITFORGE_JOB_HEARTBEAT_INTERVAL` (optional, default: `15`)
     /// - `GITFORGE_FETCH_INTERVAL` (optional, default: `5`)
     /// - `GITFORGE_SCHEDULER_TOKEN` (optional, default: `None`)
     /// - `GITFORGE_REGISTER_ATTEMPTS` (optional, default: `6`)
@@ -136,6 +147,7 @@ impl RunnerConfig {
         let mut name: Option<String> = None;
         let mut capacity: Option<i32> = None;
         let mut heartbeat_interval_secs: Option<u64> = None;
+        let mut job_heartbeat_interval_secs: Option<u64> = None;
         let mut fetch_interval_secs: Option<u64> = None;
         let mut scheduler_token: Option<Option<String>> = None;
         let mut register_attempts: Option<u32> = None;
@@ -186,6 +198,22 @@ impl RunnerConfig {
                             )));
                         }
                         heartbeat_interval_secs = Some(parsed as u64);
+                    }
+                }
+                "GITFORGE_JOB_HEARTBEAT_INTERVAL" => {
+                    let v = value.trim();
+                    if !v.is_empty() {
+                        let parsed: i64 = v.parse().map_err(|_| {
+                            Error::invalid_input(
+                                "GITFORGE_JOB_HEARTBEAT_INTERVAL must be a valid integer",
+                            )
+                        })?;
+                        if parsed <= 0 {
+                            return Err(Error::invalid_input(format!(
+                                "GITFORGE_JOB_HEARTBEAT_INTERVAL must be a positive integer (got {parsed})"
+                            )));
+                        }
+                        job_heartbeat_interval_secs = Some(parsed as u64);
                     }
                 }
                 "GITFORGE_FETCH_INTERVAL" => {
@@ -274,6 +302,7 @@ impl RunnerConfig {
             runner_type: "docker".to_string(),
             capacity: capacity.unwrap_or(2),
             heartbeat_interval_secs: heartbeat_interval_secs.unwrap_or(30),
+            job_heartbeat_interval_secs: job_heartbeat_interval_secs.unwrap_or(15),
             fetch_interval_secs: fetch_interval_secs.unwrap_or(5),
             scheduler_token: scheduler_token.unwrap_or(None),
             register_attempts: register_attempts.unwrap_or(6),
@@ -494,6 +523,50 @@ mod config_tests {
         assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
         assert!(err_contains(&err, "GITFORGE_FETCH_INTERVAL"));
         assert!(err_contains(&err, "positive integer"));
+    }
+
+    // ── GITFORGE_JOB_HEARTBEAT_INTERVAL (#243) ──────────────────────────────
+
+    #[test]
+    fn test_parse_from_iter_job_heartbeat_interval() {
+        // Explicit value is honored.
+        let vars = env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_JOB_HEARTBEAT_INTERVAL", Some("10")),
+        ]);
+        let cfg = RunnerConfig::parse_from_iter(vars).expect("valid env should parse");
+        assert_eq!(cfg.job_heartbeat_interval_secs, 10);
+
+        // Absent falls back to the default; the scheduler-side fence grace
+        // (300 s) tolerates many missed 15 s beats.
+        let vars = env([("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781"))]);
+        let cfg = RunnerConfig::parse_from_iter(vars).expect("valid env should parse");
+        assert_eq!(cfg.job_heartbeat_interval_secs, 15);
+    }
+
+    #[test]
+    fn test_parse_from_iter_zero_job_heartbeat_interval() {
+        let vars = env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_JOB_HEARTBEAT_INTERVAL", Some("0")),
+        ]);
+        let result = RunnerConfig::parse_from_iter(vars);
+        let err = result.expect_err("zero GITFORGE_JOB_HEARTBEAT_INTERVAL should fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+        assert!(err_contains(&err, "GITFORGE_JOB_HEARTBEAT_INTERVAL"));
+        assert!(err_contains(&err, "positive integer"));
+    }
+
+    #[test]
+    fn test_parse_from_iter_invalid_job_heartbeat_interval() {
+        let vars = env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://localhost:42781")),
+            ("GITFORGE_JOB_HEARTBEAT_INTERVAL", Some("soon")),
+        ]);
+        let result = RunnerConfig::parse_from_iter(vars);
+        let err = result.expect_err("invalid GITFORGE_JOB_HEARTBEAT_INTERVAL should fail");
+        assert_eq!(err.kind, gitforge_common::ErrorKind::InvalidInput);
+        assert!(err_contains(&err, "GITFORGE_JOB_HEARTBEAT_INTERVAL"));
     }
 
     // ── Whitespace-only values (empty after trim) ────────────────────────────
@@ -959,6 +1032,7 @@ impl RunnerAgent {
         let fetch_url = self.config.scheduler_url.clone();
         let fetch_runner_id = runner_id;
         let fetch_token = self.config.scheduler_token.clone();
+        let job_heartbeat_interval = self.config.job_heartbeat_interval_secs;
         let is_running = self.is_running.clone();
         let executor = self.executor.clone();
         let active_jobs_for_loop = active_jobs.clone();
@@ -1031,14 +1105,18 @@ impl RunnerAgent {
                                     let active_jobs = active_jobs_for_loop.clone();
                                     let active_job_id = job.job_id.clone();
                                     let job_handle = tokio::spawn(async move {
+                                        let channel = JobChannel {
+                                            client: &client,
+                                            scheduler_url: &url,
+                                            scheduler_token: token.as_deref(),
+                                            job_heartbeat_interval_secs: job_heartbeat_interval,
+                                        };
                                         Self::execute_job(
                                             &executor,
                                             &job,
-                                            &client,
-                                            &url,
+                                            &channel,
                                             fetch_runner_id,
                                             &lease_token,
-                                            token.as_deref(),
                                         )
                                         .await;
                                         active_jobs.release(&active_job_id).await;
@@ -1229,12 +1307,16 @@ impl RunnerAgent {
     async fn execute_job(
         executor: &Arc<JobExecutor>,
         assignment: &JobAssignment,
-        client: &Client,
-        scheduler_url: &str,
+        channel: &JobChannel<'_>,
         runner_id: RunnerId,
         lease_token: &str,
-        scheduler_token: Option<&str>,
     ) {
+        let JobChannel {
+            client,
+            scheduler_url,
+            scheduler_token,
+            job_heartbeat_interval_secs,
+        } = *channel;
         let job_id = match uuid::Uuid::parse_str(&assignment.job_id) {
             Ok(id) => JobId::from(id),
             Err(_) => {
@@ -1329,6 +1411,20 @@ impl RunnerAgent {
             },
         ));
 
+        // Per-job liveness proof (#243): renew the job's fence grace while
+        // this execution is driven. The scheduler fences a running job only
+        // after THIS channel goes quiet for the whole grace window, so a
+        // starved runner-global heartbeat can no longer fail a healthy build.
+        let job_heartbeat_watch = tokio::spawn(run_job_lease_heartbeat(
+            client.clone(),
+            scheduler_url.to_string(),
+            assignment.job_id.clone(),
+            runner_id,
+            lease_token.to_string(),
+            scheduler_token.map(ToOwned::to_owned),
+            Duration::from_secs(job_heartbeat_interval_secs.max(1)),
+        ));
+
         // Execute the job. Output is sent to the scheduler while the sandbox
         // is running; the bounded sink applies network backpressure and never
         // changes the job's success result if observability is degraded.
@@ -1344,6 +1440,7 @@ impl RunnerAgent {
             .execute_with_output(executable, Some(live_logs.clone()))
             .await;
         cancellation_watch.abort();
+        job_heartbeat_watch.abort();
 
         tracing::info!(
             "job {} completed: success={}, exit_code={}",
@@ -1473,6 +1570,18 @@ pub(crate) struct CancellationWatchConfig {
     pub orphaned: Arc<AtomicBool>,
 }
 
+/// Scheduler contact details for one job execution. Grouped so the spawned
+/// execution takes its scheduler identity in one argument instead of a
+/// growing parameter list.
+#[derive(Debug, Clone, Copy)]
+struct JobChannel<'a> {
+    client: &'a Client,
+    scheduler_url: &'a str,
+    scheduler_token: Option<&'a str>,
+    /// Per-job lease-heartbeat cadence (#243).
+    job_heartbeat_interval_secs: u64,
+}
+
 /// Background loop body for the cancellation watch. Extracted from
 /// `execute_assignment` so the probe→stop lifecycle can be exercised in
 /// tests without a real sandbox.
@@ -1544,6 +1653,60 @@ pub(crate) async fn run_cancellation_watch<S, Fut>(
                 let _ = stop_sandbox(JobId::from(uuid)).await;
             }
             break;
+        }
+    }
+}
+
+/// Background loop body for the per-job lease heartbeat (issue #243).
+/// Extracted from `execute_job` so the renew→reject lifecycle can be
+/// exercised in tests without a real sandbox.
+///
+/// Each accepted beat is the scheduler's proof this execution is alive; the
+/// scheduler fences a running job only after this channel goes quiet for the
+/// full fence-grace window. A `409` means the durable lease was rotated or
+/// revoked (duplicate claim, operator cancellation, restart fencing) — the
+/// execution is already decided, so stop renewing. Transport failures are
+/// logged and retried on the next tick: the grace window tolerates missed
+/// beats, and this loop must never be the reason a healthy build fails.
+pub(crate) async fn run_job_lease_heartbeat(
+    client: Client,
+    scheduler_url: String,
+    job_id: String,
+    runner_id: RunnerId,
+    lease_token: String,
+    token: Option<String>,
+    beat_interval: Duration,
+) {
+    let endpoint = format!("{scheduler_url}/jobs/{job_id}/heartbeat");
+    let mut ticker = interval(beat_interval);
+    loop {
+        ticker.tick().await;
+        let mut request = client.post(&endpoint).json(&serde_json::json!({
+            "runner_id": runner_id.to_string(),
+            "lease_token": lease_token,
+        }));
+        if let Some(token) = &token {
+            request = request.bearer_auth(token);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => {
+                tracing::warn!(
+                    job_id = %job_id,
+                    "job lease rejected; stopping job heartbeat"
+                );
+                break;
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    status = %response.status(),
+                    job_id = %job_id,
+                    "job lease heartbeat rejected"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, job_id = %job_id, "job lease heartbeat failed");
+            }
         }
     }
 }
@@ -2412,6 +2575,7 @@ mod tests {
             register_attempts: 3,
             register_backoff_secs: 2,
             allow_standalone: false,
+            job_heartbeat_interval_secs: 15,
         };
         assert_eq!(config.name, "custom-runner");
         assert_eq!(config.capacity, 5);
@@ -2622,6 +2786,7 @@ mod tests {
             register_attempts: 2,
             register_backoff_secs: 1,
             allow_standalone: false,
+            job_heartbeat_interval_secs: 15,
         };
 
         assert_eq!(config.scheduler_url, "http://example.com:8081");
@@ -2756,6 +2921,7 @@ mod tests {
             register_attempts: 2,
             register_backoff_secs: 1,
             allow_standalone: false,
+            job_heartbeat_interval_secs: 15,
         };
         assert_eq!(config.capacity, 0);
     }
@@ -2840,6 +3006,7 @@ mod tests {
             register_attempts: 2,
             register_backoff_secs: 1,
             allow_standalone: false,
+            job_heartbeat_interval_secs: 15,
         };
         assert!(config.scheduler_url.contains("user:pass"));
     }
@@ -2875,6 +3042,7 @@ mod tests {
             register_attempts: 2,
             register_backoff_secs: 1,
             allow_standalone: false,
+            job_heartbeat_interval_secs: 15,
         };
         let agent = RunnerAgent::new(config).await.unwrap();
         assert!(agent.runner.is_none());
@@ -3546,5 +3714,67 @@ mod tests {
         let destroyed = stopped.lock().await;
         assert_eq!(destroyed.len(), 1);
         assert_eq!(destroyed[0].to_string(), job_id);
+    }
+
+    #[tokio::test]
+    async fn test_job_lease_heartbeat_stops_on_rejected_lease() {
+        // A 409 means the durable lease was rotated or revoked (duplicate
+        // claim, operator cancellation, restart fencing): renewing further
+        // can only produce rejected requests, so the loop stops instead of
+        // beating against a decided job.
+        let url = spawn_probe_server(&[
+            (200, r#"{"status":"alive"}"#),
+            (409, r#"{"error":"invalid_job_lease"}"#),
+        ])
+        .await;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_job_lease_heartbeat(
+                Client::new(),
+                url,
+                job_id,
+                RunnerId::new(),
+                "lease-1".to_string(),
+                None,
+                Duration::from_millis(20),
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a rejected lease must stop the job heartbeat loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_job_lease_heartbeat_survives_transient_failures() {
+        // Transport failures and 5xx are not decisions: the grace window
+        // tolerates missed beats, so the loop keeps renewing and only a 409
+        // ends it.
+        let url = spawn_probe_server(&[
+            (500, r#"{"error":"unavailable"}"#),
+            (500, r#"{"error":"unavailable"}"#),
+            (409, r#"{"error":"invalid_job_lease"}"#),
+        ])
+        .await;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_job_lease_heartbeat(
+                Client::new(),
+                url,
+                job_id,
+                RunnerId::new(),
+                "lease-1".to_string(),
+                None,
+                Duration::from_millis(20),
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "transient failures must not end the loop before the lease verdict"
+        );
     }
 }

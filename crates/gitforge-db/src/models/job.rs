@@ -104,6 +104,14 @@ pub struct Job {
     pub timeout_secs: u64,
     /// JSON-encoded bounded execution receipt, when the job is terminal.
     pub result_json: Option<String>,
+    /// Last per-job liveness proof from the executing runner (issue #243).
+    /// `None` for jobs that never reported one — fencing falls back to the
+    /// runner's heartbeat, then to `started_at`.
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    /// Durable lease token handed to the runner. Read to re-adopt in-flight
+    /// jobs after a scheduler restart; validation always goes through the
+    /// lease-gated queries rather than this field.
+    pub lease_token: Option<String>,
 }
 
 impl Job {
@@ -124,6 +132,8 @@ impl Job {
             working_dir: None,
             timeout_secs: 300,
             result_json: None,
+            heartbeat_at: None,
+            lease_token: None,
         }
     }
 

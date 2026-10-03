@@ -20,6 +20,42 @@ use uuid::Uuid;
 /// model constant so every consumer agrees on the threshold.
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS;
 
+/// How long a RUNNING job's own liveness proof (per-job heartbeat, falling
+/// back to its start time) may have gone quiet before runner-loss fencing is
+/// allowed to fail it (issue #243). This is the grace multiple between
+/// "heartbeat late" and "runner gone": the observed failure mode was a
+/// healthy ~2h release build fenced twice while its runner was alive and the
+/// host was under load 42–84 — the global heartbeat starved, the job did
+/// not. Runners report job heartbeats every few seconds, so a job that has
+/// been silent this long under a loaded-but-alive host is genuinely stuck;
+/// the timeout watchdog remains the outer bound either way.
+///
+/// Configured with `GITFORGE_JOB_FENCE_GRACE_SECS`; the default is chosen
+/// well above the runner heartbeat interval so scheduler-side slowness alone
+/// can never consume the whole budget.
+pub const DEFAULT_JOB_FENCE_GRACE_SECS: i64 = 300;
+
+/// Resolve the fence grace from an env-style value. `None`/empty/invalid
+/// fall back to [`DEFAULT_JOB_FENCE_GRACE_SECS`]; a present but non-positive
+/// value is rejected in favor of the default too, because fencing with no
+/// grace at all is exactly the behavior this knob exists to avoid.
+fn fence_grace_secs_from_value(raw: Option<&str>) -> i64 {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value.parse::<i64>().ok().filter(|secs| *secs > 0),
+        None => None,
+    }
+    .unwrap_or(DEFAULT_JOB_FENCE_GRACE_SECS)
+}
+
+/// [`fence_grace_secs_from_value`] against the process environment.
+pub fn job_fence_grace_secs_from_env() -> i64 {
+    fence_grace_secs_from_value(
+        std::env::var("GITFORGE_JOB_FENCE_GRACE_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Retry budget for one-shot durability writes in the job lifecycle
 /// (enqueue inserts, lease start/completion). SQLite write saturation —
 /// not a logic error — is the dominant transient failure here (F19–F23:
@@ -241,6 +277,7 @@ pub struct Scheduler {
     event_tx: broadcast::Sender<SchedulerEvent>,
     db_pool: Option<Pool>,
     recovery_done: Arc<AtomicBool>,
+    fence_grace_secs: i64,
 }
 
 impl Scheduler {
@@ -253,6 +290,7 @@ impl Scheduler {
             event_tx,
             db_pool: None,
             recovery_done: Arc::new(AtomicBool::new(true)),
+            fence_grace_secs: DEFAULT_JOB_FENCE_GRACE_SECS,
         }
     }
 
@@ -265,7 +303,16 @@ impl Scheduler {
             event_tx,
             db_pool: Some(pool),
             recovery_done: Arc::new(AtomicBool::new(false)),
+            fence_grace_secs: DEFAULT_JOB_FENCE_GRACE_SECS,
         }
+    }
+
+    /// Override the job-fence grace window (issue #243). The CI service
+    /// applies [`job_fence_grace_secs_from_env`] here; tests pin explicit
+    /// values to keep fencing latency deterministic.
+    pub fn with_fence_grace_secs(mut self, fence_grace_secs: i64) -> Self {
+        self.fence_grace_secs = fence_grace_secs;
+        self
     }
 
     /// Set the scheduling policy
@@ -276,6 +323,7 @@ impl Scheduler {
             event_tx: self.event_tx,
             db_pool: self.db_pool,
             recovery_done: self.recovery_done,
+            fence_grace_secs: self.fence_grace_secs,
         }
     }
 
@@ -666,6 +714,142 @@ impl Scheduler {
         }
     }
 
+    /// Record a per-job liveness proof from an executing runner (#243).
+    ///
+    /// The durable write is lease-gated and — when it accepts — also
+    /// refreshes the owning runner's heartbeat and recovers it from
+    /// `offline`, because a delivered job heartbeat is direct evidence the
+    /// runner process is alive and in contact with this scheduler. The
+    /// in-memory mirror is refreshed on the same terms so the next stale-
+    /// runner sweep cannot fence a runner that is demonstrably talking.
+    pub async fn job_heartbeat(
+        &self,
+        job_id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> bool {
+        let accepted = match &self.db_pool {
+            Some(pool) => {
+                // Deliberately NOT persist_with_retry: the heartbeat write is
+                // an idempotent conditional UPDATE and the next beat (seconds
+                // away) is the retry. Blocking this handler for the full
+                // 5×2 s budget under a saturated SQLite would add scheduler
+                // latency precisely when the host is overloaded — the
+                // condition #243 fences on.
+                match gitforge_db::queries::JobQueries::heartbeat(
+                    pool,
+                    job_id,
+                    runner_id,
+                    lease_token,
+                )
+                .await
+                {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(%error, %job_id, "failed to persist job heartbeat");
+                        false
+                    }
+                }
+            }
+            None => {
+                // No durable state: validate against the mirror like the
+                // in-memory-only start/complete transitions do.
+                let state = self.state.read().await;
+                state.assigned_jobs.get(&job_id).map(|(owner, _, _)| *owner) == Some(runner_id)
+                    && state.job_leases.get(&job_id).map(String::as_str) == Some(lease_token)
+            }
+        };
+        if accepted {
+            let mut state = self.state.write().await;
+            if let Some(runner) = state.runners.get_mut(&runner_id) {
+                runner.last_heartbeat = Some(chrono::Utc::now());
+                if runner.status == "offline" {
+                    runner.status = "online".to_string();
+                    tracing::info!(%runner_id, "job heartbeat recovered offline runner to online");
+                }
+            }
+        }
+        accepted
+    }
+
+    /// Re-adopt running jobs that a restart deliberately left alive (#243).
+    ///
+    /// The restart fence only fails rows whose own liveness went quiet; the
+    /// survivors keep executing on their runners. Completion requests are
+    /// validated against this scheduler's in-memory mirror before the durable
+    /// write, so without re-adoption a surviving job could never report: its
+    /// runner would be rejected, the row would sit `running`, and the run
+    /// would only finalize when the timeout watchdog reaped it. Rebuilding
+    /// the mirror from the durable rows (lease token, runner, run, and
+    /// execution definition) restores the exact pre-restart contract.
+    async fn readopt_inflight_running(&self) -> anyhow::Result<usize> {
+        let Some(pool) = &self.db_pool else {
+            return Ok(0);
+        };
+        let running = gitforge_db::queries::JobQueries::list_running(pool)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let mut readopted = 0;
+        {
+            let mut state = self.state.write().await;
+            for job in &running {
+                if state.assigned_jobs.contains_key(&job.id) {
+                    continue;
+                }
+                let (Some(runner_id), Some(lease_token)) = (job.runner_id, job.lease_token.clone())
+                else {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        "cannot re-adopt running job without a runner and lease token"
+                    );
+                    continue;
+                };
+                // The queue entry must remain tied to the original checkout.
+                let repo_id =
+                    match gitforge_db::queries::PipelineRunQueries::get(pool, job.pipeline_run_id)
+                        .await
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                    {
+                        Some(run) => run.repo_id,
+                        None => {
+                            tracing::error!(
+                                job_id = %job.id,
+                                pipeline_run_id = %job.pipeline_run_id,
+                                "cannot re-adopt running job without its pipeline run"
+                            );
+                            continue;
+                        }
+                    };
+                state.job_leases.insert(job.id, lease_token);
+                state.job_assignments.insert(job.id, runner_id);
+                state
+                    .assigned_jobs
+                    .insert(job.id, (runner_id, job.pipeline_run_id, repo_id));
+                state.job_definitions.entry(job.id).or_insert_with(|| {
+                    JobExecutionDefinition {
+                        commands: job.commands.clone(),
+                        image: job.image.clone(),
+                        working_dir: job.working_dir.clone(),
+                        timeout_secs: job.timeout_secs,
+                        // The durable jobs table has no env column (see
+                        // load_pending_jobs): this definition is only used if
+                        // the job must be re-dispatched, and the CI engine's
+                        // rebuild path restores pipeline environment.
+                        env: HashMap::new(),
+                    }
+                });
+                readopted += 1;
+            }
+        }
+        if readopted > 0 {
+            tracing::warn!(
+                readopted,
+                "re-adopted running jobs that survived the restart fence"
+            );
+        }
+        Ok(readopted)
+    }
+
     /// Mark runners as offline if they have not sent a heartbeat within the threshold.
     /// Returns the number of runners marked offline.
     pub async fn mark_stale_runners_offline(&self, heartbeat_timeout_secs: i64) -> usize {
@@ -768,22 +952,44 @@ impl Scheduler {
             // job would race it (duplicate containers, duelling log appends,
             // rejected completions) — so it is fenced as failed instead, the
             // same contract as requeue_inflight's recovery of running jobs.
+            //
+            // #243: fencing is gated on the JOB's liveness, not the runner's
+            // global heartbeat. A runner whose job heartbeat channel still
+            // reports proof of life inside the grace window is starving, not
+            // lost — the assignment stays put and the next tick re-decides.
             let mut fenced = false;
+            let mut deferred = false;
             if let Some(pool) = &db_pool {
                 match gitforge_db::queries::JobQueries::get(pool, *job_id).await {
                     Ok(Some(job)) if job.status == "running" => {
-                        if let Err(error) =
+                        let last_proof = job.heartbeat_at.or(job.started_at);
+                        let silent_for =
+                            last_proof.map(|proof| (chrono::Utc::now() - proof).num_seconds());
+                        if silent_for.is_some_and(|age| age < self.fence_grace_secs) {
+                            tracing::warn!(
+                                %job_id,
+                                %runner_id,
+                                age = silent_for,
+                                grace = self.fence_grace_secs,
+                                "runner heartbeat is stale but the job reported \
+                                 liveness inside the grace window; deferring the fence"
+                            );
+                            deferred = true;
+                        } else if let Err(error) =
                             gitforge_db::queries::JobQueries::fail_lost(pool, *job_id).await
                         {
                             tracing::error!(%error, %job_id, "failed to fence runner-loss job");
                             continue;
+                        } else {
+                            tracing::warn!(
+                                %job_id,
+                                %runner_id,
+                                silent_for,
+                                "running job outlived the fence grace on a lost runner; \
+                                 fenced as failed instead of requeued"
+                            );
+                            fenced = true;
                         }
-                        tracing::warn!(
-                            %job_id,
-                            %runner_id,
-                            "job was running on the lost runner; fenced as failed instead of requeued"
-                        );
-                        fenced = true;
                     }
                     Ok(_) => {
                         if let Err(error) =
@@ -798,6 +1004,13 @@ impl Scheduler {
                         continue;
                     }
                 }
+            }
+
+            // A deferred fence keeps the job (and its mirror entry) exactly
+            // where it is: the execution is still trusted until the job's own
+            // liveness goes quiet for the whole grace window.
+            if deferred {
+                continue;
             }
 
             // The database call above can yield while completion or another
@@ -854,7 +1067,12 @@ impl Scheduler {
     pub async fn process_queue(&self) {
         if self.db_pool.is_some() && !self.recovery_done.swap(true, Ordering::AcqRel) {
             if let Some(pool) = &self.db_pool {
-                match gitforge_db::queries::JobQueries::requeue_inflight(pool).await {
+                match gitforge_db::queries::JobQueries::requeue_inflight(
+                    pool,
+                    self.fence_grace_secs,
+                )
+                .await
+                {
                     Ok(count) if count > 0 => {
                         tracing::warn!(count, "requeued jobs left in-flight by scheduler restart");
                     }
@@ -884,6 +1102,15 @@ impl Scheduler {
                     Err(error) => {
                         tracing::error!(%error, "failed to grade evidence-stranded jobs");
                     }
+                }
+                // #243: rows that survived the restart fence are still being
+                // executed by their runners. Re-adopt them into the mirror so
+                // their lease-gated log/completion requests are accepted and
+                // the completion event reaches the rebuilt CI engine —
+                // otherwise a surviving row could never report and would sit
+                // running until the timeout watchdog reaped it.
+                if let Err(error) = self.readopt_inflight_running().await {
+                    tracing::error!(%error, "failed to re-adopt running jobs after restart");
                 }
             }
             if let Err(error) = self.load_pending_jobs().await {
@@ -2322,7 +2549,10 @@ mod tests {
         // queue: its sandbox may still be executing, and a second execution
         // would race it (duplicate containers, duelling log appends). It is
         // fenced as failed instead — the same contract as the scheduler's
-        // restart recovery for running rows.
+        // restart recovery for running rows. #243 narrows the trigger to a
+        // job whose own liveness went quiet past the grace window, so this
+        // fixture backdates the job's heartbeat to simulate an execution
+        // that genuinely stopped reporting before its runner vanished.
         let pool = gitforge_db::Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
         let user = gitforge_db::models::User::new(
@@ -2367,7 +2597,7 @@ mod tests {
             .await
             .unwrap();
 
-        let scheduler = Scheduler::with_db(pool.clone());
+        let scheduler = Scheduler::with_db(pool.clone()).with_fence_grace_secs(60);
         let mut events = scheduler.subscribe();
         let runner_id = RunnerId::new();
         scheduler
@@ -2386,12 +2616,21 @@ mod tests {
             .unwrap();
         assert_eq!(running.status, "running");
 
-        // The runner goes stale while its job is running.
+        // The runner goes stale while its job is running, and the job's own
+        // liveness went quiet with it: the last job heartbeat is 120 s old,
+        // past this scheduler's 60 s grace.
         {
             let mut state = scheduler.state.write().await;
             state.runners.get_mut(&runner_id).unwrap().last_heartbeat =
                 Some(chrono::Utc::now() - chrono::Duration::seconds(120));
         }
+        let stale_beat = (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        sqlx::query("UPDATE jobs SET heartbeat_at = ? WHERE id = ?")
+            .bind(&stale_beat)
+            .bind(job_id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
         while events.try_recv().is_ok() {}
         scheduler.process_queue().await;
 
@@ -2417,6 +2656,126 @@ mod tests {
 
         let state = scheduler.state.read().await;
         assert_eq!(state.runners[&runner_id].status, "offline");
+    }
+
+    #[tokio::test]
+    async fn test_fresh_job_heartbeat_defers_runner_loss_fence() {
+        // The #243 regression: a runner whose GLOBAL heartbeat starves under
+        // host load must not fail a build that is still reporting per-job
+        // liveness. The stale-runner sweep offlines the runner but leaves a
+        // job with a fresh heartbeat proof exactly where it is, and a later
+        // delivered job heartbeat recovers the runner.
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (repo_id, run_id, job_id) = seed_dead_lease_fixture(&pool).await;
+
+        let scheduler = Scheduler::with_db(pool.clone()).with_fence_grace_secs(60);
+        let mut events = scheduler.subscribe();
+        let runner_id = RunnerId::new();
+        scheduler
+            .register_runner(make_runner(runner_id, "deferring-runner", "online", 1))
+            .await;
+        scheduler.enqueue(job_id, run_id, repo_id).await.unwrap();
+        scheduler.process_queue().await;
+        let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
+        scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        // The runner's global heartbeat starves while the job keeps
+        // reporting (its durable proof stays fresh — `started_at` moments
+        // ago, as if beats were arriving).
+        {
+            let mut state = scheduler.state.write().await;
+            state.runners.get_mut(&runner_id).unwrap().last_heartbeat =
+                Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        }
+
+        scheduler.process_queue().await;
+
+        // The sweep offlines the starved runner but defers the fence: the
+        // assignment survives and no completion event was emitted.
+        assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
+        assert_eq!(scheduler.queue_len().await, 0);
+        {
+            let state = scheduler.state.read().await;
+            assert_eq!(state.runners[&runner_id].status, "offline");
+        }
+        let still_running = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_running.status, "running");
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        // A delivered job heartbeat is direct evidence the runner process is
+        // alive and in contact, so it recovers the runner it owns.
+        assert!(scheduler.job_heartbeat(job_id, runner_id, &lease).await);
+        let state = scheduler.state.read().await;
+        assert_eq!(state.runners[&runner_id].status, "online");
+    }
+
+    #[tokio::test]
+    async fn test_restart_readopts_running_job_and_completes_it() {
+        // #243: a scheduler restart leaves a healthy running row in place
+        // (fresh liveness proof). The replacement scheduler must re-adopt it
+        // into its mirror so the surviving runner's lease-gated completion
+        // is accepted and the completion event reaches the CI engine.
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (repo_id, run_id, job_id) = seed_dead_lease_fixture(&pool).await;
+
+        let first = Scheduler::with_db(pool.clone()).with_fence_grace_secs(60);
+        let runner_id = RunnerId::new();
+        first
+            .register_runner(make_runner(runner_id, "restarting-runner", "online", 1))
+            .await;
+        first.enqueue(job_id, run_id, repo_id).await.unwrap();
+        first.process_queue().await;
+        let lease = first.ensure_job_lease(job_id).await.unwrap();
+        first.start_job(job_id, runner_id, &lease).await.unwrap();
+        let durable = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, "running");
+        assert_eq!(durable.runner_id, Some(runner_id));
+        assert_eq!(durable.lease_token.as_deref(), Some(lease.as_str()));
+
+        // Restart: a fresh scheduler over the same durable state. The row
+        // survived (its liveness proof is fresh), so recovery must re-adopt
+        // it rather than fence it.
+        let second = Scheduler::with_db(pool.clone()).with_fence_grace_secs(60);
+        second.process_queue().await;
+        assert_eq!(second.is_assigned(job_id).await, Some(runner_id));
+
+        // The re-adopted lease completes exactly as it would have before the
+        // restart, and the completion event fires from the mirror.
+        let mut events = second.subscribe();
+        second
+            .complete_job_with_lease(
+                job_id,
+                runner_id,
+                &lease,
+                JobOutcome::Succeeded,
+                r#"{"status":"succeeded"}"#.to_string(),
+            )
+            .await
+            .unwrap();
+        let completed = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "succeeded");
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            SchedulerEvent::JobCompleted { job_id: done, success: true, .. } if done == job_id
+        ));
     }
 
     /// Seed a user/repo/pipeline/run plus a pending job row and return the

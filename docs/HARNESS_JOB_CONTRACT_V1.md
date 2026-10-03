@@ -21,6 +21,14 @@ that token for the following transitions:
 
 - `POST /jobs/{id}/claim` confirms the runner assignment and returns the lease.
 - `POST /jobs/{id}/started` changes the job to `running`.
+- `POST /jobs/{id}/heartbeat` proves the execution is still driven. Sent
+  periodically while the job runs, it refreshes the job's liveness proof and
+  the owning runner's heartbeat. Scheduler fencing waits for THIS channel to
+  go quiet for the fence grace (`GITFORGE_JOB_FENCE_GRACE_SECS`, default
+  300 s) before failing a running job, so a runner whose global heartbeat
+  starves under host load no longer loses healthy builds (issue #243). A
+  `409` means the lease was rotated or revoked and the outcome is already
+  decided.
 - `POST /jobs/{id}/cancel` records an operator cancellation as terminal in
   the scheduler. A running runner polls `GET /jobs/{id}/cancelled` and
   destroys its active sandbox when the probe becomes true. The scheduler’s
@@ -36,7 +44,9 @@ scheduler database is required for this endpoint.
 
 Runner heartbeats are rejected for unknown runner IDs and are persisted to the
 runner record. Stale-runner reconciliation marks the runner offline and
-requeues its assigned jobs through the scheduler state machine.
+requeues its assigned jobs through the scheduler state machine, except that a
+running job whose own heartbeat proof is fresh inside the fence grace stays
+assigned — the runner is starving, not lost (issue #243).
 
 Pending-job responses include `contract_version`, `runner_id`, and
 `lease_token`. Repeated claim/start/complete calls are safe for the same
@@ -48,9 +58,13 @@ The crate-level lifecycle, durable heartbeat/cancellation transitions,
 database recovery writes, cancellation probe, and runner sandbox cancellation
 are covered by scheduler, runner, and database tests. A scheduler restart
 requeues durable `assigned` rows and restores persisted command definitions
-before scheduling. Durable `running` rows are fenced as failed with a restart
-receipt instead of being replayed: without a durable runner-generation lease,
-replay could duplicate external side effects if the old runner is still alive.
+before scheduling. Durable `running` rows whose own liveness proof went quiet
+past the fence grace are fenced as failed with a restart receipt instead of
+being replayed: without a durable runner-generation lease, replay could
+duplicate external side effects if the old runner is still alive. Rows that
+are still reporting liveness survive the restart and the replacement
+scheduler re-adopts them into its lease mirror so their runners complete
+them against the original durable lease (issue #243).
 The scheduler keeps an in-process lease mirror for fast checks, while the
 database persists a lease token and monotonic generation. Assignment, start,
 and completion use conditional updates so a competing scheduler or stale

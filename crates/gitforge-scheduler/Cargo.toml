@@ -28,6 +28,9 @@ tower = { workspace = true }
 # Paused-time tests: the durable-write retry loop sleeps 2 s between
 # attempts; auto-advance keeps the exhaustion test out of real wall time.
 tokio = { workspace = true, features = ["test-util", "macros"] }
+# Fencing tests backdate a job's liveness proof directly to simulate an
+# execution that stopped reporting before its runner vanished (#243).
+sqlx = { workspace = true }
 
 [lints]
 workspace = true
