@@ -121,6 +121,23 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create repositories table: {e}")))?;
 
+        // Additive migration for ref-update policy (#240). Existing databases
+        // predate the columns; SQLite has no portable IF NOT EXISTS form for
+        // ADD COLUMN, so tolerate only the known duplicate-column case.
+        for statement in [
+            "ALTER TABLE repositories ADD COLUMN required_checks TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE repositories ADD COLUMN deny_non_fast_forward INTEGER NOT NULL DEFAULT 0",
+        ] {
+            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
+                let message = error.to_string();
+                if !message.contains("duplicate column name") {
+                    return Err(Error::database(format!(
+                        "failed to migrate repositories table: {error}"
+                    )));
+                }
+            }
+        }
+
         // Create ssh_keys table. A key's fingerprint is globally unique:
         // the same public key may never authenticate as two different
         // accounts.

@@ -28,6 +28,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::oneshot;
 
+use crate::ref_policy::{self, RefPolicyDecision};
+
 /// Configuration for the SSH git transport.
 pub struct SshServerConfig {
     pub port: u16,
@@ -127,6 +129,19 @@ struct ChannelProcess {
     stdin: Option<ChildStdin>,
     /// Signals the pump task to kill and reap the child on disconnect.
     cancel: Option<oneshot::Sender<()>>,
+    /// Push-buffering state for receive-pack channels (#240). While set, no
+    /// child has been spawned yet: channel data accumulates until the
+    /// receive-pack command list is complete, the repository's ref-update
+    /// policy is evaluated, and the push is either declined or handed to a
+    /// freshly spawned child with the buffered command list replayed.
+    pending_push: Option<PendingPush>,
+}
+
+/// A receive-pack push whose command list is still arriving.
+struct PendingPush {
+    buffer: Vec<u8>,
+    repo_id: gitforge_common::RepoId,
+    repo_disk_path: std::path::PathBuf,
 }
 
 /// Per-connection handler.
@@ -232,8 +247,17 @@ impl Handler for GitSshSession {
         &mut self,
         channel: russh::ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // A receive-pack channel buffers its command list before the child
+        // starts so the ref-update policy can inspect the whole push (#240).
+        let buffering = self
+            .processes
+            .get(&channel)
+            .is_some_and(|process| process.pending_push.is_some());
+        if buffering {
+            return self.receive_push_data(channel, data, session).await;
+        }
         if let Some(process) = self.processes.get_mut(&channel) {
             let Some(stdin) = process.stdin.as_mut() else {
                 return Ok(());
@@ -255,11 +279,16 @@ impl Handler for GitSshSession {
         channel: russh::ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Dropping stdin signals EOF to the git child process.
         if let Some(process) = self.processes.get_mut(&channel) {
-            // Normal EOF must reach git so a valid receive-pack can finish;
-            // it is not a disconnect and must not cancel the child.
+            // Dropping stdin signals EOF to the git child process. Normal
+            // EOF must reach git so a valid receive-pack can finish; it is
+            // not a disconnect and must not cancel the child.
             process.stdin.take();
+            // A push that never delivered its command list has no child to
+            // finish; drop the buffer so it cannot linger until disconnect.
+            if process.pending_push.is_some() {
+                process.pending_push = None;
+            }
         }
         Ok(())
     }
@@ -286,6 +315,182 @@ impl GitSshSession {
         }
     }
 
+    /// Accumulate a receive-pack command list, evaluate the repository's
+    /// ref-update policy once it is complete (#240), and either decline the
+    /// push with a standard receive-pack status report or start the child
+    /// with the buffered bytes replayed into its stdin.
+    async fn receive_push_data(
+        &mut self,
+        channel: russh::ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let Some(mut pending) = self
+            .processes
+            .get_mut(&channel)
+            .and_then(|process| process.pending_push.take())
+        else {
+            return Ok(());
+        };
+        pending.buffer.extend_from_slice(data);
+
+        if pending.buffer.len() > ref_policy::MAX_COMMAND_LIST_BYTES {
+            tracing::warn!(
+                ?channel,
+                repo_id = %pending.repo_id,
+                buffer_len = pending.buffer.len(),
+                "push command list exceeded buffer bound; aborting channel"
+            );
+            return self
+                .fail_push(channel, "push command list too large", session)
+                .await;
+        }
+
+        let Some(_list_len) = ref_policy::command_list_len(&pending.buffer) else {
+            // The command list is still incomplete; keep buffering.
+            if let Some(process) = self.processes.get_mut(&channel) {
+                process.pending_push = Some(pending);
+            }
+            return Ok(());
+        };
+
+        let Some(pool) = self.context.db_pool.as_ref() else {
+            // resolve_repo_id already refuses SSH sessions without a
+            // database, so this only fires if the context was rebuilt.
+            return self
+                .fail_push(channel, "database not available", session)
+                .await;
+        };
+        let updates = ref_policy::parse_receive_updates(&pending.buffer);
+        match ref_policy::evaluate_ref_policy(pool, pending.repo_id, &updates).await {
+            RefPolicyDecision::Allow => {}
+            RefPolicyDecision::Reject(reasons) => {
+                for (ref_name, reason) in &reasons {
+                    tracing::warn!(
+                        repo_id = %pending.repo_id,
+                        ref_name = %ref_name,
+                        reason = %reason,
+                        "push declined by ref-update policy over SSH"
+                    );
+                }
+                return self.send_push_report(channel, &reasons, session).await;
+            }
+        }
+
+        // Policy allows: start the child and replay everything buffered so
+        // far (the command list and any pack data that arrived with it).
+        if let Err(message) = self.spawn_push_child(channel, pending, session).await {
+            tracing::error!(?channel, %message, "failed to start receive-pack after policy check");
+            return self.fail_push(channel, &message, session).await;
+        }
+        Ok(())
+    }
+
+    /// Spawn the receive-pack child for an approved push and wire the
+    /// channel to its stdio, replaying the buffered command list.
+    async fn spawn_push_child(
+        &mut self,
+        channel: russh::ChannelId,
+        pending: PendingPush,
+        session: &mut Session,
+    ) -> Result<(), String> {
+        let mut child = tokio::process::Command::new("git")
+            .arg("receive-pack")
+            .arg(&pending.repo_disk_path)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("failed to spawn git receive-pack: {error}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "git process was spawned without a piped stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "git process was spawned without a piped stdout".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "git process was spawned without a piped stderr".to_string())?;
+
+        let (cancel, cancellation) = oneshot::channel();
+        self.processes.insert(
+            channel,
+            ChannelProcess {
+                stdin: Some(stdin),
+                cancel: Some(cancel),
+                pending_push: None,
+            },
+        );
+
+        // The buffer carries the whole push prefix received so far — the
+        // command list plus any pack data that arrived in the same reads.
+        if let Some(process) = self.processes.get_mut(&channel) {
+            if let Some(stdin) = process.stdin.as_mut() {
+                if let Err(error) = stdin.write_all(&pending.buffer).await {
+                    tracing::warn!(?channel, %error, "failed to replay buffered push data");
+                    self.stop_process(channel);
+                    return Err(format!("failed to replay buffered push data: {error}"));
+                }
+            }
+        }
+
+        let handle = session.handle();
+        tokio::spawn(pump_until_exit(
+            handle,
+            channel,
+            child,
+            stdout,
+            stderr,
+            cancellation,
+        ));
+        Ok(())
+    }
+
+    /// Send a receive-pack status report declining refs, then close the
+    /// channel so git renders `! [remote rejected] <ref> (reason)`.
+    async fn send_push_report(
+        &mut self,
+        channel: russh::ChannelId,
+        reasons: &[(String, String)],
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let handle = session.handle();
+        let _ = handle
+            .data(channel, ref_policy::synthesize_rejection_report(reasons))
+            .await;
+        // Refusal is a normal protocol outcome, not a server failure: exit 0
+        // with per-ref declines, like a real pre-receive hook rejection.
+        let _ = handle.exit_status_request(channel, 0).await;
+        let _ = handle.eof(channel).await;
+        let _ = handle.close(channel).await;
+        self.processes.remove(&channel);
+        Ok(())
+    }
+
+    /// Abort a push channel with a diagnostic on stderr and a failed exit
+    /// status. No child exists yet, so there is nothing to reap.
+    async fn fail_push(
+        &mut self,
+        channel: russh::ChannelId,
+        message: &str,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let handle = session.handle();
+        let _ = handle
+            .extended_data(channel, 1, format!("gitforge: {message}\n").into_bytes())
+            .await;
+        let _ = handle.exit_status_request(channel, 128).await;
+        let _ = handle.eof(channel).await;
+        let _ = handle.close(channel).await;
+        self.processes.remove(&channel);
+        Ok(())
+    }
+
     /// Resolve the requested git command to a repository and start the real
     /// git child process that serves it, wiring the channel to its stdio.
     async fn serve_git_command(
@@ -304,6 +509,37 @@ impl GitSshSession {
             }
             storage.repo_path(repo_id)
         };
+
+        session
+            .handle()
+            .channel_success(channel)
+            .await
+            .map_err(|()| format!("channel {channel:?} already closed"))?;
+
+        // A push is buffered until its command list is complete so the
+        // repository's ref-update policy (#240) can decline it before any
+        // ref advances. The child is spawned from receive_push_data.
+        if git_command == "receive-pack" {
+            self.processes.insert(
+                channel,
+                ChannelProcess {
+                    stdin: None,
+                    cancel: None,
+                    pending_push: Some(PendingPush {
+                        buffer: Vec::new(),
+                        repo_id,
+                        repo_disk_path,
+                    }),
+                },
+            );
+            tracing::info!(
+                command = %command.trim(),
+                %repo_path,
+                user_id = ?self.authenticated_user,
+                "buffering push command list for ref-update policy"
+            );
+            return Ok(());
+        }
 
         let mut child = tokio::process::Command::new("git")
             .arg(git_command)
@@ -334,17 +570,9 @@ impl GitSshSession {
             ChannelProcess {
                 stdin: Some(stdin),
                 cancel: Some(cancel),
+                pending_push: None,
             },
         );
-
-        session
-            .handle()
-            .channel_success(channel)
-            .await
-            .map_err(|()| {
-                self.stop_process(channel);
-                format!("channel {channel:?} already closed")
-            })?;
 
         let handle = session.handle();
         tokio::spawn(pump_until_exit(

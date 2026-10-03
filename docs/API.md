@@ -87,7 +87,60 @@ GET /api/repos
 POST /api/repos
 GET /api/repos/{id}
 DELETE /api/repos/{id}
+GET /api/repos/{owner}/{repo}/policy
+PATCH /api/repos/{owner}/{repo}/policy
+GET /api/repos/{owner}/{repo}/commits/{sha}/status
 ```
+
+#### Ref-update policy
+
+A repository can require its pipelines to succeed before `refs/heads/*`
+advances to a commit, and can reject non-fast-forward branch updates
+(#240). Enforcement happens in the git server on both Smart HTTP and SSH:
+a push that violates the policy is declined with a standard receive-pack
+report and git shows `! [remote rejected] <ref> (reason)`. Branch
+deletions, tag pushes, and other ref namespaces are never gated.
+
+```
+GET /api/repos/{owner}/{repo}/policy
+PATCH /api/repos/{owner}/{repo}/policy
+GET /api/repos/{owner}/{repo}/commits/{sha}/status
+```
+
+**Update Policy Request** (omitted fields keep their current values):
+```json
+{
+  "required_checks": ["ci", "gates-and-release"],
+  "deny_non_fast_forward": true
+}
+```
+
+- `required_checks` names pipelines by name; a commit satisfies the gate
+  when the latest run of each named pipeline on that commit is
+  `succeeded`. An empty list disables the gate.
+- `deny_non_fast_forward` sets git's native
+  `receive.denyNonFastForwards` on the repository, so `git-receive-pack`
+  rejects rewrites of branch history on both transports.
+
+Setting the policy requires the repository owner, an administrator, or a
+maintainer. Reads are limited to the same callers and 404 for everyone
+else so repository existence is not leaked.
+
+**Commit status** reports the same evaluation the push path performs:
+
+```json
+{
+  "commit": "abcdef1234…",
+  "required_checks": [
+    {"check": "ci", "status": "succeeded"},
+    {"check": "gates-and-release", "status": null}
+  ],
+  "satisfied": false
+}
+```
+
+A `null` status means the pipeline has never run on the commit; a commit
+with no runs never satisfies a configured gate.
 
 #### User roles
 

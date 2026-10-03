@@ -51,6 +51,33 @@ impl FileStorageBackend {
             .map_err(|e| Error::storage(format!("failed to create storage root: {e}")))?;
         Ok(())
     }
+
+    /// Set git's native non-fast-forward denial on a bare repository (#240).
+    ///
+    /// `receive.denyNonFastForwards` is enforced by `git-receive-pack`
+    /// itself, with quarantine-correct ancestry checks and per-ref status
+    /// reporting, on both the Smart HTTP and SSH transports. Required
+    /// status checks (the other ref-policy knob) are evaluated in the git
+    /// server; this config write is the enforcement half for
+    /// `deny_non_fast_forward`. Failing to write the config is an error so
+    /// a policy that claims to deny cannot silently stay permissive.
+    pub async fn set_receive_deny_non_fast_forwards(
+        &self,
+        repo_id: RepoId,
+        deny: bool,
+    ) -> Result<()> {
+        let path = self.repo_path(repo_id);
+        let repo = git2::Repository::open(&path)
+            .map_err(|e| Error::git(format!("failed to open repository at {path:?}: {e}")))?;
+        let mut config = repo
+            .config()
+            .map_err(|e| Error::git(format!("failed to get repository config: {e}")))?;
+        config
+            .set_bool("receive.denyNonFastForwards", deny)
+            .map_err(|e| Error::git(format!("failed to set receive.denyNonFastForwards: {e}")))?;
+        tracing::debug!(repo_id = %repo_id, deny, "receive.denyNonFastForwards updated");
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -164,6 +191,54 @@ mod tests {
         // Delete repository
         backend.delete(repo_id).await.unwrap();
         assert!(!backend.exists(repo_id).await);
+    }
+
+    #[tokio::test]
+    async fn test_set_receive_deny_non_fast_forwards_roundtrip() {
+        let dir = tempdir().unwrap();
+        let backend = FileStorageBackend::new(dir.path());
+        let repo_id = RepoId::new();
+        backend.create(repo_id).await.unwrap();
+
+        // Fresh repositories are permissive; the ref-update policy (#240)
+        // turns the native receive-pack guard on and off.
+        let deny = backend
+            .open(repo_id)
+            .await
+            .unwrap()
+            .config()
+            .unwrap()
+            .get_bool("receive.denyNonFastForwards")
+            .unwrap_or(false);
+        assert!(!deny);
+
+        backend
+            .set_receive_deny_non_fast_forwards(repo_id, true)
+            .await
+            .unwrap();
+        let deny = backend
+            .open(repo_id)
+            .await
+            .unwrap()
+            .config()
+            .unwrap()
+            .get_bool("receive.denyNonFastForwards")
+            .unwrap_or(false);
+        assert!(deny);
+
+        backend
+            .set_receive_deny_non_fast_forwards(repo_id, false)
+            .await
+            .unwrap();
+        let deny = backend
+            .open(repo_id)
+            .await
+            .unwrap()
+            .config()
+            .unwrap()
+            .get_bool("receive.denyNonFastForwards")
+            .unwrap_or(false);
+        assert!(!deny);
     }
 
     #[tokio::test]
