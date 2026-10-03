@@ -275,3 +275,37 @@ checkpoint tuning for the gateway are the next levers if this recurs.
   a mid-flight compile break, the second to host load 111–382 making
   instrumented builds non-viable. The authoritative in-sandbox number
   rides the next clean pipeline `coverage` job.
+
+### Ghost-job defect observed during validation (2026-10-03, run 6799a7ac)
+
+The re-validation run for `d537df90` (push-triggered) surfaced a new
+platform failure class, recorded here as an F-candidate with evidence:
+
+- `fmt` + `clippy` succeeded (06:38–06:55Z). `test` (job
+  `093e53ef-3fb5-4dd8-a7f7-9480952dd911`, `timeout_secs=3600`) last
+  emitted a log chunk at 07:12:39Z ("Compiling api v0.1.0"), then went
+  permanently silent. At 08:1xZ the job's container was absent from
+  `docker ps -a` (not running, not exited) while five other jobs'
+  containers cycled to completion normally — the runner had lost it.
+- `data/abandoned-container-receipts.json` confirmed the runner's
+  in-memory view: `active_job_count: 0` for a job the DB graded
+  `running`. The orphan sweep only handles the inverse case (container
+  exists, no job); there is no reconciliation for "job exists, no
+  container".
+- Timeout enforcement fired at 08:24:46Z — **43 minutes past the
+  60-minute deadline**. The F37 cascade then behaved correctly
+  (coverage `cancelled` +42s, run graded `failed` +43s).
+- Under the same load, `POST /api/jobs/{id}/cancel` returned 500
+  `{"error":"database_error","message":"Failed to persist
+  cancellation"}` twice — the cancel path does not survive write-lock
+  contention (unlike the persist_with_retry-hardened write planes).
+
+Verdict: campaign code is not implicated — fmt/clippy green in-sandbox
+and the full local gate suite passed on this exact tip. Three platform
+defects to log for the durability ledger: (1) runner container loss
+with no liveness reconciliation and no firing timeout; (2) 43-minute
+timeout-enforcement lag under load; (3) cancel-persist not hardened
+against contention. A contributing environment factor: co-tenant
+/tmp-tmpfs exhaustion caused container-start failures the same night
+(see the v0.6.13 release record above); my run's container died at
+/tmp 100%. Re-validation will retry when host load clears.
