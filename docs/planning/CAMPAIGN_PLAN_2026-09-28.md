@@ -237,3 +237,41 @@ checkpoint tuning for the gateway are the next levers if this recurs.
    storm trigger delivery can lag minutes (dispatcher marks `delivered`
    on ci's honest 202 before the consumer creates the run) — re-query
    before diagnosing.
+
+## Phases 3 & 4 — Progress (2026-10-02/03, host under co-tenant load)
+
+- **Phase 4 supply chain executed** (23262d13): cargo-vet fully-audited
+  87 → 133 crates; exemptions 347 → 301; every `[[trusted.*]]`
+  publisher verified against ≥2 live peer-registry `audits.toml` files
+  before the entry was written — the no-self-certification rule held.
+- **Aegis baseline regenerated after triage** (4dbebfc1): 150
+  line-insensitive additions, 0 removals; every entry attributed
+  (cargo-vet public registry metadata, the webhook tests' pinned
+  loopback endpoint, digit-run false positives, baseline
+  self-reference, one changelog historical mention).
+- **Phase 3 webhook.rs route coverage advanced**: 55 → 76.5% (prior
+  #117 work), and the CI-delegation ladder is now covered end-to-end
+  against the pinned production endpoint (6c6df121), plus 8 unit tests
+  on `derive_webhook_job_plan`. Remaining api gaps by measured missed
+  lines: `ci.rs` (206), `artifacts.rs` (121), `webhook.rs` (107) —
+  the next session's ordered targets.
+- **Validation record** (branch `test/api-route-coverage-20261002`,
+  PR #252): fmt ✓; clippy `--workspace --all-targets -D warnings` ✓;
+  workspace tests 47/50 suites green at `--test-threads=2` — the 3
+  git-server spawned-protocol suites flake under co-tenant load and
+  pass 13/13 single-threaded (known class). GitForge pipeline run
+  ebbf21aa: fmt ✓ clippy ✓, `test` **timed out mid-compile** under
+  host load 111–382 (the sandbox compile was starved past the job
+  timeout before the test phase began); coverage cancelled by the
+  cascade. No in-sandbox coverage number was produced this cycle.
+- **New observation (defect class, owner: CI service)**: triggering a
+  run via `POST /api/pipelines/{id}/runs` during contention answered
+  202 with `pipeline_run_id: null` and materialized a **run row with
+  no job chain**, which reconcile later graded `cancelled` (run
+  431ac149). This is the synchronous api→ci trigger path; the
+  enqueue-only restructure already identified for the 10 s/502
+  symptom would fix both faces of the same defect.
+- Workspace coverage re-sweep status: two attempts died — the first on
+  a mid-flight compile break, the second to host load 111–382 making
+  instrumented builds non-viable. The authoritative in-sandbox number
+  rides the next clean pipeline `coverage` job.
