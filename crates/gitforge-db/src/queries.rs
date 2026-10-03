@@ -179,6 +179,10 @@ fn hydrate_job(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Job> {
         result_json: row
             .try_get("result_json")
             .map_err(|error| Error::database(format!("invalid job result: {error}")))?,
+        heartbeat_at: parse_optional_timestamp_column(&row, "heartbeat_at")?,
+        lease_token: row
+            .try_get::<Option<String>, _>("lease_token")
+            .map_err(|error| Error::database(format!("invalid job lease token: {error}")))?,
     })
 }
 
@@ -1019,6 +1023,57 @@ impl JobQueries {
         Ok(row.is_some())
     }
 
+    /// Record a per-job liveness proof from the executing runner (#243).
+    ///
+    /// The write is lease-gated exactly like start/complete, so a stale or
+    /// superseded token can never refresh anything. A delivered job
+    /// heartbeat also refreshes the OWNING runner's `last_heartbeat` and
+    /// recovers it from `offline` (never from `busy`): the request arrived
+    /// over the same scheduler endpoint as the global heartbeat, so it is
+    /// direct evidence the runner is alive and in contact. Under host load
+    /// this is what keeps a healthy long build from being fenced while its
+    /// runner's coarser global heartbeat happens to starve.
+    pub async fn heartbeat(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> Result<bool> {
+        let mut transaction = pool
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::database(format!("failed to begin job heartbeat: {e}")))?;
+        let now = Utc::now().to_rfc3339();
+        let job = sqlx::query(
+            "UPDATE jobs SET heartbeat_at = ? WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
+        )
+        .bind(&now)
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to record job heartbeat: {e}")))?;
+        if job.rows_affected() != 1 {
+            // Dropping the transaction rolls it back: nothing to undo.
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE runners SET last_heartbeat = ?, status = CASE WHEN status = 'offline' THEN 'online' ELSE status END WHERE id = ?",
+        )
+        .bind(&now)
+        .bind(runner_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to refresh runner heartbeat: {e}")))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit job heartbeat: {e}")))?;
+        Ok(true)
+    }
+
     /// Persist the scheduler's in-memory lease so durable lease validation
     /// (which reads this row) accepts the lease handed to the runner.
     /// Returns whether a row was updated.
@@ -1537,6 +1592,25 @@ impl JobQueries {
         Ok(jobs)
     }
 
+    /// List every job currently recorded as running, with its durable lease
+    /// token. This is the restart re-adoption source (#243): rows the restart
+    /// fence deliberately left alive must be mirrored back into the scheduler
+    /// so their runners can finish reporting against the durable lease.
+    pub async fn list_running(pool: &Pool) -> Result<Vec<crate::models::Job>> {
+        let rows =
+            sqlx::query("SELECT * FROM jobs WHERE status = 'running' ORDER BY created_at ASC")
+                .fetch_all(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to list running jobs: {e}")))?;
+
+        let jobs = rows
+            .into_iter()
+            .map(hydrate_job)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(jobs)
+    }
+
     /// The most recent job starts with their queued→started latency, newest
     /// first — the bounded per-job dispatch-latency sample behind
     /// `/queue/status` (R6.4). Latency is computed from the stored RFC 3339
@@ -1572,7 +1646,14 @@ impl JobQueries {
     /// are fenced as failed instead of being re-run automatically: the old
     /// runner may still be alive, and requeueing would permit duplicate side
     /// effects without a durable runner-generation lease.
-    pub async fn requeue_inflight(pool: &Pool) -> Result<u64> {
+    ///
+    /// Since #243 the fence is liveness-gated: a running job whose own proof
+    /// of life (`heartbeat_at`, falling back to the runner's heartbeat) is
+    /// fresher than `fence_grace_secs` survives the restart. The scheduler
+    /// re-adopts those rows into its mirror and their runners complete them
+    /// against the durable lease; only jobs that were already silent before
+    /// the restart are failed here.
+    pub async fn requeue_inflight(pool: &Pool, fence_grace_secs: i64) -> Result<u64> {
         let mut transaction = pool
             .pool()
             .begin_with("BEGIN IMMEDIATE")
@@ -1591,10 +1672,15 @@ impl JobQueries {
         .await
         .map_err(|e| Error::database(format!("failed to requeue assigned jobs: {e}")))?;
         let running = sqlx::query(
-            "UPDATE jobs SET status = 'failed', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE status = 'running'",
+            "UPDATE jobs SET status = 'failed', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE status = 'running' AND id IN (\
+                SELECT j.id FROM jobs j LEFT JOIN runners r ON r.id = j.runner_id \
+                WHERE j.status = 'running' \
+                  AND datetime(COALESCE(j.heartbeat_at, r.last_heartbeat, j.started_at), '+' || ? || ' seconds') <= datetime('now')\
+            )",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(r#"{"status":"failed","reason":"scheduler_restart_fenced_running_job"}"#)
+        .bind(fence_grace_secs)
         .execute(&mut *transaction)
         .await
         .map_err(|e| Error::database(format!("failed to fence running jobs: {e}")))?;
@@ -3525,21 +3611,303 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(JobQueries::requeue_inflight(&pool).await.unwrap(), 2);
-        let recovered = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
-        assert_eq!(recovered.status, "failed");
-        assert!(recovered.runner_id.is_none());
-        assert!(recovered.started_at.is_some());
-        assert!(recovered
+        // Since #243, restart recovery fences a running job only when its
+        // liveness proof is silent beyond the grace. A freshly started job
+        // (recent `started_at` as the fallback proof) survives so its runner
+        // can complete it against the durable lease.
+        let survivor = crate::models::Job::new(run.id, "restart-survivor".to_string());
+        JobQueries::create(&pool, &survivor).await.unwrap();
+        JobQueries::start(&pool, survivor.id).await.unwrap();
+
+        // A running job silent past the grace window is still fenced.
+        let fenced = crate::models::Job::new(run.id, "restart-fenced".to_string());
+        JobQueries::create(&pool, &fenced).await.unwrap();
+        JobQueries::start(&pool, fenced.id).await.unwrap();
+        let stale_started = (Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
+        sqlx::query("UPDATE jobs SET started_at = ? WHERE id = ?")
+            .bind(&stale_started)
+            .bind(fenced.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(JobQueries::requeue_inflight(&pool, 300).await.unwrap(), 2);
+
+        // The silent job is failed with the restart-fence receipt.
+        let fenced_recovered = JobQueries::get(&pool, fenced.id).await.unwrap().unwrap();
+        assert_eq!(fenced_recovered.status, "failed");
+        assert!(fenced_recovered.runner_id.is_none());
+        assert!(fenced_recovered.started_at.is_some());
+        assert!(fenced_recovered
             .result_json
             .as_deref()
             .is_some_and(|receipt| receipt.contains("scheduler_restart_fenced_running_job")));
+        // The fresh job survives, still running and reclaimable.
+        let survivor_recovered = JobQueries::get(&pool, survivor.id).await.unwrap().unwrap();
+        assert_eq!(survivor_recovered.status, "running");
         let queued_recovered = JobQueries::get(&pool, queued_job.id)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(queued_recovered.status, "queued");
         assert!(queued_recovered.runner_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_job_heartbeat_is_lease_gated_and_recovers_runner() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "beat-owner".to_string(),
+            "beat@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "beat-repo".to_string(),
+            user.id,
+            "/git/beat".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "beat-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "main".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        let runner_id = RunnerId::new();
+        let mut runner = crate::models::Runner::new(
+            "beat-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        runner.id = runner_id;
+        RunnerQueries::create(&pool, &runner).await.unwrap();
+        let job = crate::models::Job::new(run.id, "beat".to_string());
+        JobQueries::create(&pool, &job).await.unwrap();
+        // Lease sync parks the row at `assigned`; the row must be
+        // dispatchable first.
+        JobQueries::update_status(&pool, job.id, "queued")
+            .await
+            .unwrap();
+        assert!(JobQueries::sync_lease(&pool, job.id, runner_id, "lease-1")
+            .await
+            .unwrap());
+
+        // The runner's global state is stale and offline: a delivered job
+        // beat must refresh it and recover the runner, because the request
+        // proves the runner process is alive and in contact.
+        let stale_beat = (Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
+        sqlx::query("UPDATE runners SET last_heartbeat = ?, status = 'offline' WHERE id = ?")
+            .bind(&stale_beat)
+            .bind(runner_id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        // A wrong lease is rejected and writes nothing.
+        assert!(!JobQueries::heartbeat(&pool, job.id, runner_id, "lease-2")
+            .await
+            .unwrap());
+        let untouched = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert!(untouched.heartbeat_at.is_none());
+        let still_offline = RunnerQueries::get(&pool, runner_id).await.unwrap().unwrap();
+        assert_eq!(still_offline.status, "offline");
+
+        // The matching lease is accepted and recovers both sides.
+        assert!(JobQueries::heartbeat(&pool, job.id, runner_id, "lease-1")
+            .await
+            .unwrap());
+        let beaten = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert!(beaten.heartbeat_at.is_some());
+        let recovered = RunnerQueries::get(&pool, runner_id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, "online");
+        let stale_time = DateTime::parse_from_rfc3339(&stale_beat)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_ne!(recovered.last_heartbeat, Some(stale_time));
+
+        // A terminal job can no longer be heartbeated.
+        JobQueries::update_status(&pool, job.id, "failed")
+            .await
+            .unwrap();
+        assert!(!JobQueries::heartbeat(&pool, job.id, runner_id, "lease-1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_requeue_inflight_honors_job_heartbeat_over_runner_heartbeat() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "grace-owner".to_string(),
+            "grace@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "grace-repo".to_string(),
+            user.id,
+            "/git/grace".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "grace-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "main".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        // Two runners, both globally stale: the fence must judge each job by
+        // its own liveness proof, not by a runner-wide verdict.
+        let stale_runner_id = RunnerId::new();
+        let mut stale_runner = crate::models::Runner::new(
+            "grace-stale-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        stale_runner.id = stale_runner_id;
+        RunnerQueries::create(&pool, &stale_runner).await.unwrap();
+        let beat_runner_id = RunnerId::new();
+        let mut beat_runner = crate::models::Runner::new(
+            "grace-beat-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        beat_runner.id = beat_runner_id;
+        RunnerQueries::create(&pool, &beat_runner).await.unwrap();
+        let stale_beat = (Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
+        for runner_id in [stale_runner_id, beat_runner_id] {
+            sqlx::query("UPDATE runners SET last_heartbeat = ? WHERE id = ?")
+                .bind(&stale_beat)
+                .bind(runner_id.to_string())
+                .execute(pool.pool())
+                .await
+                .unwrap();
+        }
+
+        // Legacy fallback: no per-job heartbeat at all, and the runner's
+        // global heartbeat is stale past the grace — the job is fenced.
+        let legacy = crate::models::Job::new(run.id, "legacy-stale".to_string());
+        JobQueries::create(&pool, &legacy).await.unwrap();
+        JobQueries::update_status(&pool, legacy.id, "queued")
+            .await
+            .unwrap();
+        assert!(
+            JobQueries::sync_lease(&pool, legacy.id, stale_runner_id, "lease-legacy")
+                .await
+                .unwrap()
+        );
+        JobQueries::start(&pool, legacy.id).await.unwrap();
+
+        // The #243 case: the runner's global heartbeat is equally stale, but
+        // the job itself reported liveness moments ago — it survives.
+        let alive = crate::models::Job::new(run.id, "job-beat-fresh".to_string());
+        JobQueries::create(&pool, &alive).await.unwrap();
+        JobQueries::update_status(&pool, alive.id, "queued")
+            .await
+            .unwrap();
+        assert!(
+            JobQueries::sync_lease(&pool, alive.id, beat_runner_id, "lease-alive")
+                .await
+                .unwrap()
+        );
+        JobQueries::start(&pool, alive.id).await.unwrap();
+        assert!(
+            JobQueries::heartbeat(&pool, alive.id, beat_runner_id, "lease-alive")
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(JobQueries::requeue_inflight(&pool, 300).await.unwrap(), 1);
+        let legacy_recovered = JobQueries::get(&pool, legacy.id).await.unwrap().unwrap();
+        assert_eq!(legacy_recovered.status, "failed");
+        assert!(legacy_recovered
+            .result_json
+            .as_deref()
+            .is_some_and(|receipt| receipt.contains("scheduler_restart_fenced_running_job")));
+        let alive_recovered = JobQueries::get(&pool, alive.id).await.unwrap().unwrap();
+        assert_eq!(alive_recovered.status, "running");
+        assert!(alive_recovered.lease_token.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_running_returns_only_running_jobs() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "running-owner".to_string(),
+            "running@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "running-repo".to_string(),
+            user.id,
+            "/git/running".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "running-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "main".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        let running = crate::models::Job::new(run.id, "running".to_string());
+        JobQueries::create(&pool, &running).await.unwrap();
+        JobQueries::start(&pool, running.id).await.unwrap();
+        let queued = crate::models::Job::new(run.id, "queued".to_string());
+        JobQueries::create(&pool, &queued).await.unwrap();
+        JobQueries::update_status(&pool, queued.id, "queued")
+            .await
+            .unwrap();
+        let failed = crate::models::Job::new(run.id, "failed".to_string());
+        JobQueries::create(&pool, &failed).await.unwrap();
+        JobQueries::start(&pool, failed.id).await.unwrap();
+        JobQueries::update_status(&pool, failed.id, "failed")
+            .await
+            .unwrap();
+
+        let listed = JobQueries::list_running(&pool).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, running.id);
+        assert_eq!(listed[0].status, "running");
     }
 
     #[tokio::test]

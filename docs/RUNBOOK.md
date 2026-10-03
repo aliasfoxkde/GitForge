@@ -146,6 +146,7 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 | `GITFORGE_RUNNER_NAME` | Recommended | `runner` | Stable unique identity; restarts refresh this row instead of creating another one |
 | `GITFORGE_RUNNER_CAPACITY` | No | `2` | Maximum concurrent jobs |
 | `GITFORGE_HEARTBEAT_INTERVAL` | No | `30` | Heartbeat interval in seconds |
+| `GITFORGE_JOB_HEARTBEAT_INTERVAL` | No | `15` | Per-job lease-heartbeat interval in seconds (#243): sent while a job runs to renew its fence grace |
 | `GITFORGE_FETCH_INTERVAL` | No | `5` | Job-poll interval in seconds |
 | `GITFORGE_SCHEDULER_TOKEN` | No | _(none)_ | Bearer token for scheduler API authentication |
 | `GITFORGE_REGISTER_ATTEMPTS` | No | `6` | Registration attempts before giving up when the scheduler is unreachable |
@@ -306,6 +307,7 @@ and auth token), which it writes after `gitforge auth --login`.
 | `GITFORGE_SCHEDULER_URL` | runner | — | Scheduler endpoint (required) |
 | `GITFORGE_RUNNER_CAPACITY` | runner | 2 | Max concurrent jobs |
 | `GITFORGE_HEARTBEAT_INTERVAL` | runner | 30 | Heartbeat interval in seconds |
+| `GITFORGE_JOB_HEARTBEAT_INTERVAL` | runner | 15 | Per-job lease-heartbeat interval in seconds (#243) |
 | `GITFORGE_FETCH_INTERVAL` | runner | 5 | Job-poll interval in seconds |
 | `GITFORGE_SCHEDULER_TOKEN` | runner | _(none)_ | Bearer token for scheduler API. Required in compose: the scheduler rejects runner/operator requests when unset |
 | `GITFORGE_RUNNER_STANDALONE` | runner | `deny` | `deny` exits the runner when scheduler registration fails; `allow` falls back to standalone execution |

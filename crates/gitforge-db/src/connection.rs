@@ -303,6 +303,11 @@ impl Pool {
             "ALTER TABLE jobs ADD COLUMN result_json TEXT",
             "ALTER TABLE jobs ADD COLUMN lease_token TEXT",
             "ALTER TABLE jobs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0",
+            // Per-job liveness proof (issue #243): the runner refreshes this
+            // while the job executes, so fencing waits for the JOB to go
+            // quiet instead of judging from the runner's global heartbeat,
+            // which starves under host load while the build is healthy.
+            "ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT",
         ] {
             if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
                 let message = error.to_string();

@@ -24,7 +24,7 @@ use gitforge_events::{
 };
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
 use gitforge_scheduler::{
-    assigner::{JobExecutionDefinition, DEFAULT_JOB_TIMEOUT_SECS},
+    assigner::{job_fence_grace_secs_from_env, JobExecutionDefinition, DEFAULT_JOB_TIMEOUT_SECS},
     create_state_with_artifact_storage, scheduler_routes, Scheduler, SchedulerEvent,
 };
 use gitforge_storage::FileStorage;
@@ -91,11 +91,21 @@ async fn main() -> anyhow::Result<()> {
         let pool = gitforge_db::Pool::new(&database_url).await?;
         pool.migrate().await?;
         tracing::info!(database_url = %database_url, "using durable GitForge scheduler database");
-        (Scheduler::with_db(pool.clone()), Some(pool))
+        (
+            Scheduler::with_db(pool.clone()).with_fence_grace_secs(job_fence_grace_secs_from_env()),
+            Some(pool),
+        )
     } else {
         tracing::warn!("GITFORGE_DATABASE_URL is unset; scheduler state is in-memory only");
-        (Scheduler::new(), None)
+        (
+            Scheduler::new().with_fence_grace_secs(job_fence_grace_secs_from_env()),
+            None,
+        )
     };
+    tracing::info!(
+        fence_grace_secs = job_fence_grace_secs_from_env(),
+        "job fence grace configured (issue #243)"
+    );
 
     // Start scheduler HTTP API server on port 42781
     let scheduler_port: u16 = std::env::var("SCHEDULER_PORT")

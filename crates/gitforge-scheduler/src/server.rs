@@ -152,6 +152,7 @@ pub fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
         .route("/queue/status", get(get_queue_status))
         .route("/jobs/{id}/claim", post(claim_job))
         .route("/jobs/{id}/started", post(start_job))
+        .route("/jobs/{id}/heartbeat", post(job_heartbeat))
         .route("/jobs/{id}/logs", post(append_job_log))
         .route("/jobs/{id}/artifacts", post(upload_job_artifact))
         .layer(DefaultBodyLimit::max(MAX_ARTIFACT_BYTES as usize))
@@ -695,6 +696,62 @@ async fn start_job(
     }
 }
 
+/// Per-job liveness proof from the executing runner (#243).
+///
+/// Distinct from the runner-global heartbeat on purpose: this is lease-gated
+/// evidence that THIS execution is still being driven, and it is what the
+/// fence grace (#243) is measured against, so a starved global heartbeat can
+/// no longer fail a healthy build.
+async fn job_heartbeat(
+    State(state): State<SchedulerServerState>,
+    Path(job_id): Path<String>,
+    Json(request): Json<LeaseRequest>,
+) -> impl IntoResponse {
+    let job_id = match Uuid::parse_str(&job_id) {
+        Ok(id) => JobId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_job_id"})),
+            )
+        }
+    };
+    let runner_id = match Uuid::parse_str(&request.runner_id) {
+        Ok(id) => RunnerId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_runner_id"})),
+            )
+        }
+    };
+    let Some(lease_token) = request.lease_token else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing_lease_token"})),
+        );
+    };
+    if state
+        .scheduler
+        .job_heartbeat(job_id, runner_id, &lease_token)
+        .await
+    {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "contract_version": "harness.job.v1",
+                "job_id": job_id.to_string(),
+                "status": "alive",
+            })),
+        )
+    } else {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "invalid_job_lease"})),
+        )
+    }
+}
+
 /// Append bounded runner output while the durable lease is active.
 async fn append_job_log(
     State(state): State<SchedulerServerState>,
@@ -1064,6 +1121,56 @@ mod tests {
         .await;
 
         assert_status(response.into_response(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_job_heartbeat_handler_accepts_active_lease_only() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let runner = Runner::new("job-beat-runner".to_string(), RunnerType::Docker, 1);
+        let runner_id = runner.id;
+        state.scheduler.register_runner(runner).await;
+        let job_id = JobId::new();
+        state
+            .scheduler
+            .enqueue(
+                job_id,
+                gitforge_common::PipelineRunId::new(),
+                gitforge_common::RepoId::new(),
+            )
+            .await
+            .unwrap();
+        state.scheduler.process_queue().await;
+        let lease = state.scheduler.ensure_job_lease(job_id).await.unwrap();
+        state
+            .scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .unwrap();
+
+        // The active lease proves liveness.
+        let response = job_heartbeat(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(LeaseRequest {
+                runner_id: runner_id.to_string(),
+                lease_token: Some(lease.clone()),
+            }),
+        )
+        .await;
+        assert_status(response.into_response(), StatusCode::OK);
+
+        // A rotated or fabricated token is rejected, not silently accepted.
+        let response = job_heartbeat(
+            axum::extract::State(state),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(LeaseRequest {
+                runner_id: runner_id.to_string(),
+                lease_token: Some("superseded-lease".to_string()),
+            }),
+        )
+        .await;
+        assert_status(response.into_response(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
