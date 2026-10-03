@@ -2005,6 +2005,9 @@ fn execution_plan(
         image: definition.image.clone(),
         working_dir,
         timeout_secs,
+        // The DAG builder has already merged pipeline `environment` into the
+        // job `env` map, so the job definition alone carries everything.
+        env: definition.env.clone(),
     }
 }
 

@@ -26,7 +26,8 @@ gitforge   http://localhost:42782/<owner>/<repo>.git   (or LAN address)
 origin     https://github.com/<owner>/<repo>.git        (mirror)
 ```
 
-A push to GitForge triggers that project's `.gitforce.yml` pipeline.
+A push to GitForge triggers that project's `.gitforge.yml` pipeline
+(legacy `.gitforce.yml` is still accepted as a fallback).
 If a push to GitForge succeeds and the GitHub mirror push fails, the
 mirror may be repaired later; the reverse is never acceptable.
 
@@ -57,8 +58,8 @@ on both remotes before assuming they still agree.
 
 | Concern | Home |
 | --- | --- |
-| Pipeline definition | `.gitforce.yml` in the project repo |
-| Coverage / lint gates | `.gitforce.yml` jobs (e.g. GitForge at 82% fail / 84% warn, calibrated in-sandbox — F28) |
+| Pipeline definition | `.gitforge.yml` in the project repo (legacy `.gitforce.yml` accepted) |
+| Coverage / lint gates | `.gitforge.yml` jobs (e.g. GitForge at 82% fail / 84% warn, calibrated in-sandbox — F28) |
 | CI images | `infrastructure/docker/*.Dockerfile`, pre-built, tag-bumped |
 | Release evidence | GitForge run of the exact source commit |
 | Secrets | `gitforge auth --login` (interactive) or credential files; never repo files, never the mirror |

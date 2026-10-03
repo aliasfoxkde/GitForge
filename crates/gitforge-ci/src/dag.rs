@@ -127,7 +127,10 @@ impl DagBuilder {
         let mut nodes = Vec::new();
         let mut name_to_id = HashMap::new();
 
-        // First pass: create all nodes
+        // First pass: create all nodes. Pipeline-level environment is merged
+        // into each job here so everything downstream (execution plan,
+        // scheduler payload, runner exec) only ever reads `JobDefinition.env`.
+        // Job-level `env` wins over pipeline-level `environment`.
         for job in &pipeline.jobs {
             let job_id = JobId::new();
             if name_to_id.insert(job.name.clone(), job_id).is_some() {
@@ -137,10 +140,18 @@ impl DagBuilder {
                 )));
             }
 
+            let mut definition = job.clone();
+            for (key, value) in &pipeline.environment {
+                definition
+                    .env
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+
             nodes.push(JobNode {
                 id: job_id,
                 name: job.name.clone(),
-                definition: job.clone(),
+                definition,
                 dependencies: Vec::new(),
             });
         }
@@ -262,6 +273,40 @@ mod tests {
 
         let test = graph.get_by_name("test").unwrap();
         assert_eq!(test.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn test_pipeline_environment_merges_into_jobs() {
+        // Regression: the pipeline `environment` map was parsed but never
+        // reached a job container (run 9e2a1312 of Design-Intelligence died
+        // on ModuleNotFoundError with `PYTHONPATH: src` silently ignored).
+        let mut job = make_job("build", vec![]);
+        job.env.insert("CI_JOB_ONLY".to_string(), "job".to_string());
+
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::from([
+                ("PYTHONPATH".to_string(), "src".to_string()),
+                ("CI_JOB_ONLY".to_string(), "pipeline".to_string()),
+            ]),
+            jobs: vec![job],
+        };
+
+        let run_id = gitforge_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&pipeline, run_id).unwrap();
+
+        let definition = &graph.get_by_name("build").unwrap().definition;
+        assert_eq!(
+            definition.env.get("PYTHONPATH").map(String::as_str),
+            Some("src")
+        );
+        // Job-level env wins over pipeline-level environment.
+        assert_eq!(
+            definition.env.get("CI_JOB_ONLY").map(String::as_str),
+            Some("job")
+        );
     }
 
     #[test]

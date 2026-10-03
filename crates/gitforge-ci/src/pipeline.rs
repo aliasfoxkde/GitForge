@@ -103,12 +103,16 @@ impl TriggerType {
     }
 }
 
-/// Pipeline definition (loaded from .gitforce.yml)
+/// Pipeline definition (loaded from `.gitforge.yml`; legacy `.gitforce.yml`
+/// accepted)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineDefinition {
     pub name: String,
     pub version: String,
     pub trigger_on: Vec<TriggerType>,
+    /// Optional: pipelines that need no shared environment omit the key.
+    /// Absent in older pipelines; an empty map is the safe default.
+    #[serde(default)]
     pub environment: HashMap<String, String>,
     pub jobs: Vec<JobDefinition>,
 }

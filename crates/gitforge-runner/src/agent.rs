@@ -11,6 +11,7 @@ use gitforge_storage::ArtifactReceipt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -710,6 +711,10 @@ pub struct JobAssignment {
     /// responses are applied during deserialization.
     #[serde(default = "default_job_timeout_secs")]
     pub timeout_secs: u64,
+    /// Environment variables injected into every step exec. Defaults to
+    /// empty so assignments from a pre-env scheduler still decode.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 fn default_job_timeout_secs() -> u64 {
@@ -1258,7 +1263,7 @@ impl RunnerAgent {
                     working_directory: assignment.working_dir.clone(),
                 })
                 .collect(),
-            env: std::collections::HashMap::new(),
+            env: assignment.env.clone(),
             working_dir: assignment.working_dir.clone(),
             timeout_secs: assignment.timeout_secs.clamp(5, 24 * 60 * 60),
         };
@@ -2426,6 +2431,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
             timeout_secs: 300,
+            env: HashMap::new(),
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
@@ -2461,6 +2467,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            env: HashMap::new(),
         };
         assert!(assignment.working_dir.is_none());
     }
@@ -2482,6 +2489,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            env: HashMap::new(),
         };
         let debug_str = format!("{assignment:?}");
         assert!(debug_str.contains("job-123"));
@@ -2513,6 +2521,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
             timeout_secs: 300,
+            env: HashMap::new(),
         };
 
         // Test JSON serialization
@@ -2538,6 +2547,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            env: HashMap::new(),
         };
         assert!(assignment.commands.is_empty());
         assert!(assignment.working_dir.is_none());
@@ -2559,6 +2569,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: Some("/project".to_string()),
             timeout_secs: 300,
+            env: HashMap::new(),
         };
         assert_eq!(assignment.commands.len(), 4);
     }
@@ -2654,6 +2665,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            env: HashMap::new(),
         };
         let assignment2 = JobAssignment {
             job_id: "job-1".to_string(),
@@ -2663,6 +2675,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            env: HashMap::new(),
         };
         // JobAssignment should implement PartialEq if we add it
         // For now just verify individual field equality
@@ -2680,6 +2693,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            env: HashMap::new(),
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
@@ -2757,6 +2771,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            env: HashMap::new(),
         };
         assert_eq!(assignment.commands.len(), 100);
     }
@@ -2771,6 +2786,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            env: HashMap::new(),
         };
         let cloned = assignment.clone();
         assert_eq!(cloned.job_id, assignment.job_id);
@@ -2787,6 +2803,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            env: HashMap::new(),
         };
         assert_eq!(assignment.name, "测试任务");
     }
@@ -2805,6 +2822,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: None,
             timeout_secs: 300,
+            env: HashMap::new(),
         };
         assert_eq!(assignment.commands.len(), 3);
     }
@@ -2880,6 +2898,7 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: Some("".to_string()),
             timeout_secs: 300,
+            env: HashMap::new(),
         };
         assert!(assignment.working_dir.is_some());
     }

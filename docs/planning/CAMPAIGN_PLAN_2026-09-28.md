@@ -237,3 +237,39 @@ checkpoint tuning for the gateway are the next levers if this recurs.
    storm trigger delivery can lag minutes (dispatcher marks `delivered`
    on ci's honest 202 before the consumer creates the run) — re-query
    before diagnosing.
+
+## Phase 6 — Release v0.6.13 (executed 2026-10-02)
+
+1. ✅ Content: owner-prefixed repo-create fix (`43833379`, the kubix
+   activation blocker — API rejects `/` in repo names, CLI sends the
+   bare name) plus the co-tenant's pipeline-list active-filter
+   (`752ea428`, absorbed rather than racing it). Release SHA
+   `929bb967` converged all three mirrors (local main, origin/main,
+   gitforge-ci main) via PRs #249/#250 — a co-tenant had promoted a
+   bundle from their unmerged branch mid-cycle; absorbing the branch
+   and revalidating on the merge beat pinning to unmerged code.
+2. ✅ Validation on the exact release SHA: run `ed9f52d6` green (4/4:
+   fmt, clippy, test, coverage). Gate passed mechanically, bundle
+   `gitforge-929bb967-20261003` assembled and verified (11 files).
+3. ✅ Promote: `promote --apply` switched `releases/gitforge-current`
+   atomically (previous: `gitforge-752ea428-20261002` — the co-tenant
+   branch release this cut supersedes). All four units restarted via
+   `sudo -n systemctl restart gitforge@{api,git-server,ci,runner}`.
+4. ✅ Zero-cost cutover: DB check confirmed no job was in flight at
+   the kill moment — the drain window plus queue timing meant no
+   requeue, no casualty. Post-restart dispatch verified (26 jobs
+   `succeeded` in the first 10 minutes; kubix-ci's latest run
+   `succeeded`).
+5. ✅ Post-deploy: health 200 on :42780/:42781/:42782; all four
+   binaries running from the new bundle; `gitforge-status` healthy on
+   release/runners (drift-free with `GITFORGE_RELEASE_ROOT` pointed at
+   this instance, per the v0.6.12 gotcha). Residual `overall:
+   degraded` is host /tmp pressure (co-tenant gate workspace at
+   ~14G/16G tmpfs), not the release.
+6. ✅ GitHub sync: tag `v0.6.13` pushed GitForge-first then origin;
+   release published with changelog notes.
+7. Noted, not fixed here: 4 consecutive ~11s `infrastructure_failure`
+   jobs on a co-tenant pipeline (container-start failures coinciding
+   with /tmp at 100%) — environment, not cutover; owner-side retry
+   applies. CLI-token TTL (24h, no refresh) and job_log_chunks
+   retention remain open product follow-ups from the same audit.

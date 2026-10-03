@@ -667,3 +667,155 @@ mod tests {
         assert_eq!(payload.branch, "");
     }
 }
+
+#[cfg(test)]
+mod webhook_job_plan_tests {
+    use super::*;
+
+    /// A minimal valid definition document with `jobs` substituted in.
+    fn definition_json(jobs: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "name": "ci",
+            "version": "1.0",
+            "trigger_on": ["push"],
+            "environment": {},
+            "jobs": jobs
+        })
+    }
+
+    #[test]
+    fn derives_the_entry_job_from_a_valid_definition() {
+        let plan = derive_webhook_job_plan(&definition_json(serde_json::json!([
+            {
+                "name": "build",
+                "image": "dsc-ci-rust:7",
+                "steps": [
+                    {"name": "compile", "run": "cargo build", "working_directory": "crates/api"}
+                ]
+            },
+            {
+                "name": "test",
+                "image": "dsc-ci-rust:7",
+                "needs": ["build"],
+                "steps": [{"name": "t", "run": "cargo test"}]
+            }
+        ])))
+        .unwrap();
+        assert_eq!(plan.name, "build");
+        assert_eq!(plan.image, "dsc-ci-rust:7");
+        assert_eq!(plan.commands, vec!["cargo build".to_string()]);
+        assert_eq!(plan.working_dir.as_deref(), Some("crates/api"));
+    }
+
+    #[test]
+    fn entry_job_selection_ignores_dependent_jobs() {
+        let plan = derive_webhook_job_plan(&definition_json(serde_json::json!([
+            {
+                "name": "deploy",
+                "image": "img",
+                "needs": ["build"],
+                "steps": [{"name": "s", "run": "deploy.sh"}]
+            },
+            {
+                "name": "build",
+                "image": "img",
+                "steps": [{"name": "s", "run": "make"}]
+            }
+        ])))
+        .unwrap();
+        assert_eq!(plan.name, "build");
+        assert_eq!(plan.commands, vec!["make".to_string()]);
+    }
+
+    #[test]
+    fn collects_commands_across_all_entry_job_steps() {
+        let plan = derive_webhook_job_plan(&definition_json(serde_json::json!([
+            {
+                "name": "build",
+                "image": "img",
+                "steps": [
+                    {"name": "one", "run": "first"},
+                    {"name": "two", "run": "second", "working_directory": "sub/dir"}
+                ]
+            }
+        ])))
+        .unwrap();
+        assert_eq!(
+            plan.commands,
+            vec!["first".to_string(), "second".to_string()]
+        );
+        // The first declared working directory wins.
+        assert_eq!(plan.working_dir.as_deref(), Some("sub/dir"));
+    }
+
+    #[test]
+    fn rejects_definitions_without_an_entry_job() {
+        let error = derive_webhook_job_plan(&definition_json(serde_json::json!([
+            {
+                "name": "deploy",
+                "image": "img",
+                "needs": ["build"],
+                "steps": [{"name": "s", "run": "deploy.sh"}]
+            }
+        ])))
+        .unwrap_err();
+        assert!(matches!(error, WebhookJobPlanError::MissingEntryJob));
+    }
+
+    #[test]
+    fn rejects_unparseable_stored_definitions() {
+        let error =
+            derive_webhook_job_plan(&serde_json::json!({"jobs": "not-a-list"})).unwrap_err();
+        assert!(matches!(
+            error,
+            WebhookJobPlanError::InvalidStoredDefinition(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_entry_jobs_with_invalid_timeouts() {
+        let error = derive_webhook_job_plan(&definition_json(serde_json::json!([
+            {
+                "name": "build",
+                "image": "img",
+                "timeout": "12 parsecs",
+                "steps": [{"name": "s", "run": "make"}]
+            }
+        ])))
+        .unwrap_err();
+        match error {
+            WebhookJobPlanError::InvalidTimeout { job, .. } => assert_eq!(job, "build"),
+            other => panic!("expected InvalidTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defaults_timeout_when_the_entry_job_declares_none() {
+        let plan = derive_webhook_job_plan(&definition_json(serde_json::json!([
+            {
+                "name": "build",
+                "image": "img",
+                "steps": [{"name": "s", "run": "make"}]
+            }
+        ])))
+        .unwrap();
+        assert_eq!(
+            plan.timeout_secs,
+            gitforge_ci::pipeline::DEFAULT_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn parses_declared_timeouts() {
+        let plan = derive_webhook_job_plan(&definition_json(serde_json::json!([
+            {
+                "name": "build",
+                "image": "img",
+                "timeout": "45m",
+                "steps": [{"name": "s", "run": "make"}]
+            }
+        ])))
+        .unwrap();
+        assert_eq!(plan.timeout_secs, 2700);
+    }
+}

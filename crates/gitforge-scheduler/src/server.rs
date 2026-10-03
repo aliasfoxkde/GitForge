@@ -17,6 +17,7 @@ use gitforge_common::{JobId, RunnerId};
 use gitforge_db::models::{Runner, RunnerType};
 use gitforge_storage::{Artifact, ArtifactId, ArtifactStore, FileStorage, MAX_ARTIFACT_BYTES};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -49,6 +50,10 @@ pub struct PendingJobInfo {
     pub image: String,
     pub working_dir: Option<String>,
     pub timeout_secs: u64,
+    /// Environment variables injected into every step exec. Runners on an
+    /// older contract never read this key, and this side always sends it,
+    /// so no version negotiation is needed.
+    pub env: HashMap<String, String>,
     pub runner_id: String,
     pub lease_token: String,
 }
@@ -520,6 +525,7 @@ async fn get_pending_jobs(
                     image: definition.image,
                     working_dir: definition.working_dir,
                     timeout_secs: definition.timeout_secs,
+                    env: definition.env,
                     runner_id: runner_id.to_string(),
                     lease_token,
                 });
@@ -1710,12 +1716,14 @@ mod tests {
             image: "rust:latest".to_string(),
             working_dir: Some("/workspace".to_string()),
             timeout_secs: 300,
+            env: HashMap::from([("RUST_BACKTRACE".to_string(), "1".to_string())]),
             runner_id: "runner-123".to_string(),
             lease_token: "lease-123".to_string(),
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("job-123"));
         assert!(json.contains("build"));
+        assert!(json.contains("RUST_BACKTRACE"));
     }
 
     #[test]

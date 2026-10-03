@@ -1,22 +1,26 @@
-//! Integration tests for the webhook trigger route's non-delegating
-//! branches.
+//! Integration tests for the webhook trigger route.
 //!
 //! With no CI trigger client configured, the route falls back to its
 //! durable in-process path: it validates the stored pipeline definition,
 //! persists the run, and queues the entry job under an idempotency key so
 //! the scheduler's next tick adopts the work. These tests drive the real
 //! router with an in-memory database and assert on the rows the handler
-//! itself wrote. (The delegation path — a configured client — is covered
-//! by `ci_routes.rs` fail-closed tests and the spawned-binary e2e suite;
-//! the client pins the production loopback URL by design and cannot be
-//! pointed at a mock.)
+//! itself wrote.
+//!
+//! The delegation path (a configured client) is covered twice: the
+//! fail-closed angle in `ci_routes.rs` (client pointed at a dead port)
+//! and — in this file — the full ladder against a stub orchestrator
+//! binding the pinned production endpoint itself, since the client
+//! refuses any other URL by design.
 
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
+    response::IntoResponse,
+    routing::post,
     Router,
 };
-use gitforge_api::{ApiAuth, ApiServer};
+use gitforge_api::{ApiAuth, ApiServer, CiTriggerClient};
 use gitforge_common::{PipelineId, RepoId};
 use gitforge_db::{
     models::{JobStatus, Pipeline, Repository, User},
@@ -24,6 +28,7 @@ use gitforge_db::{
     Pool,
 };
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 struct Fixture {
@@ -398,4 +403,184 @@ async fn webhook_route_never_mutates_the_stored_pipeline() {
             .expect("pipeline row survives");
         assert_eq!(pipeline.id, pipeline_id);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Delegation paths (a configured CI trigger client)
+// ---------------------------------------------------------------------------
+
+/// What the stub orchestrator recorded for each delegated trigger.
+#[derive(Debug)]
+struct StubTrigger {
+    token: String,
+    body: Value,
+}
+
+/// Shared state for the stub orchestrator: what it has received and the
+/// scripted responses it still owes.
+#[derive(Clone)]
+struct StubCiState {
+    seen: Arc<Mutex<Vec<StubTrigger>>>,
+    script: Arc<Mutex<Vec<(u16, Value)>>>,
+}
+
+/// The stub's only route, mirroring the production trigger contract:
+/// a `x-gitforge-trigger-token` header and a JSON trigger payload. A
+/// scripted `Value::String` is served raw (`text/plain`) to exercise the
+/// client's non-JSON branch; any other value is served as JSON.
+async fn stub_trigger(
+    axum::extract::State(state): axum::extract::State<StubCiState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let token = headers
+        .get("x-gitforge-trigger-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    state.seen.lock().unwrap().push(StubTrigger {
+        token,
+        body: parsed,
+    });
+    let next = {
+        let mut script = state.script.lock().unwrap();
+        if script.is_empty() {
+            (500, json!({"error": "script exhausted"}))
+        } else {
+            script.remove(0)
+        }
+    };
+    let status = axum::http::StatusCode::from_u16(next.0).unwrap();
+    match next.1 {
+        Value::String(raw) => (status, raw).into_response(),
+        payload => (status, axum::Json(payload)).into_response(),
+    }
+}
+
+/// Bind the *pinned production endpoint* (`http://127.0.0.1:42781/
+/// pipelines/trigger`) and serve a scripted sequence of orchestrator
+/// responses. The client refuses any other URL by design, so owning the
+/// real port for the test's lifetime is the only honest way to drive the
+/// delegation ladder end-to-end.
+///
+/// Returns `None` when the port is already owned — the live orchestrator
+/// on a developer host — and the caller skips; the CI sandbox where the
+/// gate runs always has the port free, so coverage is collected there.
+async fn serve_stub_ci(script: Vec<(u16, Value)>) -> Option<Arc<Mutex<Vec<StubTrigger>>>> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:42781")
+        .await
+        .ok()?;
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let state = StubCiState {
+        seen: received.clone(),
+        script: Arc::new(Mutex::new(script)),
+    };
+
+    let app: Router = Router::new()
+        .route("/pipelines/trigger", post(stub_trigger))
+        .with_state(state);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Some(received)
+}
+
+/// The full delegation ladder through the pinned endpoint: a healthy
+/// orchestrator answer relays its run id, the honest `queued` answer
+/// relays "no run yet", and any orchestrator failure (HTTP error status,
+/// non-JSON body) fails the webhook closed with no local run persisted.
+#[tokio::test]
+async fn webhook_delegation_ladder_relays_success_and_fails_closed() {
+    let f = seed().await;
+    let client =
+        CiTriggerClient::new("http://127.0.0.1:42781/pipelines/trigger", "stub-token").unwrap();
+    let app = ApiServer::new("test-secret", f.pool.clone())
+        .with_ci_trigger_client(Arc::new(client))
+        .into_router();
+
+    let Some(received) = serve_stub_ci(vec![
+        (200, json!({"pipeline_run_id": "durable-run-1"})),
+        (200, json!({"queued": true, "pipeline_run_id": null})),
+        (500, json!({"error": "orchestrator exploded"})),
+        (200, Value::String("not json at all".to_string())),
+    ])
+    .await
+    else {
+        eprintln!("skipping webhook_delegation_ladder: port 42781 is already owned on this host");
+        return;
+    };
+
+    // 1. A healthy answer with a run id is relayed verbatim.
+    let (status, body) = post_webhook(
+        app.clone(),
+        &f.valid_pipeline,
+        &f.owner_token,
+        webhook_payload(&f.repo_id, &"1".repeat(40)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["success"], true);
+    assert_eq!(body["pipeline_id"], f.valid_pipeline.to_string());
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("run durable-run-1"));
+
+    // 2. The orchestrator's honest `queued` answer (its correlation window
+    //    elapsed) still succeeds — with no run id in the message.
+    let (status, body) = post_webhook(
+        app.clone(),
+        &f.valid_pipeline,
+        &f.owner_token,
+        webhook_payload(&f.repo_id, &"2".repeat(40)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["success"], true);
+    assert!(!body["message"].as_str().unwrap().contains("(run"));
+
+    // 3. An orchestrator HTTP failure is mapped to a closed 502.
+    let (status, body) = post_webhook(
+        app.clone(),
+        &f.valid_pipeline,
+        &f.owner_token,
+        webhook_payload(&f.repo_id, &"3".repeat(40)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["success"], false);
+    assert_eq!(body["message"], "CI trigger unavailable");
+    assert!(body["pipeline_id"].is_null());
+
+    // 4. An orchestrator success with a non-JSON body fails closed too.
+    let (status, body) = post_webhook(
+        app.clone(),
+        &f.valid_pipeline,
+        &f.owner_token,
+        webhook_payload(&f.repo_id, &"4".repeat(40)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["message"], "CI trigger unavailable");
+
+    // Delegation is CI's custody: nothing is persisted locally, no matter
+    // how the ladder resolves.
+    let runs = PipelineRunQueries::list(&f.pool).await.unwrap();
+    assert!(runs.is_empty(), "delegation must not persist local runs");
+
+    // The stub saw the production trigger contract: the configured token
+    // header, the repository, and the zero-hash initial-push sentinel for
+    // a payload without old_commit_hash.
+    let seen = received.lock().unwrap();
+    assert_eq!(seen.len(), 4, "every webhook hit the pinned endpoint");
+    assert_eq!(seen[0].token, "stub-token");
+    assert_eq!(seen[0].body["repo_id"], f.repo_id.to_string());
+    assert_eq!(seen[0].body["ref_name"], "main");
+    assert_eq!(
+        seen[0].body["old_hash"],
+        "0000000000000000000000000000000000000000"
+    );
+    assert_eq!(seen[0].body["new_hash"], "1".repeat(40));
 }
