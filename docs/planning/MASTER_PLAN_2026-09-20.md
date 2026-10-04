@@ -851,3 +851,99 @@ the same day, plus the r6-platform-durability line deployed.
   `test_reconcile_never_invents_doom_without_a_definition`, and the
   rewritten custody assertion in
   `test_periodic_reconciliation_skips_live_and_fresh_runs`.
+
+## 12. Platform durability blocker sweep (2026-10-03, branch fix/platform-durability-20261003)
+
+Root-cause pass over the four blocker classes from the 2026-10-03
+live-DB evidence (177/1614 trigger rows permanently hollow; cancel
+500s under contention; 43-minute timeout enforcement lag; container
+loss invisible), plus the throughput problems underneath them.
+All fixes on `fix/platform-durability-20261003` (based on 5f0f7654,
+absorbing co-tenant PR #253's heartbeat work rather than
+duplicating it).
+
+**Hollow delivery (durable trigger queue).** The bus is in-memory;
+git-server marked `ci.trigger.delivered` on any 2xx including "202
+queued", and a consumer death dropped events on the floor while the
+HTTP trigger kept answering 2xx — 11% of observed trigger rows
+never produced runs, restart-correlated (ci restarted 09:03:18Z).
+Fix: `pipeline_trigger_requests` table (gitforge-db
+`TriggerRequestQueries`) written BEFORE publish, with a partial
+unique index on `(repo_id, new_hash) WHERE status IN
+('pending','processing')` so concurrent triggers dedup to one run
+while manual re-trigger after a terminal outcome still works. The
+consumer settles every request: completed (with run id), failed
+(with error), or retry-pending — failures are now visible rows, not
+silence. A 30 s sweep republishes stale pending (>60 s) and demotes
+stale processing (>30 min, above max observed clone time); attempts
+cap at 5 with retryable-vs-terminal classification
+(`InvalidPipelineConfig` is terminal — a bad committed config
+retried forever would just hide). Run creation
+(pipeline version + run row) moved into one BEGIN IMMEDIATE
+transaction (`activate_pipeline_and_create_run`) — the old
+three-autocommit sequence was interruptible between writes, which
+is exactly the hollow-run shape. The consumer is also no longer one
+globally sequential task: per-repo FIFO lanes, global concurrency
+semaphore (`GITFORGE_TRIGGER_CONCURRENCY`, default 4) — the old
+single consumer serialized every push behind every other push's
+clone (observed 15-44 min backlogs) and exited permanently when the
+bus stream closed (now resubscribes). The bus stream itself was
+rewritten off its thread-spawn-per-10ms busy poll and survives
+broadcast lag (resync + warn) instead of wedging.
+
+**Cancel 500s.** `JobQueries::cancel` was the only durable
+job-status write with no BEGIN IMMEDIATE, no retry, and an
+unfenced `WHERE id = ?` (TOCTOU could clobber a completed job into
+cancelled). Now a single conditional UPDATE inside
+`persist_with_retry` (shared gitforge-db helper: 5 attempts, 250 ms
+doubling backoff capped at 4 s, retries only Database-kind
+errors); 0 rows affected is disambiguated by re-read — an
+already-terminal job is idempotent success, a missing id is
+not_found. Shared by any future one-shot write path (F21/F23
+class).
+
+**Timeout lag.** Durable authority stays with the 60 s watchdog,
+but: tick behavior Delay→Skip (Delay accumulated drift under DB
+contention — observed 43-minute effective enforcement); partial
+indexes back the two full scans (`idx_jobs_running_started` on
+jobs(started_at) WHERE status='running' for `reconcile_expired`;
+`idx_jobs_stranded_evidence` on finished_at for
+`reconcile_evidence_rows`).
+
+**Container loss.** docker.rs logged-and-continued exec stream
+errors and defaulted any unreadable exit to 0 — a container that
+vanished mid-step graded its step as passed (false-green
+possible). Now: mid-stream error → daemon-confirm container; gone
+→ Err (executor already grades Err as infrastructure_failure);
+final inspect polls up to 5×250 ms for a definitive answer and
+fails loudly when none arrives (unknown outcome ≠ pass;
+`container_present` treats only 404 as authoritative loss, other
+inspect errors are inconclusive).
+
+**Honest timeout grading.** The runner graded its own deadline
+kill as `failed` on the wire; the scheduler already accepted
+`timed_out`. `JobResult` now carries an explicit `timed_out`
+flag (replacing `error.contains("timeout")` string-matching,
+which the new pinned test shows mis-grades messages that merely
+mention a timeout), and agent reports `outcome: "timed_out"`.
+The durable watchdog and the runner now agree on what a timeout
+is.
+
+**git-server dispatcher.** `reqwest::Client::new()` had no
+timeout (one hung CI pinned the delivery loop), and a
+`bail!` on any failed row abandoned the rest of the claimed
+50-row batch for a 120 s lease. Now 60 s request bound
+(`ci_http_client`) and per-row continue; unparseable payloads
+park instead of poisoning the batch via `?`.
+
+Regression pins added this branch: bus lag survival
+(`test_subscriber_survives_lag_without_hanging`), trigger-request
+dedup lifecycle + stale requeue
+(`test_trigger_request_dedup_lifecycle`,
+`test_trigger_request_requeue_stale_and_terminal_failure`),
+atomic activation
+(`test_activate_pipeline_and_create_run_is_atomic`), cancel
+idempotence/fencing
+(`test_cancel_is_idempotent_and_never_clobbers_a_terminal_job`),
+persist_with_retry semantics (2 tests), flag-driven timeout
+grading (rewritten `test_job_result_status`).
