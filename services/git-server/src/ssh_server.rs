@@ -354,7 +354,11 @@ impl GitSshSession {
         };
 
         if buffer.len() > ref_policy::MAX_COMMAND_LIST_BYTES {
-            tracing::warn!(?channel, buffer_len = buffer.len(), "push command list exceeded buffer bound; aborting channel");
+            tracing::warn!(
+                ?channel,
+                buffer_len = buffer.len(),
+                "push command list exceeded buffer bound; aborting channel"
+            );
             return self
                 .fail_push(channel, "push command list too large", session)
                 .await;
