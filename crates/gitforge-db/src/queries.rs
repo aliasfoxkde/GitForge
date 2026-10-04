@@ -19,6 +19,57 @@ fn parse_uuid_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<Uuid
         .map_err(|error| Error::database(format!("invalid UUID in {column}: {error}")))
 }
 
+/// How hard a durable write fights SQLite write-lock contention before
+/// giving up. The live instance has recorded 19-40 s COMMIT stalls under
+/// co-tenant load; the 30 s busy timeout alone therefore leaves a failure
+/// tail, and interactive paths sitting on top of a one-shot write (the API
+/// cancel endpoint 500-ing "Failed to persist cancellation" through a
+/// storm) turn that tail into user-visible errors. Five attempts with
+/// exponential backoff cap the added latency well under the busy timeout's
+/// own worst case while covering the bulk of the storm window.
+const PERSIST_ATTEMPTS: usize = 5;
+const PERSIST_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(250);
+const PERSIST_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Run a durable write until it commits or the retry budget is exhausted.
+///
+/// This is the shared persistence discipline for one-shot writes that must
+/// not surface `database is busy` to callers (the F21/F23 class). Only
+/// database errors are retried — under contention the distinguishing
+/// feature of a busy failure is that a retry succeeds — while validation
+/// and not-found errors propagate immediately: retrying them cannot change
+/// the outcome.
+pub async fn persist_with_retry<T, F, Fut>(mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut last_error = None;
+    for attempt in 0..PERSIST_ATTEMPTS {
+        if attempt > 0 {
+            let backoff = PERSIST_BACKOFF_BASE
+                .saturating_mul(1 << (attempt - 1).min(4))
+                .min(PERSIST_BACKOFF_CAP);
+            tokio::time::sleep(backoff).await;
+        }
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if error.kind != gitforge_common::ErrorKind::Database {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    %error,
+                    "durable write hit a transient failure; retrying"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| Error::database("durable write made no attempts")))
+}
+
 fn parse_timestamp_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<DateTime<Utc>> {
     let value: String = row
         .try_get(column)
@@ -621,6 +672,73 @@ impl PipelineQueries {
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to deactivate pipeline: {e}")))?;
+        Ok(())
+    }
+
+    /// Record a push's pipeline version and its new run as one durable step.
+    ///
+    /// The trigger consumer used to issue three independent autocommit
+    /// writes (deactivate predecessor, insert pipeline, insert run): a busy
+    /// failure between them left a retired predecessor with no successor or
+    /// a pipeline with no run, and a retried trigger then minted a second
+    /// pipeline version. One BEGIN IMMEDIATE transaction makes the trio
+    /// all-or-nothing so a durable trigger request can never point at a
+    /// half-created run.
+    pub async fn activate_pipeline_and_create_run(
+        pool: &Pool,
+        pipeline: &crate::models::Pipeline,
+        run: &crate::models::PipelineRun,
+    ) -> Result<()> {
+        let mut transaction = pool
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::database(format!("failed to begin pipeline activation: {e}")))?;
+        sqlx::query(
+            "UPDATE pipelines SET active = 0 WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind(pipeline.repo_id.to_string())
+        .bind(&pipeline.name)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to deactivate pipeline: {e}")))?;
+        sqlx::query(
+            r#"
+            INSERT INTO pipelines (id, repo_id, name, trigger_type, config, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(pipeline.id.to_string())
+        .bind(pipeline.repo_id.to_string())
+        .bind(&pipeline.name)
+        .bind(&pipeline.trigger_type)
+        .bind(pipeline.config.to_string())
+        .bind(pipeline.created_at.to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to create pipeline: {e}")))?;
+        sqlx::query(
+            r#"
+            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(run.id.to_string())
+        .bind(run.pipeline_id.to_string())
+        .bind(run.repo_id.to_string())
+        .bind(&run.status)
+        .bind(&run.triggered_by)
+        .bind(&run.commit_hash)
+        .bind(run.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.finished_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.created_at.to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to create pipeline run: {e}")))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit pipeline activation: {e}")))?;
         Ok(())
     }
 
@@ -1527,27 +1645,39 @@ impl JobQueries {
     }
 
     /// Persist an operator cancellation as a terminal job transition.
+    ///
+    /// Idempotent: a row that already reached a terminal state is left
+    /// untouched and reported as success. The single conditional UPDATE
+    /// replaces the old read-then-write pair, which could clobber a
+    /// concurrently-completed job back into `cancelled` (the check and the
+    /// write were two separate statements with no status guard). The write
+    /// goes through `persist_with_retry` because it sits on the API's
+    /// interactive path — through a write storm it used to 500 with
+    /// "Failed to persist cancellation" while the busy timeout expired.
     pub async fn cancel(pool: &Pool, id: JobId, result_json: &str) -> Result<()> {
-        let existing = Self::get(pool, id).await?;
-        if let Some(job) = existing {
-            if let Some(status) = JobStatus::from_str(&job.status) {
-                if status.is_terminal() {
-                    return Ok(());
-                }
-            }
-        } else {
-            return Err(Error::not_found("job", id));
+        let cancelled = persist_with_retry(|| async {
+            sqlx::query(
+                "UPDATE jobs SET status = 'cancelled', finished_at = ?, result_json = ? \
+                 WHERE id = ? AND status IN ('pending', 'queued', 'assigned', 'running')",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(result_json)
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to cancel job: {e}")))
+        })
+        .await?;
+        if cancelled.rows_affected() > 0 {
+            return Ok(());
         }
-        sqlx::query(
-            "UPDATE jobs SET status = 'cancelled', finished_at = ?, result_json = ? WHERE id = ?",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(result_json)
-        .bind(id.to_string())
-        .execute(pool.pool())
-        .await
-        .map_err(|e| Error::database(format!("failed to cancel job: {e}")))?;
-        Ok(())
+        // Nothing was updated: the row is either already terminal
+        // (idempotent success — an operator double-click, or the scheduler
+        // racing the API to the same verdict) or does not exist.
+        match Self::get(pool, id).await? {
+            Some(_) => Ok(()),
+            None => Err(Error::not_found("job", id)),
+        }
     }
 
     /// List jobs by pipeline run
@@ -2670,12 +2800,678 @@ impl ReviewQueries {
 }
 
 // ============================================================================
+// Pipeline Trigger Requests
+// ============================================================================
+
+pub struct TriggerRequestQueries;
+
+impl TriggerRequestQueries {
+    /// Record a trigger request, or return the in-flight request that
+    /// already covers (repo_id, new_hash).
+    ///
+    /// The second element is `true` when this call created the row. The
+    /// dedup covers only `pending`/`processing` rows (partial unique index
+    /// `idx_trigger_requests_active`), so the webhook and a manual API
+    /// trigger racing on the same commit collapse into one run, while an
+    /// explicit re-trigger of an old commit after completion still works.
+    pub async fn create_or_existing(
+        pool: &Pool,
+        request: &crate::models::PipelineTriggerRequest,
+    ) -> Result<(crate::models::PipelineTriggerRequest, bool)> {
+        if let Some(existing) = Self::find_active(pool, request.repo_id, &request.new_hash).await? {
+            return Ok((existing, false));
+        }
+        persist_with_retry(|| async {
+            let mut transaction = pool
+                .pool()
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(|e| {
+                    Error::database(format!("failed to begin trigger request insert: {e}"))
+                })?;
+            let existing_id: Option<String> =
+                sqlx::query_scalar(
+                    "SELECT id FROM pipeline_trigger_requests \
+                     WHERE repo_id = ? AND new_hash = ? AND status IN ('pending', 'processing') \
+                     LIMIT 1",
+                )
+                .bind(request.repo_id.to_string())
+                .bind(&request.new_hash)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|e| {
+                    Error::database(format!("failed to check trigger request dedup: {e}"))
+                })?;
+            if let Some(existing_id) = existing_id {
+                // Nothing was written; end the transaction and surface the
+                // row that already covers this commit.
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|e| Error::database(format!("failed to commit dedup check: {e}")))?;
+                let existing = Self::get(pool, Uuid::parse_str(&existing_id).map_err(|e| {
+                    Error::database(format!("invalid trigger request id: {e}"))
+                })?)
+                .await?
+                .ok_or_else(|| {
+                    Error::database("trigger request vanished between check and read".to_string())
+                })?;
+                return Ok((existing, false));
+            }
+            sqlx::query(
+                r#"
+                INSERT INTO pipeline_trigger_requests
+                    (id, repo_id, ref_name, old_hash, new_hash, status, run_id, attempts, error, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(request.id.to_string())
+            .bind(request.repo_id.to_string())
+            .bind(&request.ref_name)
+            .bind(&request.old_hash)
+            .bind(&request.new_hash)
+            .bind(&request.status)
+            .bind(request.run_id.map(|id| id.to_string()))
+            .bind(request.attempts)
+            .bind(&request.error)
+            .bind(request.created_at.to_rfc3339())
+            .bind(request.updated_at.to_rfc3339())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| Error::database(format!("failed to insert trigger request: {e}")))?;
+            transaction
+                .commit()
+                .await
+                .map_err(|e| Error::database(format!("failed to commit trigger request: {e}")))?;
+            Ok((request.clone(), true))
+        })
+        .await
+    }
+
+    /// The in-flight (`pending`/`processing`) request covering (repo, commit),
+    /// if any.
+    pub async fn find_active(
+        pool: &Pool,
+        repo_id: RepoId,
+        new_hash: &str,
+    ) -> Result<Option<crate::models::PipelineTriggerRequest>> {
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM pipeline_trigger_requests \
+             WHERE repo_id = ? AND new_hash = ? AND status IN ('pending', 'processing') \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_id.to_string())
+        .bind(new_hash)
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to find active trigger request: {e}")))?;
+        match id {
+            Some(id) => {
+                let uuid = Uuid::parse_str(&id)
+                    .map_err(|e| Error::database(format!("invalid trigger request id: {e}")))?;
+                Self::get(pool, uuid).await
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch one trigger request by id.
+    pub async fn get(
+        pool: &Pool,
+        id: Uuid,
+    ) -> Result<Option<crate::models::PipelineTriggerRequest>> {
+        let row = sqlx::query("SELECT * FROM pipeline_trigger_requests WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get trigger request: {e}")))?;
+        row.map(hydrate_trigger_request).transpose()
+    }
+
+    /// Mark a request as being processed by the consumer and count the
+    /// attempt. Accepts both `pending` (first pickup, retries) and
+    /// `processing` (a redelivery while a previous pass is still counted),
+    /// so an at-least-once redelivery never dead-ends on a state mismatch.
+    pub async fn mark_processing(pool: &Pool, id: Uuid) -> Result<()> {
+        persist_with_retry(|| async {
+            sqlx::query(
+                "UPDATE pipeline_trigger_requests \
+                 SET status = 'processing', attempts = attempts + 1, updated_at = ? \
+                 WHERE id = ? AND status IN ('pending', 'processing')",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to mark trigger request processing: {e}")))
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Record the run a request produced. Terminal.
+    pub async fn mark_completed(
+        pool: &Pool,
+        id: Uuid,
+        run_id: gitforge_common::PipelineRunId,
+    ) -> Result<()> {
+        persist_with_retry(|| async {
+            sqlx::query(
+                "UPDATE pipeline_trigger_requests \
+                 SET status = 'completed', run_id = ?, error = NULL, updated_at = ? WHERE id = ?",
+            )
+            .bind(run_id.to_string())
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to complete trigger request: {e}")))
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Record a terminal failure with its cause, and the run row the failure
+    /// produced when one exists. Terminal — retry budget is the consumer's
+    /// decision to spend by leaving the row `pending` instead; once here,
+    /// the failure is visible instead of hollow.
+    pub async fn mark_failed(
+        pool: &Pool,
+        id: Uuid,
+        error: &str,
+        run_id: Option<gitforge_common::PipelineRunId>,
+    ) -> Result<()> {
+        persist_with_retry(|| async {
+            sqlx::query(
+                "UPDATE pipeline_trigger_requests \
+                 SET status = 'failed', error = ?, run_id = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(error)
+            .bind(run_id.map(|id| id.to_string()))
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to fail trigger request: {e}")))
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Return a request to `pending` after a retryable failure; the sweep
+    /// republishes it once the backoff (the pending-age cutoff) elapses.
+    pub async fn mark_retry(pool: &Pool, id: Uuid) -> Result<()> {
+        persist_with_retry(|| async {
+            sqlx::query(
+                "UPDATE pipeline_trigger_requests \
+                 SET status = 'pending', updated_at = ? WHERE id = ?",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to retry trigger request: {e}")))
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Recover interrupted requests: `pending` rows older than
+    /// `pending_after` (their bus event was lost, or a retry's backoff
+    /// elapsed) and `processing` rows older than `processing_after` (the
+    /// consumer died mid-run-creation). Both are returned for republication
+    /// and stamped `updated_at` so a sweep that outruns the consumer cannot
+    /// republish in a tight loop. A crashed `processing` row is demoted back
+    /// to `pending`; run creation itself is atomic, so a half-created run is
+    /// impossible and the redelivery either finds the completed pipeline or
+    /// creates it.
+    pub async fn requeue_stale(
+        pool: &Pool,
+        pending_after: chrono::Duration,
+        processing_after: chrono::Duration,
+    ) -> Result<Vec<crate::models::PipelineTriggerRequest>> {
+        let now = Utc::now();
+        let pending_cutoff = (now - pending_after).to_rfc3339();
+        let processing_cutoff = (now - processing_after).to_rfc3339();
+        let mut transaction = pool
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::database(format!("failed to begin trigger requeue: {e}")))?;
+        let stale_processing: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM pipeline_trigger_requests \
+             WHERE status = 'processing' AND updated_at <= ?",
+        )
+        .bind(&processing_cutoff)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to list stale processing requests: {e}")))?;
+        for id in &stale_processing {
+            sqlx::query(
+                "UPDATE pipeline_trigger_requests SET status = 'pending', updated_at = ? WHERE id = ?",
+            )
+            .bind(now.to_rfc3339())
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| Error::database(format!("failed to requeue trigger request: {e}")))?;
+        }
+        let stale_pending: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM pipeline_trigger_requests \
+             WHERE status = 'pending' AND updated_at <= ?",
+        )
+        .bind(&pending_cutoff)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to list stale pending requests: {e}")))?;
+        for id in &stale_pending {
+            sqlx::query("UPDATE pipeline_trigger_requests SET updated_at = ? WHERE id = ?")
+                .bind(now.to_rfc3339())
+                .bind(id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|e| {
+                    Error::database(format!(
+                        "failed to stamp trigger request for republish: {e}"
+                    ))
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit trigger requeue: {e}")))?;
+
+        let mut requests = Vec::new();
+        for id in stale_processing.into_iter().chain(stale_pending) {
+            let uuid = Uuid::parse_str(&id)
+                .map_err(|e| Error::database(format!("invalid trigger request id: {e}")))?;
+            if let Some(request) = Self::get(pool, uuid).await? {
+                requests.push(request);
+            }
+        }
+        Ok(requests)
+    }
+
+    /// Requests that exhausted their attempts without producing a run —
+    /// the set an operator (or a status endpoint) needs to see so a failure
+    /// is never silent.
+    pub async fn list_failed(
+        pool: &Pool,
+        limit: i64,
+    ) -> Result<Vec<crate::models::PipelineTriggerRequest>> {
+        let rows = sqlx::query(
+            "SELECT * FROM pipeline_trigger_requests WHERE status = 'failed' \
+             ORDER BY updated_at DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list failed trigger requests: {e}")))?;
+        rows.into_iter().map(hydrate_trigger_request).collect()
+    }
+}
+
+fn hydrate_trigger_request(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<crate::models::PipelineTriggerRequest> {
+    let run_id: Option<String> = row
+        .try_get("run_id")
+        .map_err(|error| Error::database(format!("invalid trigger request run_id: {error}")))?;
+    Ok(crate::models::PipelineTriggerRequest {
+        id: parse_uuid_column(&row, "id")?,
+        repo_id: RepoId::from(parse_uuid_column(&row, "repo_id")?),
+        ref_name: row
+            .try_get("ref_name")
+            .map_err(|error| Error::database(format!("invalid ref_name: {error}")))?,
+        old_hash: row
+            .try_get("old_hash")
+            .map_err(|error| Error::database(format!("invalid old_hash: {error}")))?,
+        new_hash: row
+            .try_get("new_hash")
+            .map_err(|error| Error::database(format!("invalid new_hash: {error}")))?,
+        status: row
+            .try_get("status")
+            .map_err(|error| Error::database(format!("invalid status: {error}")))?,
+        run_id: run_id
+            .map(|id| {
+                Uuid::parse_str(&id)
+                    .map_err(|error| Error::database(format!("invalid run_id: {error}")))
+            })
+            .transpose()?
+            .map(gitforge_common::PipelineRunId::from),
+        attempts: row
+            .try_get("attempts")
+            .map_err(|error| Error::database(format!("invalid attempts: {error}")))?,
+        error: row
+            .try_get("error")
+            .map_err(|error| Error::database(format!("invalid error: {error}")))?,
+        created_at: parse_timestamp_column(&row, "created_at")?,
+        updated_at: parse_timestamp_column(&row, "updated_at")?,
+    })
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_persist_with_retry_succeeds_after_transient_failures() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: Result<&'static str> = persist_with_retry(|| {
+            let count = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if count < 2 {
+                    Err(Error::database("database is busy"))
+                } else {
+                    Ok("committed")
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), "committed");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_persist_with_retry_propagates_non_database_errors() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: Result<()> = persist_with_retry(|| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(Error::not_found("job", uuid::Uuid::new_v4())) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a non-database error must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_is_idempotent_and_never_clobbers_a_terminal_job() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "cancel-owner".to_string(),
+            "cancel-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "cancel-repo".to_string(),
+            owner.id,
+            "/git/cancel-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "cancel-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({"jobs": []}),
+            created_at: Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "0".repeat(40),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        let job = crate::models::Job::new(run.id, "cancel-target".to_string());
+        JobQueries::create(&pool, &job).await.unwrap();
+        JobQueries::cancel(&pool, job.id, r#"{"reason":"first"}"#)
+            .await
+            .unwrap();
+        // Second cancel of the already-terminal row is a success and must
+        // not rewrite the receipt.
+        JobQueries::cancel(&pool, job.id, r#"{"reason":"second"}"#)
+            .await
+            .unwrap();
+        let stored = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "cancelled");
+        assert!(stored.result_json.unwrap().contains("first"));
+
+        // A completed job is likewise never dragged back to cancelled.
+        let completed = crate::models::Job::new(run.id, "completed-target".to_string());
+        JobQueries::create(&pool, &completed).await.unwrap();
+        JobQueries::update_status(&pool, completed.id, "succeeded")
+            .await
+            .unwrap();
+        JobQueries::cancel(&pool, completed.id, r#"{"reason":"late"}"#)
+            .await
+            .unwrap();
+        let stored = JobQueries::get(&pool, completed.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "succeeded");
+
+        // Cancelling a job that does not exist is a not-found, not a lie.
+        let missing = JobQueries::cancel(&pool, JobId::new(), "{}").await;
+        assert!(missing.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_activate_pipeline_and_create_run_is_atomic() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "atomic-owner".to_string(),
+            "atomic-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "atomic-repo".to_string(),
+            owner.id,
+            "/git/atomic-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let first = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({"version": 1}),
+            created_at: Utc::now(),
+        };
+        PipelineQueries::create(&pool, &first).await.unwrap();
+
+        // Push 2 retires push 1's version and lands its own in one step.
+        let second = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({"version": 2}),
+            created_at: Utc::now(),
+        };
+        let run =
+            crate::models::PipelineRun::new(second.id, repo.id, "push".to_string(), "1".repeat(40));
+        let mut started = run.clone();
+        started.start();
+        PipelineQueries::activate_pipeline_and_create_run(&pool, &second, &started)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            PipelineQueries::count_active(&pool, repo.id, "ci")
+                .await
+                .unwrap(),
+            1,
+            "exactly one active version survives the swap"
+        );
+        let stored_run = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .expect("run persisted in the same transaction");
+        assert_eq!(stored_run.status, "running");
+        assert!(stored_run.started_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_trigger_request_dedup_lifecycle() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "trigger-owner".to_string(),
+            "trigger-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "trigger-repo".to_string(),
+            owner.id,
+            "/git/trigger-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let request = crate::models::PipelineTriggerRequest::new(
+            repo.id,
+            "refs/heads/main".to_string(),
+            "0".repeat(40),
+            "a".repeat(40),
+        );
+        let (created, was_new) = TriggerRequestQueries::create_or_existing(&pool, &request)
+            .await
+            .unwrap();
+        assert!(was_new);
+
+        // A racing trigger for the same commit dedups onto the same row.
+        let duplicate = crate::models::PipelineTriggerRequest::new(
+            repo.id,
+            "refs/heads/other".to_string(),
+            "0".repeat(40),
+            "a".repeat(40),
+        );
+        let (existing, was_new) = TriggerRequestQueries::create_or_existing(&pool, &duplicate)
+            .await
+            .unwrap();
+        assert!(!was_new);
+        assert_eq!(existing.id, created.id);
+
+        // Lifecycle: pickup counts an attempt, completion records the run.
+        TriggerRequestQueries::mark_processing(&pool, created.id)
+            .await
+            .unwrap();
+        let run_id = PipelineRunId::new();
+        TriggerRequestQueries::mark_completed(&pool, created.id, run_id)
+            .await
+            .unwrap();
+        let finished = TriggerRequestQueries::get(&pool, created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.status, "completed");
+        assert_eq!(
+            finished.run_id.map(|id| id.to_string()),
+            Some(run_id.to_string())
+        );
+        assert_eq!(finished.attempts, 1);
+
+        // A completed row no longer dedups: an explicit re-trigger of the
+        // same commit mints a fresh request.
+        let (_, was_new) = TriggerRequestQueries::create_or_existing(&pool, &duplicate)
+            .await
+            .unwrap();
+        assert!(was_new);
+    }
+
+    #[tokio::test]
+    async fn test_trigger_request_requeue_stale_and_terminal_failure() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "requeue-owner".to_string(),
+            "requeue-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "requeue-repo".to_string(),
+            owner.id,
+            "/git/requeue-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        // A request whose consumer died mid-processing (row stuck in
+        // `processing`, updated_at in the past) is demoted back to pending.
+        let stuck = crate::models::PipelineTriggerRequest::new(
+            repo.id,
+            "refs/heads/main".to_string(),
+            "0".repeat(40),
+            "b".repeat(40),
+        );
+        let (stuck, _) = TriggerRequestQueries::create_or_existing(&pool, &stuck)
+            .await
+            .unwrap();
+        TriggerRequestQueries::mark_processing(&pool, stuck.id)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE pipeline_trigger_requests SET updated_at = ? WHERE id = ?")
+            .bind((Utc::now() - chrono::Duration::minutes(10)).to_rfc3339())
+            .bind(stuck.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        let requeued = TriggerRequestQueries::requeue_stale(
+            &pool,
+            chrono::Duration::minutes(5),
+            chrono::Duration::minutes(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].id, stuck.id);
+        assert_eq!(requeued[0].status, "pending");
+
+        // A fresh row inside the cutoffs is not touched.
+        let fresh = crate::models::PipelineTriggerRequest::new(
+            repo.id,
+            "refs/heads/dev".to_string(),
+            "0".repeat(40),
+            "c".repeat(40),
+        );
+        let (fresh, _) = TriggerRequestQueries::create_or_existing(&pool, &fresh)
+            .await
+            .unwrap();
+        let requeued = TriggerRequestQueries::requeue_stale(
+            &pool,
+            chrono::Duration::minutes(5),
+            chrono::Duration::minutes(5),
+        )
+        .await
+        .unwrap();
+        assert!(requeued.iter().all(|request| request.id != fresh.id));
+
+        // Terminal failure is visible and final.
+        TriggerRequestQueries::mark_failed(&pool, fresh.id, "invalid .gitforce.yml", None)
+            .await
+            .unwrap();
+        let failed = TriggerRequestQueries::list_failed(&pool, 10).await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, fresh.id);
+        assert_eq!(failed[0].error.as_deref(), Some("invalid .gitforce.yml"));
+    }
 
     #[tokio::test]
     async fn test_repo_queries() {
