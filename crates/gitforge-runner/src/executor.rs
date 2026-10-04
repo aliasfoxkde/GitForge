@@ -398,6 +398,7 @@ impl JobExecutor {
                 started_at,
                 completed_at,
                 infrastructure_failure: false,
+                timed_out: false,
                 error: Some(format!(
                     "toolchain preflight failed: {violation}. The job image is \
                      offline by contract (CARGO_NET_OFFLINE=true, no egress); \
@@ -433,6 +434,7 @@ impl JobExecutor {
                     logs: None,
                     started_at,
                     completed_at,
+                    timed_out: false,
                     error: Some(format!(
                         "failed to create sandbox: acquisition timed out after {} seconds; \
                          backend probe: {}",
@@ -455,6 +457,7 @@ impl JobExecutor {
                     logs: None,
                     started_at,
                     completed_at,
+                    timed_out: false,
                     error: Some(format!(
                         "failed to create sandbox: {e}; backend probe: {}",
                         self.pool.sandbox.backend_health().await.detail
@@ -492,6 +495,7 @@ impl JobExecutor {
                 logs: None,
                 started_at,
                 completed_at,
+                timed_out: false,
                 error: Some(format!(
                     "container backend preflight failed: {probe_error}; \
                      backend probe: {}",
@@ -677,6 +681,7 @@ impl JobExecutor {
             },
             workspace_path: job.working_dir.clone(),
             infrastructure_failure,
+            timed_out,
         }
     }
 
@@ -845,6 +850,11 @@ pub struct JobResult {
     /// acquisition failure, a failed preflight exec, an OCI-layer exec
     /// error, or a step that died on the host's exhausted scratch fs.
     pub infrastructure_failure: bool,
+    /// The job deadline elapsed while work was in flight. Reported on the
+    /// wire instead of inferred from error text — string-matching "timeout"
+    /// in the message mis-graded jobs whose error merely mentioned it, and
+    /// never fired for the runner's own kill path.
+    pub timed_out: bool,
 }
 
 impl JobResult {
@@ -852,7 +862,7 @@ impl JobResult {
     fn status(&self) -> ReceiptStatus {
         if self.success {
             ReceiptStatus::Succeeded
-        } else if self.error.as_ref().is_some_and(|e| e.contains("timeout")) {
+        } else if self.timed_out {
             ReceiptStatus::TimedOut
         } else if self.infrastructure_failure {
             ReceiptStatus::InfrastructureFailure
@@ -1063,6 +1073,7 @@ mod tests {
             error: None,
             workspace_path: None,
             infrastructure_failure: false,
+            timed_out: false,
         };
         assert_eq!(success_result.status(), ReceiptStatus::Succeeded);
 
@@ -1079,10 +1090,12 @@ mod tests {
             error: Some("build failed".to_string()),
             workspace_path: None,
             infrastructure_failure: false,
+            timed_out: false,
         };
         assert_eq!(failure_result.status(), ReceiptStatus::Failed);
 
-        // Test timeout status
+        // Test timeout status: grading is driven by the explicit flag, not
+        // by substring-matching the error text.
         let timeout_result = JobResult {
             job_id: JobId::new(),
             success: false,
@@ -1095,8 +1108,27 @@ mod tests {
             error: Some("operation timeout exceeded".to_string()),
             workspace_path: None,
             infrastructure_failure: false,
+            timed_out: true,
         };
         assert_eq!(timeout_result.status(), ReceiptStatus::TimedOut);
+
+        // An error message that merely mentions a timeout must not grade
+        // the job as timed out — the flag is the only authority.
+        let mentions_timeout_result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: -1,
+            step_results: vec![],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: Some("operation timeout exceeded".to_string()),
+            workspace_path: None,
+            infrastructure_failure: false,
+            timed_out: false,
+        };
+        assert_eq!(mentions_timeout_result.status(), ReceiptStatus::Failed);
 
         // Test infrastructure status (R6.3): the backend, not the commit,
         // failed the job.
@@ -1116,6 +1148,7 @@ mod tests {
             ),
             workspace_path: None,
             infrastructure_failure: true,
+            timed_out: false,
         };
         assert_eq!(infra_result.status(), ReceiptStatus::InfrastructureFailure);
     }
