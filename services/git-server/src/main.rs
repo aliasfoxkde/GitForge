@@ -14,11 +14,14 @@ use chrono::Utc;
 use gitforge_common::RepoId;
 use gitforge_core::git_protocol::{http::HttpGitHandler, GitProtocolHandler};
 
+mod ref_policy;
 mod ssh_server;
+
 use gitforge_core::{FileStorageBackend, RepoService, StorageBackend};
 use gitforge_db::Pool;
 use gitforge_events::{EventBus, InMemoryEventBus};
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
+use ref_policy::{parse_receive_updates, ReceiveUpdate, RefPolicyDecision};
 use ssh_server::{run_ssh_server, SshServerConfig};
 #[allow(unused_imports)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -534,6 +537,38 @@ async fn git_receive_pack(
     // not force a copy of what can be a multi-hundred-MB pack.
     let updates = parse_receive_updates(&body);
 
+    // The command list is known before the pack is unpacked, so the
+    // repository's ref-update policy (#240) can decline the push with a
+    // standard receive-pack report instead of letting the refs advance.
+    let Some(pool) = state.db_pool.as_ref() else {
+        // Unreachable in practice: the repository lookup above already
+        // declines pushes when the database is unavailable. Keep the
+        // invariant explicit instead of unwrapping.
+        return finish_response(
+            Response::builder().status(StatusCode::SERVICE_UNAVAILABLE),
+            Body::from("Database not available"),
+        );
+    };
+    match ref_policy::evaluate_ref_policy(pool, repo_id, &updates).await {
+        RefPolicyDecision::Allow => {}
+        RefPolicyDecision::Reject(reasons) => {
+            for (ref_name, reason) in &reasons {
+                tracing::warn!(
+                    repo_id = %repo_id,
+                    ref_name = %ref_name,
+                    reason = %reason,
+                    "push declined by ref-update policy"
+                );
+            }
+            return finish_response(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/x-git-receive-pack-result"),
+                Body::from(ref_policy::synthesize_rejection_report(&reasons)),
+            );
+        }
+    }
+
     match state.http_handler.receive_pack(repo_id, body).await {
         Ok(response) => {
             for update in updates {
@@ -582,49 +617,6 @@ async fn git_receive_pack(
             )
         }
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct ReceiveUpdate {
-    old_hash: String,
-    new_hash: String,
-    ref_name: String,
-}
-
-fn parse_receive_updates(input: &[u8]) -> Vec<ReceiveUpdate> {
-    let mut updates = Vec::new();
-    let mut offset = 0;
-    while offset + 4 <= input.len() {
-        let Ok(length) =
-            usize::from_str_radix(&String::from_utf8_lossy(&input[offset..offset + 4]), 16)
-        else {
-            break;
-        };
-        if length == 0 {
-            break;
-        }
-        if length < 4 || offset + length > input.len() {
-            break;
-        }
-        let payload = &input[offset + 4..offset + length];
-        if let Ok(line) = std::str::from_utf8(payload) {
-            let fields: Vec<&str> = line
-                .split('\0')
-                .next()
-                .unwrap_or_default()
-                .split_whitespace()
-                .collect();
-            if fields.len() >= 3 {
-                updates.push(ReceiveUpdate {
-                    old_hash: fields[0].to_string(),
-                    new_hash: fields[1].to_string(),
-                    ref_name: fields[2].to_string(),
-                });
-            }
-        }
-        offset += length;
-    }
-    updates
 }
 
 async fn enqueue_ci_event(

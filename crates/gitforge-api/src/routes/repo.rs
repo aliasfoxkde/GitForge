@@ -10,7 +10,11 @@ use axum::{
 };
 use gitforge_common::{RepoId, UserId};
 use gitforge_core::{FileStorageBackend, StorageBackend};
-use gitforge_db::{queries::RepoQueries, Pool};
+use gitforge_db::queries::{
+    evaluate_required_checks, required_checks_satisfied, PipelineRunQueries, RepoQueries,
+    RequiredCheckStatus,
+};
+use gitforge_db::{models::Repository, Pool};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -91,10 +95,81 @@ pub fn repo_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/repos", get(list_repos).post(create_repo))
         .route("/repos/{id}", get(get_repo).delete(delete_repo))
+        .route(
+            "/repos/{owner}/{repo}/policy",
+            get(get_ref_policy).patch(update_ref_policy),
+        )
+        .route(
+            "/repos/{owner}/{repo}/commits/{sha}/status",
+            get(get_commit_status),
+        )
 }
 
 fn can_access_repo(claims: &Claims, owner_id: UserId) -> bool {
     claims.user_id == owner_id || matches!(claims.role.as_str(), "admin" | "maintainer")
+}
+
+/// Resolve an `owner/repo` pair to a repository the caller may read,
+/// collapsing "missing" and "forbidden" into 404 so existence is not leaked.
+async fn resolve_policy_repo(
+    pool: &Pool,
+    claims: &Claims,
+    owner: &str,
+    repo: &str,
+) -> Result<Repository, (StatusCode, Json<serde_json::Value>)> {
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "message": "repository not found"
+            })),
+        )
+    };
+    match RepoQueries::get_by_owner_and_name(pool, owner, repo).await {
+        Ok(Some(repository)) if can_access_repo(claims, repository.owner_id) => Ok(repository),
+        Ok(Some(_)) | Ok(None) => Err(not_found()),
+        Err(error) => {
+            tracing::error!(owner, repo, %error, "failed to resolve repository for policy");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "failed to resolve repository"
+                })),
+            ))
+        }
+    }
+}
+
+/// Upper bound on configured required checks. A policy naming more pipelines
+/// than this is a configuration mistake, not a real gate.
+const MAX_REQUIRED_CHECKS: usize = 32;
+
+fn validate_required_checks(required_checks: &[String]) -> Result<(), String> {
+    if required_checks.len() > MAX_REQUIRED_CHECKS {
+        return Err(format!(
+            "too many required checks (max {MAX_REQUIRED_CHECKS})"
+        ));
+    }
+    for check in required_checks {
+        let name = check.trim();
+        if name.is_empty() {
+            return Err("required check names cannot be empty".to_string());
+        }
+        if name.len() > 255 {
+            return Err("required check name too long (max 255 characters)".to_string());
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '))
+        {
+            return Err(format!(
+                "required check name contains invalid character: {name:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// List repositories
@@ -341,6 +416,196 @@ async fn delete_repo(
     }
 }
 
+/// Ref-update policy response (#240)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RefPolicyResponse {
+    pub required_checks: Vec<String>,
+    pub deny_non_fast_forward: bool,
+}
+
+/// Update ref-update policy request (#240)
+#[derive(Debug, Deserialize)]
+pub struct UpdateRefPolicyRequest {
+    pub required_checks: Option<Vec<String>>,
+    pub deny_non_fast_forward: Option<bool>,
+}
+
+/// Read a repository's ref-update policy (#240).
+async fn get_ref_policy(
+    Extension(pool): Extension<Arc<Pool>>,
+    Extension(claims): Extension<Claims>,
+    Path((owner, repo)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match resolve_policy_repo(&pool, &claims, &owner, &repo).await {
+        Ok(repository) => Json(RefPolicyResponse {
+            required_checks: repository.required_checks,
+            deny_non_fast_forward: repository.deny_non_fast_forward,
+        })
+        .into_response(),
+        Err(response) => response.into_response(),
+    }
+}
+
+/// Update a repository's ref-update policy (#240).
+///
+/// Required checks gate branch advances in the git server; the
+/// non-fast-forward half is enforced by git's own
+/// `receive.denyNonFastForwards` repository config, which is written here so
+/// the enforcement and the declared policy move together. Tightening writes
+/// the config before the database (a policy that claims to deny must not
+/// lag its enforcement); relaxing writes the database first so an approved
+/// push is never blocked by a stale config.
+async fn update_ref_policy(
+    Extension(pool): Extension<Arc<Pool>>,
+    Extension(claims): Extension<Claims>,
+    Path((owner, repo)): Path<(String, String)>,
+    Json(request): Json<UpdateRefPolicyRequest>,
+) -> impl IntoResponse {
+    let repository = match resolve_policy_repo(&pool, &claims, &owner, &repo).await {
+        Ok(repository) => repository,
+        Err(response) => return response.into_response(),
+    };
+
+    let required_checks = request.required_checks.unwrap_or_else(|| {
+        // Unspecified means "keep the configured checks" so a caller can
+        // flip the non-fast-forward knob without restating the gate list.
+        repository.required_checks.clone()
+    });
+    if let Err(message) = validate_required_checks(&required_checks) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_policy",
+                "message": message
+            })),
+        )
+            .into_response();
+    }
+    let deny_non_fast_forward = request
+        .deny_non_fast_forward
+        .unwrap_or(repository.deny_non_fast_forward);
+
+    let storage_root = std::env::var("GIT_ROOT")
+        .ok()
+        .filter(|root| !root.trim().is_empty())
+        .unwrap_or_else(|| "target/gitforge-repos".to_string());
+    let storage = FileStorageBackend::new(&storage_root);
+
+    let tightening = deny_non_fast_forward && !repository.deny_non_fast_forward;
+    if tightening {
+        if let Err(error) = storage
+            .set_receive_deny_non_fast_forwards(repository.id, true)
+            .await
+        {
+            tracing::error!(repo_id = %repository.id, %error, "failed to enforce non-fast-forward denial on repository");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "storage_error",
+                    "message": "failed to enforce non-fast-forward denial on the repository"
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    if let Err(error) = RepoQueries::update_policy(
+        &pool,
+        repository.id,
+        &required_checks,
+        deny_non_fast_forward,
+    )
+    .await
+    {
+        tracing::error!(repo_id = %repository.id, %error, "failed to persist ref-update policy");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "database_error",
+                "message": "failed to persist ref-update policy"
+            })),
+        )
+            .into_response();
+    }
+
+    let relaxing = !tightening && deny_non_fast_forward != repository.deny_non_fast_forward;
+    if relaxing {
+        if let Err(error) = storage
+            .set_receive_deny_non_fast_forwards(repository.id, false)
+            .await
+        {
+            tracing::error!(repo_id = %repository.id, %error, "failed to relax non-fast-forward denial on repository");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "storage_error",
+                    "message": "policy updated but relaxing non-fast-forward denial failed"
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    tracing::info!(
+        repo_id = %repository.id,
+        checks = required_checks.len(),
+        deny_non_fast_forward,
+        "ref-update policy updated"
+    );
+    Json(RefPolicyResponse {
+        required_checks,
+        deny_non_fast_forward,
+    })
+    .into_response()
+}
+
+/// Aggregated commit status response (#240)
+#[derive(Debug, Serialize)]
+pub struct CommitStatusResponse {
+    pub commit: String,
+    pub required_checks: Vec<RequiredCheckStatus>,
+    pub satisfied: bool,
+}
+
+/// Report the aggregated pipeline status of one commit against the
+/// repository's required checks (#240). This is the same evaluation the
+/// git server performs when a push tries to advance a branch.
+async fn get_commit_status(
+    Extension(pool): Extension<Arc<Pool>>,
+    Extension(claims): Extension<Claims>,
+    Path((owner, repo, sha)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let repository = match resolve_policy_repo(&pool, &claims, &owner, &repo).await {
+        Ok(repository) => repository,
+        Err(response) => return response.into_response(),
+    };
+
+    let statuses = match PipelineRunQueries::list_commit_statuses(&pool, repository.id, &sha).await
+    {
+        Ok(statuses) => statuses,
+        Err(error) => {
+            tracing::error!(repo_id = %repository.id, %error, "failed to list commit statuses");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "failed to read commit statuses"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let required_checks = evaluate_required_checks(&repository.required_checks, &statuses);
+    let satisfied = required_checks_satisfied(&required_checks);
+    Json(CommitStatusResponse {
+        commit: sha,
+        required_checks,
+        satisfied,
+    })
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,5 +780,35 @@ mod tests {
     fn test_validate_repo_name_org_format_invalid_second_part() {
         let result = validate_repo_name("org/-invalid");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_required_checks_accepts_pipeline_names() {
+        assert!(validate_required_checks(&["ci".to_string()]).is_ok());
+        assert!(validate_required_checks(&[
+            "gates-and-release".to_string(),
+            "lint_docker.build".to_string()
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_required_checks_rejects_bad_names() {
+        assert!(validate_required_checks(&["".to_string()]).is_err());
+        assert!(validate_required_checks(&["   ".to_string()]).is_err());
+        assert!(validate_required_checks(&["ci;drop".to_string()]).is_err());
+        assert!(validate_required_checks(&["a\nb".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_validate_required_checks_rejects_oversized_lists() {
+        let too_many: Vec<String> = (0..=MAX_REQUIRED_CHECKS)
+            .map(|index| format!("check-{index}"))
+            .collect();
+        assert!(validate_required_checks(&too_many).is_err());
+        let at_limit: Vec<String> = (0..MAX_REQUIRED_CHECKS)
+            .map(|index| format!("check-{index}"))
+            .collect();
+        assert!(validate_required_checks(&at_limit).is_ok());
     }
 }

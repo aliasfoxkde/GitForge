@@ -28,6 +28,12 @@ pub struct Repository {
     pub owner_id: UserId,
     pub visibility: String,
     pub git_path: String,
+    /// JSON array of pipeline names that must be green before `refs/heads/*`
+    /// may advance to a commit (#240). Empty disables the gate.
+    pub required_checks: Vec<String>,
+    /// Reject non-fast-forward branch updates server-side (#240). Enforced by
+    /// git's own `receive.denyNonFastForwards` config on the bare repository.
+    pub deny_non_fast_forward: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -50,6 +56,8 @@ impl Repository {
             owner_id,
             visibility: Visibility::Private.as_str().to_string(),
             git_path,
+            required_checks: Vec::new(),
+            deny_non_fast_forward: false,
             created_at: now,
             updated_at: now,
         }
@@ -58,6 +66,11 @@ impl Repository {
     /// Check if repository is public
     pub fn is_public(&self) -> bool {
         self.visibility == "public"
+    }
+
+    /// Check if branch updates are gated on required pipeline outcomes
+    pub fn has_required_checks(&self) -> bool {
+        !self.required_checks.is_empty()
     }
 }
 
@@ -103,5 +116,18 @@ mod tests {
         let repo1 = Repository::new("repo1".to_string(), owner_id, "/git/repo1".to_string());
         let repo2 = Repository::new("repo2".to_string(), owner_id, "/git/repo2".to_string());
         assert_ne!(repo1.id, repo2.id);
+    }
+
+    #[test]
+    fn test_new_repository_has_empty_policy() {
+        let owner_id = UserId::new();
+        let repo = Repository::new(
+            "policy-repo".to_string(),
+            owner_id,
+            "/git/policy-repo".to_string(),
+        );
+        assert!(repo.required_checks.is_empty());
+        assert!(!repo.deny_non_fast_forward);
+        assert!(!repo.has_required_checks());
     }
 }

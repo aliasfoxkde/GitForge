@@ -76,8 +76,30 @@ fn hydrate_repository(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Rep
         git_path: row
             .try_get("git_path")
             .map_err(|error| Error::database(format!("invalid repository git path: {error}")))?,
+        required_checks: parse_required_checks_column(&row)?,
+        deny_non_fast_forward: row
+            .try_get::<i64, _>("deny_non_fast_forward")
+            .map(|value| value != 0)
+            .map_err(|error| {
+                Error::database(format!("invalid repository deny_non_fast_forward: {error}"))
+            })?,
         created_at: parse_timestamp_column(&row, "created_at")?,
         updated_at: parse_timestamp_column(&row, "updated_at")?,
+    })
+}
+
+/// Decode the `required_checks` JSON column into pipeline names. A NULL
+/// (pre-migration row) or malformed payload degrades to no required checks
+/// rather than poisoning every repository read.
+fn parse_required_checks_column(row: &sqlx::sqlite::SqliteRow) -> Result<Vec<String>> {
+    let raw: Option<String> = row
+        .try_get("required_checks")
+        .map_err(|error| Error::database(format!("invalid repository required_checks: {error}")))?;
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(&raw).map_err(|error| {
+        Error::database(format!("invalid repository required_checks JSON: {error}"))
     })
 }
 
@@ -232,8 +254,8 @@ impl RepoQueries {
     pub async fn create(pool: &Pool, repo: &crate::models::Repository) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO repositories (id, name, owner_id, visibility, git_path, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO repositories (id, name, owner_id, visibility, git_path, required_checks, deny_non_fast_forward, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(repo.id.to_string())
@@ -241,11 +263,52 @@ impl RepoQueries {
         .bind(repo.owner_id.to_string())
         .bind(&repo.visibility)
         .bind(&repo.git_path)
+        .bind(serde_json::to_string(&repo.required_checks).map_err(|e| {
+            Error::database(format!("failed to serialize required checks: {e}"))
+        })?)
+        .bind(i64::from(repo.deny_non_fast_forward))
         .bind(repo.created_at.to_rfc3339())
         .bind(repo.updated_at.to_rfc3339())
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to create repository: {e}")))?;
+        Ok(())
+    }
+
+    /// Persist the ref-update policy (#240) for a repository.
+    ///
+    /// Single conditional UPDATE in an immediate transaction so a policy read
+    /// on the push path can never observe a half-applied pair of settings.
+    pub async fn update_policy(
+        pool: &Pool,
+        repo_id: RepoId,
+        required_checks: &[String],
+        deny_non_fast_forward: bool,
+    ) -> Result<()> {
+        let required_checks_json = serde_json::to_string(required_checks)
+            .map_err(|e| Error::database(format!("failed to serialize required checks: {e}")))?;
+        let mut tx = pool
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::database(format!("failed to begin policy update: {e}")))?;
+        let result = sqlx::query(
+            "UPDATE repositories SET required_checks = ?, deny_non_fast_forward = ?, \
+             updated_at = ? WHERE id = ?",
+        )
+        .bind(&required_checks_json)
+        .bind(i64::from(deny_non_fast_forward))
+        .bind(Utc::now().to_rfc3339())
+        .bind(repo_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to update repository policy: {e}")))?;
+        if result.rows_affected() == 0 {
+            return Err(Error::not_found("repository", repo_id.to_string()));
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit policy update: {e}")))?;
         Ok(())
     }
 
@@ -836,6 +899,95 @@ impl PipelineRunQueries {
 
         Ok(runs)
     }
+
+    /// List per-pipeline outcomes recorded for one commit, latest first (#240).
+    ///
+    /// The ref-update policy matches on the exact commit hash a push wants to
+    /// install, so no ancestry walk is needed — the receive path only asks
+    /// "has this commit already built green". Hash comparison is
+    /// case-insensitive because git clients send lowercase hex while older
+    /// rows may carry uppercase from external triggers.
+    pub async fn list_commit_statuses(
+        pool: &Pool,
+        repo_id: RepoId,
+        commit_hash: &str,
+    ) -> Result<Vec<CommitRunStatus>> {
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT p.name, r.status FROM pipeline_runs r \
+             JOIN pipelines p ON r.pipeline_id = p.id \
+             WHERE r.repo_id = ? AND LOWER(r.commit_hash) = LOWER(?) \
+             ORDER BY r.created_at DESC",
+        )
+        .bind(repo_id.to_string())
+        .bind(commit_hash)
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| {
+            Error::database(format!(
+                "failed to list commit statuses for ref policy: {e}"
+            ))
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(pipeline, status)| CommitRunStatus { pipeline, status })
+            .collect())
+    }
+}
+
+/// A single pipeline run's outcome for one commit, as read from the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRunStatus {
+    pub pipeline: String,
+    pub status: Option<String>,
+}
+
+/// The outcome of one required check for a commit under the ref-update policy.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RequiredCheckStatus {
+    /// Pipeline name the check gates on.
+    pub check: String,
+    /// Latest durable run status for that pipeline on the commit; `None`
+    /// when the pipeline has never run on it.
+    pub status: Option<String>,
+}
+
+impl RequiredCheckStatus {
+    /// Green means the pipeline's latest run for the commit succeeded. A
+    /// pending, running, cancelled, failed, or never-run check is not green.
+    pub fn is_green(&self) -> bool {
+        self.status.as_deref() == Some("succeeded")
+    }
+}
+
+/// True when every required check is green. An empty check list is vacuously
+/// satisfied — repositories without a configured policy never block pushes.
+pub fn required_checks_satisfied(checks: &[RequiredCheckStatus]) -> bool {
+    checks.iter().all(RequiredCheckStatus::is_green)
+}
+
+/// Aggregate raw per-run statuses into one entry per required check.
+///
+/// The most recent run of a pipeline wins; `run_statuses` must be ordered
+/// latest-first (as `PipelineRunQueries::list_commit_statuses` returns them),
+/// and later duplicate rows for the same pipeline are ignored.
+pub fn evaluate_required_checks(
+    required_checks: &[String],
+    run_statuses: &[CommitRunStatus],
+) -> Vec<RequiredCheckStatus> {
+    required_checks
+        .iter()
+        .map(|check| {
+            let status = run_statuses
+                .iter()
+                .find(|run| run.pipeline == *check)
+                .and_then(|run| run.status.clone());
+            RequiredCheckStatus {
+                check: check.clone(),
+                status,
+            }
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -2716,6 +2868,212 @@ mod tests {
         RepoQueries::delete(&pool, repo.id).await.unwrap();
         let found = RepoQueries::get(&pool, repo.id).await.unwrap();
         assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_repo_policy_roundtrip() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "policy-owner".to_string(),
+            "policy-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+
+        let repo = crate::models::Repository::new(
+            "policy-repo".to_string(),
+            user.id,
+            "/git/policy-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        // Fresh repositories ship with no ref-update policy so existing
+        // push flows are unchanged until an operator opts in (#240).
+        let found = RepoQueries::get(&pool, repo.id).await.unwrap().unwrap();
+        assert!(found.required_checks.is_empty());
+        assert!(!found.deny_non_fast_forward);
+
+        RepoQueries::update_policy(
+            &pool,
+            repo.id,
+            &["ci".to_string(), "gates-and-release".to_string()],
+            true,
+        )
+        .await
+        .unwrap();
+
+        let found = RepoQueries::get(&pool, repo.id).await.unwrap().unwrap();
+        assert_eq!(found.required_checks, vec!["ci", "gates-and-release"]);
+        assert!(found.deny_non_fast_forward);
+        assert!(found.has_required_checks());
+
+        // Clearing the policy round-trips too.
+        RepoQueries::update_policy(&pool, repo.id, &[], false)
+            .await
+            .unwrap();
+        let found = RepoQueries::get(&pool, repo.id).await.unwrap().unwrap();
+        assert!(found.required_checks.is_empty());
+        assert!(!found.deny_non_fast_forward);
+
+        // Policy updates for an unknown repository are an error, not a no-op.
+        assert!(RepoQueries::update_policy(&pool, RepoId::new(), &[], false)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_commit_statuses_for_ref_policy() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "status-owner".to_string(),
+            "status-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+
+        let repo = crate::models::Repository::new(
+            "status-repo".to_string(),
+            user.id,
+            "/git/status-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let ci = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &ci).await.unwrap();
+        let release = crate::models::Pipeline {
+            id: PipelineId::new(),
+            name: "gates-and-release".to_string(),
+            ..ci.clone()
+        };
+        PipelineQueries::create(&pool, &release).await.unwrap();
+
+        // Two ci runs on the same commit; the older one is backdated so the
+        // "latest run wins" rule is exercised deterministically.
+        let old_run = crate::models::PipelineRun::new(
+            ci.id,
+            repo.id,
+            "push".to_string(),
+            "ABCDEF1234".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &old_run).await.unwrap();
+        PipelineRunQueries::update_status(&pool, old_run.id, "failed")
+            .await
+            .unwrap();
+        let newer_run = crate::models::PipelineRun::new(
+            ci.id,
+            repo.id,
+            "push".to_string(),
+            "abcdef1234".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &newer_run).await.unwrap();
+        PipelineRunQueries::update_status(&pool, newer_run.id, "succeeded")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE pipeline_runs SET created_at = ? WHERE id = ?")
+            .bind((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339())
+            .bind(old_run.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        let release_run = crate::models::PipelineRun::new(
+            release.id,
+            repo.id,
+            "push".to_string(),
+            "abcdef1234".to_string(),
+        );
+        // PipelineRun::new starts pending — the release gate has not run yet.
+        assert_eq!(release_run.status, "pending");
+        PipelineRunQueries::create(&pool, &release_run)
+            .await
+            .unwrap();
+
+        // Hash match is case-insensitive: the push path and historical rows
+        // may disagree about hex case.
+        let statuses = PipelineRunQueries::list_commit_statuses(&pool, repo.id, "AbCdEf1234")
+            .await
+            .unwrap();
+        assert_eq!(statuses.len(), 3);
+
+        let checks = evaluate_required_checks(
+            &[
+                "ci".to_string(),
+                "gates-and-release".to_string(),
+                "docs".to_string(),
+            ],
+            &statuses,
+        );
+        assert_eq!(checks.len(), 3);
+        let ci_check = checks.iter().find(|c| c.check == "ci").unwrap();
+        assert_eq!(ci_check.status.as_deref(), Some("succeeded"));
+        assert!(ci_check.is_green());
+        let release_check = checks
+            .iter()
+            .find(|c| c.check == "gates-and-release")
+            .unwrap();
+        assert_eq!(release_check.status.as_deref(), Some("pending"));
+        assert!(!release_check.is_green());
+        let missing = checks.iter().find(|c| c.check == "docs").unwrap();
+        assert_eq!(missing.status, None);
+        assert!(!missing.is_green());
+        assert!(!required_checks_satisfied(&checks));
+
+        // A commit with no runs yields no statuses and a failing gate.
+        let none = PipelineRunQueries::list_commit_statuses(&pool, repo.id, &"0".repeat(40))
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+        assert!(!required_checks_satisfied(&evaluate_required_checks(
+            &["ci".to_string()],
+            &none
+        )));
+    }
+
+    #[test]
+    fn test_required_checks_satisfied_rules() {
+        let green = |check: &str| RequiredCheckStatus {
+            check: check.to_string(),
+            status: Some("succeeded".to_string()),
+        };
+        let red = |check: &str, status: &str| RequiredCheckStatus {
+            check: check.to_string(),
+            status: Some(status.to_string()),
+        };
+
+        // No policy configured: nothing blocks.
+        assert!(required_checks_satisfied(&[]));
+        assert!(required_checks_satisfied(&[green("ci")]));
+        for status in ["pending", "running", "failed", "cancelled", "timed_out"] {
+            assert!(!required_checks_satisfied(&[red("ci", status)]));
+        }
+
+        // Latest run wins: an older red run behind a newer green one must not
+        // fail the gate (list_commit_statuses orders latest-first, and the
+        // aggregator ignores duplicates after the first).
+        let statuses = [
+            CommitRunStatus {
+                pipeline: "ci".to_string(),
+                status: Some("succeeded".to_string()),
+            },
+            CommitRunStatus {
+                pipeline: "ci".to_string(),
+                status: Some("failed".to_string()),
+            },
+        ];
+        let checks = evaluate_required_checks(&["ci".to_string()], &statuses);
+        assert!(checks[0].is_green());
+        assert!(required_checks_satisfied(&checks));
     }
 
     #[tokio::test]

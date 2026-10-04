@@ -2,6 +2,28 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [0.6.14] - 2026-10-03
+
+### Added
+
+- **Ref-update policy with required status checks (#240)**: repositories
+  can require named pipelines to be green on a commit before
+  `refs/heads/*` advances to it, and can deny non-fast-forward branch
+  updates. Required checks are evaluated pre-receive in the git server on
+  both Smart HTTP and SSH — a violating push is declined with a standard
+  receive-pack report (`! [remote rejected] <ref> (reason)`); non-FF
+  denial delegates to git's native `receive.denyNonFastForwards`.
+  Managed via `GET/PATCH /repos/{owner}/{repo}/policy` and
+  `GET /repos/{owner}/{repo}/commits/{sha}/status`, plus
+  `gitforge repo --policy / --set-policy / --commit-status`. Merged as
+  PR #255 (cd5bb758).
+
+- **Per-job lease liveness (#243)**: runners prove a running job is alive
+  with a per-job `jobs.heartbeat_at` refresh, and fencing waits for the
+  job to go quiet instead of judging from the runner's global heartbeat —
+  long container builds are no longer killed because the runner's
+  heartbeat starved under host load. Merged as PR #253 (ffbc21a5).
+
 ## [0.6.13] - 2026-10-02
 
 ### Fixed

@@ -66,6 +66,38 @@ pub struct RepoResponse {
     pub updated_at: String,
 }
 
+/// Ref-update policy of a repository (#240)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefPolicy {
+    pub required_checks: Vec<String>,
+    pub deny_non_fast_forward: bool,
+}
+
+/// Update ref-update policy request (#240). `None` fields keep their
+/// current values server-side.
+#[derive(Debug, Serialize)]
+pub struct UpdateRefPolicyRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_checks: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deny_non_fast_forward: Option<bool>,
+}
+
+/// Aggregated pipeline status of one commit (#240)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitStatus {
+    pub commit: String,
+    pub required_checks: Vec<RequiredCheckStatus>,
+    pub satisfied: bool,
+}
+
+/// One required check's latest outcome for a commit (#240)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequiredCheckStatus {
+    pub check: String,
+    pub status: Option<String>,
+}
+
 /// Pipeline response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineResponse {
@@ -267,6 +299,67 @@ impl ApiClient {
         let resp = ensure_success(resp, "get repository").await?;
         let repo: RepoResponse = resp.json().await?;
         Ok(repo)
+    }
+
+    /// Read a repository's ref-update policy (#240). `owner_repo` is
+    /// `owner/name` as used by the policy endpoints.
+    pub async fn get_repo_policy(&self, owner_repo: &str) -> Result<RefPolicy> {
+        let url = format!("{}/api/repos/{owner_repo}/policy", self.base_url);
+        let mut req = self.http.get(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req.send().await?;
+        let resp = ensure_success(resp, "get ref-update policy").await?;
+        let policy: RefPolicy = resp.json().await?;
+        Ok(policy)
+    }
+
+    /// Update a repository's ref-update policy (#240). `None` fields keep
+    /// their current values server-side.
+    pub async fn update_repo_policy(
+        &self,
+        owner_repo: &str,
+        required_checks: Option<Vec<String>>,
+        deny_non_fast_forward: Option<bool>,
+    ) -> Result<RefPolicy> {
+        let url = format!("{}/api/repos/{owner_repo}/policy", self.base_url);
+        let body = UpdateRefPolicyRequest {
+            required_checks,
+            deny_non_fast_forward,
+        };
+
+        let mut req = self.http.patch(&url).json(&body);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req.send().await?;
+        let resp = ensure_success(resp, "update ref-update policy").await?;
+        let policy: RefPolicy = resp.json().await?;
+        Ok(policy)
+    }
+
+    /// Read the aggregated pipeline status of one commit against the
+    /// repository's required checks (#240).
+    pub async fn get_commit_status(&self, owner_repo: &str, sha: &str) -> Result<CommitStatus> {
+        let url = format!(
+            "{}/api/repos/{owner_repo}/commits/{sha}/status",
+            self.base_url
+        );
+        let mut req = self.http.get(&url);
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req.send().await?;
+        let resp = ensure_success(resp, "get commit status").await?;
+        let status: CommitStatus = resp.json().await?;
+        Ok(status)
     }
 
     /// Create a repository

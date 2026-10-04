@@ -95,6 +95,24 @@ enum Commands {
         /// Initialize a local directory as a GitForge repo
         #[arg(long)]
         init: Option<String>,
+        /// Show the ref-update policy of owner/name (#240)
+        #[arg(long)]
+        policy: Option<String>,
+        /// Update the ref-update policy of owner/name (#240)
+        #[arg(long)]
+        set_policy: Option<String>,
+        /// Required check pipeline names, comma-separated (with --set-policy)
+        #[arg(long)]
+        required_checks: Option<String>,
+        /// Non-fast-forward denial for --set-policy (true or false)
+        #[arg(long)]
+        deny_non_fast_forward: Option<bool>,
+        /// Show the aggregated commit status of owner/name (#240)
+        #[arg(long)]
+        commit_status: Option<String>,
+        /// Commit hash for --commit-status
+        #[arg(long)]
+        commit: Option<String>,
     },
     /// Git operations (wrapper for standard git with GitForge remote)
     Git {
@@ -392,6 +410,12 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             delete,
             clone,
             init,
+            policy,
+            set_policy,
+            required_checks,
+            deny_non_fast_forward,
+            commit_status,
+            commit,
         } => {
             let api_client = GitForgeClient::new(&server, token.clone());
 
@@ -468,6 +492,91 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("📥 Cloning repository...");
                 println!("   Source: {url_or_name}");
                 println!("   (Use `gitforge git clone <repo>` for actual cloning)");
+            } else if let Some(owner_repo) = policy {
+                match api_client.get_repo_policy(owner_repo.as_str()).await {
+                    Ok(policy) => {
+                        println!("📋 Ref-update policy for {owner_repo}:");
+                        if policy.required_checks.is_empty() {
+                            println!("   Required checks: (none — branch pushes are not gated)");
+                        } else {
+                            println!("   Required checks: {}", policy.required_checks.join(", "));
+                        }
+                        println!(
+                            "   Deny non-fast-forward: {}",
+                            if policy.deny_non_fast_forward {
+                                "yes"
+                            } else {
+                                "no"
+                            }
+                        );
+                    }
+                    Err(e) => {
+                        println!("❌ {e}");
+                    }
+                }
+            } else if let Some(owner_repo) = set_policy {
+                let required_checks = required_checks.as_ref().map(|csv| {
+                    csv.split(',')
+                        .map(|name| name.trim().to_string())
+                        .filter(|name| !name.is_empty())
+                        .collect::<Vec<_>>()
+                });
+                match api_client
+                    .update_repo_policy(
+                        owner_repo.as_str(),
+                        required_checks,
+                        *deny_non_fast_forward,
+                    )
+                    .await
+                {
+                    Ok(policy) => {
+                        println!("✅ Ref-update policy updated for {owner_repo}:");
+                        if policy.required_checks.is_empty() {
+                            println!("   Required checks: (none — branch pushes are not gated)");
+                        } else {
+                            println!("   Required checks: {}", policy.required_checks.join(", "));
+                        }
+                        println!(
+                            "   Deny non-fast-forward: {}",
+                            if policy.deny_non_fast_forward {
+                                "yes"
+                            } else {
+                                "no"
+                            }
+                        );
+                    }
+                    Err(e) => {
+                        println!("❌ {e}");
+                    }
+                }
+            } else if let Some(owner_repo) = commit_status {
+                let Some(sha) = commit.as_deref() else {
+                    return Err(anyhow::anyhow!("--commit-status requires --commit <sha>"));
+                };
+                match api_client.get_commit_status(owner_repo.as_str(), sha).await {
+                    Ok(status) => {
+                        println!("📋 Commit status for {owner_repo}@{}:", status.commit);
+                        for check in &status.required_checks {
+                            let state = check.status.as_deref().unwrap_or("never run");
+                            let mark = if check.status.as_deref() == Some("succeeded") {
+                                "✅"
+                            } else {
+                                "❌"
+                            };
+                            println!("   {mark} {} — {state}", check.check);
+                        }
+                        if status.required_checks.is_empty() {
+                            println!("   (no required checks configured)");
+                        }
+                        println!(
+                            "   Satisfied: {}",
+                            if status.satisfied { "yes" } else { "no" }
+                        );
+                    }
+                    Err(e) => {
+                        println!("❌ {e}");
+                    }
+                }
             } else if let Some(path) = init {
                 println!("🔧 Initializing directory as GitForge repository...");
                 println!("   Path: {path}");
@@ -930,6 +1039,12 @@ mod tests {
             delete: None,
             clone: None,
             init: None,
+            policy: None,
+            set_policy: None,
+            required_checks: None,
+            deny_non_fast_forward: None,
+            commit_status: None,
+            commit: None,
         });
         assert!(run_cli(cli).await.is_ok());
     }
@@ -1286,6 +1401,12 @@ mod tests {
             delete: None,
             clone: None,
             init: None,
+            policy: None,
+            set_policy: None,
+            required_checks: None,
+            deny_non_fast_forward: None,
+            commit_status: None,
+            commit: None,
         });
         assert!(run_cli(cli).await.is_ok());
     }
@@ -1299,6 +1420,12 @@ mod tests {
             delete: None,
             clone: None,
             init: None,
+            policy: None,
+            set_policy: None,
+            required_checks: None,
+            deny_non_fast_forward: None,
+            commit_status: None,
+            commit: None,
         });
         assert!(run_cli(cli).await.is_ok());
     }
@@ -1312,6 +1439,12 @@ mod tests {
             delete: Some("repo-123".to_string()),
             clone: None,
             init: None,
+            policy: None,
+            set_policy: None,
+            required_checks: None,
+            deny_non_fast_forward: None,
+            commit_status: None,
+            commit: None,
         });
         assert!(run_cli(cli).await.is_ok());
     }
@@ -1325,6 +1458,12 @@ mod tests {
             delete: None,
             clone: Some("my-repo".to_string()),
             init: None,
+            policy: None,
+            set_policy: None,
+            required_checks: None,
+            deny_non_fast_forward: None,
+            commit_status: None,
+            commit: None,
         });
         assert!(run_cli(cli).await.is_ok());
     }
@@ -1338,6 +1477,12 @@ mod tests {
             delete: None,
             clone: None,
             init: Some("/tmp/my-repo".to_string()),
+            policy: None,
+            set_policy: None,
+            required_checks: None,
+            deny_non_fast_forward: None,
+            commit_status: None,
+            commit: None,
         });
         assert!(run_cli(cli).await.is_ok());
     }

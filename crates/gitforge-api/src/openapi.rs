@@ -211,6 +211,81 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     }
                 }
             },
+            "/repos/{owner}/{repo}/policy": {
+                "get": {
+                    "tags": ["repos"],
+                    "summary": "Read the ref-update policy",
+                    "description": "Returns the repository's required status checks and non-fast-forward setting (#240). Branch updates are declined when the named pipelines have not succeeded on the pushed commit.",
+                    "parameters": [
+                        {"name": "owner", "in": "path", "required": true, "schema": {"type": "string"}},
+                        {"name": "repo", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Current policy",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/RefPolicyResponse"}
+                                }
+                            }
+                        },
+                        "404": {"description": "Repository not found"}
+                    }
+                },
+                "patch": {
+                    "tags": ["repos"],
+                    "summary": "Update the ref-update policy",
+                    "description": "Sets required status checks and/or non-fast-forward denial for the repository. Omitted fields keep their current values. Tightening writes the repository's receive.denyNonFastForwards config before persisting the policy so enforcement never lags the declaration.",
+                    "parameters": [
+                        {"name": "owner", "in": "path", "required": true, "schema": {"type": "string"}},
+                        {"name": "repo", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/UpdateRefPolicyRequest"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Updated policy",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/RefPolicyResponse"}
+                                }
+                            }
+                        },
+                        "400": {"description": "Invalid required check names"},
+                        "404": {"description": "Repository not found"},
+                        "500": {"description": "Failed to persist policy or update repository config"}
+                    }
+                }
+            },
+            "/repos/{owner}/{repo}/commits/{sha}/status": {
+                "get": {
+                    "tags": ["repos"],
+                    "summary": "Aggregated commit status",
+                    "description": "Reports each required check's latest pipeline outcome for the commit and whether the commit satisfies the repository's ref-update policy (#240).",
+                    "parameters": [
+                        {"name": "owner", "in": "path", "required": true, "schema": {"type": "string"}},
+                        {"name": "repo", "in": "path", "required": true, "schema": {"type": "string"}},
+                        {"name": "sha", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Aggregated status",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/CommitStatusResponse"}
+                                }
+                            }
+                        },
+                        "404": {"description": "Repository not found"}
+                    }
+                }
+            },
             "/users/{id}/role": {
                 "patch": {
                     "tags": ["users"],
@@ -666,6 +741,54 @@ pub fn get_openapi_spec() -> serde_json::Value {
                         "visibility": {"type": "string", "nullable": true}
                     }
                 },
+                "RefPolicyResponse": {
+                    "type": "object",
+                    "properties": {
+                        "required_checks": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
+                        "deny_non_fast_forward": {"type": "boolean"}
+                    }
+                },
+                "UpdateRefPolicyRequest": {
+                    "type": "object",
+                    "properties": {
+                        "required_checks": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "nullable": true,
+                            "description": "Pipeline names that must succeed on a commit before a branch may advance to it. Omitted to keep the current list."
+                        },
+                        "deny_non_fast_forward": {
+                            "type": "boolean",
+                            "nullable": true,
+                            "description": "Reject non-fast-forward branch updates. Omitted to keep the current setting."
+                        }
+                    }
+                },
+                "CommitStatusResponse": {
+                    "type": "object",
+                    "properties": {
+                        "commit": {"type": "string"},
+                        "required_checks": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/RequiredCheckStatus"}
+                        },
+                        "satisfied": {"type": "boolean"}
+                    }
+                },
+                "RequiredCheckStatus": {
+                    "type": "object",
+                    "properties": {
+                        "check": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "nullable": true,
+                            "description": "Latest pipeline run status for the commit; null when it has never run."
+                        }
+                    }
+                },
                 "UpdateRoleRequest": {
                     "type": "object",
                     "required": ["role"],
@@ -877,6 +1000,8 @@ mod tests {
         assert!(paths.contains_key("/auth/status"));
         assert!(paths.contains_key("/health"));
         assert!(paths.contains_key("/repos"));
+        assert!(paths.contains_key("/repos/{owner}/{repo}/policy"));
+        assert!(paths.contains_key("/repos/{owner}/{repo}/commits/{sha}/status"));
         assert!(paths.contains_key("/users/{id}/role"));
         assert!(paths.contains_key("/pipelines"));
         assert!(paths.contains_key("/runners"));
