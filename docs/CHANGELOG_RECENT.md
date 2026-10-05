@@ -2,6 +2,35 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Doomed child jobs are terminalized with their run's verdict**: when a
+  pipeline run fails or is cancelled, every not-yet-dispatched (`pending`/
+  `queued`) descendant the engine cancelled in memory now commits as
+  `cancelled` in the same transaction as the run's terminal status — the
+  verdict can no longer strand live child rows that run reconciliation,
+  skipping terminal runs, could never grade again (live 2026-10-05: 828
+  pending jobs across 202 failed runs). Rows a runner already picked up are
+  never cancelled out from under it, and each row keeps an inspectable
+  failure/cancellation receipt naming the ancestor stage that doomed it.
+- **Cancellation no longer abandons runner-owned work**: `CiEngine::cancel`
+  spares `assigned`/`running` mirror jobs (no run-level cancellation
+  request/ack protocol reaches a runner) and records cancellation intent
+  instead; the run goes terminal only when the last owned job settles, with
+  `cancelled` winning the verdict over the in-flight outcome. Finalization
+  now fails closed while any durable `assigned`/`running` row is still live
+  — no terminal verdict, no engine eviction, no workspace deletion — so a
+  completion event, its lease, and its checkout survive until the runner
+  (or its cancellation watch) settles the row; the completion consumer
+  reconciles a refused mirror transition instead of dropping the event.
+  A late cancel can no longer rewrite an already-settled run verdict (F24).
+  Known limitation: cancel intent lives in the engine mirror only until
+  finalization commits; a control-plane restart before that loses it and
+  the run resumes (re-issue the cancel, or cancel the durable job rows,
+  which runners do honor).
+
 ## [0.6.14] - 2026-10-03
 
 ### Added

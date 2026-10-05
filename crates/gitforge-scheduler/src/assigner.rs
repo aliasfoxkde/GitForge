@@ -2019,6 +2019,12 @@ pub struct DispatchLatencyReport {
 /// Read-only queue admission telemetry exposed by the scheduler API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueStatus {
+    /// Misnamed since durable DAG planning: this counts durable `queued`
+    /// rows (`list_dispatchable`) only, NOT `pending` planned rows. A
+    /// `pending` row is invisible to dispatch until its dependencies release
+    /// it, so zero here alongside thousands of `pending` rows is a healthy
+    /// idle queue, not lost work — the state that used to read as silent
+    /// starvation is `durable_queued_not_in_memory`.
     pub durable_pending: Option<usize>,
     pub in_memory_queued: usize,
     pub assigned_jobs: usize,

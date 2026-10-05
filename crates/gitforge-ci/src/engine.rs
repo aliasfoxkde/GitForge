@@ -18,6 +18,12 @@ pub struct CiEngineState {
     pub jobs: HashMap<JobId, JobStateMachine>,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set by [`CiEngine::cancel`] when the run was cancelled while jobs a
+    /// runner owns (`Assigned`/`Running`) were still live. Those jobs are
+    /// left to finish, and the run's verdict is `Cancelled` whenever the
+    /// last of them settles — regardless of whether it succeeds or fails —
+    /// because the operator's cancellation outranks the in-flight outcome.
+    pub cancel_requested: bool,
 }
 
 impl CiEngineState {
@@ -34,7 +40,29 @@ impl CiEngineState {
             jobs: HashMap::new(),
             started_at: None,
             finished_at: None,
+            cancel_requested: false,
         }
+    }
+
+    /// Grade the run once its last job turned terminal.
+    ///
+    /// Recorded cancellation intent wins: a cancelled run stays `Cancelled`
+    /// even when its remaining runner-owned job succeeds or fails, because
+    /// the job's own row keeps its true outcome while the run's verdict
+    /// answers "did the pipeline as requested complete". Otherwise the
+    /// fail-fast rule applies: any non-succeeded job fails the run.
+    fn settle_if_all_finished(&mut self) {
+        if !self.all_jobs_finished() {
+            return;
+        }
+        self.status = if self.cancel_requested {
+            PipelineStatus::Cancelled
+        } else if self.all_jobs_succeeded() {
+            PipelineStatus::Succeeded
+        } else {
+            PipelineStatus::Failed
+        };
+        self.finished_at = Some(chrono::Utc::now());
     }
 
     /// Check if all jobs are finished
@@ -385,14 +413,7 @@ impl CiEngine {
             job_state.succeed(exit_code)?;
 
             // Check if pipeline is complete
-            if state.all_jobs_finished() {
-                state.status = if state.all_jobs_succeeded() {
-                    PipelineStatus::Succeeded
-                } else {
-                    PipelineStatus::Failed
-                };
-                state.finished_at = Some(chrono::Utc::now());
-            }
+            state.settle_if_all_finished();
         }
         Ok(())
     }
@@ -412,10 +433,7 @@ impl CiEngine {
         // the run workspace, and finalizing here would fence off their
         // completions ("unknown pipeline run") and delete the checkout
         // out from under their containers.
-        if state.all_jobs_finished() {
-            state.status = PipelineStatus::Failed;
-            state.finished_at = Some(chrono::Utc::now());
-        }
+        state.settle_if_all_finished();
         Ok(())
     }
 
@@ -428,10 +446,7 @@ impl CiEngine {
         self.cancel_descendants(&mut state, job_id);
         // Same reasoning as `fail_job`: wait for all jobs to finish
         // before declaring the pipeline failed.
-        if state.all_jobs_finished() {
-            state.status = PipelineStatus::Failed;
-            state.finished_at = Some(chrono::Utc::now());
-        }
+        state.settle_if_all_finished();
         Ok(())
     }
 
@@ -471,17 +486,47 @@ impl CiEngine {
         Ok(())
     }
 
-    /// Cancel the pipeline
+    /// Cancel the pipeline run.
+    ///
+    /// Records cancellation intent and immediately cancels every mirror job
+    /// no runner has taken over (`Pending`/`Queued`). Jobs in runner-owned
+    /// mirror states (`Assigned`/`Running`) are deliberately left untouched:
+    /// there is no run-level cancellation request/ack protocol that reaches
+    /// a runner (the only runner-facing cancellation signal is the durable
+    /// per-job row the runner's cancellation watch polls), so their work is
+    /// preserved and their own completion — or the scheduler's fence and
+    /// timeout reaping — is what settles them. The run is marked `Cancelled`
+    /// only once every job is terminal, the same rule the fail-fast paths
+    /// follow, so an in-flight job keeps its completion event, its lease,
+    /// and its workspace. The service-side finalizer additionally refuses to
+    /// commit the verdict while durable `assigned`/`running` rows are still
+    /// live — the mirror cannot see dispatch, only the durable rows can
+    /// arbitrate — keeping the engine and workspace for the completion
+    /// consumer, fence sweep, or timeout watchdog to reconcile.
+    ///
+    /// Known limitation: cancellation intent is held in the engine mirror
+    /// only until finalization commits. If the control plane restarts before
+    /// that, the rebuilt engine has no durable trace of the cancel and the
+    /// run resumes; the cancellation must be re-issued (the durable per-job
+    /// cancel path, which runners do honor, is the durable alternative).
+    ///
+    /// A run that already reached a terminal verdict is left untouched: a
+    /// late cancellation never re-grades a settled run (F24).
     pub async fn cancel(&self) -> Result<()> {
         let mut state = self.state.write().await;
-        state.status = PipelineStatus::Cancelled;
-        state.finished_at = Some(chrono::Utc::now());
-
+        if matches!(
+            state.status,
+            PipelineStatus::Succeeded | PipelineStatus::Failed | PipelineStatus::Cancelled
+        ) {
+            return Ok(());
+        }
+        state.cancel_requested = true;
         for job_state in state.jobs.values_mut() {
-            if !job_state.is_terminal() {
+            if matches!(job_state.status(), JobStatus::Pending | JobStatus::Queued) {
                 job_state.cancel().ok();
             }
         }
+        state.settle_if_all_finished();
 
         Ok(())
     }
@@ -733,6 +778,158 @@ mod tests {
         let state = engine.state().await;
         assert_eq!(state.status, PipelineStatus::Cancelled);
         assert!(state.finished_at.is_some());
+    }
+
+    // Cancelling a run whose job a runner already owns must NOT cancel that
+    // mirror job: no run-level cancellation request/ack protocol reaches a
+    // runner, so the work belongs to the runner lifecycle until it reports.
+    // The not-yet-dispatched tail is cancelled immediately, and the run only
+    // becomes terminal once the owned job settles — with the cancellation
+    // winning the verdict even when the job succeeds.
+    #[tokio::test]
+    async fn test_engine_cancel_spares_runner_owned_job_and_settles_on_completion() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, make_pipeline()).await.unwrap();
+        engine.start().await.unwrap();
+
+        let ready = engine.ready_jobs().await;
+        assert_eq!(ready.len(), 1);
+        let runner_id = gitforge_common::RunnerId::new();
+        engine.assign_job(ready[0], runner_id).await.unwrap();
+        engine.start_job(ready[0]).await.unwrap();
+
+        engine.cancel().await.unwrap();
+
+        let state = engine.state().await;
+        assert!(
+            state.cancel_requested,
+            "cancellation intent must be recorded"
+        );
+        assert_eq!(
+            state.status,
+            PipelineStatus::Running,
+            "a run with live runner-owned work stays non-terminal"
+        );
+        assert!(
+            state.finished_at.is_none(),
+            "no finish time while a runner owns work"
+        );
+        assert_eq!(
+            state.jobs[&ready[0]].status(),
+            JobStatus::Running,
+            "a runner-owned job keeps its lifecycle"
+        );
+        let test_id = *state
+            .jobs
+            .keys()
+            .find(|id| **id != ready[0])
+            .expect("downstream stage");
+        assert_eq!(
+            state.jobs[&test_id].status(),
+            JobStatus::Cancelled,
+            "the not-yet-dispatched tail is cancelled immediately"
+        );
+        assert!(
+            engine.ready_jobs().await.is_empty(),
+            "a cancelled stage is never dispatched"
+        );
+
+        // The runner finishes after the cancel: the completion is still a
+        // valid transition, and the last job settling is what grades the
+        // run — as `Cancelled`, the operator's intent, not `Succeeded`.
+        engine.succeed_job(ready[0], 0).await.unwrap();
+        let state = engine.state().await;
+        assert_eq!(state.status, PipelineStatus::Cancelled);
+        assert!(state.finished_at.is_some());
+        assert_eq!(
+            state.jobs[&ready[0]].status(),
+            JobStatus::Succeeded,
+            "the job row keeps its true outcome"
+        );
+    }
+
+    // The same preservation applies when the runner-owned job fails after
+    // the cancel: the verdict is still `Cancelled`, not `Failed`.
+    #[tokio::test]
+    async fn test_engine_cancel_verdict_survives_late_failure() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, make_parallel_pipeline())
+            .await
+            .unwrap();
+        engine.start().await.unwrap();
+
+        let ready = engine.ready_jobs().await;
+        let runner_id = gitforge_common::RunnerId::new();
+        for job in &ready {
+            engine.assign_job(*job, runner_id).await.unwrap();
+            engine.start_job(*job).await.unwrap();
+        }
+
+        engine.cancel().await.unwrap();
+        assert_eq!(engine.state().await.status, PipelineStatus::Running);
+
+        engine
+            .fail_job(ready[0], 1, "failed after cancel".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.state().await.status,
+            PipelineStatus::Running,
+            "one runner-owned job is still live"
+        );
+        engine.succeed_job(ready[1], 0).await.unwrap();
+
+        let state = engine.state().await;
+        assert_eq!(
+            state.status,
+            PipelineStatus::Cancelled,
+            "cancellation outranks the in-flight outcomes"
+        );
+        assert!(state.finished_at.is_some());
+    }
+
+    // A cancel that arrives after the run already reached a verdict is a
+    // no-op: terminal verdicts are never rewritten (F24), not even by an
+    // operator.
+    #[tokio::test]
+    async fn test_engine_cancel_after_terminal_verdict_is_a_no_op() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let settled = CiEngine::new(event, make_parallel_pipeline())
+            .await
+            .unwrap();
+        settled.start().await.unwrap();
+        let ready = settled.ready_jobs().await;
+        let runner_id = gitforge_common::RunnerId::new();
+        for job in &ready {
+            settled.assign_job(*job, runner_id).await.unwrap();
+            settled.start_job(*job).await.unwrap();
+            settled.succeed_job(*job, 0).await.unwrap();
+        }
+        assert_eq!(settled.state().await.status, PipelineStatus::Succeeded);
+
+        settled.cancel().await.unwrap();
+        let state = settled.state().await;
+        assert_eq!(
+            state.status,
+            PipelineStatus::Succeeded,
+            "a late cancel never re-grades a settled run"
+        );
+        assert!(!state.cancel_requested);
     }
 
     #[tokio::test]
