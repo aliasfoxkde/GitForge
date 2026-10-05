@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use gitforge_common::{JobId, PipelineId, PipelineRunId};
+use gitforge_common::{ErrorKind, JobId, PipelineId, PipelineRunId};
 use gitforge_db::{
     models::JobStatus,
     queries::{JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries},
@@ -1044,12 +1044,17 @@ async fn submit_job(
             .into_response();
     }
     if let Err(error) = JobQueries::update_status(&pool, job_id, "queued").await {
-        tracing::error!(%error, %job_id, "failed to queue submitted job");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database_error"})),
-        )
-            .into_response();
+        let (status, code) = match error.kind {
+            ErrorKind::InvalidInput => (StatusCode::CONFLICT, "job_state_conflict"),
+            ErrorKind::NotFound => (StatusCode::NOT_FOUND, "job_not_found"),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "database_error"),
+        };
+        if status.is_server_error() {
+            tracing::error!(%error, %job_id, "failed to queue submitted job");
+        } else {
+            tracing::warn!(%error, %job_id, "job could not be queued");
+        }
+        return (status, Json(serde_json::json!({"error": code}))).into_response();
     }
     if let Err(error) = JobQueries::set_definition_with_image_and_timeout(
         &pool,

@@ -1393,7 +1393,7 @@ impl JobQueries {
 
     /// Update job status
     pub async fn update_status(pool: &Pool, id: JobId, status: &str) -> Result<()> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE jobs SET status = ? WHERE id = ? AND (status IN ('pending', 'queued', 'assigned', 'running') OR status = ?)",
         )
             .bind(status)
@@ -1402,6 +1402,20 @@ impl JobQueries {
             .execute(pool.pool())
             .await
             .map_err(|e| Error::database(format!("failed to update job status: {e}")))?;
+
+        if result.rows_affected() == 0 {
+            match Self::get(pool, id).await? {
+                Some(job) if job.status == status => return Ok(()),
+                Some(job) => {
+                    return Err(Error::invalid_input(format!(
+                        "cannot transition job {id} from {} to {status}",
+                        job.status
+                    )));
+                }
+                None => return Err(Error::not_found("job", id)),
+            }
+        }
+
         Ok(())
     }
 
@@ -3677,9 +3691,13 @@ mod tests {
         // A delayed ready-job enqueue must not resurrect an operator-cancelled
         // job or leave its old lease attached to a now-queued row.
         assert!(!JobQueries::queue_if_waiting(&pool, job.id).await.unwrap());
-        JobQueries::update_status(&pool, job.id, "queued")
+        let transition_error = JobQueries::update_status(&pool, job.id, "queued")
             .await
-            .unwrap();
+            .expect_err("a terminal job must reject a queued transition");
+        assert_eq!(
+            transition_error.kind,
+            gitforge_common::ErrorKind::InvalidInput
+        );
         JobQueries::create_or_open_queue(&pool, &job).await.unwrap();
         let still_cancelled = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
         assert_eq!(still_cancelled.status, "cancelled");
