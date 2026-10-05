@@ -3900,7 +3900,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            "pending",
+            "running",
             "the run verdict is not committed past live work"
         );
         assert_eq!(

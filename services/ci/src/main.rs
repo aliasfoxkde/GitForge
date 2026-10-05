@@ -1207,6 +1207,14 @@ async fn run_definition(
 /// Durably cancel every not-yet-dispatched job that transitively depends on
 /// a failed, timed-out, or cancelled one, and return the ids cancelled.
 ///
+/// Format durable outcome values consistently in user-facing receipts.
+fn pipeline_outcome_label(status: &str) -> &str {
+    match status {
+        "timed_out" | "timeout" | "timed-out" => "timed out",
+        _ => status,
+    }
+}
+
 /// `ready_jobs` requires all dependencies to have succeeded, so these rows
 /// can never be dispatched again — leaving them `pending`/`queued` keeps
 /// the run non-terminal forever. Only rows a runner has never touched are
@@ -1226,7 +1234,7 @@ async fn cancel_doomed_rows(
     let ancestors: HashMap<&str, &str> = jobs
         .iter()
         .filter(|job| matches!(job.status.as_str(), "failed" | "timed_out" | "cancelled"))
-        .map(|job| (job.name.as_str(), job.status.as_str()))
+        .map(|job| (job.name.as_str(), pipeline_outcome_label(&job.status)))
         .collect();
     if ancestors.is_empty() {
         return HashSet::new();
@@ -2069,10 +2077,13 @@ async fn finalize_run_if_terminal(
             let mut ancestors: Vec<(String, &str)> = state
                 .jobs
                 .iter()
-                .filter_map(|(job_id, job)| match job.status() {
-                    gitforge_common::JobStatus::Failed => Some((job_id, "failed")),
-                    gitforge_common::JobStatus::TimedOut => Some((job_id, "timed out")),
-                    _ => None,
+                .filter_map(|(job_id, job)| {
+                    let outcome = match job.status() {
+                        gitforge_common::JobStatus::Failed => Some("failed"),
+                        gitforge_common::JobStatus::TimedOut => Some("timed_out"),
+                        _ => None,
+                    }?;
+                    Some((job_id, pipeline_outcome_label(outcome)))
                 })
                 .filter_map(|(job_id, outcome)| {
                     job_names.get(job_id).map(|name| (name.clone(), outcome))
