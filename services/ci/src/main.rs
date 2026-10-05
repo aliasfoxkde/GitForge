@@ -2468,6 +2468,52 @@ async fn handle_push_event(
     let ready_jobs = engine.ready_jobs().await;
     tracing::info!("enqueueing {} ready jobs", ready_jobs.len());
 
+    persist_and_launch_run(
+        scheduler_db,
+        scheduler,
+        &engine,
+        pipeline_id,
+        &pipeline,
+        repo_id,
+        &payload.new_hash,
+        event.event_id,
+        requested_workspace,
+        run_workspace_paths,
+        pipeline_registry,
+    )
+    .await
+    .map(Some)
+}
+
+/// Persist the durable side of an accepted drive and launch the run: the
+/// pipeline version row, the run row linked to the accepted event, the
+/// workspace checkout, engine registration, planned job rows, and the
+/// scheduler enqueue. Returns the run id execution belongs to.
+///
+/// The run insert is the idempotency adjudication (F2): the partial unique
+/// index on `pipeline_runs.trigger_event_id` lets exactly one concurrent
+/// drive of an accepted event land its run row, and `create_for_trigger`
+/// returns the durable run's id — the winner's, when this drive's insert
+/// lost the race. A loser must stop right there: continuing would prepare
+/// a workspace, register the engine, persist planned jobs, and enqueue
+/// under its own losing run id — a fully executing orphan no poller or
+/// settle path will ever reference.
+#[allow(clippy::too_many_arguments)]
+async fn persist_and_launch_run(
+    scheduler_db: Option<&gitforge_db::Pool>,
+    scheduler: &Arc<Scheduler>,
+    engine: &Arc<CiEngine>,
+    pipeline_id: gitforge_common::PipelineId,
+    pipeline: &PipelineDefinition,
+    repo_id: gitforge_common::RepoId,
+    commit_hash: &str,
+    event_id: uuid::Uuid,
+    requested_workspace: Option<String>,
+    run_workspace_paths: &Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
+    pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
+) -> anyhow::Result<gitforge_common::PipelineRunId> {
     let state = engine.state().await;
     if let Some(pool) = scheduler_db {
         let db_pipeline = DbPipeline {
@@ -2475,30 +2521,46 @@ async fn handle_push_event(
             repo_id,
             name: pipeline.name.clone(),
             trigger_type: "push".to_string(),
-            config: serde_json::to_value(&pipeline)?,
+            config: serde_json::to_value(pipeline)?,
             created_at: Utc::now(),
         };
-        // Only one active pipeline version per (repo, name) is allowed by
-        // idx_pipelines_active_repo_name — retire the predecessor before
-        // recording this push's version, or every push after the first
-        // fails run creation with a constraint violation.
-        gitforge_db::queries::PipelineQueries::deactivate_active(pool, repo_id, &pipeline.name)
-            .await?;
-        gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
-
         let mut db_run = DbPipelineRun::new(
             pipeline_id,
             repo_id,
             "push".to_string(),
-            payload.new_hash.clone(),
+            commit_hash.to_string(),
         );
         db_run.id = state.run_id;
         db_run.start();
-        // The event link is the run-idempotency key (F2): every drive of the
-        // same accepted event converges on this row, and a recovery sweep
-        // finds it here instead of building a second run.
-        gitforge_db::queries::PipelineRunQueries::create_for_trigger(pool, &db_run, event.event_id)
+        // The pipeline-version mutation and the run-idempotency
+        // adjudication have to land together or not at all: each push
+        // allocates a fresh PipelineId, so a losing drive's
+        // `deactivate_active` would otherwise deactivate the winner's
+        // predecessor and leave its own version active. The helper runs
+        // them under one transaction; a loser rolls back its version
+        // change and returns the durable winner's run id.
+        let durable_run =
+            gitforge_db::queries::PipelineQueries::create_version_and_run_for_trigger(
+                pool,
+                &db_pipeline,
+                &db_run,
+                event_id,
+            )
             .await?;
+        if durable_run != state.run_id {
+            // This drive lost the insert race against a concurrent driver of
+            // the same accepted event — its claim lease expired mid-drive and
+            // the winner (recovery sweep or fellow consumer) landed the row
+            // between this drive's early lookup and its insert. Return the
+            // durable run and launch nothing under the losing id.
+            tracing::warn!(
+                event_id = %event_id,
+                run = %durable_run,
+                duplicate = %state.run_id,
+                "lost the trigger run-idempotency race; converging on the durable run"
+            );
+            return Ok(durable_run);
+        }
     }
 
     let workspace_path = match requested_workspace {
@@ -2510,7 +2572,7 @@ async fn handle_push_event(
                     state.run_id
                 )
             })?;
-            match prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await {
+            match prepare_run_workspace(pool, repo_id, state.run_id, commit_hash).await {
                 Ok(path) => Some(path),
                 Err(error) => {
                     let _ = gitforge_db::queries::PipelineRunQueries::update_status(
@@ -2542,7 +2604,7 @@ async fn handle_push_event(
     // once the engine releases their stage.
     if let Some(pool) = scheduler_db {
         if let Err(error) =
-            persist_planned_jobs(pool, &engine, state.run_id, workspace_path.as_deref()).await
+            persist_planned_jobs(pool, engine, state.run_id, workspace_path.as_deref()).await
         {
             // Without the planned rows a restart cannot resume this run; a
             // half-planned run must not be left non-terminal.
@@ -2570,14 +2632,14 @@ async fn handle_push_event(
 
     enqueue_ready_jobs(
         scheduler,
-        &engine,
+        engine,
         state.run_id,
         repo_id,
         workspace_path.clone(),
     )
     .await;
 
-    Ok(Some(state.run_id))
+    Ok(state.run_id)
 }
 
 /// Converge engine job state with scheduler rows that went terminal
@@ -3558,6 +3620,514 @@ mod tests {
         );
     }
 
+    /// F2 idempotency race: two concurrent drives of one accepted event both
+    /// miss the early correlate lookup — the winner's run row lands between
+    /// that lookup and the losing drive's insert (its claim lease expired
+    /// mid-drive and the recovery sweep re-claimed the event). The unique
+    /// index hands the losing drive the winner's id, and it must return that
+    /// id without launching anything under its own losing run id: no
+    /// workspace, no engine registration, no planned job rows, no enqueue.
+    /// The losing drive's `deactivate_active` + `create` for the pipeline
+    /// version must also roll back, so (repo, name) keeps exactly one
+    /// version with the winner as the active row.
+    #[tokio::test]
+    async fn losing_trigger_drive_converges_on_the_durable_run_without_launching() {
+        let (pool, repo_id, deps, _db_path) = trigger_recovery_fixture().await;
+        let event_id = uuid::Uuid::new_v4();
+        let commit = "c".repeat(40);
+
+        // Winner and loser target the same (repo, name) so the loser's
+        // transaction would otherwise deactivate the winner's predecessor
+        // and leave its own version active. The pipeline carries real
+        // jobs so the losing drive has work to "lose" — the no-enqueue
+        // assertion is only meaningful when the ready list is non-empty.
+        let pipeline_name = "race-pipeline".to_string();
+        let pipeline_config = serde_json::json!({
+            "name": pipeline_name,
+            "version": "1.0",
+            "trigger_on": ["push"],
+            "jobs": [{"name": "build"}],
+        });
+
+        // The concurrent winner: its run row already linked by the event id.
+        let winner_pipeline_id = gitforge_common::PipelineId::new();
+        let winner_pipeline = gitforge_db::models::Pipeline {
+            id: winner_pipeline_id,
+            repo_id,
+            name: pipeline_name.clone(),
+            trigger_type: "push".to_string(),
+            config: pipeline_config.clone(),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &winner_pipeline)
+            .await
+            .unwrap();
+        let mut winner_run = gitforge_db::models::PipelineRun::new(
+            winner_pipeline_id,
+            repo_id,
+            "push".to_string(),
+            commit.clone(),
+        );
+        winner_run.start();
+        let winner_run_id = gitforge_db::queries::PipelineRunQueries::create_for_trigger(
+            &pool,
+            &winner_run,
+            event_id,
+        )
+        .await
+        .unwrap();
+        let (pre_active, pre_total) = gitforge_db::queries::PipelineQueries::version_stats_by_name(
+            &pool,
+            repo_id,
+            &pipeline_name,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pre_active, Some(winner_pipeline_id));
+        assert_eq!(pre_total, 1);
+
+        // The losing drive: its own engine, so its own in-memory run id;
+        // and its own freshly-allocated pipeline id (each push allocates
+        // a fresh one — the audit precondition the transaction helper
+        // exists to defend). The pipeline definition carries real jobs
+        // whose entry points become the "work" the loser must not launch.
+        let losing_pipeline_id = gitforge_common::PipelineId::new();
+        let mut pipeline = create_default_pipeline(&repo_id.to_string());
+        pipeline.name = pipeline_name.clone();
+        let trigger = PipelineTriggerEvent::new(
+            losing_pipeline_id,
+            repo_id,
+            commit.clone(),
+            TriggerType::Push,
+        );
+        let engine = Arc::new(CiEngine::new(trigger, pipeline.clone()).await.unwrap());
+        engine.start().await.unwrap();
+        let losing_run_id = engine.state().await.run_id;
+        let initially_ready = engine.ready_jobs().await;
+        assert_ne!(losing_run_id, winner_run_id, "fixture: distinct run ids");
+        assert_ne!(
+            losing_pipeline_id, winner_pipeline_id,
+            "fixture: distinct pipeline ids"
+        );
+        assert!(!initially_ready.is_empty(), "fixture: drive has work");
+
+        // The recovery sweep passes the persisted working directory
+        // explicitly; an explicit workspace also keeps this test off the
+        // git-clone path the losing drive must never reach.
+        let launched = persist_and_launch_run(
+            Some(&pool),
+            &deps.scheduler,
+            &engine,
+            losing_pipeline_id,
+            &pipeline,
+            repo_id,
+            &commit,
+            event_id,
+            Some(std::env::current_dir().unwrap().display().to_string()),
+            &deps.run_workspace_paths,
+            &deps.pipeline_registry,
+        )
+        .await
+        .expect("a losing drive converges on the durable run instead of erroring");
+
+        assert_eq!(
+            launched, winner_run_id,
+            "the losing drive must return the durable run's id"
+        );
+
+        // Pipeline-version invariants: the loser's `deactivate_active` +
+        // `create` ran inside a transaction with the run insert, so
+        // losing the run race rolled both back. The active version is
+        // still the winner and the history count is unchanged.
+        let (post_active, post_total) =
+            gitforge_db::queries::PipelineQueries::version_stats_by_name(
+                &pool,
+                repo_id,
+                &pipeline_name,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            post_active,
+            Some(winner_pipeline_id),
+            "the active version is unchanged: the loser's deactivate_active rolled back"
+        );
+        assert_eq!(
+            post_total, pre_total,
+            "the loser's create was rolled back: no orphan predecessor in history"
+        );
+        assert!(
+            gitforge_db::queries::PipelineQueries::get(&pool, losing_pipeline_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the loser's pipeline version row must not exist"
+        );
+
+        // No launch side effect may exist under the losing run id.
+        assert!(
+            deps.run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .get(&losing_run_id)
+                .is_none(),
+            "the losing drive must not prepare a workspace"
+        );
+        assert!(
+            deps.pipeline_registry
+                .read()
+                .await
+                .get(&losing_run_id)
+                .is_none(),
+            "the losing drive must not register its engine"
+        );
+        assert!(
+            gitforge_db::queries::JobQueries::list_by_run(&pool, losing_run_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the losing drive must not persist planned job rows"
+        );
+        for job_id in &initially_ready {
+            assert!(
+                !deps.scheduler.job_exists(*job_id).await,
+                "the losing drive must not enqueue job {job_id}"
+            );
+        }
+        assert!(
+            gitforge_db::queries::PipelineRunQueries::get(&pool, losing_run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the losing drive's run row must not exist"
+        );
+        assert_eq!(
+            gitforge_db::queries::PipelineRunQueries::list(&pool)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the accepted event still has exactly one run"
+        );
+    }
+
+    /// The companion contract: a drive that WINS the adjudication is the
+    /// durable run and still launches with every side effect — the race
+    /// check must never turn a winner into a silent no-op. The version
+    /// and run are committed together; the workspace, engine, planned
+    /// jobs, and enqueued runs are all in place.
+    #[tokio::test]
+    async fn winning_trigger_drive_launches_the_run_with_full_side_effects() {
+        let (pool, repo_id, deps, _db_path) = trigger_recovery_fixture().await;
+        let event_id = uuid::Uuid::new_v4();
+        let commit = "d".repeat(40);
+
+        let pipeline = create_default_pipeline(&repo_id.to_string());
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let trigger =
+            PipelineTriggerEvent::new(pipeline_id, repo_id, commit.clone(), TriggerType::Push);
+        let engine = Arc::new(CiEngine::new(trigger, pipeline.clone()).await.unwrap());
+        engine.start().await.unwrap();
+        let run_id = engine.state().await.run_id;
+        let initially_ready = engine.ready_jobs().await;
+        assert!(!initially_ready.is_empty(), "fixture: drive has work");
+
+        let launched = persist_and_launch_run(
+            Some(&pool),
+            &deps.scheduler,
+            &engine,
+            pipeline_id,
+            &pipeline,
+            repo_id,
+            &commit,
+            event_id,
+            Some(std::env::current_dir().unwrap().display().to_string()),
+            &deps.run_workspace_paths,
+            &deps.pipeline_registry,
+        )
+        .await
+        .expect("a winning drive launches its own run");
+
+        assert_eq!(launched, run_id, "the winning drive returns its own run id");
+        // The version+run transaction committed: the pipeline row is
+        // there, the run row is there, and the active version is the
+        // one this drive just installed.
+        let pipeline_row = gitforge_db::queries::PipelineQueries::get(&pool, pipeline_id)
+            .await
+            .unwrap()
+            .expect("the winning drive's pipeline version row must be persisted");
+        assert_eq!(pipeline_row.id, pipeline_id);
+        assert_eq!(pipeline_row.name, pipeline.name);
+        let (active_id, total) = gitforge_db::queries::PipelineQueries::version_stats_by_name(
+            &pool,
+            repo_id,
+            &pipeline.name,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            active_id,
+            Some(pipeline_id),
+            "the winning drive's version is the active one"
+        );
+        assert_eq!(total, 1, "no predecessor existed before this drive");
+        assert_eq!(
+            gitforge_db::queries::PipelineRunQueries::get(&pool, run_id)
+                .await
+                .unwrap()
+                .map(|run| run.id),
+            Some(run_id),
+            "the winning drive's run row is persisted"
+        );
+        assert_eq!(
+            deps.run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .get(&run_id)
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some(std::env::current_dir().unwrap().to_str().unwrap()),
+            "the winning drive prepared its workspace"
+        );
+        assert!(
+            deps.pipeline_registry.read().await.get(&run_id).is_some(),
+            "the winning drive registered its engine"
+        );
+        assert!(
+            !gitforge_db::queries::JobQueries::list_by_run(&pool, run_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the winning drive persisted planned job rows"
+        );
+        for job_id in &initially_ready {
+            assert!(
+                deps.scheduler.job_exists(*job_id).await,
+                "the winning drive enqueued job {job_id}"
+            );
+        }
+        assert_eq!(
+            gitforge_db::queries::PipelineRunQueries::find_id_by_trigger_event(&pool, event_id)
+                .await
+                .unwrap(),
+            Some(run_id),
+            "the durable event link points at the launched run"
+        );
+    }
+
+    /// Two drives released together for the same accepted event must converge
+    /// on exactly one durable run; only the transaction winner may launch.
+    #[tokio::test]
+    async fn concurrent_trigger_drives_converge_and_only_winner_launches() {
+        let (pool, repo_id, deps, _db_path) = trigger_recovery_fixture().await;
+        let event_id = uuid::Uuid::new_v4();
+        let commit = "e".repeat(40);
+        let mut pipeline = create_default_pipeline(&repo_id.to_string());
+        pipeline.name = "concurrent-race-pipeline".to_string();
+
+        let first_pipeline_id = gitforge_common::PipelineId::new();
+        let first_trigger = PipelineTriggerEvent::new(
+            first_pipeline_id,
+            repo_id,
+            commit.clone(),
+            TriggerType::Push,
+        );
+        let first_engine = Arc::new(
+            CiEngine::new(first_trigger, pipeline.clone())
+                .await
+                .unwrap(),
+        );
+        first_engine.start().await.unwrap();
+        let first_run_id = first_engine.state().await.run_id;
+        let first_jobs = first_engine.ready_jobs().await;
+
+        let second_pipeline_id = gitforge_common::PipelineId::new();
+        let second_trigger = PipelineTriggerEvent::new(
+            second_pipeline_id,
+            repo_id,
+            commit.clone(),
+            TriggerType::Push,
+        );
+        let second_engine = Arc::new(
+            CiEngine::new(second_trigger, pipeline.clone())
+                .await
+                .unwrap(),
+        );
+        second_engine.start().await.unwrap();
+        let second_run_id = second_engine.state().await.run_id;
+        let second_jobs = second_engine.ready_jobs().await;
+        assert_ne!(
+            first_run_id, second_run_id,
+            "drives must have distinct run ids"
+        );
+        assert_ne!(
+            first_pipeline_id, second_pipeline_id,
+            "drives must have distinct pipeline version ids"
+        );
+        assert!(!first_jobs.is_empty(), "first drive fixture must have work");
+        assert!(
+            !second_jobs.is_empty(),
+            "second drive fixture must have work"
+        );
+
+        // Release both callers at the same point. The join macro polls both
+        // async drives together, while SQLite BEGIN IMMEDIATE must serialize
+        // their version+run writes and return the winner id to the loser.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first_barrier = barrier.clone();
+        let first_drive = async {
+            first_barrier.wait().await;
+            persist_and_launch_run(
+                Some(&pool),
+                &deps.scheduler,
+                &first_engine,
+                first_pipeline_id,
+                &pipeline,
+                repo_id,
+                &commit,
+                event_id,
+                Some(std::env::current_dir().unwrap().display().to_string()),
+                &deps.run_workspace_paths,
+                &deps.pipeline_registry,
+            )
+            .await
+        };
+        let second_drive = async {
+            barrier.wait().await;
+            persist_and_launch_run(
+                Some(&pool),
+                &deps.scheduler,
+                &second_engine,
+                second_pipeline_id,
+                &pipeline,
+                repo_id,
+                &commit,
+                event_id,
+                Some(std::env::current_dir().unwrap().display().to_string()),
+                &deps.run_workspace_paths,
+                &deps.pipeline_registry,
+            )
+            .await
+        };
+        let (first_result, second_result) = tokio::join!(first_drive, second_drive);
+        let first_durable_run = first_result.expect("first drive must return a durable run id");
+        let second_durable_run = second_result.expect("second drive must return a durable run id");
+        assert_eq!(
+            first_durable_run, second_durable_run,
+            "both drives must converge on the same durable run"
+        );
+        assert!(
+            [first_run_id, second_run_id].contains(&first_durable_run),
+            "durable identity must belong to one of the competing drives"
+        );
+
+        let first_won = first_durable_run == first_run_id;
+        let (
+            winner_run_id,
+            loser_run_id,
+            winner_pipeline_id,
+            loser_pipeline_id,
+            winner_jobs,
+            loser_jobs,
+        ) = if first_won {
+            (
+                first_run_id,
+                second_run_id,
+                first_pipeline_id,
+                second_pipeline_id,
+                &first_jobs,
+                &second_jobs,
+            )
+        } else {
+            (
+                second_run_id,
+                first_run_id,
+                second_pipeline_id,
+                first_pipeline_id,
+                &second_jobs,
+                &first_jobs,
+            )
+        };
+
+        let (active_pipeline_id, version_count) =
+            gitforge_db::queries::PipelineQueries::version_stats_by_name(
+                &pool,
+                repo_id,
+                &pipeline.name,
+            )
+            .await
+            .unwrap();
+        assert_eq!(active_pipeline_id, Some(winner_pipeline_id));
+        assert_eq!(version_count, 1, "losing version must roll back");
+        assert!(
+            gitforge_db::queries::PipelineQueries::get(&pool, loser_pipeline_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "losing pipeline version must not persist"
+        );
+        assert_eq!(
+            gitforge_db::queries::PipelineRunQueries::list(&pool)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the event must have exactly one durable run"
+        );
+        assert!(
+            deps.pipeline_registry
+                .read()
+                .await
+                .get(&winner_run_id)
+                .is_some(),
+            "winning drive must register its engine"
+        );
+        assert!(
+            deps.pipeline_registry
+                .read()
+                .await
+                .get(&loser_run_id)
+                .is_none(),
+            "losing drive must not register its engine"
+        );
+        assert!(
+            !gitforge_db::queries::JobQueries::list_by_run(&pool, winner_run_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "winning drive must persist planned jobs"
+        );
+        assert!(
+            gitforge_db::queries::JobQueries::list_by_run(&pool, loser_run_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "losing drive must not persist planned jobs"
+        );
+        for job_id in winner_jobs {
+            assert!(deps.scheduler.job_exists(*job_id).await);
+        }
+        for job_id in loser_jobs {
+            assert!(!deps.scheduler.job_exists(*job_id).await);
+        }
+        assert!(
+            deps.run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .get(&winner_run_id)
+                .is_some(),
+            "winning drive must record its workspace"
+        );
+        assert!(
+            deps.run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .get(&loser_run_id)
+                .is_none(),
+            "losing drive must not prepare a workspace"
+        );
+    }
     /// A drive that fails *after* creating its run is healed by correlating
     /// that run — the workspace-clone failure here leaves a failed run and
     /// recovery resolves the event to it instead of retrying into a second

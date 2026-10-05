@@ -8,9 +8,15 @@ use chrono::{DateTime, Utc};
 use gitforge_common::{
     Error, JobId, PipelineId, PipelineRunId, RepoId, Result, RunnerId, SshKeyId, UserId,
 };
-use sqlx::Row;
+use sqlx::{Executor, Row, Sqlite};
 use std::time::Duration;
 use uuid::Uuid;
+
+/// A BEGIN IMMEDIATE transaction on the SQLite pool — every multi-statement
+/// write path uses this upgrade-to-write so concurrent writers serialize
+/// instead of racing (the WAL upgrade-to-write BUSY ignores the busy
+/// handler, see `connection.rs`).
+pub type DbTx<'c> = sqlx::Transaction<'c, Sqlite>;
 
 fn parse_uuid_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<Uuid> {
     let value: String = row
@@ -649,8 +655,12 @@ impl SshKeyQueries {
 pub struct PipelineQueries;
 
 impl PipelineQueries {
-    /// Create a new pipeline
-    pub async fn create(pool: &Pool, pipeline: &crate::models::Pipeline) -> Result<()> {
+    /// Insert a pipeline row on any pool or open transaction. The pool and
+    /// transaction callers below share this so the SQL stays in one place.
+    async fn insert_pipeline(
+        executor: impl Executor<'_, Database = Sqlite>,
+        pipeline: &crate::models::Pipeline,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO pipelines (id, repo_id, name, trigger_type, config, created_at)
@@ -663,10 +673,22 @@ impl PipelineQueries {
         .bind(&pipeline.trigger_type)
         .bind(pipeline.config.to_string())
         .bind(pipeline.created_at.to_rfc3339())
-        .execute(pool.pool())
+        .execute(executor)
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline: {e}")))?;
         Ok(())
+    }
+
+    /// Create a new pipeline
+    pub async fn create(pool: &Pool, pipeline: &crate::models::Pipeline) -> Result<()> {
+        Self::insert_pipeline(pool.pool(), pipeline).await
+    }
+
+    /// Same as [`Self::create`] but operates on an open transaction so the
+    /// insert is part of a multi-statement unit (e.g. the version+run
+    /// helper's atomicity contract below).
+    pub async fn create_tx(tx: &mut DbTx<'_>, pipeline: &crate::models::Pipeline) -> Result<()> {
+        Self::insert_pipeline(&mut **tx, pipeline).await
     }
 
     /// Retire the currently active pipeline version for (repo_id, name).
@@ -677,12 +699,31 @@ impl PipelineQueries {
     /// run creation with a constraint violation. Superseded rows stay as
     /// history with active = 0.
     pub async fn deactivate_active(pool: &Pool, repo_id: RepoId, name: &str) -> Result<()> {
+        Self::deactivate_active_with(pool.pool(), repo_id, name).await
+    }
+
+    /// Same as [`Self::deactivate_active`] but operates on an open
+    /// transaction (see [`Self::create_version_and_run_for_trigger`]).
+    pub async fn deactivate_active_tx(
+        tx: &mut DbTx<'_>,
+        repo_id: RepoId,
+        name: &str,
+    ) -> Result<()> {
+        Self::deactivate_active_with(&mut **tx, repo_id, name).await
+    }
+
+    /// Shared executor-generic body for `deactivate_active` and its tx twin.
+    async fn deactivate_active_with(
+        executor: impl Executor<'_, Database = Sqlite>,
+        repo_id: RepoId,
+        name: &str,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE pipelines SET active = 0 WHERE repo_id = ? AND name = ? AND active = 1",
         )
         .bind(repo_id.to_string())
         .bind(name)
-        .execute(pool.pool())
+        .execute(executor)
         .await
         .map_err(|e| Error::database(format!("failed to deactivate pipeline: {e}")))?;
         Ok(())
@@ -702,6 +743,46 @@ impl PipelineQueries {
         Ok(count)
     }
 
+    /// Pipeline-version invariants for `(repo_id, name)`: the id of the
+    /// currently active version (if any) and the total count of versions
+    /// in history (active plus retired predecessors). The partial UNIQUE
+    /// index guarantees the active id is `Some` at most once.
+    ///
+    /// This is the F2 losing-drive invariant: a losing drive of a
+    /// trigger race must leave both values unchanged. Its
+    /// `deactivate_active` + `create` are rolled back by
+    /// [`Self::create_version_and_run_for_trigger`], so the active row
+    /// stays the winner's and no orphan predecessor is appended.
+    pub async fn version_stats_by_name(
+        pool: &Pool,
+        repo_id: RepoId,
+        name: &str,
+    ) -> Result<(Option<PipelineId>, i64)> {
+        let rows = sqlx::query("SELECT id, active FROM pipelines WHERE repo_id = ? AND name = ?")
+            .bind(repo_id.to_string())
+            .bind(name)
+            .fetch_all(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to read pipeline versions: {e}")))?;
+        let mut active_id: Option<PipelineId> = None;
+        let mut total: i64 = 0;
+        for row in rows {
+            total += 1;
+            let id: String = row
+                .try_get("id")
+                .map_err(|e| Error::database(format!("invalid pipeline id: {e}")))?;
+            let uuid = Uuid::parse_str(&id)
+                .map_err(|e| Error::database(format!("invalid pipeline UUID: {e}")))?;
+            let active: i64 = row
+                .try_get("active")
+                .map_err(|e| Error::database(format!("invalid pipeline active flag: {e}")))?;
+            if active == 1 {
+                active_id = Some(PipelineId::from(uuid));
+            }
+        }
+        Ok((active_id, total))
+    }
+
     /// Delete a pipeline row outright.
     ///
     /// Only safe for definitions with no runs: runs reference their
@@ -714,6 +795,69 @@ impl PipelineQueries {
             .await
             .map_err(|e| Error::database(format!("failed to delete pipeline: {e}")))?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Atomically retire the current active pipeline version for
+    /// `(repo_id, name)`, insert this push's version, and adjudicate the
+    /// trigger-event run race (F2 run-idempotency). The partial UNIQUE
+    /// index on `pipeline_runs.trigger_event_id` lets exactly one drive
+    /// of an accepted event land its run row; the loser detects the loss
+    /// here and the whole transaction rolls back so the loser's version
+    /// change is undone — the winner's predecessor stays active, no
+    /// orphan version lingers, no run row exists under the losing id.
+    /// Both drives then converge on the durable run id.
+    ///
+    /// The transaction holds the write lock from the first UPDATE
+    /// through commit/rollback, so a losing drive's `deactivate_active`
+    /// cannot interleave with a winning drive's predecessor between the
+    /// run-idempotency check and the pipeline-version write. The
+    /// per-statement helpers are the only SQL involved; service code
+    /// stays free of `pool.pool()`.
+    pub async fn create_version_and_run_for_trigger(
+        pool: &Pool,
+        pipeline: &crate::models::Pipeline,
+        run: &crate::models::PipelineRun,
+        event_id: Uuid,
+    ) -> Result<PipelineRunId> {
+        let mut tx = pool
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| {
+                Error::database(format!("failed to begin version+run transaction: {e}"))
+            })?;
+        if let Err(error) =
+            Self::deactivate_active_tx(&mut tx, pipeline.repo_id, &pipeline.name).await
+        {
+            let _ = tx.rollback().await;
+            return Err(error);
+        }
+        if let Err(error) = Self::create_tx(&mut tx, pipeline).await {
+            let _ = tx.rollback().await;
+            return Err(error);
+        }
+        let durable_run =
+            match PipelineRunQueries::create_for_trigger_tx(&mut tx, run, event_id).await {
+                Ok(id) => id,
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    return Err(error);
+                }
+            };
+        if durable_run == run.id {
+            tx.commit()
+                .await
+                .map_err(|e| Error::database(format!("failed to commit version+run: {e}")))?;
+        } else {
+            // The losing drive's pipeline version change is rolled back:
+            // the winner's predecessor stays active and the loser's
+            // version disappears, leaving the active row count for
+            // (repo, name) at exactly one.
+            tx.rollback().await.map_err(|e| {
+                Error::database(format!("failed to roll back losing version+run: {e}"))
+            })?;
+        }
+        Ok(durable_run)
     }
 
     /// Get a pipeline by ID
@@ -821,11 +965,23 @@ impl PipelineRunQueries {
         pool: &Pool,
         event_id: Uuid,
     ) -> Result<Option<PipelineRunId>> {
+        Self::find_id_by_trigger_event_with(pool.pool(), event_id).await
+    }
+
+    /// Executor-generic body for the trigger-event run readback shared by
+    /// the pool and transaction variants. Both the pool's `&SqlitePool`
+    /// (Copy) and `&mut **tx` (reborrowed from the caller's transaction)
+    /// satisfy the bound, so the pool caller passes `pool.pool()` and the
+    /// transaction caller passes `&mut **tx`.
+    async fn find_id_by_trigger_event_with(
+        executor: impl Executor<'_, Database = Sqlite>,
+        event_id: Uuid,
+    ) -> Result<Option<PipelineRunId>> {
         let row = sqlx::query(
             "SELECT id FROM pipeline_runs WHERE trigger_event_id = ? ORDER BY created_at LIMIT 1",
         )
         .bind(event_id.to_string())
-        .fetch_optional(pool.pool())
+        .fetch_optional(executor)
         .await
         .map_err(|e| Error::database(format!("failed to find run by trigger event: {e}")))?;
         match row {
@@ -888,6 +1044,63 @@ impl PipelineRunQueries {
                     })
             }
         }
+    }
+
+    /// Same semantics as [`Self::create_for_trigger`] but runs on a
+    /// caller-supplied transaction. The readback after a UNIQUE-constraint
+    /// loss reuses the same connection so the loser sees the committed
+    /// winner's row without leaving the transaction.
+    pub async fn create_for_trigger_tx(
+        tx: &mut DbTx<'_>,
+        run: &crate::models::PipelineRun,
+        event_id: Uuid,
+    ) -> Result<PipelineRunId> {
+        let insert = sqlx::query(
+            r#"
+            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at, trigger_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(run.id.to_string())
+        .bind(run.pipeline_id.to_string())
+        .bind(run.repo_id.to_string())
+        .bind(&run.status)
+        .bind(&run.triggered_by)
+        .bind(&run.commit_hash)
+        .bind(run.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.finished_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.created_at.to_rfc3339())
+        .bind(event_id.to_string())
+        .execute(&mut **tx)
+        .await;
+        match insert {
+            Ok(_) => Ok(run.id),
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("UNIQUE constraint failed") {
+                    return Err(Error::database(format!(
+                        "failed to create pipeline run: {error}"
+                    )));
+                }
+                Self::find_id_by_trigger_event_tx(tx, event_id)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::database(
+                            "run insert lost the trigger idempotency race but no winner exists",
+                        )
+                    })
+            }
+        }
+    }
+
+    /// In-transaction readback used by [`Self::create_for_trigger_tx`]
+    /// after a UNIQUE-constraint loss. Re-exposes the executor-generic
+    /// body through the transaction's own connection.
+    async fn find_id_by_trigger_event_tx(
+        tx: &mut DbTx<'_>,
+        event_id: Uuid,
+    ) -> Result<Option<PipelineRunId>> {
+        Self::find_id_by_trigger_event_with(&mut **tx, event_id).await
     }
 
     /// Update pipeline run status.
