@@ -150,6 +150,18 @@ struct PendingPush {
     repo_id: gitforge_common::RepoId,
 }
 
+struct ProcessPump {
+    handle: russh::server::Handle,
+    channel: russh::ChannelId,
+    child: Child,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+    cancellation: oneshot::Receiver<()>,
+    push_event: oneshot::Receiver<PushEventContext>,
+    db_pool: Option<Arc<Pool>>,
+    capture_receive_status: bool,
+}
+
 struct PushEventContext {
     repo_id: Option<gitforge_common::RepoId>,
     updates: Vec<crate::ref_policy::ReceiveUpdate>,
@@ -575,17 +587,17 @@ impl GitSshSession {
 
         let handle = session.handle();
         let capture_receive_status = git_command == "receive-pack";
-        tokio::spawn(pump_until_exit(
+        tokio::spawn(pump_until_exit(ProcessPump {
             handle,
             channel,
             child,
             stdout,
             stderr,
             cancellation,
-            push_event_receiver,
-            self.context.db_pool.clone(),
+            push_event: push_event_receiver,
+            db_pool: self.context.db_pool.clone(),
             capture_receive_status,
-        ));
+        }));
         tracing::info!(
             command = %command.trim(),
             %repo_path,
@@ -655,17 +667,18 @@ fn parse_git_command(command: &str) -> Result<(&str, String), String> {
 
 /// Forward the git child's stdout to the channel, its stderr as extended
 /// (stderr) data, and report the exit status once both pipes are drained.
-async fn pump_until_exit(
-    handle: russh::server::Handle,
-    channel: russh::ChannelId,
-    mut child: Child,
-    stdout: tokio::process::ChildStdout,
-    stderr: tokio::process::ChildStderr,
-    mut cancellation: oneshot::Receiver<()>,
-    push_event: oneshot::Receiver<PushEventContext>,
-    db_pool: Option<Arc<Pool>>,
-    capture_receive_status: bool,
-) {
+async fn pump_until_exit(pump: ProcessPump) {
+    let ProcessPump {
+        handle,
+        channel,
+        mut child,
+        stdout,
+        stderr,
+        mut cancellation,
+        push_event,
+        db_pool,
+        capture_receive_status,
+    } = pump;
     let data_handle = handle.clone();
     let mut out_task = tokio::spawn(async move {
         if capture_receive_status {
@@ -771,7 +784,13 @@ fn parse_receive_status_ok_refs(status: &[u8]) -> Option<std::collections::HashS
             usize::from_str_radix(std::str::from_utf8(&status[offset..offset + 4]).ok()?, 16)
                 .ok()?;
         if length == 0 {
-            return saw_unpack_ok.then_some(accepted);
+            if saw_unpack_ok {
+                return Some(accepted);
+            }
+            // receive-pack stdout includes a ref advertisement section before
+            // its post-push status report. Skip its flush and keep parsing.
+            offset += 4;
+            continue;
         }
         if length < 4 || offset + length > status.len() {
             return None;
@@ -920,6 +939,13 @@ mod tests {
         assert!(accepted.contains("refs/heads/main"));
         assert!(!accepted.contains("refs/heads/bad"));
         assert!(parse_receive_status_ok_refs(b"0000").is_none());
+    }
+
+    #[test]
+    fn test_receive_status_skips_initial_advertisement_flush() {
+        let status = b"000eversion 1\n0000000eunpack ok\n0017ok refs/heads/main\n0000";
+        let accepted = parse_receive_status_ok_refs(status).expect("valid post-push status");
+        assert!(accepted.contains("refs/heads/main"));
     }
 
     #[tokio::test]
