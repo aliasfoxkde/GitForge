@@ -1,15 +1,15 @@
 # GitForge Fedora user-systemd policy
 
-These files describe the **candidate** user-systemd deployment contract for
-the Fedora host. They are not installed automatically and no live service
-uses them: since the 2026-09-22 cutover the live services are supervised by
-the **system** template units `gitforge@{api,ci,git-server,runner}.service`,
-installed from `systemd/gitforge@.service` with the runtime environment and
-`ExecStart` pin supplied by a `/etc/systemd/system/gitforge@.service.d/`
-drop-in (see `docs/RUNBOOK.md` → "Service environment and credential
-isolation" and `docs/planning/MASTER_PLAN_2026-09-20.md` §4). Treat this
-directory as a candidate migration target; apply anything here only through
-the release/rollback procedure below after validating the complete unit set.
+These files describe the active **user-systemd deployment contract** for the
+Fedora host. The running services are `gitforge-api.service`,
+`gitforge-ci.service`, `gitforge-git-server.service`, and
+`gitforge-runner.service`; their installed units and operational drop-ins are
+under `~/.config/systemd/user/`. The system-scope template
+`systemd/gitforge@.service` is not the active deployment. A names-only audit
+on 2026-10-05 found provider credentials in the active processes; the
+isolation drop-in remains uninstalled and requires a drained-queue rollout
+with rollback. See
+`docs/RUNBOOK.md` → "Service Environment and Credential Isolation".
 
 ## Resource policy
 
@@ -71,12 +71,14 @@ The candidate CI binary owns the scheduler HTTP API, so the legacy standalone
 
 The legacy `make run-all` and `make stop` targets intentionally refuse
 unmanaged background startup and broad process termination. Service lifecycle
-belongs to the service manager — today the `gitforge@*` system template
+belongs to the user service manager — today the named `gitforge-*.service`
 units — so resource limits, restart behavior, and status remain observable
-and scoped to named GitForge units. Ad-hoc copies of the binaries started
-from an operator shell are the one leak path unit files cannot cover: they
-inherit the shell's full environment, including every exported provider key.
-Always start services through their units.
+and scoped to named GitForge units. A managed user unit still inherits the
+manager's imported environment unless its per-unit `UnsetEnvironment=` policy
+removes irrelevant provider variables; the live units do not yet have that
+drop-in. Ad-hoc copies started from an operator shell inherit the same ambient
+environment and are outside unit-level protection. Always use named service
+units and install the verified per-unit scrub before restarting them.
 
 ## Credential isolation
 
@@ -90,8 +92,10 @@ login variables. The list is mirrored from the canonical list in
 `systemd/gitforge@.service`; `scripts/verify-unit-env-policy` (run by
 `make unit-policy`, part of `make lint`) fails on drift between the two
 files and on any scrub that would remove a variable a service actually
-reads. The exact per-service environment contract is documented in
-`docs/RUNBOOK.md`.
+reads. This removes provider keys/endpoints, not all cross-service GitForge
+secrets: JWT, database, scheduler, and CI-trigger credentials still need a
+later per-unit least-privilege policy. The exact per-service environment
+contract and remaining gap are documented in `docs/RUNBOOK.md`.
 
 Two credential paths are intentionally outside every service unit:
 
@@ -135,6 +139,6 @@ unless an operator explicitly invokes `--apply` against a production path.
 6. Promote one release atomically, health-check, and retain the prior release
    for rollback.
 
-Do not install this policy directly into the current production units until the
-runner's container-child accounting and the rollback procedure have been
-verified.
+Do not restart production units with this policy until the CI queue is drained,
+the runner's container-child accounting and rollback procedure have been
+verified, and the full remote GitForge lane passes.

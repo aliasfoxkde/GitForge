@@ -60,8 +60,8 @@ shellcheck:
 	shellcheck scripts/*.sh systemd/*.sh
 
 # Service-unit policy verification (no installation, no live changes):
-# resource limits for the candidate user units, and the credential-isolation
-# UnsetEnvironment= policy for the system template + user drop-in.
+# resource limits and credential-isolation policy for active user units,
+# plus the mirrored policy in the system-scope candidate template.
 unit-policy:
 	./scripts/verify-unit-env-policy
 	./scripts/verify-user-systemd-policy
@@ -111,14 +111,14 @@ run-git-server:
 
 run-all:
 	@echo "Refusing unmanaged multi-process startup." >&2
-	@echo "Lifecycle belongs to the system template units: gitforge@{api,git-server,ci,runner}.service" >&2
-	@echo "(see docs/RUNBOOK.md and systemd/gitforge-install.sh)." >&2
+	@echo "Lifecycle belongs to the Fedora user units: gitforge-{api,ci,git-server,runner}.service" >&2
+	@echo "(see systemd/user/README.md and docs/RUNBOOK.md)." >&2
 	@exit 2
 
 # ─── Stop Services ────────────────────────────────────────────────────────────
 stop:
 	@echo "Refusing unmanaged process termination." >&2
-	@echo "Use systemctl with the documented GitForge system units (gitforge@*)." >&2
+	@echo "Use systemctl --user with the documented GitForge user units." >&2
 	@exit 2
 
 # ─── Docker ───────────────────────────────────────────────────────────────────
@@ -158,8 +158,8 @@ help:
 	@echo "  make aegis-baseline    - Regenerate the Aegis baseline"
 	@echo "  make unit-policy       - Verify service-unit resource + env-isolation policy"
 	@echo ""
-	@echo "  make run-all           - Refuse unmanaged startup; use gitforge@* system units"
-	@echo "  make stop              - Refuse unmanaged termination; use gitforge@* system units"
+	@echo "  make run-all           - Refuse unmanaged startup; use GitForge user-systemd units"
+	@echo "  make stop              - Refuse unmanaged termination; use GitForge user-systemd units"
 	@echo ""
 	@echo "  make docker-build      - Build Docker image"
 	@echo "  make docker-up         - Start with Docker Compose"

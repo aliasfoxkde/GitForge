@@ -11,8 +11,8 @@
 #   3. No variable any service binary reads (the required-env allowlist
 #      documented in docs/RUNBOOK.md) is scrubbed — isolation must be
 #      strictly subtractive for the services.
-#   4. systemd-analyze validates the directive syntax of the system template
-#      and the candidate user units with the isolation drop-in merged.
+#   4. systemd-analyze validates the directive syntax and candidate user
+#      units with the isolation drop-in merged.
 #
 # Fails closed: any drift, overlap, or parse diagnostic fails the script.
 set -u -o pipefail
@@ -123,10 +123,10 @@ for name in "${required_env[@]}"; do
 done
 
 # ── 4. systemd-analyze validates the directive syntax ───────────────────────
-# The system template is verified in isolation: a synthetic oneshot unit that
-# embeds the template's UnsetEnvironment= block. Verifying the template file
-# by name would merge the live host's drop-ins (ExecStart pin) and unrelated
-# host units, which are outside this check's scope.
+# Verify a synthetic oneshot unit embedding the candidate system template's
+# UnsetEnvironment= block in user mode. This validates the shared directive
+# syntax without root access or scanning unrelated host system units. The
+# separate candidate user units below validate drop-in merge behavior.
 sys_unit="$RUN_DIR/gitforge-unit-env-policy.service"
 {
     printf '[Unit]\nDescription=Disposable GitForge env-policy check (system scope)\n\n'
@@ -134,8 +134,9 @@ sys_unit="$RUN_DIR/gitforge-unit-env-policy.service"
     sed -n '/^UnsetEnvironment=/,/^$/p' "$TEMPLATE" | grep -v '^$'
     printf '\n[Install]\nWantedBy=multi-user.target\n'
 } > "$sys_unit"
-if ! systemd-analyze verify "$sys_unit"; then
+if ! out=$(systemd-analyze --user verify "$sys_unit" 2>&1); then
     fail "system-scope policy unit failed systemd-analyze verify"
+    printf '%s\n' "$out" >&2
 fi
 
 # Candidate user units: the real example units with ExecStart/WorkingDirectory
