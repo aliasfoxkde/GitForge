@@ -9,6 +9,34 @@ User=gitforge
 Group=gitforge
 WorkingDirectory=/nas/Temp/repos/GitForge
 Environment=RUST_LOG=info
+
+# Ambient-credential isolation. Provider/host secrets from the manager's
+# global set, EnvironmentFile= drop-ins, or PAM must never reach a GitForge
+# service process: no service binary consumes them, and every child the
+# services spawn (git receive-pack, container exec) inherits this environment.
+# systemd applies UnsetEnvironment= as the FINAL step when compiling the
+# executed environment, so it undoes assignments from any configuration
+# source. The interactive `gitforge` CLI (code review) and explicit job
+# payload env are not service processes and are unaffected.
+# This list is canonical: systemd/user/gitforge-env-isolation.conf mirrors it
+# for the candidate user-scope units, and scripts/verify-unit-env-policy
+# fails when the two drift apart or when a service-required variable is
+# scrubbed here. Extend both together.
+UnsetEnvironment=AMORTYX_ADMIN_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN \
+    ANTHROPIC_BASE_URL CLOUDFLARE_ALL_ACCESS_TOKEN CLOUDFLARE_API_TOKEN \
+    CLOUDFLARE_BUILD_TOKEN CODEX_API_KEY GEMINI_API_KEY GH_TOKEN \
+    GITHUB_TOKEN GOOGLE_AI_API_KEY GOOGLE_APPLICATION_CREDENTIALS \
+    GROQ_API_KEY GROQ_FREE_API_KEY HF_TOKEN HUGGING_FACE_HUB_TOKEN \
+    KAGGLE_API_KEY KAGGLE_API_TOKEN KILO_API_KEY KILOCODE_API_KEY \
+    LEMONSQEEZY_API_KEY LEMONSQEEZY_WEBHOOK_SECRET LOCAL_API_KEY \
+    MINIMAX_ANTHROPIC_BASE_URL MINIMAX_API_KEY MINIMAX_OPENAI_BASE_URL \
+    OPENAI_API_KEY OPENAI_BASE_URL OPENROUTER_API_KEY OPENROUTER_BASE_URL \
+    ORCA_API_KEY OWNER_PASSWORD PADDLE_API_KEY PADDLE_CLIENT_SIDE_TOKEN \
+    PADDLE_WEBHOOK_SECRET RUNINFRA_API_KEY SESSION_SECRET TIYUVTA_API_KEY \
+    WORKOS_API_KEY ZAI_ANTHROPIC_BASE_URL ZAI_API_KEY ZAI_GLM_LITE_API_KEY \
+    ZAI_GLM_MAX_API_KEY ZAI_GLM_PRO_API_KEY ZAI_LITE_API_KEY ZAI_MAX_API_KEY \
+    ZAI_OPENAI_BASE_URL ZAI_PRO_API_KEY
+
 ExecStart=/nas/Temp/repos/GitForge/target/release/%i
 Restart=always
 RestartSec=5

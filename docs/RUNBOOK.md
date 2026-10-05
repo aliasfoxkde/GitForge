@@ -166,6 +166,153 @@ Historical stale rows are retained for audit and can be retired through the
 authenticated runner-retirement operation after confirming that they own no
 active jobs.
 
+## Service Environment and Credential Isolation
+
+### Who owns service lifecycle
+
+The live services are supervised by the **system** template units
+`gitforge@{api,git-server,ci,runner}.service`, installed from
+`systemd/gitforge@.service` (`Restart=always`), with the runtime environment
+and the release-bundle `ExecStart` pin supplied by the
+`/etc/systemd/system/gitforge@.service.d/` drop-in (cutover procedure:
+`docs/planning/MASTER_PLAN_2026-09-20.md` §4). The files under
+`systemd/user/` are an **unbuilt candidate** migration to user-systemd; no
+live service uses them. `scripts/gitforge-status` reports the unit scope
+that actually owns each process.
+
+### Credential scrub policy
+
+Provider keys and host secrets must never reach a service process: no
+GitForge service binary consumes them, and everything the services spawn
+(`git receive-pack`, container exec) inherits their environment. Every unit
+therefore carries an explicit `UnsetEnvironment=` scrub — systemd applies it
+as the **final step** when compiling the executed environment, so it
+overrides `EnvironmentFile=` files, drop-in `Environment=` lines, manager
+globals, and PAM:
+
+| Scope | File | Status |
+|-------|------|--------|
+| System template (live deployment) | `systemd/gitforge@.service` — canonical list | deployed on `daemon-reload` after recopying the unit |
+| User-systemd candidate | `systemd/user/gitforge-env-isolation.conf` — mirror of the canonical list | not installed |
+
+`make unit-policy` (part of `make lint`; `scripts/verify-unit-env-policy`)
+fails on: drift between the canonical list and the user drop-in, a scrubbed
+name that the codebase consumes for the CLI (grep'd from `gitforge-ai`), or
+a scrub of any variable in the required-environment table below. Extend the
+list by editing **both** files together — never one.
+
+Two credential paths are intentionally outside every service unit:
+
+- **Interactive CLI** — `gitforge` code review reads `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` from the invoking shell (`crates/gitforge-ai`). The CLI
+  is not a service; the scrub never applies to it.
+- **Job payloads** — credentials a CI job needs travel in the job
+  specification through the scheduler/runner API and are injected as
+  explicit `docker exec` env pairs (`crates/gitforge-runner/src/executor.rs`,
+  `crates/gitforge-sandbox/src/docker.rs`). The runner's own process
+  environment is never forwarded into job containers, so the scrub cannot
+  break an explicitly configured payload.
+
+### Required environment, per service
+
+The complete set of variables each binary reads. Anything else (and anything
+on the scrub list) has no effect on the service; prefer `JWT_SECRET_FILE`-
+style credential files over inline secrets where supported.
+
+**`gitforge@api`** (`services/api`)
+
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `JWT_SECRET_FILE` / `JWT_SECRET` (`_FILE` wins) | one of the two | — | JWT signing secret; `_FILE` points at a 0600 file (LoadCredential pattern) |
+| `PORT` | no | `42780` | Listen port |
+| `DATABASE_URL` | no | `sqlite:/gitforge.db` | SQLite location |
+| `GITFORGE_CI_TRIGGER_URL` | no | — | CI trigger endpoint used by Git-server bridge |
+| `GITFORGE_CI_TRIGGER_TOKEN` | no | — | Bearer token for the trigger |
+
+**`gitforge@git-server`** (`services/git-server`)
+
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `GIT_ROOT` | yes | — | Repository tree root (unset ⇒ lookups 503) |
+| `DATABASE_URL` | yes | — | **Git-server's own** database URL (not `GITFORGE_DATABASE_URL`) |
+| `GITFORGE_SSH_HOST_KEY` | no | `$HOME/.ssh/gitforge_host_ed25519` | SSH host key path |
+| `HTTP_PORT` / `SSH_PORT` | no | `42782` / `42022` | Listen ports |
+| `GITFORGE_MAX_GIT_BODY_BYTES` | no | — | Smart-HTTP body cap |
+| `GITFORGE_CI_TRIGGER_URL` / `GITFORGE_CI_TRIGGER_TOKEN` | no | — | Outbox trigger bridge to CI |
+
+**`gitforge@ci`** (scheduler included; `services/ci`)
+
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `GITFORGE_DATABASE_URL` | yes | — | Scheduler database (not `DATABASE_URL`) |
+| `SCHEDULER_PORT` | no | `42781` | Scheduler HTTP port |
+| `GITFORGE_TRIGGER_TOKEN` | see note | — | Trigger auth; falls back to `GITFORGE_CI_TRIGGER_TOKEN`, `GITFORGE_SCHEDULER_OPERATOR_TOKEN`, `GITFORGE_SCHEDULER_TOKEN` |
+| `GITFORGE_SCHEDULER_TOKEN` / `GITFORGE_SCHEDULER_OPERATOR_TOKEN` / `GITFORGE_RUNNER_TOKEN` | no | — | Scheduler API + runner registration auth (fail-closed when unset) |
+| `GITFORGE_ARTIFACT_ROOT` | no | — | Artifact storage root |
+| `GITFORGE_WORKSPACE_ROOT` / `GITFORGE_WORKSPACE_ROOTS` | no | — | Checkout workspace roots |
+| `GITFORGE_CONTAINER_BACKEND` | no | error if invalid | Backend selection |
+| `GITFORGE_JOB_FENCE_GRACE_SECS` | no | built-in | Job lease fence grace |
+| `GITFORGE_BUILD_SOCKET` | no | — | Build-queue socket (`gitforge-build`) |
+
+**`gitforge@runner`** (`services/runner`, `crates/gitforge-runner`)
+
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `GITFORGE_SCHEDULER_URL` | **yes** | — | Scheduler endpoint; startup fails without it |
+| `GITFORGE_SCHEDULER_TOKEN` | no | — | Bearer token for scheduler API |
+| `GITFORGE_RUNNER_NAME` / `GITFORGE_RUNNER_CAPACITY` | no | `runner` / `2` | Identity and concurrency |
+| `GITFORGE_HEARTBEAT_INTERVAL` / `GITFORGE_JOB_HEARTBEAT_INTERVAL` / `GITFORGE_FETCH_INTERVAL` | no | `30` / `15` / `5` | Timing knobs (seconds) |
+| `GITFORGE_REGISTER_ATTEMPTS` / `GITFORGE_REGISTER_BACKOFF_SECS` / `GITFORGE_RUNNER_STANDALONE` | no | `6` / `1` / `deny` | Registration retry policy |
+| `GITFORGE_ARTIFACT_ROOT` | no | — | Artifact storage root |
+| `GITFORGE_SANDBOX_ACQUIRE_SECS` / `GITFORGE_SANDBOX_MEMORY_MB` | no | built-in | Sandbox acquisition/memory caps |
+| `GITFORGE_RECONCILE_DELETE` / `_GRACE_SECS` / `_INTERVAL_SECS` / `_RECEIPT` | no | `off` / `3600` / `300` | Container reconciler |
+| `DOCKER_HOST` | no | well-known socket | Container daemon endpoint |
+
+Shared: `RUST_LOG` (tracing filter) on every service.
+
+### Rollout / rollback (live host)
+
+The scrub is part of the unit file, so rolling it out is the normal unit
+recopy — no environment file changes:
+
+```bash
+# 1. Back up the installed unit (rollback anchor).
+sudo cp /etc/systemd/system/gitforge@.service \
+        /etc/systemd/system/gitforge@.service.prev
+
+# 2. Install the hardened template from the promoted source checkout.
+sudo cp systemd/gitforge@.service /etc/systemd/system/gitforge@.service
+sudo systemctl daemon-reload
+
+# 3. Restart stateless services any time; drain-gate ci/runner as in §4 of
+#    the master plan (a ci restart fails in-flight rows into recovery).
+sudo systemctl restart gitforge@api.service gitforge@git-server.service
+sudo systemctl restart gitforge@ci.service gitforge@runner.service
+
+# 4. Verify: services healthy, and no credential name in the live process
+#    environment. Both commands print NAMES ONLY — never pipe the raw
+#    environ or `systemctl show -p Environment` anywhere, they carry values.
+./scripts/gitforge-status
+pid=$(systemctl show -p ExecMainPID --value gitforge@api.service)
+sudo cat "/proc/$pid/environ" | tr '\0' '\n' | cut -d= -f1 | sort
+```
+
+Rollback: restore `gitforge@.service.prev`, `daemon-reload`, restart in the
+same order. The `ExecStart` release-bundle pin lives in the drop-in, which
+neither step touches, so rollout and rollback never change which binaries
+serve.
+
+> **2026-10-05 audit correction.** The process-environment audit (names
+> only) attributed ambient provider keys to "API, CI, runner". Re-inspection
+> shows the four `gitforge@*` system units source their environment solely
+> from the unit, the drop-in, and the three `EnvironmentFile=` targets — all
+> audited clean of provider-key names. The leaking processes were **ad-hoc
+> copies outside any unit** (e.g. a daemonized `api` started from an
+> operator shell), which inherit the shell wholesale. Units cannot scrub a
+> process that never runs under one: stop ad-hoc instances and start
+> services through their units. `make run-all`/`make stop` refuse unmanaged
+> lifecycle for exactly this reason.
+
 ## Docker Compose
 
 Before `docker compose up`, set the required deployment variables in `.env`
@@ -185,7 +332,8 @@ docker-compose up -d
 curl http://localhost:42780/health
 curl http://localhost:42781/health  # CI/Scheduler
 
-# Read-only Fedora service and endpoint report (user-level systemd)
+# Read-only Fedora service and endpoint report (probes the system template
+# units and candidate user units, reporting the scope that owns each process)
 ./scripts/gitforge-status
 ./scripts/gitforge-status --json
 
