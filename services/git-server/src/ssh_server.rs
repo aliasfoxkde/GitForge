@@ -795,15 +795,57 @@ fn parse_receive_status_ok_refs(status: &[u8]) -> Option<std::collections::HashS
         if length < 4 || offset + length > status.len() {
             return None;
         }
-        let mut payload = &status[offset + 4..offset + length];
-        if payload.first() == Some(&1) {
-            payload = &payload[1..];
+        let payload = &status[offset + 4..offset + length];
+        let is_sideband_data = payload.first() == Some(&1);
+        let payload = payload.strip_prefix(&[1]).unwrap_or(payload);
+
+        // Side-band channel 1 carries a second pkt-line stream inside the
+        // outer side-band packet. Parse those inner report-status packets;
+        // treating their four-byte lengths as line text silently loses every
+        // accepted ref even though receive-pack reports success to the client.
+        let mut inner_offset = 0;
+        let mut found_inner_packet = false;
+        while is_sideband_data
+            && inner_offset + 4 <= payload.len()
+            && payload[inner_offset..inner_offset + 4]
+                .iter()
+                .all(u8::is_ascii_hexdigit)
+        {
+            let inner_length = usize::from_str_radix(
+                std::str::from_utf8(&payload[inner_offset..inner_offset + 4]).ok()?,
+                16,
+            )
+            .ok()?;
+            if inner_length == 0 {
+                found_inner_packet = true;
+                if saw_unpack_ok {
+                    return Some(accepted);
+                }
+                inner_offset += 4;
+                continue;
+            }
+            if inner_length < 4 || inner_offset + inner_length > payload.len() {
+                break;
+            }
+            found_inner_packet = true;
+            for line in
+                payload[inner_offset + 4..inner_offset + inner_length].split(|byte| *byte == b'\n')
+            {
+                if line == b"unpack ok" {
+                    saw_unpack_ok = true;
+                } else if let Some(ref_name) = line.strip_prefix(b"ok ") {
+                    accepted.insert(std::str::from_utf8(ref_name).ok()?.to_string());
+                }
+            }
+            inner_offset += inner_length;
         }
-        for line in payload.split(|byte| *byte == b'\n') {
-            if line == b"unpack ok" {
-                saw_unpack_ok = true;
-            } else if let Some(ref_name) = line.strip_prefix(b"ok ") {
-                accepted.insert(std::str::from_utf8(ref_name).ok()?.to_string());
+        if !found_inner_packet {
+            for line in payload.split(|byte| *byte == b'\n') {
+                if line == b"unpack ok" {
+                    saw_unpack_ok = true;
+                } else if let Some(ref_name) = line.strip_prefix(b"ok ") {
+                    accepted.insert(std::str::from_utf8(ref_name).ok()?.to_string());
+                }
             }
         }
         offset += length;
@@ -943,7 +985,7 @@ mod tests {
 
     #[test]
     fn test_receive_status_skips_initial_advertisement_flush() {
-        let status = b"000eversion 1\n0000000eunpack ok\n0017ok refs/heads/main\n0000";
+        let status = b"000eversion 1\n0000002e\x01000eunpack ok\n0017ok refs/heads/main\n0000";
         let accepted = parse_receive_status_ok_refs(status).expect("valid post-push status");
         assert!(accepted.contains("refs/heads/main"));
     }

@@ -218,6 +218,12 @@ async fn spawn_server() -> TestServer {
         &[],
         None,
     );
+    run_git(
+        &["config", "receive.denyDeleteCurrent", "ignore"],
+        &bare_repo,
+        &[],
+        None,
+    );
 
     let host_key_path = ssh_dir.join("host_ed25519");
     let ssh_port = free_port();
