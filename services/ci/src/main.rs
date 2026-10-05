@@ -319,6 +319,32 @@ async fn main() -> anyhow::Result<()> {
                             tracing::error!(%error, "watchdog failed to grade evidence-stranded jobs");
                         }
                     }
+                    // Cancellation custody: a cancelled job whose runner never
+                    // acknowledged (crash mid-teardown, lost runner) would hold
+                    // its lease — and its run's finalization — forever. The
+                    // per-job heartbeat freezes once the row turns terminal, so
+                    // custody expires one fence-grace window past the last
+                    // liveness proof.
+                    match gitforge_db::queries::JobQueries::reap_cancelled_leases(
+                        pool,
+                        job_fence_grace_secs_from_env(),
+                    )
+                    .await
+                    {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            tracing::warn!(
+                                count,
+                                "watchdog reclaimed abandoned cancellation leases"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                "watchdog failed to reap cancelled job leases"
+                            );
+                        }
+                    }
                     let live_run_ids: Vec<gitforge_common::PipelineRunId> =
                         watchdog_registry.read().await.keys().copied().collect();
                     for run_id in live_run_ids {
@@ -1119,6 +1145,27 @@ async fn reconcile_orphaned_runs_filtered(
         if unfinished {
             continue;
         }
+        // Custody gate: every row may be terminal, but a `cancelled` row
+        // whose runner has not yet relinquished its lease means the run's
+        // workspace checkout is still live in the executing runner. Grading
+        // the run now would let the workspace sweep delete that checkout
+        // under a still-stopping container. The acknowledgement — or the
+        // abandoned-lease reaper, one fence-grace window past the runner's
+        // last liveness proof — clears the lease, and the next pass grades
+        // the run exactly as it would have here. An unreadable check skips
+        // the run: fail closed rather than grade past an unknown.
+        match gitforge_db::queries::JobQueries::has_cancelled_lease(pool, run.id).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    run = %run.id,
+                    "run reconciliation skipped: cancelled-lease check unreadable"
+                );
+                continue;
+            }
+        }
         // The durable job rows only cover the jobs an engine has already
         // enqueued: chained jobs are enqueued lazily as their dependencies
         // turn terminal, so a run whose control-plane process died mid-chain
@@ -1156,16 +1203,22 @@ async fn reconcile_orphaned_runs_filtered(
             } else {
                 continue;
             }
-        } else if jobs
-            .iter()
-            .any(|job| job.status == "failed" || job.status == "timed_out")
-        {
+        } else if jobs.iter().any(|job| {
+            job.status == "failed"
+                || job.status == "timed_out"
+                || job.status == "infrastructure_failure"
+        }) {
             // A watchdog-reaped job dooms the run just like a reported
             // failure; grading it `succeeded` here would publish a green
-            // run whose job never finished. Failure deliberately outranks
-            // cancellation: a run that genuinely lost a job grades failed
-            // even when the remaining rows were cancelled afterwards (by an
-            // operator or by the doom cascade above).
+            // run whose job never finished. An infrastructure failure is
+            // still a failure for the run verdict — the durable row keeps
+            // the backend classification for alerting. Failure deliberately
+            // outranks cancellation: a run that genuinely lost a job grades
+            // failed even when the remaining rows were cancelled afterwards
+            // (by an operator or by the doom cascade above). This is the
+            // same precedence the scheduler's `finalize_pipeline_if_terminal`
+            // and the engine's `settle_if_all_finished` apply, so a verdict
+            // re-derived after a restart matches the one committed live.
             "failed"
         } else if jobs.iter().any(|job| job.status == "cancelled") {
             "cancelled"
@@ -1292,7 +1345,7 @@ async fn cancel_doomed_rows(
         })
         .to_string();
         match gitforge_db::queries::JobQueries::cancel(pool, job.id, &receipt).await {
-            Ok(()) => {
+            Ok(outcome) if outcome.is_cancelled() => {
                 tracing::info!(
                     job = %job.id,
                     run = %run.id,
@@ -1300,6 +1353,17 @@ async fn cancel_doomed_rows(
                     "cancelled doomed job: its pipeline ancestor already failed"
                 );
                 cancelled.insert(job.id);
+            }
+            Ok(outcome) => {
+                // The row reached its own terminal verdict between the
+                // snapshot read and this conditional write — it is no longer
+                // doomed and must not be counted as cancelled.
+                tracing::debug!(
+                    job = %job.id,
+                    run = %run.id,
+                    ?outcome,
+                    "doomed-job cancellation lost the race to a terminal verdict"
+                );
             }
             Err(error) => {
                 // Leave it for the next pass rather than grading the run
@@ -1894,6 +1958,7 @@ async fn run_scheduler_event_consumer(
             pipeline_run_id,
             runner_id,
             success,
+            cancelled,
         } = event
         else {
             continue;
@@ -1910,56 +1975,74 @@ async fn run_scheduler_event_consumer(
             );
             continue;
         };
-        // The mirror may be behind or already settled: a run-level cancel
-        // leaves runner-owned jobs untouched but may have mirror-cancelled a
-        // job that was dispatched without the mirror knowing, and a lagged
-        // redelivery can arrive for an already-terminal mirror job. The
-        // durable row is authoritative and terminal — the completion was
-        // lease-verified before this broadcast — so a refused mirror
-        // transition must NOT discard the completion: the finalization at
-        // the end of this loop is what reconciles the run against it.
-        if let Err(error) = engine.assign_job(job_id, runner_id).await {
-            tracing::debug!(%job_id, %error, "completion mirror assign skipped");
-        }
-        if let Err(error) = engine.start_job(job_id).await {
-            tracing::debug!(%job_id, %error, "completion mirror start skipped");
-        }
-        if success {
-            if let Err(error) = engine.succeed_job(job_id, 0).await {
+        if cancelled {
+            // A cancellation acknowledgement, not an execution outcome: the
+            // runner stopped its sandbox and relinquished the lease it held
+            // on the durably cancelled row. Converge the mirror to
+            // `cancelled` — never a synthetic failure — and cascade its
+            // doomed dependents. Nothing downstream is unlocked: a cancelled
+            // stage's dependents can never be dispatched under any verdict.
+            // The lease handoff is already durable at this point, so the
+            // finalization below is cleared to commit.
+            if let Err(error) = engine.cancel_job(job_id).await {
+                tracing::warn!(
+                    %job_id,
+                    %error,
+                    "cancellation acknowledgement not applied to the mirror; the durable row stays authoritative"
+                );
+            }
+        } else {
+            // The mirror may be behind or already settled: a run-level cancel
+            // leaves runner-owned jobs untouched but may have mirror-cancelled a
+            // job that was dispatched without the mirror knowing, and a lagged
+            // redelivery can arrive for an already-terminal mirror job. The
+            // durable row is authoritative and terminal — the completion was
+            // lease-verified before this broadcast — so a refused mirror
+            // transition must NOT discard the completion: the finalization at
+            // the end of this loop is what reconciles the run against it.
+            if let Err(error) = engine.assign_job(job_id, runner_id).await {
+                tracing::debug!(%job_id, %error, "completion mirror assign skipped");
+            }
+            if let Err(error) = engine.start_job(job_id).await {
+                tracing::debug!(%job_id, %error, "completion mirror start skipped");
+            }
+            if success {
+                if let Err(error) = engine.succeed_job(job_id, 0).await {
+                    tracing::warn!(
+                        %job_id,
+                        %error,
+                        "completion not applied to the mirror; the durable row stays authoritative"
+                    );
+                } else if let Err(error) = engine.queue_ready_jobs().await {
+                    tracing::error!(%pipeline_run_id, %error, "failed to queue downstream jobs");
+                }
+            } else if let Err(error) = engine
+                .fail_job(job_id, -1, "runner reported failure".to_string())
+                .await
+            {
                 tracing::warn!(
                     %job_id,
                     %error,
                     "completion not applied to the mirror; the durable row stays authoritative"
                 );
-            } else if let Err(error) = engine.queue_ready_jobs().await {
-                tracing::error!(%pipeline_run_id, %error, "failed to queue downstream jobs");
             }
-        } else if let Err(error) = engine
-            .fail_job(job_id, -1, "runner reported failure".to_string())
-            .await
-        {
-            tracing::warn!(
-                %job_id,
-                %error,
-                "completion not applied to the mirror; the durable row stays authoritative"
-            );
-        }
 
-        let state = engine.state().await;
-        let workspace_path = run_workspace_paths
-            .lock()
-            .expect("workspace cache lock poisoned")
-            .get(&state.run_id)
-            .cloned()
-            .flatten();
-        enqueue_ready_jobs(
-            &scheduler,
-            &engine,
-            state.run_id,
-            state.repo_id,
-            workspace_path,
-        )
-        .await;
+            let state = engine.state().await;
+            let workspace_path = run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .get(&state.run_id)
+                .cloned()
+                .flatten();
+            enqueue_ready_jobs(
+                &scheduler,
+                &engine,
+                state.run_id,
+                state.repo_id,
+                workspace_path,
+            )
+            .await;
+        }
 
         // No-op until every job in the run is terminal; see
         // `finalize_run_if_terminal`.
@@ -2026,7 +2109,12 @@ async fn finalize_run_if_terminal(
         // itself terminalizes (not-yet-dispatched doomed rows) are not
         // blockers; everything else non-terminal is, and an unreadable job
         // list blocks too — a verdict that cannot be checked against the
-        // durable rows must not be written.
+        // durable rows must not be written. A `cancelled` row that still
+        // carries a runner lease is live work the same way: the workspace
+        // checkout is in the executing runner's custody until its
+        // cancellation acknowledgement (or the abandoned-lease reaper)
+        // releases it, and deleting that checkout now would pull the tree
+        // out from under a still-stopping container.
         let live: Vec<gitforge_common::JobId> = match gitforge_db::queries::JobQueries::list_by_run(
             pool,
             state.run_id,
@@ -2038,9 +2126,10 @@ async fn finalize_run_if_terminal(
                 .filter(|job| {
                     let terminal = gitforge_db::models::JobStatus::from_str(&job.status)
                         .is_some_and(|status| status.is_terminal());
+                    let in_cancel_custody = job.status == "cancelled" && job.lease_token.is_some();
                     let terminalized_here = matches!(job.status.as_str(), "pending" | "queued")
                         && doomed.contains(&job.id);
-                    !terminal && !terminalized_here
+                    (!terminal || in_cancel_custody) && !terminalized_here
                 })
                 .map(|job| job.id)
                 .collect(),
@@ -4204,6 +4293,224 @@ jobs:
             .lock()
             .expect("workspace cache lock poisoned")
             .contains_key(&run_id));
+    }
+
+    #[tokio::test]
+    async fn test_finalize_defers_while_cancelled_job_holds_runner_lease() {
+        // Per-job operator cancellation of a runner-owned stage: the durable
+        // row flips to `cancelled` but KEEPS the lease — the runner is still
+        // tearing down inside the workspace checkout and must acknowledge
+        // (or be reaped) before the verdict commits. The fence sweep
+        // converges the mirror immediately (no completion event will ever
+        // arrive for a cancelled job), so the engine's run looks terminal
+        // while custody is still outstanding; finalization must fail closed
+        // on exactly that shape, then commit everything at once once the
+        // runner relinquishes.
+        let (pool, repo_id, _pipeline_id) = sweep_test_pool().await;
+        let definition = dag_pipeline(&[("head", &[]), ("tail", &["head"])]);
+        let (run_id, engine, registry, workspaces) =
+            finalize_fixture(&pool, repo_id, &definition).await;
+        let planned: HashMap<String, gitforge_common::JobId> = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(id, name)| (name, id))
+            .collect();
+
+        engine.start().await.unwrap();
+        let runner = gitforge_common::RunnerId::new();
+        // Durable dispatch state the mirror cannot see: head queued,
+        // lease-synced, running.
+        gitforge_db::queries::JobQueries::update_status(&pool, planned["head"], "queued")
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::sync_lease(
+            &pool,
+            planned["head"],
+            runner,
+            "lease-cancel",
+        )
+        .await
+        .unwrap();
+        gitforge_db::queries::JobQueries::update_status(&pool, planned["head"], "running")
+            .await
+            .unwrap();
+        engine.assign_job(planned["head"], runner).await.unwrap();
+        engine.start_job(planned["head"]).await.unwrap();
+        workspaces
+            .lock()
+            .expect("workspace cache lock poisoned")
+            .insert(run_id, Some("unused".to_string()));
+
+        // The operator cancels the job through the durable conditional
+        // transition: terminal, but the lease stays with the runner.
+        let outcome = gitforge_db::queries::JobQueries::cancel(
+            &pool,
+            planned["head"],
+            r#"{"status":"cancelled","reason":"api operator requested cancellation"}"#,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_new_cancellation());
+        let row = job_row(&pool, planned["head"]).await;
+        assert_eq!(row.status, "cancelled");
+        assert_eq!(
+            row.lease_token.as_deref(),
+            Some("lease-cancel"),
+            "custody survives the cancellation"
+        );
+        assert_eq!(row.runner_id, Some(runner));
+        assert!(
+            gitforge_db::queries::JobQueries::has_cancelled_lease(&pool, run_id)
+                .await
+                .unwrap()
+        );
+
+        // The fence sweep converges the mirror onto the durable verdict.
+        engine.cancel_job(planned["head"]).await.unwrap();
+        assert_eq!(
+            engine.state().await.status,
+            gitforge_common::PipelineStatus::Cancelled
+        );
+
+        finalize_run_if_terminal(&engine, Some(&pool), &workspaces, &registry).await;
+
+        assert_eq!(
+            run_status(&pool, run_id).await,
+            "running",
+            "no verdict while a cancelled row still holds its lease"
+        );
+        assert!(
+            registry.read().await.contains_key(&run_id),
+            "the engine stays registered for the acknowledgement"
+        );
+        assert!(
+            workspaces
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .contains_key(&run_id),
+            "workspace custody is kept while the runner tears down"
+        );
+        assert_eq!(
+            job_row(&pool, planned["tail"]).await.status,
+            "pending",
+            "the doomed row is not terminalized behind outstanding custody"
+        );
+
+        // The runner acknowledges: its exact lease proof releases custody,
+        // and the next finalization pass commits the verdict and the doomed
+        // rows together.
+        assert!(gitforge_db::queries::JobQueries::release_cancelled_lease(
+            &pool,
+            planned["head"],
+            runner,
+            "lease-cancel",
+        )
+        .await
+        .unwrap());
+        finalize_run_if_terminal(&engine, Some(&pool), &workspaces, &registry).await;
+
+        assert_eq!(run_status(&pool, run_id).await, "cancelled");
+        let head = job_row(&pool, planned["head"]).await;
+        assert_eq!(head.status, "cancelled");
+        assert!(
+            head.lease_token.is_none(),
+            "the acknowledgement released it"
+        );
+        let tail = job_row(&pool, planned["tail"]).await;
+        assert_eq!(tail.status, "cancelled");
+        let receipt: serde_json::Value =
+            serde_json::from_str(tail.result_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            receipt["reason"], "pipeline run cancelled before this job was dispatched",
+            "the tail never reached a runner"
+        );
+        assert!(
+            !registry.read().await.contains_key(&run_id),
+            "the engine is evicted once custody is released"
+        );
+        assert!(!workspaces
+            .lock()
+            .expect("workspace cache lock poisoned")
+            .contains_key(&run_id));
+        assert!(gitforge_db::queries::JobQueries::list_dispatchable(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_grades_infrastructure_failure_and_respects_cancel_custody() {
+        // Restart/recovery parity: the orphan-run reconciler must grade with
+        // the same precedence the live graders use — an
+        // `infrastructure_failure` row fails the run (it used to be ignored
+        // and graded `succeeded`) — and must NOT finalize a run whose
+        // cancelled row still holds a runner lease; once that lease is
+        // released, the same sweep converges the run to `cancelled`.
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+
+        let infra = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        seed_job(&pool, infra, "lint", "infrastructure_failure").await;
+
+        let custody = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        let runner = gitforge_common::RunnerId::new();
+        seed_job(&pool, custody, "lint", "queued").await;
+        let jobs = gitforge_db::queries::JobQueries::list_by_run(&pool, custody)
+            .await
+            .unwrap();
+        let held = jobs[0].id;
+        assert!(
+            gitforge_db::queries::JobQueries::sync_lease(&pool, held, runner, "lease-reaped")
+                .await
+                .unwrap()
+        );
+        gitforge_db::queries::JobQueries::update_status(&pool, held, "running")
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::cancel(
+            &pool,
+            held,
+            r#"{"status":"cancelled","reason":"api operator requested cancellation"}"#,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reconcile_orphaned_runs(&pool).await,
+            1,
+            "only the custody-free run is finalized"
+        );
+        assert_eq!(
+            run_status(&pool, infra).await,
+            "failed",
+            "infrastructure_failure fails the run like any other loss"
+        );
+        assert_eq!(
+            run_status(&pool, custody).await,
+            "running",
+            "a cancelled run with an outstanding lease is not finished"
+        );
+        assert_eq!(
+            job_row(&pool, held).await.status,
+            "cancelled",
+            "the reconciler never touches a custody row"
+        );
+
+        // The lease proof (or the reaper) releases custody; reconciliation
+        // then derives the identical verdict the live path would have.
+        assert!(gitforge_db::queries::JobQueries::release_cancelled_lease(
+            &pool,
+            held,
+            runner,
+            "lease-reaped",
+        )
+        .await
+        .unwrap());
+        assert_eq!(reconcile_orphaned_runs(&pool).await, 1);
+        assert_eq!(
+            run_status(&pool, custody).await,
+            "cancelled",
+            "restart recovery grades the cancelled run exactly once custody clears"
+        );
     }
 
     #[tokio::test]

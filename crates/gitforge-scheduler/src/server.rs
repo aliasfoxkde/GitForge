@@ -157,6 +157,7 @@ pub fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
         .route("/jobs/{id}/artifacts", post(upload_job_artifact))
         .layer(DefaultBodyLimit::max(MAX_ARTIFACT_BYTES as usize))
         .route("/jobs/{id}/cancelled", get(job_cancelled))
+        .route("/jobs/{id}/cancelled/ack", post(acknowledge_cancellation))
         .route("/jobs/{id}/complete", post(complete_job))
         .layer(middleware::from_fn(move |request, next: Next| {
             require_scheduler_auth(request, next, runner_auth_token.clone(), "runner")
@@ -494,6 +495,85 @@ async fn job_cancelled(
             "cancelled": state.scheduler.is_cancelled(job_id).await,
         })),
     )
+}
+
+/// Acknowledge a job cancellation. This is the counterpart of the
+/// `cancelled` probe: a runner that observed `cancelled: true`, stopped its
+/// executor, and released the workspace presents the SAME lease proof the
+/// completion route requires. Why a separate route instead of reusing
+/// `complete`: the completion transition is lease-gated to live
+/// (`assigned`/`running`) rows by design — accepting an execution outcome
+/// for an already-`cancelled` row would either fail the CAS or open a path
+/// around F24. The acknowledgement is not an outcome; it only relinquishes
+/// custody, so the run finalization liveness check can tell "runner still
+/// tearing down" from "runner is gone".
+async fn acknowledge_cancellation(
+    State(state): State<SchedulerServerState>,
+    Path(job_id): Path<String>,
+    Json(request): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let job_id: JobId = match Uuid::parse_str(&job_id) {
+        Ok(id) => JobId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_job_id",
+                    "message": "Invalid job ID format"
+                })),
+            )
+        }
+    };
+    let Some(runner_id) = request["runner_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .map(RunnerId::from)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "runner_id_required"})),
+        );
+    };
+    let Some(lease_token) = request["lease_token"].as_str() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "lease_token_required"})),
+        );
+    };
+    if !state.scheduler.job_exists(job_id).await {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "job_not_found", "job_id": job_id.to_string()})),
+        );
+    }
+    match state
+        .scheduler
+        .acknowledge_cancellation(job_id, runner_id, lease_token)
+        .await
+    {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "contract_version": "harness.job.v1",
+                "job_id": job_id.to_string(),
+                "acknowledged": true,
+            })),
+        ),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "cancellation_lease_not_outstanding",
+                "job_id": job_id.to_string(),
+            })),
+        ),
+        Err(error) => {
+            tracing::error!(%error, %job_id, "failed to record cancellation acknowledgement");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "cancellation_ack_persistence_failed"})),
+            )
+        }
+    }
 }
 
 /// Get pending jobs for a runner

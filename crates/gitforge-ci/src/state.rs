@@ -172,12 +172,22 @@ impl JobStateMachine {
             // at Queued here while the database records it Running. The
             // durable deadline is authoritative, so allow the reaping.
             (JobStatus::Queued, JobStatus::TimedOut) => true,
+            // The fence sweep converges a mirror that missed both the
+            // dispatch and the completion event onto the durable terminal
+            // verdict. Durable `succeeded`/`failed` rows are only written by
+            // lease-verified scheduler transitions, so they are authoritative
+            // for a mirror row that no runner is driving — refusing the
+            // convergence wedges the run non-terminal forever.
+            (JobStatus::Queued, JobStatus::Succeeded) => true,
 
             // From assigned
             (JobStatus::Assigned, JobStatus::Running) => true,
             (JobStatus::Assigned, JobStatus::Cancelled) => true,
             // Same watchdog rationale as the Queued case above.
             (JobStatus::Assigned, JobStatus::TimedOut) => true,
+            // Same fence-sweep rationale as the Queued case above.
+            (JobStatus::Assigned, JobStatus::Failed) => true,
+            (JobStatus::Assigned, JobStatus::Succeeded) => true,
 
             // From running
             (JobStatus::Running, JobStatus::Succeeded) => true,

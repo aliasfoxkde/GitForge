@@ -83,6 +83,43 @@ impl JobStatus {
     }
 }
 
+/// Result of a cancellation attempt against a durable job row.
+///
+/// The distinction is what makes repeated cancellation idempotent without
+/// masking a lost race: an already-cancelled row keeps its original receipt
+/// and reports [`JobCancelOutcome::AlreadyCancelled`], while a row that
+/// reached any other terminal verdict first reports
+/// [`JobCancelOutcome::AlreadyTerminal`] — the cancellation lost the F24
+/// race and must never overwrite the winner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobCancelOutcome {
+    /// The row was `pending`, `queued`, `assigned`, or `running` and is now
+    /// durably `cancelled`.
+    Cancelled,
+    /// The row was already `cancelled` by an earlier cancellation; the
+    /// existing receipt is preserved.
+    AlreadyCancelled,
+    /// The row reached a different terminal verdict first; the cancellation
+    /// was rejected (F24 first-terminal-writer-wins).
+    AlreadyTerminal,
+}
+
+impl JobCancelOutcome {
+    /// Whether this attempt newly transitioned the row to `cancelled`.
+    pub fn is_new_cancellation(&self) -> bool {
+        matches!(self, JobCancelOutcome::Cancelled)
+    }
+
+    /// Whether the row is durably `cancelled` after this attempt (a fresh
+    /// cancellation or a repeated one).
+    pub fn is_cancelled(&self) -> bool {
+        matches!(
+            self,
+            JobCancelOutcome::Cancelled | JobCancelOutcome::AlreadyCancelled
+        )
+    }
+}
+
 /// Job entity
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {

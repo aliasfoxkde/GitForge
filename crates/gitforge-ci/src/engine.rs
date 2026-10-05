@@ -46,21 +46,43 @@ impl CiEngineState {
 
     /// Grade the run once its last job turned terminal.
     ///
-    /// Recorded cancellation intent wins: a cancelled run stays `Cancelled`
-    /// even when its remaining runner-owned job succeeds or fails, because
-    /// the job's own row keeps its true outcome while the run's verdict
-    /// answers "did the pipeline as requested complete". Otherwise the
-    /// fail-fast rule applies: any non-succeeded job fails the run.
+    /// Recorded cancellation intent (a run-level cancel request) wins: a
+    /// cancelled run stays `Cancelled` even when its remaining runner-owned
+    /// job succeeds or fails, because the job's own row keeps its true
+    /// outcome while the run's verdict answers "did the pipeline as
+    /// requested complete".
+    ///
+    /// Otherwise the verdict follows the durable graders' precedence (the
+    /// scheduler's `finalize_pipeline_if_terminal` and the service's
+    /// orphan-run reconciliation use the same order, so a restart
+    /// re-derives the identical verdict): a failed, timed-out, or
+    /// infrastructure-failed job fails the run — its ancestors' outcome is
+    /// the reason the pipeline did not complete, even when a sibling was
+    /// cancelled along the way — otherwise any cancelled job cancels the
+    /// run (a per-job operator cancellation with every other job green is a
+    /// cancelled run, not a failed one), and a run with nothing but
+    /// successes succeeded.
     fn settle_if_all_finished(&mut self) {
         if !self.all_jobs_finished() {
             return;
         }
         self.status = if self.cancel_requested {
             PipelineStatus::Cancelled
-        } else if self.all_jobs_succeeded() {
-            PipelineStatus::Succeeded
-        } else {
+        } else if self.jobs.values().any(|job| {
+            matches!(
+                job.status(),
+                JobStatus::Failed | JobStatus::TimedOut | JobStatus::InfrastructureFailure
+            )
+        }) {
             PipelineStatus::Failed
+        } else if self
+            .jobs
+            .values()
+            .any(|job| job.status() == JobStatus::Cancelled)
+        {
+            PipelineStatus::Cancelled
+        } else {
+            PipelineStatus::Succeeded
         };
         self.finished_at = Some(chrono::Utc::now());
     }
@@ -123,17 +145,26 @@ pub enum FenceAction {
     Succeed,
 }
 
-/// Compare the engine's running jobs against the scheduler's terminal job
+/// Compare the engine's unfinished jobs against the scheduler's terminal job
 /// statuses and return the (job, action) pairs required to converge.
 ///
-/// Only `Running` engine jobs are considered: a job the engine already
-/// finished must not be re-judged from a stale scheduler row, and
-/// queued/assigned jobs legitimately have non-terminal scheduler rows.
+/// Every non-terminal mirror state is considered — `Running`, but also
+/// `Pending`/`Queued`/`Assigned`. A queued or assigned mirror job whose
+/// durable row is already terminal has no runner and no completion event
+/// coming: the canonical case is an operator cancelling a queued job, where
+/// the durable row turns `cancelled` while the engine mirror still shows
+/// `Queued`. Restricting the sweep to `Running` mirrors left such runs
+/// non-terminal forever, holding the engine and the run workspace open.
+/// A job the engine already finished is still excluded: it must not be
+/// re-judged from a stale scheduler row.
 ///
 /// Every terminal durable status maps to an action, `succeeded` included:
 /// an unmapped direction is a run the watchdog can never settle (a durable
 /// `succeeded` under a `Running` mirror previously fell through `_ => None`,
-/// leaving the run wedged non-terminal forever — run bccaa1be).
+/// leaving the run wedged non-terminal forever — run bccaa1be). Non-terminal
+/// durable statuses map to nothing: a queued/assigned row under a
+/// queued/assigned mirror is the ordinary pre-dispatch state, and dispatch
+/// progress reaches the mirror through the completion event, not this sweep.
 pub fn fence_actions(
     state: &CiEngineState,
     db_status: &HashMap<JobId, String>,
@@ -141,7 +172,7 @@ pub fn fence_actions(
     state
         .jobs
         .iter()
-        .filter(|(_, job_state)| job_state.status() == JobStatus::Running)
+        .filter(|(_, job_state)| !job_state.status().is_terminal())
         .filter_map(
             |(job_id, _)| match db_status.get(job_id).map(String::as_str) {
                 Some("failed") => Some((*job_id, FenceAction::Fail)),
@@ -475,7 +506,16 @@ impl CiEngine {
         }
     }
 
-    /// Cancel a specific job
+    /// Cancel a specific job.
+    ///
+    /// Everything transitively downstream of the cancelled job can never be
+    /// dispatched (`ready_jobs` requires succeeded dependencies), so it is
+    /// cancelled in the mirror too — the same rule `fail_job` applies — and
+    /// the run settles once its last job is terminal. Without the cascade
+    /// and the settle, a per-job cancellation of a stage with dependents (or
+    /// of the last unfinished job in the run) left the mirror non-terminal:
+    /// the run never graded, finalization never ran, and the engine plus
+    /// workspace leaked until a restart reconciled them.
     pub async fn cancel_job(&self, job_id: JobId) -> Result<()> {
         let mut state = self.state.write().await;
         if let Some(job_state) = state.jobs.get_mut(&job_id) {
@@ -483,6 +523,10 @@ impl CiEngine {
                 job_state.cancel()?;
             }
         }
+        // A cancelled ancestor dooms its dependents exactly like a failed
+        // one: they can never run under any verdict.
+        self.cancel_descendants(&mut state, job_id);
+        state.settle_if_all_finished();
         Ok(())
     }
 
@@ -1146,13 +1190,132 @@ mod tests {
             vec![(b, FenceAction::Succeed)]
         );
 
-        // A queued engine job with a terminal scheduler row is not
-        // fenceable (nothing is running to converge); same for a job the
-        // engine already finished.
+        // A job the engine already finished is never re-judged from a stale
+        // scheduler row — only unfinished mirror states converge.
         engine.succeed_job(a, 0).await.unwrap();
         let state = engine.state().await;
         let db_status: HashMap<JobId, String> = [(a, "failed".to_string())].into_iter().collect();
         assert!(fence_actions(&state, &db_status).is_empty());
+    }
+
+    /// An operator cancelled a job that was still queued: the durable row is
+    /// terminal while the engine mirror shows `Queued` and no completion
+    /// event will ever arrive (there is no runner). The fence sweep must
+    /// converge that mirror too — restricting it to `Running` mirrors left
+    /// such runs non-terminal forever, holding the engine and workspace.
+    #[tokio::test]
+    async fn test_fence_actions_converges_queued_mirror_with_cancelled_row() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, make_pipeline()).await.unwrap();
+        engine.start().await.unwrap();
+        let planned: HashMap<String, JobId> = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(id, name)| (name, id))
+            .collect();
+
+        let state = engine.state().await;
+        assert_eq!(
+            state.jobs[&planned["build"]].status(),
+            JobStatus::Queued,
+            "the mirror is queued while the durable row was cancelled beneath it"
+        );
+        let db_status: HashMap<JobId, String> = [(planned["build"], "cancelled".to_string())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            fence_actions(&state, &db_status),
+            vec![(planned["build"], FenceAction::Cancel)]
+        );
+
+        // Applying the action cancels the queued job AND its dependents and
+        // settles the run — the per-job cancel has no failures, so the run
+        // grades `Cancelled`, not `Failed`.
+        engine.cancel_job(planned["build"]).await.unwrap();
+        let state = engine.state().await;
+        assert_eq!(state.jobs[&planned["build"]].status(), JobStatus::Cancelled);
+        assert_eq!(
+            state.jobs[&planned["test"]].status(),
+            JobStatus::Cancelled,
+            "the dependent of a cancelled stage can never be dispatched"
+        );
+        assert_eq!(state.status, PipelineStatus::Cancelled);
+        assert!(state.finished_at.is_some());
+    }
+
+    /// Per-job cancellation verdicts follow the durable graders' precedence:
+    /// a cancelled job with every other job green grades the run
+    /// `Cancelled` (not a synthetic `Failed`), while a genuinely failed
+    /// sibling still fails the run, and a run-level cancel request outranks
+    /// everything it covers.
+    #[tokio::test]
+    async fn test_cancel_settlement_precedence_matches_durable_graders() {
+        let event_for = |name: &str| {
+            PipelineTriggerEvent::new(
+                PipelineId::new(),
+                RepoId::new(),
+                format!("{name}-sha"),
+                TriggerType::Push,
+            )
+        };
+
+        // Operator cancels one entry job while its sibling succeeds.
+        let engine = CiEngine::new(event_for("cancel"), make_parallel_pipeline())
+            .await
+            .unwrap();
+        engine.start().await.unwrap();
+        let ready = engine.ready_jobs().await;
+        let (a, b) = (ready[0], ready[1]);
+        engine.succeed_job(a, 0).await.unwrap();
+        engine.cancel_job(b).await.unwrap();
+        let state = engine.state().await;
+        assert_eq!(state.status, PipelineStatus::Cancelled);
+        assert!(!state.cancel_requested, "this was a per-job cancel");
+
+        // A real failure with a cancelled sibling still fails the run.
+        let engine = CiEngine::new(event_for("failed"), make_parallel_pipeline())
+            .await
+            .unwrap();
+        engine.start().await.unwrap();
+        let ready = engine.ready_jobs().await;
+        let (a, b) = (ready[0], ready[1]);
+        engine
+            .fail_job(a, 1, "genuinely broken".to_string())
+            .await
+            .unwrap();
+        engine.cancel_job(b).await.unwrap();
+        let state = engine.state().await;
+        assert_eq!(state.status, PipelineStatus::Failed);
+
+        // A run-level cancel request keeps winning over in-flight outcomes:
+        // both jobs are runner-owned when the cancel lands, so neither
+        // mirror is touched — the recorded intent alone decides the verdict
+        // once the last of them settles.
+        let engine = CiEngine::new(event_for("run-cancel"), make_parallel_pipeline())
+            .await
+            .unwrap();
+        engine.start().await.unwrap();
+        let ready = engine.ready_jobs().await;
+        let (a, b) = (ready[0], ready[1]);
+        let runner = gitforge_common::RunnerId::new();
+        engine.assign_job(a, runner).await.unwrap();
+        engine.start_job(a).await.unwrap();
+        engine.assign_job(b, runner).await.unwrap();
+        engine.start_job(b).await.unwrap();
+        engine
+            .fail_job(a, 1, "lost sibling".to_string())
+            .await
+            .unwrap();
+        engine.cancel().await.unwrap();
+        engine.succeed_job(b, 0).await.unwrap();
+        let state = engine.state().await;
+        assert_eq!(state.status, PipelineStatus::Cancelled);
+        assert!(state.cancel_requested);
     }
 
     // Restart recovery grafts durable rows onto a rebuilt engine: graph node

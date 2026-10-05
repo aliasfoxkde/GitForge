@@ -31,6 +31,32 @@ All notable changes to GitForge will be documented in this file.
   the run resumes (re-issue the cancel, or cancel the durable job rows,
   which runners do honor).
 
+### Added
+
+- **Per-job cancellation is race-safe, custody-aware, and end-to-end**:
+  `JobQueries::cancel` is one conditional `BEGIN IMMEDIATE` update — only
+  `pending`/`queued`/`assigned`/`running` rows can be cancelled, a
+  completion that wins the race is never overwritten (F24), repeats are
+  idempotent and preserve the first receipt, and unknown statuses fail
+  closed. A row cancelled while `assigned`/`running` keeps its
+  `lease_token`/`runner_id`: the executing runner keeps workspace custody
+  and relinquishes it through a new lease-proof acknowledgement
+  (`POST /jobs/{id}/cancelled/ack`, runner-auth scope, idempotent CAS
+  `release_cancelled_lease`, 409 when nothing is outstanding), while the
+  scheduler's abandoned-lease reaper (`reap_cancelled_leases`, one fence
+  grace window past the frozen heartbeat) bounds a missed
+  acknowledgement. All finalizers (`finalize_terminal`,
+  `finalize_run_if_terminal`, `finalize_pipeline_if_terminal`, and
+  orphan-run reconciliation) defer a run's verdict while a cancelled row
+  holds a lease, then commit the verdict and doomed rows together with
+  aligned precedence: failed/timed_out/infrastructure_failure → `failed`,
+  else any cancelled → `cancelled`, else `succeeded` (this also fixes a
+  latent bug grading timed-out-only runs `succeeded`). Queued-job
+  cancellation converges through the engine fence sweep, which now fences
+  every non-terminal mirror instead of only `Running` ones. The scheduler
+  completion event carries `cancelled: true` for an acknowledgement so a
+  released custody is never misreported as a synthetic failure.
+
 ## [0.6.14] - 2026-10-03
 
 ### Added

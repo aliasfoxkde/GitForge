@@ -12,7 +12,7 @@ use axum::{
 };
 use gitforge_api::{ApiAuth, ApiServer, CiTriggerClient};
 use gitforge_ci::{JobDefinition, PipelineDefinition, StepDefinition, TriggerType};
-use gitforge_common::{PipelineId, PipelineRunId, RepoId};
+use gitforge_common::{PipelineId, PipelineRunId, RepoId, RunnerId};
 use gitforge_db::{
     models::{Job, JobStatus, Pipeline, PipelineRun, Repository, Runner, RunnerType, User},
     queries::{
@@ -616,6 +616,91 @@ async fn cancel_job_lifecycle_is_owned_idempotent_and_final() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["receipt"]["status"], "cancelled");
     assert_eq!(body["status"], "cancelled");
+}
+
+#[tokio::test]
+async fn cancelling_a_leased_job_keeps_runner_custody_until_the_lease_is_released() {
+    // A job a runner already owns must survive cancellation WITHOUT losing
+    // its lease: the row flips to `cancelled` but custody stays with the
+    // runner until that exact runner relinquishes it through the
+    // lease-verified acknowledgement (or the abandoned-lease reaper
+    // expires it). Finalization defers on exactly this condition, so the
+    // API surface must never clear the columns itself.
+    let f = seed().await;
+    let mut job = Job::new(f.run_id, "leased-job".to_string());
+    job.status = JobStatus::Assigned.as_str().to_string();
+    job.runner_id = Some(RunnerId::new());
+    job.lease_token = Some("lease-held-by-runner".to_string());
+    let job_id = job.id;
+    JobQueries::create(&f.pool, &job).await.unwrap();
+
+    let uri = format!("/api/jobs/{job_id}/cancel");
+    let (status, body) =
+        request_json(f.app.clone(), "POST", &uri, Some(&f.owner_token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let stored = JobQueries::get(&f.pool, job_id).await.unwrap().unwrap();
+    assert_eq!(stored.status, JobStatus::Cancelled.as_str());
+    assert_eq!(
+        stored.lease_token.as_deref(),
+        Some("lease-held-by-runner"),
+        "cancellation must not strip a runner's lease"
+    );
+    assert_eq!(stored.runner_id, job.runner_id);
+    assert!(stored.finished_at.is_some());
+    assert!(JobQueries::has_cancelled_lease(&f.pool, f.run_id)
+        .await
+        .unwrap());
+
+    // Repeating the cancel is still idempotent while custody is pending.
+    let (status, body) =
+        request_json(f.app.clone(), "POST", &uri, Some(&f.owner_token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "cancelled");
+
+    // Custody is released only by the exact (runner, lease) pair.
+    let wrong_runner = !JobQueries::release_cancelled_lease(
+        &f.pool,
+        job_id,
+        RunnerId::new(),
+        "lease-held-by-runner",
+    )
+    .await
+    .unwrap();
+    assert!(wrong_runner, "a foreign runner cannot relinquish the lease");
+    let wrong_lease = !JobQueries::release_cancelled_lease(
+        &f.pool,
+        job_id,
+        job.runner_id.unwrap(),
+        "lease-forged",
+    )
+    .await
+    .unwrap();
+    assert!(wrong_lease, "a forged token cannot relinquish the lease");
+
+    let released = JobQueries::release_cancelled_lease(
+        &f.pool,
+        job_id,
+        job.runner_id.unwrap(),
+        "lease-held-by-runner",
+    )
+    .await
+    .unwrap();
+    assert!(
+        released,
+        "the owning runner's acknowledgement releases custody"
+    );
+
+    let stored = JobQueries::get(&f.pool, job_id).await.unwrap().unwrap();
+    assert_eq!(stored.status, JobStatus::Cancelled.as_str());
+    assert!(stored.lease_token.is_none());
+    assert!(stored.runner_id.is_none());
+    assert!(
+        !JobQueries::has_cancelled_lease(&f.pool, f.run_id)
+            .await
+            .unwrap(),
+        "run finalization may proceed once custody is released"
+    );
 }
 
 #[tokio::test]
