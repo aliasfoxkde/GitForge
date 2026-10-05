@@ -4,7 +4,7 @@
 
 use axum::Router;
 use axum::{
-    extract::{Extension, Request},
+    extract::{Extension, Path, Request},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -52,6 +52,29 @@ const PIPELINE_CONFIG_PATHS: [&str; 2] = [".gitforge.yml", ".gitforce.yml"];
 /// live engines to the same terminal state.
 const JOB_TIMEOUT_SWEEP_SECS: u64 = 60;
 
+/// How often the trigger recovery sweep looks for orphaned pending trigger
+/// events (F2). The first sweep runs at startup, so events stranded by a
+/// previous process lifetime are re-driven without waiting a full interval.
+const TRIGGER_RECOVERY_SWEEP_SECS: u64 = 15;
+
+/// How long one driver's lease on a pending trigger event lasts. Long enough
+/// for a cold drive (config load, clone, durable planning) to finish; a drive
+/// that somehow outlives the lease still converges on one run through the
+/// trigger-event idempotency index.
+const TRIGGER_CLAIM_LEASE_SECS: u64 = 300;
+
+/// How many claims — across the live consumer and every recovery sweep — one
+/// accepted event may consume before it is failed terminally. Bounds both a
+/// crashlooping recovery and the time a poller can be strung along with
+/// `queued` answers.
+const TRIGGER_MAX_CLAIM_ATTEMPTS: i64 = 5;
+
+/// Exponential backoff between recovery attempts: 30s, 60s, 120s, 240s…
+/// capped so a persistently undriveable event still reaches its terminal
+/// failure within a bounded wall-clock budget.
+const TRIGGER_RETRY_BACKOFF_BASE_SECS: i64 = 30;
+const TRIGGER_RETRY_BACKOFF_CAP_SECS: i64 = 600;
+
 struct TriggerState {
     event_bus: Arc<dyn EventBus>,
     workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
@@ -60,6 +83,10 @@ struct TriggerState {
             HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
         >,
     >,
+    /// Durable store backing trigger correlation (issue #259). `None` keeps
+    /// the development-only in-memory scheduler: the status endpoint then
+    /// refuses to answer rather than correlating from volatile state.
+    db: Option<gitforge_db::Pool>,
 }
 
 #[tokio::main]
@@ -129,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
         event_bus: event_bus.clone(),
         workspace_paths: workspace_paths.clone(),
         run_waiters: run_waiters.clone(),
+        db: scheduler_db.clone(),
     });
 
     let scheduler_app = Router::new()
@@ -136,6 +164,11 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/pipelines/trigger",
             axum::routing::post(trigger_pipeline).layer(middleware::from_fn(require_trigger_auth)),
+        )
+        .route(
+            "/pipelines/trigger/status/{event_id}",
+            axum::routing::get(trigger_event_status)
+                .layer(middleware::from_fn(require_status_auth)),
         )
         .merge(scheduler_routes(scheduler_state))
         .layer(Extension(trigger_state))
@@ -379,6 +412,32 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("job timeout watchdog shutting down");
     });
 
+    // Trigger recovery (F2). The startup sweep resolves events the previous
+    // process accepted but never consumed; the periodic sweep bounds the
+    // fate of events whose consumer dies, lags past its lease, or loses the
+    // correlate write while this process lives on.
+    let trigger_recovery_db = scheduler_db.clone();
+    let trigger_recovery_scheduler = scheduler_arc.clone();
+    let trigger_recovery_cache = pipeline_cache.clone();
+    let trigger_recovery_workspaces = workspace_paths.clone();
+    let trigger_recovery_run_workspaces = run_workspace_paths.clone();
+    let trigger_recovery_registry = pipeline_registry.clone();
+    let trigger_recovery_shutdown = shutdown.clone();
+    if trigger_recovery_db.is_some() {
+        let _trigger_recovery_handle = tokio::spawn(async move {
+            run_trigger_recovery_loop(
+                trigger_recovery_db.expect("recovery pool checked above"),
+                trigger_recovery_scheduler,
+                trigger_recovery_cache,
+                trigger_recovery_workspaces,
+                trigger_recovery_run_workspaces,
+                trigger_recovery_registry,
+                trigger_recovery_shutdown,
+            )
+            .await;
+        });
+    }
+
     tracing::info!("CI Orchestrator initialized successfully");
 
     // Wait for shutdown signal
@@ -410,6 +469,8 @@ struct PipelineTriggerRequest {
     ref_name: String,
     old_hash: String,
     new_hash: String,
+    #[serde(default)]
+    pusher_id: Option<gitforge_common::UserId>,
     working_dir: Option<String>,
 }
 
@@ -428,11 +489,12 @@ fn configured_trigger_token(get_var: impl Fn(&str) -> Option<String>) -> Option<
     .find_map(|name| get_var(name).filter(|token| !token.is_empty()))
 }
 
-/// Compare trigger credentials without leaking the first differing byte or
+/// Compare bearer credentials without leaking the first differing byte or
 /// accepting a token with a different length. The scheduler is an internal
 /// control-plane boundary, so both the dedicated compatibility header and the
-/// standard Bearer form are supported during migration.
-fn trigger_token_matches(expected: &str, supplied: Option<&str>) -> bool {
+/// standard Bearer form are supported; the trigger and status middlewares
+/// share this comparison (issue #259).
+fn token_matches(expected: &str, supplied: Option<&str>) -> bool {
     let Some(supplied) = supplied else {
         return false;
     };
@@ -449,6 +511,15 @@ fn trigger_token_matches(expected: &str, supplied: Option<&str>) -> bool {
     difference == 0
 }
 
+/// The trigger status endpoint takes its own credential, deliberately NOT
+/// falling back to the trigger or scheduler operator tokens (issue #259): a
+/// deployment that leaks the status secret exposes only "did the run I
+/// triggered finish", never the ability to start builds or operate the
+/// scheduler. Unset means the endpoint is closed, not open.
+fn configured_status_token(get_var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    get_var("GITFORGE_STATUS_TOKEN").filter(|token| !token.is_empty())
+}
+
 async fn require_trigger_auth(request: Request, next: Next) -> Response {
     let expected = configured_trigger_token(|name| std::env::var(name).ok());
     let Some(expected) = expected else {
@@ -463,12 +534,37 @@ async fn require_trigger_auth(request: Request, next: Next) -> Response {
         .get("x-gitforge-trigger-token")
         .or_else(|| request.headers().get(header::AUTHORIZATION))
         .and_then(|value| value.to_str().ok());
-    if trigger_token_matches(&expected, supplied) {
+    if token_matches(&expected, supplied) {
         next.run(request).await
     } else {
         (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "trigger_auth_required"})),
+        )
+            .into_response()
+    }
+}
+
+async fn require_status_auth(request: Request, next: Next) -> Response {
+    let expected = configured_status_token(|name| std::env::var(name).ok());
+    let Some(expected) = expected else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "status_auth_not_configured"})),
+        )
+            .into_response();
+    };
+    let supplied = request
+        .headers()
+        .get("x-gitforge-status-token")
+        .or_else(|| request.headers().get(header::AUTHORIZATION))
+        .and_then(|value| value.to_str().ok());
+    if token_matches(&expected, supplied) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "status_auth_required"})),
         )
             .into_response()
     }
@@ -522,17 +618,18 @@ async fn trigger_pipeline(
         .workspace_paths
         .lock()
         .expect("workspace cache lock poisoned")
-        .insert(repo_id, working_dir);
+        .insert(repo_id, working_dir.clone());
 
+    let push_payload = PushReceivedPayload {
+        repo_id,
+        ref_name: request.ref_name.clone(),
+        old_hash: request.old_hash.clone(),
+        new_hash: request.new_hash.clone(),
+        pusher_id: request.pusher_id,
+    };
     let event = EventEnvelope::new(
         EventType::PushReceived,
-        EventPayload::PushReceived(PushReceivedPayload {
-            repo_id,
-            ref_name: request.ref_name,
-            old_hash: request.old_hash,
-            new_hash: request.new_hash.clone(),
-            pusher_id: None,
-        }),
+        EventPayload::PushReceived(push_payload.clone()),
         Some(repo_id),
         None,
     );
@@ -543,6 +640,60 @@ async fn trigger_pipeline(
         .lock()
         .expect("run waiter lock poisoned")
         .insert(event.event_id, run_tx);
+
+    // Durably record the accepted event before it is published (issue #259):
+    // a `queued` answer (the correlation window below elapsed) must stay
+    // resolvable by event_id even after a service restart, which volatile
+    // waiter map cannot do. Failing the trigger here is deliberate — firing
+    // an event no caller could ever correlate would strand it.
+    //
+    // The serialized payload travels with the row (F2): if this process dies
+    // before the consumer creates the run, the recovery sweep can re-drive
+    // the exact accepted event — same repo, ref, and commit — instead of
+    // failing a request the caller was told was accepted.
+    if let Some(pool) = trigger_state.db.as_ref() {
+        let payload_json = match serde_json::to_string(&push_payload) {
+            Ok(json) => json,
+            Err(error) => {
+                trigger_state
+                    .run_waiters
+                    .lock()
+                    .expect("run waiter lock poisoned")
+                    .remove(&event.event_id);
+                tracing::error!(%error, event_id = %event.event_id, "failed to serialize trigger payload");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "trigger_correlation_unavailable",
+                        "message": "could not serialize trigger payload; retry the request"
+                    })),
+                );
+            }
+        };
+        if let Err(error) = gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            pool,
+            event.event_id,
+            repo_id,
+            Some(&payload_json),
+            working_dir.as_deref(),
+        )
+        .await
+        {
+            trigger_state
+                .run_waiters
+                .lock()
+                .expect("run waiter lock poisoned")
+                .remove(&event.event_id);
+            tracing::error!(%error, event_id = %event.event_id, "failed to persist trigger correlation row");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "trigger_correlation_unavailable",
+                    "message": "could not persist trigger correlation; retry the request"
+                })),
+            );
+        }
+    }
 
     match trigger_state.event_bus.publish(event.clone()).await {
         Ok(()) => {
@@ -579,13 +730,160 @@ async fn trigger_pipeline(
                 })),
             )
         }
-        Err(error) => (
+        Err(error) => {
+            // The event never reached the consumer, so nothing will ever
+            // correlate it: close the correlation row out as failed instead
+            // of leaving a pending row a poller could wait on forever.
+            if let Some(pool) = trigger_state.db.as_ref() {
+                let _ =
+                    gitforge_db::queries::CiTriggerEventQueries::mark_failed(pool, event.event_id)
+                        .await;
+            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "event_publish_failed",
+                    "message": error.to_string(),
+                })),
+            )
+        }
+    }
+}
+
+/// Status read for one trigger event, addressed by the `event_id` the
+/// triggering call received (issue #259). Deliberately narrow on every axis:
+/// the credential is a dedicated status token, the caller can only name an
+/// event it already saw in a trigger response, the response carries only the
+/// correlation and the run's one-word lifecycle state, and every ambiguous
+/// case maps to a non-green status. A transient database read failure is
+/// answered retryably with 503 — it is never graded into a terminal status,
+/// so a poller fails the job only on genuine evidence, not on a read fault.
+async fn trigger_event_status(
+    Extension(trigger_state): Extension<Arc<TriggerState>>,
+    Path(event_id): Path<String>,
+) -> Response {
+    let Some(pool) = trigger_state.db.as_ref() else {
+        // Without durable storage there is no correlation that survives a
+        // restart, which the contract requires — refuse rather than guess.
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "event_publish_failed",
-                "message": error.to_string(),
+                "error": "status_unavailable",
+                "message": "durable trigger correlation requires GITFORGE_DATABASE_URL"
             })),
-        ),
+        )
+            .into_response();
+    };
+    let Ok(event_id) = uuid::Uuid::parse_str(&event_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_event_id",
+                "message": "event_id must be a UUID"
+            })),
+        )
+            .into_response();
+    };
+    let correlation = match gitforge_db::queries::CiTriggerEventQueries::get(pool, event_id).await {
+        Ok(Some(correlation)) => correlation,
+        Ok(None) => {
+            // Unknown event id: either never triggered or durably lost.
+            // Both are failures, never a green answer.
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "unknown_event_id",
+                    "status": "missing"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::warn!(%error, event_id = %event_id, "trigger status read failed");
+            // Retryable, so the body must not carry a terminal verdict: the
+            // poller keeps polling on anything that is not 200/404/401/403.
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "status_read_failed",
+                    "status": "unavailable"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = match correlation.status.as_str() {
+        // The consumer has not created the run yet — keep polling.
+        gitforge_db::models::TRIGGER_EVENT_PENDING => "queued",
+        // The consumer errored; there is no run and there never will be.
+        gitforge_db::models::TRIGGER_EVENT_FAILED => "failed",
+        // The run exists; grade from the same durable row the reconcilers
+        // write, so this endpoint never disagrees with the run's verdict.
+        gitforge_db::models::TRIGGER_EVENT_CORRELATED => match correlation.pipeline_run_id {
+            // A correlated row that names no run is a corrupted record, not a
+            // polling hiccup: fail closed and terminally.
+            None => "failed",
+            Some(run_id) => {
+                match gitforge_db::queries::PipelineRunQueries::get(pool, run_id).await {
+                    Ok(Some(run)) => map_run_status(Some(&run.status)),
+                    // The correlation names a run that does not exist: the
+                    // record is genuinely lost, so the answer is terminal —
+                    // but still never green.
+                    Ok(None) => "failed",
+                    // A read error says nothing about the run's verdict, so
+                    // the answer must not be terminal: 503 is the one answer
+                    // the poller keeps retrying instead of failing the job.
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            run_id = %run_id,
+                            "pipeline run status read failed"
+                        );
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": "status_read_failed",
+                                "status": "unavailable"
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        },
+        other => {
+            tracing::warn!(status = %other, "unknown correlation status; answering fail-closed");
+            "failed"
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "event_id": event_id.to_string(),
+            "status": status,
+            "pipeline_run_id": correlation
+                .pipeline_run_id
+                .map(|id| id.to_string()),
+        })),
+    )
+        .into_response()
+}
+
+/// Fail-closed mapping from a durable pipeline-run status to the one-word
+/// status the poller consumes. `None` — a correlated event that names a run
+/// with no row, or names no run at all — and any unrecognized verdict map to
+/// `failed`: a missing or ambiguous record is never green. Transient read
+/// errors never reach this mapping; the handler answers them with a
+/// retryable 503 instead.
+fn map_run_status(status: Option<&str>) -> &'static str {
+    match status {
+        Some("pending") | Some("running") => "running",
+        Some("succeeded") => "succeeded",
+        Some("failed") | Some("timed_out") | Some("timeout") | Some("timed-out") => "failed",
+        Some("cancelled") => "cancelled",
+        _ => "failed",
     }
 }
 
@@ -611,6 +909,33 @@ fn validate_workspace_path(path: &str) -> Result<String, String> {
         return Err(format!("workspace must be inside one of: {allowed}"));
     }
     Ok(workspace.to_string_lossy().into_owned())
+}
+
+/// A drive failure that is a deterministic function of the committed
+/// pipeline configuration at the pushed revision: an unparseable or
+/// non-UTF-8 definition file, or a definition the DAG builder rejects.
+/// Re-driving the event re-reads the same commit and fails identically,
+/// so the settle path fails the trigger terminally instead of spending
+/// its retry budget delaying a verdict that cannot change. Everything
+/// else (database, git plumbing, filesystem, process spawn) is treated
+/// as transient.
+#[derive(Debug)]
+struct CommittedConfigInvalid(anyhow::Error);
+
+impl std::fmt::Display for CommittedConfigInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Render the whole inner chain: this type is a classification
+        // marker, and exposing no `source()` keeps anyhow's alternate
+        // (`{:#}`) rendering from printing the chain twice.
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for CommittedConfigInvalid {}
+
+/// Classify an error as a permanent rejection of committed configuration.
+fn invalid_committed_config(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(CommittedConfigInvalid(error))
 }
 
 /// Load the pipeline definition committed at the pushed revision. CI
@@ -660,11 +985,15 @@ async fn load_pipeline_from_commit(
         }
 
         let yaml = String::from_utf8(show.stdout).map_err(|error| {
-            anyhow::anyhow!("{config_path} at {commit_hash} is not valid UTF-8: {error}")
+            invalid_committed_config(anyhow::anyhow!(
+                "{config_path} at {commit_hash} is not valid UTF-8: {error}"
+            ))
         })?;
-        return PipelineDefinition::parse(&yaml)
-            .map(Some)
-            .map_err(|error| anyhow::anyhow!("invalid {config_path} at {commit_hash}: {error}"));
+        return PipelineDefinition::parse(&yaml).map(Some).map_err(|error| {
+            invalid_committed_config(anyhow::anyhow!(
+                "invalid {config_path} at {commit_hash}: {error}"
+            ))
+        });
     }
     Ok(None)
 }
@@ -1540,17 +1869,70 @@ async fn run_event_consumer(
                 match event {
                     Some(event) => {
                         tracing::debug!("received event: {:?}", event.event_type);
-                        match handle_push_event(&event, &scheduler, &pipeline_cache, scheduler_db.as_ref(), &workspace_paths, &run_workspace_paths, &pipeline_registry).await {
-                            Ok(run_id) => {
-                                if let Some(waiter) = run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id) {
-                                    let _ = waiter.send(run_id);
+
+                        // Claim the accepted event before driving it (F2).
+                        // The lease is what keeps the recovery sweep out of
+                        // an event this consumer is actively handling, and
+                        // what makes this consumer skip an event recovery
+                        // already owns: exactly one driver at a time. With
+                        // no durable store there is nothing to coordinate
+                        // and nothing to recover — drive as before.
+                        let claim = match scheduler_db.as_ref() {
+                            Some(pool) => {
+                                match gitforge_db::queries::CiTriggerEventQueries::claim_event(
+                                    pool,
+                                    event.event_id,
+                                    chrono::Utc::now(),
+                                    Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+                                )
+                                .await
+                                {
+                                    Ok(claim) => claim,
+                                    Err(error) => {
+                                        run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id);
+                                        tracing::error!(%error, event_id = %event.event_id, "failed to claim trigger event");
+                                        continue;
+                                    }
                                 }
                             }
-                            Err(e) => {
-                                run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id);
-                                tracing::error!("failed to handle push event: {}", e);
-                            }
+                            None => None,
+                        };
+                        if scheduler_db.is_some() && claim.is_none() {
+                            // Another driver holds this event (recovery sweep,
+                            // or the row already settled). Dropping it here is
+                            // correct: its owner will correlate or fail it.
+                            tracing::debug!(event_id = %event.event_id, "trigger event claimed elsewhere; skipping");
+                            run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id);
+                            continue;
                         }
+
+                        let drive_result = handle_push_event(
+                            &event,
+                            &scheduler,
+                            &pipeline_cache,
+                            scheduler_db.as_ref(),
+                            &workspace_paths,
+                            &run_workspace_paths,
+                            &pipeline_registry,
+                            None,
+                        )
+                        .await;
+                        if let Ok(Some(run_id)) = &drive_result {
+                            if let Some(waiter) = run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id) {
+                                let _ = waiter.send(*run_id);
+                            }
+                        } else {
+                            // No run: the waiter stays unanswered so the
+                            // trigger's caller sees `queued` rather than a
+                            // fabricated correlation.
+                            run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id);
+                        }
+                        settle_claimed_trigger_event(
+                            scheduler_db.as_ref(),
+                            claim,
+                            drive_result,
+                        )
+                        .await;
                     }
                     None => {
                         tracing::info!("event stream closed");
@@ -1564,7 +1946,389 @@ async fn run_event_consumer(
     Ok(())
 }
 
-/// Handle a push received event - trigger pipeline if configured
+/// Close out a claimed trigger event from a drive outcome. Every write is
+/// conditional on the claim token, so a driver that lost its lease can never
+/// bury an event another driver is making progress on; and a drive that
+/// failed *after* creating its run is healed by correlating that run instead
+/// of being retried into a duplicate (F2).
+async fn settle_claimed_trigger_event(
+    pool: Option<&gitforge_db::Pool>,
+    claim: Option<gitforge_db::models::TriggerEventClaim>,
+    outcome: anyhow::Result<Option<gitforge_common::PipelineRunId>>,
+) {
+    let (Some(pool), Some(claim)) = (pool, claim) else {
+        return;
+    };
+    let event_id = claim.event.event_id;
+    match outcome {
+        Ok(Some(run_id)) => {
+            match gitforge_db::queries::CiTriggerEventQueries::correlate_claimed(
+                pool,
+                event_id,
+                run_id,
+                &claim.claim_token,
+            )
+            .await
+            {
+                Ok(1) => {
+                    tracing::info!(event_id = %event_id, run = %run_id, "trigger event correlated");
+                }
+                // The lease expired and another driver owns the row now; it
+                // will settle the event (and converge on this same run via
+                // the idempotency link).
+                Ok(_) => {
+                    tracing::warn!(
+                        event_id = %event_id,
+                        run = %run_id,
+                        "trigger claim lost before correlation; another driver owns the row"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(%error, event_id = %event_id, run = %run_id, "failed to persist trigger correlation");
+                }
+            }
+        }
+        Ok(None) => {
+            // The event was consumed without producing a run. There is
+            // nothing to wait for, so the row must say so terminally — a
+            // pending verdict here is exactly the F2 forever-queued defect.
+            if let Err(error) = gitforge_db::queries::CiTriggerEventQueries::fail_claimed(
+                pool,
+                event_id,
+                &claim.claim_token,
+                "event carried no buildable push",
+            )
+            .await
+            {
+                tracing::error!(%error, event_id = %event_id, "failed to record trigger no-run outcome");
+            }
+        }
+        Err(error) => {
+            // The drive failed, but it may have failed after creating the
+            // run (persist failure, lease race won by the index). Correlate
+            // beats retry whenever the run exists — a retry cannot improve
+            // on a run that is already there.
+            match gitforge_db::queries::PipelineRunQueries::find_id_by_trigger_event(pool, event_id)
+                .await
+            {
+                Ok(Some(run_id)) => {
+                    if let Err(correlate_error) =
+                        gitforge_db::queries::CiTriggerEventQueries::correlate_claimed(
+                            pool,
+                            event_id,
+                            run_id,
+                            &claim.claim_token,
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            %correlate_error,
+                            event_id = %event_id,
+                            run = %run_id,
+                            "drive failed but its run exists and could not be correlated"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    // A committed-config rejection fails terminally now:
+                    // re-driving re-reads the same commit and fails
+                    // identically, so the retry budget would only delay
+                    // the verdict the poller is already owed. Every other
+                    // failure is transient — bounded retries with backoff,
+                    // terminal at exhaustion.
+                    let permanent = error.downcast_ref::<CommittedConfigInvalid>().is_some();
+                    let exhausted = claim.event.attempts >= TRIGGER_MAX_CLAIM_ATTEMPTS;
+                    if permanent || exhausted {
+                        let message = if permanent {
+                            format!("committed pipeline config rejected: {error:#}")
+                        } else {
+                            format!(
+                                "trigger drive failed after {} attempts: {error}",
+                                claim.event.attempts
+                            )
+                        };
+                        if let Err(fail_error) =
+                            gitforge_db::queries::CiTriggerEventQueries::fail_claimed(
+                                pool,
+                                event_id,
+                                &claim.claim_token,
+                                &message,
+                            )
+                            .await
+                        {
+                            tracing::error!(%fail_error, event_id = %event_id, "failed to record terminal trigger failure");
+                        } else if permanent {
+                            tracing::warn!(
+                                event_id = %event_id,
+                                %error,
+                                "trigger event failed terminally: committed pipeline config is invalid"
+                            );
+                        } else {
+                            tracing::error!(
+                                event_id = %event_id,
+                                attempts = claim.event.attempts,
+                                %error,
+                                "trigger event failed terminally after exhausting its retry budget"
+                            );
+                        }
+                    } else {
+                        let next = chrono::Utc::now() + trigger_retry_backoff(claim.event.attempts);
+                        if let Err(retry_error) =
+                            gitforge_db::queries::CiTriggerEventQueries::schedule_retry(
+                                pool,
+                                event_id,
+                                &claim.claim_token,
+                                next,
+                                &format!("{error:#}"),
+                            )
+                            .await
+                        {
+                            tracing::error!(%retry_error, event_id = %event_id, "failed to schedule trigger retry");
+                        } else {
+                            tracing::warn!(
+                                event_id = %event_id,
+                                attempts = claim.event.attempts,
+                                %error,
+                                "trigger drive failed; recovery retry scheduled"
+                            );
+                        }
+                    }
+                }
+                Err(read_error) => {
+                    tracing::error!(
+                        %read_error,
+                        event_id = %event_id,
+                        "cannot read whether the drive created a run; leaving the claim to expire"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Backoff before the next recovery attempt, doubling from the base with a
+/// cap. `attempts` is the count already consumed (the claim that just failed
+/// included), so the first retry waits the base interval.
+fn trigger_retry_backoff(attempts: i64) -> std::time::Duration {
+    let shift = attempts.saturating_sub(1).min(16) as u32;
+    let secs = TRIGGER_RETRY_BACKOFF_BASE_SECS
+        .saturating_mul(1i64 << shift)
+        .min(TRIGGER_RETRY_BACKOFF_CAP_SECS);
+    std::time::Duration::from_secs(secs.max(1) as u64)
+}
+
+/// Recovery sweep for orphaned pending trigger events (F2). Claims due rows
+/// one at a time under the same lease the live consumer uses, then either
+/// correlates an already-created run, fails a row that cannot be re-driven,
+/// or re-drives the accepted event from its durable payload.
+async fn sweep_orphaned_trigger_events(
+    pool: &gitforge_db::Pool,
+    scheduler: &Arc<Scheduler>,
+    pipeline_cache: &Arc<std::sync::Mutex<PipelineCache>>,
+    workspace_paths: &Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    run_workspace_paths: &Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
+    pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
+) -> anyhow::Result<usize> {
+    // Bound each sweep so a backlog cannot monopolize the runtime; the next
+    // tick (15 s) continues where this one stopped, oldest first.
+    const MAX_PER_SWEEP: usize = 16;
+    let mut recovered = 0usize;
+    for _ in 0..MAX_PER_SWEEP {
+        let Some(claim) = gitforge_db::queries::CiTriggerEventQueries::claim_due(
+            pool,
+            chrono::Utc::now(),
+            Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+        )
+        .await?
+        else {
+            break;
+        };
+        recovered += 1;
+        recover_claimed_trigger_event(
+            pool,
+            claim,
+            scheduler,
+            pipeline_cache,
+            workspace_paths,
+            run_workspace_paths,
+            pipeline_registry,
+        )
+        .await;
+    }
+    Ok(recovered)
+}
+
+/// Resolve one claimed, orphaned trigger event: correlate if its run already
+/// exists, fail it if it cannot be re-driven, otherwise re-drive the exact
+/// accepted event from the durable payload and settle the outcome.
+async fn recover_claimed_trigger_event(
+    pool: &gitforge_db::Pool,
+    claim: gitforge_db::models::TriggerEventClaim,
+    scheduler: &Arc<Scheduler>,
+    pipeline_cache: &Arc<std::sync::Mutex<PipelineCache>>,
+    workspace_paths: &Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    run_workspace_paths: &Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
+    pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
+) {
+    let event_id = claim.event.event_id;
+
+    // A run already exists for this event — a correlate write that failed, a
+    // crash between run creation and correlation. Point the row at it; never
+    // build a second one.
+    match gitforge_db::queries::PipelineRunQueries::find_id_by_trigger_event(pool, event_id).await {
+        Ok(Some(run_id)) => {
+            match gitforge_db::queries::CiTriggerEventQueries::correlate_claimed(
+                pool,
+                event_id,
+                run_id,
+                &claim.claim_token,
+            )
+            .await
+            {
+                Ok(1) => tracing::info!(
+                    event_id = %event_id,
+                    run = %run_id,
+                    "recovered orphaned trigger event by correlating its existing run"
+                ),
+                Ok(_) => tracing::warn!(
+                    event_id = %event_id,
+                    "orphaned trigger event was settled while being recovered"
+                ),
+                Err(error) => tracing::error!(
+                    %error,
+                    event_id = %event_id,
+                    run = %run_id,
+                    "recovered trigger run exists but correlation failed"
+                ),
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(
+                %error,
+                event_id = %event_id,
+                "cannot read whether an orphaned trigger event has a run; leaving the claim to expire"
+            );
+            return;
+        }
+    }
+
+    let Some(payload_text) = claim.event.payload.as_deref() else {
+        // A pre-recovery row: its producing process is gone and no payload
+        // was ever persisted, so no driver can ever create its run. Terminal
+        // failure is the honest answer — the poller learns instead of
+        // polling a `queued` verdict forever.
+        let message =
+            "pending trigger event has no durable payload; the process that accepted it is gone";
+        if let Err(error) = gitforge_db::queries::CiTriggerEventQueries::fail_claimed(
+            pool,
+            event_id,
+            &claim.claim_token,
+            message,
+        )
+        .await
+        {
+            tracing::error!(%error, event_id = %event_id, "failed to fail payload-less trigger event");
+        } else {
+            tracing::warn!(event_id = %event_id, "failed a pending trigger event without a durable payload");
+        }
+        return;
+    };
+
+    let drive = match serde_json::from_str::<PushReceivedPayload>(payload_text) {
+        Ok(payload) => {
+            // Rebuild the exact accepted envelope: same event id (so the
+            // run-idempotency link lands on this event), same payload, same
+            // requested workspace.
+            let envelope = EventEnvelope {
+                event_id,
+                event_type: EventType::PushReceived,
+                event_version: 1,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                repo_id: Some(claim.event.repo_id),
+                actor_id: None,
+                correlation_id: None,
+                payload: EventPayload::PushReceived(payload),
+            };
+            handle_push_event(
+                &envelope,
+                scheduler,
+                pipeline_cache,
+                Some(pool),
+                workspace_paths,
+                run_workspace_paths,
+                pipeline_registry,
+                claim.event.working_dir.clone(),
+            )
+            .await
+        }
+        Err(error) => Err(anyhow::anyhow!(
+            "durable trigger payload is undecodable: {error}"
+        )),
+    };
+    settle_claimed_trigger_event(Some(pool), Some(claim), drive).await;
+}
+
+/// Long-running trigger recovery loop (F2): sweeps immediately — so events
+/// stranded by the previous process lifetime are resolved at startup — and
+/// then once per interval, which is what bounds the fate of events whose
+/// consumer dies while the process lives on.
+async fn run_trigger_recovery_loop(
+    pool: gitforge_db::Pool,
+    scheduler: Arc<Scheduler>,
+    pipeline_cache: Arc<std::sync::Mutex<PipelineCache>>,
+    workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    run_workspace_paths: Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
+    pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    tracing::info!("starting trigger recovery loop");
+    let mut ticker = tokio::time::interval(Duration::from_secs(TRIGGER_RECOVERY_SWEEP_SECS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        // The first tick completes immediately: startup sweep.
+        ticker.tick().await;
+        if shutdown.load(Ordering::SeqCst) {
+            tracing::info!("trigger recovery loop shutting down");
+            break;
+        }
+        match sweep_orphaned_trigger_events(
+            &pool,
+            &scheduler,
+            &pipeline_cache,
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(recovered) => {
+                tracing::info!(
+                    recovered,
+                    "trigger recovery sweep processed orphaned events"
+                );
+            }
+            Err(error) => {
+                tracing::error!(%error, "trigger recovery sweep failed");
+            }
+        }
+    }
+}
+
+/// Handle a push received event - trigger pipeline if configured. Returns the
+/// created run's id, or `None` when the event was consumed without creating a
+/// run (ref deletion, non-push envelope) — callers must not treat `None` as a
+/// run id, and the trigger waiter stays unanswered so its caller sees
+/// `queued` rather than a fabricated correlation.
+#[allow(clippy::too_many_arguments)]
 async fn handle_push_event(
     event: &EventEnvelope,
     scheduler: &Arc<Scheduler>,
@@ -1575,10 +2339,11 @@ async fn handle_push_event(
         std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
     >,
     pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
-) -> anyhow::Result<gitforge_common::PipelineRunId> {
+    requested_workspace_override: Option<String>,
+) -> anyhow::Result<Option<gitforge_common::PipelineRunId>> {
     // Only handle PushReceived events
     let EventPayload::PushReceived(payload) = &event.payload else {
-        return Ok(gitforge_common::PipelineRunId::new());
+        return Ok(None);
     };
 
     // Belt-and-suspenders for the git-server's deletion filter (F37): an
@@ -1592,7 +2357,26 @@ async fn handle_push_event(
             ref_name = %payload.ref_name,
             "ignoring ref-deletion push: nothing to build"
         );
-        return Ok(gitforge_common::PipelineRunId::new());
+        return Ok(None);
+    }
+
+    // Trigger-run idempotency (F2): if a previous drive of this accepted
+    // event already created its run — a correlate write that failed, a crash
+    // between run creation and correlation, a lease that expired mid-drive —
+    // answer with that run instead of building a duplicate. The durable
+    // event link written by `create_for_trigger` makes this exact.
+    if let Some(pool) = scheduler_db {
+        if let Some(existing_run) =
+            gitforge_db::queries::PipelineRunQueries::find_id_by_trigger_event(pool, event.event_id)
+                .await?
+        {
+            tracing::info!(
+                event_id = %event.event_id,
+                run = %existing_run,
+                "push event already produced a run; correlating instead of re-driving"
+            );
+            return Ok(Some(existing_run));
+        }
     }
 
     let repo_id = payload.repo_id;
@@ -1647,19 +2431,31 @@ async fn handle_push_event(
         .lock()
         .unwrap()
         .insert(repo_id, pipeline.clone());
-    let requested_workspace = workspace_paths
-        .lock()
-        .expect("workspace cache lock poisoned")
-        .get(&repo_id)
-        .cloned()
-        .flatten();
+    // The recovery sweep passes the working directory persisted with the
+    // accepted event explicitly, so it never reads (or pollutes) the live
+    // request cache across a restart.
+    let requested_workspace = match requested_workspace_override {
+        Some(explicit) => Some(explicit),
+        None => workspace_paths
+            .lock()
+            .expect("workspace cache lock poisoned")
+            .get(&repo_id)
+            .cloned()
+            .flatten(),
+    };
 
     // Create trigger event
     let trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
     let pipeline_id = trigger_event.pipeline_id;
 
-    // Create and start the CI engine
-    let engine = Arc::new(CiEngine::new(trigger_event, pipeline.clone()).await?);
+    // Create and start the CI engine. `CiEngine::new` fails only when the
+    // DAG builder rejects the definition — a pure function of the committed
+    // configuration — so its errors are permanent, not retryable.
+    let engine = Arc::new(
+        CiEngine::new(trigger_event, pipeline.clone())
+            .await
+            .map_err(|error| invalid_committed_config(error.into()))?,
+    );
     engine.start().await?;
 
     tracing::info!(
@@ -1672,6 +2468,52 @@ async fn handle_push_event(
     let ready_jobs = engine.ready_jobs().await;
     tracing::info!("enqueueing {} ready jobs", ready_jobs.len());
 
+    persist_and_launch_run(
+        scheduler_db,
+        scheduler,
+        &engine,
+        pipeline_id,
+        &pipeline,
+        repo_id,
+        &payload.new_hash,
+        event.event_id,
+        requested_workspace,
+        run_workspace_paths,
+        pipeline_registry,
+    )
+    .await
+    .map(Some)
+}
+
+/// Persist the durable side of an accepted drive and launch the run: the
+/// pipeline version row, the run row linked to the accepted event, the
+/// workspace checkout, engine registration, planned job rows, and the
+/// scheduler enqueue. Returns the run id execution belongs to.
+///
+/// The run insert is the idempotency adjudication (F2): the partial unique
+/// index on `pipeline_runs.trigger_event_id` lets exactly one concurrent
+/// drive of an accepted event land its run row, and `create_for_trigger`
+/// returns the durable run's id — the winner's, when this drive's insert
+/// lost the race. A loser must stop right there: continuing would prepare
+/// a workspace, register the engine, persist planned jobs, and enqueue
+/// under its own losing run id — a fully executing orphan no poller or
+/// settle path will ever reference.
+#[allow(clippy::too_many_arguments)]
+async fn persist_and_launch_run(
+    scheduler_db: Option<&gitforge_db::Pool>,
+    scheduler: &Arc<Scheduler>,
+    engine: &Arc<CiEngine>,
+    pipeline_id: gitforge_common::PipelineId,
+    pipeline: &PipelineDefinition,
+    repo_id: gitforge_common::RepoId,
+    commit_hash: &str,
+    event_id: uuid::Uuid,
+    requested_workspace: Option<String>,
+    run_workspace_paths: &Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
+    pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
+) -> anyhow::Result<gitforge_common::PipelineRunId> {
     let state = engine.state().await;
     if let Some(pool) = scheduler_db {
         let db_pipeline = DbPipeline {
@@ -1679,26 +2521,46 @@ async fn handle_push_event(
             repo_id,
             name: pipeline.name.clone(),
             trigger_type: "push".to_string(),
-            config: serde_json::to_value(&pipeline)?,
+            config: serde_json::to_value(pipeline)?,
             created_at: Utc::now(),
         };
-        // Only one active pipeline version per (repo, name) is allowed by
-        // idx_pipelines_active_repo_name — retire the predecessor before
-        // recording this push's version, or every push after the first
-        // fails run creation with a constraint violation.
-        gitforge_db::queries::PipelineQueries::deactivate_active(pool, repo_id, &pipeline.name)
-            .await?;
-        gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
-
         let mut db_run = DbPipelineRun::new(
             pipeline_id,
             repo_id,
             "push".to_string(),
-            payload.new_hash.clone(),
+            commit_hash.to_string(),
         );
         db_run.id = state.run_id;
         db_run.start();
-        gitforge_db::queries::PipelineRunQueries::create(pool, &db_run).await?;
+        // The pipeline-version mutation and the run-idempotency
+        // adjudication have to land together or not at all: each push
+        // allocates a fresh PipelineId, so a losing drive's
+        // `deactivate_active` would otherwise deactivate the winner's
+        // predecessor and leave its own version active. The helper runs
+        // them under one transaction; a loser rolls back its version
+        // change and returns the durable winner's run id.
+        let durable_run =
+            gitforge_db::queries::PipelineQueries::create_version_and_run_for_trigger(
+                pool,
+                &db_pipeline,
+                &db_run,
+                event_id,
+            )
+            .await?;
+        if durable_run != state.run_id {
+            // This drive lost the insert race against a concurrent driver of
+            // the same accepted event — its claim lease expired mid-drive and
+            // the winner (recovery sweep or fellow consumer) landed the row
+            // between this drive's early lookup and its insert. Return the
+            // durable run and launch nothing under the losing id.
+            tracing::warn!(
+                event_id = %event_id,
+                run = %durable_run,
+                duplicate = %state.run_id,
+                "lost the trigger run-idempotency race; converging on the durable run"
+            );
+            return Ok(durable_run);
+        }
     }
 
     let workspace_path = match requested_workspace {
@@ -1710,7 +2572,7 @@ async fn handle_push_event(
                     state.run_id
                 )
             })?;
-            match prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await {
+            match prepare_run_workspace(pool, repo_id, state.run_id, commit_hash).await {
                 Ok(path) => Some(path),
                 Err(error) => {
                     let _ = gitforge_db::queries::PipelineRunQueries::update_status(
@@ -1742,7 +2604,7 @@ async fn handle_push_event(
     // once the engine releases their stage.
     if let Some(pool) = scheduler_db {
         if let Err(error) =
-            persist_planned_jobs(pool, &engine, state.run_id, workspace_path.as_deref()).await
+            persist_planned_jobs(pool, engine, state.run_id, workspace_path.as_deref()).await
         {
             // Without the planned rows a restart cannot resume this run; a
             // half-planned run must not be left non-terminal.
@@ -1770,7 +2632,7 @@ async fn handle_push_event(
 
     enqueue_ready_jobs(
         scheduler,
-        &engine,
+        engine,
         state.run_id,
         repo_id,
         workspace_path.clone(),
@@ -2359,32 +3221,1362 @@ mod tests {
     }
 
     #[test]
-    fn trigger_token_matches_raw_and_bearer_credentials() {
-        assert!(trigger_token_matches(
+    fn token_matches_raw_and_bearer_credentials() {
+        assert!(token_matches("shared-secret", Some("shared-secret")));
+        assert!(token_matches("shared-secret", Some("Bearer shared-secret")));
+    }
+
+    #[test]
+    fn token_matches_rejects_missing_mismatched_and_malformed_credentials() {
+        assert!(!token_matches("shared-secret", None));
+        assert!(!token_matches("shared-secret", Some("wrong-secret")));
+        assert!(!token_matches("shared-secret", Some("Basic shared-secret")));
+        assert!(!token_matches(
             "shared-secret",
-            Some("shared-secret")
-        ));
-        assert!(trigger_token_matches(
-            "shared-secret",
-            Some("Bearer shared-secret")
+            Some("Bearer shared-secret-extra")
         ));
     }
 
     #[test]
-    fn trigger_token_rejects_missing_mismatched_and_malformed_credentials() {
-        assert!(!trigger_token_matches("shared-secret", None));
-        assert!(!trigger_token_matches(
-            "shared-secret",
-            Some("wrong-secret")
+    fn status_token_has_no_fallback_and_ignores_empty_values() {
+        // No fallback chain: the status endpoint's credential must be the
+        // dedicated name, never the trigger or operator token (issue #259).
+        let token = configured_status_token(|name| match name {
+            "GITFORGE_STATUS_TOKEN" => Some("status-secret".to_string()),
+            "GITFORGE_TRIGGER_TOKEN" => Some("trigger-secret".to_string()),
+            "GITFORGE_SCHEDULER_OPERATOR_TOKEN" => Some("operator-secret".to_string()),
+            _ => None,
+        });
+        assert_eq!(token.as_deref(), Some("status-secret"));
+
+        assert_eq!(
+            configured_status_token(|name| match name {
+                "GITFORGE_TRIGGER_TOKEN" => Some("trigger-secret".to_string()),
+                _ => None,
+            }),
+            None,
+            "the trigger token must not satisfy the status endpoint"
+        );
+        // An empty configured value closes the endpoint like an unset one.
+        assert_eq!(
+            configured_status_token(|name| (name == "GITFORGE_STATUS_TOKEN").then(String::new)),
+            None
+        );
+    }
+
+    #[test]
+    fn run_status_maps_fail_closed() {
+        // Non-terminal states keep polling.
+        assert_eq!(map_run_status(Some("pending")), "running");
+        assert_eq!(map_run_status(Some("running")), "running");
+        // Terminal states pass through.
+        assert_eq!(map_run_status(Some("succeeded")), "succeeded");
+        assert_eq!(map_run_status(Some("failed")), "failed");
+        assert_eq!(map_run_status(Some("timed_out")), "failed");
+        assert_eq!(map_run_status(Some("timeout")), "failed");
+        assert_eq!(map_run_status(Some("cancelled")), "cancelled");
+        // Unreadable run row, unexpected verdict, or missing correlation:
+        // never green.
+        assert_eq!(map_run_status(None), "failed");
+        assert_eq!(map_run_status(Some("queued")), "failed");
+        assert_eq!(map_run_status(Some("")), "failed");
+    }
+
+    /// Build a trigger state over a real file-backed pool, so the status
+    /// handler's database branches run against actual SQLite semantics
+    /// (`:memory:` pools do not share tables across pool connections). The
+    /// pool carries one user-owned repository so run fixtures can satisfy
+    /// the `pipeline_runs` foreign keys.
+    async fn trigger_status_state() -> (
+        Arc<TriggerState>,
+        gitforge_db::Pool,
+        gitforge_common::RepoId,
+        std::path::PathBuf,
+    ) {
+        let db_path = std::env::temp_dir().join(format!(
+            "gitforge-ci-status-tests-{}.db",
+            uuid::Uuid::new_v4()
         ));
-        assert!(!trigger_token_matches(
-            "shared-secret",
-            Some("Basic shared-secret")
+        let pool = gitforge_db::Pool::new(&db_path.display().to_string())
+            .await
+            .unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "status-tests".to_string(),
+            "status-tests@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repository = gitforge_db::models::Repository::new(
+            "status-tests".to_string(),
+            user.id,
+            std::env::temp_dir()
+                .join(format!("status-tests-{}.git", uuid::Uuid::new_v4()))
+                .display()
+                .to_string(),
+        );
+        let repo_id = repository.id;
+        gitforge_db::queries::RepoQueries::create(&pool, &repository)
+            .await
+            .unwrap();
+        let state = Arc::new(TriggerState {
+            event_bus: Arc::new(InMemoryEventBus::new()),
+            workspace_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            run_waiters: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            db: Some(pool.clone()),
+        });
+        (state, pool, repo_id, db_path)
+    }
+
+    /// Invoke the status handler directly and decode its JSON body.
+    async fn trigger_status_response(
+        state: &Arc<TriggerState>,
+        event_id: uuid::Uuid,
+    ) -> (StatusCode, serde_json::Value) {
+        let response =
+            trigger_event_status(Extension(state.clone()), Path(event_id.to_string())).await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Record a trigger event already correlated to `run_id`.
+    async fn correlated_event(
+        pool: &gitforge_db::Pool,
+        run_id: gitforge_common::PipelineRunId,
+    ) -> uuid::Uuid {
+        let event_id = uuid::Uuid::new_v4();
+        gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            pool,
+            event_id,
+            gitforge_common::RepoId::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        gitforge_db::queries::CiTriggerEventQueries::correlate(pool, event_id, run_id)
+            .await
+            .unwrap();
+        event_id
+    }
+
+    /// The positive anchor: a correlated event grades from the durable run
+    /// row, so the answer follows the run's verdict, not the correlation's.
+    #[tokio::test]
+    async fn trigger_status_correlated_event_grades_from_the_run_row() {
+        let (state, pool, repo_id, _db_path) = trigger_status_state().await;
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id,
+            name: "status-grade-fixture".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo_id,
+            "status-tests".to_string(),
+            "0".repeat(40),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+        gitforge_db::queries::PipelineRunQueries::update_status(&pool, run.id, "succeeded")
+            .await
+            .unwrap();
+
+        let event_id = correlated_event(&pool, run.id).await;
+        let (status, payload) = trigger_status_response(&state, event_id).await;
+        assert_eq!(status, StatusCode::OK, "payload: {payload}");
+        assert_eq!(payload["status"], "succeeded", "payload: {payload}");
+        assert_eq!(payload["pipeline_run_id"], run.id.to_string());
+    }
+
+    /// A correlation that names a run with no row is a genuinely lost record:
+    /// terminal `failed` over HTTP 200 — the poller fails the job instead of
+    /// retrying forever (issue #259 follow-up).
+    #[tokio::test]
+    async fn trigger_status_missing_run_row_is_terminal_failed() {
+        let (state, pool, _repo_id, _db_path) = trigger_status_state().await;
+        let event_id = correlated_event(&pool, gitforge_common::PipelineRunId::new()).await;
+
+        let (status, payload) = trigger_status_response(&state, event_id).await;
+        assert_eq!(status, StatusCode::OK, "payload: {payload}");
+        assert_eq!(payload["status"], "failed", "payload: {payload}");
+    }
+
+    /// A correlated row without a run id is a corrupted record: terminal
+    /// `failed`, never green, and no run lookup is attempted for it.
+    #[tokio::test]
+    async fn trigger_status_correlated_row_without_run_id_is_terminal_failed() {
+        let (state, pool, _repo_id, _db_path) = trigger_status_state().await;
+        let event_id = uuid::Uuid::new_v4();
+        gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            &pool,
+            event_id,
+            gitforge_common::RepoId::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE ci_trigger_events SET status = 'correlated' WHERE event_id = ?")
+            .bind(event_id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        let (status, payload) = trigger_status_response(&state, event_id).await;
+        assert_eq!(status, StatusCode::OK, "payload: {payload}");
+        assert_eq!(payload["status"], "failed", "payload: {payload}");
+        assert!(payload["pipeline_run_id"].is_null(), "payload: {payload}");
+    }
+
+    /// The distinction the audit required: a transient run-read error is a
+    /// retryable 503, never an HTTP 200 terminal `failed` — a poller must
+    /// keep polling instead of failing the job on a database fault, and must
+    /// be able to tell the two answers apart (issue #259 follow-up).
+    #[tokio::test]
+    async fn trigger_status_unreadable_run_is_retryable_503_not_terminal_failed() {
+        let (state, pool, _repo_id, _db_path) = trigger_status_state().await;
+        let event_id = correlated_event(&pool, gitforge_common::PipelineRunId::new()).await;
+
+        // Force PipelineRunQueries::get into the error branch while the
+        // correlation row itself stays readable.
+        sqlx::query("DROP TABLE pipeline_runs")
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        let (status, payload) = trigger_status_response(&state, event_id).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a transient read fault must not look terminal: {payload}"
+        );
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a read fault must never answer the terminal 200 contract"
+        );
+        assert_eq!(payload["error"], "status_read_failed", "payload: {payload}");
+        assert_eq!(payload["status"], "unavailable", "payload: {payload}");
+    }
+
+    /// Shared fixture for the recovery tests: a file-backed pool carrying
+    /// one user-owned repository, plus the process dependencies a recovery
+    /// drive needs. The repository's git path deliberately does not exist —
+    /// the drive-failure tests rely on that.
+    async fn trigger_recovery_fixture() -> (
+        gitforge_db::Pool,
+        gitforge_common::RepoId,
+        RecoveryDeps,
+        std::path::PathBuf,
+    ) {
+        let db_path = std::env::temp_dir().join(format!(
+            "gitforge-ci-recovery-tests-{}.db",
+            uuid::Uuid::new_v4()
         ));
-        assert!(!trigger_token_matches(
-            "shared-secret",
-            Some("Bearer shared-secret-extra")
+        let pool = gitforge_db::Pool::new(&db_path.display().to_string())
+            .await
+            .unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "recovery-tests".to_string(),
+            "recovery-tests@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repository = gitforge_db::models::Repository::new(
+            "recovery-tests".to_string(),
+            user.id,
+            std::env::temp_dir()
+                .join(format!("recovery-tests-{}.git", uuid::Uuid::new_v4()))
+                .display()
+                .to_string(),
+        );
+        let repo_id = repository.id;
+        gitforge_db::queries::RepoQueries::create(&pool, &repository)
+            .await
+            .unwrap();
+        (pool, repo_id, RecoveryDeps::new(), db_path)
+    }
+
+    /// The scheduler/cache/registry bundle `recover_claimed_trigger_event`
+    /// drives; fresh and empty per test.
+    struct RecoveryDeps {
+        scheduler: Arc<Scheduler>,
+        pipeline_cache: Arc<std::sync::Mutex<PipelineCache>>,
+        workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+        run_workspace_paths:
+            Arc<std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>>,
+        pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
+    }
+
+    impl RecoveryDeps {
+        fn new() -> Self {
+            Self {
+                scheduler: Arc::new(Scheduler::new()),
+                pipeline_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                workspace_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                run_workspace_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                pipeline_registry: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            }
+        }
+    }
+
+    /// The crash window the whole F2 defect lives in: the consumer created
+    /// the run, then died (or lost the correlate write). Recovery must point
+    /// the correlation row at that run — never build a second one.
+    #[tokio::test]
+    async fn trigger_recovery_correlates_the_run_that_already_exists() {
+        let (pool, repo_id, deps, _db_path) = trigger_recovery_fixture().await;
+        let event_id = uuid::Uuid::new_v4();
+        let payload = PushReceivedPayload {
+            repo_id,
+            ref_name: "refs/heads/main".to_string(),
+            old_hash: "0".repeat(40),
+            new_hash: "a".repeat(40),
+            pusher_id: None,
+        };
+        gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            &pool,
+            event_id,
+            repo_id,
+            Some(&serde_json::to_string(&payload).unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The run the (crashed) consumer already created, linked by event.
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id,
+            name: "recovery-fixture".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+            .await
+            .unwrap();
+        let mut run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo_id,
+            "push".to_string(),
+            "a".repeat(40),
+        );
+        run.start();
+        let created =
+            gitforge_db::queries::PipelineRunQueries::create_for_trigger(&pool, &run, event_id)
+                .await
+                .unwrap();
+
+        let claim = gitforge_db::queries::CiTriggerEventQueries::claim_due(
+            &pool,
+            chrono::Utc::now(),
+            Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+        )
+        .await
+        .unwrap()
+        .expect("orphaned event is claimable");
+        assert_eq!(claim.event.event_id, event_id);
+        recover_claimed_trigger_event(
+            &pool,
+            claim,
+            &deps.scheduler,
+            &deps.pipeline_cache,
+            &deps.workspace_paths,
+            &deps.run_workspace_paths,
+            &deps.pipeline_registry,
+        )
+        .await;
+
+        let row = gitforge_db::queries::CiTriggerEventQueries::get(&pool, event_id)
+            .await
+            .unwrap()
+            .expect("correlation row");
+        assert_eq!(row.status, "correlated", "row: {row:?}");
+        assert_eq!(row.pipeline_run_id, Some(created));
+        assert_eq!(
+            gitforge_db::queries::PipelineRunQueries::list(&pool)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "recovery must correlate, not duplicate"
+        );
+    }
+
+    /// F2 idempotency race: two concurrent drives of one accepted event both
+    /// miss the early correlate lookup — the winner's run row lands between
+    /// that lookup and the losing drive's insert (its claim lease expired
+    /// mid-drive and the recovery sweep re-claimed the event). The unique
+    /// index hands the losing drive the winner's id, and it must return that
+    /// id without launching anything under its own losing run id: no
+    /// workspace, no engine registration, no planned job rows, no enqueue.
+    /// The losing drive's `deactivate_active` + `create` for the pipeline
+    /// version must also roll back, so (repo, name) keeps exactly one
+    /// version with the winner as the active row.
+    #[tokio::test]
+    async fn losing_trigger_drive_converges_on_the_durable_run_without_launching() {
+        let (pool, repo_id, deps, _db_path) = trigger_recovery_fixture().await;
+        let event_id = uuid::Uuid::new_v4();
+        let commit = "c".repeat(40);
+
+        // Winner and loser target the same (repo, name) so the loser's
+        // transaction would otherwise deactivate the winner's predecessor
+        // and leave its own version active. The pipeline carries real
+        // jobs so the losing drive has work to "lose" — the no-enqueue
+        // assertion is only meaningful when the ready list is non-empty.
+        let pipeline_name = "race-pipeline".to_string();
+        let pipeline_config = serde_json::json!({
+            "name": pipeline_name,
+            "version": "1.0",
+            "trigger_on": ["push"],
+            "jobs": [{"name": "build"}],
+        });
+
+        // The concurrent winner: its run row already linked by the event id.
+        let winner_pipeline_id = gitforge_common::PipelineId::new();
+        let winner_pipeline = gitforge_db::models::Pipeline {
+            id: winner_pipeline_id,
+            repo_id,
+            name: pipeline_name.clone(),
+            trigger_type: "push".to_string(),
+            config: pipeline_config.clone(),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &winner_pipeline)
+            .await
+            .unwrap();
+        let mut winner_run = gitforge_db::models::PipelineRun::new(
+            winner_pipeline_id,
+            repo_id,
+            "push".to_string(),
+            commit.clone(),
+        );
+        winner_run.start();
+        let winner_run_id = gitforge_db::queries::PipelineRunQueries::create_for_trigger(
+            &pool,
+            &winner_run,
+            event_id,
+        )
+        .await
+        .unwrap();
+        let (pre_active, pre_total) = gitforge_db::queries::PipelineQueries::version_stats_by_name(
+            &pool,
+            repo_id,
+            &pipeline_name,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pre_active, Some(winner_pipeline_id));
+        assert_eq!(pre_total, 1);
+
+        // The losing drive: its own engine, so its own in-memory run id;
+        // and its own freshly-allocated pipeline id (each push allocates
+        // a fresh one — the audit precondition the transaction helper
+        // exists to defend). The pipeline definition carries real jobs
+        // whose entry points become the "work" the loser must not launch.
+        let losing_pipeline_id = gitforge_common::PipelineId::new();
+        let mut pipeline = create_default_pipeline(&repo_id.to_string());
+        pipeline.name = pipeline_name.clone();
+        let trigger = PipelineTriggerEvent::new(
+            losing_pipeline_id,
+            repo_id,
+            commit.clone(),
+            TriggerType::Push,
+        );
+        let engine = Arc::new(CiEngine::new(trigger, pipeline.clone()).await.unwrap());
+        engine.start().await.unwrap();
+        let losing_run_id = engine.state().await.run_id;
+        let initially_ready = engine.ready_jobs().await;
+        assert_ne!(losing_run_id, winner_run_id, "fixture: distinct run ids");
+        assert_ne!(
+            losing_pipeline_id, winner_pipeline_id,
+            "fixture: distinct pipeline ids"
+        );
+        assert!(!initially_ready.is_empty(), "fixture: drive has work");
+
+        // The recovery sweep passes the persisted working directory
+        // explicitly; an explicit workspace also keeps this test off the
+        // git-clone path the losing drive must never reach.
+        let launched = persist_and_launch_run(
+            Some(&pool),
+            &deps.scheduler,
+            &engine,
+            losing_pipeline_id,
+            &pipeline,
+            repo_id,
+            &commit,
+            event_id,
+            Some(std::env::current_dir().unwrap().display().to_string()),
+            &deps.run_workspace_paths,
+            &deps.pipeline_registry,
+        )
+        .await
+        .expect("a losing drive converges on the durable run instead of erroring");
+
+        assert_eq!(
+            launched, winner_run_id,
+            "the losing drive must return the durable run's id"
+        );
+
+        // Pipeline-version invariants: the loser's `deactivate_active` +
+        // `create` ran inside a transaction with the run insert, so
+        // losing the run race rolled both back. The active version is
+        // still the winner and the history count is unchanged.
+        let (post_active, post_total) =
+            gitforge_db::queries::PipelineQueries::version_stats_by_name(
+                &pool,
+                repo_id,
+                &pipeline_name,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            post_active,
+            Some(winner_pipeline_id),
+            "the active version is unchanged: the loser's deactivate_active rolled back"
+        );
+        assert_eq!(
+            post_total, pre_total,
+            "the loser's create was rolled back: no orphan predecessor in history"
+        );
+        assert!(
+            gitforge_db::queries::PipelineQueries::get(&pool, losing_pipeline_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the loser's pipeline version row must not exist"
+        );
+
+        // No launch side effect may exist under the losing run id.
+        assert!(
+            deps.run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .get(&losing_run_id)
+                .is_none(),
+            "the losing drive must not prepare a workspace"
+        );
+        assert!(
+            deps.pipeline_registry
+                .read()
+                .await
+                .get(&losing_run_id)
+                .is_none(),
+            "the losing drive must not register its engine"
+        );
+        assert!(
+            gitforge_db::queries::JobQueries::list_by_run(&pool, losing_run_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the losing drive must not persist planned job rows"
+        );
+        for job_id in &initially_ready {
+            assert!(
+                !deps.scheduler.job_exists(*job_id).await,
+                "the losing drive must not enqueue job {job_id}"
+            );
+        }
+        assert!(
+            gitforge_db::queries::PipelineRunQueries::get(&pool, losing_run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the losing drive's run row must not exist"
+        );
+        assert_eq!(
+            gitforge_db::queries::PipelineRunQueries::list(&pool)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the accepted event still has exactly one run"
+        );
+    }
+
+    /// The companion contract: a drive that WINS the adjudication is the
+    /// durable run and still launches with every side effect — the race
+    /// check must never turn a winner into a silent no-op. The version
+    /// and run are committed together; the workspace, engine, planned
+    /// jobs, and enqueued runs are all in place.
+    #[tokio::test]
+    async fn winning_trigger_drive_launches_the_run_with_full_side_effects() {
+        let (pool, repo_id, deps, _db_path) = trigger_recovery_fixture().await;
+        let event_id = uuid::Uuid::new_v4();
+        let commit = "d".repeat(40);
+
+        let pipeline = create_default_pipeline(&repo_id.to_string());
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let trigger =
+            PipelineTriggerEvent::new(pipeline_id, repo_id, commit.clone(), TriggerType::Push);
+        let engine = Arc::new(CiEngine::new(trigger, pipeline.clone()).await.unwrap());
+        engine.start().await.unwrap();
+        let run_id = engine.state().await.run_id;
+        let initially_ready = engine.ready_jobs().await;
+        assert!(!initially_ready.is_empty(), "fixture: drive has work");
+
+        let launched = persist_and_launch_run(
+            Some(&pool),
+            &deps.scheduler,
+            &engine,
+            pipeline_id,
+            &pipeline,
+            repo_id,
+            &commit,
+            event_id,
+            Some(std::env::current_dir().unwrap().display().to_string()),
+            &deps.run_workspace_paths,
+            &deps.pipeline_registry,
+        )
+        .await
+        .expect("a winning drive launches its own run");
+
+        assert_eq!(launched, run_id, "the winning drive returns its own run id");
+        // The version+run transaction committed: the pipeline row is
+        // there, the run row is there, and the active version is the
+        // one this drive just installed.
+        let pipeline_row = gitforge_db::queries::PipelineQueries::get(&pool, pipeline_id)
+            .await
+            .unwrap()
+            .expect("the winning drive's pipeline version row must be persisted");
+        assert_eq!(pipeline_row.id, pipeline_id);
+        assert_eq!(pipeline_row.name, pipeline.name);
+        let (active_id, total) = gitforge_db::queries::PipelineQueries::version_stats_by_name(
+            &pool,
+            repo_id,
+            &pipeline.name,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            active_id,
+            Some(pipeline_id),
+            "the winning drive's version is the active one"
+        );
+        assert_eq!(total, 1, "no predecessor existed before this drive");
+        assert_eq!(
+            gitforge_db::queries::PipelineRunQueries::get(&pool, run_id)
+                .await
+                .unwrap()
+                .map(|run| run.id),
+            Some(run_id),
+            "the winning drive's run row is persisted"
+        );
+        assert_eq!(
+            deps.run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .get(&run_id)
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some(std::env::current_dir().unwrap().to_str().unwrap()),
+            "the winning drive prepared its workspace"
+        );
+        assert!(
+            deps.pipeline_registry.read().await.get(&run_id).is_some(),
+            "the winning drive registered its engine"
+        );
+        assert!(
+            !gitforge_db::queries::JobQueries::list_by_run(&pool, run_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the winning drive persisted planned job rows"
+        );
+        for job_id in &initially_ready {
+            assert!(
+                deps.scheduler.job_exists(*job_id).await,
+                "the winning drive enqueued job {job_id}"
+            );
+        }
+        assert_eq!(
+            gitforge_db::queries::PipelineRunQueries::find_id_by_trigger_event(&pool, event_id)
+                .await
+                .unwrap(),
+            Some(run_id),
+            "the durable event link points at the launched run"
+        );
+    }
+
+    /// Two drives released together for the same accepted event must converge
+    /// on exactly one durable run; only the transaction winner may launch.
+    #[tokio::test]
+    async fn concurrent_trigger_drives_converge_and_only_winner_launches() {
+        let (pool, repo_id, deps, _db_path) = trigger_recovery_fixture().await;
+        let event_id = uuid::Uuid::new_v4();
+        let commit = "e".repeat(40);
+        let mut pipeline = create_default_pipeline(&repo_id.to_string());
+        pipeline.name = "concurrent-race-pipeline".to_string();
+
+        let first_pipeline_id = gitforge_common::PipelineId::new();
+        let first_trigger = PipelineTriggerEvent::new(
+            first_pipeline_id,
+            repo_id,
+            commit.clone(),
+            TriggerType::Push,
+        );
+        let first_engine = Arc::new(
+            CiEngine::new(first_trigger, pipeline.clone())
+                .await
+                .unwrap(),
+        );
+        first_engine.start().await.unwrap();
+        let first_run_id = first_engine.state().await.run_id;
+        let first_jobs = first_engine.ready_jobs().await;
+
+        let second_pipeline_id = gitforge_common::PipelineId::new();
+        let second_trigger = PipelineTriggerEvent::new(
+            second_pipeline_id,
+            repo_id,
+            commit.clone(),
+            TriggerType::Push,
+        );
+        let second_engine = Arc::new(
+            CiEngine::new(second_trigger, pipeline.clone())
+                .await
+                .unwrap(),
+        );
+        second_engine.start().await.unwrap();
+        let second_run_id = second_engine.state().await.run_id;
+        let second_jobs = second_engine.ready_jobs().await;
+        assert_ne!(
+            first_run_id, second_run_id,
+            "drives must have distinct run ids"
+        );
+        assert_ne!(
+            first_pipeline_id, second_pipeline_id,
+            "drives must have distinct pipeline version ids"
+        );
+        assert!(!first_jobs.is_empty(), "first drive fixture must have work");
+        assert!(
+            !second_jobs.is_empty(),
+            "second drive fixture must have work"
+        );
+
+        // Release both callers at the same point. The join macro polls both
+        // async drives together, while SQLite BEGIN IMMEDIATE must serialize
+        // their version+run writes and return the winner id to the loser.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first_barrier = barrier.clone();
+        let first_drive = async {
+            first_barrier.wait().await;
+            persist_and_launch_run(
+                Some(&pool),
+                &deps.scheduler,
+                &first_engine,
+                first_pipeline_id,
+                &pipeline,
+                repo_id,
+                &commit,
+                event_id,
+                Some(std::env::current_dir().unwrap().display().to_string()),
+                &deps.run_workspace_paths,
+                &deps.pipeline_registry,
+            )
+            .await
+        };
+        let second_drive = async {
+            barrier.wait().await;
+            persist_and_launch_run(
+                Some(&pool),
+                &deps.scheduler,
+                &second_engine,
+                second_pipeline_id,
+                &pipeline,
+                repo_id,
+                &commit,
+                event_id,
+                Some(std::env::current_dir().unwrap().display().to_string()),
+                &deps.run_workspace_paths,
+                &deps.pipeline_registry,
+            )
+            .await
+        };
+        let (first_result, second_result) = tokio::join!(first_drive, second_drive);
+        let first_durable_run = first_result.expect("first drive must return a durable run id");
+        let second_durable_run = second_result.expect("second drive must return a durable run id");
+        assert_eq!(
+            first_durable_run, second_durable_run,
+            "both drives must converge on the same durable run"
+        );
+        assert!(
+            [first_run_id, second_run_id].contains(&first_durable_run),
+            "durable identity must belong to one of the competing drives"
+        );
+
+        let first_won = first_durable_run == first_run_id;
+        let (
+            winner_run_id,
+            loser_run_id,
+            winner_pipeline_id,
+            loser_pipeline_id,
+            winner_jobs,
+            loser_jobs,
+        ) = if first_won {
+            (
+                first_run_id,
+                second_run_id,
+                first_pipeline_id,
+                second_pipeline_id,
+                &first_jobs,
+                &second_jobs,
+            )
+        } else {
+            (
+                second_run_id,
+                first_run_id,
+                second_pipeline_id,
+                first_pipeline_id,
+                &second_jobs,
+                &first_jobs,
+            )
+        };
+
+        let (active_pipeline_id, version_count) =
+            gitforge_db::queries::PipelineQueries::version_stats_by_name(
+                &pool,
+                repo_id,
+                &pipeline.name,
+            )
+            .await
+            .unwrap();
+        assert_eq!(active_pipeline_id, Some(winner_pipeline_id));
+        assert_eq!(version_count, 1, "losing version must roll back");
+        assert!(
+            gitforge_db::queries::PipelineQueries::get(&pool, loser_pipeline_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "losing pipeline version must not persist"
+        );
+        assert_eq!(
+            gitforge_db::queries::PipelineRunQueries::list(&pool)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the event must have exactly one durable run"
+        );
+        assert!(
+            deps.pipeline_registry
+                .read()
+                .await
+                .get(&winner_run_id)
+                .is_some(),
+            "winning drive must register its engine"
+        );
+        assert!(
+            deps.pipeline_registry
+                .read()
+                .await
+                .get(&loser_run_id)
+                .is_none(),
+            "losing drive must not register its engine"
+        );
+        assert!(
+            !gitforge_db::queries::JobQueries::list_by_run(&pool, winner_run_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "winning drive must persist planned jobs"
+        );
+        assert!(
+            gitforge_db::queries::JobQueries::list_by_run(&pool, loser_run_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "losing drive must not persist planned jobs"
+        );
+        for job_id in winner_jobs {
+            assert!(deps.scheduler.job_exists(*job_id).await);
+        }
+        for job_id in loser_jobs {
+            assert!(!deps.scheduler.job_exists(*job_id).await);
+        }
+        assert!(
+            deps.run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .get(&winner_run_id)
+                .is_some(),
+            "winning drive must record its workspace"
+        );
+        assert!(
+            deps.run_workspace_paths
+                .lock()
+                .expect("workspace cache lock poisoned")
+                .get(&loser_run_id)
+                .is_none(),
+            "losing drive must not prepare a workspace"
+        );
+    }
+    /// A drive that fails *after* creating its run is healed by correlating
+    /// that run — the workspace-clone failure here leaves a failed run and
+    /// recovery resolves the event to it instead of retrying into a second
+    /// build.
+    #[tokio::test]
+    async fn trigger_recovery_heals_a_drive_that_failed_after_creating_its_run() {
+        let (pool, repo_id, deps, _db_path) = trigger_recovery_fixture().await;
+        let event_id = uuid::Uuid::new_v4();
+        let payload = PushReceivedPayload {
+            repo_id,
+            ref_name: "refs/heads/main".to_string(),
+            old_hash: "0".repeat(40),
+            new_hash: "b".repeat(40),
+            pusher_id: None,
+        };
+        gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            &pool,
+            event_id,
+            repo_id,
+            Some(&serde_json::to_string(&payload).unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let claim = gitforge_db::queries::CiTriggerEventQueries::claim_due(
+            &pool,
+            chrono::Utc::now(),
+            Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+        )
+        .await
+        .unwrap()
+        .expect("orphaned event is claimable");
+        recover_claimed_trigger_event(
+            &pool,
+            claim,
+            &deps.scheduler,
+            &deps.pipeline_cache,
+            &deps.workspace_paths,
+            &deps.run_workspace_paths,
+            &deps.pipeline_registry,
+        )
+        .await;
+
+        let row = gitforge_db::queries::CiTriggerEventQueries::get(&pool, event_id)
+            .await
+            .unwrap()
+            .expect("correlation row");
+        assert_eq!(row.status, "correlated", "row: {row:?}");
+        let run_id = row.pipeline_run_id.expect("correlated run id");
+        let run = gitforge_db::queries::PipelineRunQueries::get(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("recovered run row");
+        assert_eq!(
+            run.status, "failed",
+            "the undriveable checkout must show as a failed run, not a stuck one"
+        );
+        assert_eq!(
+            gitforge_db::queries::PipelineRunQueries::list(&pool)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A drive that fails before anything durable exists is retried with
+    /// backoff, and the retry budget is finite: the event terminates as
+    /// `failed` instead of pending forever.
+    #[tokio::test]
+    async fn trigger_recovery_retries_then_terminally_fails_an_undriveable_event() {
+        let (pool, _repo_id, deps, _db_path) = trigger_recovery_fixture().await;
+        let event_id = uuid::Uuid::new_v4();
+        // A repo id with no repository row: the drive fails at the lookup,
+        // before any run or pipeline is created.
+        let payload = PushReceivedPayload {
+            repo_id: gitforge_common::RepoId::new(),
+            ref_name: "refs/heads/main".to_string(),
+            old_hash: "0".repeat(40),
+            new_hash: "c".repeat(40),
+            pusher_id: None,
+        };
+        gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            &pool,
+            event_id,
+            payload.repo_id,
+            Some(&serde_json::to_string(&payload).unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        for attempt in 1..=TRIGGER_MAX_CLAIM_ATTEMPTS {
+            // The consumer-style claim ignores the retry backoff, so the
+            // test can walk the budget without sleeping through it.
+            let claim = gitforge_db::queries::CiTriggerEventQueries::claim_event(
+                &pool,
+                event_id,
+                chrono::Utc::now(),
+                Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+            )
+            .await
+            .unwrap()
+            .expect("pending event is claimable between retries");
+            assert_eq!(claim.event.attempts, attempt);
+            recover_claimed_trigger_event(
+                &pool,
+                claim,
+                &deps.scheduler,
+                &deps.pipeline_cache,
+                &deps.workspace_paths,
+                &deps.run_workspace_paths,
+                &deps.pipeline_registry,
+            )
+            .await;
+
+            let row = gitforge_db::queries::CiTriggerEventQueries::get(&pool, event_id)
+                .await
+                .unwrap()
+                .expect("correlation row");
+            if attempt < TRIGGER_MAX_CLAIM_ATTEMPTS {
+                assert_eq!(row.status, "pending", "attempt {attempt} must retry");
+                assert!(
+                    row.last_error.is_some(),
+                    "the recorded failure must be visible to operators"
+                );
+            } else {
+                assert_eq!(row.status, "failed", "attempt {attempt} must terminate");
+                assert!(row
+                    .last_error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("attempt"));
+            }
+        }
+
+        // Terminal: nothing claims it again, and no run was ever created.
+        assert!(gitforge_db::queries::CiTriggerEventQueries::claim_due(
+            &pool,
+            chrono::Utc::now() + Duration::from_secs(3_600),
+            Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert!(gitforge_db::queries::PipelineRunQueries::list(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A committed definition that parses but is rejected by the DAG
+    /// builder (duplicate job names here) is the same permanent class as
+    /// an unparseable one: the settle path fails the trigger terminally on
+    /// the first attempt with a nearly untouched retry budget. The
+    /// transient contrast is the sibling test above — an unregistered
+    /// repository keeps its bounded retries.
+    #[tokio::test]
+    async fn trigger_drive_fails_terminally_on_a_dag_invalid_committed_pipeline() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let duplicate_jobs = r#"
+name: dup-jobs
+version: "1.0"
+trigger_on:
+  - push
+jobs:
+  - name: build
+    image: rust:latest
+    steps:
+      - name: build
+        run: echo one
+  - name: build
+    image: rust:latest
+    steps:
+      - name: build
+        run: echo two
+"#
+        .to_string();
+        let (bare, commit) =
+            seed_pipeline_files(&[(PIPELINE_CONFIG_PATHS[0], duplicate_jobs)]).await;
+        let (pool, repo_id) = test_pool_with_repository(bare.to_string_lossy().into_owned()).await;
+
+        let event_id = uuid::Uuid::new_v4();
+        let payload = PushReceivedPayload {
+            repo_id,
+            ref_name: "refs/heads/main".to_string(),
+            old_hash: "0".repeat(40),
+            new_hash: commit,
+            pusher_id: None,
+        };
+        gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            &pool,
+            event_id,
+            repo_id,
+            Some(&serde_json::to_string(&payload).unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let claim = gitforge_db::queries::CiTriggerEventQueries::claim_event(
+            &pool,
+            event_id,
+            chrono::Utc::now(),
+            Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+        )
+        .await
+        .unwrap()
+        .expect("pending event is claimable");
+        assert_eq!(claim.event.attempts, 1, "first drive of a fresh event");
+        let deps = RecoveryDeps::new();
+        recover_claimed_trigger_event(
+            &pool,
+            claim,
+            &deps.scheduler,
+            &deps.pipeline_cache,
+            &deps.workspace_paths,
+            &deps.run_workspace_paths,
+            &deps.pipeline_registry,
+        )
+        .await;
+
+        let row = gitforge_db::queries::CiTriggerEventQueries::get(&pool, event_id)
+            .await
+            .unwrap()
+            .expect("correlation row");
+        assert_eq!(
+            row.status, "failed",
+            "a DAG-invalid committed pipeline is permanent: {row:?}"
+        );
+        let recorded = row.last_error.as_deref().unwrap_or_default();
+        assert!(
+            recorded.contains("committed pipeline config rejected"),
+            "the failure must name the permanent class: {recorded}"
+        );
+        assert!(
+            recorded.contains("duplicate job name"),
+            "the rejection reason must survive into the recorded error: {recorded}"
+        );
+
+        // Terminal on attempt one, not at budget exhaustion: nothing is
+        // claimable afterwards, and no run was ever created.
+        assert!(gitforge_db::queries::CiTriggerEventQueries::claim_due(
+            &pool,
+            chrono::Utc::now() + Duration::from_secs(3_600),
+            Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert!(gitforge_db::queries::PipelineRunQueries::list(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The settle branch in isolation: a committed-config rejection is
+    /// terminal on the first attempt even with the whole retry budget
+    /// unspent, while an unclassified (transient) fault keeps the row
+    /// `pending` behind the retry backoff — the budget exists precisely
+    /// for those.
+    #[tokio::test]
+    async fn settle_fails_a_committed_config_rejection_terminally_on_first_attempt() {
+        let (pool, _repo_id, _deps, _db_path) = trigger_recovery_fixture().await;
+        let event_id = uuid::Uuid::new_v4();
+        gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            &pool,
+            event_id,
+            gitforge_common::RepoId::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let claim = gitforge_db::queries::CiTriggerEventQueries::claim_event(
+            &pool,
+            event_id,
+            chrono::Utc::now(),
+            Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+        )
+        .await
+        .unwrap()
+        .expect("pending event is claimable");
+        assert_eq!(claim.event.attempts, 1);
+
+        let drive_error = invalid_committed_config(anyhow::anyhow!(
+            "invalid .gitforge.yml at abc: missing field `jobs`"
         ));
+        settle_claimed_trigger_event(Some(&pool), Some(claim), Err(drive_error)).await;
+
+        let row = gitforge_db::queries::CiTriggerEventQueries::get(&pool, event_id)
+            .await
+            .unwrap()
+            .expect("correlation row");
+        assert_eq!(row.status, "failed", "permanent must not retry: {row:?}");
+        let recorded = row.last_error.as_deref().unwrap_or_default();
+        assert!(
+            recorded.contains("committed pipeline config rejected")
+                && recorded.contains("missing field `jobs`"),
+            "the recorded error must carry the class and the reason: {recorded}"
+        );
+        assert!(
+            gitforge_db::queries::CiTriggerEventQueries::claim_due(
+                &pool,
+                chrono::Utc::now() + Duration::from_secs(3_600),
+                Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a terminally failed event is never claimable again"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_keeps_a_transient_drive_failure_retryable_behind_backoff() {
+        let (pool, _repo_id, _deps, _db_path) = trigger_recovery_fixture().await;
+        let event_id = uuid::Uuid::new_v4();
+        gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            &pool,
+            event_id,
+            gitforge_common::RepoId::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let claim = gitforge_db::queries::CiTriggerEventQueries::claim_event(
+            &pool,
+            event_id,
+            chrono::Utc::now(),
+            Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+        )
+        .await
+        .unwrap()
+        .expect("pending event is claimable");
+        assert_eq!(claim.event.attempts, 1);
+
+        settle_claimed_trigger_event(
+            Some(&pool),
+            Some(claim),
+            Err(anyhow::anyhow!("checkout storage briefly unavailable")),
+        )
+        .await;
+
+        let row = gitforge_db::queries::CiTriggerEventQueries::get(&pool, event_id)
+            .await
+            .unwrap()
+            .expect("correlation row");
+        assert_eq!(
+            row.status, "pending",
+            "an unclassified fault is transient: the retry budget applies: {row:?}"
+        );
+        assert!(
+            row.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("briefly unavailable"),
+            "the recorded failure must be visible to operators"
+        );
+        // The backoff is honored: not claimable now, claimable after the
+        // base window.
+        assert!(gitforge_db::queries::CiTriggerEventQueries::claim_due(
+            &pool,
+            chrono::Utc::now(),
+            Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert!(
+            gitforge_db::queries::CiTriggerEventQueries::claim_due(
+                &pool,
+                chrono::Utc::now() + trigger_retry_backoff(1),
+                Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "the scheduled retry must come due after the backoff"
+        );
+    }
+
+    /// Rows written before recovery existed carry no payload and their
+    /// producing process is gone: the sweep fails them fail-closed instead
+    /// of leaving them `queued` for every poller forever.
+    #[tokio::test]
+    async fn trigger_recovery_fails_a_legacy_pending_event_without_payload() {
+        let (pool, repo_id, deps, _db_path) = trigger_recovery_fixture().await;
+        let event_id = uuid::Uuid::new_v4();
+        gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            &pool, event_id, repo_id, None, None,
+        )
+        .await
+        .unwrap();
+
+        let claim = gitforge_db::queries::CiTriggerEventQueries::claim_due(
+            &pool,
+            chrono::Utc::now(),
+            Duration::from_secs(TRIGGER_CLAIM_LEASE_SECS),
+        )
+        .await
+        .unwrap()
+        .expect("legacy row is claimable");
+        assert!(claim.event.payload.is_none());
+        recover_claimed_trigger_event(
+            &pool,
+            claim,
+            &deps.scheduler,
+            &deps.pipeline_cache,
+            &deps.workspace_paths,
+            &deps.run_workspace_paths,
+            &deps.pipeline_registry,
+        )
+        .await;
+
+        let row = gitforge_db::queries::CiTriggerEventQueries::get(&pool, event_id)
+            .await
+            .unwrap()
+            .expect("correlation row");
+        assert_eq!(row.status, "failed");
+        assert!(
+            row.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no durable payload"),
+            "the failure must say why the event cannot be re-driven"
+        );
+    }
+
+    /// The backoff schedule: doubling from the base, capped.
+    #[test]
+    fn trigger_retry_backoff_doubles_and_caps() {
+        assert_eq!(
+            trigger_retry_backoff(1),
+            Duration::from_secs(TRIGGER_RETRY_BACKOFF_BASE_SECS as u64)
+        );
+        assert_eq!(
+            trigger_retry_backoff(2),
+            Duration::from_secs((TRIGGER_RETRY_BACKOFF_BASE_SECS * 2) as u64)
+        );
+        assert_eq!(
+            trigger_retry_backoff(9),
+            Duration::from_secs(TRIGGER_RETRY_BACKOFF_CAP_SECS as u64)
+        );
     }
 
     async fn run_git<I, S>(args: I, cwd: Option<&std::path::Path>) -> String
@@ -3610,11 +5802,33 @@ jobs:
             .await
             .unwrap_err();
         assert!(error.to_string().contains("invalid .gitforge.yml"));
+        assert!(
+            error.downcast_ref::<CommittedConfigInvalid>().is_some(),
+            "a committed unparseable definition is a permanent rejection, not a retryable fault: {error}"
+        );
     }
 
     /// Seed a bare repository whose HEAD commit carries a definition at
     /// every name in `config_paths`, in order. Returns (bare path, commit).
     async fn seed_pipeline_at_paths(config_paths: &[&str]) -> (PathBuf, String) {
+        let files = config_paths
+            .iter()
+            .enumerate()
+            .map(|(index, config_path)| {
+                (
+                    *config_path,
+                    format!(
+                        "name: fixture-{index}\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment: {{}}\njobs: []\n"
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        seed_pipeline_files(&files).await
+    }
+
+    /// Seed a bare repository whose HEAD commit carries each committed
+    /// (path, content) pair. Returns (bare path, commit).
+    async fn seed_pipeline_files(files: &[(&str, String)]) -> (PathBuf, String) {
         let run_id = gitforge_common::PipelineRunId::new();
         let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/gitforge-ci-pipeline-config-tests")
@@ -3627,13 +5841,10 @@ jobs:
         run_git(["init", seed.to_str().unwrap()], None).await;
         run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
         run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
-        for (index, config_path) in config_paths.iter().enumerate() {
-            tokio::fs::write(
-                seed.join(config_path),
-                format!("name: fixture-{index}\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment: {{}}\njobs: []\n"),
-            )
-            .await
-            .unwrap();
+        for (config_path, content) in files {
+            tokio::fs::write(seed.join(config_path), content)
+                .await
+                .unwrap();
             run_git(["add", config_path], Some(&seed)).await;
         }
         run_git(["commit", "-m", "pipeline definitions"], Some(&seed)).await;
@@ -4316,7 +6527,7 @@ jobs:
         let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
-        handle_push_event(
+        let handled = handle_push_event(
             &zero_hash_push_envelope(),
             &scheduler,
             &pipeline_cache,
@@ -4324,9 +6535,14 @@ jobs:
             &workspace_paths,
             &run_workspace_paths,
             &pipeline_registry,
+            None,
         )
         .await
         .expect("a deletion push is consumed silently, never an error");
+        assert!(
+            handled.is_none(),
+            "a deletion push creates no run, so it must not correlate one"
+        );
 
         // The strong assertion: the guard fired before any pipeline was
         // resolved or planned for the deleted ref's repository.

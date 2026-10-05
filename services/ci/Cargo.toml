@@ -32,6 +32,9 @@ tower-http = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }
+# Test-only: raw SQL lets status-endpoint tests force database states (a
+# dropped or altered row) that the typed queries deliberately cannot express.
+sqlx = { workspace = true }
 
 [lints]
 workspace = true

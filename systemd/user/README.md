@@ -33,7 +33,10 @@ Git-server and CI are separate user services. Configure the Git-server unit
 with `DATABASE_URL` (the Git-server variable), `GIT_ROOT`,
 `GITFORGE_CI_TRIGGER_URL`, and `GITFORGE_CI_TRIGGER_TOKEN`. Configure the CI
 unit with `GITFORGE_DATABASE_URL`, `GITFORGE_TRIGGER_TOKEN`, and the scheduler
-tokens. In a standard deployment the trigger URL is:
+tokens. When the GitHub Actions trigger path is enabled, the CI unit also
+needs `GITFORGE_STATUS_TOKEN` — a distinct, high-entropy credential that only
+authorizes `GET /pipelines/trigger/status/{event_id}` (issue #259). In a
+standard deployment the trigger URL is:
 
 ```text
 http://127.0.0.1:42781/pipelines/trigger
