@@ -31,12 +31,18 @@ env:
   # (configured_trigger_token in services/ci), so the operator token must be
   # treated as trigger-capable; this workflow requires the dedicated secret
   # so its credential survives that fallback's removal. The reverse is
-  # enforced: GITFORGE_STATUS_TOKEN is honored only under its own name and
-  # can only read the lifecycle state of the exact trigger event this
-  # workflow created (GET /pipelines/trigger/status/{event_id}). The API
-  # gateway JWT is not part of this loop: status is answered by the CI
-  # service itself, so GITFORGE_API_URL/GITFORGE_API_TOKEN are no longer
-  # used.
+  # enforced: GITFORGE_STATUS_TOKEN is honored only under its own name at
+  # GET /pipelines/trigger/status/{event_id}. This workflow only ever polls
+  # the event id its own trigger call returned, but that scoping lives in
+  # this workflow, not in the service: status authorization is a shared-token
+  # trust boundary. The service does not bind the status token to the event
+  # id or to the repository, so any caller holding the token can read the
+  # lifecycle state of any stored event by UUID — UUID secrecy is not a
+  # substitute for token auth. Per-event/per-repository (multi-tenant)
+  # authorization on the status endpoint is future work if a deployment
+  # needs it. The API gateway JWT is not part of this loop: status is
+  # answered by the CI service itself, so GITFORGE_API_URL/GITFORGE_API_TOKEN
+  # are no longer used.
   GITFORGE_TRIGGER_TOKEN: ${{ secrets.GITFORGE_TRIGGER_TOKEN }}
   GITFORGE_STATUS_TOKEN: ${{ secrets.GITFORGE_STATUS_TOKEN }}
 
@@ -60,12 +66,16 @@ jobs:
       - name: Validate GitForge configuration
         run: |
           set -euo pipefail
+          # Canonical 8-4-4-4-12 hexadecimal UUID shape. Stronger than the
+          # former "36 chars of hex or hyphen" test, which accepted malformed
+          # forms such as 32 hex digits with no separators at all.
+          UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
           : "${GITFORGE_SCHEDULER_URL:?GITFORGE_SCHEDULER_URL is required}"
           : "${GITFORGE_REPO_ID:?GITFORGE_REPO_ID is required (GitForge UUID, not GitHub repository_id)}"
           : "${GITFORGE_TRIGGER_TOKEN:?GITFORGE_TRIGGER_TOKEN secret is required (starts runs: POST /pipelines/trigger)}"
           : "${GITFORGE_STATUS_TOKEN:?GITFORGE_STATUS_TOKEN secret is required (reads trigger status: GET /pipelines/trigger/status/{event_id}); it must be a distinct, high-entropy credential, not the trigger or operator token}"
-          [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
-            echo "GITFORGE_REPO_ID must be a UUID" >&2
+          [[ "$GITFORGE_REPO_ID" =~ $UUID_RE ]] || {
+            echo "GITFORGE_REPO_ID must be a canonical UUID (8-4-4-4-12 hex)" >&2
             exit 1
           }
           [[ "$GITFORGE_POLL_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
@@ -84,6 +94,7 @@ jobs:
         id: enqueue
         run: |
           set -euo pipefail
+          UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
           # Trigger the GitForge CI service. The response always carries the
           # durable event id; it also carries the pipeline-run id once the
           # service's correlation window (15s) succeeds. When it answers
@@ -112,16 +123,17 @@ jobs:
             RUN_ID=$(echo "$BODY" | jq -r '.pipeline_run_id // empty')
             if [ -n "$EVENT_ID" ] && [ "$EVENT_ID" != "null" ]; then
               # These ids become workflow outputs consumed by later jobs, so
-              # only a well-formed UUID may pass: a crafted trigger response
-              # must never be able to smuggle shell into a consumer step.
-              [[ "$EVENT_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
-                echo "trigger response event_id is not a UUID; refusing to continue" >&2
+              # only a canonical 8-4-4-4-12 hexadecimal UUID may pass: a
+              # crafted trigger response must never be able to smuggle shell
+              # into a consumer step.
+              [[ "$EVENT_ID" =~ $UUID_RE ]] || {
+                echo "trigger response event_id is not a canonical UUID (8-4-4-4-12 hex); refusing to continue" >&2
                 exit 1
               }
               echo "event_id=$EVENT_ID" >> "$GITHUB_OUTPUT"
               if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
-                [[ "$RUN_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
-                  echo "trigger response pipeline_run_id is not a UUID; refusing to continue" >&2
+                [[ "$RUN_ID" =~ $UUID_RE ]] || {
+                  echo "trigger response pipeline_run_id is not a canonical UUID (8-4-4-4-12 hex); refusing to continue" >&2
                   exit 1
                 }
                 echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
@@ -155,12 +167,17 @@ jobs:
           # The event id reaches this script as an environment variable, not
           # as an inline expression: a malformed value can only fail the
           # validation below, never terminate out of the quoted context.
-          [[ "$EVENT_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
-            echo "enqueue did not yield a well-formed event id: refusing to poll" >&2
+          UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          [[ "$EVENT_ID" =~ $UUID_RE ]] || {
+            echo "enqueue did not yield a canonical event id (8-4-4-4-12 hex): refusing to poll" >&2
             exit 1
           }
           # Status reads use the dedicated status credential against the CI
-          # service, scoped to the exact event this run created (#259).
+          # service. The URL is built from the event id this run's own trigger
+          # call returned (#259) — that scoping is this workflow's behavior,
+          # not a service guarantee: status authorization is a shared-token
+          # trust boundary, so the event id is not a capability and its
+          # secrecy is no substitute for the token check below.
           STATUS_URL="$GITFORGE_SCHEDULER_URL/pipelines/trigger/status/$EVENT_ID"
           STATUS_FILE="$RUNNER_TEMP/gitforge-trigger-status.json"
           echo "Build enqueued as event $EVENT_ID, polling GitForge for status..."

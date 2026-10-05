@@ -29,7 +29,10 @@ workflow: run status is answered by the CI service itself, keyed by the
 `event_id` returned at trigger time, so no API gateway JWT is held. The two
 secrets must be distinct high-entropy values; the workflow refuses to start
 when either is missing, when both hold the same value, or when the trigger
-response does not carry a well-formed event id.
+response does not carry a well-formed (canonical 8-4-4-4-12 hexadecimal)
+event id. All UUID inputs — `GITFORGE_REPO_ID`, the trigger response's
+`event_id` and `pipeline_run_id`, and the poll step's event id — are
+validated against that canonical shape.
 
 Note on the trigger credential: during the migration to dedicated tokens the
 CI service still accepts its scheduler operator/shared token names at the
@@ -38,6 +41,17 @@ Configure a dedicated `GITFORGE_TRIGGER_TOKEN` rather than reusing the
 operator secret. The status endpoint has no such fallback and accepts only
 `GITFORGE_STATUS_TOKEN`. See `docs/RUNBOOK.md` for the service-side
 credential table.
+
+Status authorization is a shared-token trust boundary, not an event-scoped
+one. The workflow only ever polls the `event_id` its own trigger call
+returned, but the CI service does not cryptographically bind
+`GITFORGE_STATUS_TOKEN` to that event or to the repository: any caller
+holding the status token can read the lifecycle state of any stored trigger
+event by UUID. UUID secrecy is not a substitute for token auth. Treat the
+status token with the same care as the trigger token, and treat the status
+endpoint's reachability as part of the exposure surface. Per-event and
+per-repository (multi-tenant) authorization on the status endpoint is
+future work, to be added only if a deployment actually needs it.
 
 While polling, non-terminal and transient answers keep the job alive: only
 `succeeded` is green, an unrecognized body fails the job, and a retryable

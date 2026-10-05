@@ -105,6 +105,69 @@ that fails `pending` rows older than a grace threshold, or a durable
 publication path (the existing `publication_outbox` pattern) so an accepted
 trigger is always either consumed or explicitly failed.
 
+## F4 — status-token scope: corrected claims and canonical UUID validation
+
+Recorded from branch `codex/gitforge-status-scope-20261005` (same day, clean
+tree based on `63f87d4`). The follow-up above left one audit finding standing
+in the workflow's own commentary: the env comment claimed the status token
+"can only read the lifecycle state of the exact trigger event this workflow
+created", and the poll step claimed reads are "scoped to the exact event this
+run created". Both are false at the service level and have been replaced.
+
+Ground truth (`services/ci/src/main.rs`): `require_status_auth` gates
+`GET /pipelines/trigger/status/{event_id}` with the single shared
+`GITFORGE_STATUS_TOKEN` (`configured_status_token`). The token is not bound
+to the event UUID or to the repository, and no event-scoped check runs in
+the handler — any caller holding the shared status token can read the
+lifecycle state of any stored trigger event by UUID. The only scoping
+difference from the trigger endpoint is fallback behavior: the status token
+is honored under its own name alone.
+
+The accurate model, now stated in the workflow env comment, the poll-step
+comment, and `.github/GITFORGE_CI_SETUP.md`:
+
+- Scoping to "its own event" is **workflow behavior**: the status URL is
+  built from the `event_id` the workflow's own trigger call returned. It is
+  not a service guarantee.
+- API auth on the status endpoint is a **shared status-token trust
+  boundary**: one credential for all callers and all events.
+- **UUID secrecy is not a substitute for token auth**; the event id is not
+  a capability.
+- Per-event/per-repository (multi-tenant) authorization is **future work**,
+  to be built only if a deployment needs it.
+
+Deliberately not changed: no service-side code. This was a documentation
+precision fix plus input-validation hardening, not a redesign of the status
+endpoint's authorization model.
+
+UUID validation in `.github/workflows/gitforge-ci.yml` was strengthened from
+`^[0-9a-fA-F-]{36}$` (any 36 hex/hyphen characters) to the canonical
+`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`
+for the trigger response's `event_id` and `pipeline_run_id` and for the poll
+step's `EVENT_ID` input; the `GITFORGE_REPO_ID` config check was tightened to
+the same shape for consistency. Shell safety is unchanged: ids still reach
+scripts through `env:` and `$GITHUB_OUTPUT`, and the regex lives in a
+per-block variable (`UUID_RE`) used unquoted in `[[ =~ ]]`.
+
+### F4 validation
+
+Run on the same Fedora host and worktree
+(`/home/mkinney/Temp/work/gitforge-ci-status-hardening-20261005`). No
+`cargo` build, test, or coverage command was run — documentation/workflow
+scope only:
+
+- `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/gitforge-ci.yml'))"` —
+  workflow YAML parses.
+- Every `run:` block extracted from the parsed workflow, with `${{ }}`
+  expressions substituted the way the runner would and runner-provided env
+  exported. The three changed blocks (`Validate GitForge configuration`,
+  `enqueue`, `poll`) passed `bash -n` and `shellcheck` with zero findings.
+  The unchanged report-status block also passed `bash -n`; its single
+  `SC2050` finding is an artifact of the harness — substituting a literal
+  for `${{ needs.poll-build.result }}` makes the comparison constant, which
+  it is not at runtime.
+- `git diff` reviewed; commit made locally with no push.
+
 ## Validation
 
 Run on this Fedora host (worktree
