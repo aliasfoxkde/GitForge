@@ -17,12 +17,32 @@ Configure these repository or organization values before enabling it:
 | Name | Kind | Requirement |
 | --- | --- | --- |
 | `GITFORGE_ENABLED` | variable | Exactly `true` |
-| `GITFORGE_API_URL` | variable | Reachable GitForge API base URL |
-| `GITFORGE_SCHEDULER_URL` | variable | Reachable scheduler base URL |
+| `GITFORGE_SCHEDULER_URL` | variable | Reachable CI (scheduler) service base URL; both the trigger and the trigger-status endpoint are answered there |
 | `GITFORGE_REPO_ID` | variable | UUID of the mirrored GitForge repository |
 | `GITFORGE_POLL_TIMEOUT_SECONDS` | variable | Positive integer timeout |
 | `GITFORGE_POLL_INTERVAL_SECONDS` | variable | Positive integer interval |
-| `GITFORGE_API_TOKEN` | secret | Token accepted by the scheduler/API |
+| `GITFORGE_TRIGGER_TOKEN` | secret | Token the CI service accepts for `POST /pipelines/trigger` |
+| `GITFORGE_STATUS_TOKEN` | secret | Dedicated token for `GET /pipelines/trigger/status/{event_id}`; must differ from `GITFORGE_TRIGGER_TOKEN` |
+
+`GITFORGE_API_URL` and `GITFORGE_API_TOKEN` are no longer used by the
+workflow: run status is answered by the CI service itself, keyed by the
+`event_id` returned at trigger time, so no API gateway JWT is held. The two
+secrets must be distinct high-entropy values; the workflow refuses to start
+when either is missing, when both hold the same value, or when the trigger
+response does not carry a well-formed event id.
+
+Note on the trigger credential: during the migration to dedicated tokens the
+CI service still accepts its scheduler operator/shared token names at the
+trigger endpoint, so the operator token must be treated as trigger-capable.
+Configure a dedicated `GITFORGE_TRIGGER_TOKEN` rather than reusing the
+operator secret. The status endpoint has no such fallback and accepts only
+`GITFORGE_STATUS_TOKEN`. See `docs/RUNBOOK.md` for the service-side
+credential table.
+
+While polling, non-terminal and transient answers keep the job alive: only
+`succeeded` is green, an unrecognized body fails the job, and a retryable
+503 (for example a transient status-read error) is retried until the
+`GITFORGE_POLL_TIMEOUT_SECONDS` deadline.
 
 The workflow validates all values and refuses to bypass GitForge if enqueue or
 polling fails. Until `GITFORGE_ENABLED=true` is intentionally configured, the

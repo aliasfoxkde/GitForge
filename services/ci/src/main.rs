@@ -680,7 +680,9 @@ async fn trigger_pipeline(
 /// the credential is a dedicated status token, the caller can only name an
 /// event it already saw in a trigger response, the response carries only the
 /// correlation and the run's one-word lifecycle state, and every ambiguous
-/// case maps to a non-green status.
+/// case maps to a non-green status. A transient database read failure is
+/// answered retryably with 503 — it is never graded into a terminal status,
+/// so a poller fails the job only on genuine evidence, not on a read fault.
 async fn trigger_event_status(
     Extension(trigger_state): Extension<Arc<TriggerState>>,
     Path(event_id): Path<String>,
@@ -723,11 +725,13 @@ async fn trigger_event_status(
         }
         Err(error) => {
             tracing::warn!(%error, event_id = %event_id, "trigger status read failed");
+            // Retryable, so the body must not carry a terminal verdict: the
+            // poller keeps polling on anything that is not 200/404/401/403.
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
                     "error": "status_read_failed",
-                    "status": "failed"
+                    "status": "unavailable"
                 })),
             )
                 .into_response();
@@ -741,17 +745,38 @@ async fn trigger_event_status(
         gitforge_db::models::TRIGGER_EVENT_FAILED => "failed",
         // The run exists; grade from the same durable row the reconcilers
         // write, so this endpoint never disagrees with the run's verdict.
-        gitforge_db::models::TRIGGER_EVENT_CORRELATED => {
-            let run_status = match correlation.pipeline_run_id {
-                Some(run_id) => gitforge_db::queries::PipelineRunQueries::get(pool, run_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|run| run.status),
-                None => None,
-            };
-            map_run_status(run_status.as_deref())
-        }
+        gitforge_db::models::TRIGGER_EVENT_CORRELATED => match correlation.pipeline_run_id {
+            // A correlated row that names no run is a corrupted record, not a
+            // polling hiccup: fail closed and terminally.
+            None => "failed",
+            Some(run_id) => {
+                match gitforge_db::queries::PipelineRunQueries::get(pool, run_id).await {
+                    Ok(Some(run)) => map_run_status(Some(&run.status)),
+                    // The correlation names a run that does not exist: the
+                    // record is genuinely lost, so the answer is terminal —
+                    // but still never green.
+                    Ok(None) => "failed",
+                    // A read error says nothing about the run's verdict, so
+                    // the answer must not be terminal: 503 is the one answer
+                    // the poller keeps retrying instead of failing the job.
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            run_id = %run_id,
+                            "pipeline run status read failed"
+                        );
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": "status_read_failed",
+                                "status": "unavailable"
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        },
         other => {
             tracing::warn!(status = %other, "unknown correlation status; answering fail-closed");
             "failed"
@@ -772,9 +797,11 @@ async fn trigger_event_status(
 }
 
 /// Fail-closed mapping from a durable pipeline-run status to the one-word
-/// status the poller consumes. `None` — a correlated event whose run row
-/// cannot be read — and any unrecognized verdict map to `failed`: a missing
-/// or ambiguous record is never green.
+/// status the poller consumes. `None` — a correlated event that names a run
+/// with no row, or names no run at all — and any unrecognized verdict map to
+/// `failed`: a missing or ambiguous record is never green. Transient read
+/// errors never reach this mapping; the handler answers them with a
+/// retryable 503 instead.
 fn map_run_status(status: Option<&str>) -> &'static str {
     match status {
         Some("pending") | Some("running") => "running",
@@ -2621,7 +2648,7 @@ mod tests {
         );
         // An empty configured value closes the endpoint like an unset one.
         assert_eq!(
-            configured_status_token(|name| (name == "GITFORGE_STATUS_TOKEN").then(|| String::new())),
+            configured_status_token(|name| (name == "GITFORGE_STATUS_TOKEN").then(String::new)),
             None
         );
     }
@@ -2642,6 +2669,192 @@ mod tests {
         assert_eq!(map_run_status(None), "failed");
         assert_eq!(map_run_status(Some("queued")), "failed");
         assert_eq!(map_run_status(Some("")), "failed");
+    }
+
+    /// Build a trigger state over a real file-backed pool, so the status
+    /// handler's database branches run against actual SQLite semantics
+    /// (`:memory:` pools do not share tables across pool connections). The
+    /// pool carries one user-owned repository so run fixtures can satisfy
+    /// the `pipeline_runs` foreign keys.
+    async fn trigger_status_state() -> (
+        Arc<TriggerState>,
+        gitforge_db::Pool,
+        gitforge_common::RepoId,
+        std::path::PathBuf,
+    ) {
+        let db_path = std::env::temp_dir().join(format!(
+            "gitforge-ci-status-tests-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = gitforge_db::Pool::new(&db_path.display().to_string())
+            .await
+            .unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "status-tests".to_string(),
+            "status-tests@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repository = gitforge_db::models::Repository::new(
+            "status-tests".to_string(),
+            user.id,
+            std::env::temp_dir()
+                .join(format!("status-tests-{}.git", uuid::Uuid::new_v4()))
+                .display()
+                .to_string(),
+        );
+        let repo_id = repository.id;
+        gitforge_db::queries::RepoQueries::create(&pool, &repository)
+            .await
+            .unwrap();
+        let state = Arc::new(TriggerState {
+            event_bus: Arc::new(InMemoryEventBus::new()),
+            workspace_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            run_waiters: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            db: Some(pool.clone()),
+        });
+        (state, pool, repo_id, db_path)
+    }
+
+    /// Invoke the status handler directly and decode its JSON body.
+    async fn trigger_status_response(
+        state: &Arc<TriggerState>,
+        event_id: uuid::Uuid,
+    ) -> (StatusCode, serde_json::Value) {
+        let response =
+            trigger_event_status(Extension(state.clone()), Path(event_id.to_string())).await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Record a trigger event already correlated to `run_id`.
+    async fn correlated_event(
+        pool: &gitforge_db::Pool,
+        run_id: gitforge_common::PipelineRunId,
+    ) -> uuid::Uuid {
+        let event_id = uuid::Uuid::new_v4();
+        gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            pool,
+            event_id,
+            gitforge_common::RepoId::new(),
+        )
+        .await
+        .unwrap();
+        gitforge_db::queries::CiTriggerEventQueries::correlate(pool, event_id, run_id)
+            .await
+            .unwrap();
+        event_id
+    }
+
+    /// The positive anchor: a correlated event grades from the durable run
+    /// row, so the answer follows the run's verdict, not the correlation's.
+    #[tokio::test]
+    async fn trigger_status_correlated_event_grades_from_the_run_row() {
+        let (state, pool, repo_id, _db_path) = trigger_status_state().await;
+        let pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id,
+            name: "status-grade-fixture".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+            .await
+            .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline.id,
+            repo_id,
+            "status-tests".to_string(),
+            "0".repeat(40),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+        gitforge_db::queries::PipelineRunQueries::update_status(&pool, run.id, "succeeded")
+            .await
+            .unwrap();
+
+        let event_id = correlated_event(&pool, run.id).await;
+        let (status, payload) = trigger_status_response(&state, event_id).await;
+        assert_eq!(status, StatusCode::OK, "payload: {payload}");
+        assert_eq!(payload["status"], "succeeded", "payload: {payload}");
+        assert_eq!(payload["pipeline_run_id"], run.id.to_string());
+    }
+
+    /// A correlation that names a run with no row is a genuinely lost record:
+    /// terminal `failed` over HTTP 200 — the poller fails the job instead of
+    /// retrying forever (issue #259 follow-up).
+    #[tokio::test]
+    async fn trigger_status_missing_run_row_is_terminal_failed() {
+        let (state, pool, _repo_id, _db_path) = trigger_status_state().await;
+        let event_id = correlated_event(&pool, gitforge_common::PipelineRunId::new()).await;
+
+        let (status, payload) = trigger_status_response(&state, event_id).await;
+        assert_eq!(status, StatusCode::OK, "payload: {payload}");
+        assert_eq!(payload["status"], "failed", "payload: {payload}");
+    }
+
+    /// A correlated row without a run id is a corrupted record: terminal
+    /// `failed`, never green, and no run lookup is attempted for it.
+    #[tokio::test]
+    async fn trigger_status_correlated_row_without_run_id_is_terminal_failed() {
+        let (state, pool, _repo_id, _db_path) = trigger_status_state().await;
+        let event_id = uuid::Uuid::new_v4();
+        gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            &pool,
+            event_id,
+            gitforge_common::RepoId::new(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE ci_trigger_events SET status = 'correlated' WHERE event_id = ?")
+            .bind(event_id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        let (status, payload) = trigger_status_response(&state, event_id).await;
+        assert_eq!(status, StatusCode::OK, "payload: {payload}");
+        assert_eq!(payload["status"], "failed", "payload: {payload}");
+        assert!(payload["pipeline_run_id"].is_null(), "payload: {payload}");
+    }
+
+    /// The distinction the audit required: a transient run-read error is a
+    /// retryable 503, never an HTTP 200 terminal `failed` — a poller must
+    /// keep polling instead of failing the job on a database fault, and must
+    /// be able to tell the two answers apart (issue #259 follow-up).
+    #[tokio::test]
+    async fn trigger_status_unreadable_run_is_retryable_503_not_terminal_failed() {
+        let (state, pool, _repo_id, _db_path) = trigger_status_state().await;
+        let event_id = correlated_event(&pool, gitforge_common::PipelineRunId::new()).await;
+
+        // Force PipelineRunQueries::get into the error branch while the
+        // correlation row itself stays readable.
+        sqlx::query("DROP TABLE pipeline_runs")
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        let (status, payload) = trigger_status_response(&state, event_id).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a transient read fault must not look terminal: {payload}"
+        );
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a read fault must never answer the terminal 200 contract"
+        );
+        assert_eq!(payload["error"], "status_read_failed", "payload: {payload}");
+        assert_eq!(payload["status"], "unavailable", "payload: {payload}");
     }
 
     async fn run_git<I, S>(args: I, cwd: Option<&std::path::Path>) -> String

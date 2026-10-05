@@ -1015,16 +1015,23 @@ impl CiTriggerEventQueries {
 }
 
 fn hydrate_ci_trigger_event(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::CiTriggerEvent> {
+    // The optional run id is matched outside a closure so the `?` on the
+    // UUID parse stays in this function's `Result`-returning body.
+    let pipeline_run_id = match row
+        .try_get::<Option<String>, _>("pipeline_run_id")
+        .map_err(|error| Error::database(format!("invalid trigger event run id: {error}")))?
+    {
+        Some(value) => {
+            let run_id = Uuid::parse_str(&value).map_err(|error| {
+                Error::database(format!("invalid trigger event run id UUID: {error}"))
+            })?;
+            Some(PipelineRunId::from(run_id))
+        }
+        None => None,
+    };
     Ok(crate::models::CiTriggerEvent {
         event_id: parse_uuid_column(&row, "event_id")?,
-        pipeline_run_id: row
-            .try_get::<Option<String>, _>("pipeline_run_id")
-            .map_err(|error| Error::database(format!("invalid trigger event run id: {error}")))?
-            .map(|value| {
-                PipelineRunId::from(Uuid::parse_str(&value).map_err(|error| {
-                    Error::database(format!("invalid trigger event run id UUID: {error}"))
-                })?)
-            }),
+        pipeline_run_id,
         status: row
             .try_get("status")
             .map_err(|error| Error::database(format!("invalid trigger event status: {error}")))?,

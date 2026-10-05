@@ -185,6 +185,10 @@ async fn spawn_ci() -> CiService {
     // around so tests can push follow-up commits (e.g. a broken definition).
     let bare = git_root.join("harness.git");
     std::fs::create_dir_all(&bare).expect("create bare dir");
+    // The directory is only a valid push target once it is an actual bare
+    // repository; without this init every push (and every service-side
+    // clone) fails with "does not appear to be a git repository".
+    run_git(&["init", "--bare"], &bare);
     let seed = base.join("seed");
     std::fs::create_dir_all(&seed).expect("create seed dir");
     run_git(&["init", "--initial-branch=main"], &seed);
@@ -557,6 +561,60 @@ async fn test_unparseable_pipeline_marks_trigger_failed() {
         .await
         .expect("list runs");
     assert!(runs.is_empty(), "a failed trigger must not create runs");
+
+    common::shutdown_gracefully(&mut service.child).await;
+}
+
+/// A correlated event that names a run with no row is a genuinely lost
+/// record, which is a different answer from a transient read fault or an
+/// unknown event id: it is terminal `failed` over HTTP 200 (the poller fails
+/// the job), where an unknown event id stays 404 `missing` and a read fault
+/// is a retryable 503.
+#[tokio::test]
+async fn test_correlated_event_with_missing_run_row_is_terminal_failed() {
+    let mut service = spawn_ci().await;
+
+    // Write a correlation row straight to the durable store: correlated to a
+    // run id that was never created. `ci_trigger_events` carries no foreign
+    // keys, so the test can stage this lost-record shape exactly.
+    let event_id = uuid::Uuid::new_v4();
+    let dangling_run_id = gitforge_common::PipelineRunId::new();
+    let pool = gitforge_db::Pool::new(&service.db_path.display().to_string())
+        .await
+        .expect("open service database");
+    gitforge_db::queries::CiTriggerEventQueries::insert_pending(&pool, event_id, service.repo_id)
+        .await
+        .expect("record pending event");
+    gitforge_db::queries::CiTriggerEventQueries::correlate(&pool, event_id, dangling_run_id)
+        .await
+        .expect("correlate event to the missing run");
+    drop(pool);
+
+    // Terminal failed over HTTP 200 — never green, never retryable, and
+    // distinct from the 404 an unknown event id answers.
+    let (status, body) = get_trigger_status(
+        service.scheduler_port,
+        Some(status_bearer()),
+        &event_id.to_string(),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("parse status body");
+    assert_eq!(payload["status"], "failed", "payload: {payload}");
+    assert_eq!(
+        payload["pipeline_run_id"],
+        dangling_run_id.to_string(),
+        "the correlation is still reported: {payload}"
+    );
+
+    // The contrast case, same service: an event id with no row at all is
+    // missing, not failed.
+    let unknown = uuid::Uuid::new_v4().to_string();
+    let (status, body) =
+        get_trigger_status(service.scheduler_port, Some(status_bearer()), &unknown).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "body: {body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("parse 404 body");
+    assert_eq!(payload["status"], "missing", "payload: {payload}");
 
     common::shutdown_gracefully(&mut service.child).await;
 }
