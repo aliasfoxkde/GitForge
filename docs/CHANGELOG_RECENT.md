@@ -2,6 +2,16 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Terminal jobs cannot be revived by delayed dispatch**: guarded status
+  updates now report rejected transitions, and heap generations ensure a
+  removed or re-enqueued job dispatches only its newest queue entry. The
+  database, scheduler, and API regression tests cover the cancellation and
+  duplicate-entry paths.
+
 ## [0.6.14] - 2026-10-03
 
 ### Added

@@ -1350,10 +1350,14 @@ impl JobQueries {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 status = 'queued',
+                runner_id = NULL,
+                started_at = NULL,
+                lease_token = NULL,
                 commands = excluded.commands,
                 image = excluded.image,
                 working_dir = excluded.working_dir,
                 timeout_secs = excluded.timeout_secs
+            WHERE jobs.status IN ('pending', 'queued') AND jobs.finished_at IS NULL
             "#,
         )
         .bind(job.id.to_string())
@@ -1389,13 +1393,44 @@ impl JobQueries {
 
     /// Update job status
     pub async fn update_status(pool: &Pool, id: JobId, status: &str) -> Result<()> {
-        sqlx::query("UPDATE jobs SET status = ? WHERE id = ?")
+        let result = sqlx::query(
+            "UPDATE jobs SET status = ? WHERE id = ? AND (status IN ('pending', 'queued', 'assigned', 'running') OR status = ?)",
+        )
             .bind(status)
             .bind(id.to_string())
+            .bind(status)
             .execute(pool.pool())
             .await
             .map_err(|e| Error::database(format!("failed to update job status: {e}")))?;
+
+        if result.rows_affected() == 0 {
+            match Self::get(pool, id).await? {
+                Some(job) if job.status == status => return Ok(()),
+                Some(job) => {
+                    return Err(Error::invalid_input(format!(
+                        "cannot transition job {id} from {} to {status}",
+                        job.status
+                    )));
+                }
+                None => return Err(Error::not_found("job", id)),
+            }
+        }
+
         Ok(())
+    }
+
+    /// Move a planned job into the durable dispatch queue without reviving a
+    /// terminal or already-running job. Repeated queueing is idempotent; a
+    /// stale assignment on a still-queued row is cleared atomically.
+    pub async fn queue_if_waiting(pool: &Pool, id: JobId) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL WHERE id = ? AND status IN ('pending', 'queued') AND finished_at IS NULL",
+        )
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to queue waiting job: {e}")))?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Requeue an assigned job and clear its runner fencing token.
@@ -1680,18 +1715,8 @@ impl JobQueries {
 
     /// Persist an operator cancellation as a terminal job transition.
     pub async fn cancel(pool: &Pool, id: JobId, result_json: &str) -> Result<()> {
-        let existing = Self::get(pool, id).await?;
-        if let Some(job) = existing {
-            if let Some(status) = JobStatus::from_str(&job.status) {
-                if status.is_terminal() {
-                    return Ok(());
-                }
-            }
-        } else {
-            return Err(Error::not_found("job", id));
-        }
-        sqlx::query(
-            "UPDATE jobs SET status = 'cancelled', finished_at = ?, result_json = ? WHERE id = ?",
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'cancelled', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE id = ? AND status IN ('pending', 'queued', 'assigned', 'running')",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(result_json)
@@ -1699,7 +1724,23 @@ impl JobQueries {
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to cancel job: {e}")))?;
-        Ok(())
+        if result.rows_affected() == 1 {
+            return Ok(());
+        }
+
+        match Self::get(pool, id).await? {
+            Some(job)
+                if JobStatus::from_str(&job.status).is_some_and(|status| status.is_terminal()) =>
+            {
+                // Another terminal transition won the race; preserve its
+                // status and receipt rather than overwriting it with cancel.
+                Ok(())
+            }
+            Some(_) => Err(Error::invalid_input(
+                "job status changed before cancellation could be persisted",
+            )),
+            None => Err(Error::not_found("job", id)),
+        }
     }
 
     /// List jobs by pipeline run
@@ -3644,6 +3685,22 @@ mod tests {
         let cancelled = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
         assert_eq!(cancelled.status, "cancelled");
         assert!(cancelled.finished_at.is_some());
+        assert!(cancelled.runner_id.is_none());
+        assert!(cancelled.lease_token.is_none());
+
+        // A delayed ready-job enqueue must not resurrect an operator-cancelled
+        // job or leave its old lease attached to a now-queued row.
+        assert!(!JobQueries::queue_if_waiting(&pool, job.id).await.unwrap());
+        let transition_error = JobQueries::update_status(&pool, job.id, "queued")
+            .await
+            .expect_err("a terminal job must reject a queued transition");
+        assert_eq!(
+            transition_error.kind,
+            gitforge_common::ErrorKind::InvalidInput
+        );
+        JobQueries::create_or_open_queue(&pool, &job).await.unwrap();
+        let still_cancelled = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(still_cancelled.status, "cancelled");
 
         // List by run
         let jobs = JobQueries::list_by_run(&pool, run.id).await.unwrap();

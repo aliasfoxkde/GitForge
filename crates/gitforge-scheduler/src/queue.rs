@@ -35,6 +35,28 @@ pub struct QueuedJob {
     pub queued_at: i64,
 }
 
+/// A heap entry snapshots the insertion generation so an older entry for a
+/// removed or re-enqueued job cannot consume the current `by_id` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeapEntry {
+    job: QueuedJob,
+    generation: u64,
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.job
+            .cmp(&other.job)
+            .then_with(|| self.generation.cmp(&other.generation))
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl QueuedJob {
     pub fn new(job_id: JobId, pipeline_run_id: PipelineRunId, repo_id: RepoId) -> Self {
         Self {
@@ -75,7 +97,7 @@ impl Ord for QueuedJob {
 /// Job queue with priority support
 #[derive(Debug)]
 pub struct JobQueue {
-    heap: BinaryHeap<QueuedJob>,
+    heap: BinaryHeap<HeapEntry>,
     by_id: HashMap<JobId, QueuedJob>,
     insertion_order: HashMap<JobId, u64>,
     next_insertion_order: u64,
@@ -102,10 +124,10 @@ impl JobQueue {
     pub fn enqueue(&mut self, job: QueuedJob) {
         let job_id = job.job_id;
         self.next_insertion_order = self.next_insertion_order.saturating_add(1);
-        self.insertion_order
-            .insert(job_id, self.next_insertion_order);
+        let generation = self.next_insertion_order;
+        self.insertion_order.insert(job_id, generation);
         self.by_id.insert(job_id, job.clone());
-        self.heap.push(job);
+        self.heap.push(HeapEntry { job, generation });
     }
 
     /// Dequeue the highest priority active job.
@@ -114,10 +136,11 @@ impl JobQueue {
     /// stale heap entries must therefore be skipped here as well as by
     /// `peek`, otherwise a canceled job can be returned to the scheduler.
     pub fn dequeue(&mut self) -> Option<QueuedJob> {
-        while let Some(job) = self.heap.pop() {
-            if self.by_id.remove(&job.job_id).is_some() {
-                self.insertion_order.remove(&job.job_id);
-                return Some(job);
+        while let Some(entry) = self.heap.pop() {
+            let job_id = entry.job.job_id;
+            if self.insertion_order.get(&job_id) == Some(&entry.generation) {
+                self.insertion_order.remove(&job_id);
+                return self.by_id.remove(&job_id);
             }
         }
         None
@@ -125,9 +148,9 @@ impl JobQueue {
 
     /// Peek at the next active job without removing it.
     pub fn peek(&mut self) -> Option<&QueuedJob> {
-        while let Some(job) = self.heap.peek() {
-            if self.by_id.contains_key(&job.job_id) {
-                return self.heap.peek();
+        while let Some(entry) = self.heap.peek() {
+            if self.insertion_order.get(&entry.job.job_id) == Some(&entry.generation) {
+                return self.heap.peek().map(|entry| &entry.job);
             }
             self.heap.pop();
         }
@@ -466,6 +489,59 @@ mod tests {
 
         queue.dequeue();
         assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn reenqueueing_an_id_dequeues_only_the_latest_entry() {
+        let mut queue = JobQueue::new();
+        let job_id = JobId::new();
+        let pipeline_run_id = PipelineRunId::new();
+        let repo_id = RepoId::new();
+        let earlier = QueuedJob {
+            job_id,
+            pipeline_run_id,
+            repo_id,
+            priority: Priority::High,
+            queued_at: 10,
+        };
+        let latest = QueuedJob {
+            priority: Priority::Low,
+            queued_at: 20,
+            ..earlier.clone()
+        };
+
+        queue.enqueue(earlier);
+        queue.enqueue(latest.clone());
+
+        assert_eq!(queue.peek(), Some(&latest));
+        assert_eq!(queue.dequeue(), Some(latest));
+        assert_eq!(queue.dequeue(), None);
+    }
+
+    #[test]
+    fn reenqueue_after_removal_ignores_the_removed_heap_entry() {
+        let mut queue = JobQueue::new();
+        let job_id = JobId::new();
+        let earlier = QueuedJob {
+            job_id,
+            pipeline_run_id: PipelineRunId::new(),
+            repo_id: RepoId::new(),
+            priority: Priority::High,
+            queued_at: 10,
+        };
+        let latest = QueuedJob {
+            priority: Priority::Low,
+            queued_at: 20,
+            ..earlier.clone()
+        };
+
+        queue.enqueue(earlier.clone());
+        assert_eq!(queue.remove(job_id), Some(earlier));
+        queue.enqueue(latest.clone());
+
+        assert_eq!(queue.peek(), Some(&latest));
+        assert_eq!(queue.dequeue(), Some(latest));
+        assert_eq!(queue.dequeue(), None);
     }
 
     #[test]

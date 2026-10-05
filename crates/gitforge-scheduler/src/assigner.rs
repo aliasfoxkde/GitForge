@@ -10,8 +10,8 @@ use gitforge_db::models::{
 use gitforge_db::Pool;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use std::sync::{Arc, Weak};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
 /// Maximum heartbeat age before a runner is considered lost by the normal
@@ -273,6 +273,7 @@ impl SchedulerState {
 /// Job scheduler
 pub struct Scheduler {
     state: Arc<RwLock<SchedulerState>>,
+    enqueue_locks: Arc<Mutex<HashMap<JobId, Weak<Mutex<()>>>>>,
     policy: Arc<dyn SchedulingPolicy>,
     event_tx: broadcast::Sender<SchedulerEvent>,
     db_pool: Option<Pool>,
@@ -286,6 +287,7 @@ impl Scheduler {
         let (event_tx, _) = broadcast::channel(100);
         Self {
             state: Arc::new(RwLock::new(SchedulerState::new())),
+            enqueue_locks: Arc::new(Mutex::new(HashMap::new())),
             policy: Arc::new(SimplePolicy::new()),
             event_tx,
             db_pool: None,
@@ -299,6 +301,7 @@ impl Scheduler {
         let (event_tx, _) = broadcast::channel(100);
         Self {
             state: Arc::new(RwLock::new(SchedulerState::new())),
+            enqueue_locks: Arc::new(Mutex::new(HashMap::new())),
             policy: Arc::new(SimplePolicy::new()),
             event_tx,
             db_pool: Some(pool),
@@ -320,6 +323,7 @@ impl Scheduler {
         Self {
             policy: Arc::new(policy),
             state: self.state,
+            enqueue_locks: self.enqueue_locks,
             event_tx: self.event_tx,
             db_pool: self.db_pool,
             recovery_done: self.recovery_done,
@@ -330,6 +334,22 @@ impl Scheduler {
     /// Get whether scheduler has database connection
     pub fn has_db(&self) -> bool {
         self.db_pool.is_some()
+    }
+
+    /// Return the shared lock for one job's durable-definition and in-memory
+    /// enqueue sequence. Weak entries let inactive job locks be reclaimed on
+    /// later enqueue requests instead of retaining one mutex per historical
+    /// job for the scheduler's lifetime.
+    async fn enqueue_lock_for(&self, job_id: JobId) -> Arc<Mutex<()>> {
+        let mut locks = self.enqueue_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&job_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(job_id, Arc::downgrade(&lock));
+        lock
     }
 
     /// Check whether a job is known to durable or in-memory scheduler state.
@@ -453,6 +473,8 @@ impl Scheduler {
         repo_id: RepoId,
         definition: JobExecutionDefinition,
     ) -> anyhow::Result<()> {
+        let enqueue_lock = self.enqueue_lock_for(job_id).await;
+        let _enqueue_guard = enqueue_lock.lock().await;
         let timeout_secs = definition.timeout_secs.clamp(5, 24 * 60 * 60);
         if let Some(pool) = &self.db_pool {
             let mut db_job = DbJob::new(pipeline_run_id, format!("job-{job_id}"));
@@ -474,10 +496,17 @@ impl Scheduler {
                 })
                 .await?;
             }
-            persist_with_retry("status update", job_id, || {
-                gitforge_db::queries::JobQueries::update_status(pool, job_id, "queued")
+            let queued = persist_with_retry("queue transition", job_id, || {
+                gitforge_db::queries::JobQueries::queue_if_waiting(pool, job_id)
             })
             .await?;
+            if !queued {
+                tracing::debug!(
+                    %job_id,
+                    "skipping enqueue because the durable job is no longer waiting"
+                );
+                return Ok(());
+            }
             let commands = definition.commands.clone();
             let image = definition.image.clone();
             let working_dir = definition.working_dir.clone();
@@ -2294,6 +2323,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_delayed_enqueue_does_not_resurrect_cancelled_job() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (run_id, repo_id) = seed_durable_run(&pool).await;
+        let job = gitforge_db::models::Job::new(run_id, "cancelled-before-enqueue".to_string());
+        gitforge_db::queries::JobQueries::create(&pool, &job)
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::cancel(&pool, job.id, r#"{"status":"cancelled"}"#)
+            .await
+            .unwrap();
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                job.id,
+                run_id,
+                repo_id,
+                plain_definition(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(scheduler.queue_len().await, 0);
+        assert_eq!(
+            gitforge_db::queries::JobQueries::get(&pool, job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
     async fn test_idempotent_submission_replays_same_job_and_rejects_conflict() {
         let pool = gitforge_db::Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
@@ -3334,6 +3398,30 @@ mod tests {
             .enqueue_with_priority(JobId::new(), run_id, repo_id, Priority::High)
             .await;
         assert_eq!(scheduler.queue_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_lock_is_shared_for_one_job_and_reclaimed_when_idle() {
+        let scheduler = Scheduler::new();
+        let job_id = JobId::new();
+
+        let first = scheduler.enqueue_lock_for(job_id).await;
+        let second = scheduler.enqueue_lock_for(job_id).await;
+        assert!(Arc::ptr_eq(&first, &second));
+        let guard = first.lock().await;
+        assert!(second.try_lock().is_err());
+        drop(guard);
+        assert!(second.try_lock().is_ok());
+
+        let inactive = Arc::downgrade(&first);
+        drop(first);
+        drop(second);
+        let replacement = scheduler.enqueue_lock_for(job_id).await;
+        assert!(inactive.upgrade().is_none());
+        assert_eq!(Arc::strong_count(&replacement), 1);
+        let lock_registry = scheduler.enqueue_locks.lock().await;
+        assert_eq!(lock_registry.len(), 1);
+        assert!(lock_registry[&job_id].upgrade().is_some());
     }
 
     #[tokio::test]
