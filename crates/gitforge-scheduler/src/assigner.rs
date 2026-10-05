@@ -474,10 +474,17 @@ impl Scheduler {
                 })
                 .await?;
             }
-            persist_with_retry("status update", job_id, || {
-                gitforge_db::queries::JobQueries::update_status(pool, job_id, "queued")
+            let queued = persist_with_retry("queue transition", job_id, || {
+                gitforge_db::queries::JobQueries::queue_if_waiting(pool, job_id)
             })
             .await?;
+            if !queued {
+                tracing::debug!(
+                    %job_id,
+                    "skipping enqueue because the durable job is no longer waiting"
+                );
+                return Ok(());
+            }
             let commands = definition.commands.clone();
             let image = definition.image.clone();
             let working_dir = definition.working_dir.clone();
@@ -2291,6 +2298,41 @@ mod tests {
         assert_eq!(definition.image, "node:22");
         assert_eq!(definition.working_dir.as_deref(), Some("/workspace"));
         assert_eq!(definition.timeout_secs, 900);
+    }
+
+    #[tokio::test]
+    async fn test_delayed_enqueue_does_not_resurrect_cancelled_job() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (run_id, repo_id) = seed_durable_run(&pool).await;
+        let job = gitforge_db::models::Job::new(run_id, "cancelled-before-enqueue".to_string());
+        gitforge_db::queries::JobQueries::create(&pool, &job)
+            .await
+            .unwrap();
+        gitforge_db::queries::JobQueries::cancel(&pool, job.id, r#"{"status":"cancelled"}"#)
+            .await
+            .unwrap();
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                job.id,
+                run_id,
+                repo_id,
+                plain_definition(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(scheduler.queue_len().await, 0);
+        assert_eq!(
+            gitforge_db::queries::JobQueries::get(&pool, job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
     }
 
     #[tokio::test]
