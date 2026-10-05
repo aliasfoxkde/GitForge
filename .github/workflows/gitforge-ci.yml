@@ -20,12 +20,20 @@ env:
   # this workflow only after a reachable endpoint or self-hosted runner is
   # deliberately configured at repository/organization scope.
   GITFORGE_ENABLED: ${{ vars.GITFORGE_ENABLED || 'false' }}
-  GITFORGE_API_URL: ${{ vars.GITFORGE_API_URL || '' }}
   GITFORGE_SCHEDULER_URL: ${{ vars.GITFORGE_SCHEDULER_URL || '' }}
   GITFORGE_REPO_ID: ${{ vars.GITFORGE_REPO_ID || '' }}
   GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
-  GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
+  # Trigger and status credentials are distinct on purpose (issue #259).
+  # GITFORGE_TRIGGER_TOKEN starts runs (POST /pipelines/trigger); the CI
+  # service's scheduler-operator token is NOT accepted there, and neither
+  # token substitutes for the other. GITFORGE_STATUS_TOKEN can only read the
+  # lifecycle state of the exact trigger event this workflow created
+  # (GET /pipelines/trigger/status/{event_id}). The API gateway JWT is not
+  # part of this loop: status is answered by the CI service itself, so
+  # GITFORGE_API_URL/GITFORGE_API_TOKEN are no longer used.
+  GITFORGE_TRIGGER_TOKEN: ${{ secrets.GITFORGE_TRIGGER_TOKEN }}
+  GITFORGE_STATUS_TOKEN: ${{ secrets.GITFORGE_STATUS_TOKEN }}
 
 permissions:
   contents: read
@@ -40,16 +48,17 @@ jobs:
     if: vars.GITFORGE_ENABLED == 'true'
     runs-on: [self-hosted, linux, x64, gitforge-github]
     outputs:
+      event_id: ${{ steps.enqueue.outputs.event_id }}
       run_id: ${{ steps.enqueue.outputs.run_id }}
       build_status: ${{ steps.enqueue.outputs.status }}
     steps:
       - name: Validate GitForge configuration
         run: |
           set -euo pipefail
-          : "${GITFORGE_API_URL:?GITFORGE_API_URL is required}"
           : "${GITFORGE_SCHEDULER_URL:?GITFORGE_SCHEDULER_URL is required}"
           : "${GITFORGE_REPO_ID:?GITFORGE_REPO_ID is required (GitForge UUID, not GitHub repository_id)}"
-          : "${GITFORGE_API_TOKEN:?GITFORGE_API_TOKEN is required}"
+          : "${GITFORGE_TRIGGER_TOKEN:?GITFORGE_TRIGGER_TOKEN secret is required (starts runs: POST /pipelines/trigger)}"
+          : "${GITFORGE_STATUS_TOKEN:?GITFORGE_STATUS_TOKEN secret is required (reads trigger status: GET /pipelines/trigger/status/{event_id}); it must be a distinct, high-entropy credential, not the trigger or operator token}"
           [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
             echo "GITFORGE_REPO_ID must be a UUID" >&2
             exit 1
@@ -62,13 +71,20 @@ jobs:
             echo "GITFORGE_POLL_INTERVAL_SECONDS must be a positive integer" >&2
             exit 1
           }
+          [[ "$GITFORGE_TRIGGER_TOKEN" != "$GITFORGE_STATUS_TOKEN" ]] || {
+            echo "GITFORGE_TRIGGER_TOKEN and GITFORGE_STATUS_TOKEN must be distinct credentials (issue #259)" >&2
+            exit 1
+          }
       - name: Enqueue build job
         id: enqueue
         run: |
           set -euo pipefail
-          # Trigger the GitForge CI service. The service returns the durable
-          # pipeline-run ID; polling the API by pipeline ID was a protocol
-          # mismatch and could never observe the created run.
+          # Trigger the GitForge CI service. The response always carries the
+          # durable event id; it also carries the pipeline-run id once the
+          # service's correlation window (15s) succeeds. When it answers
+          # `queued` without a run id, the poll job resolves the run from the
+          # event id — the correlation is durable, so the answer survives
+          # service restarts.
           PAYLOAD=$(jq -n \
             --arg repo "$GITFORGE_REPO_ID" \
             --arg ref "${{ github.ref_name }}" \
@@ -77,7 +93,7 @@ jobs:
             '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "$GITFORGE_SCHEDULER_URL/pipelines/trigger" \
-            -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+            -H "Authorization: Bearer $GITFORGE_TRIGGER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" 2>&1)
 
@@ -85,19 +101,24 @@ jobs:
           BODY=$(echo "$RESPONSE" | sed '$d')
 
           echo "HTTP Code: $HTTP_CODE"
-          echo "Response: $BODY"
 
           if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
+            EVENT_ID=$(echo "$BODY" | jq -r '.event_id // empty')
             RUN_ID=$(echo "$BODY" | jq -r '.pipeline_run_id // empty')
-            if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
-              echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+            if [ -n "$EVENT_ID" ] && [ "$EVENT_ID" != "null" ]; then
+              echo "event_id=$EVENT_ID" >> "$GITHUB_OUTPUT"
+              if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
+                echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+              fi
               echo "status=enqueued" >> "$GITHUB_OUTPUT"
-              echo "Successfully enqueued pipeline run $RUN_ID"
+              echo "Trigger accepted: event $EVENT_ID${RUN_ID:+, run $RUN_ID}"
               exit 0
             fi
+            echo "GitForge trigger response carried no event_id; refusing to continue" >&2
+          else
+            echo "GitForge enqueue failed (HTTP $HTTP_CODE); refusing to bypass GitForge" >&2
+            echo "$BODY" | jq -r '.error // "unparsed error body"' >&2 || true
           fi
-
-          echo "GitForge enqueue failed (HTTP $HTTP_CODE); refusing to bypass GitForge" >&2
           exit 1
 
   # Poll GitForge for build status (when GitForge is available)
@@ -113,37 +134,70 @@ jobs:
         id: poll
         run: |
           set -euo pipefail
-          echo "Build enqueued, polling GitForge for status..."
-          RUN_ID='${{ needs.enqueue-build.outputs.run_id }}'
-          STATUS_URL="$GITFORGE_API_URL/api/pipeline-runs/$RUN_ID"
+          EVENT_ID='${{ needs.enqueue-build.outputs.event_id }}'
+          [[ "$EVENT_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
+            echo "enqueue did not yield a well-formed event id: refusing to poll" >&2
+            exit 1
+          }
+          # Status reads use the dedicated status credential against the CI
+          # service, scoped to the exact event this run created (#259).
+          STATUS_URL="$GITFORGE_SCHEDULER_URL/pipelines/trigger/status/$EVENT_ID"
+          STATUS_FILE="$RUNNER_TEMP/gitforge-trigger-status.json"
+          echo "Build enqueued as event $EVENT_ID, polling GitForge for status..."
 
           deadline=$(( $(date +%s) + GITFORGE_POLL_TIMEOUT_SECONDS ))
           while :; do
-            RESPONSE=$(curl --fail-with-body --silent --show-error \
-              --max-time 30 \
-              -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+            HTTP_CODE=$(curl --silent --show-error --max-time 30 \
+              -o "$STATUS_FILE" -w "%{http_code}" \
+              -H "Authorization: Bearer $GITFORGE_STATUS_TOKEN" \
               -H "Accept: application/json" \
               "$STATUS_URL")
-            STATUS=$(echo "$RESPONSE" | jq -r '.status // .state // empty' | tr '[:upper:]' '[:lower:]')
-            echo "GitForge pipeline run $RUN_ID status: ${STATUS:-unknown}"
-
-            case "$STATUS" in
-              completed|succeeded|success|passed|failed|failure|cancelled|canceled|timed_out|timeout|error)
-                echo "terminal_status=$STATUS" >> "$GITHUB_OUTPUT"
+            case "$HTTP_CODE" in
+              200)
+                # Fail closed: an unreadable or unrecognized body is never
+                # treated as success, and only `succeeded` is green.
+                STATUS=$(jq -r '.status // empty' "$STATUS_FILE" 2>/dev/null || true)
+                RUN_ID=$(jq -r '.pipeline_run_id // empty' "$STATUS_FILE" 2>/dev/null || true)
+                echo "GitForge event $EVENT_ID status: ${STATUS:-unknown}${RUN_ID:+ (run $RUN_ID)}"
                 case "$STATUS" in
-                  completed|succeeded|success|passed) exit 0 ;;
-                  *) echo "GitForge job reached unsuccessful terminal state: $STATUS" >&2; exit 1 ;;
+                  succeeded)
+                    echo "terminal_status=succeeded" >> "$GITHUB_OUTPUT"
+                    exit 0
+                    ;;
+                  failed|cancelled|canceled|timed_out|timeout|error)
+                    echo "GitForge pipeline reached unsuccessful terminal state: $STATUS" >&2
+                    echo "terminal_status=$STATUS" >> "$GITHUB_OUTPUT"
+                    exit 1
+                    ;;
+                  queued|running|pending|assigned)
+                    : # not terminal; keep polling
+                    ;;
+                  *)
+                    echo "GitForge returned unrecognized status '${STATUS:-<none>}'; refusing to guess" >&2
+                    echo "terminal_status=invalid" >> "$GITHUB_OUTPUT"
+                    exit 1
+                    ;;
                 esac
                 ;;
+              404)
+                echo "GitForge has no durable correlation for event $EVENT_ID; treating as failure" >&2
+                echo "terminal_status=missing" >> "$GITHUB_OUTPUT"
+                exit 1
+                ;;
+              401|403)
+                echo "GitForge rejected the status credential (HTTP $HTTP_CODE); check the GITFORGE_STATUS_TOKEN secret" >&2
+                exit 1
+                ;;
               *)
-                if [ "$(date +%s)" -ge "$deadline" ]; then
-                  echo "GitForge pipeline run did not reach a terminal state within ${GITFORGE_POLL_TIMEOUT_SECONDS}s" >&2
-                  echo "terminal_status=timeout" >> "$GITHUB_OUTPUT"
-                  exit 1
-                fi
-                sleep "$GITFORGE_POLL_INTERVAL_SECONDS"
+                echo "GitForge status endpoint answered HTTP $HTTP_CODE" >&2
                 ;;
             esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "GitForge pipeline run did not reach a terminal state within ${GITFORGE_POLL_TIMEOUT_SECONDS}s" >&2
+              echo "terminal_status=timeout" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            sleep "$GITFORGE_POLL_INTERVAL_SECONDS"
           done
 
   # Report final status to GitHub
@@ -156,6 +210,7 @@ jobs:
       - name: Report completion
         run: |
           echo "GitForge enqueue status: ${{ needs.enqueue-build.outputs.build_status }}"
+          echo "GitForge event id: ${{ needs.enqueue-build.outputs.event_id }}"
           echo "GitForge poll job result: ${{ needs.poll-build.result }}"
           echo "GitForge terminal status: ${{ needs.poll-build.outputs.terminal_status || 'not-reached' }}"
           if [ "${{ needs.poll-build.result }}" != "success" ]; then

@@ -66,6 +66,11 @@ services:
       # Scheduler API auth is fail-closed: runners cannot register, fetch, or
       # complete jobs unless this shared credential is configured.
       - GITFORGE_SCHEDULER_TOKEN=${GITFORGE_SCHEDULER_TOKEN:?set GITFORGE_SCHEDULER_TOKEN in .env}
+      # Optional trigger-status credential (issue #259). Unset keeps the
+      # GET /pipelines/trigger/status endpoint closed (503); set it to a
+      # dedicated high-entropy value, distinct from every other token, only
+      # when the GitHub Actions trigger path is enabled.
+      - GITFORGE_STATUS_TOKEN=${GITFORGE_STATUS_TOKEN:-}
     depends_on:
       - git-server
     networks:

@@ -427,6 +427,27 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create job idempotency table: {e}")))?;
 
+        // Durable CI trigger correlation (issue #259). One row per accepted
+        // POST /pipelines/trigger request, keyed by the event_id returned to
+        // the caller, so a `queued` answer (the synchronous correlation window
+        // elapsed) can still be resolved to its pipeline run after the fact —
+        // including after a service restart, because the row is on disk.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS ci_trigger_events (
+                event_id TEXT PRIMARY KEY,
+                pipeline_run_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                repo_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create ci_trigger_events table: {e}")))?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS publication_outbox (
@@ -611,6 +632,37 @@ mod tests {
         assert!(names.iter().any(|name| name == "delivery_token"));
         assert!(names.iter().any(|name| name == "delivery_until"));
         assert!(names.iter().any(|name| name == "delivery_attempts"));
+    }
+
+    /// The trigger-correlation table (issue #259) must exist after a fresh
+    /// migration and survive a re-migration (service restart) untouched, so
+    /// correlation rows written before the restart stay readable.
+    #[tokio::test]
+    async fn test_ci_trigger_events_table_is_idempotently_migrated() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        pool.migrate().await.unwrap();
+        let columns = sqlx::query("PRAGMA table_info(ci_trigger_events)")
+            .fetch_all(pool.pool())
+            .await
+            .unwrap();
+        let names = columns
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        for expected in [
+            "event_id",
+            "pipeline_run_id",
+            "status",
+            "repo_id",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "ci_trigger_events is missing column {expected}"
+            );
+        }
     }
 
     #[tokio::test]

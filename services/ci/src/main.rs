@@ -4,7 +4,7 @@
 
 use axum::Router;
 use axum::{
-    extract::{Extension, Request},
+    extract::{Extension, Path, Request},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -60,6 +60,10 @@ struct TriggerState {
             HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
         >,
     >,
+    /// Durable store backing trigger correlation (issue #259). `None` keeps
+    /// the development-only in-memory scheduler: the status endpoint then
+    /// refuses to answer rather than correlating from volatile state.
+    db: Option<gitforge_db::Pool>,
 }
 
 #[tokio::main]
@@ -129,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         event_bus: event_bus.clone(),
         workspace_paths: workspace_paths.clone(),
         run_waiters: run_waiters.clone(),
+        db: scheduler_db.clone(),
     });
 
     let scheduler_app = Router::new()
@@ -136,6 +141,11 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/pipelines/trigger",
             axum::routing::post(trigger_pipeline).layer(middleware::from_fn(require_trigger_auth)),
+        )
+        .route(
+            "/pipelines/trigger/status/{event_id}",
+            axum::routing::get(trigger_event_status)
+                .layer(middleware::from_fn(require_status_auth)),
         )
         .merge(scheduler_routes(scheduler_state))
         .layer(Extension(trigger_state))
@@ -430,11 +440,12 @@ fn configured_trigger_token(get_var: impl Fn(&str) -> Option<String>) -> Option<
     .find_map(|name| get_var(name).filter(|token| !token.is_empty()))
 }
 
-/// Compare trigger credentials without leaking the first differing byte or
+/// Compare bearer credentials without leaking the first differing byte or
 /// accepting a token with a different length. The scheduler is an internal
 /// control-plane boundary, so both the dedicated compatibility header and the
-/// standard Bearer form are supported during migration.
-fn trigger_token_matches(expected: &str, supplied: Option<&str>) -> bool {
+/// standard Bearer form are supported; the trigger and status middlewares
+/// share this comparison (issue #259).
+fn token_matches(expected: &str, supplied: Option<&str>) -> bool {
     let Some(supplied) = supplied else {
         return false;
     };
@@ -451,6 +462,15 @@ fn trigger_token_matches(expected: &str, supplied: Option<&str>) -> bool {
     difference == 0
 }
 
+/// The trigger status endpoint takes its own credential, deliberately NOT
+/// falling back to the trigger or scheduler operator tokens (issue #259): a
+/// deployment that leaks the status secret exposes only "did the run I
+/// triggered finish", never the ability to start builds or operate the
+/// scheduler. Unset means the endpoint is closed, not open.
+fn configured_status_token(get_var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    get_var("GITFORGE_STATUS_TOKEN").filter(|token| !token.is_empty())
+}
+
 async fn require_trigger_auth(request: Request, next: Next) -> Response {
     let expected = configured_trigger_token(|name| std::env::var(name).ok());
     let Some(expected) = expected else {
@@ -465,12 +485,37 @@ async fn require_trigger_auth(request: Request, next: Next) -> Response {
         .get("x-gitforge-trigger-token")
         .or_else(|| request.headers().get(header::AUTHORIZATION))
         .and_then(|value| value.to_str().ok());
-    if trigger_token_matches(&expected, supplied) {
+    if token_matches(&expected, supplied) {
         next.run(request).await
     } else {
         (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "trigger_auth_required"})),
+        )
+            .into_response()
+    }
+}
+
+async fn require_status_auth(request: Request, next: Next) -> Response {
+    let expected = configured_status_token(|name| std::env::var(name).ok());
+    let Some(expected) = expected else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "status_auth_not_configured"})),
+        )
+            .into_response();
+    };
+    let supplied = request
+        .headers()
+        .get("x-gitforge-status-token")
+        .or_else(|| request.headers().get(header::AUTHORIZATION))
+        .and_then(|value| value.to_str().ok());
+    if token_matches(&expected, supplied) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "status_auth_required"})),
         )
             .into_response()
     }
@@ -546,6 +591,35 @@ async fn trigger_pipeline(
         .expect("run waiter lock poisoned")
         .insert(event.event_id, run_tx);
 
+    // Durably record the accepted event before it is published (issue #259):
+    // a `queued` answer (the correlation window below elapsed) must stay
+    // resolvable by event_id even after a service restart, which volatile
+    // waiter map cannot do. Failing the trigger here is deliberate — firing
+    // an event no caller could ever correlate would strand it.
+    if let Some(pool) = trigger_state.db.as_ref() {
+        if let Err(error) = gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+            pool,
+            event.event_id,
+            repo_id,
+        )
+        .await
+        {
+            trigger_state
+                .run_waiters
+                .lock()
+                .expect("run waiter lock poisoned")
+                .remove(&event.event_id);
+            tracing::error!(%error, event_id = %event.event_id, "failed to persist trigger correlation row");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "trigger_correlation_unavailable",
+                    "message": "could not persist trigger correlation; retry the request"
+                })),
+            );
+        }
+    }
+
     match trigger_state.event_bus.publish(event.clone()).await {
         Ok(()) => {
             // Pipeline creation includes event delivery, config loading, and
@@ -581,13 +655,133 @@ async fn trigger_pipeline(
                 })),
             )
         }
-        Err(error) => (
+        Err(error) => {
+            // The event never reached the consumer, so nothing will ever
+            // correlate it: close the correlation row out as failed instead
+            // of leaving a pending row a poller could wait on forever.
+            if let Some(pool) = trigger_state.db.as_ref() {
+                let _ =
+                    gitforge_db::queries::CiTriggerEventQueries::mark_failed(pool, event.event_id)
+                        .await;
+            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "event_publish_failed",
+                    "message": error.to_string(),
+                })),
+            )
+        }
+    }
+}
+
+/// Status read for one trigger event, addressed by the `event_id` the
+/// triggering call received (issue #259). Deliberately narrow on every axis:
+/// the credential is a dedicated status token, the caller can only name an
+/// event it already saw in a trigger response, the response carries only the
+/// correlation and the run's one-word lifecycle state, and every ambiguous
+/// case maps to a non-green status.
+async fn trigger_event_status(
+    Extension(trigger_state): Extension<Arc<TriggerState>>,
+    Path(event_id): Path<String>,
+) -> Response {
+    let Some(pool) = trigger_state.db.as_ref() else {
+        // Without durable storage there is no correlation that survives a
+        // restart, which the contract requires — refuse rather than guess.
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "event_publish_failed",
-                "message": error.to_string(),
+                "error": "status_unavailable",
+                "message": "durable trigger correlation requires GITFORGE_DATABASE_URL"
             })),
-        ),
+        )
+            .into_response();
+    };
+    let Ok(event_id) = uuid::Uuid::parse_str(&event_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_event_id",
+                "message": "event_id must be a UUID"
+            })),
+        )
+            .into_response();
+    };
+    let correlation = match gitforge_db::queries::CiTriggerEventQueries::get(pool, event_id).await {
+        Ok(Some(correlation)) => correlation,
+        Ok(None) => {
+            // Unknown event id: either never triggered or durably lost.
+            // Both are failures, never a green answer.
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "unknown_event_id",
+                    "status": "missing"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::warn!(%error, event_id = %event_id, "trigger status read failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "status_read_failed",
+                    "status": "failed"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = match correlation.status.as_str() {
+        // The consumer has not created the run yet — keep polling.
+        gitforge_db::models::TRIGGER_EVENT_PENDING => "queued",
+        // The consumer errored; there is no run and there never will be.
+        gitforge_db::models::TRIGGER_EVENT_FAILED => "failed",
+        // The run exists; grade from the same durable row the reconcilers
+        // write, so this endpoint never disagrees with the run's verdict.
+        gitforge_db::models::TRIGGER_EVENT_CORRELATED => {
+            let run_status = match correlation.pipeline_run_id {
+                Some(run_id) => gitforge_db::queries::PipelineRunQueries::get(pool, run_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|run| run.status),
+                None => None,
+            };
+            map_run_status(run_status.as_deref())
+        }
+        other => {
+            tracing::warn!(status = %other, "unknown correlation status; answering fail-closed");
+            "failed"
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "event_id": event_id.to_string(),
+            "status": status,
+            "pipeline_run_id": correlation
+                .pipeline_run_id
+                .map(|id| id.to_string()),
+        })),
+    )
+        .into_response()
+}
+
+/// Fail-closed mapping from a durable pipeline-run status to the one-word
+/// status the poller consumes. `None` — a correlated event whose run row
+/// cannot be read — and any unrecognized verdict map to `failed`: a missing
+/// or ambiguous record is never green.
+fn map_run_status(status: Option<&str>) -> &'static str {
+    match status {
+        Some("pending") | Some("running") => "running",
+        Some("succeeded") => "succeeded",
+        Some("failed") | Some("timed_out") | Some("timeout") | Some("timed-out") => "failed",
+        Some("cancelled") => "cancelled",
+        _ => "failed",
     }
 }
 
@@ -1543,13 +1737,37 @@ async fn run_event_consumer(
                     Some(event) => {
                         tracing::debug!("received event: {:?}", event.event_type);
                         match handle_push_event(&event, &scheduler, &pipeline_cache, scheduler_db.as_ref(), &workspace_paths, &run_workspace_paths, &pipeline_registry).await {
-                            Ok(run_id) => {
+                            Ok(Some(run_id)) => {
                                 if let Some(waiter) = run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id) {
                                     let _ = waiter.send(run_id);
                                 }
+                                // Durable trigger correlation (issue #259):
+                                // the run id outlives the waiter map, so a
+                                // caller holding only the event id can still
+                                // resolve its run after this process dies.
+                                if let Some(pool) = scheduler_db.as_ref() {
+                                    if let Err(error) = gitforge_db::queries::CiTriggerEventQueries::correlate(pool, event.event_id, run_id).await {
+                                        tracing::error!(%error, event_id = %event.event_id, "failed to persist trigger correlation");
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                // Nothing was built for this event (ref
+                                // deletion, non-push envelope): drop the
+                                // waiter without answering, leave the
+                                // correlation pending — never green.
+                                run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id);
                             }
                             Err(e) => {
                                 run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id);
+                                // The consumer failed: record it so the
+                                // trigger's caller fails fast instead of
+                                // waiting out its poll timeout.
+                                if let Some(pool) = scheduler_db.as_ref() {
+                                    if let Err(error) = gitforge_db::queries::CiTriggerEventQueries::mark_failed(pool, event.event_id).await {
+                                        tracing::error!(%error, event_id = %event.event_id, "failed to persist trigger failure");
+                                    }
+                                }
                                 tracing::error!("failed to handle push event: {}", e);
                             }
                         }
@@ -1566,7 +1784,11 @@ async fn run_event_consumer(
     Ok(())
 }
 
-/// Handle a push received event - trigger pipeline if configured
+/// Handle a push received event - trigger pipeline if configured. Returns the
+/// created run's id, or `None` when the event was consumed without creating a
+/// run (ref deletion, non-push envelope) — callers must not treat `None` as a
+/// run id, and the trigger waiter stays unanswered so its caller sees
+/// `queued` rather than a fabricated correlation.
 async fn handle_push_event(
     event: &EventEnvelope,
     scheduler: &Arc<Scheduler>,
@@ -1577,10 +1799,10 @@ async fn handle_push_event(
         std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
     >,
     pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
-) -> anyhow::Result<gitforge_common::PipelineRunId> {
+) -> anyhow::Result<Option<gitforge_common::PipelineRunId>> {
     // Only handle PushReceived events
     let EventPayload::PushReceived(payload) = &event.payload else {
-        return Ok(gitforge_common::PipelineRunId::new());
+        return Ok(None);
     };
 
     // Belt-and-suspenders for the git-server's deletion filter (F37): an
@@ -1594,7 +1816,7 @@ async fn handle_push_event(
             ref_name = %payload.ref_name,
             "ignoring ref-deletion push: nothing to build"
         );
-        return Ok(gitforge_common::PipelineRunId::new());
+        return Ok(None);
     }
 
     let repo_id = payload.repo_id;
@@ -1779,7 +2001,7 @@ async fn handle_push_event(
     )
     .await;
 
-    Ok(state.run_id)
+    Ok(Some(state.run_id))
 }
 
 /// Converge engine job state with scheduler rows that went terminal
@@ -2361,32 +2583,65 @@ mod tests {
     }
 
     #[test]
-    fn trigger_token_matches_raw_and_bearer_credentials() {
-        assert!(trigger_token_matches(
+    fn token_matches_raw_and_bearer_credentials() {
+        assert!(token_matches("shared-secret", Some("shared-secret")));
+        assert!(token_matches("shared-secret", Some("Bearer shared-secret")));
+    }
+
+    #[test]
+    fn token_matches_rejects_missing_mismatched_and_malformed_credentials() {
+        assert!(!token_matches("shared-secret", None));
+        assert!(!token_matches("shared-secret", Some("wrong-secret")));
+        assert!(!token_matches("shared-secret", Some("Basic shared-secret")));
+        assert!(!token_matches(
             "shared-secret",
-            Some("shared-secret")
-        ));
-        assert!(trigger_token_matches(
-            "shared-secret",
-            Some("Bearer shared-secret")
+            Some("Bearer shared-secret-extra")
         ));
     }
 
     #[test]
-    fn trigger_token_rejects_missing_mismatched_and_malformed_credentials() {
-        assert!(!trigger_token_matches("shared-secret", None));
-        assert!(!trigger_token_matches(
-            "shared-secret",
-            Some("wrong-secret")
-        ));
-        assert!(!trigger_token_matches(
-            "shared-secret",
-            Some("Basic shared-secret")
-        ));
-        assert!(!trigger_token_matches(
-            "shared-secret",
-            Some("Bearer shared-secret-extra")
-        ));
+    fn status_token_has_no_fallback_and_ignores_empty_values() {
+        // No fallback chain: the status endpoint's credential must be the
+        // dedicated name, never the trigger or operator token (issue #259).
+        let token = configured_status_token(|name| match name {
+            "GITFORGE_STATUS_TOKEN" => Some("status-secret".to_string()),
+            "GITFORGE_TRIGGER_TOKEN" => Some("trigger-secret".to_string()),
+            "GITFORGE_SCHEDULER_OPERATOR_TOKEN" => Some("operator-secret".to_string()),
+            _ => None,
+        });
+        assert_eq!(token.as_deref(), Some("status-secret"));
+
+        assert_eq!(
+            configured_status_token(|name| match name {
+                "GITFORGE_TRIGGER_TOKEN" => Some("trigger-secret".to_string()),
+                _ => None,
+            }),
+            None,
+            "the trigger token must not satisfy the status endpoint"
+        );
+        // An empty configured value closes the endpoint like an unset one.
+        assert_eq!(
+            configured_status_token(|name| (name == "GITFORGE_STATUS_TOKEN").then(|| String::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn run_status_maps_fail_closed() {
+        // Non-terminal states keep polling.
+        assert_eq!(map_run_status(Some("pending")), "running");
+        assert_eq!(map_run_status(Some("running")), "running");
+        // Terminal states pass through.
+        assert_eq!(map_run_status(Some("succeeded")), "succeeded");
+        assert_eq!(map_run_status(Some("failed")), "failed");
+        assert_eq!(map_run_status(Some("timed_out")), "failed");
+        assert_eq!(map_run_status(Some("timeout")), "failed");
+        assert_eq!(map_run_status(Some("cancelled")), "cancelled");
+        // Unreadable run row, unexpected verdict, or missing correlation:
+        // never green.
+        assert_eq!(map_run_status(None), "failed");
+        assert_eq!(map_run_status(Some("queued")), "failed");
+        assert_eq!(map_run_status(Some("")), "failed");
     }
 
     async fn run_git<I, S>(args: I, cwd: Option<&std::path::Path>) -> String
@@ -4318,7 +4573,7 @@ jobs:
         let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
-        handle_push_event(
+        let handled = handle_push_event(
             &zero_hash_push_envelope(),
             &scheduler,
             &pipeline_cache,
@@ -4329,6 +4584,10 @@ jobs:
         )
         .await
         .expect("a deletion push is consumed silently, never an error");
+        assert!(
+            handled.is_none(),
+            "a deletion push creates no run, so it must not correlate one"
+        );
 
         // The strong assertion: the guard fired before any pipeline was
         // resolved or planned for the deleted ref's repository.

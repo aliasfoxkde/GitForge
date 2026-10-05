@@ -92,6 +92,39 @@ Services are configured exclusively through environment variables; there is no
 config file. See `.env.example` for the deployment variables and
 [RUNBOOK.md](RUNBOOK.md#configuration) for the full per-service table.
 
+### GitHub Actions trigger credentials (issue #259)
+
+When the repository's `gitforge-ci.yml` workflow is enabled
+(`GITFORGE_ENABLED == 'true'`), it uses two distinct credentials:
+
+| Credential | Where it lives | What it may do |
+|------------|----------------|----------------|
+| `GITFORGE_TRIGGER_TOKEN` | GitHub secret + CI service env | Start runs: `POST /pipelines/trigger` on the CI service |
+| `GITFORGE_STATUS_TOKEN` | GitHub secret + CI service env | Read the status of one trigger event it can name: `GET /pipelines/trigger/status/{event_id}` |
+
+Both tokens must be high-entropy and distinct from each other and from the
+scheduler operator/runner tokens. The status token is scoped to status reads
+only — it cannot start runs, and the trigger or operator token is not accepted
+by the status endpoint. Token values are never logged by the service.
+
+Deployment migration (the table is created automatically at the next `ci`
+service start; no manual SQL):
+
+1. Add `GITFORGE_STATUS_TOKEN=<new high-entropy secret>` to the CI service
+   environment file (the same unit that already sets `GITFORGE_TRIGGER_TOKEN`
+   and `GITFORGE_DATABASE_URL`), then restart the service once.
+2. In the GitHub repository settings, set the secrets `GITFORGE_TRIGGER_TOKEN`
+   and `GITFORGE_STATUS_TOKEN` to their matching values. The workflow fails
+   fast with an actionable message if either secret is missing or if both
+   hold the same value.
+3. `GITFORGE_API_URL` and `GITFORGE_API_TOKEN` are no longer used by the
+   workflow: run status is answered by the CI service itself, so the workflow
+   no longer holds an API gateway JWT.
+
+The endpoint refuses to answer when the CI service runs without
+`GITFORGE_DATABASE_URL` — durable correlation is required, so deployments that
+enable the GitHub workflow must keep the CI service's database configured.
+
 ## Scaling Runners
 
 Add more runners by scaling the service:

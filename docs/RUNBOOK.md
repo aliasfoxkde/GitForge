@@ -122,6 +122,40 @@ cargo run -p ci
 - Hosts scheduler HTTP API on port 42781
 - Assigns jobs to runners
 
+**Trigger and status endpoints (issue #259):**
+
+- `POST /pipelines/trigger` — start a run for a push. Authenticated by the
+  trigger credential (`GITFORGE_TRIGGER_TOKEN`, with the
+  `GITFORGE_CI_TRIGGER_TOKEN`/operator names accepted only as a migration
+  fallback for the git-server bridge). Returns `202` with `event_id` always,
+  plus `pipeline_run_id` once the 15 s synchronous correlation window
+  succeeds; otherwise `status: "queued"` and the caller resolves the run
+  through the status endpoint below.
+- `GET /pipelines/trigger/status/{event_id}` — read one trigger event's
+  correlation and lifecycle state. Authenticated ONLY by
+  `GITFORGE_STATUS_TOKEN` — the trigger, operator, and runner tokens are
+  rejected. Answers `{"event_id", "status", "pipeline_run_id"}` with `status`
+  one of `queued` (run not created yet), `running`, `succeeded`, `failed`,
+  `cancelled`, or `missing` (404: unknown event id). The mapping is
+  fail-closed: an unreadable or unrecognized state answers `failed`, never
+  green.
+
+The correlation (`event_id` → `pipeline_run_id`) is stored durably in the
+`ci_trigger_events` SQLite table (created automatically by migrations), so a
+`queued` answer stays resolvable across service restarts. The endpoint
+requires `GITFORGE_DATABASE_URL`; without it the status endpoint answers
+`503 status_unavailable` instead of guessing.
+
+**CI orchestrator environment variables:**
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `GITFORGE_DATABASE_URL` | For durable runs | _(none)_ | SQLite database; without it scheduler state is in-memory and the status endpoint is closed |
+| `GITFORGE_TRIGGER_TOKEN` | **Yes** (prod) | _(none)_ | Credential for `POST /pipelines/trigger`; the endpoint is fail-closed when unset |
+| `GITFORGE_STATUS_TOKEN` | **Yes** (prod) | _(none)_ | Dedicated credential for `GET /pipelines/trigger/status/{event_id}`; must be distinct from the trigger token, which is not accepted here |
+| `GITFORGE_ARTIFACT_ROOT` | No | `target/gitforge-artifacts` | Bounded artifact storage root |
+| `GITFORGE_WORKSPACE_ROOT` | No | `/var/lib/gitforge/workspaces` | Run checkout root |
+
 ### 4. Runner Agent
 
 The runner agent executes jobs in Docker containers.

@@ -935,6 +935,105 @@ impl PipelineRunQueries {
     }
 }
 
+// ============================================================================
+// CI Trigger Event Queries (durable trigger correlation, issue #259)
+// ============================================================================
+
+pub struct CiTriggerEventQueries;
+
+impl CiTriggerEventQueries {
+    /// Record a freshly accepted trigger request as `pending`. Idempotent on
+    /// the event id: the row is written before the event is published, so a
+    /// caller that retries after a lost response cannot create a second
+    /// correlation row for the same accepted event.
+    pub async fn insert_pending(pool: &Pool, event_id: Uuid, repo_id: RepoId) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT OR IGNORE INTO ci_trigger_events \
+             (event_id, pipeline_run_id, status, repo_id, created_at, updated_at) \
+             VALUES (?, NULL, 'pending', ?, ?, ?)",
+        )
+        .bind(event_id.to_string())
+        .bind(repo_id.to_string())
+        .bind(&now)
+        .bind(&now)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to record trigger event: {e}")))?;
+        Ok(())
+    }
+
+    /// Attach the created run to the trigger's correlation row. Conditional on
+    /// the `pending` state so a row the consumer already marked `failed` (or
+    /// an already-correlated row) is never rewritten.
+    pub async fn correlate(pool: &Pool, event_id: Uuid, run_id: PipelineRunId) -> Result<usize> {
+        let result = sqlx::query(
+            "UPDATE ci_trigger_events \
+             SET pipeline_run_id = ?, status = 'correlated', updated_at = ? \
+             WHERE event_id = ? AND status = 'pending'",
+        )
+        .bind(run_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .bind(event_id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to correlate trigger event: {e}")))?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    /// Mark the trigger's event handling as failed. Conditional on `pending`
+    /// for the same reason as [`Self::correlate`]: a failed verdict is final —
+    /// nothing may resurrect it into a green-looking correlation.
+    pub async fn mark_failed(pool: &Pool, event_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE ci_trigger_events \
+             SET status = 'failed', updated_at = ? \
+             WHERE event_id = ? AND status = 'pending'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(event_id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to fail trigger event: {e}")))?;
+        Ok(())
+    }
+
+    /// Read one trigger's correlation row by the event id the caller
+    /// received from the trigger response.
+    pub async fn get(pool: &Pool, event_id: Uuid) -> Result<Option<crate::models::CiTriggerEvent>> {
+        let row = sqlx::query("SELECT * FROM ci_trigger_events WHERE event_id = ?")
+            .bind(event_id.to_string())
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get trigger event: {e}")))?;
+
+        match row {
+            Some(row) => hydrate_ci_trigger_event(row).map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
+fn hydrate_ci_trigger_event(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::CiTriggerEvent> {
+    Ok(crate::models::CiTriggerEvent {
+        event_id: parse_uuid_column(&row, "event_id")?,
+        pipeline_run_id: row
+            .try_get::<Option<String>, _>("pipeline_run_id")
+            .map_err(|error| Error::database(format!("invalid trigger event run id: {error}")))?
+            .map(|value| {
+                PipelineRunId::from(Uuid::parse_str(&value).map_err(|error| {
+                    Error::database(format!("invalid trigger event run id UUID: {error}"))
+                })?)
+            }),
+        status: row
+            .try_get("status")
+            .map_err(|error| Error::database(format!("invalid trigger event status: {error}")))?,
+        repo_id: RepoId::from(parse_uuid_column(&row, "repo_id")?),
+        created_at: parse_timestamp_column(&row, "created_at")?,
+        updated_at: parse_timestamp_column(&row, "updated_at")?,
+    })
+}
+
 /// A single pipeline run's outcome for one commit, as read from the database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRunStatus {
@@ -3460,6 +3559,91 @@ mod tests {
         .unwrap();
 
         assert!(PipelineQueries::list_by_repo(&pool, repo.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ci_trigger_event_correlation_lifecycle() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let event_id = Uuid::new_v4();
+        let repo_id = RepoId::new();
+
+        // Fresh correlation: pending, no run attached.
+        CiTriggerEventQueries::insert_pending(&pool, event_id, repo_id)
+            .await
+            .unwrap();
+        let pending = CiTriggerEventQueries::get(&pool, event_id)
+            .await
+            .unwrap()
+            .expect("pending correlation row");
+        assert_eq!(pending.status, "pending");
+        assert!(pending.pipeline_run_id.is_none());
+        assert_eq!(pending.repo_id, repo_id);
+
+        // Unknown event ids read back as absent — the status endpoint's 404.
+        assert!(CiTriggerEventQueries::get(&pool, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+
+        // Correlation attaches the run id exactly once; a second call is a
+        // no-op (idempotent retry), and a failed row is never rewritten.
+        let run_id = PipelineRunId::new();
+        assert_eq!(
+            CiTriggerEventQueries::correlate(&pool, event_id, run_id)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            CiTriggerEventQueries::correlate(&pool, event_id, PipelineRunId::new())
+                .await
+                .unwrap(),
+            0
+        );
+        let correlated = CiTriggerEventQueries::get(&pool, event_id)
+            .await
+            .unwrap()
+            .expect("correlated row");
+        assert_eq!(correlated.status, "correlated");
+        assert_eq!(correlated.pipeline_run_id, Some(run_id));
+
+        // mark_failed cannot overwrite a correlated row.
+        CiTriggerEventQueries::mark_failed(&pool, event_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            CiTriggerEventQueries::get(&pool, event_id)
+                .await
+                .unwrap()
+                .expect("row survives failed attempt")
+                .status,
+            "correlated"
+        );
+
+        // A pending row does fail, and stays failed.
+        let failed_id = Uuid::new_v4();
+        CiTriggerEventQueries::insert_pending(&pool, failed_id, repo_id)
+            .await
+            .unwrap();
+        CiTriggerEventQueries::mark_failed(&pool, failed_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            CiTriggerEventQueries::get(&pool, failed_id)
+                .await
+                .unwrap()
+                .expect("failed row")
+                .status,
+            "failed"
+        );
+        assert_eq!(
+            CiTriggerEventQueries::correlate(&pool, failed_id, PipelineRunId::new())
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
