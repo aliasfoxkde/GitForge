@@ -202,6 +202,7 @@ impl Pool {
                 started_at TEXT,
                 finished_at TEXT,
                 created_at TEXT NOT NULL,
+                trigger_event_id TEXT,
                 FOREIGN KEY (pipeline_id) REFERENCES pipelines(id),
                 FOREIGN KEY (repo_id) REFERENCES repositories(id)
             )
@@ -210,6 +211,27 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline_runs table: {e}")))?;
+
+        // Run-creation idempotency for recovered CI triggers (F2). The column
+        // links a push-triggered run to the accepted trigger event that
+        // produced it; the partial unique index makes a second run for the
+        // same event impossible at the storage layer, so a recovery sweep
+        // that re-drives an event whose run already exists converges on the
+        // original run instead of duplicating it.
+        for statement in [
+            "ALTER TABLE pipeline_runs ADD COLUMN trigger_event_id TEXT",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_runs_trigger_event \
+             ON pipeline_runs(trigger_event_id) WHERE trigger_event_id IS NOT NULL",
+        ] {
+            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
+                let message = error.to_string();
+                if !message.contains("duplicate column name") {
+                    return Err(Error::database(format!(
+                        "failed to migrate pipeline_runs table: {error}"
+                    )));
+                }
+            }
+        }
 
         // Create runners table
         sqlx::query(
@@ -432,6 +454,13 @@ impl Pool {
         // the caller, so a `queued` answer (the synchronous correlation window
         // elapsed) can still be resolved to its pipeline run after the fact —
         // including after a service restart, because the row is on disk.
+        //
+        // The recovery columns (F2) make the accepted event self-describing
+        // and claimable: `payload` holds the serialized push event so a
+        // process that died before consuming can re-drive it after restart,
+        // and the claim/attempt columns give the recovery sweep an atomic
+        // lease with a bounded retry budget instead of leaving rows pending
+        // forever.
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS ci_trigger_events (
@@ -440,13 +469,43 @@ impl Pool {
                 status TEXT NOT NULL DEFAULT 'pending',
                 repo_id TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                payload TEXT,
+                working_dir TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                claim_token TEXT,
+                claim_until TEXT,
+                next_attempt_at TEXT,
+                last_error TEXT
             )
             "#,
         )
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create ci_trigger_events table: {e}")))?;
+
+        // Additive migration for trigger recovery (F2). Databases created
+        // before the recovery columns existed hold rows that can only be
+        // failed fail-closed (no payload to re-drive); the columns themselves
+        // must still exist for the recovery queries.
+        for statement in [
+            "ALTER TABLE ci_trigger_events ADD COLUMN payload TEXT",
+            "ALTER TABLE ci_trigger_events ADD COLUMN working_dir TEXT",
+            "ALTER TABLE ci_trigger_events ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE ci_trigger_events ADD COLUMN claim_token TEXT",
+            "ALTER TABLE ci_trigger_events ADD COLUMN claim_until TEXT",
+            "ALTER TABLE ci_trigger_events ADD COLUMN next_attempt_at TEXT",
+            "ALTER TABLE ci_trigger_events ADD COLUMN last_error TEXT",
+        ] {
+            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
+                let message = error.to_string();
+                if !message.contains("duplicate column name") {
+                    return Err(Error::database(format!(
+                        "failed to migrate ci_trigger_events table: {error}"
+                    )));
+                }
+            }
+        }
 
         sqlx::query(
             r#"
@@ -657,12 +716,84 @@ mod tests {
             "repo_id",
             "created_at",
             "updated_at",
+            "payload",
+            "working_dir",
+            "attempts",
+            "claim_token",
+            "claim_until",
+            "next_attempt_at",
+            "last_error",
         ] {
             assert!(
                 names.iter().any(|name| name == expected),
                 "ci_trigger_events is missing column {expected}"
             );
         }
+    }
+
+    /// The trigger-recovery migration (F2) must also upgrade a database that
+    /// predates the recovery columns: a table in the exact pre-F2 shape
+    /// migrates cleanly, keeps its rows readable, and gains the run-id
+    /// idempotency index on pipeline_runs.
+    #[tokio::test]
+    async fn test_ci_trigger_events_upgrade_from_pre_recovery_shape() {
+        let pool = Pool::memory().await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE ci_trigger_events (
+                event_id TEXT PRIMARY KEY,
+                pipeline_run_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                repo_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(pool.pool())
+        .await
+        .unwrap();
+        let legacy_event = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO ci_trigger_events \
+             (event_id, pipeline_run_id, status, repo_id, created_at, updated_at) \
+             VALUES (?, NULL, 'pending', ?, ?, ?)",
+        )
+        .bind(legacy_event.to_string())
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind("2026-10-05T00:00:00+00:00")
+        .bind("2026-10-05T00:00:00+00:00")
+        .execute(pool.pool())
+        .await
+        .unwrap();
+
+        pool.migrate().await.unwrap();
+        // A restart re-runs the migration against the upgraded shape.
+        pool.migrate().await.unwrap();
+
+        let columns = sqlx::query("PRAGMA table_info(ci_trigger_events)")
+            .fetch_all(pool.pool())
+            .await
+            .unwrap();
+        let names = columns
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        for expected in ["payload", "attempts", "claim_token", "next_attempt_at"] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "upgraded ci_trigger_events is missing column {expected}"
+            );
+        }
+
+        let indexes = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_pipeline_runs_trigger_event'",
+        )
+        .fetch_all(pool.pool())
+        .await
+        .unwrap();
+        assert_eq!(indexes.len(), 1, "run idempotency index must exist");
     }
 
     #[tokio::test]

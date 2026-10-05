@@ -9,6 +9,7 @@ use gitforge_common::{
     Error, JobId, PipelineId, PipelineRunId, RepoId, Result, RunnerId, SshKeyId, UserId,
 };
 use sqlx::Row;
+use std::time::Duration;
 use uuid::Uuid;
 
 fn parse_uuid_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<Uuid> {
@@ -813,6 +814,82 @@ impl PipelineRunQueries {
         }
     }
 
+    /// Find the run a trigger event already produced, if any. This is the
+    /// recovery sweep's idempotency probe (F2): an event whose run exists is
+    /// correlated to it instead of being driven again.
+    pub async fn find_id_by_trigger_event(
+        pool: &Pool,
+        event_id: Uuid,
+    ) -> Result<Option<PipelineRunId>> {
+        let row = sqlx::query(
+            "SELECT id FROM pipeline_runs WHERE trigger_event_id = ? ORDER BY created_at LIMIT 1",
+        )
+        .bind(event_id.to_string())
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to find run by trigger event: {e}")))?;
+        match row {
+            Some(row) => {
+                let id: String = row
+                    .try_get("id")
+                    .map_err(|e| Error::database(format!("invalid pipeline run id: {e}")))?;
+                let uuid = Uuid::parse_str(&id)
+                    .map_err(|e| Error::database(format!("invalid pipeline run UUID: {e}")))?;
+                Ok(Some(PipelineRunId::from(uuid)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Create a push-triggered run linked to the trigger event that produced
+    /// it, or return the run an earlier attempt already created for the same
+    /// event. The partial unique index on `pipeline_runs.trigger_event_id`
+    /// makes the second insert lose the race and read back the winner, so
+    /// concurrent or repeated drives of one accepted event converge on a
+    /// single run (F2 run idempotency).
+    pub async fn create_for_trigger(
+        pool: &Pool,
+        run: &crate::models::PipelineRun,
+        event_id: Uuid,
+    ) -> Result<PipelineRunId> {
+        let insert = sqlx::query(
+            r#"
+            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at, trigger_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(run.id.to_string())
+        .bind(run.pipeline_id.to_string())
+        .bind(run.repo_id.to_string())
+        .bind(&run.status)
+        .bind(&run.triggered_by)
+        .bind(&run.commit_hash)
+        .bind(run.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.finished_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.created_at.to_rfc3339())
+        .bind(event_id.to_string())
+        .execute(pool.pool())
+        .await;
+        match insert {
+            Ok(_) => Ok(run.id),
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("UNIQUE constraint failed") {
+                    return Err(Error::database(format!(
+                        "failed to create pipeline run: {error}"
+                    )));
+                }
+                Self::find_id_by_trigger_event(pool, event_id)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::database(
+                            "run insert lost the trigger idempotency race but no winner exists",
+                        )
+                    })
+            }
+        }
+    }
+
     /// Update pipeline run status.
     ///
     /// A terminal verdict is final: once a run is `succeeded`, `failed`,
@@ -936,26 +1013,43 @@ impl PipelineRunQueries {
 }
 
 // ============================================================================
-// CI Trigger Event Queries (durable trigger correlation, issue #259)
+// CI Trigger Event Queries (durable trigger correlation, issue #259;
+// crash-safe recovery with leased claims, F2)
 // ============================================================================
 
 pub struct CiTriggerEventQueries;
 
 impl CiTriggerEventQueries {
-    /// Record a freshly accepted trigger request as `pending`. Idempotent on
-    /// the event id: the row is written before the event is published, so a
-    /// caller that retries after a lost response cannot create a second
+    /// Record a freshly accepted trigger request as `pending`, together with
+    /// the serialized push payload (and requested working directory) the
+    /// event was accepted with. The payload is what makes the accepted event
+    /// recoverable (F2): a process that dies before consuming it can be
+    /// restarted and re-drive the event verbatim. Idempotent on the event
+    /// id: the row is written before the event is published, so a caller
+    /// that retries after a lost response cannot create a second
     /// correlation row for the same accepted event.
-    pub async fn insert_pending(pool: &Pool, event_id: Uuid, repo_id: RepoId) -> Result<()> {
+    pub async fn insert_pending(
+        pool: &Pool,
+        event_id: Uuid,
+        repo_id: RepoId,
+        payload: Option<&str>,
+        working_dir: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT OR IGNORE INTO ci_trigger_events \
-             (event_id, pipeline_run_id, status, repo_id, created_at, updated_at) \
-             VALUES (?, NULL, 'pending', ?, ?, ?)",
+             (event_id, pipeline_run_id, status, repo_id, created_at, updated_at, \
+              payload, working_dir, attempts, next_attempt_at) \
+             VALUES (?, NULL, 'pending', ?, ?, ?, ?, ?, 0, ?)",
         )
         .bind(event_id.to_string())
         .bind(repo_id.to_string())
         .bind(&now)
+        .bind(&now)
+        .bind(payload)
+        .bind(working_dir)
+        // Immediately claimable: the recovery sweep's due filter is what
+        // spaces retries, not the insert.
         .bind(&now)
         .execute(pool.pool())
         .await
@@ -963,9 +1057,128 @@ impl CiTriggerEventQueries {
         Ok(())
     }
 
-    /// Attach the created run to the trigger's correlation row. Conditional on
-    /// the `pending` state so a row the consumer already marked `failed` (or
-    /// an already-correlated row) is never rewritten.
+    /// Claim one specific event for driving (the live consumer's pickup).
+    /// The conditional update is the entire coordination protocol: exactly
+    /// one driver wins the row; a loser gets `None` and must not drive the
+    /// event, because the winner will resolve it.
+    pub async fn claim_event(
+        pool: &Pool,
+        event_id: Uuid,
+        now: DateTime<Utc>,
+        lease: Duration,
+    ) -> Result<Option<crate::models::TriggerEventClaim>> {
+        let row = sqlx::query(
+            "SELECT * FROM ci_trigger_events \
+             WHERE event_id = ? AND status = 'pending' \
+               AND (claim_token IS NULL OR claim_until <= ?)",
+        )
+        .bind(event_id.to_string())
+        .bind(now.to_rfc3339())
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to find trigger event to claim: {e}")))?;
+        if row.is_none() {
+            return Ok(None);
+        }
+        Self::take_lease(pool, event_id, now, lease).await
+    }
+
+    /// Claim the oldest pending event whose retry backoff has elapsed and
+    /// whose lease — if any — has expired (the recovery sweep's pickup).
+    pub async fn claim_due(
+        pool: &Pool,
+        now: DateTime<Utc>,
+        lease: Duration,
+    ) -> Result<Option<crate::models::TriggerEventClaim>> {
+        let row = sqlx::query(
+            "SELECT event_id FROM ci_trigger_events \
+             WHERE status = 'pending' \
+               AND (next_attempt_at IS NULL OR next_attempt_at <= ?) \
+               AND (claim_token IS NULL OR claim_until <= ?) \
+             ORDER BY created_at, event_id LIMIT 1",
+        )
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to find due trigger event: {e}")))?;
+        let Some(row) = row else { return Ok(None) };
+        let event_id: String = row
+            .try_get("event_id")
+            .map_err(|e| Error::database(format!("invalid trigger event id: {e}")))?;
+        let event_id = Uuid::parse_str(&event_id)
+            .map_err(|e| Error::database(format!("invalid trigger event id UUID: {e}")))?;
+        Self::take_lease(pool, event_id, now, lease).await
+    }
+
+    /// Install a fresh lease on a pending, unclaimed (or lease-expired)
+    /// event and return the claimed row. The UPDATE re-checks every
+    /// predicate so two racing drivers cannot both pass.
+    async fn take_lease(
+        pool: &Pool,
+        event_id: Uuid,
+        now: DateTime<Utc>,
+        lease: Duration,
+    ) -> Result<Option<crate::models::TriggerEventClaim>> {
+        let now_text = now.to_rfc3339();
+        let token = Uuid::new_v4().to_string();
+        let until = (now + lease).to_rfc3339();
+        let changed = sqlx::query(
+            "UPDATE ci_trigger_events \
+             SET claim_token = ?, claim_until = ?, attempts = attempts + 1, updated_at = ? \
+             WHERE event_id = ? AND status = 'pending' \
+               AND (claim_token IS NULL OR claim_until <= ?)",
+        )
+        .bind(&token)
+        .bind(&until)
+        .bind(&now_text)
+        .bind(event_id.to_string())
+        .bind(&now_text)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to claim trigger event: {e}")))?;
+        if changed.rows_affected() != 1 {
+            return Ok(None);
+        }
+        let event = Self::get(pool, event_id)
+            .await?
+            .ok_or_else(|| Error::database("claimed trigger event disappeared immediately"))?;
+        Ok(Some(crate::models::TriggerEventClaim {
+            event,
+            claim_token: token,
+        }))
+    }
+
+    /// Attach the created run to the trigger's correlation row. Conditional
+    /// on `pending` and on the caller's claim token: a row another driver
+    /// now owns, or one already terminally resolved, is never rewritten.
+    /// Returns the matched row count (0 means the caller lost the row).
+    pub async fn correlate_claimed(
+        pool: &Pool,
+        event_id: Uuid,
+        run_id: PipelineRunId,
+        claim_token: &str,
+    ) -> Result<usize> {
+        let result = sqlx::query(
+            "UPDATE ci_trigger_events \
+             SET pipeline_run_id = ?, status = 'correlated', \
+                 claim_token = NULL, claim_until = NULL, updated_at = ? \
+             WHERE event_id = ? AND status = 'pending' AND claim_token = ?",
+        )
+        .bind(run_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .bind(event_id.to_string())
+        .bind(claim_token)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to correlate trigger event: {e}")))?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    /// Attach the created run to the trigger's correlation row without a
+    /// lease. Only meaningful before any driver has claimed the row (the
+    /// pre-claim publish-failure path); the consumer and recovery drivers
+    /// use [`Self::correlate_claimed`].
     pub async fn correlate(pool: &Pool, event_id: Uuid, run_id: PipelineRunId) -> Result<usize> {
         let result = sqlx::query(
             "UPDATE ci_trigger_events \
@@ -981,9 +1194,64 @@ impl CiTriggerEventQueries {
         Ok(result.rows_affected() as usize)
     }
 
+    /// Record a recoverable failure under an active lease: the row returns
+    /// to `pending` and becomes claimable again at `next_attempt_at`, with
+    /// the lease released so the next driver can take it. Returns the
+    /// matched row count (0 means the caller no longer holds the row).
+    pub async fn schedule_retry(
+        pool: &Pool,
+        event_id: Uuid,
+        claim_token: &str,
+        next_attempt_at: DateTime<Utc>,
+        error: &str,
+    ) -> Result<usize> {
+        let result = sqlx::query(
+            "UPDATE ci_trigger_events \
+             SET next_attempt_at = ?, last_error = ?, \
+                 claim_token = NULL, claim_until = NULL, updated_at = ? \
+             WHERE event_id = ? AND status = 'pending' AND claim_token = ?",
+        )
+        .bind(next_attempt_at.to_rfc3339())
+        .bind(error)
+        .bind(Utc::now().to_rfc3339())
+        .bind(event_id.to_string())
+        .bind(claim_token)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to schedule trigger retry: {e}")))?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    /// Terminate a claimed event as `failed`. Conditional on the claim token
+    /// like every settle write, so a driver that lost its lease cannot bury
+    /// an event another driver is making progress on.
+    pub async fn fail_claimed(
+        pool: &Pool,
+        event_id: Uuid,
+        claim_token: &str,
+        error: &str,
+    ) -> Result<usize> {
+        let result = sqlx::query(
+            "UPDATE ci_trigger_events \
+             SET status = 'failed', last_error = ?, \
+                 claim_token = NULL, claim_until = NULL, updated_at = ? \
+             WHERE event_id = ? AND status = 'pending' AND claim_token = ?",
+        )
+        .bind(error)
+        .bind(Utc::now().to_rfc3339())
+        .bind(event_id.to_string())
+        .bind(claim_token)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to fail trigger event: {e}")))?;
+        Ok(result.rows_affected() as usize)
+    }
+
     /// Mark the trigger's event handling as failed. Conditional on `pending`
     /// for the same reason as [`Self::correlate`]: a failed verdict is final —
-    /// nothing may resurrect it into a green-looking correlation.
+    /// nothing may resurrect it into a green-looking correlation. This
+    /// no-lease form is for the publish-failure path, where no driver ever
+    /// claimed the row.
     pub async fn mark_failed(pool: &Pool, event_id: Uuid) -> Result<()> {
         sqlx::query(
             "UPDATE ci_trigger_events \
@@ -1029,6 +1297,9 @@ fn hydrate_ci_trigger_event(row: sqlx::sqlite::SqliteRow) -> Result<crate::model
         }
         None => None,
     };
+    let attempts: Option<i64> = row
+        .try_get("attempts")
+        .map_err(|error| Error::database(format!("invalid trigger event attempts: {error}")))?;
     Ok(crate::models::CiTriggerEvent {
         event_id: parse_uuid_column(&row, "event_id")?,
         pipeline_run_id,
@@ -1038,6 +1309,18 @@ fn hydrate_ci_trigger_event(row: sqlx::sqlite::SqliteRow) -> Result<crate::model
         repo_id: RepoId::from(parse_uuid_column(&row, "repo_id")?),
         created_at: parse_timestamp_column(&row, "created_at")?,
         updated_at: parse_timestamp_column(&row, "updated_at")?,
+        payload: row
+            .try_get("payload")
+            .map_err(|error| Error::database(format!("invalid trigger event payload: {error}")))?,
+        working_dir: row.try_get("working_dir").map_err(|error| {
+            Error::database(format!("invalid trigger event working dir: {error}"))
+        })?,
+        // A row migrated from the pre-recovery shape has no attempts value
+        // in its default until the ALTER backfills it; read defensively.
+        attempts: attempts.unwrap_or(0),
+        last_error: row
+            .try_get("last_error")
+            .map_err(|error| Error::database(format!("invalid trigger event error: {error}")))?,
     })
 }
 
@@ -3577,7 +3860,7 @@ mod tests {
         let repo_id = RepoId::new();
 
         // Fresh correlation: pending, no run attached.
-        CiTriggerEventQueries::insert_pending(&pool, event_id, repo_id)
+        CiTriggerEventQueries::insert_pending(&pool, event_id, repo_id, None, None)
             .await
             .unwrap();
         let pending = CiTriggerEventQueries::get(&pool, event_id)
@@ -3631,7 +3914,7 @@ mod tests {
 
         // A pending row does fail, and stays failed.
         let failed_id = Uuid::new_v4();
-        CiTriggerEventQueries::insert_pending(&pool, failed_id, repo_id)
+        CiTriggerEventQueries::insert_pending(&pool, failed_id, repo_id, None, None)
             .await
             .unwrap();
         CiTriggerEventQueries::mark_failed(&pool, failed_id)
@@ -3650,6 +3933,272 @@ mod tests {
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    /// The lease is the coordination device between the live consumer and
+    /// the recovery sweep: one claim wins, a second claim on the same event
+    /// loses until the lease expires, and settlement writes are conditional
+    /// on the winner's token.
+    #[tokio::test]
+    async fn test_trigger_event_lease_claim_is_exclusive_and_expires() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let event_id = Uuid::new_v4();
+        CiTriggerEventQueries::insert_pending(
+            &pool,
+            event_id,
+            RepoId::new(),
+            Some(r#"{"new_hash":"a"}"#),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let now = Utc::now();
+        let lease = Duration::from_secs(300);
+
+        // The first claim wins and carries the durable payload.
+        let first = CiTriggerEventQueries::claim_event(&pool, event_id, now, lease)
+            .await
+            .unwrap()
+            .expect("first claim wins");
+        assert_eq!(first.event.event_id, event_id);
+        assert_eq!(first.event.attempts, 1);
+        assert_eq!(first.event.payload.as_deref(), Some(r#"{"new_hash":"a"}"#));
+
+        // A concurrent claim of the same event loses.
+        assert!(
+            CiTriggerEventQueries::claim_event(&pool, event_id, now, lease)
+                .await
+                .unwrap()
+                .is_none(),
+            "a leased event must not be claimable"
+        );
+        // The recovery sweep skips it too, while the lease is live.
+        assert!(
+            CiTriggerEventQueries::claim_due(&pool, now, lease)
+                .await
+                .unwrap()
+                .is_none(),
+            "no other row is due"
+        );
+
+        // Settlement is claim-guarded: a stale or wrong token writes nothing.
+        assert_eq!(
+            CiTriggerEventQueries::correlate_claimed(
+                &pool,
+                event_id,
+                PipelineRunId::new(),
+                "not-the-token"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+
+        // Once the lease expires the recovery sweep can take over, and the
+        // attempt counter keeps climbing across claims.
+        let later = now + Duration::from_secs(301);
+        let reclaimed = CiTriggerEventQueries::claim_due(&pool, later, lease)
+            .await
+            .unwrap()
+            .expect("expired lease is reclaimable");
+        assert_eq!(reclaimed.event.event_id, event_id);
+        assert_eq!(reclaimed.event.attempts, 2);
+        assert_ne!(reclaimed.claim_token, first.claim_token);
+    }
+
+    /// Bounded recovery: a failed drive returns to `pending` but becomes
+    /// claimable only after its backoff, and a terminal failure is final —
+    /// no claim, correlation, or retry can rewrite it afterwards.
+    #[tokio::test]
+    async fn test_trigger_event_retry_backoff_and_terminal_failure() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let event_id = Uuid::new_v4();
+        CiTriggerEventQueries::insert_pending(
+            &pool,
+            event_id,
+            RepoId::new(),
+            Some(r#"{"new_hash":"b"}"#),
+            Some("/tmp/workspace"),
+        )
+        .await
+        .unwrap();
+
+        let now = Utc::now();
+        let claimed =
+            CiTriggerEventQueries::claim_event(&pool, event_id, now, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("claim for retry test");
+        assert_eq!(claimed.event.working_dir.as_deref(), Some("/tmp/workspace"));
+
+        // Retry under the lease: back to pending, claim released, due later.
+        let next = now + Duration::from_secs(120);
+        assert_eq!(
+            CiTriggerEventQueries::schedule_retry(
+                &pool,
+                event_id,
+                &claimed.claim_token,
+                next,
+                "drive failed"
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let retried = CiTriggerEventQueries::get(&pool, event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.status, "pending");
+        assert_eq!(retried.last_error.as_deref(), Some("drive failed"));
+
+        // Not due before the backoff elapses…
+        assert!(CiTriggerEventQueries::claim_due(
+            &pool,
+            now + Duration::from_secs(60),
+            lease_for_test()
+        )
+        .await
+        .unwrap()
+        .is_none());
+        // …and claimable after it does, with the same event.
+        let reclaimed = CiTriggerEventQueries::claim_due(
+            &pool,
+            next + Duration::from_secs(1),
+            lease_for_test(),
+        )
+        .await
+        .unwrap()
+        .expect("retry becomes due");
+        assert_eq!(reclaimed.event.event_id, event_id);
+
+        // Terminal failure under the (correct) token, then every later
+        // write is refused: no reclaim, no correlation, no second failure.
+        assert_eq!(
+            CiTriggerEventQueries::fail_claimed(
+                &pool,
+                event_id,
+                &reclaimed.claim_token,
+                "attempts exhausted"
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(
+            CiTriggerEventQueries::claim_due(
+                &pool,
+                next + Duration::from_secs(3600),
+                lease_for_test()
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a failed event is never claimable again"
+        );
+        assert_eq!(
+            CiTriggerEventQueries::correlate_claimed(
+                &pool,
+                event_id,
+                PipelineRunId::new(),
+                &reclaimed.claim_token
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            CiTriggerEventQueries::get(&pool, event_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+    }
+
+    fn lease_for_test() -> Duration {
+        Duration::from_secs(300)
+    }
+
+    /// The event -> run link is the idempotency key: the first insert wins,
+    /// a second insert for the same event reads back the winner instead of
+    /// creating a second run, and plain (non-trigger) runs never collide.
+    #[tokio::test]
+    async fn test_pipeline_run_trigger_idempotency() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "idem-owner".to_string(),
+            "idem-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &owner).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "trigger-idem".to_string(),
+            owner.id,
+            "/tmp/idem.git".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "idem".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+
+        let event_id = Uuid::new_v4();
+        let first = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "a".repeat(40),
+        );
+        let winner = PipelineRunQueries::create_for_trigger(&pool, &first, event_id)
+            .await
+            .unwrap();
+        assert_eq!(winner, first.id);
+
+        // A repeated drive builds a different run id but must converge on
+        // the row that already exists.
+        let mut second = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "a".repeat(40),
+        );
+        second.id = PipelineRunId::new();
+        let converged = PipelineRunQueries::create_for_trigger(&pool, &second, event_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            converged, first.id,
+            "duplicate drive must read back the winner"
+        );
+        assert_eq!(
+            PipelineRunQueries::find_id_by_trigger_event(&pool, event_id)
+                .await
+                .unwrap(),
+            Some(first.id)
+        );
+
+        // Unrelated events stay unlinkable to this run.
+        assert!(
+            PipelineRunQueries::find_id_by_trigger_event(&pool, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

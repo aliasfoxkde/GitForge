@@ -582,9 +582,15 @@ async fn test_correlated_event_with_missing_run_row_is_terminal_failed() {
     let pool = gitforge_db::Pool::new(&service.db_path.display().to_string())
         .await
         .expect("open service database");
-    gitforge_db::queries::CiTriggerEventQueries::insert_pending(&pool, event_id, service.repo_id)
-        .await
-        .expect("record pending event");
+    gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+        &pool,
+        event_id,
+        service.repo_id,
+        None,
+        None,
+    )
+    .await
+    .expect("record pending event");
     gitforge_db::queries::CiTriggerEventQueries::correlate(&pool, event_id, dangling_run_id)
         .await
         .expect("correlate event to the missing run");
@@ -615,6 +621,154 @@ async fn test_correlated_event_with_missing_run_row_is_terminal_failed() {
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "body: {body}");
     let payload: serde_json::Value = serde_json::from_str(&body).expect("parse 404 body");
     assert_eq!(payload["status"], "missing", "payload: {payload}");
+
+    common::shutdown_gracefully(&mut service.child).await;
+}
+
+/// The exact push payload the recovery tests stage as an orphaned pending
+/// event: the seed commit on the seed branch, the same shape the trigger
+/// endpoint persists with every accepted request.
+fn staged_payload(service: &CiService) -> String {
+    let payload = gitforge_events::PushReceivedPayload {
+        repo_id: service.repo_id,
+        ref_name: "refs/heads/main".to_string(),
+        old_hash: service.commit_hash.clone(),
+        new_hash: service.commit_hash.clone(),
+        pusher_id: None,
+    };
+    serde_json::to_string(&payload).expect("serialize staged payload")
+}
+
+/// F2, the crash shape: the service accepted a trigger (durable `pending`
+/// row with its payload) and died before the consumer created the run. The
+/// event is on no bus anymore, so only the recovery sweep can resolve it.
+/// After a restart the accepted event must be re-driven from its durable
+/// payload — the poller gets a real run, never an endless `queued`.
+#[tokio::test]
+async fn test_orphaned_pending_event_is_recovered_after_restart() {
+    let service = spawn_ci().await;
+
+    let event_id = uuid::Uuid::new_v4();
+    let pool = gitforge_db::Pool::new(&service.db_path.display().to_string())
+        .await
+        .expect("open service database");
+    gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+        &pool,
+        event_id,
+        service.repo_id,
+        Some(&staged_payload(&service)),
+        None,
+    )
+    .await
+    .expect("stage orphaned pending event");
+    drop(pool);
+
+    // Restart: the fresh process owns the startup recovery sweep.
+    let mut service = service.respawn().await;
+
+    // The event resolves to a run — never stuck on `queued`.
+    let payload = poll_trigger_status(service.scheduler_port, &event_id.to_string(), |payload| {
+        payload["status"] != "queued"
+    })
+    .await;
+    assert_eq!(payload["status"], "running", "payload: {payload}");
+    let run_id = payload["pipeline_run_id"]
+        .as_str()
+        .expect("recovered run id in status response")
+        .to_string();
+
+    // Exactly one run was created, and it is linked to the event so any
+    // further recovery pass converges on it instead of duplicating.
+    let pool = gitforge_db::Pool::new(&service.db_path.display().to_string())
+        .await
+        .expect("reopen service database");
+    assert_eq!(
+        gitforge_db::queries::PipelineRunQueries::find_id_by_trigger_event(&pool, event_id)
+            .await
+            .expect("find run by trigger event")
+            .map(|id| id.to_string()),
+        Some(run_id)
+    );
+    assert_eq!(
+        gitforge_db::queries::PipelineRunQueries::list(&pool)
+            .await
+            .expect("list runs")
+            .len(),
+        1
+    );
+
+    common::shutdown_gracefully(&mut service.child).await;
+}
+
+/// F2, the duplicate-run shape: the consumer created the run but died before
+/// the correlate write. Recovery must point the pending row at the existing
+/// run — a second run for the same accepted event would double-build the
+/// commit and race for the same required check.
+#[tokio::test]
+async fn test_recovery_correlates_instead_of_duplicating_an_existing_run() {
+    let service = spawn_ci().await;
+
+    let event_id = uuid::Uuid::new_v4();
+    let pool = gitforge_db::Pool::new(&service.db_path.display().to_string())
+        .await
+        .expect("open service database");
+    gitforge_db::queries::CiTriggerEventQueries::insert_pending(
+        &pool,
+        event_id,
+        service.repo_id,
+        Some(&staged_payload(&service)),
+        None,
+    )
+    .await
+    .expect("stage orphaned pending event");
+
+    // The run the crashed consumer already created, durably linked to the
+    // event but never correlated into `ci_trigger_events`.
+    let pipeline = gitforge_db::models::Pipeline {
+        id: gitforge_common::PipelineId::new(),
+        repo_id: service.repo_id,
+        name: "recovery-e2e".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
+        .await
+        .expect("create pipeline fixture");
+    let mut run = gitforge_db::models::PipelineRun::new(
+        pipeline.id,
+        service.repo_id,
+        "push".to_string(),
+        service.commit_hash.clone(),
+    );
+    run.start();
+    let expected_run =
+        gitforge_db::queries::PipelineRunQueries::create_for_trigger(&pool, &run, event_id)
+            .await
+            .expect("create linked run fixture");
+    drop(pool);
+
+    let mut service = service.respawn().await;
+
+    let payload = poll_trigger_status(service.scheduler_port, &event_id.to_string(), |payload| {
+        payload["status"] != "queued"
+    })
+    .await;
+    assert_eq!(payload["status"], "running", "payload: {payload}");
+    assert_eq!(
+        payload["pipeline_run_id"],
+        expected_run.to_string(),
+        "recovery must report the run that already existed: {payload}"
+    );
+
+    let pool = gitforge_db::Pool::new(&service.db_path.display().to_string())
+        .await
+        .expect("reopen service database");
+    let runs = gitforge_db::queries::PipelineRunQueries::list(&pool)
+        .await
+        .expect("list runs");
+    assert_eq!(runs.len(), 1, "recovery must not duplicate the run");
+    assert_eq!(runs[0].id.to_string(), expected_run.to_string());
 
     common::shutdown_gracefully(&mut service.child).await;
 }

@@ -28,6 +28,34 @@ pub struct CiTriggerEvent {
     pub repo_id: RepoId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Serialized push payload the event was accepted with (F2). `None` on
+    /// rows written before recovery existed; such rows cannot be re-driven
+    /// and are failed fail-closed by the recovery sweep.
+    pub payload: Option<String>,
+    /// Working directory the trigger request asked for, honored when the
+    /// event is re-driven after a restart.
+    pub working_dir: Option<String>,
+    /// How many times a driver (live consumer or recovery sweep) has claimed
+    /// this event. Bounds the recovery retry budget.
+    pub attempts: i64,
+    /// Last failure recorded by a driver, for operators reading the row.
+    pub last_error: Option<String>,
+}
+
+/// A pending trigger event held under an active lease by one driver.
+///
+/// The lease is the whole coordination scheme: the live consumer claims an
+/// event when it picks it up from the bus, the recovery sweep claims only
+/// unclaimed or lease-expired rows, and both drivers settle the row through
+/// claim-guarded writes. Two drivers can therefore never process the same
+/// accepted event at the same time (barring a drive that outlives its lease,
+/// where the run-idempotency index converges the outcome onto one run).
+#[derive(Debug, Clone)]
+pub struct TriggerEventClaim {
+    /// The claimed correlation row, including its durable payload.
+    pub event: CiTriggerEvent,
+    /// Proof of ownership; settle writes are conditional on this token.
+    pub claim_token: String,
 }
 
 #[cfg(test)]
@@ -50,6 +78,10 @@ mod tests {
             repo_id: RepoId::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            payload: None,
+            working_dir: None,
+            attempts: 0,
+            last_error: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: CiTriggerEvent = serde_json::from_str(&json).unwrap();
