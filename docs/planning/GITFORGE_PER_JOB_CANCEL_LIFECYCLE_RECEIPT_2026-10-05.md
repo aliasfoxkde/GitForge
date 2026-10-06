@@ -244,8 +244,9 @@ and a `lease_token` on the in-memory struct before `JobQueries::create`, and
 reached the row and the custody assertions ran against an unleased job. The
 scheduler DB custody test and the six new ack route tests passed.
 
-**Fixture correction (pending remote revalidation):** the fixture now creates
-the job queued with no fabricated lease and grants custody through
+**Fixture correction (local commit `93f04bb`; pending remote revalidation):**
+the fixture now creates the job queued with no fabricated lease and grants
+custody through
 `JobQueries::assign_with_lease` using the persisted `runner.id` and the
 intended token before exercising HTTP cancellation — the same atomic
 transition the dispatching scheduler uses. All custody assertions are
