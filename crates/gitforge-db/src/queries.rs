@@ -2,7 +2,7 @@
 //!
 //! This module provides real SQLite query implementations for all database operations.
 
-use crate::models::JobStatus;
+use crate::models::{JobCancelOutcome, JobStatus};
 use crate::Pool;
 use chrono::{DateTime, Utc};
 use gitforge_common::{
@@ -864,6 +864,178 @@ impl PipelineRunQueries {
         Ok(())
     }
 
+    /// Finalize a run's terminal verdict together with every not-yet-
+    /// dispatched doomed job row, in one transaction.
+    ///
+    /// The CI engine's `cancel_descendants` cascade lives only in its
+    /// in-memory mirror and dies with the engine: once the verdict commits
+    /// and the engine is evicted, no code path can grade the doomed rows
+    /// again — run reconciliation skips terminal runs — so a verdict written
+    /// without its doomed rows strands them `pending`/`queued` forever (live
+    /// 2026-10-05: 828 pending jobs across 202 failed runs). Verdict and
+    /// terminalization therefore share one `BEGIN IMMEDIATE` transaction.
+    ///
+    /// Only rows a runner has never touched are cancelled (`pending` or
+    /// `queued`); `assigned`/`running` rows belong to the runner lifecycle
+    /// and are never cancelled out from under it. `doomed` carries the jobs
+    /// the engine's mirror cancelled — for a failed run the transitive
+    /// descendants of the failed stage, for a cancelled run every stage that
+    /// never finished. Each cancellation is individually conditional, so a
+    /// row that flipped to a runner between the mirror read and this commit
+    /// is skipped, not clobbered. `receipt` is persisted as each row's
+    /// `result_json`, keeping the failure or cancellation reason inspectable
+    /// alongside the run's own verdict.
+    ///
+    /// The verdict follows the same F24 rule as `update_status`: a different
+    /// terminal verdict already on the row is kept and logged, never
+    /// rewritten (the doomed-row cancels still commit — those rows can never
+    /// run under any terminal verdict). Returns the number of rows
+    /// terminalized. Before making any changes, the same `BEGIN IMMEDIATE`
+    /// transaction checks every durable job row. A live row not in `doomed`
+    /// blocks finalization; a pending/queued doomed row is safe because this
+    /// transaction will cancel it before committing the verdict. This check
+    /// and the writes share SQLite's writer lock, so dispatch cannot race
+    /// between the liveness check and the terminal commit. Returns `None`
+    /// when live work defers finalization, otherwise `Some(count)` with the
+    /// number of rows terminalized. A `cancelled` row that still holds a
+    /// runner lease counts as live work the same way: its workspace is in
+    /// runner custody until the cancellation acknowledgement or the
+    /// abandoned-lease reaper releases it, so grading the run before that
+    /// handoff is deferred rather than risked. Re-running after a crash or
+    /// from a second finalizer is idempotent: terminal rows and the
+    /// recorded verdict are left as they are.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::database`] when the finalization transaction cannot
+    /// be begun (`BEGIN IMMEDIATE` failure under SQLite contention), when a
+    /// doomed-row cancel or the verdict write fails, when the run's durable
+    /// status cannot be re-read after a fully-contended verdict write, or
+    /// when the transaction cannot be committed. On any error NOTHING is
+    /// written: the run keeps its previous status and every doomed row keeps
+    /// its previous one, so the caller can simply retry (the CI engine's
+    /// watchdog sweep does). A missing run row is not an error: the verdict
+    /// write affects zero rows, the status read returns `None`, and the
+    /// doomed-row cancels (which match on `pipeline_run_id`) affect zero
+    /// rows. An unknown `status` string is written verbatim; callers pass
+    /// the same terminal spellings `update_status` accepts. A deferred
+    /// finalization writes nothing and returns `Ok(None)`.
+    pub async fn finalize_terminal(
+        pool: &Pool,
+        id: PipelineRunId,
+        status: &str,
+        doomed: &[JobId],
+        receipt: &str,
+    ) -> Result<Option<usize>> {
+        let finished_at = Utc::now().to_rfc3339();
+        let mut tx = pool
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::database(format!("failed to begin run finalization: {e}")))?;
+
+        // Arbitrate against runner dispatch under the writer lock. The
+        // service-level preflight is useful for avoiding needless writes,
+        // but cannot establish this invariant: dispatch could acquire the
+        // row after that read and before this transaction starts. Unknown
+        // statuses are treated as live so schema/data drift fails closed.
+        let doomed_ids: std::collections::HashSet<String> =
+            doomed.iter().map(ToString::to_string).collect();
+        let durable_rows =
+            sqlx::query("SELECT id, status, lease_token FROM jobs WHERE pipeline_run_id = ?")
+                .bind(id.to_string())
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| {
+                    Error::database(format!(
+                        "failed to check live jobs before finalization: {e}"
+                    ))
+                })?;
+        let mut live_ids = Vec::new();
+        for row in durable_rows {
+            let job_id: String = row
+                .try_get("id")
+                .map_err(|e| Error::database(format!("invalid durable job id: {e}")))?;
+            let status: String = row
+                .try_get("status")
+                .map_err(|e| Error::database(format!("invalid durable job status: {e}")))?;
+            let lease_token: Option<String> = row
+                .try_get("lease_token")
+                .map_err(|e| Error::database(format!("invalid durable job lease: {e}")))?;
+            let terminal = JobStatus::from_str(&status).is_some_and(|status| status.is_terminal());
+            // A cancelled row whose runner has not yet relinquished its
+            // lease defers finalization: the workspace checkout is still in
+            // the runner's custody until the cancellation acknowledgement
+            // lands or the abandoned-lease reaper reclaims it. Deleting the
+            // checkout before that handoff would pull the tree out from
+            // under a still-stopping container.
+            let custody = status == "cancelled" && lease_token.is_some();
+            let will_cancel =
+                matches!(status.as_str(), "pending" | "queued") && doomed_ids.contains(&job_id);
+            if (!terminal || custody) && !will_cancel {
+                live_ids.push(job_id);
+            }
+        }
+        if !live_ids.is_empty() {
+            // No writes have occurred. Dropping the transaction releases
+            // the lock without persisting a partial cascade or verdict.
+            return Ok(None);
+        }
+
+        let mut cancelled = 0usize;
+        for job_id in doomed {
+            let result = sqlx::query(
+                "UPDATE jobs SET status = 'cancelled', runner_id = NULL, lease_token = NULL, \
+                 finished_at = ?, result_json = ? \
+                 WHERE id = ? AND pipeline_run_id = ? AND status IN ('pending', 'queued')",
+            )
+            .bind(&finished_at)
+            .bind(receipt)
+            .bind(job_id.to_string())
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::database(format!("failed to cancel doomed job: {e}")))?;
+            cancelled += result.rows_affected() as usize;
+        }
+
+        let result = sqlx::query(
+            "UPDATE pipeline_runs SET status = ?, finished_at = COALESCE(finished_at, ?) \
+             WHERE id = ? AND (status IS NULL OR status NOT IN \
+             ('succeeded','failed','cancelled','timed_out','timeout','timed-out') OR status = ?)",
+        )
+        .bind(status)
+        .bind(&finished_at)
+        .bind(id.to_string())
+        .bind(status)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::database(format!("failed to finalize pipeline run: {e}")))?;
+        if result.rows_affected() == 0 {
+            let durable =
+                sqlx::query_scalar::<_, String>("SELECT status FROM pipeline_runs WHERE id = ?")
+                    .bind(id.to_string())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        Error::database(format!("failed to read pipeline run status: {e}"))
+                    })?;
+            if durable.as_deref() != Some(status) {
+                tracing::warn!(
+                    run = %id,
+                    durable = durable.as_deref().unwrap_or("missing"),
+                    attempted = %status,
+                    "refusing to rewrite a terminal run verdict (F24)"
+                );
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit run finalization: {e}")))?;
+        Ok(Some(cancelled))
+    }
+
     /// List pipeline runs by pipeline
     pub async fn list_by_pipeline(
         pool: &Pool,
@@ -1679,27 +1851,160 @@ impl JobQueries {
     }
 
     /// Persist an operator cancellation as a terminal job transition.
-    pub async fn cancel(pool: &Pool, id: JobId, result_json: &str) -> Result<()> {
-        let existing = Self::get(pool, id).await?;
-        if let Some(job) = existing {
-            if let Some(status) = JobStatus::from_str(&job.status) {
-                if status.is_terminal() {
-                    return Ok(());
-                }
-            }
-        } else {
-            return Err(Error::not_found("job", id));
-        }
-        sqlx::query(
-            "UPDATE jobs SET status = 'cancelled', finished_at = ?, result_json = ? WHERE id = ?",
+    ///
+    /// The transition is one conditional update under `BEGIN IMMEDIATE`:
+    /// only a row still in `pending`/`queued`/`assigned`/`running` can be
+    /// cancelled, so a completion that wins the race can never be
+    /// overwritten by a later cancel (F24 first-terminal-writer-wins), and a
+    /// repeated cancellation observes the `cancelled` row and preserves the
+    /// original receipt. The classification read happens inside the same
+    /// writer transaction, so there is no check-then-write window for a
+    /// concurrent completion to slip through.
+    ///
+    /// Custody: a row cancelled while `assigned` or `running` KEEPS its
+    /// `lease_token` and `runner_id` — the executing runner still owns the
+    /// workspace checkout and must relinquish the lease through the
+    /// cancellation acknowledgement
+    /// ([`JobQueries::release_cancelled_lease`]) or the abandoned-lease
+    /// reaper ([`JobQueries::reap_cancelled_leases`]) before the parent run
+    /// may finalize. Rows cancelled before dispatch never reached a runner,
+    /// so their lease columns are cleared here.
+    ///
+    /// A missing job is [`Error::not_found`]; an unparseable durable status
+    /// fails closed rather than guessing.
+    pub async fn cancel(pool: &Pool, id: JobId, result_json: &str) -> Result<JobCancelOutcome> {
+        let mut tx = pool
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::database(format!("failed to begin job cancellation: {e}")))?;
+        let updated = sqlx::query(
+            "UPDATE jobs SET status = 'cancelled', finished_at = ?, result_json = ?, \
+             lease_token = CASE WHEN status IN ('assigned', 'running') THEN lease_token ELSE NULL END, \
+             runner_id = CASE WHEN status IN ('assigned', 'running') THEN runner_id ELSE NULL END \
+             WHERE id = ? AND status IN ('pending', 'queued', 'assigned', 'running')",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(result_json)
         .bind(id.to_string())
-        .execute(pool.pool())
+        .execute(&mut *tx)
         .await
         .map_err(|e| Error::database(format!("failed to cancel job: {e}")))?;
-        Ok(())
+        if updated.rows_affected() == 1 {
+            tx.commit()
+                .await
+                .map_err(|e| Error::database(format!("failed to commit job cancellation: {e}")))?;
+            return Ok(JobCancelOutcome::Cancelled);
+        }
+
+        // The conditional update did not apply: the row is missing, already
+        // terminal, or carrying an unknown status. Classify under the same
+        // writer lock — nothing else can have moved the row meanwhile.
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Error::database(format!("failed to read job for cancellation: {e}")))?;
+        let outcome = match status.as_deref() {
+            None => {
+                return Err(Error::not_found("job", id));
+            }
+            Some("cancelled") => JobCancelOutcome::AlreadyCancelled,
+            Some(other) => {
+                let parsed = JobStatus::from_str(other).ok_or_else(|| {
+                    Error::database(format!("job {id} has unknown status '{other}'"))
+                })?;
+                if parsed.is_terminal() {
+                    JobCancelOutcome::AlreadyTerminal
+                } else {
+                    // Unreachable by construction (the conditional update
+                    // covers every non-terminal status); fail closed rather
+                    // than silently accept a lost cancellation.
+                    return Err(Error::database(format!(
+                        "job {id} remains in unhandled status '{other}' after cancellation"
+                    )));
+                }
+            }
+        };
+        tx.commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit job cancellation: {e}")))?;
+        Ok(outcome)
+    }
+
+    /// Record the executing runner's relinquishment of a cancelled job.
+    ///
+    /// The acknowledgement is a compare-and-set against the exact lease the
+    /// runner holds on a durably `cancelled` row: any other combination — a
+    /// completed job, a lease already reaped, a different runner — writes
+    /// nothing and returns `false`. This is the handoff that releases run
+    /// finalization after a cancel: until it lands (or
+    /// [`JobQueries::reap_cancelled_leases`] reclaims the lease), the
+    /// runner's workspace checkout is still live and the parent run must
+    /// not be graded.
+    pub async fn release_cancelled_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET lease_token = NULL, runner_id = NULL \
+             WHERE id = ? AND runner_id = ? AND lease_token = ? AND status = 'cancelled'",
+        )
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to release cancelled lease: {e}")))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Reclaim the leases of cancelled jobs whose runner never acknowledged
+    /// the cancellation (runner crash, network partition).
+    ///
+    /// Custody expires once `grace_secs` have passed since cancellation.
+    /// `heartbeat_at` can be much older than the cancellation request, so
+    /// `finished_at` (written by the cancellation transition) must take
+    /// precedence; the heartbeat is only a fallback for legacy rows without
+    /// a finish timestamp. Only the lease columns are touched: the row
+    /// keeps its `cancelled` verdict and receipt. Returns the number of
+    /// rows reaped.
+    pub async fn reap_cancelled_leases(pool: &Pool, grace_secs: i64) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE jobs SET lease_token = NULL, runner_id = NULL \
+             WHERE status = 'cancelled' AND lease_token IS NOT NULL \
+             AND datetime(COALESCE(finished_at, heartbeat_at), '+' || ? || ' seconds') <= datetime('now')",
+        )
+        .bind(grace_secs)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to reap cancelled leases: {e}")))?;
+        if result.rows_affected() > 0 {
+            tracing::warn!(
+                reaped = result.rows_affected(),
+                grace_secs,
+                "reclaimed abandoned cancellation leases past the acknowledgement grace"
+            );
+        }
+        Ok(result.rows_affected())
+    }
+
+    /// Whether any job of the run was cancelled while still holding a
+    /// runner lease. Finalizers treat such a run as not yet safe to grade:
+    /// the workspace checkout is still in the executing runner's custody
+    /// until it acknowledges the cancellation or the lease is reaped.
+    pub async fn has_cancelled_lease(pool: &Pool, run_id: PipelineRunId) -> Result<bool> {
+        let held: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM jobs \
+             WHERE pipeline_run_id = ? AND status = 'cancelled' AND lease_token IS NOT NULL",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to check cancelled leases for run: {e}")))?;
+        Ok(held > 0)
     }
 
     /// List jobs by pipeline run
@@ -3638,9 +3943,10 @@ mod tests {
         );
         RunnerQueries::create(&pool, &runner).await.unwrap();
         JobQueries::assign(&pool, job.id, runner.id).await.unwrap();
-        JobQueries::cancel(&pool, job.id, r#"{"status":"cancelled"}"#)
+        let outcome = JobQueries::cancel(&pool, job.id, r#"{"status":"cancelled"}"#)
             .await
             .unwrap();
+        assert_eq!(outcome, crate::models::JobCancelOutcome::Cancelled);
         let cancelled = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
         assert_eq!(cancelled.status, "cancelled");
         assert!(cancelled.finished_at.is_some());
@@ -3657,6 +3963,608 @@ mod tests {
             .unwrap();
         assert!(JobQueries::get(&pool, job.id).await.is_err());
         assert!(JobQueries::list_by_run(&pool, run.id).await.is_err());
+    }
+
+    /// Seed a user/repo/pipeline/run fixture for the cancellation lifecycle
+    /// tests and return the run plus one fresh queued job per requested name.
+    async fn seed_cancellation_run(
+        pool: &Pool,
+        name: &str,
+        job_names: &[&str],
+    ) -> (crate::models::PipelineRun, Vec<crate::models::Job>) {
+        let user = crate::models::User::new(
+            format!("{name}-owner"),
+            format!("{name}@example.com"),
+            "hash".to_string(),
+        );
+        UserQueries::create(pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            format!("{name}-repo"),
+            user.id,
+            format!("/git/{name}-repo"),
+        );
+        RepoQueries::create(pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: format!("{name} pipeline"),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(pool, &run).await.unwrap();
+        PipelineRunQueries::update_status(pool, run.id, "running")
+            .await
+            .unwrap();
+        let mut jobs = Vec::new();
+        for job_name in job_names {
+            let job = crate::models::Job::new(run.id, job_name.to_string());
+            JobQueries::create(pool, &job).await.unwrap();
+            JobQueries::update_status(pool, job.id, "queued")
+                .await
+                .unwrap();
+            jobs.push(job);
+        }
+        (run, jobs)
+    }
+
+    #[tokio::test]
+    async fn test_cancel_is_conditional_idempotent_and_f24_safe() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (_run, jobs) = seed_cancellation_run(&pool, "cancel-cas", &["build", "done"]).await;
+        let (build, done) = (&jobs[0], &jobs[1]);
+
+        // A row that already reached a terminal verdict can never be
+        // cancelled (F24 first-terminal-writer-wins).
+        JobQueries::complete(&pool, done.id, "succeeded", r#"{"status":"succeeded"}"#)
+            .await
+            .unwrap();
+        let lost = JobQueries::cancel(&pool, done.id, r#"{"status":"cancelled"}"#)
+            .await
+            .unwrap();
+        assert_eq!(lost, JobCancelOutcome::AlreadyTerminal);
+        let row = JobQueries::get(&pool, done.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "succeeded", "the completion verdict stands");
+        assert_eq!(
+            row.result_json.as_deref(),
+            Some(r#"{"status":"succeeded"}"#),
+            "the completion receipt is never overwritten by a later cancel"
+        );
+
+        // A queued row cancels cleanly and keeps no lease: it never reached
+        // a runner.
+        let receipt = r#"{"status":"cancelled","reason":"operator"}"#;
+        let first = JobQueries::cancel(&pool, build.id, receipt).await.unwrap();
+        assert_eq!(first, JobCancelOutcome::Cancelled);
+        let row = JobQueries::get(&pool, build.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "cancelled");
+        assert!(row.finished_at.is_some());
+        assert!(row.lease_token.is_none());
+        assert!(row.runner_id.is_none());
+
+        // A repeated cancellation is idempotent and preserves the FIRST
+        // receipt — the durable record still says who cancelled it.
+        let repeat = JobQueries::cancel(
+            &pool,
+            build.id,
+            r#"{"status":"cancelled","reason":"duplicate"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeat, JobCancelOutcome::AlreadyCancelled);
+        let row = JobQueries::get(&pool, build.id).await.unwrap().unwrap();
+        assert_eq!(row.result_json.as_deref(), Some(receipt));
+
+        // A missing job fails closed as NotFound, never as a silent success.
+        let missing = JobQueries::cancel(&pool, JobId::new(), receipt).await;
+        assert!(
+            matches!(missing, Err(ref error) if error.kind == gitforge_common::ErrorKind::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_running_job_keeps_lease_until_acknowledged() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (run, jobs) = seed_cancellation_run(&pool, "cancel-custody", &["build"]).await;
+        let job = &jobs[0];
+        let runner = crate::models::Runner::new(
+            "custody-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        RunnerQueries::create(&pool, &runner).await.unwrap();
+        assert!(
+            JobQueries::assign_with_lease(&pool, job.id, runner.id, "lease-1")
+                .await
+                .unwrap()
+        );
+        JobQueries::start(&pool, job.id).await.unwrap();
+
+        // Cancelling a RUNNING job retains the runner custody: the lease and
+        // the runner stay on the row until the runner relinquishes them.
+        let outcome = JobQueries::cancel(&pool, job.id, r#"{"status":"cancelled"}"#)
+            .await
+            .unwrap();
+        assert_eq!(outcome, JobCancelOutcome::Cancelled);
+        let row = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "cancelled");
+        assert_eq!(row.lease_token.as_deref(), Some("lease-1"));
+        assert_eq!(row.runner_id, Some(runner.id));
+        assert!(JobQueries::has_cancelled_lease(&pool, run.id)
+            .await
+            .unwrap());
+
+        // The lease-gated completion can no longer win either direction:
+        // the cancelled row is not `assigned`/`running`, so a late runner
+        // completion is rejected instead of overwriting the cancellation.
+        assert!(!JobQueries::complete_with_lease(
+            &pool,
+            job.id,
+            runner.id,
+            "lease-1",
+            "succeeded",
+            r#"{"status":"succeeded"}"#,
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            JobQueries::get(&pool, job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+
+        // The acknowledgement is a strict CAS on the presented lease.
+        let other_runner = crate::models::Runner::new(
+            "impostor".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        RunnerQueries::create(&pool, &other_runner).await.unwrap();
+        assert!(
+            !JobQueries::release_cancelled_lease(&pool, job.id, other_runner.id, "lease-1")
+                .await
+                .unwrap(),
+            "a foreign runner cannot relinquish someone else's lease"
+        );
+        assert!(
+            !JobQueries::release_cancelled_lease(&pool, job.id, runner.id, "lease-wrong")
+                .await
+                .unwrap(),
+            "a stale token cannot relinquish the lease"
+        );
+        assert!(
+            JobQueries::has_cancelled_lease(&pool, run.id)
+                .await
+                .unwrap(),
+            "custody is still held after failed acknowledgement attempts"
+        );
+
+        assert!(
+            JobQueries::release_cancelled_lease(&pool, job.id, runner.id, "lease-1")
+                .await
+                .unwrap()
+        );
+        let row = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "cancelled", "the verdict is untouched");
+        assert_eq!(
+            row.result_json.as_deref(),
+            Some(r#"{"status":"cancelled"}"#)
+        );
+        assert!(row.lease_token.is_none(), "the lease is relinquished");
+        assert!(row.runner_id.is_none());
+        assert!(!JobQueries::has_cancelled_lease(&pool, run.id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_reap_cancelled_leases_expires_after_grace() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (run, jobs) = seed_cancellation_run(&pool, "cancel-reap", &["build"]).await;
+        let job = &jobs[0];
+        let runner = crate::models::Runner::new(
+            "reap-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        RunnerQueries::create(&pool, &runner).await.unwrap();
+        JobQueries::assign_with_lease(&pool, job.id, runner.id, "lease-1")
+            .await
+            .unwrap();
+        JobQueries::start(&pool, job.id).await.unwrap();
+
+        // A runner heartbeat may predate an operator's cancellation by more
+        // than the reaper grace. Custody must still receive a full grace
+        // window starting from the cancellation timestamp, not be reaped
+        // immediately using this stale heartbeat.
+        sqlx::query("UPDATE jobs SET heartbeat_at = ? WHERE id = ?")
+            .bind((chrono::Utc::now() - chrono::Duration::seconds(3_600)).to_rfc3339())
+            .bind(job.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        JobQueries::cancel(&pool, job.id, r#"{"status":"cancelled"}"#)
+            .await
+            .unwrap();
+
+        // Inside the grace window nothing is reaped: the runner may still
+        // acknowledge.
+        assert_eq!(
+            JobQueries::reap_cancelled_leases(&pool, 600).await.unwrap(),
+            0
+        );
+        let row = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(row.lease_token.as_deref(), Some("lease-1"));
+
+        // Once the cancellation timestamp ages past the grace window, the
+        // custody is abandoned and reclaimed — verdict and receipt preserved,
+        // lease columns cleared. Keep the stale heartbeat to assert that the
+        // cancellation timestamp, rather than heartbeat_at, controls expiry.
+        sqlx::query("UPDATE jobs SET finished_at = ? WHERE id = ?")
+            .bind((chrono::Utc::now() - chrono::Duration::seconds(301)).to_rfc3339())
+            .bind(job.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            JobQueries::reap_cancelled_leases(&pool, 300).await.unwrap(),
+            1
+        );
+        let row = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "cancelled");
+        assert_eq!(
+            row.result_json.as_deref(),
+            Some(r#"{"status":"cancelled"}"#)
+        );
+        assert!(row.lease_token.is_none());
+        assert!(row.runner_id.is_none());
+        assert!(!JobQueries::has_cancelled_lease(&pool, run.id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_finalize_terminal_defers_while_cancelled_row_holds_lease() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (run, jobs) =
+            seed_cancellation_run(&pool, "cancel-finalize", &["green", "doomed"]).await;
+        let (green, doomed) = (&jobs[0], &jobs[1]);
+        JobQueries::complete(&pool, green.id, "succeeded", r#"{"status":"succeeded"}"#)
+            .await
+            .unwrap();
+
+        let runner = crate::models::Runner::new(
+            "finalize-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        RunnerQueries::create(&pool, &runner).await.unwrap();
+        JobQueries::assign_with_lease(&pool, doomed.id, runner.id, "lease-1")
+            .await
+            .unwrap();
+        JobQueries::start(&pool, doomed.id).await.unwrap();
+        JobQueries::cancel(&pool, doomed.id, r#"{"status":"cancelled"}"#)
+            .await
+            .unwrap();
+
+        // Every row is terminal, but the cancelled row still holds the
+        // runner's lease: finalization defers rather than grading the run
+        // while the workspace checkout may still be executing.
+        let deferred = PipelineRunQueries::finalize_terminal(
+            &pool,
+            run.id,
+            "cancelled",
+            &[],
+            r#"{"status":"cancelled"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(deferred, None, "custody defers finalization");
+        assert_eq!(
+            PipelineRunQueries::get(&pool, run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "running",
+            "no verdict is written past an outstanding lease"
+        );
+
+        // The handoff releases the deferral and the same call commits.
+        assert!(
+            JobQueries::release_cancelled_lease(&pool, doomed.id, runner.id, "lease-1")
+                .await
+                .unwrap()
+        );
+        let committed = PipelineRunQueries::finalize_terminal(
+            &pool,
+            run.id,
+            "cancelled",
+            &[],
+            r#"{"status":"cancelled"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(committed, Some(0));
+        assert_eq!(
+            PipelineRunQueries::get(&pool, run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        // The sibling's outcome is preserved by the same commit.
+        assert_eq!(
+            JobQueries::get(&pool, green.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finalize_terminal_defers_for_live_rows_then_commits_doomed_rows() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "owner".to_string(),
+            "owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "finalize-repo".to_string(),
+            user.id,
+            "/git/finalize-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "Finalize Pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+        PipelineRunQueries::update_status(&pool, run.id, "running")
+            .await
+            .unwrap();
+
+        let seed = |name: &str| crate::models::Job::new(run.id, name.to_string());
+        let failed = seed("failed-stage");
+        let doomed_pending = seed("doomed-pending");
+        let doomed_queued = seed("doomed-queued");
+        let in_flight = seed("in-flight");
+        let succeeded = seed("succeeded-stage");
+        for (job, status) in [
+            (&failed, "failed"),
+            (&doomed_pending, "pending"),
+            (&doomed_queued, "queued"),
+            (&in_flight, "running"),
+            (&succeeded, "succeeded"),
+        ] {
+            JobQueries::create(&pool, job).await.unwrap();
+            JobQueries::update_status(&pool, job.id, status)
+                .await
+                .unwrap();
+        }
+        // A row a runner owns keeps its lease bookkeeping; finalization must
+        // not touch it.
+        sqlx::query("UPDATE jobs SET lease_token = 'lease-1' WHERE id = ?")
+            .bind(in_flight.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        let receipt = serde_json::json!({
+            "status": "cancelled",
+            "reason": "pipeline ancestor failed; this job can never be dispatched",
+        })
+        .to_string();
+        let deferred = PipelineRunQueries::finalize_terminal(
+            &pool,
+            run.id,
+            "failed",
+            &[doomed_pending.id, doomed_queued.id, in_flight.id],
+            &receipt,
+        )
+        .await
+        .unwrap();
+        assert_eq!(deferred, None, "live runner work defers the whole commit");
+        assert_eq!(
+            PipelineRunQueries::get(&pool, run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "running",
+            "the run verdict is not committed past live work"
+        );
+        assert_eq!(
+            JobQueries::get(&pool, doomed_pending.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert_eq!(
+            JobQueries::get(&pool, doomed_queued.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "queued"
+        );
+
+        // Once the runner-owned row settles, the same transaction can
+        // safely terminalize the queued descendants and commit the verdict.
+        JobQueries::update_status(&pool, in_flight.id, "failed")
+            .await
+            .unwrap();
+        let cancelled = PipelineRunQueries::finalize_terminal(
+            &pool,
+            run.id,
+            "failed",
+            &[doomed_pending.id, doomed_queued.id, in_flight.id],
+            &receipt,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancelled, Some(2));
+
+        assert_eq!(
+            PipelineRunQueries::get(&pool, run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+        for job in [&doomed_pending, &doomed_queued] {
+            let row = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+            assert_eq!(row.status, "cancelled");
+            assert!(row.finished_at.is_some());
+            assert_eq!(row.result_json.as_deref(), Some(receipt.as_str()));
+            assert!(row.runner_id.is_none());
+            assert!(row.lease_token.is_none());
+        }
+        let kept = JobQueries::get(&pool, in_flight.id).await.unwrap().unwrap();
+        assert_eq!(kept.status, "failed", "the runner outcome is preserved");
+        assert_eq!(kept.lease_token.as_deref(), Some("lease-1"));
+        assert_eq!(
+            JobQueries::get(&pool, succeeded.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "succeeded"
+        );
+
+        // Idempotent: a retry (watchdog sweep, duplicate completion event)
+        // rewrites nothing and preserves the first receipts.
+        let again = PipelineRunQueries::finalize_terminal(
+            &pool,
+            run.id,
+            "failed",
+            &[doomed_pending.id, doomed_queued.id],
+            &receipt,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, Some(0));
+        let row = JobQueries::get(&pool, doomed_pending.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.result_json.as_deref(), Some(receipt.as_str()));
+
+        // F24: a competing terminal verdict is kept, never rewritten; the
+        // rows already terminal stay exactly as they were.
+        PipelineRunQueries::finalize_terminal(
+            &pool,
+            run.id,
+            "cancelled",
+            &[succeeded.id],
+            &receipt,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            PipelineRunQueries::get(&pool, run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert_eq!(
+            JobQueries::get(&pool, succeeded.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finalize_terminal_without_doomed_rows_writes_verdict() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "owner".to_string(),
+            "owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "finalize-empty-repo".to_string(),
+            user.id,
+            "/git/finalize-empty-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "Finalize Empty Pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        // A fully-succeeded mirror finalizes with nothing to terminalize.
+        let cancelled = PipelineRunQueries::finalize_terminal(
+            &pool,
+            run.id,
+            "succeeded",
+            &[],
+            r#"{"status":"cancelled"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancelled, Some(0));
+        let finalized = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finalized.status, "succeeded");
+        assert!(finalized.finished_at.is_some());
     }
 
     #[tokio::test]

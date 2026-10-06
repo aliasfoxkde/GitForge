@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use gitforge_common::{JobId, PipelineId, PipelineRunId};
+use gitforge_common::{error::ErrorKind, JobId, PipelineId, PipelineRunId};
 use gitforge_db::{
     models::JobStatus,
     queries::{JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries},
@@ -1181,6 +1181,15 @@ async fn get_job_logs(
 /// Cancel a job through the durable control-plane state. The scheduler and
 /// runner observe this row, so API and scheduler remain safe as separate
 /// processes; no shared in-memory scheduler extension is required.
+///
+/// The outcome is arbitrated by [`JobQueries::cancel`]'s conditional write,
+/// not by the preflight read above: a runner completion that lands between
+/// the two wins (F24) and surfaces as `409 job_already_terminal`, while a
+/// repeated cancellation of an already-cancelled row replays the same 200
+/// without touching the recorded receipt. When the cancelled job was
+/// assigned or running, its lease stays in the runner's custody; the
+/// scheduler-side acknowledgement and lease reaper release it, and the run
+/// finalizers refuse to grade the parent run until that handoff.
 async fn cancel_job(
     Extension(pool): Extension<Arc<Pool>>,
     Extension(claims): Extension<Claims>,
@@ -1243,12 +1252,38 @@ async fn cancel_job(
     })
     .to_string();
     match JobQueries::cancel(&pool, job_id, &receipt).await {
-        Ok(()) => (
+        Ok(outcome) if outcome.is_cancelled() => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "contract_version": "harness.job.v1",
                 "status": "cancelled",
                 "job_id": job_id.to_string()
+            })),
+        )
+            .into_response(),
+        Ok(outcome) => {
+            // The conditional write lost the race: a runner completion
+            // reached a terminal verdict between the preflight read and the
+            // CAS. The winner stands.
+            tracing::info!(
+                %job_id,
+                ?outcome,
+                "API job cancellation lost the race to a terminal verdict"
+            );
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "job_already_terminal",
+                    "status": job.status
+                })),
+            )
+                .into_response()
+        }
+        Err(error) if error.kind == ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "message": "Job no longer exists"
             })),
         )
             .into_response(),

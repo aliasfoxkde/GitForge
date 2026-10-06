@@ -1391,9 +1391,10 @@ impl RunnerAgent {
 
         // Set when the scheduler says the job's durable outcome was already
         // decided while this execution was still running: an operator
-        // cancellation, or restart recovery failing the in-flight row. The
-        // lease is gone in both cases, so post-execution reporting can only
-        // produce rejected requests.
+        // cancellation, or restart recovery failing the in-flight row.
+        // Completion/log/artifact reporting is no longer valid in either
+        // case. Cancellation retains this runner's lease until the explicit
+        // acknowledgement below; restart recovery may already have fenced it.
         let orphaned = Arc::new(AtomicBool::new(false));
         let cancellation_executor = executor.clone();
         let cancellation_watch = tokio::spawn(run_cancellation_watch(
@@ -1451,15 +1452,33 @@ impl RunnerAgent {
 
         if orphaned.load(std::sync::atomic::Ordering::Relaxed) {
             // The scheduler finalized this job while we were executing it
-            // (operator cancellation, or restart recovery re-queuing the
-            // row and failing the in-flight execution). The lease no longer
-            // exists, so log chunks, artifacts, and a completion POST would
-            // all be rejected 409; stop here instead of writing noise.
+            // (operator cancellation, or restart recovery fencing the
+            // row and failing the in-flight execution). The durable row is
+            // terminal either way, so log chunks, artifacts, and a
+            // completion POST would all be rejected 409; stop here instead
+            // of writing noise. What differs is custody: a cancellation
+            // retains this lease until the acknowledgement below, while
+            // restart recovery cleared it when it fenced the row.
             tracing::warn!(
                 job_id = %assignment.job_id,
                 "job outcome was decided by the scheduler mid-execution; \
                  skipping log, artifact, and completion reporting"
             );
+            // Relinquish custody of a cancelled job: the durable row still
+            // carries this execution's lease, and the parent run is not
+            // finalized until the scheduler records this handoff (or its
+            // abandoned-lease reaper expires it). A restart-fenced row was
+            // failed, not cancelled, so the scheduler rejects the
+            // acknowledgement and nothing changes.
+            acknowledge_cancellation(
+                client,
+                scheduler_url,
+                &assignment.job_id,
+                runner_id,
+                lease_token,
+                scheduler_token,
+            )
+            .await;
             return;
         }
 
@@ -1588,11 +1607,14 @@ struct JobChannel<'a> {
 ///
 /// The scheduler owns the durable outcome: an operator cancellation and a
 /// restart-recovery failure both surface here as `cancelled: true`, because
-/// in both cases the lease is gone and finishing the execution can only
-/// produce requests the scheduler rejects. Three consecutive probe failures
-/// also stop the sandbox — a scheduler that cannot be asked about the job
-/// must not leave it running unobserved — but do not mark the execution
-/// orphaned, since the outcome is unknown rather than decided.
+/// the durable row is terminal either way and finishing the execution can
+/// only produce requests the scheduler rejects. The two differ in custody,
+/// not in the probe: a cancellation keeps this runner's lease until the
+/// explicit acknowledgement (or the abandoned-lease reaper), while restart
+/// recovery clears it when it fences the row. Three consecutive probe
+/// failures also stop the sandbox — a scheduler that cannot be asked about
+/// the job must not leave it running unobserved — but do not mark the
+/// execution orphaned, since the outcome is unknown rather than decided.
 pub(crate) async fn run_cancellation_watch<S, Fut>(
     config: CancellationWatchConfig,
     probe_interval: Duration,
@@ -1655,6 +1677,65 @@ pub(crate) async fn run_cancellation_watch<S, Fut>(
             break;
         }
     }
+}
+
+/// Relinquish control-plane custody of a cancelled job. The counterpart of
+/// the cancellation watch: the execution saw a decided outcome, its sandbox
+/// has stopped, and the presented lease proof is all the scheduler needs to
+/// record the handoff. The scheduler accepts it only when the durable row is
+/// `cancelled` and this exact lease is still outstanding — a restart-fenced
+/// row (failed by recovery) or an already-reaped lease rejects with 409, and
+/// that is final, not an error to retry. Transient transport and 5xx
+/// failures get three bounded attempts; past that the scheduler's
+/// abandoned-lease reaper expires the custody, so a missed acknowledgement
+/// delays run finalization by one grace window but can never wedge it.
+pub(crate) async fn acknowledge_cancellation(
+    client: &Client,
+    scheduler_url: &str,
+    job_id: &str,
+    runner_id: RunnerId,
+    lease_token: &str,
+    token: Option<&str>,
+) -> bool {
+    let endpoint = format!("{scheduler_url}/jobs/{job_id}/cancelled/ack");
+    for attempt in 1..=3 {
+        let mut request = client.post(&endpoint).json(&serde_json::json!({
+            "runner_id": runner_id.to_string(),
+            "lease_token": lease_token,
+        }));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                tracing::info!(
+                    job_id,
+                    "scheduler recorded the cancellation acknowledgement"
+                );
+                return true;
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                tracing::warn!(
+                    job_id,
+                    %status,
+                    response_body = %body,
+                    attempt,
+                    "cancellation acknowledgement rejected"
+                );
+                if status == reqwest::StatusCode::CONFLICT {
+                    return false;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(job_id, %error, attempt, "failed to reach scheduler for cancellation acknowledgement");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    tracing::warn!(job_id, "cancellation acknowledgement unconfirmed; the scheduler's abandoned-lease reaper will reclaim custody");
+    false
 }
 
 /// Background loop body for the per-job lease heartbeat (issue #243).
@@ -3714,6 +3795,86 @@ mod tests {
         let destroyed = stopped.lock().await;
         assert_eq!(destroyed.len(), 1);
         assert_eq!(destroyed[0].to_string(), job_id);
+    }
+
+    // ── Cancellation acknowledgement ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_cancellation_acknowledgement_releases_custody_on_first_accept() {
+        // The happy handoff: the runner stopped the sandbox and presents the
+        // exact lease it still holds. One accepted POST ends the exchange —
+        // no retries, and the runner proceeds to (skipped) post-execution
+        // reporting knowing the scheduler will settle the run.
+        let (url, hits) = spawn_status_server(&[200]).await;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let acknowledged = acknowledge_cancellation(
+            &Client::new(),
+            &url,
+            &job_id,
+            RunnerId::new(),
+            "lease-ack",
+            None,
+        )
+        .await;
+        assert!(
+            acknowledged,
+            "an accepted acknowledgement is reported as such"
+        );
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "an accepted acknowledgement is never retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_acknowledgement_treats_conflict_as_final() {
+        // A 409 means this lease is not outstanding — the row was already
+        // reaped, restart-fenced, or acknowledged by another execution.
+        // Retrying can only repeat the rejection, so the runner stops after
+        // the single attempt and leaves the outcome to the reaper.
+        let (url, hits) = spawn_status_server(&[409, 200]).await;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let acknowledged = acknowledge_cancellation(
+            &Client::new(),
+            &url,
+            &job_id,
+            RunnerId::new(),
+            "lease-ack",
+            None,
+        )
+        .await;
+        assert!(!acknowledged);
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "a conflicting acknowledgement is final, not retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_acknowledgement_retries_transient_failures_bounded() {
+        // 5xx answers are not decisions: the ack retries, and after the
+        // bounded attempts it reports failure — the scheduler's
+        // abandoned-lease reaper, not the runner, now owns the custody
+        // deadline.
+        let (url, hits) = spawn_status_server(&[500]).await;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let acknowledged = acknowledge_cancellation(
+            &Client::new(),
+            &url,
+            &job_id,
+            RunnerId::new(),
+            "lease-ack",
+            None,
+        )
+        .await;
+        assert!(!acknowledged);
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            3,
+            "transient failures are retried exactly three times"
+        );
     }
 
     #[tokio::test]

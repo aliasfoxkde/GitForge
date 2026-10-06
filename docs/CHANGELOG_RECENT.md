@@ -2,6 +2,61 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Doomed child jobs are terminalized with their run's verdict**: when a
+  pipeline run fails or is cancelled, every not-yet-dispatched (`pending`/
+  `queued`) descendant the engine cancelled in memory now commits as
+  `cancelled` in the same transaction as the run's terminal status — the
+  verdict can no longer strand live child rows that run reconciliation,
+  skipping terminal runs, could never grade again (live 2026-10-05: 828
+  pending jobs across 202 failed runs). Rows a runner already picked up are
+  never cancelled out from under it, and each row keeps an inspectable
+  failure/cancellation receipt naming the ancestor stage that doomed it.
+- **Cancellation no longer abandons runner-owned work**: `CiEngine::cancel`
+  spares `assigned`/`running` mirror jobs (no run-level cancellation
+  request/ack protocol reaches a runner) and records cancellation intent
+  instead; the run goes terminal only when the last owned job settles, with
+  `cancelled` winning the verdict over the in-flight outcome. Finalization
+  now fails closed while any durable `assigned`/`running` row is still live
+  — no terminal verdict, no engine eviction, no workspace deletion — so a
+  completion event, its lease, and its checkout survive until the runner
+  (or its cancellation watch) settles the row; the completion consumer
+  reconciles a refused mirror transition instead of dropping the event.
+  A late cancel can no longer rewrite an already-settled run verdict (F24).
+  Known limitation: cancel intent lives in the engine mirror only until
+  finalization commits; a control-plane restart before that loses it and
+  the run resumes (re-issue the cancel, or cancel the durable job rows,
+  which runners do honor).
+
+### Added
+
+- **Per-job cancellation is race-safe, custody-aware, and end-to-end**:
+  `JobQueries::cancel` is one conditional `BEGIN IMMEDIATE` update — only
+  `pending`/`queued`/`assigned`/`running` rows can be cancelled, a
+  completion that wins the race is never overwritten (F24), repeats are
+  idempotent and preserve the first receipt, and unknown statuses fail
+  closed. A row cancelled while `assigned`/`running` keeps its
+  `lease_token`/`runner_id`: the executing runner keeps workspace custody
+  and relinquishes it through a new lease-proof acknowledgement
+  (`POST /jobs/{id}/cancelled/ack`, runner-auth scope, idempotent CAS
+  `release_cancelled_lease`, 409 when nothing is outstanding), while the
+  scheduler's abandoned-lease reaper (`reap_cancelled_leases`, one fence
+  grace window past the frozen heartbeat) bounds a missed
+  acknowledgement. All finalizers (`finalize_terminal`,
+  `finalize_run_if_terminal`, `finalize_pipeline_if_terminal`, and
+  orphan-run reconciliation) defer a run's verdict while a cancelled row
+  holds a lease, then commit the verdict and doomed rows together with
+  aligned precedence: failed/timed_out/infrastructure_failure → `failed`,
+  else any cancelled → `cancelled`, else `succeeded` (this also fixes a
+  latent bug grading timed-out-only runs `succeeded`). Queued-job
+  cancellation converges through the engine fence sweep, which now fences
+  every non-terminal mirror instead of only `Running` ones. The scheduler
+  completion event carries `cancelled: true` for an acknowledgement so a
+  released custody is never misreported as a synthetic failure.
+
 ## [0.6.14] - 2026-10-03
 
 ### Added
