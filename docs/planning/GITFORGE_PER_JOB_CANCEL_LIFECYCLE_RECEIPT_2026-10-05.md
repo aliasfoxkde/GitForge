@@ -230,3 +230,24 @@ gitforge-db unit tests use), placed beside `seed_job`; the API test uses the
 inline form its neighboring test already established. **None of these edits
 have been executed locally per task constraints — `Test`, `Test (Serialized)`,
 and `Coverage` must be re-run on the lane before this branch is called green.**
+
+### Validation follow-up (2026-10-06 — GitHub Actions run, commit `b4da0b9`, PR #264)
+
+**Run:** GitHub Actions mirror, Rust CI
+[`37401224644`](https://github.com/aliasfoxkde/GitForge/actions/runs/37401224644).
+
+**Result:** 22/23 tests in the `ci_routes` test binary passed. One fixture failed:
+`cancelling_a_leased_job_keeps_runner_custody_until_the_lease_is_released`
+expected a lease token but got `None` — the fixture set `status = Assigned`
+and a `lease_token` on the in-memory struct before `JobQueries::create`, and
+`create`'s INSERT does not persist leases, so the fabricated lease never
+reached the row and the custody assertions ran against an unleased job. The
+scheduler DB custody test and the six new ack route tests passed.
+
+**Fixture correction (pending remote revalidation):** the fixture now creates
+the job queued with no fabricated lease and grants custody through
+`JobQueries::assign_with_lease` using the persisted `runner.id` and the
+intended token before exercising HTTP cancellation — the same atomic
+transition the dispatching scheduler uses. All custody assertions are
+retained verbatim; no production code changed. **This correction has not been
+re-run on the lane yet — remote revalidation is the outstanding gate.**

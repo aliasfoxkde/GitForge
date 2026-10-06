@@ -631,12 +631,20 @@ async fn cancelling_a_leased_job_keeps_runner_custody_until_the_lease_is_release
     // row's runner_id must reference a persisted row (jobs.runner_id FK).
     let runner = Runner::new("custody-runner".to_string(), RunnerType::Docker, 1);
     RunnerQueries::create(&f.pool, &runner).await.unwrap();
+    // The persisted row starts queued — `JobQueries::create` does not write
+    // lease columns — so custody is granted the way the
+    // dispatching scheduler grants it: the atomic `assign_with_lease`
+    // transition that attaches the runner and its token.
     let mut job = Job::new(f.run_id, "leased-job".to_string());
-    job.status = JobStatus::Assigned.as_str().to_string();
-    job.runner_id = Some(runner.id);
-    job.lease_token = Some("lease-held-by-runner".to_string());
+    job.status = JobStatus::Queued.as_str().to_string();
     let job_id = job.id;
     JobQueries::create(&f.pool, &job).await.unwrap();
+    let assigned =
+        JobQueries::assign_with_lease(&f.pool, job_id, runner.id, "lease-held-by-runner")
+            .await
+            .unwrap();
+    assert!(assigned, "the scheduler's lease assignment must win");
+    job.runner_id = Some(runner.id);
 
     let uri = format!("/api/jobs/{job_id}/cancel");
     let (status, body) =
