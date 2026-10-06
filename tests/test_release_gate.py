@@ -9,22 +9,28 @@ evidence readers:
   gate is allowed to make: `-batch -readonly <db> ".timeout 15000" <sql>`
   in list mode. The shim refuses any other argv, so every CLI-path test
   transitively pins the read-only and busy-timeout wiring;
-- the python3 sqlite3 fallback path, forced by hiding the CLI behind a
-  non-executable PATH stub (the natural mode on hosts like Fedora that
-  ship the sqlite3 module without the CLI).
+- the python3 sqlite3 fallback path, forced by a hermetic PATH that
+  carries no sqlite3 at all (the natural mode on hosts like Fedora that
+  ship the sqlite3 module without the CLI);
+- where the host does install a real sqlite3 CLI, one optional test
+  runs the gate against that real binary (skipped otherwise).
 
 Every fail-closed gate is asserted on both paths — exact 40-hex commit
 argument, run existence, a succeeded run, run-id shape, readable persisted
 definition, durable-row coverage of the definition, durable count parity,
 and all-jobs-succeeded — and the two readers must agree byte-for-byte on
-stdout and exit status. The green path additionally asserts the database
-file is not modified, proving the readers stay read-only.
+stdout and exit status. A failed evidence query (schema drift) must exit
+nonzero without ever printing PASSED, on both paths. The green path
+additionally asserts the database file is not modified, proving the
+readers stay read-only, and the blocked-reader path proves the busy
+timeout is actually waited out behind an exclusive writer.
 
 The tests are deterministic: no network, no real build artifacts, no
-cargo. Run with either runner:
+cargo. Fixtures live under TMPDIR — set it explicitly when the default
+temp filesystem is small. Run with either runner:
 
-    python3 tests/test_release_gate.py -v
-    python3 -m pytest tests/test_release_gate.py -v
+    TMPDIR=/var/tmp python3 tests/test_release_gate.py -v
+    TMPDIR=/var/tmp python3 -m pytest tests/test_release_gate.py -v
 """
 
 import hashlib
@@ -34,6 +40,8 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from uuid import uuid4
@@ -46,6 +54,11 @@ GATE_SCRIPT = REPO_ROOT / "scripts" / "gitforge-release-gate"
 SOURCE_COMMIT = "4a1f2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c"
 PIPELINE_ID = "pl-fixture-0001"
 RUN_ID = "8f2a6c1e-5b47-4a90-9c31-d2e8f0a6b7c4"
+
+EXPECTED_GREEN_STDOUT = (
+    "release gate: PASSED — run 8f2a6c1e green, 3/3 jobs "
+    "covering the persisted definition\n"
+)
 
 DEF_JOBS = (
     {
@@ -137,13 +150,20 @@ class ReleaseGateContractTests(unittest.TestCase):
 
     # ─── fixture helpers ─────────────────────────────────────────────────────
 
-    def _hermetic_tools(self, with_sqlite3_shim):
+    def _hermetic_tools(self, sqlite3_mode):
         """Fresh tools dir with a hermetic PATH.
 
-        with_sqlite3_shim=True provides the executable CLI shim (the gate's
-        CLI path). Otherwise no sqlite3 exists on PATH at all — the hermetic
-        PATH excludes system directories — so `command -v sqlite3` fails and
-        the gate must take the python3 fallback on any host.
+        sqlite3_mode selects what `sqlite3` on that PATH is:
+
+        - "shim": the executable CLI shim (the gate's CLI path). The shim
+          refuses any argv beyond the one invocation the gate is allowed
+          to make, so every CLI-path test transitively pins the
+          read-only and busy-timeout wiring;
+        - "real": a symlink to this host's real sqlite3 CLI, for the
+          optional test of the unshimmed binary;
+        - None: no sqlite3 exists on PATH at all — the hermetic PATH
+          excludes system directories, so `command -v sqlite3` fails and
+          the gate must take the python3 fallback on any host.
         """
         tools_dir = self.workdir / f"tools-{uuid4().hex[:8]}"
         tools_dir.mkdir()
@@ -151,10 +171,12 @@ class ReleaseGateContractTests(unittest.TestCase):
             resolved = shutil.which(tool)
             self.assertIsNotNone(resolved, f"required tool not on PATH: {tool}")
             os.symlink(resolved, tools_dir / tool)
-        if with_sqlite3_shim:
+        if sqlite3_mode == "shim":
             sqlite3_path = tools_dir / "sqlite3"
             sqlite3_path.write_text(SQLITE3_SHIM)
             sqlite3_path.chmod(0o755)
+        elif sqlite3_mode == "real":
+            os.symlink(shutil.which("sqlite3"), tools_dir / "sqlite3")
         return tools_dir
 
     def _pipeline_row(self, config=json.dumps({"version": 1, "jobs": list(DEF_JOBS)})):
@@ -202,7 +224,8 @@ class ReleaseGateContractTests(unittest.TestCase):
 
     def _env(self, backend):
         env = os.environ.copy()
-        env["PATH"] = str(self._hermetic_tools(backend == "cli"))
+        sqlite3_mode = {"cli": "shim", "python": None, "real": "real"}[backend]
+        env["PATH"] = str(self._hermetic_tools(sqlite3_mode))
         return env
 
     def _run_gate(self, db_path, backend, commit=SOURCE_COMMIT, extra_env=None):
@@ -253,16 +276,28 @@ class ReleaseGateContractTests(unittest.TestCase):
             with self.subTest(backend=backend):
                 self.assertEqual(result.returncode, 0,
                                  f"gate refused a green run:\n{result.stderr}")
-                self.assertEqual(
-                    result.stdout,
-                    "release gate: PASSED — run 8f2a6c1e green, 3/3 jobs "
-                    "covering the persisted definition\n",
-                )
+                self.assertEqual(result.stdout, EXPECTED_GREEN_STDOUT)
         self.assertEqual(self._sha256(db_path), digest_before,
                          "the gate wrote to the evidence database")
 
         self.assertIn("python3 sqlite3 fallback", results["python"].stderr)
         self.assertNotIn("fallback", results["cli"].stderr)
+
+    @unittest.skipIf(shutil.which("sqlite3") is None,
+                     "the sqlite3 CLI is not installed on this host")
+    def test_real_sqlite3_cli_when_installed(self):
+        # The shimmed tests define the CLI contract; this optional test
+        # exercises the gate against the real sqlite3 binary where one is
+        # installed, and is skipped on hosts that ship only the Python
+        # module (Fedora among them).
+        db_path = self._green_db()
+        digest_before = self._sha256(db_path)
+        result = self._run_gate(db_path, "real")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, EXPECTED_GREEN_STDOUT)
+        self.assertNotIn("fallback", result.stderr)
+        self.assertEqual(self._sha256(db_path), digest_before,
+                         "the gate wrote to the evidence database")
 
     def test_succeeded_run_selection_prefers_the_newest_run(self):
         # An older failed run and a newer succeeded run for the same commit:
@@ -425,27 +460,104 @@ class ReleaseGateContractTests(unittest.TestCase):
             self.assertIn("2 of 3 jobs succeeded", result.stderr)
             self.assertIn("=failed", result.stderr)
 
-    # ─── 4. reading while a writer holds the database ────────────────────────
-
-    def test_gate_reads_while_a_write_transaction_is_open(self):
-        # The live services hold write locks on the evidence database; the
-        # readers must wait on their busy timeout instead of failing
-        # instantly. WAL lets this read proceed without waiting, but an
-        # instant-fail reader (no busy timeout) would still lose this race.
-        db_path = self._green_db()
+    def test_coverage_query_failure_fails_closed_on_both_readers(self):
+        # Schema drift: a jobs table without the commands column. The count
+        # query never touches it, so run selection and count evidence still
+        # succeed — but the coverage query cannot run, and the gate must
+        # exit nonzero without printing PASSED rather than silently
+        # degrading to count-only grading. This also pins the set -e
+        # propagation of a failed db_query on both readers.
+        db_path = self.workdir / "schema-drift.db"
         connection = sqlite3.connect(db_path)
-        connection.execute("PRAGMA journal_mode=wal")
-        connection.execute("PRAGMA busy_timeout=15000")
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "UPDATE pipeline_runs SET status='running' WHERE id=?", (RUN_ID,))
         self.addCleanup(connection.close)
-        self.addCleanup(connection.rollback)
+        connection.executescript(SCHEMA.replace(" commands TEXT,", ""))
+        connection.execute("INSERT INTO pipelines VALUES (?,?,?,?,?,?,?)",
+                           self._pipeline_row())
+        connection.execute(
+            "INSERT INTO pipeline_runs VALUES (?,?,?,?,?,?,?,?,?,?)",
+            self._run_row())
+        for name in ("fmt", "clippy", "test"):
+            row = list(self._job_row(commands=DEF_COMMANDS[name]))
+            del row[9]  # the drifted schema has no commands column
+            connection.execute(
+                f"INSERT INTO jobs VALUES ({','.join('?' * len(row))})", row)
+        connection.commit()
 
         results = self._run_both_backends(db_path)
-        for result in results.values():
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("PASSED", result.stdout)
+        for backend, result in results.items():
+            with self.subTest(backend=backend):
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    result.stdout, "",
+                    "the gate printed on stdout despite a failed evidence query")
+                self.assertNotIn("PASSED", result.stderr)
+                # Pin the failure to the coverage query itself: reaching it
+                # proves the count query succeeded on the drifted schema.
+                self.assertIn("no such column", result.stderr)
+
+    # ─── 4. reading while a writer holds the database ────────────────────────
+
+    HOLD_SECONDS = 1.5
+
+    def _run_gate_behind_exclusive_writer(self, db_path, backend):
+        """Hold a writer EXCLUSIVE lock in rollback-journal mode, release it
+        HOLD_SECONDS in, and run one gate process against the locked
+        database.
+
+        Unlike WAL — under which a reader proceeds without ever waiting —
+        an EXCLUSIVE rollback-journal writer blocks readers outright, so
+        the only way the gate can still succeed is by waiting on its busy
+        timeout. The elapsed-time assertion in the caller proves it did.
+        """
+        # check_same_thread=False: the releaser thread performs the single
+        # rollback. Access stays strictly sequential — created and driven
+        # here, rolled back there, joined before anything else touches it.
+        writer = sqlite3.connect(db_path, timeout=5.0, isolation_level=None,
+                                 check_same_thread=False)
+        self.addCleanup(writer.close)
+        writer.execute("PRAGMA journal_mode=DELETE")
+        writer.execute("BEGIN EXCLUSIVE")
+        writer.execute(
+            "UPDATE pipeline_runs SET status='running' WHERE id=?", (RUN_ID,))
+
+        # Prove the lock actually blocks readers before the gate starts;
+        # without this, a silently unheld lock would make the elapsed-time
+        # assertion below vacuous.
+        probe = sqlite3.connect(db_path, timeout=0.0)
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                probe.execute("SELECT count(*) FROM pipeline_runs").fetchone()
+        finally:
+            probe.close()
+
+        def release():
+            time.sleep(self.HOLD_SECONDS)
+            writer.rollback()
+
+        releaser = threading.Thread(target=release, daemon=True)
+        started = time.monotonic()
+        releaser.start()
+        result = self._run_gate(db_path, backend)
+        elapsed = time.monotonic() - started
+        releaser.join(timeout=self.HOLD_SECONDS + 10)
+        return result, elapsed
+
+    def test_gate_waits_out_an_exclusive_writer_on_both_readers(self):
+        db_path = self._green_db()
+        for backend in ("cli", "python"):
+            with self.subTest(backend=backend):
+                result, elapsed = self._run_gate_behind_exclusive_writer(
+                    db_path, backend)
+                self.assertEqual(
+                    result.returncode, 0,
+                    f"gate failed behind a released lock:\n{result.stderr}")
+                self.assertIn("PASSED", result.stdout)
+                # Success is only possible once the writer released, so the
+                # elapsed time must cover the hold — while staying well
+                # short of the 15s busy timeout, proving the reader waited
+                # for the release rather than riding out the deadline.
+                self.assertGreaterEqual(elapsed, self.HOLD_SECONDS - 0.5)
+                self.assertLess(elapsed, 14.0)
 
 
 if __name__ == "__main__":

@@ -91,12 +91,20 @@ Tags are cut on `main` only after the exact-SHA pipeline run is green.
 The release sequence is: `scripts/gitforge-release-gate` (refuses a cut
 without a green run of the exact source commit; reads run evidence
 through the sqlite3 CLI, or through a Python standard-library sqlite3
-fallback — read-only connection, 15s busy timeout, identical output —
-on hosts that ship the module without the CLI) →
-`scripts/gitforge-release-bundle` → `gitforge-release-promote --apply`
-→ drain-gated restart of the `gitforge@*` units → GitHub tag + release
-pushed GitForge-first, then mirrored. See `docs/RUNBOOK.md` for the
-authoritative steps and `docs/MIRROR_POLICY.md` for what belongs where.
+fallback — read-only connection, 15s busy timeout, identical stdout,
+grading decisions, and exit status; only the stderr diagnostics differ,
+as the fallback announces itself and reports query failures in its own
+voice — on hosts that ship the module without the CLI, Fedora among
+them) → `scripts/gitforge-release-bundle` →
+`gitforge-release-promote --apply` → drain-gated restart of the GitForge
+services → GitHub tag + release pushed GitForge-first, then mirrored.
+The live unit names are host-specific — check what actually exists
+(`systemctl --user list-units 'gitforge*'`) before a drain/restart. On
+the current Fedora host they are plain user services, not templated
+units: `gitforge-api.service`, `gitforge-ci.service`,
+`gitforge-git-server.service`, `gitforge-runner.service`. See
+`docs/RUNBOOK.md` for the authoritative steps and `docs/MIRROR_POLICY.md`
+for what belongs where.
 
 ## Best Practices
 
