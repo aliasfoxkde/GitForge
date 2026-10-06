@@ -155,13 +155,19 @@ fi
 # carry a generated name ('job-<uuid>' — step names are not persisted, plan
 # finding F12), but their commands column mirrors the definition's step
 # `run` strings in order. A definition job whose command list has no
-# matching durable row is exactly the lazy-enqueue false green.
+# matching durable row is exactly the lazy-enqueue false green. NULL
+# commands rows are excluded from the match set: under SQL three-valued
+# logic a single NULL in the subquery turns every NOT IN comparison
+# UNKNOWN, so one unreadable durable row would silently pass coverage for
+# the whole run — a NULL commands row matches no definition job and
+# therefore covers nothing.
 missing=$(db_query "SELECT json_extract(d.value, '\$.name')
 FROM pipelines p, json_each(json_extract(p.config, '\$.jobs')) d
 WHERE p.id = (SELECT pipeline_id FROM pipeline_runs WHERE id = '$run_id')
   AND (SELECT json_group_array(json_extract(s.value, '\$.run'))
        FROM json_each(json_extract(d.value, '\$.steps')) s)
-      NOT IN (SELECT commands FROM jobs WHERE pipeline_run_id = '$run_id');")
+      NOT IN (SELECT commands FROM jobs
+              WHERE pipeline_run_id = '$run_id' AND commands IS NOT NULL);")
 missing_count=$(grep -c . <<< "$missing" || true)
 failing=$(db_query "SELECT '  ' || name || '=' || status FROM jobs
 WHERE pipeline_run_id = '$run_id' AND status <> 'succeeded';")

@@ -55,6 +55,10 @@ SOURCE_COMMIT = "4a1f2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c"
 PIPELINE_ID = "pl-fixture-0001"
 RUN_ID = "8f2a6c1e-5b47-4a90-9c31-d2e8f0a6b7c4"
 
+# Sentinel distinguishing "no config argument" from an explicit None, which
+# the unreadable-definition fixture passes to store a SQL NULL config.
+_UNSET = object()
+
 EXPECTED_GREEN_STDOUT = (
     "release gate: PASSED — run 8f2a6c1e green, 3/3 jobs "
     "covering the persisted definition\n"
@@ -78,6 +82,7 @@ DEF_JOBS = (
         "name": "test",
         "steps": (
             {"name": "test", "run": "cargo test --workspace -- --test-threads=2"},
+            {"name": "coverage", "run": "cargo llvm-cov --all --html"},
         ),
     },
 )
@@ -179,7 +184,13 @@ class ReleaseGateContractTests(unittest.TestCase):
             os.symlink(shutil.which("sqlite3"), tools_dir / "sqlite3")
         return tools_dir
 
-    def _pipeline_row(self, config=json.dumps({"version": 1, "jobs": list(DEF_JOBS)})):
+    def _pipeline_row(self, config=_UNSET):
+        if config is _UNSET:
+            # Compact separators: the gate compares SQLite's own JSON
+            # serialization (json_group_array emits no spaces) byte for
+            # byte, so the fixture must serialize identically.
+            config = json.dumps({"version": 1, "jobs": list(DEF_JOBS)},
+                                separators=(",", ":"))
         return (PIPELINE_ID, "repo-1", "ci", "push", config,
                 "2026-10-01T00:00:00Z", 1)
 
@@ -190,9 +201,18 @@ class ReleaseGateContractTests(unittest.TestCase):
                 "2026-10-06T10:00:00Z", None)
 
     def _job_row(self, run_id=RUN_ID, commands=(), status="succeeded"):
+        # commands=None stores a SQL NULL — the durable row that proves
+        # nothing. Otherwise the list must be serialized exactly as SQLite's
+        # json_group_array does (compact, no spaces), because the coverage
+        # query matches the definition's step-run list against this TEXT
+        # byte for byte; a multi-step list with default json.dumps spacing
+        # would never match.
+        commands_text = (
+            None if commands is None
+            else json.dumps(list(commands), separators=(",", ":")))
         return (f"job-{uuid4().hex}", run_id, f"job-{uuid4().hex}", status,
                 "runner-1", "2026-10-06T10:00:00Z", "2026-10-06T10:05:00Z", 0,
-                "2026-10-06T10:00:00Z", json.dumps(list(commands)), "dsc-ci-rust:7",
+                "2026-10-06T10:00:00Z", commands_text, "dsc-ci-rust:7",
                 "/workspace", None, None, None, 900)
 
     def _build_db(self, *, pipelines, runs, jobs=()):
@@ -420,6 +440,9 @@ class ReleaseGateContractTests(unittest.TestCase):
     def test_missing_durable_row_fails_closed(self):
         # The lazy-enqueue false green: a succeeded run whose durable rows
         # do not cover the definition, graded by the step-command lists.
+        # The uncovered "test" job is the multi-step fixture job, so this
+        # also proves the durable commands TEXT matches SQLite's compact
+        # json_group_array serialization in both length and order.
         db_path = self._build_db(
             pipelines=[self._pipeline_row()],
             runs=[self._run_row()],
@@ -431,6 +454,31 @@ class ReleaseGateContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("never got a durable row", result.stderr)
             self.assertIn("\ntest\n", result.stderr)
+
+    def test_null_commands_row_cannot_greenwash_coverage(self):
+        # A durable row with NULL commands proves nothing: under SQL
+        # three-valued logic, one NULL in the NOT IN match set turns every
+        # comparison UNKNOWN and would silently pass coverage for the whole
+        # run. Here the count parity and all-succeeded gates both hold
+        # (3 durable rows, 3 definition jobs, all succeeded) and the NULL
+        # row squats on the "test" job's slot — so only the null-safe
+        # coverage check can catch this, and it must fail closed naming the
+        # uncovered definition job, on both readers.
+        db_path = self._build_db(
+            pipelines=[self._pipeline_row()],
+            runs=[self._run_row()],
+            jobs=[self._job_row(commands=DEF_COMMANDS["fmt"]),
+                  self._job_row(commands=DEF_COMMANDS["clippy"]),
+                  self._job_row(commands=None)],
+        )
+        results = self._run_both_backends(db_path)
+        for result in results.values():
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("never got a durable row", result.stderr)
+            self.assertIn("\ntest\n", result.stderr)
+            # The refusal must come from the coverage check, not count
+            # parity — the durable count matches the definition exactly.
+            self.assertNotIn("durable job rows for", result.stderr)
 
     def test_extra_durable_row_fails_closed(self):
         db_path = self._build_db(
