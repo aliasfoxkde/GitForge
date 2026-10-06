@@ -1257,9 +1257,6 @@ async fn run_definition(
     serde_json::from_value(pipeline.config).ok()
 }
 
-/// Durably cancel every not-yet-dispatched job that transitively depends on
-/// a failed, timed-out, or cancelled one, and return the ids cancelled.
-///
 /// Format durable outcome values consistently in user-facing receipts.
 fn pipeline_outcome_label(status: &str) -> &str {
     match status {
@@ -1268,6 +1265,9 @@ fn pipeline_outcome_label(status: &str) -> &str {
     }
 }
 
+/// Durably cancel every not-yet-dispatched job that transitively depends on
+/// a failed, timed-out, or cancelled one, and return the ids cancelled.
+///
 /// `ready_jobs` requires all dependencies to have succeeded, so these rows
 /// can never be dispatched again — leaving them `pending`/`queued` keeps
 /// the run non-terminal forever. Only rows a runner has never touched are
@@ -3421,6 +3421,22 @@ mod tests {
             .unwrap();
     }
 
+    /// Persist a runners row for an id a fixture already hands to
+    /// `assign_job`/`sync_lease`: production dispatch registers the runner
+    /// first, and the durable lease write otherwise trips the
+    /// `jobs.runner_id` foreign key.
+    async fn seed_runner(pool: &gitforge_db::Pool, runner: gitforge_common::RunnerId) {
+        let mut row = gitforge_db::models::Runner::new(
+            format!("test-runner-{runner}"),
+            gitforge_db::models::RunnerType::Docker,
+            1,
+        );
+        row.id = runner;
+        gitforge_db::queries::RunnerQueries::create(pool, &row)
+            .await
+            .unwrap();
+    }
+
     async fn run_status(
         pool: &gitforge_db::Pool,
         run_id: gitforge_common::PipelineRunId,
@@ -4095,6 +4111,7 @@ jobs:
 
         engine.start().await.unwrap();
         let runner = gitforge_common::RunnerId::new();
+        seed_runner(&pool, runner).await;
         engine.assign_job(planned["head"], runner).await.unwrap();
         engine.start_job(planned["head"]).await.unwrap();
         // Model the scheduler dispatch the mirror cannot see: the durable
@@ -4318,6 +4335,7 @@ jobs:
 
         engine.start().await.unwrap();
         let runner = gitforge_common::RunnerId::new();
+        seed_runner(&pool, runner).await;
         // Durable dispatch state the mirror cannot see: head queued,
         // lease-synced, running.
         gitforge_db::queries::JobQueries::update_status(&pool, planned["head"], "queued")
@@ -4453,6 +4471,7 @@ jobs:
 
         let custody = seed_run(&pool, repo_id, pipeline_id, "running").await;
         let runner = gitforge_common::RunnerId::new();
+        seed_runner(&pool, runner).await;
         seed_job(&pool, custody, "lint", "queued").await;
         let jobs = gitforge_db::queries::JobQueries::list_by_run(&pool, custody)
             .await

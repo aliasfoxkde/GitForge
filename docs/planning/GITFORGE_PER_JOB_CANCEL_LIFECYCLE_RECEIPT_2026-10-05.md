@@ -6,9 +6,14 @@ runner notification path, no lease custody, no acknowledgement, and finalizers
 that either ignored the cancelled status or graded it inconsistently.
 **Date:** 2026-10-05
 **Worker branch:** `codex/gitforge-per-job-cancel-lifecycle-20261005`
-**Base:** `bd23be6` (working tree — changes are uncommitted; the parent session
-owns the commit/push and the Fedora GitForge lane)
-**Status:** IMPLEMENTED, TESTS AUTHORED-BUT-NOT-RUN (see Gates below)
+**Base:** origin/main `19daeea`; the branch carries three commits
+(`7eaf889` → `bd23be6` → `e0db7d6`) and the fixture fixes below are still
+uncommitted working-tree changes (the parent session owns the commit/push and
+the Fedora GitForge lane)
+**Status:** IMPLEMENTED; first lane run (`e0db7d6`) red on 5 unpersisted-runner
+test fixtures — all 5 fixture fixes are applied but UNCOMMITTED, and the tests
+have not been rerun (locally or on the lane); lane re-validation pending, see
+Lane Validation below
 
 ---
 
@@ -63,12 +68,20 @@ owns the commit/push and the Fedora GitForge lane)
    all defer while `status='cancelled' AND lease_token IS NOT NULL`, then
    commit the verdict and doomed rows atomically. Unknown status / DB read
    errors defer (fail closed), never finalize.
-6. **Aligned verdict precedence** in all four graders (engine
+6. **Aligned durable-job verdict precedence** across the engine
    `settle_if_all_finished`, scheduler `finalize_pipeline_if_terminal`,
-   services/ci consumer + orphan reconciler): `cancel_requested` (run-level)
-   > `failed`/`timed_out`/`infrastructure_failure` → `failed` > any
-   `cancelled` → `cancelled` > `succeeded`. A restart re-derives the identical
-   verdict.
+   services/ci consumer, and orphan reconciler: a failed, timed-out, or
+   infrastructure-failed job grades `failed`; otherwise any cancelled job
+   grades `cancelled`; otherwise the run succeeds. The engine additionally
+   gives its mirror-only `cancel_requested` flag precedence over those durable
+   job outcomes. **Restart parity holds for
+   per-job cancellation only:** the `cancelled` row verdict is durable, and
+   every grader re-derives the same run verdict from the durable rows.
+   Run-level `cancel_requested` is the documented exception — it lives only
+   in the engine mirror, so a control-plane restart before finalization
+   loses it and the re-derived verdict can differ: remaining jobs run to
+   completion and the run grades `succeeded` where the operator intended
+   `cancelled` (see Remaining Limitations 1).
 7. **Convergence without stranding.** `fence_actions` now fences every
    non-terminal mirror (F6); `CiEngine::cancel_job` cascades doomed
    descendants and settles the run (F7); the services/ci consumer handles a
@@ -95,7 +108,7 @@ owns the commit/push and the Fedora GitForge lane)
 No schema migration was needed: custody reuses the existing
 `lease_token`/`runner_id`/`heartbeat_at` columns.
 
-## Tests Authored (15 — none executed locally; parent submits to the GitForge lane)
+## Tests Authored (15 lifecycle tests plus 6 HTTP contract tests; current diff unvalidated)
 
 | Crate | Test | Pins |
 |-------|------|------|
@@ -114,6 +127,12 @@ No schema migration was needed: custody reuses the existing
 | gitforge-api | `cancelling_a_leased_job_keeps_runner_custody_until_the_lease_is_released` | real POST route, 200 + lease retained + run in custody, repeat 200, wrong runner/token refused, correct ack releases |
 | services/ci | `test_finalize_defers_while_cancelled_job_holds_runner_lease` | durable cancel keeps lease; engine+workspace held; doomed row not terminalized behind custody; ack → verdict+receipts+eviction+workspace release |
 | services/ci | `test_reconcile_grades_infrastructure_failure_and_respects_cancel_custody` | `infrastructure_failure` → `failed` (F8); custody run spared, then `cancelled` after release (restart parity) |
+| gitforge-scheduler HTTP | `test_cancellation_ack_invalid_job_id_is_bad_request` | actual router returns 400 and the invalid-ID error contract |
+| gitforge-scheduler HTTP | `test_cancellation_ack_requires_runner_id` | actual router rejects missing and malformed runner IDs with 400 |
+| gitforge-scheduler HTTP | `test_cancellation_ack_requires_lease_token` | actual router rejects missing lease proof with 400 |
+| gitforge-scheduler HTTP | `test_cancellation_ack_unknown_job_is_not_found` | actual router returns 404 and identifies the requested job |
+| gitforge-scheduler HTTP | `test_cancellation_ack_success_releases_and_consumes_custody` | 200 acknowledgement contract; replay returns 409 |
+| gitforge-scheduler HTTP | `test_cancellation_ack_conflict_does_not_consume_custody` | wrong lease/runner return 409 without consuming genuine custody |
 
 Every test asserts the durable row, run status, lease columns, engine
 registry, and/or workspace custody it is named for. No existing assertion was
@@ -125,12 +144,11 @@ event-match sites).
 
 - `cargo fmt --all` — **ran, exit 0, stable** (`--check` clean on re-run).
 - `git diff --check` — **ran, clean** (no whitespace errors).
-- `cargo test`, `cargo clippy -D warnings`, coverage — **NOT run** per task
-  constraints (no local builds/tests; parent submits to the Fedora GitForge
-  lane `fmt → clippy → test → coverage`). Risk is concentrated in the
-  authored-but-unexecuted tests, not the production paths, which mirror
-  already-tested patterns (conditional UPDATE + outcome read inside one tx;
-  broadcast-after-process_queue ordering handled in the new scheduler tests).
+- No Cargo build, tests, Clippy, or coverage has run on the current working
+  diff. The first GitHub Actions run at `e0db7d6` did execute the original 15
+  lifecycle tests but failed five on unpersisted-runner fixtures; those five
+  fixture corrections and the six new HTTP contract tests remain unvalidated.
+  The required Fedora GitForge lane is `fmt → clippy → test → coverage`.
 
 ## Remaining Limitations
 
@@ -148,3 +166,67 @@ event-match sites).
 4. The stale comment fix in `test_fence_actions_action_and_noise_mapping`
    re-documents the old case (terminal mirror excluded); the new queued-mirror
    test pins the changed behavior next to it.
+
+---
+
+## Lane Validation (2026-10-05 — first lane run, commit `e0db7d6`, PR #264)
+
+**Run:** GitHub Actions mirror, Rust CI
+[`37379916852`](https://github.com/aliasfoxkde/GitForge/actions/runs/37379916852).
+`Test`, `Test (Serialized)`, and `Coverage` all FAILED on the identical test
+set; `Format`, `Clippy`, `Build` green. (The GitForge enqueue jobs skipped —
+known lane wiring, not a code signal.)
+
+**Result:** 5 failing tests across 3 crates, all one failure class — a fixture
+`RunnerId::new()` never persisted to `runners`, tripping the `jobs.runner_id`
+foreign key (SQLite code 787) at the first lease write. No custody assertion
+failed anywhere: every panic is fixture setup, so the production custody
+behavior under test was never reached.
+
+| Failing test | Panic site | Failing call |
+|---|---|---|
+| `scheduler::test_finalize_pipeline_grades_failed_over_cancelled_and_defers_custody` | `assigner.rs:4092` | `assign_with_lease` — "failed to assign job lease" |
+| `cancelling_a_leased_job_keeps_runner_custody_until_the_lease_is_released` | `crates/gitforge-api/tests/ci_routes.rs:635` | `JobQueries::create` with `runner_id = Some(RunnerId::new())` |
+| `test_finalize_cancelled_run_waits_for_live_runner_then_settles` | `services/ci/src/main.rs:4107` | `sync_lease` after `engine.assign_job(RunnerId::new())` |
+| `test_finalize_defers_while_cancelled_job_holds_runner_lease` | `services/ci/src/main.rs:4333` | `sync_lease`, same unpersisted-runner shape |
+| `test_reconcile_grades_infrastructure_failure_and_respects_cancel_custody` | `services/ci/src/main.rs:4464` | `sync_lease`, same unpersisted-runner shape |
+
+### Fixes applied in this update (all 5 fixtures — code only, validation pending)
+
+All five failures share one root cause: a fixture `RunnerId::new()` never
+persisted to `runners`, tripping the `jobs.runner_id` foreign key (SQLite code
+787) at the first durable lease write. Each fix registers the runner through
+the existing persistence helper before that write, mirroring production
+(scheduler register-before-dispatch). Every custody assertion is retained
+verbatim; no production behavior changed.
+
+1. `crates/gitforge-scheduler/src/assigner.rs`
+   (`test_finalize_pipeline_grades_failed_over_cancelled_and_defers_custody`):
+   the runner is registered through the DB-backed scheduler before the lease
+   is assigned — `scheduler.register_runner(make_runner(runner, "custody-runner",
+   "online", 1))` — which persists the row via `RunnerQueries::register_or_refresh`
+   and satisfies the FK for `assign_with_lease`.
+2. `crates/gitforge-api/tests/ci_routes.rs`
+   (`cancelling_a_leased_job_keeps_runner_custody_until_the_lease_is_released`,
+   panic site `ci_routes.rs:635`): the job's runner is now seeded with the
+   file's existing pattern (`Runner::new` + `RunnerQueries::create`, as the
+   logs test already does) and `job.runner_id` references that persisted
+   `runner.id` instead of a bare `RunnerId::new()`. `RunnerId` stays imported
+   for the wrong-runner refusal assertion.
+3. `services/ci/src/main.rs`
+   (`test_finalize_cancelled_run_waits_for_live_runner_then_settles`, site
+   `main.rs:4107`): `seed_runner(&pool, runner)` persists the runner before
+   `sync_lease`.
+4. `services/ci/src/main.rs`
+   (`test_finalize_defers_while_cancelled_job_holds_runner_lease`, site
+   `main.rs:4333`): same `seed_runner` call before `sync_lease`.
+5. `services/ci/src/main.rs`
+   (`test_reconcile_grades_infrastructure_failure_and_respects_cancel_custody`,
+   site `main.rs:4464`): same `seed_runner` call before `sync_lease`.
+
+The three services/ci sites share one new test helper, `seed_runner`
+(`gitforge_db::models::Runner` + `RunnerQueries::create`, the same shape the
+gitforge-db unit tests use), placed beside `seed_job`; the API test uses the
+inline form its neighboring test already established. **None of these edits
+have been executed locally per task constraints — `Test`, `Test (Serialized)`,
+and `Coverage` must be re-run on the lane before this branch is called green.**

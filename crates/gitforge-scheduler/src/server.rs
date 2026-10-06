@@ -2046,6 +2046,216 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// POST the cancellation acknowledgement through the real router with the
+    /// runner credential, so status and response JSON are pinned at the HTTP
+    /// boundary rather than against the handler signature.
+    async fn post_cancellation_ack(
+        app: Router,
+        job_id: &str,
+        body: serde_json::Value,
+    ) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/jobs/{job_id}/cancelled/ack"))
+                .header("authorization", "Bearer runner-secret")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_ack_invalid_job_id_is_bad_request() {
+        let app: Router = scheduler_routes_with_tokens(
+            authenticated_test_state(),
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let response = post_cancellation_ack(
+            app,
+            "not-a-uuid",
+            serde_json::json!({"lease_token": "lease"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_json(response).await;
+        assert_eq!(payload["error"], "invalid_job_id");
+        assert!(
+            payload["message"].as_str().is_some(),
+            "rejection must explain itself: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_ack_requires_runner_id() {
+        let app: Router = scheduler_routes_with_tokens(
+            authenticated_test_state(),
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        // Missing and non-UUID runner identities are the same refusal: the
+        // route can only relinquish custody to a runner it can name.
+        for runner_id in [None, Some("not-a-uuid".to_string())] {
+            let body = match runner_id {
+                Some(runner_id) => {
+                    serde_json::json!({"runner_id": runner_id, "lease_token": "lease"})
+                }
+                None => serde_json::json!({"lease_token": "lease"}),
+            };
+            let response =
+                post_cancellation_ack(app.clone(), &JobId::new().to_string(), body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let payload = response_json(response).await;
+            assert_eq!(payload["error"], "runner_id_required");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_ack_requires_lease_token() {
+        let app: Router = scheduler_routes_with_tokens(
+            authenticated_test_state(),
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let response = post_cancellation_ack(
+            app,
+            &JobId::new().to_string(),
+            serde_json::json!({"runner_id": RunnerId::new().to_string()}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_json(response).await;
+        assert_eq!(payload["error"], "lease_token_required");
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_ack_unknown_job_is_not_found() {
+        let app: Router = scheduler_routes_with_tokens(
+            authenticated_test_state(),
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let unknown_job = JobId::new();
+        let response = post_cancellation_ack(
+            app,
+            &unknown_job.to_string(),
+            serde_json::json!({
+                "runner_id": RunnerId::new().to_string(),
+                "lease_token": "lease",
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let payload = response_json(response).await;
+        assert_eq!(payload["error"], "job_not_found");
+        assert_eq!(payload["job_id"], unknown_job.to_string());
+    }
+
+    /// The executing runner's correct proof relinquishes custody: 200 with
+    /// the acknowledgement receipt, and the custody is consumed — a repeat
+    /// acknowledgement is a conflict, not a second success.
+    #[tokio::test]
+    async fn test_cancellation_ack_success_releases_and_consumes_custody() {
+        let (state, job_id, runner_id, lease) = assigned_job_with_lease("ack-runner").await;
+        state.scheduler.cancel(job_id).await;
+        let app: Router = scheduler_routes_with_tokens(
+            state,
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let response = post_cancellation_ack(
+            app.clone(),
+            &job_id.to_string(),
+            serde_json::json!({
+                "runner_id": runner_id.to_string(),
+                "lease_token": lease,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["contract_version"], "harness.job.v1");
+        assert_eq!(payload["job_id"], job_id.to_string());
+        assert_eq!(payload["acknowledged"], true);
+
+        let repeat = post_cancellation_ack(
+            app,
+            &job_id.to_string(),
+            serde_json::json!({
+                "runner_id": runner_id.to_string(),
+                "lease_token": lease,
+            }),
+        )
+        .await;
+        assert_eq!(repeat.status(), StatusCode::CONFLICT);
+        let payload = response_json(repeat).await;
+        assert_eq!(payload["error"], "cancellation_lease_not_outstanding");
+        assert_eq!(payload["job_id"], job_id.to_string());
+    }
+
+    /// A forged proof is a conflict that changes nothing: the real custody
+    /// must still be outstanding afterwards, so the genuine runner can hand
+    /// the job back. The same refusal covers a spent (already acknowledged
+    /// or reaped) lease.
+    #[tokio::test]
+    async fn test_cancellation_ack_conflict_does_not_consume_custody() {
+        let (state, job_id, runner_id, lease) =
+            assigned_job_with_lease("ack-conflict-runner").await;
+        state.scheduler.cancel(job_id).await;
+        let app: Router = scheduler_routes_with_tokens(
+            state,
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+
+        let wrong_lease = post_cancellation_ack(
+            app.clone(),
+            &job_id.to_string(),
+            serde_json::json!({
+                "runner_id": runner_id.to_string(),
+                "lease_token": "superseded-lease",
+            }),
+        )
+        .await;
+        assert_eq!(wrong_lease.status(), StatusCode::CONFLICT);
+        let payload = response_json(wrong_lease).await;
+        assert_eq!(payload["error"], "cancellation_lease_not_outstanding");
+
+        let foreign_runner = post_cancellation_ack(
+            app.clone(),
+            &job_id.to_string(),
+            serde_json::json!({
+                "runner_id": RunnerId::new().to_string(),
+                "lease_token": lease,
+            }),
+        )
+        .await;
+        assert_eq!(foreign_runner.status(), StatusCode::CONFLICT);
+
+        // Neither forged attempt spent the custody record.
+        let genuine = post_cancellation_ack(
+            app,
+            &job_id.to_string(),
+            serde_json::json!({
+                "runner_id": runner_id.to_string(),
+                "lease_token": lease,
+            }),
+        )
+        .await;
+        assert_eq!(genuine.status(), StatusCode::OK);
+        assert_eq!(response_json(genuine).await["acknowledged"], true);
+    }
+
     #[tokio::test]
     async fn test_operator_submit_unknown_pipeline_run_is_not_found() {
         let pool = gitforge_db::Pool::memory().await.unwrap();

@@ -4086,7 +4086,12 @@ mod tests {
         let custody_run = seed_cancel_run(&pool, "grade-custody").await;
         let green = seed_cancel_job(&pool, custody_run, "green", "succeeded").await;
         let held = seed_cancel_job(&pool, custody_run, "held", "queued").await;
+        // The lease columns carry a foreign key into `runners`, so custody
+        // needs a durably registered runner before it can be assigned.
         let runner = gitforge_common::RunnerId::new();
+        scheduler
+            .register_runner(make_runner(runner, "custody-runner", "online", 1))
+            .await;
         gitforge_db::queries::JobQueries::assign_with_lease(&pool, held, runner, "lease-custody")
             .await
             .unwrap();

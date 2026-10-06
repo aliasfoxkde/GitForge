@@ -1452,10 +1452,13 @@ impl RunnerAgent {
 
         if orphaned.load(std::sync::atomic::Ordering::Relaxed) {
             // The scheduler finalized this job while we were executing it
-            // (operator cancellation, or restart recovery re-queuing the
-            // row and failing the in-flight execution). The lease no longer
-            // exists, so log chunks, artifacts, and a completion POST would
-            // all be rejected 409; stop here instead of writing noise.
+            // (operator cancellation, or restart recovery fencing the
+            // row and failing the in-flight execution). The durable row is
+            // terminal either way, so log chunks, artifacts, and a
+            // completion POST would all be rejected 409; stop here instead
+            // of writing noise. What differs is custody: a cancellation
+            // retains this lease until the acknowledgement below, while
+            // restart recovery cleared it when it fenced the row.
             tracing::warn!(
                 job_id = %assignment.job_id,
                 "job outcome was decided by the scheduler mid-execution; \
@@ -1604,11 +1607,14 @@ struct JobChannel<'a> {
 ///
 /// The scheduler owns the durable outcome: an operator cancellation and a
 /// restart-recovery failure both surface here as `cancelled: true`, because
-/// in both cases the lease is gone and finishing the execution can only
-/// produce requests the scheduler rejects. Three consecutive probe failures
-/// also stop the sandbox — a scheduler that cannot be asked about the job
-/// must not leave it running unobserved — but do not mark the execution
-/// orphaned, since the outcome is unknown rather than decided.
+/// the durable row is terminal either way and finishing the execution can
+/// only produce requests the scheduler rejects. The two differ in custody,
+/// not in the probe: a cancellation keeps this runner's lease until the
+/// explicit acknowledgement (or the abandoned-lease reaper), while restart
+/// recovery clears it when it fences the row. Three consecutive probe
+/// failures also stop the sandbox — a scheduler that cannot be asked about
+/// the job must not leave it running unobserved — but do not mark the
+/// execution orphaned, since the outcome is unknown rather than decided.
 pub(crate) async fn run_cancellation_watch<S, Fut>(
     config: CancellationWatchConfig,
     probe_interval: Duration,

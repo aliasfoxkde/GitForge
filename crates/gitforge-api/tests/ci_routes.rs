@@ -627,9 +627,13 @@ async fn cancelling_a_leased_job_keeps_runner_custody_until_the_lease_is_release
     // expires it). Finalization defers on exactly this condition, so the
     // API surface must never clear the columns itself.
     let f = seed().await;
+    // The dispatching scheduler has registered the runner, so the durable
+    // row's runner_id must reference a persisted row (jobs.runner_id FK).
+    let runner = Runner::new("custody-runner".to_string(), RunnerType::Docker, 1);
+    RunnerQueries::create(&f.pool, &runner).await.unwrap();
     let mut job = Job::new(f.run_id, "leased-job".to_string());
     job.status = JobStatus::Assigned.as_str().to_string();
-    job.runner_id = Some(RunnerId::new());
+    job.runner_id = Some(runner.id);
     job.lease_token = Some("lease-held-by-runner".to_string());
     let job_id = job.id;
     JobQueries::create(&f.pool, &job).await.unwrap();
