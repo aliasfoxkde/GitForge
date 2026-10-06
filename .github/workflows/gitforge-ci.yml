@@ -37,7 +37,10 @@ jobs:
   # Enqueue build job to GitForge queue instead of running directly
   enqueue-build:
     name: Enqueue Build to GitForge
-    if: vars.GITFORGE_ENABLED == 'true'
+    if: >-
+      vars.GITFORGE_ENABLED == 'true' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, linux, x64, gitforge-github]
     outputs:
       run_id: ${{ steps.enqueue.outputs.run_id }}
@@ -69,18 +72,12 @@ jobs:
           PUSH_REF: ${{ github.ref_name }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_SHA: ${{ github.sha }}
-          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            if [[ "$PR_HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
-              echo "GitForge CI supports same-repository pull requests only; fork head is not present in the canonical mirror" >&2
-              exit 1
-            fi
             REF_NAME="$PR_HEAD_REF"
             OLD_HASH="$PR_BASE_SHA"
             NEW_HASH="$PR_HEAD_SHA"
@@ -174,7 +171,10 @@ jobs:
   report-status:
     name: Report Build Status
     needs: [enqueue-build, poll-build]
-    if: always() && vars.GITFORGE_ENABLED == 'true'
+    if: >-
+      always() && vars.GITFORGE_ENABLED == 'true' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - name: Report completion

@@ -36,12 +36,14 @@ class GitForgeCiContractTests(unittest.TestCase):
         self.assertNotIn('--arg ref "${{ github.ref_name }}"', self.workflow)
         self.assertNotIn('--arg old "${{ github.event.before }}"', self.workflow)
 
-    def test_fork_pull_requests_fail_closed(self) -> None:
-        self.assertIn('if [[ "$PR_HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then', self.workflow)
-        self.assertIn("same-repository pull requests only", self.workflow)
+    def test_fork_pull_requests_skip_mirror_only_bridge(self) -> None:
+        fork_gate = "github.event.pull_request.head.repo.full_name == github.repository"
+        self.assertGreaterEqual(self.workflow.count(fork_gate), 2)
+        self.assertIn("github.event_name != 'pull_request'", self.workflow)
+        self.assertIn("same-repository pull requests", self.setup)
 
     def test_bridge_remains_opt_in_and_setup_docs_match_credentials(self) -> None:
-        self.assertIn("if: vars.GITFORGE_ENABLED == 'true'", self.workflow)
+        self.assertGreaterEqual(self.workflow.count("vars.GITFORGE_ENABLED == 'true'"), 2)
         self.assertIn("`GITFORGE_CI_TRIGGER_TOKEN` | secret", self.setup)
         self.assertIn("`GITFORGE_SCHEDULER_OPERATOR_TOKEN` | secret", self.setup)
         self.assertNotIn("GITFORGE_API_URL", self.workflow)

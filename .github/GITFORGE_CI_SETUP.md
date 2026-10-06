@@ -32,8 +32,9 @@ For push and tag events, the workflow forwards GitHub's short ref name and commi
 range. For same-repository pull requests, it forwards the mirrored head branch
 (`head-ref`), base SHA, and head SHA; GitHub's synthetic
 `<number>/merge` ref is not a GitForge mirror ref. Fork pull requests fail
-closed because the canonical GitForge mirror does not contain the fork's head
-branch. Before enabling this event path, verify that the mirror synchronizes
+skipped because the canonical GitForge mirror does not contain the fork's head
+branch; ordinary GitHub checks remain responsible for fork contributions.
+Before enabling this event path, verify that the mirror synchronizes
 same-repository feature branches as well as protected branches.
 
 The trigger service can accept an event without returning a durable run ID
