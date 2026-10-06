@@ -11,6 +11,9 @@ on:
       - '**/Cargo.lock'
       - 'supply-chain/**'
       - '.github/workflows/rust-ci.yml'
+      - '.github/workflows/gitforge-ci.yml'
+      - '.github/GITFORGE_CI_SETUP.md'
+      - 'tests/test_gitforge_ci_contract.py'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -74,6 +77,8 @@ jobs:
         run: |
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           ~/go/bin/actionlint -color
+      - name: Test GitForge workflow contract
+        run: python3 tests/test_gitforge_ci_contract.py
 
   # ─── Testing ────────────────────────────────────────────────────────────────
   # This runner shares the NAS Docker daemon with GitForge CI sandbox jobs.
