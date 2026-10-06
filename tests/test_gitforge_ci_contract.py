@@ -27,6 +27,19 @@ class GitForgeCiContractTests(unittest.TestCase):
             self.workflow,
         )
 
+    def test_pull_request_uses_mirrored_head_branch_and_commit_range(self) -> None:
+        self.assertIn('if [[ "$EVENT_NAME" == "pull_request" ]]; then', self.workflow)
+        self.assertIn('REF_NAME="$PR_HEAD_REF"', self.workflow)
+        self.assertIn('OLD_HASH="$PR_BASE_SHA"', self.workflow)
+        self.assertIn('NEW_HASH="$PR_HEAD_SHA"', self.workflow)
+        self.assertIn('REF_NAME="$PUSH_REF"', self.workflow)
+        self.assertNotIn('--arg ref "${{ github.ref_name }}"', self.workflow)
+        self.assertNotIn('--arg old "${{ github.event.before }}"', self.workflow)
+
+    def test_fork_pull_requests_fail_closed(self) -> None:
+        self.assertIn('if [[ "$PR_HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then', self.workflow)
+        self.assertIn("same-repository pull requests only", self.workflow)
+
     def test_bridge_remains_opt_in_and_setup_docs_match_credentials(self) -> None:
         self.assertIn("if: vars.GITFORGE_ENABLED == 'true'", self.workflow)
         self.assertIn("`GITFORGE_CI_TRIGGER_TOKEN` | secret", self.setup)

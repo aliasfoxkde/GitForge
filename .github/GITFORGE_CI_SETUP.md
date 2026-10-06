@@ -28,6 +28,21 @@ credential roles from drifting. The workflow refuses to bypass GitForge when
 enqueue or polling fails. Until all configuration is independently verified
 and `GITFORGE_ENABLED=true` is explicitly set, it skips the bridge.
 
+For push and tag events, the workflow forwards GitHub's short ref name and commit
+range. For same-repository pull requests, it forwards the mirrored head branch
+(`head-ref`), base SHA, and head SHA; GitHub's synthetic
+`<number>/merge` ref is not a GitForge mirror ref. Fork pull requests fail
+closed because the canonical GitForge mirror does not contain the fork's head
+branch. Before enabling this event path, verify that the mirror synchronizes
+same-repository feature branches as well as protected branches.
+
+The trigger service can accept an event without returning a durable run ID
+when correlation expires under load. The workflow treats that response as a
+failure and does not retry the trigger (which could create duplicate builds)
+or report a passing GitForge gate. A durable event-to-run lookup or idempotent
+trigger contract is required before treating this bridge as resilient under
+queue contention.
+
 The Fedora-native GitForge path remains the source-of-truth CI path for local
 Git pushes. The GitHub workflow is only an integration bridge and must not be
 treated as proof of Fedora service health.

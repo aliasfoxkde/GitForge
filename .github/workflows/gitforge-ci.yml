@@ -64,16 +64,40 @@ jobs:
           }
       - name: Enqueue build job
         id: enqueue
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_REF: ${{ github.ref_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # Trigger the GitForge CI service. The service returns the durable
-          # pipeline-run ID; polling the API by pipeline ID was a protocol
-          # mismatch and could never observe the created run.
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            if [[ "$PR_HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+              echo "GitForge CI supports same-repository pull requests only; fork head is not present in the canonical mirror" >&2
+              exit 1
+            fi
+            REF_NAME="$PR_HEAD_REF"
+            OLD_HASH="$PR_BASE_SHA"
+            NEW_HASH="$PR_HEAD_SHA"
+          else
+            REF_NAME="$PUSH_REF"
+            OLD_HASH="$PUSH_BEFORE"
+            NEW_HASH="$PUSH_SHA"
+          fi
+
+          # Trigger the GitForge CI service. Poll by the durable run ID; a
+          # queued response without that ID fails closed rather than duplicating
+          # a trigger or claiming a build result that cannot be observed.
           PAYLOAD=$(jq -n \
             --arg repo "$GITFORGE_REPO_ID" \
-            --arg ref "${{ github.ref_name }}" \
-            --arg old "${{ github.event.before }}" \
-            --arg new "${{ github.sha }}" \
+            --arg ref "$REF_NAME" \
+            --arg old "$OLD_HASH" \
+            --arg new "$NEW_HASH" \
             '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "$GITFORGE_SCHEDULER_URL/pipelines/trigger" \
