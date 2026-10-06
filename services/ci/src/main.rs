@@ -2826,6 +2826,8 @@ mod tests {
                 owner_id: user.id,
                 visibility: "private".to_string(),
                 git_path: "/git/fail-run-test".to_string(),
+                required_checks: Vec::new(),
+                deny_non_fast_forward: false,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             },
