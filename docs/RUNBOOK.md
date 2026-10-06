@@ -122,6 +122,20 @@ cargo run -p ci
 - Hosts scheduler HTTP API on port 42781
 - Assigns jobs to runners
 
+Each workspace-prep git command (adopt checkout, clean, clone, checkout)
+runs under a wall-clock budget; a hung child is killed and the run is
+graded `failed` with the cause recorded on the run row (visible as
+`error` in the run's API/CLI output).
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `GITFORGE_WORKSPACE_PREP_TIMEOUT_SECS` | No | `300` | Per-command budget for workspace prep. Raise it on hosts that legitimately clone multi-gigabyte repositories; `0`/invalid values fall back to the default. |
+
+Failed runs carry their cause in the `error` field of
+`GET /api/v1/ci/pipeline-runs/{id}`, and a run that ends `failed` or
+`cancelled` sweeps its never-dispatched (`pending`/`queued`) job rows to
+`cancelled`, so no zombie rows outlive a terminal run.
+
 ### 4. Runner Agent
 
 The runner agent executes jobs in Docker containers.

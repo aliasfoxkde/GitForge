@@ -131,6 +131,9 @@ fn hydrate_pipeline_run(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::P
         started_at: parse_optional_timestamp_column(&row, "started_at")?,
         finished_at: parse_optional_timestamp_column(&row, "finished_at")?,
         created_at: parse_timestamp_column(&row, "created_at")?,
+        error: row
+            .try_get("error")
+            .map_err(|error| Error::database(format!("invalid pipeline run error: {error}")))?,
     })
 }
 
@@ -717,8 +720,8 @@ impl PipelineRunQueries {
     pub async fn create(pool: &Pool, run: &crate::models::PipelineRun) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(run.id.to_string())
@@ -730,6 +733,7 @@ impl PipelineRunQueries {
         .bind(run.started_at.map(|dt| dt.to_rfc3339()))
         .bind(run.finished_at.map(|dt| dt.to_rfc3339()))
         .bind(run.created_at.to_rfc3339())
+        .bind(&run.error)
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline run: {e}")))?;
@@ -761,18 +765,36 @@ impl PipelineRunQueries {
     /// Re-writing the same terminal status stays allowed (idempotent
     /// re-finalize after a restart).
     pub async fn update_status(pool: &Pool, id: PipelineRunId, status: &str) -> Result<()> {
+        Self::update_status_with_error(pool, id, status, None).await
+    }
+
+    /// Update pipeline run status, optionally recording the cause of a
+    /// non-success verdict.
+    ///
+    /// Same terminal-verdict guard as [`Self::update_status`]. A supplied
+    /// error lands on the run row so a failed run explains itself in the API
+    /// without log access; a reason-less rewrite of the same status never
+    /// erases a previously recorded reason (first cause wins).
+    pub async fn update_status_with_error(
+        pool: &Pool,
+        id: PipelineRunId,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
         let finished_at = matches!(
             status,
             "succeeded" | "failed" | "cancelled" | "timed_out" | "timeout" | "timed-out"
         )
         .then(|| Utc::now().to_rfc3339());
         let result = sqlx::query(
-            "UPDATE pipeline_runs SET status = ?, finished_at = COALESCE(finished_at, ?) \
+            "UPDATE pipeline_runs SET status = ?, finished_at = COALESCE(finished_at, ?), \
+             error = COALESCE(?, error) \
              WHERE id = ? AND (status IS NULL OR status NOT IN \
              ('succeeded','failed','cancelled','timed_out','timeout','timed-out') OR status = ?)",
         )
         .bind(status)
         .bind(finished_at.clone())
+        .bind(error)
         .bind(id.to_string())
         .bind(status)
         .execute(pool.pool())
@@ -1244,6 +1266,30 @@ impl JobQueries {
             .await
             .map_err(|e| Error::database(format!("failed to update job status: {e}")))?;
         Ok(())
+    }
+
+    /// Cancel every never-dispatched (`pending`/`queued`) job of one run and
+    /// return how many rows changed.
+    ///
+    /// When a run's lifecycle ends in `failed`/`cancelled`, the rows that
+    /// were planned but never dispatched must not outlive it: the run is
+    /// terminal, so nothing will ever release their stage, and a zombie
+    /// `pending` row both misstates the run's history and keeps `GET
+    /// /pipeline-runs/{id}/jobs` showing work that can never run. Only
+    /// runner-untouched states are swept, matching `cancel_doomed_rows` —
+    /// `assigned`/`running` rows belong to the runner lifecycle.
+    pub async fn cancel_unclaimed_for_run(pool: &Pool, run_id: PipelineRunId) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = ?, finished_at = COALESCE(finished_at, ?) \
+             WHERE pipeline_run_id = ? AND status IN ('pending', 'queued')",
+        )
+        .bind(JobStatus::Cancelled.as_str())
+        .bind(Utc::now().to_rfc3339())
+        .bind(run_id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to cancel unclaimed jobs: {e}")))?;
+        Ok(result.rows_affected())
     }
 
     /// Requeue an assigned job and clear its runner fencing token.
@@ -3183,6 +3229,154 @@ mod tests {
             .await
             .unwrap();
         assert!(PipelineRunQueries::get(&pool, run.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_run_failure_reason_persists() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "owner".to_string(),
+            "owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "test-repo".to_string(),
+            user.id,
+            "/git/test-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "Test Pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        // A fresh run carries no failure reason.
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.error, None);
+
+        // Failing with a reason records it alongside the terminal verdict.
+        let reason = "workspace clone exceeded its time budget and was killed";
+        PipelineRunQueries::update_status_with_error(&pool, run.id, "failed", Some(reason))
+            .await
+            .unwrap();
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "failed");
+        assert_eq!(found.error.as_deref(), Some(reason));
+        assert!(found.finished_at.is_some());
+
+        // A reason-less rewrite of the same status never erases the cause.
+        PipelineRunQueries::update_status(&pool, run.id, "failed")
+            .await
+            .unwrap();
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.error.as_deref(), Some(reason));
+
+        // The terminal-verdict guard still holds with the error variant.
+        PipelineRunQueries::update_status_with_error(&pool, run.id, "succeeded", None)
+            .await
+            .unwrap();
+        let found = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.status, "failed");
+        assert_eq!(found.error.as_deref(), Some(reason));
+    }
+
+    #[tokio::test]
+    async fn test_job_queries_cancel_unclaimed_for_run() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "owner".to_string(),
+            "owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "test-repo".to_string(),
+            user.id,
+            "/git/test-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "Test Pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        let pending = crate::models::Job::new(run.id, "pending-job".to_string());
+        let mut queued = crate::models::Job::new(run.id, "queued-job".to_string());
+        queued.status = JobStatus::Queued.as_str().to_string();
+        let running = crate::models::Job::new(run.id, "running-job".to_string());
+        let done = crate::models::Job::new(run.id, "done-job".to_string());
+        for job in [&pending, &queued, &running, &done] {
+            JobQueries::create(&pool, job).await.unwrap();
+        }
+        JobQueries::update_status(&pool, running.id, "running")
+            .await
+            .unwrap();
+        JobQueries::update_status(&pool, done.id, "succeeded")
+            .await
+            .unwrap();
+
+        // Only the runner-untouched rows are swept.
+        let swept = JobQueries::cancel_unclaimed_for_run(&pool, run.id)
+            .await
+            .unwrap();
+        assert_eq!(swept, 2);
+
+        let swept_row = JobQueries::get(&pool, pending.id).await.unwrap().unwrap();
+        assert_eq!(swept_row.status, "cancelled");
+        assert!(swept_row.finished_at.is_some());
+        let swept_row = JobQueries::get(&pool, queued.id).await.unwrap().unwrap();
+        assert_eq!(swept_row.status, "cancelled");
+        let untouched = JobQueries::get(&pool, running.id).await.unwrap().unwrap();
+        assert_eq!(untouched.status, "running");
+        let untouched = JobQueries::get(&pool, done.id).await.unwrap().unwrap();
+        assert_eq!(untouched.status, "succeeded");
+
+        // A second sweep over an already-terminal run is a no-op.
+        let swept = JobQueries::cancel_unclaimed_for_run(&pool, run.id)
+            .await
+            .unwrap();
+        assert_eq!(swept, 0);
     }
 
     #[tokio::test]

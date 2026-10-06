@@ -685,7 +685,8 @@ pub fn get_openapi_spec() -> serde_json::Value {
                         "commit_hash": {"type": "string"},
                         "triggered_by": {"type": "string"},
                         "started_at": {"type": "string", "nullable": true},
-                        "finished_at": {"type": "string", "nullable": true}
+                        "finished_at": {"type": "string", "nullable": true},
+                        "error": {"type": "string", "nullable": true}
                     }
                 },
                 "JobResponse": {

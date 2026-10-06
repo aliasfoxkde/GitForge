@@ -30,6 +30,9 @@ pub struct PipelineRunResponse {
     pub triggered_by: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    /// Durable cause for a non-success verdict; absent for successes and
+    /// runs that predate the column.
+    pub error: Option<String>,
 }
 
 /// Job response
@@ -702,7 +705,8 @@ async fn list_pipeline_runs(
                         "commit_hash": r.commit_hash,
                         "triggered_by": r.triggered_by,
                         "started_at": r.started_at.map(|dt| dt.to_rfc3339()),
-                        "finished_at": r.finished_at.map(|dt| dt.to_rfc3339())
+                        "finished_at": r.finished_at.map(|dt| dt.to_rfc3339()),
+                        "error": r.error
                     }));
                 }
             }
@@ -745,7 +749,8 @@ async fn get_pipeline_run(
                                 "commit_hash": run.commit_hash,
                                 "triggered_by": run.triggered_by,
                                 "started_at": run.started_at.map(|dt| dt.to_rfc3339()),
-                                "finished_at": run.finished_at.map(|dt| dt.to_rfc3339())
+                                "finished_at": run.finished_at.map(|dt| dt.to_rfc3339()),
+                                "error": run.error
                             })),
                         )
                             .into_response(),
@@ -1267,7 +1272,8 @@ mod tests {
     use super::*;
 
     /// The run listing wire contract: exact field names with timestamps
-    /// rendered only once the run has started and finished.
+    /// rendered only once the run has started and finished, and the failure
+    /// reason present only when a finalizer recorded one.
     #[test]
     fn pipeline_run_response_wire_contract() {
         let json = serde_json::to_value(PipelineRunResponse {
@@ -1278,6 +1284,7 @@ mod tests {
             triggered_by: "webhook".to_string(),
             started_at: Some("2026-01-01T00:00:00Z".to_string()),
             finished_at: Some("2026-01-01T00:05:00Z".to_string()),
+            error: None,
         })
         .unwrap();
         assert_eq!(
@@ -1289,8 +1296,26 @@ mod tests {
                 "commit_hash": "a".repeat(40),
                 "triggered_by": "webhook",
                 "started_at": "2026-01-01T00:00:00Z",
-                "finished_at": "2026-01-01T00:05:00Z"
+                "finished_at": "2026-01-01T00:05:00Z",
+                "error": null
             })
+        );
+
+        let json = serde_json::to_value(PipelineRunResponse {
+            id: "run-2".to_string(),
+            pipeline_id: "pipe-1".to_string(),
+            status: "failed".to_string(),
+            commit_hash: "a".repeat(40),
+            triggered_by: "push".to_string(),
+            started_at: None,
+            finished_at: Some("2026-01-01T00:05:00Z".to_string()),
+            error: Some("workspace clone exceeded its time budget".to_string()),
+        })
+        .unwrap();
+        assert_eq!(json["status"], "failed");
+        assert_eq!(
+            json["error"],
+            "workspace clone exceeded its time budget".to_string()
         );
     }
 

@@ -2398,6 +2398,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 created_at: chrono::Utc::now(),
+                error: None,
             },
         )
         .await

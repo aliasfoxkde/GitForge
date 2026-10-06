@@ -185,6 +185,7 @@ impl Pool {
                 started_at TEXT,
                 finished_at TEXT,
                 created_at TEXT NOT NULL,
+                error TEXT,
                 FOREIGN KEY (pipeline_id) REFERENCES pipelines(id),
                 FOREIGN KEY (repo_id) REFERENCES repositories(id)
             )
@@ -193,6 +194,22 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline_runs table: {e}")))?;
+
+        // Durable cause for a non-success run verdict. A planning-stage
+        // failure (workspace prep, job planning) produces a run with zero
+        // job rows, and a job-backed failure leaves the reason only in the
+        // process log, which is unreadable after the fact. SQLite has no
+        // portable IF NOT EXISTS form for ADD COLUMN, so tolerate only the
+        // known duplicate-column case.
+        for statement in ["ALTER TABLE pipeline_runs ADD COLUMN error TEXT"] {
+            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
+                if !error.to_string().contains("duplicate column name") {
+                    return Err(Error::database(format!(
+                        "failed to migrate pipeline_runs table: {error}"
+                    )));
+                }
+            }
+        }
 
         // Create runners table
         sqlx::query(
