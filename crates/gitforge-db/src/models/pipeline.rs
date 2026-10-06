@@ -70,6 +70,10 @@ pub struct PipelineRun {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Durable cause for a non-success verdict, written by whichever layer
+    /// finalized the run. `None` for successes and for runs that predate
+    /// the column.
+    pub error: Option<String>,
 }
 
 impl PipelineRun {
@@ -90,6 +94,7 @@ impl PipelineRun {
             started_at: None,
             finished_at: None,
             created_at: Utc::now(),
+            error: None,
         }
     }
 

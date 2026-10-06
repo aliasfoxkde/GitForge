@@ -141,6 +141,9 @@ pub struct PipelineRunResponse {
     pub triggered_by: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    /// Durable cause for a non-success verdict; absent on successes.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Job response

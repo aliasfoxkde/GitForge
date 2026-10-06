@@ -382,7 +382,13 @@ async fn trigger_pipeline(
             match JobQueries::get_idempotency(&pool, &scope, &idempotency_key).await {
                 Ok(Some((existing_job_id, stored_fingerprint))) => {
                     if stored_fingerprint != fingerprint {
-                        let _ = PipelineRunQueries::update_status(&pool, run_id, "failed").await;
+                        let _ = PipelineRunQueries::update_status_with_error(
+                            &pool,
+                            run_id,
+                            "failed",
+                            Some("webhook idempotency key reused with a different job"),
+                        )
+                        .await;
                         return (
                             StatusCode::CONFLICT,
                             Json(WebhookTriggerResponse {
@@ -462,9 +468,13 @@ async fn trigger_pipeline(
                                         .into_response();
                                 }
                                 Ok(None) | Err(_) => {
-                                    let _ =
-                                        PipelineRunQueries::update_status(&pool, run_id, "failed")
-                                            .await;
+                                    let _ = PipelineRunQueries::update_status_with_error(
+                                        &pool,
+                                        run_id,
+                                        "failed",
+                                        Some("webhook idempotency reservation race could not be reconciled"),
+                                    )
+                                    .await;
                                     return (
                                         StatusCode::CONFLICT,
                                         Json(WebhookTriggerResponse {
@@ -479,8 +489,13 @@ async fn trigger_pipeline(
                             }
                         }
                         Err(error) => {
-                            let _ =
-                                PipelineRunQueries::update_status(&pool, run_id, "failed").await;
+                            let _ = PipelineRunQueries::update_status_with_error(
+                                &pool,
+                                run_id,
+                                "failed",
+                                Some("failed to reserve webhook job idempotency key"),
+                            )
+                            .await;
                             tracing::error!(%error, %pipeline_id, "failed to reserve webhook job idempotency key");
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -503,7 +518,13 @@ async fn trigger_pipeline(
                     if let Err(error) = JobQueries::create(&pool, &job).await {
                         let _ =
                             JobQueries::delete_idempotency(&pool, &scope, &idempotency_key).await;
-                        let _ = PipelineRunQueries::update_status(&pool, run_id, "failed").await;
+                        let _ = PipelineRunQueries::update_status_with_error(
+                            &pool,
+                            run_id,
+                            "failed",
+                            Some("failed to persist webhook job"),
+                        )
+                        .await;
                         tracing::error!(%error, %pipeline_id, "failed to persist webhook job");
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -518,7 +539,13 @@ async fn trigger_pipeline(
                     tracing::info!(%job_id, %pipeline_id, "Persisted webhook job in durable queue");
                 }
                 Err(error) => {
-                    let _ = PipelineRunQueries::update_status(&pool, run_id, "failed").await;
+                    let _ = PipelineRunQueries::update_status_with_error(
+                        &pool,
+                        run_id,
+                        "failed",
+                        Some("failed to inspect webhook idempotency key"),
+                    )
+                    .await;
                     tracing::error!(%error, %pipeline_id, "failed to inspect webhook idempotency key");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,

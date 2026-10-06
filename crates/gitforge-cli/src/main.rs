@@ -261,6 +261,9 @@ async fn watch_pipeline_run(client: &GitForgeClient, run_id: &str) -> Result<Str
         let run = client.get_pipeline_run(run_id).await?;
         println!("   run {} — {}", run.id, run.status);
         if terminal.contains(&run.status.as_str()) {
+            if let Some(error) = &run.error {
+                println!("   reason: {error}");
+            }
             return Ok(run.status);
         }
         tokio::time::sleep(std::time::Duration::from_secs(WATCH_POLL_SECS)).await;

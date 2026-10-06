@@ -1420,24 +1420,21 @@ async fn prepare_run_workspace(
         // run this way). Adopt the directory instead: force the tracked tree
         // back to the run's commit and clear job leftovers so a resumed
         // stage sees fresh-checkout state.
-        let repair = tokio::process::Command::new("git")
+        let mut repair = tokio::process::Command::new("git");
+        repair
             .arg("-C")
             .arg(&workspace)
-            .args(["checkout", "--force", "--detach", commit_hash])
-            .output()
-            .await?;
+            .args(["checkout", "--force", "--detach", commit_hash]);
+        let repair = run_git_output(repair, "adopt checkout", workspace_prep_timeout()).await?;
         if !repair.status.success() {
             return Err(anyhow::anyhow!(
                 "workspace for run {run_id} exists but could not be adopted at commit {commit_hash}: {}",
                 String::from_utf8_lossy(&repair.stderr).trim()
             ));
         }
-        let clean = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&workspace)
-            .args(["clean", "-fdx"])
-            .output()
-            .await?;
+        let mut clean = tokio::process::Command::new("git");
+        clean.arg("-C").arg(&workspace).args(["clean", "-fdx"]);
+        let clean = run_git_output(clean, "adopt clean", workspace_prep_timeout()).await?;
         if !clean.status.success() {
             return Err(anyhow::anyhow!(
                 "workspace for run {run_id} adopted but could not be cleaned: {}",
@@ -1451,14 +1448,14 @@ async fn prepare_run_workspace(
     // Do not request Git's hard-link-based local clone optimization here.
     // Workspace and repository storage may be mounted with policies that
     // reject hard links; a regular clone is portable across those filesystems.
-    let clone = tokio::process::Command::new("git")
-        // --no-local: avoid hard links and local-object alternates for
-        // portability across protected or differently-owned storage.
+    let mut clone = tokio::process::Command::new("git");
+    // --no-local: avoid hard links and local-object alternates for
+    // portability across protected or differently-owned storage.
+    clone
         .args(["clone", "--no-local", "--no-checkout"])
         .arg(&source)
-        .arg(&workspace)
-        .output()
-        .await?;
+        .arg(&workspace);
+    let clone = run_git_output(clone, "clone", workspace_prep_timeout()).await?;
     if !clone.status.success() {
         return Err(anyhow::anyhow!(
             "checkout clone failed for run {}: {}",
@@ -1467,12 +1464,12 @@ async fn prepare_run_workspace(
         ));
     }
 
-    let checkout = tokio::process::Command::new("git")
+    let mut checkout = tokio::process::Command::new("git");
+    checkout
         .arg("-C")
         .arg(&workspace)
-        .args(["checkout", "--detach", commit_hash])
-        .output()
-        .await?;
+        .args(["checkout", "--detach", commit_hash]);
+    let checkout = run_git_output(checkout, "checkout", workspace_prep_timeout()).await?;
     if !checkout.status.success() {
         return Err(anyhow::anyhow!(
             "checkout commit {} failed for run {}: {}",
@@ -1483,6 +1480,53 @@ async fn prepare_run_workspace(
     }
 
     Ok(workspace.to_string_lossy().into_owned())
+}
+
+/// Wall-clock budget for one workspace-prep git command.
+///
+/// Workspace prep runs inside the push handler, so one hung child wedged the
+/// whole corridor: a `git clone --no-local` that never returned left the run
+/// row `running` with zero jobs forever (observed 2026-10-06, run 7a612e78:
+/// clone at 12m36s etime, empty workspace, nothing reaped it). The default
+/// sits far above the slowest observed legitimate clone — the reconciler's
+/// own grace window documents multi-gigabyte clones at minutes — and the
+/// override exists for hosts that legitimately need longer.
+fn workspace_prep_timeout() -> Duration {
+    parse_workspace_prep_timeout(std::env::var("GITFORGE_WORKSPACE_PREP_TIMEOUT_SECS").ok())
+}
+
+/// Parse the workspace-prep budget override; any unusable value (unset,
+/// non-numeric, zero) falls back to the default. Split from
+/// [`workspace_prep_timeout`] so the parsing contract is testable without
+/// racing other tests over the process environment.
+fn parse_workspace_prep_timeout(value: Option<String>) -> Duration {
+    let seconds = value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&seconds| seconds > 0);
+    Duration::from_secs(seconds.unwrap_or(300))
+}
+
+/// Run one workspace-prep git command under the prep budget.
+///
+/// `kill_on_drop` is the part that actually bounds the damage: on timeout the
+/// `output()` future is dropped, and without the kill flag the child would
+/// outlive its future and keep cloning — the exact unbounded state this
+/// helper exists to prevent.
+async fn run_git_output(
+    mut command: tokio::process::Command,
+    step: &str,
+    budget: Duration,
+) -> anyhow::Result<std::process::Output> {
+    command.kill_on_drop(true);
+    match timeout(budget, command.output()).await {
+        Ok(output) => output.map_err(|error| {
+            anyhow::anyhow!("workspace prep step '{step}' failed to spawn: {error}")
+        }),
+        Err(_) => Err(anyhow::anyhow!(
+            "workspace prep step '{step}' exceeded its {}s budget and was killed",
+            budget.as_secs()
+        )),
+    }
 }
 
 /// Create the shutdown future that waits for shutdown signal
@@ -1713,12 +1757,10 @@ async fn handle_push_event(
             match prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await {
                 Ok(path) => Some(path),
                 Err(error) => {
-                    let _ = gitforge_db::queries::PipelineRunQueries::update_status(
-                        pool,
-                        state.run_id,
-                        "failed",
-                    )
-                    .await;
+                    // The cause must survive the process: a failed run with
+                    // zero job rows is otherwise indistinguishable from a
+                    // silent planning crash once the log has rotated.
+                    fail_run(pool, state.run_id, &error).await;
                     return Err(error);
                 }
             }
@@ -1747,12 +1789,7 @@ async fn handle_push_event(
             // Without the planned rows a restart cannot resume this run; a
             // half-planned run must not be left non-terminal.
             tracing::error!(run = %state.run_id, %error, "failed to persist planned jobs");
-            let _ = gitforge_db::queries::PipelineRunQueries::update_status(
-                pool,
-                state.run_id,
-                "failed",
-            )
-            .await;
+            fail_run(pool, state.run_id, &error).await;
             pipeline_registry.write().await.remove(&state.run_id);
             if let Some(path) = run_workspace_paths
                 .lock()
@@ -1929,7 +1966,8 @@ async fn run_scheduler_event_consumer(
 }
 
 /// Finalize `engine`'s run once it has reached a terminal status: persist the
-/// status, free the run's workspace, and evict the engine from the registry.
+/// status, sweep any never-dispatched job rows left behind by a non-success
+/// verdict, free the run's workspace, and evict the engine from the registry.
 /// Shared by the completion consumer and the timeout watchdog so a job reaped
 /// by the watchdog finalizes exactly like one reported by a runner. Runs that
 /// are not terminal yet are left untouched.
@@ -1969,6 +2007,9 @@ async fn finalize_run_if_terminal(
             );
             return;
         }
+        if terminal_status != "succeeded" {
+            sweep_unclaimed_jobs(pool, state.run_id).await;
+        }
     }
     let workspace_path = run_workspace_paths
         .lock()
@@ -1984,6 +2025,59 @@ async fn finalize_run_if_terminal(
         remove_run_workspace_dir(&root, run_id, workspace_path.as_deref()).await;
     });
     pipeline_registry.write().await.remove(&state.run_id);
+}
+
+/// Record a run's failure cause durably, then sweep any job rows the run
+/// left unclaimed.
+///
+/// Both halves answer the same defect from opposite sides: the reason makes
+/// the run explain itself in the API (a zero-job failed run's cause
+/// otherwise lives only in the process log), and the sweep keeps the run's
+/// `pending`/`queued` rows from outliving it — once the run row is terminal
+/// the orphan reconciler skips it forever, so an unswept row can never reach
+/// a terminal state on its own (observed 2026-10-06, run 84e2ab37: `fmt`
+/// succeeded, `clippy` failed, `test` and `coverage` pending for hours after
+/// the run was graded `failed`).
+async fn fail_run(
+    pool: &gitforge_db::Pool,
+    run_id: gitforge_common::PipelineRunId,
+    error: &anyhow::Error,
+) {
+    let reason = format!("{error:#}");
+    if let Err(status_error) = gitforge_db::queries::PipelineRunQueries::update_status_with_error(
+        pool,
+        run_id,
+        "failed",
+        Some(&reason),
+    )
+    .await
+    {
+        tracing::error!(%status_error, run = %run_id, "failed to persist run failure reason");
+    }
+    sweep_unclaimed_jobs(pool, run_id).await;
+}
+
+/// Cancel the run's never-dispatched (`pending`/`queued`) job rows. Best
+/// effort: a failed sweep logs and moves on, leaving the rows legible to a
+/// future operator pass rather than hiding behind a swallowed error.
+async fn sweep_unclaimed_jobs(pool: &gitforge_db::Pool, run_id: gitforge_common::PipelineRunId) {
+    match gitforge_db::queries::JobQueries::cancel_unclaimed_for_run(pool, run_id).await {
+        Ok(0) => {}
+        Ok(count) => {
+            tracing::info!(
+                run = %run_id,
+                count,
+                "cancelled never-dispatched job rows on a terminal run"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                run = %run_id,
+                "failed to sweep never-dispatched job rows"
+            );
+        }
+    }
 }
 
 /// Resolve a job definition into the scheduler's flat execution plan: the
@@ -2635,6 +2729,170 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("git path is unavailable"));
+    }
+
+    #[test]
+    fn workspace_prep_timeout_parses_override_and_falls_back() {
+        let default = parse_workspace_prep_timeout(None);
+        assert_eq!(default, Duration::from_secs(300));
+
+        let override_secs = parse_workspace_prep_timeout(Some("45".to_string()));
+        assert_eq!(override_secs, Duration::from_secs(45));
+
+        let padded = parse_workspace_prep_timeout(Some("  120  ".to_string()));
+        assert_eq!(padded, Duration::from_secs(120));
+
+        // Any unusable override falls back to the default rather than
+        // producing a zero budget that would kill every clone instantly.
+        for unusable in [
+            Some("0".to_string()),
+            Some("abc".to_string()),
+            Some("-5".to_string()),
+            Some(String::new()),
+        ] {
+            assert_eq!(
+                parse_workspace_prep_timeout(unusable),
+                Duration::from_secs(300)
+            );
+        }
+    }
+
+    /// A prep command that hangs must return the timeout error promptly AND
+    /// stop producing output: the kill_on_drop contract, observed through
+    /// the child's own heartbeat. A dead shell can never append another
+    /// line, so growth after the kill is the one thing this test cannot
+    /// tolerate.
+    #[tokio::test]
+    async fn run_git_output_times_out_and_kills_the_child() {
+        let marker_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-prep-timeout-tests")
+            .join(gitforge_common::PipelineRunId::new().to_string());
+        tokio::fs::create_dir_all(&marker_dir).await.unwrap();
+        let heartbeat = marker_dir.join("heartbeat.log");
+        let heartbeat_path = heartbeat.to_string_lossy().into_owned();
+
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(format!(
+            "while :; do date +%s%N >> {heartbeat_path}; sleep 0.1; done"
+        ));
+
+        let started = std::time::Instant::now();
+        let error = run_git_output(command, "clone", Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "timeout returned only after {:?}",
+            started.elapsed()
+        );
+        assert!(error.to_string().contains("exceeded its"));
+
+        // Let any in-flight final write land, then verify the heartbeat
+        // stopped for a full second's worth of the old 10 Hz cadence.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let size_after_kill = tokio::fs::metadata(&heartbeat).await.unwrap().len();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let size_settled = tokio::fs::metadata(&heartbeat).await.unwrap().len();
+        assert_eq!(
+            size_settled, size_after_kill,
+            "child kept writing after the prep budget killed it"
+        );
+
+        tokio::fs::remove_dir_all(&marker_dir).await.unwrap();
+    }
+
+    /// `fail_run` is the planning-stage finalizer: the run row must carry
+    /// the human-readable cause and its never-dispatched job rows must not
+    /// outlive it, while rows a runner already took stay with the runner
+    /// lifecycle.
+    #[tokio::test]
+    async fn fail_run_records_reason_and_sweeps_unclaimed_jobs() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "fail-run-test".to_string(),
+            "fail-run@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "fail-run-test".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: "/git/fail-run-test".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: "fail-run-pipeline".to_string(),
+                trigger_type: "push".to_string(),
+                config: serde_json::json!({}),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let run_id = seed_run(&pool, repo_id, pipeline_id, "running").await;
+
+        let pending = gitforge_db::models::Job::new(run_id, "pending-job".to_string());
+        let mut queued = gitforge_db::models::Job::new(run_id, "queued-job".to_string());
+        queued.status = gitforge_db::models::JobStatus::Queued.as_str().to_string();
+        let running = gitforge_db::models::Job::new(run_id, "running-job".to_string());
+        for job in [&pending, &queued, &running] {
+            gitforge_db::queries::JobQueries::create(&pool, job)
+                .await
+                .unwrap();
+        }
+        gitforge_db::queries::JobQueries::update_status(&pool, running.id, "running")
+            .await
+            .unwrap();
+
+        fail_run(
+            &pool,
+            run_id,
+            &anyhow::anyhow!("clone blew its time budget"),
+        )
+        .await;
+
+        let run = gitforge_db::queries::PipelineRunQueries::get(&pool, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(run
+            .error
+            .is_some_and(|reason| reason.contains("clone blew its time budget")));
+
+        let swept = gitforge_db::queries::JobQueries::get(&pool, pending.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(swept.status, "cancelled");
+        assert!(swept.finished_at.is_some());
+        let swept = gitforge_db::queries::JobQueries::get(&pool, queued.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(swept.status, "cancelled");
+        let untouched = gitforge_db::queries::JobQueries::get(&pool, running.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.status, "running");
     }
 
     /// Seed a bare repository with two commits: the first without a pipeline

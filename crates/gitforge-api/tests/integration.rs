@@ -1048,6 +1048,7 @@ async fn test_api_artifacts_are_scoped_to_job_repository_owner() {
             started_at: Some(chrono::Utc::now()),
             finished_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
+            error: None,
         },
     )
     .await
@@ -2206,6 +2207,7 @@ async fn test_api_job_control_enforces_repository_ownership_and_persists_cancel(
             started_at: Some(chrono::Utc::now()),
             finished_at: None,
             created_at: chrono::Utc::now(),
+            error: None,
         },
     )
     .await
@@ -2351,6 +2353,7 @@ async fn test_api_pipeline_runs_with_jobs() {
         started_at: Some(chrono::Utc::now()),
         finished_at: None,
         created_at: chrono::Utc::now(),
+        error: None,
     };
     gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
         .await
