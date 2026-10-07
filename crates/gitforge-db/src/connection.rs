@@ -293,8 +293,10 @@ impl Pool {
         })?;
 
         // Refresh tokens: long-lived, revocable session credentials. Only
-        // the bcrypt hash is stored — a database leak must not yield usable
-        // credentials (same bar as users.password_hash). Old databases gain
+        // the SHA-256 digest is stored (unsalted: the token is 244-bit
+        // random, so a leak cannot be reversed and equality lookup needs a
+        // deterministic digest) — a database leak must not yield usable
+        // credentials. Old databases gain
         // the table on first boot after upgrade; tokens issued before the
         // upgrade simply don't exist, which is the correct state.
         sqlx::query(

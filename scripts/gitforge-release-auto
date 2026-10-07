@@ -197,7 +197,7 @@ if ! wait_healthy; then
     rollback
 fi
 
-if "$script_dir/gitforge-status" >/dev/null 2>&1; then
+if GITFORGE_RELEASE_ROOT="$current_link" "$script_dir/gitforge-status" >/dev/null 2>&1; then
     say "cutover complete and healthy: $candidate_id is live"
 else
     say "cutover complete, but gitforge-status reports drift; check its output"

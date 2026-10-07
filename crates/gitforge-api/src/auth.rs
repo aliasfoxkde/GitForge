@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 /// state lives in the revocable refresh credential, not in the JWT.
 pub const ACCESS_TTL_SECS: i64 = 86_400;
 
-/// Refresh-credential lifetime (30 days). Stored server-side as a bcrypt
-/// hash and rotated on every use, so the plaintext lives only on the
+/// Refresh-credential lifetime (30 days). Stored server-side as a SHA-256
+/// digest and rotated on every use, so the plaintext lives only on the
 /// client and revocation is immediate.
 pub const REFRESH_TTL_SECS: i64 = 30 * 86_400;
 
