@@ -4,7 +4,7 @@
 
 use axum::Router;
 use axum::{
-    extract::{Extension, Request},
+    extract::{Extension, Path, Request},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -55,11 +55,105 @@ const JOB_TIMEOUT_SWEEP_SECS: u64 = 60;
 struct TriggerState {
     event_bus: Arc<dyn EventBus>,
     workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
-    run_waiters: Arc<
-        std::sync::Mutex<
-            HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
-        >,
-    >,
+    trigger_outcomes: TriggerOutcomeRegistry,
+}
+
+/// Correlation state of an accepted trigger event, keyed by the stable event
+/// id returned in the trigger response.
+#[derive(Debug, Clone)]
+enum CorrelationState {
+    /// Event accepted; the consumer has not committed a durable run row yet.
+    Pending,
+    /// The durable run row exists and is pollable at `/pipelines/runs/{id}`.
+    Correlated(gitforge_common::PipelineRunId),
+    /// The consumer failed before committing a durable run row, so no run
+    /// will ever exist for this event.
+    Failed(String),
+}
+
+/// In-memory correlation record for one accepted trigger event. The event
+/// bus is in-memory, so acceptance itself never survives a restart; this
+/// record only has to outlive the trigger's synchronous correlation window
+/// so that a `queued` trigger response stays resolvable to the run the
+/// consumer creates afterwards.
+struct TriggerOutcome {
+    created_at: std::time::Instant,
+    state: tokio::sync::watch::Sender<CorrelationState>,
+}
+
+impl TriggerOutcome {
+    fn new() -> Self {
+        let (state, _rx) = tokio::sync::watch::channel(CorrelationState::Pending);
+        Self {
+            created_at: std::time::Instant::now(),
+            state,
+        }
+    }
+
+    fn state(&self) -> CorrelationState {
+        self.state.borrow().clone()
+    }
+
+    fn correlate(&self, run_id: gitforge_common::PipelineRunId) {
+        self.state
+            .send_replace(CorrelationState::Correlated(run_id));
+    }
+
+    /// Mark the event failed only if no durable run was ever correlated.
+    /// A failure after correlation (e.g. job planning) is carried by the
+    /// run's own terminal status; overwriting would strand pollers that
+    /// already hold the run id.
+    fn fail(&self, message: String) {
+        if matches!(self.state.borrow().clone(), CorrelationState::Pending) {
+            self.state.send_replace(CorrelationState::Failed(message));
+        }
+    }
+}
+
+type TriggerOutcomeRegistry = Arc<std::sync::Mutex<HashMap<uuid::Uuid, Arc<TriggerOutcome>>>>;
+
+/// How long a trigger event's correlation record stays queryable. This must
+/// comfortably exceed any client's correlation-poll budget: a record pruned
+/// mid-poll answers 404 and fails an event whose run may still be running.
+const EVENT_CORRELATION_TTL_SECS: u64 = 24 * 60 * 60;
+
+fn prune_expired_outcomes(outcomes: &mut HashMap<uuid::Uuid, Arc<TriggerOutcome>>) {
+    outcomes
+        .retain(|_, outcome| outcome.created_at.elapsed().as_secs() < EVENT_CORRELATION_TTL_SECS);
+}
+
+fn insert_trigger_outcome(
+    registry: &TriggerOutcomeRegistry,
+    event_id: uuid::Uuid,
+    outcome: Arc<TriggerOutcome>,
+) {
+    let mut outcomes = registry.lock().expect("trigger outcome lock poisoned");
+    prune_expired_outcomes(&mut outcomes);
+    outcomes.insert(event_id, outcome);
+}
+
+/// Synchronous correlation budget for the trigger endpoint. Defaults to the
+/// shared window; overridable so the accepted-but-not-yet-correlated path
+/// can be exercised deterministically and so operators can widen the window
+/// under sustained write contention without a rebuild. Widening past the
+/// api gateway's derived budget (`CI_TRIGGER_CORRELATION_WINDOW` plus its
+/// 10s margin) makes the gateway's trigger client time out first and answer
+/// 502 for triggers this service would still have correlated.
+fn trigger_correlation_window() -> std::time::Duration {
+    match std::env::var("GITFORGE_TRIGGER_CORRELATION_WINDOW_SECS") {
+        Ok(value) => value.parse::<u64>().map_or_else(
+            |error| {
+                tracing::warn!(
+                    %error,
+                    "GITFORGE_TRIGGER_CORRELATION_WINDOW_SECS is not a positive integer; \
+                     using the default correlation window"
+                );
+                gitforge_common::CI_TRIGGER_CORRELATION_WINDOW
+            },
+            std::time::Duration::from_secs,
+        ),
+        Err(_) => gitforge_common::CI_TRIGGER_CORRELATION_WINDOW,
+    }
 }
 
 #[tokio::main]
@@ -124,11 +218,11 @@ async fn main() -> anyhow::Result<()> {
     let scheduler_arc = scheduler_state.scheduler.clone();
     let workspace_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let run_workspace_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let run_waiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let trigger_outcomes: TriggerOutcomeRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let trigger_state = Arc::new(TriggerState {
         event_bus: event_bus.clone(),
         workspace_paths: workspace_paths.clone(),
-        run_waiters: run_waiters.clone(),
+        trigger_outcomes: trigger_outcomes.clone(),
     });
 
     let scheduler_app = Router::new()
@@ -136,6 +230,11 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/pipelines/trigger",
             axum::routing::post(trigger_pipeline).layer(middleware::from_fn(require_trigger_auth)),
+        )
+        .route(
+            "/pipelines/events/{event_id}",
+            axum::routing::get(get_trigger_event_status)
+                .layer(middleware::from_fn(require_trigger_auth)),
         )
         .merge(scheduler_routes(scheduler_state))
         .layer(Extension(trigger_state))
@@ -164,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
     let scheduler_db_clone = scheduler_db.clone();
     let workspace_paths_clone = workspace_paths.clone();
     let run_workspace_paths_clone = run_workspace_paths.clone();
-    let run_waiters_clone = run_waiters.clone();
+    let trigger_outcomes_clone = trigger_outcomes.clone();
     let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let pipeline_registry_clone = pipeline_registry.clone();
@@ -227,7 +326,7 @@ async fn main() -> anyhow::Result<()> {
             workspace_paths_clone,
             run_workspace_paths_clone,
             pipeline_registry_clone,
-            run_waiters_clone,
+            trigger_outcomes_clone,
             shutdown_consumer,
         )
         .await
@@ -537,53 +636,147 @@ async fn trigger_pipeline(
         None,
     );
 
-    let (run_tx, run_rx) = tokio::sync::oneshot::channel();
-    trigger_state
-        .run_waiters
-        .lock()
-        .expect("run waiter lock poisoned")
-        .insert(event.event_id, run_tx);
+    let outcome = Arc::new(TriggerOutcome::new());
+    insert_trigger_outcome(
+        &trigger_state.trigger_outcomes,
+        event.event_id,
+        outcome.clone(),
+    );
 
     match trigger_state.event_bus.publish(event.clone()).await {
         Ok(()) => {
             // Pipeline creation includes event delivery, config loading, and
-            // durable run/job persistence.  Three seconds was shorter than
-            // the observed cold-path on the Fedora runner, causing a valid
-            // accepted event to be returned as `queued` without a run ID;
-            // consumers that require a correlated run then failed with a
-            // false 500. The window is shared with api clients
-            // (`gitforge_common::CI_TRIGGER_CORRELATION_WINDOW`) so their
-            // request budgets are derived from this one; a window that
-            // elapses under write contention still answers `queued` — the
-            // run is created by the consumer either way.
-            let pipeline_run_id =
-                tokio::time::timeout(gitforge_common::CI_TRIGGER_CORRELATION_WINDOW, run_rx)
-                    .await
-                    .ok()
-                    .and_then(std::result::Result::ok);
-            if pipeline_run_id.is_none() {
-                trigger_state
-                    .run_waiters
-                    .lock()
-                    .expect("run waiter lock poisoned")
-                    .remove(&event.event_id);
+            // durable run persistence. This synchronous wait is only the
+            // fast path: when the window elapses (or the consumer already
+            // failed) the correlation record stays registered, so the
+            // `queued` event id remains resolvable through
+            // `/pipelines/events/{event_id}` instead of being silently
+            // dropped. The window defaults to the value shared with api
+            // clients (`gitforge_common::CI_TRIGGER_CORRELATION_WINDOW`) so
+            // their request budgets are derived from this one.
+            let mut wait_rx = outcome.state.subscribe();
+            let outcome_state = timeout(trigger_correlation_window(), async move {
+                loop {
+                    match &*wait_rx.borrow() {
+                        CorrelationState::Pending => {}
+                        state => return state.clone(),
+                    }
+                    if wait_rx.changed().await.is_err() {
+                        return CorrelationState::Pending;
+                    }
+                }
+            })
+            .await
+            .unwrap_or(CorrelationState::Pending);
+            match outcome_state {
+                CorrelationState::Correlated(pipeline_run_id) => (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "status": "accepted",
+                        "event_id": event.event_id.to_string(),
+                        "pipeline_run_id": pipeline_run_id.to_string(),
+                        "repo_id": repo_id.to_string(),
+                        "new_hash": request.new_hash,
+                    })),
+                ),
+                CorrelationState::Failed(message) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "event_processing_failed",
+                        "event_id": event.event_id.to_string(),
+                        "message": message,
+                    })),
+                ),
+                CorrelationState::Pending => (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "status": "queued",
+                        "event_id": event.event_id.to_string(),
+                        "pipeline_run_id": serde_json::Value::Null,
+                        "repo_id": repo_id.to_string(),
+                        "new_hash": request.new_hash,
+                    })),
+                ),
             }
+        }
+        Err(error) => {
+            // The consumer can never observe an unpublished event, so the
+            // correlation record must not linger as perpetually pending.
+            trigger_state
+                .trigger_outcomes
+                .lock()
+                .expect("trigger outcome lock poisoned")
+                .remove(&event.event_id);
             (
-                StatusCode::ACCEPTED,
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
-                    "status": if pipeline_run_id.is_some() { "accepted" } else { "queued" },
-                    "event_id": event.event_id.to_string(),
-                    "pipeline_run_id": pipeline_run_id.map(|id| id.to_string()),
-                    "repo_id": repo_id.to_string(),
-                    "new_hash": request.new_hash,
+                    "error": "event_publish_failed",
+                    "message": error.to_string(),
                 })),
             )
         }
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// Report the correlation state of an accepted trigger event. This is the
+/// late-resolution half of the trigger contract: a `queued` trigger response
+/// carries only the event id, and the run it eventually produces must stay
+/// discoverable under the same trigger credential without re-triggering.
+async fn get_trigger_event_status(
+    Extension(trigger_state): Extension<Arc<TriggerState>>,
+    Path(event_id): Path<String>,
+) -> impl IntoResponse {
+    trigger_event_status_response(&trigger_state.trigger_outcomes, &event_id)
+}
+
+fn trigger_event_status_response(
+    registry: &TriggerOutcomeRegistry,
+    event_id: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Ok(event_id) = uuid::Uuid::parse_str(event_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_event_id"})),
+        );
+    };
+    let outcome = {
+        let mut outcomes = registry.lock().expect("trigger outcome lock poisoned");
+        prune_expired_outcomes(&mut outcomes);
+        outcomes.get(&event_id).cloned()
+    };
+    let Some(outcome) = outcome else {
+        return (
+            StatusCode::NOT_FOUND,
             Json(serde_json::json!({
-                "error": "event_publish_failed",
-                "message": error.to_string(),
+                "error": "event_not_found",
+                "message": "no correlation record for this event id; it was never accepted \
+                            by this process, its record expired, or the service restarted \
+                            after accepting it"
+            })),
+        );
+    };
+    match outcome.state() {
+        CorrelationState::Pending => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "event_id": event_id.to_string(),
+                "status": "pending",
+            })),
+        ),
+        CorrelationState::Correlated(run_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "event_id": event_id.to_string(),
+                "status": "correlated",
+                "pipeline_run_id": run_id.to_string(),
+            })),
+        ),
+        CorrelationState::Failed(message) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "event_id": event_id.to_string(),
+                "status": "failed",
+                "message": message,
             })),
         ),
     }
@@ -1555,11 +1748,7 @@ async fn run_event_consumer(
         std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
     >,
     pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
-    run_waiters: Arc<
-        std::sync::Mutex<
-            HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
-        >,
-    >,
+    trigger_outcomes: TriggerOutcomeRegistry,
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     tracing::info!("starting event consumer loop");
@@ -1584,14 +1773,17 @@ async fn run_event_consumer(
                 match event {
                     Some(event) => {
                         tracing::debug!("received event: {:?}", event.event_type);
-                        match handle_push_event(&event, &scheduler, &pipeline_cache, scheduler_db.as_ref(), &workspace_paths, &run_workspace_paths, &pipeline_registry).await {
-                            Ok(run_id) => {
-                                if let Some(waiter) = run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id) {
-                                    let _ = waiter.send(run_id);
-                                }
-                            }
+                        let outcome = trigger_outcomes
+                            .lock()
+                            .expect("trigger outcome lock poisoned")
+                            .get(&event.event_id)
+                            .cloned();
+                        match handle_push_event(&event, &scheduler, &pipeline_cache, scheduler_db.as_ref(), &workspace_paths, &run_workspace_paths, &pipeline_registry, outcome.as_deref()).await {
+                            Ok(_) => {}
                             Err(e) => {
-                                run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id);
+                                if let Some(outcome) = outcome {
+                                    outcome.fail(format!("run creation failed: {e}"));
+                                }
                                 tracing::error!("failed to handle push event: {}", e);
                             }
                         }
@@ -1609,6 +1801,7 @@ async fn run_event_consumer(
 }
 
 /// Handle a push received event - trigger pipeline if configured
+#[allow(clippy::too_many_arguments)]
 async fn handle_push_event(
     event: &EventEnvelope,
     scheduler: &Arc<Scheduler>,
@@ -1619,6 +1812,7 @@ async fn handle_push_event(
         std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
     >,
     pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
+    trigger_outcome: Option<&TriggerOutcome>,
 ) -> anyhow::Result<gitforge_common::PipelineRunId> {
     // Only handle PushReceived events
     let EventPayload::PushReceived(payload) = &event.payload else {
@@ -1743,6 +1937,17 @@ async fn handle_push_event(
         db_run.id = state.run_id;
         db_run.start();
         gitforge_db::queries::PipelineRunQueries::create(pool, &db_run).await?;
+        // Correlate the accepted trigger event the moment the durable run
+        // row exists — not after workspace preparation, planning, and
+        // enqueueing finish. A workspace clone can take minutes, and both
+        // the trigger's correlation window and any poller of
+        // /pipelines/events/{event_id} must not be held hostage to it: the
+        // run is pollable at /pipelines/runs/{id} as soon as the row is
+        // committed. Without a durable database the run can never be
+        // observed by a poller, so the record stays honestly pending.
+        if let Some(outcome) = trigger_outcome {
+            outcome.correlate(state.run_id);
+        }
     }
 
     let workspace_path = match requested_workspace {
@@ -4584,6 +4789,7 @@ jobs:
             &workspace_paths,
             &run_workspace_paths,
             &pipeline_registry,
+            None,
         )
         .await
         .expect("a deletion push is consumed silently, never an error");
@@ -4604,5 +4810,126 @@ jobs:
                 .is_empty(),
             "a ref-deletion push must not prepare a run workspace"
         );
+    }
+
+    #[test]
+    fn trigger_outcome_notifies_existing_observers() {
+        let outcome = TriggerOutcome::new();
+        assert!(matches!(outcome.state(), CorrelationState::Pending));
+
+        // The trigger's synchronous wait uses a subscribed receiver, so a
+        // consumer that resolves between subscribe and await must still be
+        // observed.
+        let rx = outcome.state.subscribe();
+        outcome.correlate(gitforge_common::PipelineRunId::new());
+        assert!(
+            rx.has_changed().expect("watch receiver stays usable"),
+            "resolution must wake the synchronous waiter"
+        );
+        assert!(matches!(outcome.state(), CorrelationState::Correlated(_)));
+
+        outcome.fail("planning exploded".to_string());
+        assert!(matches!(outcome.state(), CorrelationState::Correlated(_)));
+    }
+
+    #[test]
+    fn trigger_outcome_state_persists_before_any_receiver_subscribes() {
+        let correlated = TriggerOutcome::new();
+        correlated.correlate(gitforge_common::PipelineRunId::new());
+        assert!(matches!(
+            correlated.state(),
+            CorrelationState::Correlated(_)
+        ));
+        let receiver = correlated.state.subscribe();
+        assert!(matches!(
+            &*receiver.borrow(),
+            CorrelationState::Correlated(_)
+        ));
+    }
+
+    #[test]
+    fn trigger_failure_state_persists_before_any_receiver_subscribes() {
+        let failed = TriggerOutcome::new();
+        failed.fail("run creation failed".to_string());
+        match failed.state() {
+            CorrelationState::Failed(message) => assert_eq!(message, "run creation failed"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prune_expired_outcomes_keeps_fresh_and_drops_expired() {
+        let mut outcomes: HashMap<uuid::Uuid, Arc<TriggerOutcome>> = HashMap::new();
+        let fresh_id = uuid::Uuid::new_v4();
+        outcomes.insert(fresh_id, Arc::new(TriggerOutcome::new()));
+        let expired_id = uuid::Uuid::new_v4();
+        outcomes.insert(
+            expired_id,
+            Arc::new(TriggerOutcome {
+                created_at: std::time::Instant::now()
+                    - std::time::Duration::from_secs(EVENT_CORRELATION_TTL_SECS + 1),
+                state: tokio::sync::watch::channel(CorrelationState::Pending).0,
+            }),
+        );
+
+        prune_expired_outcomes(&mut outcomes);
+
+        assert!(outcomes.contains_key(&fresh_id));
+        assert!(!outcomes.contains_key(&expired_id));
+    }
+
+    #[test]
+    fn event_status_endpoint_reports_each_correlation_state() {
+        let registry: TriggerOutcomeRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pending_id = uuid::Uuid::new_v4();
+        insert_trigger_outcome(&registry, pending_id, Arc::new(TriggerOutcome::new()));
+        let correlated_id = uuid::Uuid::new_v4();
+        let run_id = gitforge_common::PipelineRunId::new();
+        let correlated_outcome = Arc::new(TriggerOutcome::new());
+        correlated_outcome.correlate(run_id);
+        insert_trigger_outcome(&registry, correlated_id, correlated_outcome);
+        let failed_id = uuid::Uuid::new_v4();
+        let failed_outcome = Arc::new(TriggerOutcome::new());
+        failed_outcome.fail("no such pipeline".to_string());
+        insert_trigger_outcome(&registry, failed_id, failed_outcome);
+
+        let (code, body) = trigger_event_status_response(&registry, &pending_id.to_string());
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["event_id"], pending_id.to_string());
+        assert_eq!(body["status"], "pending");
+
+        let (code, body) = trigger_event_status_response(&registry, &correlated_id.to_string());
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "correlated");
+        assert_eq!(body["pipeline_run_id"], run_id.to_string());
+
+        let (code, body) = trigger_event_status_response(&registry, &failed_id.to_string());
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["message"], "no such pipeline");
+
+        // An unknown id must be a hard 404 so pollers fail closed instead of
+        // waiting forever on a record that will never appear.
+        let (code, body) =
+            trigger_event_status_response(&registry, &uuid::Uuid::new_v4().to_string());
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "event_not_found");
+
+        let (code, body) = trigger_event_status_response(&registry, "not-a-uuid");
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_event_id");
+    }
+
+    #[test]
+    fn trigger_correlation_window_defaults_to_shared_constant() {
+        // The env var is process-global, so only assert the fallback path
+        // when the override is unset; a set value is covered by the
+        // integration harness that spawns the service with it.
+        if std::env::var("GITFORGE_TRIGGER_CORRELATION_WINDOW_SECS").is_err() {
+            assert_eq!(
+                trigger_correlation_window(),
+                gitforge_common::CI_TRIGGER_CORRELATION_WINDOW
+            );
+        }
     }
 }

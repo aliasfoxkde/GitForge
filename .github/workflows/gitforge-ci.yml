@@ -23,7 +23,13 @@ env:
   GITFORGE_REPO_ID: ${{ vars.GITFORGE_REPO_ID || '' }}
   GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
+  # Budget for turning a queued (accepted, not yet correlated) trigger event
+  # into a pipeline-run id via /pipelines/events/{event_id}. Must stay well
+  # below the server's 24h correlation-record retention.
+  GITFORGE_CORRELATION_TIMEOUT_SECONDS: ${{ vars.GITFORGE_CORRELATION_TIMEOUT_SECONDS || '600' }}
+  # Trigger credential: POST /pipelines/trigger and GET /pipelines/events/{id}.
   GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
+  # Operator credential: GET /pipelines/runs/{id}.
   GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
 
 permissions:
@@ -39,8 +45,8 @@ jobs:
     if: vars.GITFORGE_ENABLED == 'true'
     runs-on: [self-hosted, linux, x64, gitforge-github]
     outputs:
-      run_id: ${{ steps.enqueue.outputs.run_id }}
-      build_status: ${{ steps.enqueue.outputs.status }}
+      run_id: ${{ steps.enqueue.outputs.run_id || steps.correlate.outputs.run_id }}
+      build_status: ${{ steps.enqueue.outputs.status == 'enqueued' && 'enqueued' || steps.correlate.outputs.status }}
     steps:
       - name: Validate GitForge configuration
         run: |
@@ -51,6 +57,10 @@ jobs:
           : "${GITFORGE_SCHEDULER_OPERATOR_TOKEN:?GITFORGE_SCHEDULER_OPERATOR_TOKEN is required}"
           [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
             echo "GITFORGE_REPO_ID must be a UUID" >&2
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required for temporary files}"
+          [[ -d "$RUNNER_TEMP" && -w "$RUNNER_TEMP" ]] || {
+            echo "RUNNER_TEMP must be an existing writable directory" >&2
+            exit 1
             exit 1
           }
           [[ "$GITFORGE_POLL_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
@@ -61,24 +71,34 @@ jobs:
             echo "GITFORGE_POLL_INTERVAL_SECONDS must be a positive integer" >&2
             exit 1
           }
+          [[ "$GITFORGE_CORRELATION_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+            echo "GITFORGE_CORRELATION_TIMEOUT_SECONDS must be a positive integer" >&2
+            exit 1
+          }
       - name: Enqueue build job
         id: enqueue
+        env:
+          GITFORGE_REF_NAME: ${{ github.ref_name }}
+          GITFORGE_BEFORE_SHA: ${{ github.event.before }}
+          GITFORGE_COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Trigger the GitForge CI service. The service returns the durable
-          # pipeline-run ID; polling the API by pipeline ID was a protocol
-          # mismatch and could never observe the created run.
+          # Trigger the GitForge CI service. A response carrying
+          # pipeline_run_id means the durable run exists ("accepted"). A 202
+          # with status "queued" means the event was accepted but the run is
+          # not correlated yet — the event is NOT lost, so this step hands
+          # the event id to the correlation step instead of failing.
           PAYLOAD=$(jq -n \
             --arg repo "$GITFORGE_REPO_ID" \
-            --arg ref "${{ github.ref_name }}" \
-            --arg old "${{ github.event.before }}" \
-            --arg new "${{ github.sha }}" \
+            --arg ref "$GITFORGE_REF_NAME" \
+            --arg old "$GITFORGE_BEFORE_SHA" \
+            --arg new "$GITFORGE_COMMIT_SHA" \
             '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+          RESPONSE=$(curl --silent --show-error --max-time 30 -w "\n%{http_code}" -X POST \
             "$GITFORGE_SCHEDULER_URL/pipelines/trigger" \
             -H "Authorization: Bearer $GITFORGE_CI_TRIGGER_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD" 2>&1)
+            -d "$PAYLOAD")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
@@ -94,10 +114,93 @@ jobs:
               echo "Successfully enqueued pipeline run $RUN_ID"
               exit 0
             fi
+            STATUS=$(echo "$BODY" | jq -r '.status // empty')
+            EVENT_ID=$(echo "$BODY" | jq -r '.event_id // empty')
+            if [ "$STATUS" = "queued" ] && [ -n "$EVENT_ID" ]; then
+              echo "event_id=$EVENT_ID" >> "$GITHUB_OUTPUT"
+              echo "status=queued" >> "$GITHUB_OUTPUT"
+              echo "Event $EVENT_ID accepted; pipeline run not correlated yet"
+              exit 0
+            fi
           fi
 
           echo "GitForge enqueue failed (HTTP $HTTP_CODE); refusing to bypass GitForge" >&2
           exit 1
+
+      # A queued event is accepted and will create its durable run on the
+      # server. Resolve the event id to the pipeline run and continue; never
+      # re-trigger the same event because correlation was delayed.
+      - name: Resolve pipeline run from accepted event
+        id: correlate
+        if: steps.enqueue.outputs.status == 'queued'
+        env:
+          GITFORGE_EVENT_ID: ${{ steps.enqueue.outputs.event_id }}
+        run: |
+          set -euo pipefail
+          EVENT_ID="$GITFORGE_EVENT_ID"
+          STATUS_URL="$GITFORGE_SCHEDULER_URL/pipelines/events/$EVENT_ID"
+          ERR_FILE="$(mktemp "$RUNNER_TEMP/gitforge-correlation-error.XXXXXX")"
+          trap 'rm -f "$ERR_FILE"' EXIT
+
+          echo "Waiting for GitForge to correlate event $EVENT_ID to a pipeline run..."
+          deadline=$(( $(date +%s) + GITFORGE_CORRELATION_TIMEOUT_SECONDS ))
+          while :; do
+            CURL_RC=0
+            RESPONSE=$(curl --silent --show-error --max-time 30 \
+              -w '\n%{http_code}' \
+              -H "Authorization: Bearer $GITFORGE_CI_TRIGGER_TOKEN" \
+              -H "Accept: application/json" \
+              "$STATUS_URL" 2>"$ERR_FILE") || CURL_RC=$?
+            HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -n1)
+            BODY=$(printf '%s' "$RESPONSE" | sed '$d')
+
+            if [ "$CURL_RC" -ne 0 ]; then
+              echo "correlation lookup transport error (curl rc=$CURL_RC): $(cat "$ERR_FILE")" >&2
+            elif [ "$HTTP_CODE" = "200" ]; then
+              CORRELATION=$(echo "$BODY" | jq -r '.status // empty')
+              RUN_ID=$(echo "$BODY" | jq -r '.pipeline_run_id // empty')
+              case "$CORRELATION" in
+                correlated)
+                  if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
+                    echo "Event $EVENT_ID correlated to pipeline run $RUN_ID"
+                    echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+                    echo "status=enqueued" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+                  echo "GitForge reported correlated without a run id; refusing to guess" >&2
+                  exit 1
+                  ;;
+                failed)
+                  echo "GitForge failed to create a pipeline run for event $EVENT_ID: $(echo "$BODY" | jq -r '.message // "unknown error"')" >&2
+                  exit 1
+                  ;;
+                pending)
+                  # Not correlated yet; keep polling until the deadline.
+                  ;;
+                *)
+                  echo "GitForge returned unknown correlation status '${CORRELATION:-none}'; refusing to assume success" >&2
+                  exit 1
+                  ;;
+              esac
+            elif [ "$HTTP_CODE" = "404" ]; then
+              echo "GitForge has no correlation record for event $EVENT_ID (service restarted or record expired); refusing to re-trigger" >&2
+              exit 1
+            elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+              echo "GitForge rejected the trigger credential for correlation lookup (HTTP $HTTP_CODE)" >&2
+              exit 1
+            else
+              case "$HTTP_CODE" in
+                408|429|5[0-9][0-9]) echo "correlation lookup returned transient HTTP $HTTP_CODE" >&2 ;;
+                *) echo "correlation lookup returned permanent or invalid HTTP status '${HTTP_CODE:-none}'" >&2; exit 1 ;;
+              esac
+            fi
+
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "GitForge did not correlate event $EVENT_ID within ${GITFORGE_CORRELATION_TIMEOUT_SECONDS}s; refusing to re-trigger" >&2
+              exit 1
+            fi
+            sleep "$GITFORGE_POLL_INTERVAL_SECONDS"
+          done
 
   # Poll GitForge for build status (when GitForge is available)
   poll-build:
@@ -110,39 +213,79 @@ jobs:
     steps:
       - name: Poll for build completion
         id: poll
+        env:
+          GITFORGE_RUN_ID: ${{ needs.enqueue-build.outputs.run_id }}
         run: |
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required for temporary files}"
+          [[ -d "$RUNNER_TEMP" && -w "$RUNNER_TEMP" ]] || {
+            echo "RUNNER_TEMP must be an existing writable directory" >&2
+            exit 1
           set -euo pipefail
           echo "Build enqueued, polling GitForge for status..."
-          RUN_ID='${{ needs.enqueue-build.outputs.run_id }}'
+          RUN_ID="$GITFORGE_RUN_ID"
           STATUS_URL="$GITFORGE_SCHEDULER_URL/pipelines/runs/$RUN_ID"
+          ERR_FILE="$(mktemp "$RUNNER_TEMP/gitforge-run-status-error.XXXXXX")"
+          trap 'rm -f "$ERR_FILE"' EXIT
 
           deadline=$(( $(date +%s) + GITFORGE_POLL_TIMEOUT_SECONDS ))
           while :; do
-            RESPONSE=$(curl --fail-with-body --silent --show-error \
-              --max-time 30 \
+            CURL_RC=0
+            RESPONSE=$(curl --silent --show-error --max-time 30 \
+              -w '\n%{http_code}' \
               -H "Authorization: Bearer $GITFORGE_SCHEDULER_OPERATOR_TOKEN" \
               -H "Accept: application/json" \
-              "$STATUS_URL")
-            STATUS=$(echo "$RESPONSE" | jq -r '.status // .state // empty' | tr '[:upper:]' '[:lower:]')
-            echo "GitForge pipeline run $RUN_ID status: ${STATUS:-unknown}"
+              "$STATUS_URL" 2>"$ERR_FILE") || CURL_RC=$?
+            HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -n1)
+            BODY=$(printf '%s' "$RESPONSE" | sed '$d')
 
-            case "$STATUS" in
-              completed|succeeded|success|passed|failed|failure|cancelled|canceled|timed_out|timeout|error)
-                echo "terminal_status=$STATUS" >> "$GITHUB_OUTPUT"
-                case "$STATUS" in
-                  completed|succeeded|success|passed) exit 0 ;;
-                  *) echo "GitForge job reached unsuccessful terminal state: $STATUS" >&2; exit 1 ;;
-                esac
-                ;;
-              *)
-                if [ "$(date +%s)" -ge "$deadline" ]; then
-                  echo "GitForge pipeline run did not reach a terminal state within ${GITFORGE_POLL_TIMEOUT_SECONDS}s" >&2
-                  echo "terminal_status=timeout" >> "$GITHUB_OUTPUT"
+            if [ "$CURL_RC" -ne 0 ]; then
+              echo "status lookup transport error (curl rc=$CURL_RC): $(cat "$ERR_FILE")" >&2
+            elif [ "$HTTP_CODE" = "404" ]; then
+              echo "GitForge pipeline run $RUN_ID not found (HTTP 404); a missing run can never report success" >&2
+              echo "terminal_status=missing_run" >> "$GITHUB_OUTPUT"
+              exit 1
+            elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+              echo "GitForge rejected the operator credential for run status (HTTP $HTTP_CODE)" >&2
+              echo "terminal_status=auth_error" >> "$GITHUB_OUTPUT"
+              exit 1
+            elif [ "$HTTP_CODE" = "200" ]; then
+              STATUS=$(echo "$BODY" | jq -r '.status // .state // empty' | tr '[:upper:]' '[:lower:]')
+              echo "GitForge pipeline run $RUN_ID status: ${STATUS:-unknown}"
+              case "$STATUS" in
+                succeeded)
+                  echo "terminal_status=$STATUS" >> "$GITHUB_OUTPUT"
+                  exit 0
+                  ;;
+                failed|cancelled)
+                  echo "terminal_status=$STATUS" >> "$GITHUB_OUTPUT"
+                  echo "GitForge job reached unsuccessful terminal state: $STATUS" >&2
                   exit 1
-                fi
-                sleep "$GITFORGE_POLL_INTERVAL_SECONDS"
-                ;;
-            esac
+                  ;;
+                pending|running)
+                  # Known non-terminal GitForge states continue polling.
+                  ;;
+                "")
+                  echo "GitForge returned HTTP 200 without a status field; refusing to guess" >&2
+                  exit 1
+                  ;;
+                *)
+                  echo "GitForge returned unknown run status '$STATUS'; refusing to assume success" >&2
+                  exit 1
+                  ;;
+              esac
+            else
+              case "$HTTP_CODE" in
+                408|429|5[0-9][0-9]) echo "status lookup returned transient HTTP $HTTP_CODE" >&2 ;;
+                *) echo "status lookup returned permanent or invalid HTTP status '${HTTP_CODE:-none}'" >&2; exit 1 ;;
+              esac
+            fi
+
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "GitForge pipeline run did not reach a terminal state within ${GITFORGE_POLL_TIMEOUT_SECONDS}s" >&2
+              echo "terminal_status=timeout" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            sleep "$GITFORGE_POLL_INTERVAL_SECONDS"
           done
 
   # Report final status to GitHub
