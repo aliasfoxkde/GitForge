@@ -194,7 +194,10 @@ the repository (admin/maintainer override applies).
 that exact pipeline ID, resolving the optional `ref` (default: repository
 HEAD) to a commit and rejecting ambiguous or hostile refs. A retired pipeline
 ID cannot be used to create a new run. Ordinary Git push events remain
-governed by the pipeline configuration committed at the pushed revision.
+governed by the pipeline configuration committed at the pushed revision. The
+CI trigger event preserves the selected pipeline ID, and the created run is
+recorded against that pipeline. This selection is validated as active and
+owned by the event's repository before a run is created.
 
 `DELETE /api/pipelines/{id}` deletes a runless pipeline outright and
 deactivates one with run history (the history stays queryable).

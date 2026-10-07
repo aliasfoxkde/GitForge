@@ -2,6 +2,18 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Manual CI runs retain their selected pipeline identity**: an explicit
+  active pipeline ID now travels through the CI trigger event and is stored
+  on the created run; inactive and cross-repository selections fail closed.
+  Ordinary push events continue loading the pipeline definition committed at
+  the pushed revision. A queued event ID is only a correlation handle, not a
+  durable-delivery guarantee: the CI event bus is currently in-memory and a
+  durable trigger outbox remains required for crash-safe acceptance.
+
 ## [0.6.14] - 2026-10-03
 
 ### Added

@@ -5093,6 +5093,77 @@ jobs:
     }
 
     #[tokio::test]
+    async fn test_handle_push_event_persists_selected_pipeline_id_on_run() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let (bare, commit) = seed_pipeline_at_paths(&[PIPELINE_CONFIG_PATHS[0]]).await;
+        let (pool, repo_id) = test_pool_with_repository(bare.to_string_lossy().into_owned()).await;
+        let selected_id = gitforge_common::PipelineId::new();
+        let selected_definition = create_default_pipeline("manual-selected");
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &DbPipeline {
+                id: selected_id,
+                repo_id,
+                name: selected_definition.name.clone(),
+                trigger_type: "manual".to_string(),
+                config: serde_json::to_value(&selected_definition).unwrap(),
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-selected-pipeline-workspaces")
+            .join(repo_id.to_string());
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", &workspace_root);
+
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "0".repeat(40),
+                new_hash: commit.clone(),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        )
+        .with_selected_pipeline(selected_id);
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let run_id = handle_push_event(
+            &event,
+            &scheduler,
+            &pipeline_cache,
+            Some(&pool),
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        .expect("an active same-repository pipeline selection should create a run");
+
+        let run = gitforge_db::queries::PipelineRunQueries::get(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("the selected pipeline run should be persisted");
+        assert_eq!(run.pipeline_id, selected_id);
+        assert_eq!(run.triggered_by, "manual");
+        assert_eq!(run.commit_hash, commit);
+
+        tokio::fs::remove_dir_all(workspace_root).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_handle_push_event_rejects_selected_pipeline_from_another_repo() {
         let (pool, repo_id, _) = sweep_test_pool().await;
         let repo = gitforge_db::queries::RepoQueries::get(&pool, repo_id)
@@ -5164,7 +5235,7 @@ jobs:
             .is_empty());
     }
 
-    // --- trigger correlation status (202 queued -> durable run handoff) ---
+    // --- trigger correlation status (202 queued -> persisted run handoff) ---
 
     use gitforge_events::RepoCreatedPayload;
 

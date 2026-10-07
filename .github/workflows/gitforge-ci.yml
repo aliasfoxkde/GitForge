@@ -143,11 +143,12 @@ jobs:
           deadline=$(( $(date +%s) + GITFORGE_POLL_TIMEOUT_SECONDS ))
 
           # Phase 1: resolve a queued trigger into its pipeline run. The
-          # trigger POST was accepted and is durable (an event id was
-          # returned), but the run had not been created within the
-          # orchestrator's correlation window. Poll the read-only trigger
-          # status endpoint until the run id appears, the trigger reaches a
-          # terminal failure, or the overall configured timeout elapses.
+          # trigger POST was accepted into the CI process, but the run had
+          # not been created within the orchestrator's correlation window.
+          # The event id is a correlation handle, not a durable-delivery
+          # guarantee: the current in-memory event bus can lose work on a
+          # process crash. Poll for the run, and fail on terminal error or
+          # timeout rather than treating acceptance as completed delivery.
           if [ '${{ needs.enqueue-build.outputs.build_status }}' = 'queued' ]; then
             : "${GITFORGE_TRIGGER_EVENT_ID:?queued trigger requires trigger_event_id}"
             TRIGGER_URL="$GITFORGE_SCHEDULER_URL/pipelines/trigger/$GITFORGE_TRIGGER_EVENT_ID"
