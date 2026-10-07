@@ -1687,7 +1687,9 @@ async fn handle_push_event(
             anyhow::bail!("selected pipeline {selected_id} belongs to a different repository");
         }
         serde_json::from_value::<PipelineDefinition>(selected.config).map_err(|error| {
-            anyhow::anyhow!("selected pipeline {selected_id} has an invalid stored definition: {error}")
+            anyhow::anyhow!(
+                "selected pipeline {selected_id} has an invalid stored definition: {error}"
+            )
         })?
     } else {
         let committed_pipeline = match scheduler_db {
@@ -1769,12 +1771,8 @@ async fn handle_push_event(
             // idx_pipelines_active_repo_name — retire the predecessor before
             // recording this push's version, or every push after the first
             // fails run creation with a constraint violation.
-            gitforge_db::queries::PipelineQueries::deactivate_active(
-                pool,
-                repo_id,
-                &pipeline.name,
-            )
-            .await?;
+            gitforge_db::queries::PipelineQueries::deactivate_active(pool, repo_id, &pipeline.name)
+                .await?;
             gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
         }
 
@@ -4655,13 +4653,9 @@ jobs:
     #[tokio::test]
     async fn test_handle_push_event_rejects_retired_selected_pipeline() {
         let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
-        gitforge_db::queries::PipelineQueries::deactivate_active(
-            &pool,
-            repo_id,
-            "sweep-pipeline",
-        )
-        .await
-        .unwrap();
+        gitforge_db::queries::PipelineQueries::deactivate_active(&pool, repo_id, "sweep-pipeline")
+            .await
+            .unwrap();
 
         let event = EventEnvelope::new(
             EventType::PushReceived,
@@ -4766,7 +4760,10 @@ jobs:
         )
         .await
         .expect_err("a cross-repository selection must fail closed");
-        assert!(error.to_string().contains("different repository"), "{error:#}");
+        assert!(
+            error.to_string().contains("different repository"),
+            "{error:#}"
+        );
         assert!(pipeline_cache.lock().unwrap().is_empty());
         assert!(gitforge_db::queries::PipelineRunQueries::list(&pool)
             .await

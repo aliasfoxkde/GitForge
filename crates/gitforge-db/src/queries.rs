@@ -3497,14 +3497,20 @@ mod tests {
         PipelineQueries::deactivate_active(&pool, repo.id, "Test Pipeline")
             .await
             .unwrap();
-        assert!(PipelineQueries::get(&pool, pipeline.id)
-            .await
-            .unwrap()
-            .is_some(), "retired definition remains addressable for history");
-        assert!(PipelineQueries::get_active(&pool, pipeline.id)
-            .await
-            .unwrap()
-            .is_none(), "retired definition cannot be selected for a new run");
+        assert!(
+            PipelineQueries::get(&pool, pipeline.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "retired definition remains addressable for history"
+        );
+        assert!(
+            PipelineQueries::get_active(&pool, pipeline.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "retired definition cannot be selected for a new run"
+        );
     }
 
     #[tokio::test]

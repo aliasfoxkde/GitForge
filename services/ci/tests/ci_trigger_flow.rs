@@ -356,7 +356,11 @@ async fn test_trigger_requires_token_and_runs_committed_pipeline() {
     let runs = gitforge_db::queries::PipelineRunQueries::list(&pool)
         .await
         .expect("list runs after selected trigger");
-    assert_eq!(runs.len(), 2, "push and selected manual trigger are recorded");
+    assert_eq!(
+        runs.len(),
+        2,
+        "push and selected manual trigger are recorded"
+    );
     let selected_run = runs
         .iter()
         .find(|run| run.id.to_string() == selected_run_id)

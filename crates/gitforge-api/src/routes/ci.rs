@@ -543,7 +543,13 @@ async fn trigger_pipeline_run(
     };
 
     match client
-        .trigger(pipeline.repo_id, &revision, None, &commit, Some(pipeline.id))
+        .trigger(
+            pipeline.repo_id,
+            &revision,
+            None,
+            &commit,
+            Some(pipeline.id),
+        )
         .await
     {
         Ok(Some(pipeline_run_id)) => (
