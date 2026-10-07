@@ -292,6 +292,39 @@ impl Pool {
             ))
         })?;
 
+        // Refresh tokens: long-lived, revocable session credentials. Only
+        // the bcrypt hash is stored — a database leak must not yield usable
+        // credentials (same bar as users.password_hash). Old databases gain
+        // the table on first boot after upgrade; tokens issued before the
+        // upgrade simply don't exist, which is the correct state.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create refresh_tokens table: {e}")))?;
+
+        // The login/refresh paths look tokens up by exact hash.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash
+            ON refresh_tokens(token_hash)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create refresh token index: {e}")))?;
+
         // Create runners table
         sqlx::query(
             r#"

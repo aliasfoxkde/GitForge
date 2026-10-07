@@ -29,12 +29,25 @@ async fn ensure_success(resp: Response, operation: &str) -> Result<Response> {
     anyhow::bail!("{operation} failed: {status} — {detail}");
 }
 
-/// Login response from the API
+/// Login response from the API. Servers that predate refresh rotation
+/// omit the last two fields; `#[serde(default)]` keeps the CLI usable
+/// against them (renewal then degrades to re-login on expiry).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginResponse {
     pub token: String,
     pub token_type: String,
     pub expires_in: i64,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub refresh_expires_in: Option<i64>,
+}
+
+/// Body for `/auth/refresh` and `/auth/logout`: the long-lived
+/// credential handed out at login.
+#[derive(Debug, Serialize)]
+pub struct RefreshRequest {
+    pub refresh_token: String,
 }
 
 /// Auth status response
@@ -275,6 +288,40 @@ impl ApiClient {
         let resp = req.send().await?;
         let auth_resp: AuthStatusResponse = resp.json().await?;
         Ok(auth_resp)
+    }
+
+    /// Exchange the long-lived refresh credential for a fresh JWT pair.
+    /// The server rotates on use: the presented credential is revoked and
+    /// a new one is returned alongside the fresh JWT.
+    pub async fn refresh(&self, refresh_token: &str) -> Result<LoginResponse> {
+        let url = format!("{}/auth/refresh", self.base_url);
+        let body = RefreshRequest {
+            refresh_token: refresh_token.to_string(),
+        };
+
+        let resp = self.http.post(&url).json(&body).send().await?;
+        let status = resp.status();
+
+        if !status.is_success() {
+            let error_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Refresh failed: {status} - {error_text}");
+        }
+
+        let login_resp: LoginResponse = resp.json().await?;
+        Ok(login_resp)
+    }
+
+    /// Revoke a refresh credential server-side. Idempotent: the server
+    /// answers 200 even when the credential is already dead.
+    pub async fn logout(&self, refresh_token: &str) -> Result<()> {
+        let url = format!("{}/auth/logout", self.base_url);
+        let body = RefreshRequest {
+            refresh_token: refresh_token.to_string(),
+        };
+
+        let resp = self.http.post(&url).json(&body).send().await?;
+        ensure_success(resp, "logout").await?;
+        Ok(())
     }
 
     /// List repositories

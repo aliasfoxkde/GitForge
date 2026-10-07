@@ -3349,6 +3349,135 @@ fn hydrate_trigger_request(
 }
 
 // ============================================================================
+// Refresh tokens
+// ============================================================================
+
+/// A stored refresh token row. Only the SHA-256 digest of the token is
+/// kept: a database leak must not yield usable credentials, and the
+/// plaintext exists only on the client that was handed it at
+/// login/refresh time.
+#[derive(Debug, Clone)]
+pub struct RefreshTokenRow {
+    pub user_id: UserId,
+    pub token_hash: String,
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+pub struct RefreshTokenQueries;
+
+impl RefreshTokenQueries {
+    /// Store a refresh token (digest only) for a user.
+    pub async fn create(
+        pool: &Pool,
+        user_id: UserId,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO refresh_tokens (id, user_id, token_hash, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(user_id.to_string())
+        .bind(token_hash)
+        .bind(Utc::now().to_rfc3339())
+        .bind(expires_at.to_rfc3339())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to create refresh token: {e}")))?;
+        Ok(())
+    }
+
+    /// Look up a live (unrevoked, unexpired) token row by its hash.
+    pub async fn find_active_by_hash(
+        pool: &Pool,
+        token_hash: &str,
+    ) -> Result<Option<RefreshTokenRow>> {
+        let row = sqlx::query(
+            r#"
+            SELECT user_id, token_hash, expires_at, revoked_at, created_at
+            FROM refresh_tokens
+            WHERE token_hash = ?
+              AND revoked_at IS NULL
+              AND expires_at > ?
+            "#,
+        )
+        .bind(token_hash)
+        .bind(Utc::now().to_rfc3339())
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to look up refresh token: {e}")))?;
+
+        let Some(row) = row else { return Ok(None) };
+        let expires_at: String = row
+            .try_get("expires_at")
+            .map_err(|error| Error::database(format!("invalid expires_at: {error}")))?;
+        Ok(Some(RefreshTokenRow {
+            user_id: UserId::from(parse_uuid_column(&row, "user_id")?),
+            token_hash: row
+                .try_get("token_hash")
+                .map_err(|error| Error::database(format!("invalid token_hash: {error}")))?,
+            expires_at: DateTime::parse_from_rfc3339(&expires_at)
+                .map_err(|error| Error::database(format!("invalid expires_at: {error}")))?
+                .with_timezone(&Utc),
+            revoked_at: row
+                .try_get::<Option<String>, _>("revoked_at")
+                .map_err(|error| Error::database(format!("invalid revoked_at: {error}")))?
+                .map(|value| {
+                    DateTime::parse_from_rfc3339(&value)
+                        .map_err(|error| Error::database(format!("invalid revoked_at: {error}")))
+                })
+                .transpose()?
+                .map(|value| value.with_timezone(&Utc)),
+            created_at: parse_timestamp_column(&row, "created_at")?,
+        }))
+    }
+
+    /// Revoke a token by hash. Idempotent: revoking an already-revoked (or
+    /// unknown) token is not an error — logout must never fail open.
+    pub async fn revoke(pool: &Pool, token_hash: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(token_hash)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to revoke refresh token: {e}")))?;
+        Ok(())
+    }
+
+    /// Revoke every live token for a user (password change, admin lockout).
+    pub async fn revoke_all_for_user(pool: &Pool, user_id: UserId) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(user_id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to revoke user refresh tokens: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Drop expired/revoked rows older than the cutoff. Housekeeping only —
+    /// revoked rows could stay forever without correctness impact.
+    pub async fn prune(pool: &Pool, older_than: DateTime<Utc>) -> Result<u64> {
+        let result =
+            sqlx::query("DELETE FROM refresh_tokens WHERE (expires_at < ?1 OR revoked_at < ?1)")
+                .bind(older_than.to_rfc3339())
+                .execute(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to prune refresh tokens: {e}")))?;
+        Ok(result.rows_affected())
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -5463,5 +5592,113 @@ mod tests {
         // List recent
         let recent = EventQueries::list_recent(&pool, 10).await.unwrap();
         assert_eq!(recent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_lifecycle_filters_and_prunes() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "refresh-lifecycle".to_string(),
+            "refresh-lifecycle@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+
+        let live_digest = "digest-live";
+        let expired_digest = "digest-expired";
+        let now = Utc::now();
+        RefreshTokenQueries::create(
+            &pool,
+            user.id,
+            live_digest,
+            now + chrono::Duration::days(30),
+        )
+        .await
+        .unwrap();
+        RefreshTokenQueries::create(
+            &pool,
+            user.id,
+            expired_digest,
+            now - chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+
+        // Only the unexpired row is live.
+        let live = RefreshTokenQueries::find_active_by_hash(&pool, live_digest)
+            .await
+            .unwrap()
+            .expect("unexpired row must be live");
+        assert_eq!(live.user_id, user.id);
+        assert!(
+            RefreshTokenQueries::find_active_by_hash(&pool, expired_digest)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Revocation is immediate and idempotent.
+        RefreshTokenQueries::revoke(&pool, live_digest)
+            .await
+            .unwrap();
+        assert!(RefreshTokenQueries::find_active_by_hash(&pool, live_digest)
+            .await
+            .unwrap()
+            .is_none());
+        RefreshTokenQueries::revoke(&pool, live_digest)
+            .await
+            .unwrap();
+
+        // revoke_all_for_user only touches that user's rows.
+        let other = crate::models::User::new(
+            "refresh-lifecycle-2".to_string(),
+            "refresh-lifecycle-2@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &other)
+            .await
+            .unwrap();
+        RefreshTokenQueries::create(
+            &pool,
+            other.id,
+            "digest-other",
+            now + chrono::Duration::days(30),
+        )
+        .await
+        .unwrap();
+        let revoked = RefreshTokenQueries::revoke_all_for_user(&pool, user.id)
+            .await
+            .unwrap();
+        // Only the expired-but-never-revoked row counts: the live row was
+        // revoked earlier in this test and revocation is not re-applied.
+        assert_eq!(revoked, 1);
+        assert!(
+            RefreshTokenQueries::find_active_by_hash(&pool, "digest-other")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Prune is age-based housekeeping: a cutoff of `now` drops only
+        // the row already expired before it; rows revoked after `now`
+        // (and the other user's future-expiry row) survive.
+        let pruned = RefreshTokenQueries::prune(&pool, now).await.unwrap();
+        assert_eq!(pruned, 1);
+
+        // A cutoff past every lifetime clears the table.
+        let pruned = RefreshTokenQueries::prune(&pool, now + chrono::Duration::days(31))
+            .await
+            .unwrap();
+        assert_eq!(pruned, 2);
+        assert!(
+            RefreshTokenQueries::find_active_by_hash(&pool, "digest-other")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

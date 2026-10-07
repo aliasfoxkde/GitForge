@@ -115,6 +115,8 @@ impl ApiServer {
         });
         let auth_routes = Router::new()
             .route("/auth/login", post(crate::routes::login))
+            .route("/auth/refresh", post(crate::routes::refresh))
+            .route("/auth/logout", post(crate::routes::logout))
             .route("/auth/status", get(crate::routes::auth_status))
             .layer(RateLimitLayer::new(auth_rate_limiter.clone()))
             .layer(Extension(Arc::new(auth.clone())))
