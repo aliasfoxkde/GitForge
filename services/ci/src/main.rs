@@ -762,29 +762,49 @@ async fn require_trigger_auth(request: Request, next: Next) -> Response {
         .and_then(|value| value.to_str().ok());
     match trigger_auth_verdict(expected, supplied) {
         Ok(()) => next.run(request).await,
-        Err(rejection) => rejection,
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TriggerAuthRejection {
+    status: StatusCode,
+    code: &'static str,
+}
+
+impl TriggerAuthRejection {
+    fn status(self) -> StatusCode {
+        self.status
+    }
+}
+
+impl IntoResponse for TriggerAuthRejection {
+    fn into_response(self) -> Response {
+        (self.status, Json(serde_json::json!({"error": self.code}))).into_response()
     }
 }
 
 /// Pure auth verdict for the trigger control plane, split out of the
 /// middleware so the credential rules are testable without process-global
-/// environment mutation. `Err` carries the ready rejection response.
-fn trigger_auth_verdict(expected: Option<String>, supplied: Option<&str>) -> Result<(), Response> {
+/// environment mutation. The small error value is converted to an HTTP
+/// response only at the middleware boundary.
+fn trigger_auth_verdict(
+    expected: Option<String>,
+    supplied: Option<&str>,
+) -> Result<(), TriggerAuthRejection> {
     let Some(expected) = expected else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "trigger_auth_not_configured"})),
-        )
-            .into_response());
+        return Err(TriggerAuthRejection {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "trigger_auth_not_configured",
+        });
     };
     if trigger_token_matches(&expected, supplied) {
         Ok(())
     } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "trigger_auth_required"})),
-        )
-            .into_response())
+        Err(TriggerAuthRejection {
+            status: StatusCode::UNAUTHORIZED,
+            code: "trigger_auth_required",
+        })
     }
 }
 
@@ -3249,6 +3269,8 @@ mod tests {
                 owner_id: user.id,
                 visibility: "private".to_string(),
                 git_path: "/git/fail-run-test".to_string(),
+                required_checks: Vec::new(),
+                deny_non_fast_forward: false,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             },
