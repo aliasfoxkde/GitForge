@@ -738,7 +738,7 @@ struct PipelineTriggerRequest {
 /// webhooks. This endpoint is internal control-plane automation and requires
 /// a dedicated trigger token, falling back to the scheduler operator/shared
 /// token during migration.
-fn configured_trigger_token(get_var: impl Fn(&str) -> Option<String>) -> Option<String> {
+fn configured_trigger_tokens(get_var: impl Fn(&str) -> Option<String>) -> Vec<String> {
     [
         "GITFORGE_TRIGGER_TOKEN",
         "GITFORGE_CI_TRIGGER_TOKEN",
@@ -746,7 +746,8 @@ fn configured_trigger_token(get_var: impl Fn(&str) -> Option<String>) -> Option<
         "GITFORGE_SCHEDULER_TOKEN",
     ]
     .into_iter()
-    .find_map(|name| get_var(name).filter(|token| !token.is_empty()))
+    .filter_map(|name| get_var(name).filter(|token| !token.is_empty()))
+    .collect()
 }
 
 /// Compare trigger credentials without leaking the first differing byte or
@@ -771,7 +772,7 @@ fn trigger_token_matches(expected: &str, supplied: Option<&str>) -> bool {
 }
 
 async fn require_trigger_auth(request: Request, next: Next) -> Response {
-    let expected = configured_trigger_token(|name| std::env::var(name).ok());
+    let expected = configured_trigger_tokens(|name| std::env::var(name).ok());
     let supplied = request
         .headers()
         .get("x-gitforge-trigger-token")
@@ -800,16 +801,19 @@ impl IntoResponse for TriggerAuthRejection {
 /// environment mutation. The small error value is converted to an HTTP
 /// response only at the middleware boundary.
 fn trigger_auth_verdict(
-    expected: Option<String>,
+    expected: Vec<String>,
     supplied: Option<&str>,
 ) -> Result<(), TriggerAuthRejection> {
-    let Some(expected) = expected else {
+    if expected.is_empty() {
         return Err(TriggerAuthRejection {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "trigger_auth_not_configured",
         });
-    };
-    if trigger_token_matches(&expected, supplied) {
+    }
+    if expected
+        .iter()
+        .any(|token| trigger_token_matches(token, supplied))
+    {
         Ok(())
     } else {
         Err(TriggerAuthRejection {
@@ -823,8 +827,8 @@ fn trigger_auth_verdict(
 /// `queued` answer poll this endpoint by the returned `event_id` until the
 /// event consumer creates the pipeline run (`accepted` plus
 /// `pipeline_run_id`) or the trigger reaches a terminal `failed`. Same
-/// control-plane authentication as the trigger POST: the dedicated trigger
-/// token or the scheduler operator token.
+/// control-plane authentication as the trigger POST: any non-empty dedicated
+/// trigger or scheduler compatibility token configured in the service.
 async fn get_trigger_status(
     Extension(trigger_state): Extension<Arc<TriggerState>>,
     Path(event_id): Path<String>,
@@ -2883,31 +2887,32 @@ mod tests {
     static WORKSPACE_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
     #[test]
-    fn trigger_token_accepts_git_server_compatibility_name() {
-        let token = configured_trigger_token(|name| {
+    fn trigger_tokens_accept_git_server_compatibility_name() {
+        let tokens = configured_trigger_tokens(|name| {
             (name == "GITFORGE_CI_TRIGGER_TOKEN").then(|| "shared-secret".to_string())
         });
-        assert_eq!(token.as_deref(), Some("shared-secret"));
+        assert_eq!(tokens, ["shared-secret"]);
     }
 
     #[test]
-    fn trigger_token_prefers_dedicated_name_over_compatibility_alias() {
-        let token = configured_trigger_token(|name| match name {
+    fn trigger_tokens_accept_dedicated_and_compatibility_names() {
+        let tokens = configured_trigger_tokens(|name| match name {
             "GITFORGE_TRIGGER_TOKEN" => Some("dedicated".to_string()),
             "GITFORGE_CI_TRIGGER_TOKEN" => Some("compatibility".to_string()),
             _ => None,
         });
-        assert_eq!(token.as_deref(), Some("dedicated"));
+        assert_eq!(tokens, ["dedicated", "compatibility"]);
     }
 
     #[test]
-    fn trigger_token_ignores_empty_values_and_falls_back() {
-        let token = configured_trigger_token(|name| match name {
+    fn trigger_tokens_ignore_empty_values_and_keep_fallbacks() {
+        let tokens = configured_trigger_tokens(|name| match name {
             "GITFORGE_TRIGGER_TOKEN" => Some(String::new()),
             "GITFORGE_CI_TRIGGER_TOKEN" => Some("compatibility".to_string()),
+            "GITFORGE_SCHEDULER_OPERATOR_TOKEN" => Some("operator".to_string()),
             _ => None,
         });
-        assert_eq!(token.as_deref(), Some("compatibility"));
+        assert_eq!(tokens, ["compatibility", "operator"]);
     }
 
     #[test]
@@ -5289,13 +5294,13 @@ jobs:
 
     #[test]
     fn trigger_auth_verdict_unconfigured_returns_503() {
-        let rejection = trigger_auth_verdict(None, Some("anything")).unwrap_err();
+        let rejection = trigger_auth_verdict(Vec::new(), Some("anything")).unwrap_err();
         assert_eq!(rejection.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
     fn trigger_auth_verdict_rejects_missing_and_wrong_credentials() {
-        let expected = Some("secret".to_string());
+        let expected = vec!["secret".to_string()];
         for supplied in [None, Some("wrong"), Some("Bearer wrong")] {
             let rejection = trigger_auth_verdict(expected.clone(), supplied).unwrap_err();
             assert_eq!(rejection.status, StatusCode::UNAUTHORIZED, "{supplied:?}");
@@ -5304,9 +5309,10 @@ jobs:
 
     #[test]
     fn trigger_auth_verdict_accepts_raw_and_bearer_credentials() {
-        let expected = Some("secret".to_string());
+        let expected = vec!["secret".to_string(), "operator".to_string()];
         assert!(trigger_auth_verdict(expected.clone(), Some("secret")).is_ok());
-        assert!(trigger_auth_verdict(expected, Some("Bearer secret")).is_ok());
+        assert!(trigger_auth_verdict(expected.clone(), Some("Bearer secret")).is_ok());
+        assert!(trigger_auth_verdict(expected, Some("Bearer operator")).is_ok());
     }
 
     #[tokio::test]
