@@ -159,6 +159,9 @@ async fn pipeline_list_is_scoped_to_authorized_repositories() {
     assert_eq!(owner_view.as_array().unwrap().len(), 1);
     assert_eq!(owner_view[0]["name"], "ci-routes-pipeline");
     assert_eq!(owner_view[0]["repo_id"], f.repo_id.to_string());
+    // The listing returns only active pipeline versions, so each row must
+    // advertise enabled=true for the CLI's status label.
+    assert_eq!(owner_view[0]["enabled"], true);
 
     // An unrelated developer must not even see the pipeline's existence.
     let (status, intruder_view) =
@@ -171,6 +174,7 @@ async fn pipeline_list_is_scoped_to_authorized_repositories() {
         request_json(f.app.clone(), "GET", uri, Some(&f.admin_token), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(admin_view.as_array().unwrap().len(), 1);
+    assert_eq!(admin_view[0]["enabled"], true);
 }
 
 #[tokio::test]
