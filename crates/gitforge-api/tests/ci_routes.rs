@@ -5,14 +5,13 @@
 //! durable job-submission contract: payload validation, idempotent replay,
 //! and the cancel lifecycle.
 
+use async_trait::async_trait;
 use axum::{
     body::{to_bytes, Body},
-    extract::State,
     http::{Request, StatusCode},
-    routing::post,
     Router,
 };
-use gitforge_api::{ApiAuth, ApiServer, CiTriggerClient};
+use gitforge_api::{routes::CiTriggerTransport, ApiAuth, ApiServer, CiTriggerClient};
 use gitforge_ci::{JobDefinition, PipelineDefinition, StepDefinition, TriggerType};
 use gitforge_common::{PipelineId, PipelineRunId, RepoId};
 use gitforge_db::{
@@ -137,14 +136,6 @@ async fn request_json(
             .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into_owned()))
     };
     (status, parsed)
-}
-
-async fn capture_selected_pipeline_trigger(
-    State(seen): State<Arc<Mutex<Vec<Value>>>>,
-    Json(payload): Json<Value>,
-) -> Json<Value> {
-    seen.lock().unwrap().push(payload);
-    Json(json!({"pipeline_run_id": "selected-pipeline-run"}))
 }
 
 fn submit_body(run_id: &PipelineRunId, commands: Vec<&str>) -> Value {
@@ -792,20 +783,63 @@ async fn webhook_replays_are_idempotent_and_map_to_one_durable_job() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// CI delegation test transports
+// ---------------------------------------------------------------------------
+
+/// One observed delivery: the trigger token the client forwarded and the
+/// exact orchestrator payload it built.
+struct CiTriggerDelivery {
+    trigger_token: String,
+    payload: Value,
+}
+
+/// Captures the exact trigger deliveries the gateway hands the CI client.
+///
+/// The production client is pinned to the fixed loopback orchestrator
+/// endpoint (`CiTriggerClient::new` rejects any other URL as an SSRF
+/// bound), so delegation is observed by injecting this transport instead
+/// of binding the pinned port — a port a live deployment may already own,
+/// which previously turned the assertion into a silent skip.
+struct CapturingCiTriggerTransport {
+    deliveries: Mutex<Vec<CiTriggerDelivery>>,
+    pipeline_run_id: String,
+}
+
+#[async_trait]
+impl CiTriggerTransport for CapturingCiTriggerTransport {
+    async fn send(&self, trigger_token: &str, payload: Value) -> Result<Option<String>, String> {
+        self.deliveries.lock().unwrap().push(CiTriggerDelivery {
+            trigger_token: trigger_token.to_string(),
+            payload,
+        });
+        Ok(Some(self.pipeline_run_id.clone()))
+    }
+}
+
+/// A transport that models an orchestrator the gateway cannot reach, so
+/// delegation fails without any live network dependency.
+struct RefusingCiTriggerTransport;
+
+#[async_trait]
+impl CiTriggerTransport for RefusingCiTriggerTransport {
+    async fn send(&self, _: &str, _: Value) -> Result<Option<String>, String> {
+        Err("CI trigger request failed: connection refused".to_string())
+    }
+}
+
 /// The API gateway delegates webhook execution to the loopback CI
-/// orchestrator whenever the trigger client is configured. This deployment
-/// has no CI endpoint answering under the test's identity, so the gateway
-/// must fail closed with a 502 instead of silently dropping the delivery.
+/// orchestrator whenever the trigger client is configured. When the
+/// orchestrator cannot accept the delivery, the gateway must fail closed
+/// with a 502 instead of silently dropping the delivery.
 #[tokio::test]
 async fn webhook_delegation_fails_closed_when_ci_cannot_accept_the_trigger() {
     let f = seed().await;
-    let client = CiTriggerClient::new(
-        "http://127.0.0.1:42781/pipelines/trigger",
-        "not-a-real-token",
-    )
-    .unwrap();
     let app = ApiServer::new("test-secret", f.pool.clone())
-        .with_ci_trigger_client(Arc::new(client))
+        .with_ci_trigger_client(Arc::new(CiTriggerClient::with_transport(
+            Arc::new(RefusingCiTriggerTransport),
+            "not-a-real-token",
+        )))
         .into_router();
 
     let (status, body) = request_json(
@@ -1187,36 +1221,27 @@ async fn pipeline_run_trigger_resolves_revisions_in_repository_storage() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
+/// The runs endpoint must hand CI the selected pipeline id, the resolved
+/// commit, and the owning repository — exactly once per trigger. The
+/// orchestrator endpoint is pinned to a fixed loopback URL by
+/// `CiTriggerClient::new` (an SSRF bound the test must not relax), so the
+/// delivery is observed through an injected capturing transport rather
+/// than a stub bound to the pinned port, which silently skipped whenever
+/// the port was already owned on the host.
 #[tokio::test]
 async fn pipeline_run_trigger_delegates_the_exact_selected_pipeline_id() {
     let f = seed().await;
     let (_bare, pipeline_id, commit) = seed_real_storage_repo(&f).await;
-    let client = CiTriggerClient::new(
-        "http://127.0.0.1:42781/pipelines/trigger",
-        "selected-pipeline-token",
-    )
-    .unwrap();
+    let deliveries = Arc::new(Mutex::new(Vec::new()));
     let app = ApiServer::new("test-secret", f.pool.clone())
-        .with_ci_trigger_client(Arc::new(client))
+        .with_ci_trigger_client(Arc::new(CiTriggerClient::with_transport(
+            Arc::new(CapturingCiTriggerTransport {
+                deliveries: deliveries.clone(),
+                pipeline_run_id: "selected-pipeline-run".to_string(),
+            }),
+            "selected-pipeline-token",
+        )))
         .into_router();
-
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:42781").await {
-        Ok(listener) => listener,
-        Err(_) => {
-            eprintln!("skipping pipeline_run_trigger_delegates_the_exact_selected_pipeline_id: pinned CI port is occupied");
-            return;
-        }
-    };
-    let received = Arc::new(Mutex::new(Vec::new()));
-    let stub = Router::new()
-        .route(
-            "/pipelines/trigger",
-            post(capture_selected_pipeline_trigger),
-        )
-        .with_state(received.clone());
-    let server = tokio::spawn(async move {
-        axum::serve(listener, stub).await.unwrap();
-    });
 
     let (status, body) = request_json(
         app,
@@ -1230,12 +1255,16 @@ async fn pipeline_run_trigger_delegates_the_exact_selected_pipeline_id() {
     assert_eq!(body["pipeline_id"], pipeline_id.to_string());
     assert_eq!(body["pipeline_run_id"], "selected-pipeline-run");
 
-    let seen = received.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0]["repo_id"], f.repo_id.to_string());
-    assert_eq!(seen[0]["new_hash"], commit);
-    assert_eq!(seen[0]["selected_pipeline_id"], pipeline_id.to_string());
-    server.abort();
+    let seen = deliveries.lock().unwrap();
+    assert_eq!(seen.len(), 1, "exactly one delegation per trigger");
+    assert_eq!(seen[0].trigger_token, "selected-pipeline-token");
+    assert_eq!(seen[0].payload["repo_id"], f.repo_id.to_string());
+    assert_eq!(seen[0].payload["new_hash"], commit);
+    assert_eq!(
+        seen[0].payload["selected_pipeline_id"],
+        pipeline_id.to_string()
+    );
+    assert_eq!(seen[0].payload["old_hash"], "0".repeat(40));
 }
 
 #[tokio::test]

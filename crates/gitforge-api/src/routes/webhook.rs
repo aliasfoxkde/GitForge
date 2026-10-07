@@ -3,6 +3,7 @@
 //! Allows external services to trigger pipeline runs via webhooks.
 
 use crate::middleware::AuthenticatedUser;
+use async_trait::async_trait;
 use axum::{
     extract::{Extension, Path},
     http::StatusCode,
@@ -111,13 +112,92 @@ fn derive_webhook_job_plan(
     })
 }
 
+/// Outbound transport for one CI trigger delivery to the CI orchestrator.
+///
+/// The trigger endpoint is pinned to the fixed loopback address
+/// ([`CI_TRIGGER_URL`]) as an SSRF bound: deployment configuration must
+/// never be able to point trigger deliveries at an arbitrary host, port,
+/// or path. [`CiTriggerClient::new`] enforces that bound before installing
+/// the reqwest-backed transport; tests deliver through injected transports
+/// instead, never by relaxing the endpoint bound.
+#[async_trait]
+pub trait CiTriggerTransport: Send + Sync + 'static {
+    /// Deliver one trigger payload and report the `pipeline_run_id` the
+    /// orchestrator echoed, or `None` when it accepted the trigger without
+    /// creating a run yet.
+    async fn send(
+        &self,
+        trigger_token: &str,
+        payload: serde_json::Value,
+    ) -> Result<Option<String>, String>;
+}
+
+/// reqwest-backed delivery to the fixed loopback orchestrator endpoint.
+/// Only [`CiTriggerClient::new`] constructs it, after validating that
+/// endpoint.
+#[derive(Clone)]
+struct ReqwestCiTriggerTransport {
+    client: reqwest::Client,
+}
+
+impl ReqwestCiTriggerTransport {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                // Must outlast the orchestrator's run-creation correlation
+                // window: the trigger handler is synchronous end-to-end and
+                // answers `queued` (no run id) when that window elapses
+                // under write contention. A budget at or below the window
+                // made this client die first, manufacturing a 502 for
+                // triggers that actually succeeded (observed live
+                // 2026-09-29 under a dispatch-storm backlog).
+                .timeout(trigger_client_timeout())
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| format!("failed to build CI trigger client: {error}"))?,
+        })
+    }
+}
+
+#[async_trait]
+impl CiTriggerTransport for ReqwestCiTriggerTransport {
+    async fn send(
+        &self,
+        trigger_token: &str,
+        payload: serde_json::Value,
+    ) -> Result<Option<String>, String> {
+        let response = self
+            .client
+            // The configured value is validated at startup, but never
+            // reaches this request sink; the deployed CI endpoint is fixed.
+            .post(CI_TRIGGER_URL)
+            .header("x-gitforge-trigger-token", trigger_token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| format!("CI trigger request failed: {error}"))?;
+        let status = response.status();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| format!("CI trigger returned invalid JSON: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("CI trigger returned HTTP {status}: {body}"));
+        }
+        Ok(body
+            .get("pipeline_run_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string))
+    }
+}
+
 /// HTTP client for the separately deployed CI orchestrator. The API gateway
 /// must hand webhook execution to CI so CI can create the run-owned checkout,
 /// register the pipeline engine, and progress the dependency DAG.
 #[derive(Clone)]
 pub struct CiTriggerClient {
     token: String,
-    client: reqwest::Client,
+    transport: Arc<dyn CiTriggerTransport>,
 }
 
 impl CiTriggerClient {
@@ -133,19 +213,23 @@ impl CiTriggerClient {
 
         Ok(Self {
             token: token.into(),
-            client: reqwest::Client::builder()
-                // Must outlast the orchestrator's run-creation correlation
-                // window: the trigger handler is synchronous end-to-end and
-                // answers `queued` (no run id) when that window elapses
-                // under write contention. A budget at or below the window
-                // made this client die first, manufacturing a 502 for
-                // triggers that actually succeeded (observed live
-                // 2026-09-29 under a dispatch-storm backlog).
-                .timeout(trigger_client_timeout())
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|error| format!("failed to build CI trigger client: {error}"))?,
+            transport: Arc::new(ReqwestCiTriggerTransport::new()?),
         })
+    }
+
+    /// Build a client around an explicit transport. Production always goes
+    /// through [`CiTriggerClient::new`], whose URL validation is the SSRF
+    /// bound; this constructor exists so tests can observe the exact
+    /// delegation payload without binding the orchestrator's pinned
+    /// loopback port on the test host.
+    pub fn with_transport(
+        transport: Arc<dyn CiTriggerTransport>,
+        token: impl Into<String>,
+    ) -> Self {
+        Self {
+            token: token.into(),
+            transport,
+        }
     }
 
     /// The total request budget this client grants the orchestrator. Exposed
@@ -165,35 +249,19 @@ impl CiTriggerClient {
         let old_hash = old_commit_hash
             .filter(|hash| !hash.is_empty())
             .unwrap_or("0000000000000000000000000000000000000000");
-        let response = self
-            .client
-            // The configured value is validated at startup, but never reaches
-            // this request sink; the deployed CI endpoint is fixed.
-            .post(CI_TRIGGER_URL)
-            .header("x-gitforge-trigger-token", &self.token)
-            .json(&serde_json::json!({
-                "repo_id": repo_id.to_string(),
-                "ref_name": branch,
-                "old_hash": old_hash,
-                "new_hash": commit_hash,
-                "selected_pipeline_id": selected_pipeline_id.map(|id| id.to_string()),
-                "working_dir": null
-            }))
-            .send()
+        self.transport
+            .send(
+                &self.token,
+                serde_json::json!({
+                    "repo_id": repo_id.to_string(),
+                    "ref_name": branch,
+                    "old_hash": old_hash,
+                    "new_hash": commit_hash,
+                    "selected_pipeline_id": selected_pipeline_id.map(|id| id.to_string()),
+                    "working_dir": null
+                }),
+            )
             .await
-            .map_err(|error| format!("CI trigger request failed: {error}"))?;
-        let status = response.status();
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|error| format!("CI trigger returned invalid JSON: {error}"))?;
-        if !status.is_success() {
-            return Err(format!("CI trigger returned HTTP {status}: {body}"));
-        }
-        Ok(body
-            .get("pipeline_run_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string))
     }
 }
 
