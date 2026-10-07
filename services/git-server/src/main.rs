@@ -586,7 +586,17 @@ async fn git_receive_pack(
                     );
                     continue;
                 }
-                if let Err(error) = enqueue_ci_event(&state, repo_id, &update).await {
+                if let Err(error) = enqueue_ci_event(
+                    state
+                        .db_pool
+                        .as_deref()
+                        .expect("repo lookup requires database"),
+                    repo_id,
+                    &update,
+                    None,
+                )
+                .await
+                {
                     // No longer a drop: the inline retry outlives measured
                     // storms (F42) and anything beyond that hands off to a
                     // background continuation that keeps inserting until the
@@ -619,10 +629,11 @@ async fn git_receive_pack(
     }
 }
 
-async fn enqueue_ci_event(
-    state: &AppState,
+pub(crate) async fn enqueue_ci_event(
+    pool: &Pool,
     repo_id: RepoId,
     update: &ReceiveUpdate,
+    pusher_id: Option<gitforge_common::UserId>,
 ) -> anyhow::Result<()> {
     // Defense in depth for the deletion filter at the call site: no caller
     // should publish a trigger with nothing to build, whatever the path.
@@ -634,14 +645,12 @@ async fn enqueue_ci_event(
         );
         return Ok(());
     }
-    let Some(pool) = &state.db_pool else {
-        anyhow::bail!("database is required for durable CI delivery");
-    };
     let payload = serde_json::json!({
         "repo_id": repo_id.to_string(),
         "ref_name": update.ref_name,
         "old_hash": update.old_hash,
         "new_hash": update.new_hash,
+        "pusher_id": pusher_id.map(|user_id| user_id.to_string()),
     });
     // A lost trigger row is a lost pipeline: by this point the push is
     // already accepted, so nothing else will ever retry this insert — the
@@ -1164,18 +1173,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_enqueue_ci_event_skips_all_zero_new_hash() {
-        let storage = Arc::new(FileStorageBackend::new("target/test-git-root-f37"));
-        let state = AppState {
-            http_handler: Arc::new(HttpGitHandler::new((*storage).clone())),
-            storage,
-            // Deliberately absent: the unguarded durable-delivery path bails
-            // without a pool, which is what makes the contrast case below a
-            // proof that the zero-hash branch really short-circuited.
-            db_pool: None,
-            ci_trigger_url: None,
-            ci_trigger_token: None,
-            http_client: reqwest::Client::new(),
-        };
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let pool = Pool::new(&dir.path().join("events.db").display().to_string())
+            .await
+            .expect("create database pool");
+        pool.migrate().await.expect("migrate database");
         let repo_id = RepoId::new();
 
         let deletion = ReceiveUpdate {
@@ -1183,22 +1185,34 @@ mod tests {
             new_hash: "0000000000000000000000000000000000000000".to_string(),
             ref_name: "refs/heads/feat/gone".to_string(),
         };
-        enqueue_ci_event(&state, repo_id, &deletion)
+        enqueue_ci_event(&pool, repo_id, &deletion, None)
             .await
             .expect("a ref deletion has nothing to build; it must be a silent no-op");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(pool.pool())
+            .await
+            .expect("count events after deletion");
+        assert_eq!(count, 0, "deletions must not create a durable CI event");
 
-        // Same state, real hash: the guard does not fire, the function
-        // reaches the database requirement and fails loudly.
+        // A real commit hash reaches the durable path and creates one row.
         let real = ReceiveUpdate {
             old_hash: deletion.old_hash,
             new_hash: "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
             ref_name: "refs/heads/feat/live".to_string(),
         };
-        let result = enqueue_ci_event(&state, repo_id, &real).await;
-        assert!(
-            result.is_err(),
-            "a real commit hash must still require the durable database path"
-        );
+        let result = enqueue_ci_event(&pool, repo_id, &real, None).await;
+        result.expect("a real ref update must be durably enqueued");
+        let (event_type, payload): (String, String) = sqlx::query_as(
+            "SELECT event_type, payload FROM events ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(pool.pool())
+        .await
+        .expect("read durable event");
+        assert_eq!(event_type, "ci.trigger.pending");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("parse payload");
+        assert_eq!(payload["repo_id"], repo_id.to_string());
+        assert_eq!(payload["ref_name"], "refs/heads/feat/live");
+        assert_eq!(payload["new_hash"], real.new_hash);
     }
 
     // --- F42 acceptance: the trigger outbox survives a real SQLITE_BUSY

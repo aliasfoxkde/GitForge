@@ -41,6 +41,7 @@ struct CiService {
     db_path: PathBuf,
     workspace_root: PathBuf,
     repo_id: RepoId,
+    user_id: UserId,
     commit_hash: String,
 }
 
@@ -179,6 +180,7 @@ async fn spawn_ci() -> CiService {
         db_path,
         workspace_root: workspaces,
         repo_id,
+        user_id,
         commit_hash,
     }
 }
@@ -206,10 +208,12 @@ async fn test_trigger_requires_token_and_runs_committed_pipeline() {
 
     let trigger_body = format!(
         "{{\"repo_id\":\"{}\",\"ref_name\":\"refs/heads/main\",\
-          \"old_hash\":\"{}\",\"new_hash\":\"{}\",\"working_dir\":null}}",
+          \"old_hash\":\"{}\",\"new_hash\":\"{}\",\"pusher_id\":\"{}\",\
+          \"working_dir\":null}}",
         service.repo_id,
         "0".repeat(40),
-        service.commit_hash
+        service.commit_hash,
+        service.user_id
     );
 
     // Without the trigger token the endpoint must not start anything.

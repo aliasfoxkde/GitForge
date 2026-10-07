@@ -22,6 +22,8 @@ struct TestServer {
     ssh_port: u16,
     git_root: PathBuf,
     repo_id: RepoId,
+    user_id: UserId,
+    db_path: PathBuf,
     /// `GIT_SSH_COMMAND` that authenticates with the generated client key.
     git_ssh_command: String,
     ssh_key_dir: PathBuf,
@@ -259,6 +261,8 @@ async fn spawn_server() -> TestServer {
         ssh_port,
         git_root,
         repo_id,
+        user_id,
+        db_path,
         git_ssh_command,
         ssh_key_dir,
         _ssh_key_tempdir: ssh_key_tempdir,
@@ -317,6 +321,25 @@ async fn test_git_push_and_clone_over_ssh() {
         "pushed ref must match local commit"
     );
 
+    // The SSH receive-pack path must use the same durable outbox contract as
+    // Smart HTTP, including the account authenticated by the presented key.
+    let pool = gitforge_db::Pool::new(&server.db_path.display().to_string())
+        .await
+        .expect("open push event database");
+    let (event_type, payload): (String, String) = sqlx::query_as(
+        "SELECT event_type, payload FROM events WHERE event_type = 'ci.trigger.pending'",
+    )
+    .fetch_one(pool.pool())
+    .await
+    .expect("SSH push must leave a durable CI event");
+    assert_eq!(event_type, "ci.trigger.pending");
+    let payload: serde_json::Value = serde_json::from_str(&payload).expect("parse push event");
+    assert_eq!(payload["repo_id"], server.repo_id.to_string());
+    assert_eq!(payload["ref_name"], "refs/heads/main");
+    assert_eq!(payload["old_hash"], "0".repeat(40));
+    assert_eq!(payload["new_hash"], pushed_sha);
+    assert_eq!(payload["pusher_id"], server.user_id.to_string());
+
     // ─── Clone: real upload-pack negotiation over SSH ───────────────────
     let clone_parent = base.join("clones");
     std::fs::create_dir_all(&clone_parent).expect("create clone parent");
@@ -336,6 +359,53 @@ async fn test_git_push_and_clone_over_ssh() {
     );
     run_git(&["push", "origin", "main"], &work, &[], ssh);
     run_git(&["fetch", "origin"], &clone_parent.join("cloned"), &[], ssh);
+    let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(pool.pool())
+        .await
+        .expect("count push events after upload-pack");
+    assert_eq!(event_count, 2, "upload-pack must not create a build event");
+
+    // A divergent update is rejected by receive-pack. Git's process can
+    // still exit normally after reporting per-ref rejection, so only an
+    // explicit `ok <ref>` status may enqueue another build.
+    let stale_clone = clone_parent.join("cloned");
+    std::fs::write(stale_clone.join("divergent.txt"), "divergent\n").expect("write divergent file");
+    run_git(&["add", "."], &stale_clone, &[], None);
+    run_git(
+        &["commit", "-m", "divergent stale commit"],
+        &stale_clone,
+        &[],
+        None,
+    );
+    let rejected = Command::new("git")
+        .args(["push", "origin", "main"])
+        .current_dir(&stale_clone)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_SSH_COMMAND", server.git_ssh_command.clone())
+        .output()
+        .expect("spawn rejected non-fast-forward push");
+    assert!(
+        !rejected.status.success(),
+        "divergent push must be rejected"
+    );
+    let count_after_rejection: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(pool.pool())
+        .await
+        .expect("count events after rejected push");
+    assert_eq!(
+        count_after_rejection, 2,
+        "rejected refs must not trigger CI"
+    );
+
+    // Ref deletion has a successful receive-pack status but no commit to
+    // build, so it must not add an outbox event either.
+    run_git(&["push", "origin", ":main"], &work, &[], ssh);
+    let count_after_deletion: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(pool.pool())
+        .await
+        .expect("count events after ref deletion");
+    assert_eq!(count_after_deletion, 2, "ref deletion must not trigger CI");
 
     common::shutdown_gracefully(&mut server.child).await;
 }

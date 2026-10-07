@@ -134,6 +134,10 @@ struct ChannelProcess {
     /// complete and the repository's ref-update policy has been evaluated;
     /// the bytes are only forwarded to the child afterwards.
     pending_push: Option<PendingPush>,
+    push_updates: Option<Vec<crate::ref_policy::ReceiveUpdate>>,
+    push_repo_id: Option<gitforge_common::RepoId>,
+    push_pusher: Option<gitforge_common::UserId>,
+    push_event_sender: Option<oneshot::Sender<PushEventContext>>,
     /// Set once a push has been declined by the ref-update policy: the
     /// status report is already on the wire, and any further client bytes
     /// are discarded so a large pack can never stall on a full pipe.
@@ -144,6 +148,12 @@ struct ChannelProcess {
 struct PendingPush {
     buffer: Vec<u8>,
     repo_id: gitforge_common::RepoId,
+}
+
+struct PushEventContext {
+    repo_id: Option<gitforge_common::RepoId>,
+    updates: Vec<crate::ref_policy::ReceiveUpdate>,
+    pusher_id: Option<gitforge_common::UserId>,
 }
 
 /// Per-connection handler.
@@ -303,6 +313,13 @@ impl Handler for GitSshSession {
             if process.pending_push.is_some() {
                 process.pending_push = None;
             }
+            if let Some(sender) = process.push_event_sender.take() {
+                let _ = sender.send(PushEventContext {
+                    updates: process.push_updates.take().unwrap_or_default(),
+                    repo_id: process.push_repo_id.take(),
+                    pusher_id: process.push_pusher,
+                });
+            }
         }
         Ok(())
     }
@@ -390,6 +407,7 @@ impl GitSshSession {
                 .await;
         };
         let updates = ref_policy::parse_receive_updates(&buffer);
+        let authenticated_user = self.authenticated_user;
         match ref_policy::evaluate_ref_policy(&pool, repo_id, &updates).await {
             RefPolicyDecision::Allow => {}
             RefPolicyDecision::Reject(reasons) => {
@@ -410,6 +428,9 @@ impl GitSshSession {
         // that has been serving the advertisement since the channel opened.
         if let Some(process) = self.processes.get_mut(&channel) {
             process.pending_push = None;
+            process.push_updates = Some(updates);
+            process.push_repo_id = Some(repo_id);
+            process.push_pusher = authenticated_user;
             if let Some(stdin) = process.stdin.as_mut() {
                 if let Err(error) = stdin.write_all(&buffer).await {
                     tracing::warn!(?channel, %error, "failed to replay buffered push data");
@@ -520,6 +541,7 @@ impl GitSshSession {
             .ok_or_else(|| "git process was spawned without a piped stderr".to_string())?;
 
         let (cancel, cancellation) = oneshot::channel();
+        let (push_event_sender, push_event_receiver) = oneshot::channel();
         // For receive-pack, stdin forwarding is held back until the command
         // list is complete and the ref-update policy (#240) has approved the
         // push. The child itself starts immediately: an interactive receive
@@ -544,10 +566,15 @@ impl GitSshSession {
                 cancel: Some(cancel),
                 pending_push,
                 declined: false,
+                push_updates: None,
+                push_repo_id: None,
+                push_pusher: None,
+                push_event_sender: (git_command == "receive-pack").then_some(push_event_sender),
             },
         );
 
         let handle = session.handle();
+        let capture_receive_status = git_command == "receive-pack";
         tokio::spawn(pump_until_exit(
             handle,
             channel,
@@ -555,6 +582,9 @@ impl GitSshSession {
             stdout,
             stderr,
             cancellation,
+            push_event_receiver,
+            self.context.db_pool.clone(),
+            capture_receive_status,
         ));
         tracing::info!(
             command = %command.trim(),
@@ -632,27 +662,35 @@ async fn pump_until_exit(
     stdout: tokio::process::ChildStdout,
     stderr: tokio::process::ChildStderr,
     mut cancellation: oneshot::Receiver<()>,
+    push_event: oneshot::Receiver<PushEventContext>,
+    db_pool: Option<Arc<Pool>>,
+    capture_receive_status: bool,
 ) {
     let data_handle = handle.clone();
     let mut out_task = tokio::spawn(async move {
-        pipe_to_channel(data_handle, channel, stdout, false).await;
+        if capture_receive_status {
+            Some(pipe_receive_status_to_channel(data_handle, channel, stdout).await)
+        } else {
+            pipe_to_channel(data_handle, channel, stdout, false).await;
+            None
+        }
     });
     let error_handle = handle.clone();
     let mut err_task = tokio::spawn(async move {
         pipe_to_channel(error_handle, channel, stderr, true).await;
     });
-    tokio::select! {
+    let receive_status = tokio::select! {
         _ = &mut cancellation => {
             out_task.abort();
             err_task.abort();
             reap_cancelled_child(&mut child).await;
             return;
         }
-        () = async {
-            let _ = (&mut out_task).await;
+        result = async {
             let _ = (&mut err_task).await;
-        } => {}
-    }
+            (&mut out_task).await.ok().flatten()
+        } => result,
+    };
 
     let status = tokio::select! {
         result = child.wait() => result.ok().and_then(|status| status.code()).unwrap_or(-1),
@@ -661,9 +699,97 @@ async fn pump_until_exit(
             return;
         }
     };
+    if status == 0 {
+        if let (Ok(push_event), Some(pool)) = (push_event.await, db_pool) {
+            let pusher_id = push_event.pusher_id;
+            if let Some(repo_id) = push_event.repo_id {
+                let accepted_refs = receive_status
+                    .as_deref()
+                    .and_then(parse_receive_status_ok_refs)
+                    .unwrap_or_default();
+                for update in push_event.updates {
+                    if !accepted_refs.contains(&update.ref_name) {
+                        continue;
+                    }
+                    if let Err(error) =
+                        crate::enqueue_ci_event(&pool, repo_id, &update, pusher_id).await
+                    {
+                        tracing::error!(?channel, ref_name = %update.ref_name, %error,
+                            "SSH CI trigger insert deferred to background redelivery");
+                    }
+                }
+            }
+        }
+    }
     let _ = handle.exit_status_request(channel, status as u32).await;
     let _ = handle.eof(channel).await;
     let _ = handle.close(channel).await;
+}
+
+/// Read the bounded receive-pack status report while forwarding it unchanged
+/// to the SSH client. The report is small; refusing to enqueue if it exceeds
+/// the cap is safer than guessing which refs receive-pack accepted.
+async fn pipe_receive_status_to_channel(
+    handle: russh::server::Handle,
+    channel: russh::ChannelId,
+    mut pipe: impl tokio::io::AsyncRead + Unpin,
+) -> Vec<u8> {
+    const MAX_STATUS_BYTES: usize = 1024 * 1024;
+    let mut status = Vec::new();
+    let mut overflowed = false;
+    let mut buffer = vec![0u8; 16 * 1024];
+    loop {
+        match pipe.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let chunk = buffer[..n].to_vec();
+                if !overflowed && status.len() + n <= MAX_STATUS_BYTES {
+                    status.extend_from_slice(&buffer[..n]);
+                } else {
+                    overflowed = true;
+                    status.clear();
+                }
+                if handle.data(channel, chunk).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    if overflowed {
+        Vec::new()
+    } else {
+        status
+    }
+}
+
+fn parse_receive_status_ok_refs(status: &[u8]) -> Option<std::collections::HashSet<String>> {
+    let mut accepted = std::collections::HashSet::new();
+    let mut offset = 0;
+    let mut saw_unpack_ok = false;
+    while offset + 4 <= status.len() {
+        let length =
+            usize::from_str_radix(std::str::from_utf8(&status[offset..offset + 4]).ok()?, 16)
+                .ok()?;
+        if length == 0 {
+            return saw_unpack_ok.then_some(accepted);
+        }
+        if length < 4 || offset + length > status.len() {
+            return None;
+        }
+        let mut payload = &status[offset + 4..offset + length];
+        if payload.first() == Some(&1) {
+            payload = &payload[1..];
+        }
+        for line in payload.split(|byte| *byte == b'\n') {
+            if line == b"unpack ok" {
+                saw_unpack_ok = true;
+            } else if let Some(ref_name) = line.strip_prefix(b"ok ") {
+                accepted.insert(std::str::from_utf8(ref_name).ok()?.to_string());
+            }
+        }
+        offset += length;
+    }
+    None
 }
 
 /// Kill a disconnected git child and await it so it cannot remain a zombie.
@@ -785,6 +911,15 @@ mod tests {
         assert!(parse_git_command("git-upload-pack ''").is_err());
         assert!(parse_git_command("ls -la /tmp").is_err());
         assert!(parse_git_command("git-shell '/owner/repo.git'").is_err());
+    }
+
+    #[test]
+    fn test_receive_status_only_accepts_reported_refs() {
+        let status = b"000eunpack ok\n0017ok refs/heads/main\n001dng refs/heads/bad denied\n0000";
+        let accepted = parse_receive_status_ok_refs(status).expect("valid status report");
+        assert!(accepted.contains("refs/heads/main"));
+        assert!(!accepted.contains("refs/heads/bad"));
+        assert!(parse_receive_status_ok_refs(b"0000").is_none());
     }
 
     #[tokio::test]
