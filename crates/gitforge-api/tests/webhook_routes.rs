@@ -577,6 +577,11 @@ async fn webhook_delegation_ladder_relays_success_and_fails_closed() {
     assert_eq!(seen.len(), 4, "every webhook hit the pinned endpoint");
     assert_eq!(seen[0].token, "stub-token");
     assert_eq!(seen[0].body["repo_id"], f.repo_id.to_string());
+    assert_eq!(
+        seen[0].body["selected_pipeline_id"],
+        f.valid_pipeline.to_string(),
+        "the explicit webhook pipeline must cross the CI boundary"
+    );
     assert_eq!(seen[0].body["ref_name"], "main");
     assert_eq!(
         seen[0].body["old_hash"],

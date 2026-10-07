@@ -4,6 +4,10 @@ All notable GitForge changes are recorded here by release or merged change.
 
 ## Unreleased
 
+- Preserve the explicitly requested active pipeline ID from manual and
+  webhook triggers through the API-to-CI event path, execute that stored
+  definition, and retain commit-bound configuration resolution for ordinary
+  Git pushes. Retired and cross-repository selections fail closed.
 - Make runner registration restart-safe by refreshing the durable identity for
   a stable `GITFORGE_RUNNER_NAME` instead of inserting a new UUID on every
   process restart. Existing stale rows remain available for audited retirement.

@@ -160,6 +160,7 @@ impl CiTriggerClient {
         branch: &str,
         old_commit_hash: Option<&str>,
         commit_hash: &str,
+        selected_pipeline_id: Option<PipelineId>,
     ) -> Result<Option<String>, String> {
         let old_hash = old_commit_hash
             .filter(|hash| !hash.is_empty())
@@ -175,6 +176,7 @@ impl CiTriggerClient {
                 "ref_name": branch,
                 "old_hash": old_hash,
                 "new_hash": commit_hash,
+                "selected_pipeline_id": selected_pipeline_id.map(|id| id.to_string()),
                 "working_dir": null
             }))
             .send()
@@ -231,7 +233,7 @@ async fn trigger_pipeline(
     };
 
     // Verify pipeline exists
-    match PipelineQueries::get(&pool, pipeline_uuid).await {
+    match PipelineQueries::get_active(&pool, pipeline_uuid).await {
         Ok(Some(pipeline)) => {
             let repo_id = match uuid::Uuid::parse_str(&payload.repo_id) {
                 Ok(uuid) if RepoId::from(uuid) == pipeline.repo_id => RepoId::from(uuid),
@@ -255,6 +257,7 @@ async fn trigger_pipeline(
                         &payload.branch,
                         payload.old_commit_hash.as_deref(),
                         &payload.commit_hash,
+                        Some(pipeline.id),
                     )
                     .await
                 {

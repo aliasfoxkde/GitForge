@@ -411,6 +411,8 @@ struct PipelineTriggerRequest {
     old_hash: String,
     new_hash: String,
     working_dir: Option<String>,
+    #[serde(default)]
+    selected_pipeline_id: Option<String>,
 }
 
 /// Trigger a pipeline through the same typed push-event path used by Git
@@ -502,6 +504,22 @@ async fn trigger_pipeline(
         }
     };
 
+    let selected_pipeline_id = match request.selected_pipeline_id {
+        Some(id) => match uuid::Uuid::parse_str(&id) {
+            Ok(id) => Some(gitforge_common::PipelineId::from(id)),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_pipeline_id",
+                        "message": "selected_pipeline_id must be a UUID"
+                    })),
+                )
+            }
+        },
+        None => None,
+    };
+
     let working_dir = match request.working_dir {
         Some(path) => match validate_workspace_path(&path) {
             Ok(path) => Some(path),
@@ -524,7 +542,7 @@ async fn trigger_pipeline(
         .expect("workspace cache lock poisoned")
         .insert(repo_id, working_dir);
 
-    let event = EventEnvelope::new(
+    let mut event = EventEnvelope::new(
         EventType::PushReceived,
         EventPayload::PushReceived(PushReceivedPayload {
             repo_id,
@@ -536,6 +554,9 @@ async fn trigger_pipeline(
         Some(repo_id),
         None,
     );
+    if let Some(pipeline_id) = selected_pipeline_id {
+        event = event.with_selected_pipeline(pipeline_id);
+    }
 
     let (run_tx, run_rx) = tokio::sync::oneshot::channel();
     trigger_state
@@ -1650,47 +1671,60 @@ async fn handle_push_event(
         payload.new_hash
     );
 
-    // Get or create the pipeline definition for this repo. The definition
-    // committed at the pushed revision is authoritative: CI configuration is
-    // code, so a push that changes it must govern this and later runs without
-    // a control-plane restart. The in-memory cache and durable rows only
-    // apply when the revision carries no committed definition.
-    let committed_pipeline = match scheduler_db {
-        Some(pool) => match load_pipeline_from_commit(pool, repo_id, &payload.new_hash).await {
-            Ok(pipeline) => pipeline,
-            Err(error) => return Err(error),
-        },
-        None => None,
-    };
-    let pipeline = if let Some(committed) = committed_pipeline {
-        tracing::info!(
-            "using committed pipeline definition at {} for repo {}",
-            payload.new_hash,
-            repo_id
-        );
-        committed
-    } else {
-        let cached_pipeline = { pipeline_cache.lock().unwrap().get(&repo_id).cloned() };
-        if let Some(cached) = cached_pipeline {
-            cached
-        } else {
-            let persisted = if let Some(pool) = scheduler_db {
-                gitforge_db::queries::PipelineQueries::list_by_repo(pool, repo_id)
-                    .await?
-                    .into_iter()
-                    .find_map(|pipeline| {
-                        serde_json::from_value::<PipelineDefinition>(pipeline.config).ok()
-                    })
-            } else {
-                None
-            };
-            persisted.unwrap_or_else(|| create_default_pipeline(&repo_id.to_string()))
+    // Manual/API triggers carry an explicit active pipeline identity and
+    // must execute that stored definition. Ordinary pushes deliberately do
+    // not carry one: their committed definition remains authoritative, with
+    // the existing cache/database/default fallback only when no file exists.
+    let selected_pipeline_id = event.selected_pipeline_id;
+    let pipeline = if let Some(selected_id) = selected_pipeline_id {
+        let pool = scheduler_db.ok_or_else(|| {
+            anyhow::anyhow!("selected pipeline {selected_id} requires durable pipeline storage")
+        })?;
+        let selected = gitforge_db::queries::PipelineQueries::get_active(pool, selected_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("selected pipeline {selected_id} is not active"))?;
+        if selected.repo_id != repo_id {
+            anyhow::bail!("selected pipeline {selected_id} belongs to a different repository");
         }
+        serde_json::from_value::<PipelineDefinition>(selected.config).map_err(|error| {
+            anyhow::anyhow!("selected pipeline {selected_id} has an invalid stored definition: {error}")
+        })?
+    } else {
+        let committed_pipeline = match scheduler_db {
+            Some(pool) => load_pipeline_from_commit(pool, repo_id, &payload.new_hash).await?,
+            None => None,
+        };
+        let pipeline = if let Some(committed) = committed_pipeline {
+            tracing::info!(
+                "using committed pipeline definition at {} for repo {}",
+                payload.new_hash,
+                repo_id
+            );
+            committed
+        } else {
+            let cached_pipeline = { pipeline_cache.lock().unwrap().get(&repo_id).cloned() };
+            if let Some(cached) = cached_pipeline {
+                cached
+            } else {
+                let persisted = if let Some(pool) = scheduler_db {
+                    gitforge_db::queries::PipelineQueries::list_by_repo(pool, repo_id)
+                        .await?
+                        .into_iter()
+                        .find_map(|pipeline| {
+                            serde_json::from_value::<PipelineDefinition>(pipeline.config).ok()
+                        })
+                } else {
+                    None
+                };
+                persisted.unwrap_or_else(|| create_default_pipeline(&repo_id.to_string()))
+            }
+        };
+        pipeline_cache
+            .lock()
+            .unwrap()
+            .insert(repo_id, pipeline.clone());
+        pipeline
     };
-    pipeline_cache
-        .lock()
-        .unwrap()
-        .insert(repo_id, pipeline.clone());
     let requested_workspace = workspace_paths
         .lock()
         .expect("workspace cache lock poisoned")
@@ -1699,7 +1733,11 @@ async fn handle_push_event(
         .flatten();
 
     // Create trigger event
-    let trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
+    let mut trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
+    if let Some(selected_id) = selected_pipeline_id {
+        trigger_event.pipeline_id = selected_id;
+        trigger_event.trigger_type = TriggerType::Manual;
+    }
     let pipeline_id = trigger_event.pipeline_id;
 
     // Create and start the CI engine
@@ -1718,26 +1756,36 @@ async fn handle_push_event(
 
     let state = engine.state().await;
     if let Some(pool) = scheduler_db {
-        let db_pipeline = DbPipeline {
-            id: pipeline_id,
-            repo_id,
-            name: pipeline.name.clone(),
-            trigger_type: "push".to_string(),
-            config: serde_json::to_value(&pipeline)?,
-            created_at: Utc::now(),
-        };
-        // Only one active pipeline version per (repo, name) is allowed by
-        // idx_pipelines_active_repo_name — retire the predecessor before
-        // recording this push's version, or every push after the first
-        // fails run creation with a constraint violation.
-        gitforge_db::queries::PipelineQueries::deactivate_active(pool, repo_id, &pipeline.name)
+        if selected_pipeline_id.is_none() {
+            let db_pipeline = DbPipeline {
+                id: pipeline_id,
+                repo_id,
+                name: pipeline.name.clone(),
+                trigger_type: "push".to_string(),
+                config: serde_json::to_value(&pipeline)?,
+                created_at: Utc::now(),
+            };
+            // Only one active pipeline version per (repo, name) is allowed by
+            // idx_pipelines_active_repo_name — retire the predecessor before
+            // recording this push's version, or every push after the first
+            // fails run creation with a constraint violation.
+            gitforge_db::queries::PipelineQueries::deactivate_active(
+                pool,
+                repo_id,
+                &pipeline.name,
+            )
             .await?;
-        gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
+            gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
+        }
 
         let mut db_run = DbPipelineRun::new(
             pipeline_id,
             repo_id,
-            "push".to_string(),
+            if selected_pipeline_id.is_some() {
+                "manual".to_string()
+            } else {
+                "push".to_string()
+            },
             payload.new_hash.clone(),
         );
         db_run.id = state.run_id;
@@ -4602,5 +4650,127 @@ jobs:
                 .is_empty(),
             "a ref-deletion push must not prepare a run workspace"
         );
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_event_rejects_retired_selected_pipeline() {
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        gitforge_db::queries::PipelineQueries::deactivate_active(
+            &pool,
+            repo_id,
+            "sweep-pipeline",
+        )
+        .await
+        .unwrap();
+
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "0".repeat(40),
+                new_hash: "1".repeat(40),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        )
+        .with_selected_pipeline(pipeline_id);
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<
+            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let error = handle_push_event(
+            &event,
+            &scheduler,
+            &pipeline_cache,
+            Some(&pool),
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        .expect_err("a retired explicit selection must fail closed");
+        assert!(error.to_string().contains("is not active"), "{error:#}");
+        assert!(pipeline_cache.lock().unwrap().is_empty());
+        assert!(gitforge_db::queries::PipelineRunQueries::list(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_event_rejects_selected_pipeline_from_another_repo() {
+        let (pool, repo_id, _) = sweep_test_pool().await;
+        let repo = gitforge_db::queries::RepoQueries::get(&pool, repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let other_repo = gitforge_db::models::Repository::new(
+            "other-sweep-repo".to_string(),
+            repo.owner_id,
+            "/tmp/other-sweep-repo".to_string(),
+        );
+        gitforge_db::queries::RepoQueries::create(&pool, &other_repo)
+            .await
+            .unwrap();
+        let other_pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: other_repo.id,
+            name: "other-pipeline".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &other_pipeline)
+            .await
+            .unwrap();
+
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "0".repeat(40),
+                new_hash: "1".repeat(40),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        )
+        .with_selected_pipeline(other_pipeline.id);
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<
+            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let error = handle_push_event(
+            &event,
+            &scheduler,
+            &pipeline_cache,
+            Some(&pool),
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        .expect_err("a cross-repository selection must fail closed");
+        assert!(error.to_string().contains("different repository"), "{error:#}");
+        assert!(pipeline_cache.lock().unwrap().is_empty());
+        assert!(gitforge_db::queries::PipelineRunQueries::list(&pool)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

@@ -7,7 +7,9 @@
 
 use axum::{
     body::{to_bytes, Body},
+    extract::State,
     http::{Request, StatusCode},
+    routing::post,
     Router,
 };
 use gitforge_api::{ApiAuth, ApiServer, CiTriggerClient};
@@ -21,7 +23,7 @@ use gitforge_db::{
     Pool,
 };
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 /// Seed users, a repository with one pipeline and one pending run, and the
@@ -135,6 +137,14 @@ async fn request_json(
             .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into_owned()))
     };
     (status, parsed)
+}
+
+async fn capture_selected_pipeline_trigger(
+    State(seen): State<Arc<Mutex<Vec<Value>>>>,
+    Json(payload): Json<Value>,
+) -> Json<Value> {
+    seen.lock().unwrap().push(payload);
+    Json(json!({"pipeline_run_id": "selected-pipeline-run"}))
 }
 
 fn submit_body(run_id: &PipelineRunId, commands: Vec<&str>) -> Value {
@@ -1175,6 +1185,76 @@ async fn pipeline_run_trigger_resolves_revisions_in_repository_storage() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn pipeline_run_trigger_delegates_the_exact_selected_pipeline_id() {
+    let f = seed().await;
+    let (_bare, pipeline_id, commit) = seed_real_storage_repo(&f).await;
+    let client = CiTriggerClient::new(
+        "http://127.0.0.1:42781/pipelines/trigger",
+        "selected-pipeline-token",
+    )
+    .unwrap();
+    let app = ApiServer::new("test-secret", f.pool.clone())
+        .with_ci_trigger_client(Arc::new(client))
+        .into_router();
+
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:42781").await {
+        Ok(listener) => listener,
+        Err(_) => {
+            eprintln!("skipping pipeline_run_trigger_delegates_the_exact_selected_pipeline_id: pinned CI port is occupied");
+            return;
+        }
+    };
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let stub = Router::new()
+        .route(
+            "/pipelines/trigger",
+            post(capture_selected_pipeline_trigger),
+        )
+        .with_state(received.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, stub).await.unwrap();
+    });
+
+    let (status, body) = request_json(
+        app,
+        "POST",
+        &format!("/api/pipelines/{pipeline_id}/runs"),
+        Some(&f.owner_token),
+        Some(json!({"ref": commit})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["pipeline_id"], pipeline_id.to_string());
+    assert_eq!(body["pipeline_run_id"], "selected-pipeline-run");
+
+    let seen = received.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["repo_id"], f.repo_id.to_string());
+    assert_eq!(seen[0]["new_hash"], commit);
+    assert_eq!(seen[0]["selected_pipeline_id"], pipeline_id.to_string());
+    server.abort();
+}
+
+#[tokio::test]
+async fn pipeline_run_trigger_rejects_retired_pipeline_ids() {
+    let f = seed().await;
+    PipelineQueries::deactivate_active(&f.pool, f.repo_id, "ci-routes-pipeline")
+        .await
+        .unwrap();
+
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipelines/{}/runs", f.pipeline_id),
+        Some(&f.owner_token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "not_found");
 }
 
 #[tokio::test]

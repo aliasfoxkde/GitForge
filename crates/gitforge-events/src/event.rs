@@ -22,6 +22,10 @@ pub struct EventEnvelope {
     pub actor_id: Option<UserId>,
     /// Correlation ID for tracing related events
     pub correlation_id: Option<Uuid>,
+    /// Explicitly selected pipeline definition, when the trigger is not a
+    /// repository push and must not resolve configuration from the commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_pipeline_id: Option<PipelineId>,
     /// Event-specific payload
     pub payload: EventPayload,
 }
@@ -42,6 +46,7 @@ impl EventEnvelope {
             repo_id,
             actor_id,
             correlation_id: None,
+            selected_pipeline_id: None,
             payload,
         }
     }
@@ -49,6 +54,13 @@ impl EventEnvelope {
     /// Create a new event with a correlation ID
     pub fn with_correlation(mut self, correlation_id: Uuid) -> Self {
         self.correlation_id = Some(correlation_id);
+        self
+    }
+
+    /// Bind an explicit pipeline selection to this trigger event. Ordinary
+    /// push events leave this unset and continue resolving commit-bound CI.
+    pub fn with_selected_pipeline(mut self, pipeline_id: PipelineId) -> Self {
+        self.selected_pipeline_id = Some(pipeline_id);
         self
     }
 
@@ -327,6 +339,31 @@ mod tests {
 
         assert_eq!(event.event_version, 1);
         assert!(event.timestamp > 0);
+        assert!(event.selected_pipeline_id.is_none());
+    }
+
+    #[test]
+    fn test_event_envelope_deserializes_before_pipeline_selection_field() {
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id: RepoId::new(),
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "0".repeat(40),
+                new_hash: "1".repeat(40),
+                pusher_id: None,
+            }),
+            None,
+            None,
+        );
+        let mut encoded = serde_json::to_value(event).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("selected_pipeline_id");
+
+        let decoded: EventEnvelope = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.selected_pipeline_id.is_none());
     }
 
     #[test]

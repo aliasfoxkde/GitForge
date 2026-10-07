@@ -438,7 +438,7 @@ async fn trigger_pipeline_run(
             .into_response();
     };
 
-    let pipeline = match PipelineQueries::get(&pool, PipelineId::from(uuid)).await {
+    let pipeline = match PipelineQueries::get_active(&pool, PipelineId::from(uuid)).await {
         Ok(Some(pipeline)) => pipeline,
         Ok(None) => {
             return (
@@ -543,7 +543,7 @@ async fn trigger_pipeline_run(
     };
 
     match client
-        .trigger(pipeline.repo_id, &revision, None, &commit)
+        .trigger(pipeline.repo_id, &revision, None, &commit, Some(pipeline.id))
         .await
     {
         Ok(Some(pipeline_run_id)) => (

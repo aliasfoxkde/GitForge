@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use gitforge_common::{RepoId, UserId};
+use gitforge_common::{PipelineId, RepoId, UserId};
 
 mod common;
 
@@ -34,6 +34,20 @@ jobs:
         run: echo harness
 "#;
 
+const SELECTED_MANUAL_PIPELINE: &str = r#"
+name: selected-manual-pipeline
+version: "1.0"
+trigger_on:
+  - push
+environment: {}
+jobs:
+  - name: selected-manual-job
+    image: alpine:latest
+    steps:
+      - name: selected-manual-smoke
+        run: echo selected-manual-definition
+"#;
+
 /// Environment for a spawned ci service.
 struct CiService {
     child: tokio::process::Child,
@@ -41,6 +55,7 @@ struct CiService {
     db_path: PathBuf,
     workspace_root: PathBuf,
     repo_id: RepoId,
+    selected_pipeline_id: PipelineId,
     commit_hash: String,
 }
 
@@ -137,6 +152,23 @@ async fn spawn_ci() -> CiService {
     gitforge_db::queries::RepoQueries::create(&pool, &repository)
         .await
         .expect("create repository");
+
+    // This separate active definition must be selectable by ID even though
+    // the tested commit contains a different, authoritative push definition.
+    let selected_definition = gitforge_ci::PipelineDefinition::parse(SELECTED_MANUAL_PIPELINE)
+        .expect("parse selected manual pipeline");
+    let selected_pipeline = gitforge_db::models::Pipeline {
+        id: PipelineId::new(),
+        repo_id,
+        name: selected_definition.name.clone(),
+        trigger_type: "manual".to_string(),
+        config: serde_json::to_value(selected_definition).expect("serialize selected pipeline"),
+        created_at: chrono::Utc::now(),
+    };
+    let selected_pipeline_id = selected_pipeline.id;
+    gitforge_db::queries::PipelineQueries::create(&pool, &selected_pipeline)
+        .await
+        .expect("store selected manual pipeline");
     drop(pool);
 
     let scheduler_port = free_port();
@@ -179,6 +211,7 @@ async fn spawn_ci() -> CiService {
         db_path,
         workspace_root: workspaces,
         repo_id,
+        selected_pipeline_id,
         commit_hash,
     }
 }
@@ -246,6 +279,7 @@ async fn test_trigger_requires_token_and_runs_committed_pipeline() {
     assert_eq!(runs[0].id.to_string(), run_id);
     assert_eq!(runs[0].repo_id, service.repo_id);
     assert_eq!(runs[0].commit_hash, service.commit_hash);
+    assert_eq!(runs[0].triggered_by, "push");
 
     let jobs = gitforge_db::queries::JobQueries::list_by_run(&pool, runs[0].id)
         .await
@@ -272,6 +306,72 @@ async fn test_trigger_requires_token_and_runs_committed_pipeline() {
     let checked_out =
         std::fs::read_to_string(workspace.join(".gitforge.yml")).expect("workspace pipeline file");
     assert_eq!(checked_out, COMMITTED_PIPELINE);
+
+    // An invalid explicit pipeline identity is rejected instead of silently
+    // falling back to commit configuration or a repo-wide cached definition.
+    let invalid_selection = format!(
+        "{{\"repo_id\":\"{}\",\"ref_name\":\"refs/heads/main\",\
+          \"old_hash\":\"{}\",\"new_hash\":\"{}\",\
+          \"working_dir\":null,\"selected_pipeline_id\":\"not-a-uuid\"}}",
+        service.repo_id,
+        "0".repeat(40),
+        service.commit_hash
+    );
+    let (status, body) = post_trigger(
+        service.scheduler_port,
+        Some("harness-trigger-token"),
+        &invalid_selection,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(body.contains("invalid_pipeline_id"), "body: {body}");
+
+    // Explicit manual selection must use precisely the stored definition and
+    // persist the selected pipeline identity. The commit still contains
+    // COMMITTED_PIPELINE, so this distinguishes selection from fallback.
+    let selected_trigger = format!(
+        "{{\"repo_id\":\"{}\",\"ref_name\":\"refs/heads/main\",\
+          \"old_hash\":\"{}\",\"new_hash\":\"{}\",\
+          \"working_dir\":null,\"selected_pipeline_id\":\"{}\"}}",
+        service.repo_id,
+        "0".repeat(40),
+        service.commit_hash,
+        service.selected_pipeline_id
+    );
+    let (status, body) = post_trigger(
+        service.scheduler_port,
+        Some("harness-trigger-token"),
+        &selected_trigger,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "body: {body}");
+    let selected_response: serde_json::Value =
+        serde_json::from_str(&body).expect("parse selected trigger response");
+    assert_eq!(selected_response["status"], "accepted", "body: {body}");
+    let selected_run_id = selected_response["pipeline_run_id"]
+        .as_str()
+        .expect("selected pipeline_run_id")
+        .to_string();
+
+    let runs = gitforge_db::queries::PipelineRunQueries::list(&pool)
+        .await
+        .expect("list runs after selected trigger");
+    assert_eq!(runs.len(), 2, "push and selected manual trigger are recorded");
+    let selected_run = runs
+        .iter()
+        .find(|run| run.id.to_string() == selected_run_id)
+        .expect("selected run exists");
+    assert_eq!(selected_run.pipeline_id, service.selected_pipeline_id);
+    assert_eq!(selected_run.triggered_by, "manual");
+    let selected_jobs = gitforge_db::queries::JobQueries::list_by_run(&pool, selected_run.id)
+        .await
+        .expect("list selected pipeline jobs");
+    assert_eq!(selected_jobs.len(), 1);
+    assert_eq!(selected_jobs[0].name, "selected-manual-job");
+    assert!(selected_jobs[0]
+        .commands
+        .iter()
+        .any(|command| command.contains("selected-manual-definition")));
 
     common::shutdown_gracefully(&mut service.child).await;
 }
