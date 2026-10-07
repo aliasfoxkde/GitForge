@@ -288,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
             if finalized > 0 {
                 tracing::info!(finalized, "startup run reconciliation complete");
             }
+            sweep_ghost_jobs(&sweep_pool).await;
             let removed = sweep_terminal_workspaces(&sweep_pool).await;
             if removed > 0 {
                 tracing::info!(removed, "startup workspace sweep complete");
@@ -1559,6 +1560,37 @@ async fn run_reconciliation_loop(pool: gitforge_db::Pool) {
             if removed > 0 {
                 tracing::info!(removed, "periodic workspace sweep complete");
             }
+        }
+        // Every tick, not only when something finalized: the sweep is a
+        // single indexed UPDATE and is the safety net for any path that
+        // strands a never-dispatched row under a terminal run without
+        // passing through a per-run sweep.
+        sweep_ghost_jobs(&pool).await;
+    }
+}
+
+/// Cancel every never-dispatched job row sitting under an already-terminal
+/// run, across all runs. This is the backlog cleaner for rows stranded by
+/// finalization paths that predate the per-run sweeps — on first boot after
+/// upgrade it reclaims the whole historical accumulation in one pass.
+/// Returns the number of rows cancelled (0 on error; failures log and move
+/// on rather than stall the reconciliation loop).
+async fn sweep_ghost_jobs(pool: &gitforge_db::Pool) -> u64 {
+    match gitforge_db::queries::JobQueries::cancel_unclaimed_in_terminal_runs(pool).await {
+        Ok(0) => 0,
+        Ok(count) => {
+            tracing::info!(
+                count,
+                "cancelled never-dispatched job rows under terminal runs"
+            );
+            count
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "failed to sweep never-dispatched job rows under terminal runs"
+            );
+            0
         }
     }
 }
@@ -3384,6 +3416,107 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(untouched.status, "running");
+    }
+
+    /// The bulk ghost sweep reclaims never-dispatched rows under terminal
+    /// runs — including the historical accumulation left by finalization
+    /// paths that predated the per-run sweeps — while leaving live runs and
+    /// runner-owned rows untouched.
+    #[tokio::test]
+    async fn sweep_ghost_jobs_cancels_only_unclaimed_rows_of_terminal_runs() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "ghost-sweep-test".to_string(),
+            "ghost-sweep@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "ghost-sweep-test".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: "/git/ghost-sweep-test".to_string(),
+                required_checks: Vec::new(),
+                deny_non_fast_forward: false,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: "ghost-sweep-pipeline".to_string(),
+                trigger_type: "push".to_string(),
+                config: serde_json::json!({}),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // A failed run with the classic ghost set, a live run holding a
+        // legitimately queued row, and a terminal run whose row a runner
+        // already claimed.
+        let failed_run = seed_run(&pool, repo_id, pipeline_id, "failed").await;
+        let ghost_pending = gitforge_db::models::Job::new(failed_run, "fmt".to_string());
+        let mut ghost_queued = gitforge_db::models::Job::new(failed_run, "test".to_string());
+        ghost_queued.status = gitforge_db::models::JobStatus::Queued.as_str().to_string();
+        let live_run = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        let mut live_queued = gitforge_db::models::Job::new(live_run, "clippy".to_string());
+        live_queued.status = gitforge_db::models::JobStatus::Queued.as_str().to_string();
+        let terminal_run = seed_run(&pool, repo_id, pipeline_id, "succeeded").await;
+        let claimed = gitforge_db::models::Job::new(terminal_run, "coverage".to_string());
+        for job in [&ghost_pending, &ghost_queued, &live_queued, &claimed] {
+            gitforge_db::queries::JobQueries::create(&pool, job)
+                .await
+                .unwrap();
+        }
+        gitforge_db::queries::JobQueries::update_status(&pool, claimed.id, "assigned")
+            .await
+            .unwrap();
+
+        let swept = sweep_ghost_jobs(&pool).await;
+        assert_eq!(swept, 2, "exactly the two unclaimed rows of the failed run");
+
+        for job in [&ghost_pending, &ghost_queued] {
+            let row = gitforge_db::queries::JobQueries::get(&pool, job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status, "cancelled", "ghost must be swept: {}", job.name);
+            assert!(row.finished_at.is_some());
+        }
+        let live = gitforge_db::queries::JobQueries::get(&pool, live_queued.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live.status, "queued",
+            "a live run's queued row must survive"
+        );
+        let assigned = gitforge_db::queries::JobQueries::get(&pool, claimed.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            assigned.status, "assigned",
+            "runner-owned rows stay with the runner lifecycle"
+        );
+
+        // Idempotent: a second pass reclaims nothing.
+        assert_eq!(sweep_ghost_jobs(&pool).await, 0);
     }
 
     /// Seed a bare repository with two commits: the first without a pipeline

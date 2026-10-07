@@ -1562,6 +1562,32 @@ impl JobQueries {
         Ok(result.rows_affected())
     }
 
+    /// Cancel every never-dispatched (`pending`/`queued`) job row whose run
+    /// is already terminal, across all runs at once.
+    ///
+    /// A row under a terminal run can never be dispatched again, so it is
+    /// inert garbage that keeps job counts wrong forever — the durable
+    /// complement to the per-run sweeps performed at finalization time,
+    /// catching rows stranded by paths that predate those sweeps (observed
+    /// 2026-10-07: 1478 such rows accumulated under failed/cancelled runs).
+    /// Only `pending`/`queued` rows are touched: `assigned`/`running` rows
+    /// belong to the runner lifecycle and are reaped by the lease and
+    /// timeout machinery.
+    pub async fn cancel_unclaimed_in_terminal_runs(pool: &Pool) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = ?, finished_at = COALESCE(finished_at, ?) \
+             WHERE status IN ('pending', 'queued') AND pipeline_run_id IN \
+             (SELECT id FROM pipeline_runs WHERE status IN \
+             ('succeeded', 'failed', 'cancelled', 'timed_out', 'timeout', 'timed-out'))",
+        )
+        .bind(JobStatus::Cancelled.as_str())
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to cancel jobs under terminal runs: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
     /// Requeue an assigned job and clear its runner fencing token.
     ///
     /// A scheduler may have already persisted `queued` while retaining a
