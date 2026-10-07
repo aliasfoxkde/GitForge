@@ -38,6 +38,7 @@ use tower_http::trace::TraceLayer;
 
 type PipelineCache = HashMap<gitforge_common::RepoId, PipelineDefinition>;
 type PipelineRegistry = HashMap<gitforge_common::PipelineRunId, Arc<CiEngine>>;
+type TriggerWorkspacePaths = HashMap<uuid::Uuid, Option<String>>;
 
 /// Paths of the pipeline definition inside a repository checkout, in
 /// resolution order. `.gitforge.yml` is the product spelling; the
@@ -54,7 +55,7 @@ const JOB_TIMEOUT_SWEEP_SECS: u64 = 60;
 
 struct TriggerState {
     event_bus: Arc<dyn EventBus>,
-    workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    workspace_paths: Arc<std::sync::Mutex<TriggerWorkspacePaths>>,
     run_waiters: Arc<
         std::sync::Mutex<
             HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
@@ -74,10 +75,26 @@ async fn record_trigger_publish_failure(
 ) {
     trigger_state.tracker.record_failed(event_id, error).await;
     trigger_state
+        .workspace_paths
+        .lock()
+        .expect("workspace cache lock poisoned")
+        .remove(&event_id);
+    trigger_state
         .run_waiters
         .lock()
         .expect("run waiter lock poisoned")
         .remove(&event_id);
+}
+
+fn take_trigger_workspace(
+    workspace_paths: &std::sync::Mutex<TriggerWorkspacePaths>,
+    event_id: uuid::Uuid,
+) -> Option<String> {
+    workspace_paths
+        .lock()
+        .expect("workspace cache lock poisoned")
+        .remove(&event_id)
+        .flatten()
 }
 
 /// Event type namespace reserved for CI trigger status rows in the existing
@@ -925,12 +942,6 @@ async fn trigger_pipeline(
         None => None,
     };
 
-    trigger_state
-        .workspace_paths
-        .lock()
-        .expect("workspace cache lock poisoned")
-        .insert(repo_id, working_dir);
-
     let mut event = EventEnvelope::new(
         EventType::PushReceived,
         EventPayload::PushReceived(PushReceivedPayload {
@@ -946,6 +957,11 @@ async fn trigger_pipeline(
     if let Some(pipeline_id) = selected_pipeline_id {
         event = event.with_selected_pipeline(pipeline_id);
     }
+    trigger_state
+        .workspace_paths
+        .lock()
+        .expect("workspace cache lock poisoned")
+        .insert(event.event_id, working_dir);
 
     // File the durable correlation record before the event is published, so
     // the moment a caller holds an event_id a status read can find it. A
@@ -1973,7 +1989,7 @@ async fn run_event_consumer(
     scheduler: Arc<Scheduler>,
     pipeline_cache: Arc<std::sync::Mutex<PipelineCache>>,
     scheduler_db: Option<gitforge_db::Pool>,
-    workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    workspace_paths: Arc<std::sync::Mutex<TriggerWorkspacePaths>>,
     run_workspace_paths: Arc<
         std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
     >,
@@ -2051,12 +2067,16 @@ async fn handle_push_event(
     scheduler: &Arc<Scheduler>,
     pipeline_cache: &Arc<std::sync::Mutex<PipelineCache>>,
     scheduler_db: Option<&gitforge_db::Pool>,
-    workspace_paths: &Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    workspace_paths: &Arc<std::sync::Mutex<TriggerWorkspacePaths>>,
     run_workspace_paths: &Arc<
         std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
     >,
     pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
 ) -> anyhow::Result<gitforge_common::PipelineRunId> {
+    // Consume the per-event workspace handoff even when the payload is a
+    // deletion or fails later validation; never leave stale request state.
+    let requested_workspace = take_trigger_workspace(workspace_paths, event.event_id);
+
     // Only handle PushReceived events
     let EventPayload::PushReceived(payload) = &event.payload else {
         return Ok(gitforge_common::PipelineRunId::new());
@@ -2143,13 +2163,6 @@ async fn handle_push_event(
             .insert(repo_id, pipeline.clone());
         pipeline
     };
-    let requested_workspace = workspace_paths
-        .lock()
-        .expect("workspace cache lock poisoned")
-        .get(&repo_id)
-        .cloned()
-        .flatten();
-
     // Create trigger event
     let mut trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
     if let Some(selected_id) = selected_pipeline_id {
@@ -2931,6 +2944,27 @@ mod tests {
             "shared-secret",
             Some("Bearer shared-secret")
         ));
+    }
+
+    #[test]
+    fn trigger_workspace_paths_are_isolated_by_event_and_consumed_once() {
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let paths = std::sync::Mutex::new(HashMap::from([
+            (first, Some("/work/first".to_string())),
+            (second, Some("/work/second".to_string())),
+        ]));
+
+        assert_eq!(
+            take_trigger_workspace(&paths, first).as_deref(),
+            Some("/work/first")
+        );
+        assert_eq!(take_trigger_workspace(&paths, first), None);
+        assert_eq!(
+            take_trigger_workspace(&paths, second).as_deref(),
+            Some("/work/second")
+        );
+        assert!(paths.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -5038,9 +5072,8 @@ jobs:
         let scheduler = Arc::new(Scheduler::new());
         let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let workspace_paths: Arc<
-            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
-        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<std::sync::Mutex<TriggerWorkspacePaths>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let run_workspace_paths = run_workspace_paths_cache();
         let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -5098,9 +5131,8 @@ jobs:
         let scheduler = Arc::new(Scheduler::new());
         let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let workspace_paths: Arc<
-            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
-        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<std::sync::Mutex<TriggerWorkspacePaths>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let run_workspace_paths = run_workspace_paths_cache();
         let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -5238,9 +5270,8 @@ jobs:
         let scheduler = Arc::new(Scheduler::new());
         let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let workspace_paths: Arc<
-            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
-        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<std::sync::Mutex<TriggerWorkspacePaths>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let run_workspace_paths = run_workspace_paths_cache();
         let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -5401,12 +5432,22 @@ jobs:
             .record_queued(trigger_id, gitforge_common::RepoId::new(), &"d".repeat(40))
             .await;
         let state = test_trigger_state(tracker);
+        state
+            .workspace_paths
+            .lock()
+            .unwrap()
+            .insert(trigger_id, Some("/work/unpublished-trigger".to_string()));
         let (waiter, receiver) = tokio::sync::oneshot::channel();
         state.run_waiters.lock().unwrap().insert(trigger_id, waiter);
 
         record_trigger_publish_failure(&state, trigger_id, "event bus unavailable").await;
 
         assert!(!state.run_waiters.lock().unwrap().contains_key(&trigger_id));
+        assert!(!state
+            .workspace_paths
+            .lock()
+            .unwrap()
+            .contains_key(&trigger_id));
         assert!(receiver.await.is_err(), "removed waiter sender must close");
         let (status, body) = trigger_status_response(state, &trigger_id.to_string()).await;
         assert_eq!(status, StatusCode::OK);

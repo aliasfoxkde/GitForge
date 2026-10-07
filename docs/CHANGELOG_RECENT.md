@@ -6,6 +6,13 @@ All notable changes to GitForge will be documented in this file.
 
 ### Fixed
 
+- **CI trigger status is terminal and request-scoped**: callers can resolve a
+  queued event to its pipeline run or observe a terminal publish/consumer
+  failure; failed publication releases its waiter and workspace handoff, and
+  concurrent triggers cannot overwrite each other's workspace. Trigger-status
+  polling accepts the configured CI trigger credential as well as explicitly
+  configured compatibility/operator credentials. The status journal remains
+  best-effort correlation, not a durable outbox.
 - **Manual CI runs retain their selected pipeline identity**: an explicit
   active pipeline ID now travels through the CI trigger event and is stored
   on the created run; inactive and cross-repository selections fail closed.
