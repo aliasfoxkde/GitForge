@@ -156,7 +156,7 @@ jobs:
               # curl failures (network hiccups) must be retried, not fatal.
               RESPONSE=$(curl --silent --show-error --max-time 30 \
                 -w "\n%{http_code}" \
-                -H "Authorization: Bearer $GITFORGE_SCHEDULER_OPERATOR_TOKEN" \
+                -H "Authorization: Bearer $GITFORGE_CI_TRIGGER_TOKEN" \
                 -H "Accept: application/json" \
                 "$TRIGGER_URL" 2>&1) || RESPONSE=$'\n000'
               HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
@@ -178,7 +178,7 @@ jobs:
                   echo "GitForge trigger $GITFORGE_TRIGGER_EVENT_ID status: ${TRIGGER_STATUS:-unknown}; run not yet created"
                   ;;
                 401|403)
-                  echo "GitForge rejected the operator credential for trigger status (HTTP $HTTP_CODE)" >&2
+                  echo "GitForge rejected the CI trigger credential for trigger status (HTTP $HTTP_CODE)" >&2
                   exit 1
                   ;;
                 *)

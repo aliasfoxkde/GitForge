@@ -63,6 +63,23 @@ struct TriggerState {
     tracker: Arc<TriggerTracker>,
 }
 
+/// A failed event-bus publish is a terminal trigger outcome. Record that
+/// outcome and release the correlation waiter before returning a non-2xx
+/// response, so clients never observe a permanently queued trigger that was
+/// not delivered to the consumer.
+async fn record_trigger_publish_failure(
+    trigger_state: &TriggerState,
+    event_id: uuid::Uuid,
+    error: &str,
+) {
+    trigger_state.tracker.record_failed(event_id, error).await;
+    trigger_state
+        .run_waiters
+        .lock()
+        .expect("run waiter lock poisoned")
+        .remove(&event_id);
+}
+
 /// Event type namespace reserved for CI trigger status rows in the existing
 /// `events` table. The trigger event itself is still published through the
 /// in-memory event bus; this journal is best-effort status correlation, not a
@@ -977,13 +994,17 @@ async fn trigger_pipeline(
                 })),
             )
         }
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "event_publish_failed",
-                "message": error.to_string(),
-            })),
-        ),
+        Err(error) => {
+            record_trigger_publish_failure(&trigger_state, event.event_id, &error.to_string())
+                .await;
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "event_publish_failed",
+                    "message": error.to_string(),
+                })),
+            )
+        }
     }
 }
 
@@ -5357,6 +5378,28 @@ jobs:
                 "{body}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn publish_failure_marks_trigger_terminal_and_releases_waiter() {
+        let pool = trigger_test_pool().await;
+        let trigger_id = uuid::Uuid::new_v4();
+        let tracker = Arc::new(TriggerTracker::new(Some(pool.clone())));
+        tracker
+            .record_queued(trigger_id, gitforge_common::RepoId::new(), &"d".repeat(40))
+            .await;
+        let state = test_trigger_state(tracker);
+        let (waiter, receiver) = tokio::sync::oneshot::channel();
+        state.run_waiters.lock().unwrap().insert(trigger_id, waiter);
+
+        record_trigger_publish_failure(&state, trigger_id, "event bus unavailable").await;
+
+        assert!(!state.run_waiters.lock().unwrap().contains_key(&trigger_id));
+        assert!(receiver.await.is_err(), "removed waiter sender must close");
+        let (status, body) = trigger_status_response(state, &trigger_id.to_string()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["error"], "event bus unavailable");
     }
 
     #[tokio::test]
