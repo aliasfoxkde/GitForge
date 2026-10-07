@@ -1,0 +1,17 @@
+[Unit]
+Description=GitForge release auto-update pass
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mkinney
+Group=mkinney
+WorkingDirectory=/nas/Temp/repos/GitForge
+# AUTO_UPDATE=1 is the opt-in for real cutovers. The default dry-run only
+# reports the channel state, so an enabled timer is safe before this is
+# flipped.
+Environment=AUTO_UPDATE=0
+ExecStart=/nas/Temp/repos/GitForge/scripts/gitforge-release-auto
+# A failing pass must not look like a hung unit; the journal carries the detail.
+TimeoutStartSec=600
