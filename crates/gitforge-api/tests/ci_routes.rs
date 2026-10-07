@@ -178,6 +178,26 @@ async fn pipeline_list_is_scoped_to_authorized_repositories() {
 }
 
 #[tokio::test]
+async fn pipeline_list_excludes_deactivated_versions() {
+    let f = seed().await;
+    PipelineQueries::deactivate_active(&f.pool, f.repo_id, "ci-routes-pipeline")
+        .await
+        .unwrap();
+
+    let (status, pipelines) = request_json(
+        f.app.clone(),
+        "GET",
+        "/api/pipelines",
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(pipelines.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn get_pipeline_enforces_ownership_with_admin_override() {
     let f = seed().await;
     let uri = format!("/api/pipelines/{}", f.pipeline_id);

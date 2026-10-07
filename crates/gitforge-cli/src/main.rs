@@ -678,7 +678,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("⚙️  Pipeline: {}", pipeline.name);
                         println!("   ID: {}", pipeline.id);
                         println!("   Repository: {}", pipeline.repo_id);
-                        println!("   Enabled: {}", pipeline.status_label());
+                        println!("   Status: {}", pipeline.status_label());
                     }
                     Err(e) => {
                         println!("❌ {e}");
