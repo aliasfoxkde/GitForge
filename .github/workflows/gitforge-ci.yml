@@ -57,10 +57,11 @@ jobs:
           : "${GITFORGE_SCHEDULER_OPERATOR_TOKEN:?GITFORGE_SCHEDULER_OPERATOR_TOKEN is required}"
           [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
             echo "GITFORGE_REPO_ID must be a UUID" >&2
+            exit 1
+          }
           : "${RUNNER_TEMP:?RUNNER_TEMP is required for temporary files}"
           [[ -d "$RUNNER_TEMP" && -w "$RUNNER_TEMP" ]] || {
             echo "RUNNER_TEMP must be an existing writable directory" >&2
-            exit 1
             exit 1
           }
           [[ "$GITFORGE_POLL_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
@@ -145,8 +146,17 @@ jobs:
           echo "Waiting for GitForge to correlate event $EVENT_ID to a pipeline run..."
           deadline=$(( $(date +%s) + GITFORGE_CORRELATION_TIMEOUT_SECONDS ))
           while :; do
+            remaining=$((deadline - $(date +%s)))
+            if [ "$remaining" -le 0 ]; then
+              echo "GitForge did not correlate event $EVENT_ID within ${GITFORGE_CORRELATION_TIMEOUT_SECONDS}s; refusing to re-trigger" >&2
+              exit 1
+            fi
+            curl_timeout=30
+            if [ "$remaining" -lt "$curl_timeout" ]; then
+              curl_timeout="$remaining"
+            fi
             CURL_RC=0
-            RESPONSE=$(curl --silent --show-error --max-time 30 \
+            RESPONSE=$(curl --silent --show-error --max-time "$curl_timeout" \
               -w '\n%{http_code}' \
               -H "Authorization: Bearer $GITFORGE_CI_TRIGGER_TOKEN" \
               -H "Accept: application/json" \
@@ -195,11 +205,16 @@ jobs:
               esac
             fi
 
-            if [ "$(date +%s)" -ge "$deadline" ]; then
+            remaining=$((deadline - $(date +%s)))
+            if [ "$remaining" -le 0 ]; then
               echo "GitForge did not correlate event $EVENT_ID within ${GITFORGE_CORRELATION_TIMEOUT_SECONDS}s; refusing to re-trigger" >&2
               exit 1
             fi
-            sleep "$GITFORGE_POLL_INTERVAL_SECONDS"
+            sleep_for="$GITFORGE_POLL_INTERVAL_SECONDS"
+            if [ "$sleep_for" -gt "$remaining" ]; then
+              sleep_for="$remaining"
+            fi
+            sleep "$sleep_for"
           done
 
   # Poll GitForge for build status (when GitForge is available)
@@ -216,11 +231,12 @@ jobs:
         env:
           GITFORGE_RUN_ID: ${{ needs.enqueue-build.outputs.run_id }}
         run: |
+          set -euo pipefail
           : "${RUNNER_TEMP:?RUNNER_TEMP is required for temporary files}"
           [[ -d "$RUNNER_TEMP" && -w "$RUNNER_TEMP" ]] || {
             echo "RUNNER_TEMP must be an existing writable directory" >&2
             exit 1
-          set -euo pipefail
+          }
           echo "Build enqueued, polling GitForge for status..."
           RUN_ID="$GITFORGE_RUN_ID"
           STATUS_URL="$GITFORGE_SCHEDULER_URL/pipelines/runs/$RUN_ID"
@@ -229,8 +245,18 @@ jobs:
 
           deadline=$(( $(date +%s) + GITFORGE_POLL_TIMEOUT_SECONDS ))
           while :; do
+            remaining=$((deadline - $(date +%s)))
+            if [ "$remaining" -le 0 ]; then
+              echo "GitForge pipeline run did not reach a terminal state within ${GITFORGE_POLL_TIMEOUT_SECONDS}s" >&2
+              echo "terminal_status=timeout" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            curl_timeout=30
+            if [ "$remaining" -lt "$curl_timeout" ]; then
+              curl_timeout="$remaining"
+            fi
             CURL_RC=0
-            RESPONSE=$(curl --silent --show-error --max-time 30 \
+            RESPONSE=$(curl --silent --show-error --max-time "$curl_timeout" \
               -w '\n%{http_code}' \
               -H "Authorization: Bearer $GITFORGE_SCHEDULER_OPERATOR_TOKEN" \
               -H "Accept: application/json" \
@@ -280,12 +306,17 @@ jobs:
               esac
             fi
 
-            if [ "$(date +%s)" -ge "$deadline" ]; then
+            remaining=$((deadline - $(date +%s)))
+            if [ "$remaining" -le 0 ]; then
               echo "GitForge pipeline run did not reach a terminal state within ${GITFORGE_POLL_TIMEOUT_SECONDS}s" >&2
               echo "terminal_status=timeout" >> "$GITHUB_OUTPUT"
               exit 1
             fi
-            sleep "$GITFORGE_POLL_INTERVAL_SECONDS"
+            sleep_for="$GITFORGE_POLL_INTERVAL_SECONDS"
+            if [ "$sleep_for" -gt "$remaining" ]; then
+              sleep_for="$remaining"
+            fi
+            sleep "$sleep_for"
           done
 
   # Report final status to GitHub

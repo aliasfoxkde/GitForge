@@ -64,6 +64,8 @@ The trigger API currently has no caller-supplied idempotency key. If the POST
 is accepted but its response is lost, this workflow fails without retrying the
 POST; a manual workflow rerun can create a duplicate run. Do not describe this
 as exactly-once delivery. Durable idempotency and correlation across service
+restarts remain follow-up requirements for production-grade recovery.
+
 The workflow validates all values and refuses to bypass GitForge if enqueue,
 correlation, or polling fails. Until `GITFORGE_ENABLED=true` is intentionally
 configured, the workflow is skipped rather than issuing requests to an invalid
