@@ -47,7 +47,7 @@ TOOLCHAIN = "test-rustc 1.0.0 (canary)"
 RELEASE_ID = "20260909-canary"
 
 MANIFEST_FILES = frozenset(
-    ("RELEASE_METADATA.txt",)
+    ("READY", "RELEASE_METADATA.txt")
     + tuple(f"bin/{name}" for name in REQUIRED_BINARIES)
     + ("scripts/gitforge-status",)
     + tuple(f"systemd/user/{name}" for name in UNIT_EXAMPLES)
@@ -91,6 +91,9 @@ class ReleaseBundleContractTests(unittest.TestCase):
         env = os.environ.copy()
         env["GITFORGE_SOURCE_COMMIT"] = SOURCE_COMMIT
         env["GITFORGE_TOOLCHAIN"] = TOOLCHAIN
+        # These contract tests assemble synthetic fixtures; the separate
+        # release gate is covered by its own tests and requires a live DB.
+        env["GITFORGE_RELEASE_SKIP_GATE"] = "1"
         return env
 
     def _run(self, script, *args):
@@ -170,6 +173,7 @@ class ReleaseBundleContractTests(unittest.TestCase):
 
         manifest = self._manifest_entries()
         self.assertEqual(set(manifest), set(MANIFEST_FILES))
+        self.assertIn("READY", manifest)
         for rel_path, digest in manifest.items():
             actual = hashlib.sha256((self.release_dir / rel_path).read_bytes()).hexdigest()
             self.assertEqual(actual, digest, f"manifest digest mismatch: {rel_path}")
@@ -206,6 +210,15 @@ class ReleaseBundleContractTests(unittest.TestCase):
         self.assertIn("FAILED", result.stdout + result.stderr)
         # READY and metadata still agree, so the failure is the checksum gate,
         # not the metadata consistency check.
+        self.assertNotIn("valid bundle=", result.stdout)
+
+    def test_tampered_ready_marker_fails_verification(self):
+        ready = self.release_dir / "READY"
+        ready.write_text(ready.read_text() + "tampered=yes\n")
+
+        result = self.verify()
+        self.assertNotEqual(result.returncode, 0, "verify accepted a tampered READY marker")
+        self.assertIn("FAILED", result.stdout + result.stderr)
         self.assertNotIn("valid bundle=", result.stdout)
 
     # ─── 4. malformed or incomplete bundles fail closed ─────────────────────
@@ -252,6 +265,14 @@ class ReleaseBundleContractTests(unittest.TestCase):
                 for line in lines
             )
             + "\n"
+        )
+        manifest = self.release_dir / "MANIFEST.sha256"
+        ready_digest = hashlib.sha256(ready.read_bytes()).hexdigest()
+        manifest.write_text(
+            "".join(
+                f"{ready_digest}  READY\n" if line.endswith("  READY\n") else line
+                for line in manifest.read_text().splitlines(keepends=True)
+            )
         )
         result = self.verify()
         self.assertEqual(result.returncode, 1)
