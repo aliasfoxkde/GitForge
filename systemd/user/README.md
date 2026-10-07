@@ -1,9 +1,15 @@
 # GitForge Fedora user-systemd policy
 
-These files describe the deployment contract for the Fedora host. They are
-candidate configuration and are not installed automatically. The live Fedora
-deployment uses user units under `~/.config/systemd/user/`; apply changes only
-through a release/rollback procedure after validating the complete unit set.
+These files describe the active **user-systemd deployment contract** for the
+Fedora host. The running services are `gitforge-api.service`,
+`gitforge-ci.service`, `gitforge-git-server.service`, and
+`gitforge-runner.service`; their installed units and operational drop-ins are
+under `~/.config/systemd/user/`. The system-scope template
+`systemd/gitforge@.service` is not the active deployment. A names-only audit
+on 2026-10-05 found provider credentials in the active processes; the
+isolation drop-in remains uninstalled and requires a drained-queue rollout
+with rollback. See
+`docs/RUNBOOK.md` → "Service Environment and Credential Isolation".
 
 ## Resource policy
 
@@ -65,8 +71,41 @@ The candidate CI binary owns the scheduler HTTP API, so the legacy standalone
 
 The legacy `make run-all` and `make stop` targets intentionally refuse
 unmanaged background startup and broad process termination. Service lifecycle
-belongs to user-systemd so resource limits, restart behavior, and status remain
-observable and scoped to named GitForge units.
+belongs to the user service manager — today the named `gitforge-*.service`
+units — so resource limits, restart behavior, and status remain observable
+and scoped to named GitForge units. A managed user unit still inherits the
+manager's imported environment unless its per-unit `UnsetEnvironment=` policy
+removes irrelevant provider variables; the live units do not yet have that
+drop-in. Ad-hoc copies started from an operator shell inherit the same ambient
+environment and are outside unit-level protection. Always use named service
+units and install the verified per-unit scrub before restarting them.
+
+## Credential isolation
+
+A user service manager passes its whole login environment to the services it
+starts, so every exported provider key in the operator shell would reach
+GitForge processes and everything they spawn. `gitforge-env-isolation.conf`
+is a drop-in that scrubs the provider/host credential set with
+`UnsetEnvironment=`; systemd applies it as the final step when compiling the
+executed environment, so it wins over `EnvironmentFile=` files and imported
+login variables. The list is mirrored from the canonical list in
+`systemd/gitforge@.service`; `scripts/verify-unit-env-policy` (run by
+`make unit-policy`, part of `make lint`) fails on drift between the two
+files and on any scrub that would remove a variable a service actually
+reads. This removes provider keys/endpoints, not all cross-service GitForge
+secrets: JWT, database, scheduler, and CI-trigger credentials still need a
+later per-unit least-privilege policy. The exact per-service environment
+contract and remaining gap are documented in `docs/RUNBOOK.md`.
+
+Two credential paths are intentionally outside every service unit:
+
+- **Interactive CLI** — `gitforge` code review reads `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` from the invoking shell. It is not a service; the scrub
+  never applies to it.
+- **Job payloads** — credentials a CI job needs travel in the job
+  specification through the scheduler/runner API and are injected as
+  explicit container env pairs; the runner's own process environment is
+  never forwarded into job containers.
 
 ## Atomic release pointer
 
@@ -90,8 +129,9 @@ unless an operator explicitly invokes `--apply` against a production path.
 
 ## Validation and rollout
 
-1. Copy the drop-in into each matching `*.service.d/` directory in a disposable
-   user manager or candidate account.
+1. Copy the drop-ins (`gitforge-resource-limits.conf` per service, plus
+   `gitforge-env-isolation.conf`) into each matching `*.service.d/` directory
+   in a disposable user manager or candidate account.
 2. Run `systemd-analyze --user verify` against every unit and drop-in.
 3. Start a candidate GitForge bundle with isolated ports/database/workspace.
 4. Run the serialized DB/API/scheduler/runner gates and the push smoke test.
@@ -99,6 +139,6 @@ unless an operator explicitly invokes `--apply` against a production path.
 6. Promote one release atomically, health-check, and retain the prior release
    for rollback.
 
-Do not install this policy directly into the current production units until the
-runner's container-child accounting and the rollback procedure have been
-verified.
+Do not restart production units with this policy until the CI queue is drained,
+the runner's container-child accounting and rollback procedure have been
+verified, and the full remote GitForge lane passes.

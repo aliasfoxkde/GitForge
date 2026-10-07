@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# Verify the GitForge service-unit credential-isolation policy without
+# installing or altering anything.
+#
+# Checks, in order:
+#   1. The canonical UnsetEnvironment= list parses and is mirrored verbatim by
+#      the candidate user-scope drop-in.
+#   2. Every provider key the codebase actually consumes (grep'd from
+#      gitforge-ai) appears in the scrub list — the CLI keeps them in its own
+#      interactive environment; services must never see them.
+#   3. No variable any service binary reads (the required-env allowlist
+#      documented in docs/RUNBOOK.md) is scrubbed — isolation must be
+#      strictly subtractive for the services.
+#   4. systemd-analyze validates the directive syntax and candidate user
+#      units with the isolation drop-in merged.
+#
+# Fails closed: any drift, overlap, or parse diagnostic fails the script.
+set -u -o pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+TEMPLATE="$ROOT/systemd/gitforge@.service"
+DROPIN="$ROOT/systemd/user/gitforge-env-isolation.conf"
+EXAMPLES="$ROOT/systemd/user"
+AI_LIB="$ROOT/crates/gitforge-ai/src/lib.rs"
+VERIFY_ROOT="${GITFORGE_POLICY_VERIFY_ROOT:-$ROOT/target/systemd-policy-verify}"
+RUN_DIR="$VERIFY_ROOT/$$"
+
+if ! command -v systemd-analyze >/dev/null 2>&1; then
+    echo "systemd-analyze is required" >&2
+    exit 2
+fi
+
+failed=0
+fail() {
+    echo "FAIL: $*" >&2
+    failed=1
+}
+
+# Extract the UnsetEnvironment= directive (with backslash continuations)
+# from a unit file as a single whitespace-normalized list of names.
+policy_names() {
+    awk '
+        /^UnsetEnvironment=/ {
+            in_policy = 1
+            line = $0
+            sub(/^UnsetEnvironment=/, "", line)
+            sub(/\\$/, "", line)
+            printf "%s ", line
+            if ($0 !~ /\\$/) exit
+            next
+        }
+        in_policy {
+            line = $0
+            sub(/\\$/, "", line)
+            printf "%s ", line
+            if ($0 !~ /\\$/) exit
+        }
+    ' "$1" | tr -s '[:space:]' '\n' | sed '/^$/d'
+}
+
+mkdir -p "$RUN_DIR"
+cleanup() {
+    rm -rf -- "$RUN_DIR"
+}
+trap cleanup EXIT INT TERM
+
+# ── 1. Canonical list parses and the user drop-in mirrors it ────────────────
+canonical=$(policy_names "$TEMPLATE")
+if [ -z "$canonical" ]; then
+    fail "no UnsetEnvironment= directive found in $TEMPLATE"
+    exit 1
+fi
+mirrored=$(policy_names "$DROPIN")
+if [ "$canonical" != "$mirrored" ]; then
+    fail "user drop-in list differs from the canonical template list"
+    diff <(printf '%s\n' "$canonical") <(printf '%s\n' "$mirrored") >&2 || true
+fi
+
+# ── 2. CLI-consumed provider keys are all scrubbed ──────────────────────────
+# Source-derived: gitforge-ai names the env var holding each provider key;
+# the gitforge CLI code-review path reads them from the INTERACTIVE shell,
+# never from a service unit. Every such name must still be in the scrub list.
+while IFS= read -r key_var; do
+    if ! printf '%s\n' "$canonical" | grep -qx -- "$key_var"; then
+        fail "provider key env '$key_var' (consumed by gitforge-ai) is not scrubbed"
+    fi
+done < <(grep -oE '"[A-Z][A-Z0-9_]*"' "$AI_LIB" | tr -d '"' | grep -E '_API_KEY$' | sort -u)
+
+# ── 3. No service-required variable is scrubbed ──────────────────────────────
+# The exact per-service environment contract is documented in
+# docs/RUNBOOK.md ("Service environment and credential isolation"); keep the
+# two lists in sync. A name here that is also scrubbed would silently break
+# the service at next restart.
+required_env=(
+    # shared
+    RUST_LOG HOME PATH
+    # api
+    JWT_SECRET JWT_SECRET_FILE PORT DATABASE_URL
+    GITFORGE_CI_TRIGGER_URL GITFORGE_CI_TRIGGER_TOKEN
+    # git-server
+    GIT_ROOT GITFORGE_SSH_HOST_KEY GITFORGE_MAX_GIT_BODY_BYTES
+    HTTP_PORT SSH_PORT
+    # ci (scheduler included)
+    GITFORGE_DATABASE_URL SCHEDULER_PORT GITFORGE_ARTIFACT_ROOT
+    GITFORGE_WORKSPACE_ROOT GITFORGE_WORKSPACE_ROOTS GITFORGE_TRIGGER_TOKEN
+    GITFORGE_SCHEDULER_OPERATOR_TOKEN GITFORGE_SCHEDULER_TOKEN
+    GITFORGE_CONTAINER_BACKEND GITFORGE_JOB_FENCE_GRACE_SECS
+    GITFORGE_BUILD_SOCKET
+    # runner
+    GITFORGE_SCHEDULER_URL GITFORGE_RUNNER_NAME GITFORGE_RUNNER_CAPACITY
+    GITFORGE_HEARTBEAT_INTERVAL GITFORGE_JOB_HEARTBEAT_INTERVAL
+    GITFORGE_FETCH_INTERVAL GITFORGE_RUNNER_TOKEN GITFORGE_RUNNER_STANDALONE
+    GITFORGE_REGISTER_ATTEMPTS GITFORGE_REGISTER_BACKOFF_SECS
+    GITFORGE_SANDBOX_ACQUIRE_SECS GITFORGE_SANDBOX_MEMORY_MB
+    GITFORGE_RECONCILE_DELETE GITFORGE_RECONCILE_GRACE_SECS
+    GITFORGE_RECONCILE_INTERVAL_SECS GITFORGE_RECONCILE_RECEIPT
+    DOCKER_HOST
+)
+for name in "${required_env[@]}"; do
+    if printf '%s\n' "$canonical" | grep -qx -- "$name"; then
+        fail "required service variable '$name' must not be scrubbed"
+    fi
+done
+
+# ── 4. systemd-analyze validates the directive syntax ───────────────────────
+# Verify a synthetic oneshot unit embedding the candidate system template's
+# UnsetEnvironment= block in user mode. This validates the shared directive
+# syntax without root access or scanning unrelated host system units. The
+# separate candidate user units below validate drop-in merge behavior.
+sys_unit="$RUN_DIR/gitforge-unit-env-policy.service"
+{
+    printf '[Unit]\nDescription=Disposable GitForge env-policy check (system scope)\n\n'
+    printf '[Service]\nType=oneshot\nExecStart=/usr/bin/true\n'
+    sed -n '/^UnsetEnvironment=/,/^$/p' "$TEMPLATE" | grep -v '^$'
+    printf '\n[Install]\nWantedBy=multi-user.target\n'
+} > "$sys_unit"
+if ! out=$(systemd-analyze --user verify "$sys_unit" 2>&1); then
+    fail "system-scope policy unit failed systemd-analyze verify"
+    printf '%s\n' "$out" >&2
+fi
+
+# Candidate user units: the real example units with ExecStart/WorkingDirectory
+# swapped for verifiable stubs, plus the isolation drop-in merged under a
+# matching .d/ directory. Instance names are prefixed so they can never
+# collide with installed units.
+for svc in ci runner; do
+    unit_dir="$RUN_DIR/gitforge-candidate-$svc.service.d"
+    mkdir -p "$unit_dir"
+    sed -e "s/^Description=GitForge/Description=Disposable GitForge env-policy check ($svc) — was GitForge/" \
+        -e 's|^ExecStart=.*|ExecStart=/usr/bin/true|' \
+        -e 's|^WorkingDirectory=.*|WorkingDirectory=/tmp|' \
+        -e 's/gitforge-ci\.service/gitforge-candidate-ci.service/g' \
+        -e 's/gitforge-runner\.service/gitforge-candidate-runner.service/g' \
+        -e 's|EnvironmentFile=.*||' \
+        "$EXAMPLES/gitforge-$svc.service.example" \
+        > "$RUN_DIR/gitforge-candidate-$svc.service"
+    cp "$DROPIN" "$unit_dir/10-env-isolation.conf"
+    if ! out=$(systemd-analyze --user verify "$RUN_DIR/gitforge-candidate-$svc.service" 2>&1); then
+        fail "candidate user unit gitforge-candidate-$svc.service failed verify"
+        printf '%s\n' "$out" >&2
+    elif printf '%s\n' "$out" | grep -q 'gitforge-candidate'; then
+        fail "candidate user unit gitforge-candidate-$svc.service produced diagnostics"
+        printf '%s\n' "$out" >&2
+    fi
+done
+
+if ((failed)); then
+    echo "unit env-isolation policy: INVALID" >&2
+    exit 1
+fi
+echo "unit env-isolation policy: valid ($(printf '%s\n' "$canonical" | wc -l) names scrubbed; drop-in mirrored; required env untouched; units verify)"

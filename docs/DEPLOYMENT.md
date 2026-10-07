@@ -92,6 +92,15 @@ Services are configured exclusively through environment variables; there is no
 config file. See `.env.example` for the deployment variables and
 [RUNBOOK.md](RUNBOOK.md#configuration) for the full per-service table.
 
+On the Fedora host, the live service lifecycle belongs to the user-systemd
+units `gitforge-{api,ci,git-server,runner}.service` (not Compose). The
+credential-isolation drop-in is not yet installed in the live units; the
+names-only audit found provider variables in their process environments.
+The system-scope `gitforge@.service` template is not the active deployment.
+The complete per-service environment contract, credential-isolation policy,
+and queue-drained rollout/rollback steps are in
+[RUNBOOK.md → Service Environment and Credential Isolation](RUNBOOK.md#service-environment-and-credential-isolation).
+
 ## Scaling Runners
 
 Add more runners by scaling the service:

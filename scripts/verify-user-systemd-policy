@@ -31,7 +31,8 @@ for service in api ci git-server runner scheduler; do
         cat "$policy"
         printf '\n[Install]\nWantedBy=default.target\n'
     } > "$unit"
-    if ! systemd-analyze verify "$unit"; then
+    if ! out=$(systemd-analyze --user verify "$unit" 2>&1); then
+        printf '%s\n' "$out" >&2
         failed=1
     fi
 done

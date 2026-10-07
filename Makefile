@@ -45,7 +45,7 @@ coverage: test
 	cargo llvm-cov report --all --html --open || true
 
 # ─── Lint ─────────────────────────────────────────────────────────────────────
-lint: fmt vet clippy shellcheck aegis
+lint: fmt vet clippy shellcheck unit-policy aegis
 
 fmt:
 	cargo fmt --check
@@ -58,6 +58,13 @@ clippy:
 
 shellcheck:
 	shellcheck scripts/*.sh systemd/*.sh
+
+# Service-unit policy verification (no installation, no live changes):
+# resource limits and credential-isolation policy for active user units,
+# plus the mirrored policy in the system-scope candidate template.
+unit-policy:
+	./scripts/verify-unit-env-policy
+	./scripts/verify-user-systemd-policy
 
 # Security pattern scan (Aegis). The baseline records every finding triaged
 # as intentional or a false positive at audit time (see
@@ -104,13 +111,14 @@ run-git-server:
 
 run-all:
 	@echo "Refusing unmanaged multi-process startup." >&2
-	@echo "Use the Fedora user-systemd release procedure in systemd/user/README.md." >&2
+	@echo "Lifecycle belongs to the Fedora user units: gitforge-{api,ci,git-server,runner}.service" >&2
+	@echo "(see systemd/user/README.md and docs/RUNBOOK.md)." >&2
 	@exit 2
 
 # ─── Stop Services ────────────────────────────────────────────────────────────
 stop:
 	@echo "Refusing unmanaged process termination." >&2
-	@echo "Use systemctl --user with the documented GitForge release units." >&2
+	@echo "Use systemctl --user with the documented GitForge user units." >&2
 	@exit 2
 
 # ─── Docker ───────────────────────────────────────────────────────────────────
@@ -148,9 +156,10 @@ help:
 	@echo "  make aegis             - Security pattern scan (new findings fail)"
 	@echo "  make aegis-report      - Security pattern scan (full report)"
 	@echo "  make aegis-baseline    - Regenerate the Aegis baseline"
+	@echo "  make unit-policy       - Verify service-unit resource + env-isolation policy"
 	@echo ""
-	@echo "  make run-all           - Refuse unmanaged startup; use Fedora systemd"
-	@echo "  make stop              - Refuse unmanaged termination; use Fedora systemd"
+	@echo "  make run-all           - Refuse unmanaged startup; use GitForge user-systemd units"
+	@echo "  make stop              - Refuse unmanaged termination; use GitForge user-systemd units"
 	@echo ""
 	@echo "  make docker-build      - Build Docker image"
 	@echo "  make docker-up         - Start with Docker Compose"
