@@ -2891,7 +2891,7 @@ mod tests {
         let tokens = configured_trigger_tokens(|name| {
             (name == "GITFORGE_CI_TRIGGER_TOKEN").then(|| "shared-secret".to_string())
         });
-        assert_eq!(tokens, ["shared-secret"]);
+        assert_eq!(tokens, vec!["shared-secret".to_string()]);
     }
 
     #[test]
@@ -2901,7 +2901,10 @@ mod tests {
             "GITFORGE_CI_TRIGGER_TOKEN" => Some("compatibility".to_string()),
             _ => None,
         });
-        assert_eq!(tokens, ["dedicated", "compatibility"]);
+        assert_eq!(
+            tokens,
+            vec!["dedicated".to_string(), "compatibility".to_string()]
+        );
     }
 
     #[test]
@@ -2912,7 +2915,10 @@ mod tests {
             "GITFORGE_SCHEDULER_OPERATOR_TOKEN" => Some("operator".to_string()),
             _ => None,
         });
-        assert_eq!(tokens, ["compatibility", "operator"]);
+        assert_eq!(
+            tokens,
+            vec!["compatibility".to_string(), "operator".to_string()]
+        );
     }
 
     #[test]
