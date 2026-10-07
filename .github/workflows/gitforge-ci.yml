@@ -64,16 +64,24 @@ jobs:
           }
       - name: Enqueue build job
         id: enqueue
+        env:
+          GITFORGE_TRIGGER_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          GITFORGE_TRIGGER_OLD: ${{ github.event.pull_request.base.sha || github.event.before }}
+          GITFORGE_TRIGGER_NEW: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           # Trigger the GitForge CI service. The service returns the durable
           # pipeline-run ID; polling the API by pipeline ID was a protocol
           # mismatch and could never observe the created run.
+          # pull_request's github.sha is a synthetic refs/pull/<n>/merge
+          # commit that is not present in GitForge's mirrored branch refs.
+          # Send the actual PR branch and head SHA; push events keep their
+          # normal ref/before/after values.
           PAYLOAD=$(jq -n \
             --arg repo "$GITFORGE_REPO_ID" \
-            --arg ref "${{ github.ref_name }}" \
-            --arg old "${{ github.event.before }}" \
-            --arg new "${{ github.sha }}" \
+            --arg ref "$GITFORGE_TRIGGER_REF" \
+            --arg old "$GITFORGE_TRIGGER_OLD" \
+            --arg new "$GITFORGE_TRIGGER_NEW" \
             '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "$GITFORGE_SCHEDULER_URL/pipelines/trigger" \
