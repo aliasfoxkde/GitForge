@@ -221,6 +221,37 @@ class ReleaseBundleContractTests(unittest.TestCase):
         self.assertIn("FAILED", result.stdout + result.stderr)
         self.assertNotIn("valid bundle=", result.stdout)
 
+    def test_manifest_missing_ready_entry_fails_verification(self):
+        manifest = self.release_dir / "MANIFEST.sha256"
+        manifest.write_text(
+            "".join(
+                line
+                for line in manifest.read_text().splitlines(keepends=True)
+                if not line.endswith("  READY\n")
+            )
+        )
+
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "checksum manifest must contain exactly one READY entry", result.stderr
+        )
+
+    def test_manifest_duplicate_ready_entry_fails_verification(self):
+        manifest = self.release_dir / "MANIFEST.sha256"
+        ready_entry = next(
+            line
+            for line in manifest.read_text().splitlines(keepends=True)
+            if line.endswith("  READY\n")
+        )
+        manifest.write_text(manifest.read_text() + ready_entry)
+
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "checksum manifest must contain exactly one READY entry", result.stderr
+        )
+
     # ─── 4. malformed or incomplete bundles fail closed ─────────────────────
 
     def test_missing_ready_marker_fails_closed(self):

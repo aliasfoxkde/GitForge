@@ -30,6 +30,11 @@ if [[ ! -x "$release_dir/scripts/gitforge-status" ]]; then
   exit 1
 fi
 
+if ! awk '$2 == "READY" { count++ } END { exit count != 1 }' "$release_dir/MANIFEST.sha256"; then
+  echo 'release verify: checksum manifest must contain exactly one READY entry' >&2
+  exit 1
+fi
+
 (
   cd "$release_dir"
   sha256sum --check MANIFEST.sha256
