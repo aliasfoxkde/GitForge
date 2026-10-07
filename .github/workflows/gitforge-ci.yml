@@ -16,16 +16,15 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # GitHub-hosted runners cannot reach a private Fedora LAN address. Enable
-  # this workflow only after a reachable endpoint or self-hosted runner is
-  # deliberately configured at repository/organization scope.
+  # Jobs run on the Fedora self-hosted runner. Keep the scheduler URL on
+  # loopback so trigger and status polling stay on that host.
   GITFORGE_ENABLED: ${{ vars.GITFORGE_ENABLED || 'false' }}
-  GITFORGE_API_URL: ${{ vars.GITFORGE_API_URL || '' }}
   GITFORGE_SCHEDULER_URL: ${{ vars.GITFORGE_SCHEDULER_URL || '' }}
   GITFORGE_REPO_ID: ${{ vars.GITFORGE_REPO_ID || '' }}
   GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
-  GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
+  GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
+  GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
 
 permissions:
   contents: read
@@ -46,10 +45,10 @@ jobs:
       - name: Validate GitForge configuration
         run: |
           set -euo pipefail
-          : "${GITFORGE_API_URL:?GITFORGE_API_URL is required}"
           : "${GITFORGE_SCHEDULER_URL:?GITFORGE_SCHEDULER_URL is required}"
           : "${GITFORGE_REPO_ID:?GITFORGE_REPO_ID is required (GitForge UUID, not GitHub repository_id)}"
-          : "${GITFORGE_API_TOKEN:?GITFORGE_API_TOKEN is required}"
+          : "${GITFORGE_CI_TRIGGER_TOKEN:?GITFORGE_CI_TRIGGER_TOKEN is required}"
+          : "${GITFORGE_SCHEDULER_OPERATOR_TOKEN:?GITFORGE_SCHEDULER_OPERATOR_TOKEN is required}"
           [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
             echo "GITFORGE_REPO_ID must be a UUID" >&2
             exit 1
@@ -77,7 +76,7 @@ jobs:
             '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "$GITFORGE_SCHEDULER_URL/pipelines/trigger" \
-            -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+            -H "Authorization: Bearer $GITFORGE_CI_TRIGGER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" 2>&1)
 
@@ -115,13 +114,13 @@ jobs:
           set -euo pipefail
           echo "Build enqueued, polling GitForge for status..."
           RUN_ID='${{ needs.enqueue-build.outputs.run_id }}'
-          STATUS_URL="$GITFORGE_API_URL/api/pipeline-runs/$RUN_ID"
+          STATUS_URL="$GITFORGE_SCHEDULER_URL/pipelines/runs/$RUN_ID"
 
           deadline=$(( $(date +%s) + GITFORGE_POLL_TIMEOUT_SECONDS ))
           while :; do
             RESPONSE=$(curl --fail-with-body --silent --show-error \
               --max-time 30 \
-              -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+              -H "Authorization: Bearer $GITFORGE_SCHEDULER_OPERATOR_TOKEN" \
               -H "Accept: application/json" \
               "$STATUS_URL")
             STATUS=$(echo "$RESPONSE" | jq -r '.status // .state // empty' | tr '[:upper:]' '[:lower:]')
