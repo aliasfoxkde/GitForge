@@ -10,7 +10,9 @@ use std::sync::Mutex;
 /// exact orchestrator payload it built.
 #[derive(Clone)]
 pub struct CiTriggerDelivery {
+    /// Credential forwarded to the CI trigger endpoint.
     pub trigger_token: String,
+    /// Serialized payload forwarded by the trigger client.
     pub payload: Value,
 }
 
@@ -32,6 +34,10 @@ pub struct ScriptedCiTriggerTransport {
 }
 
 impl ScriptedCiTriggerTransport {
+    /// Create a transport that returns the supplied outcomes in sequence.
+    ///
+    /// If only one outcome is supplied, it repeats for every request. An
+    /// empty script rejects each request with an exhaustion error.
     pub fn new(script: Vec<Result<Option<String>, String>>) -> Self {
         Self {
             deliveries: Mutex::new(Vec::new()),

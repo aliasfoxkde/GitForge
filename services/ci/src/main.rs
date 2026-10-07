@@ -772,12 +772,6 @@ struct TriggerAuthRejection {
     code: &'static str,
 }
 
-impl TriggerAuthRejection {
-    fn status(self) -> StatusCode {
-        self.status
-    }
-}
-
 impl IntoResponse for TriggerAuthRejection {
     fn into_response(self) -> Response {
         (self.status, Json(serde_json::json!({"error": self.code}))).into_response()
@@ -5204,7 +5198,7 @@ jobs:
     #[test]
     fn trigger_auth_verdict_unconfigured_returns_503() {
         let rejection = trigger_auth_verdict(None, Some("anything")).unwrap_err();
-        assert_eq!(rejection.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejection.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
@@ -5212,7 +5206,7 @@ jobs:
         let expected = Some("secret".to_string());
         for supplied in [None, Some("wrong"), Some("Bearer wrong")] {
             let rejection = trigger_auth_verdict(expected.clone(), supplied).unwrap_err();
-            assert_eq!(rejection.status(), StatusCode::UNAUTHORIZED, "{supplied:?}");
+            assert_eq!(rejection.status, StatusCode::UNAUTHORIZED, "{supplied:?}");
         }
     }
 
