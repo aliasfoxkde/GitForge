@@ -314,7 +314,7 @@ pub fn get_openapi_spec() -> serde_json::Value {
                 "get": {
                     "tags": ["ci"],
                     "summary": "List pipelines",
-                    "description": "Returns a list of all pipelines",
+                    "description": "Returns active pipeline versions visible to the authenticated user. Retired versions are not included.",
                     "responses": {
                         "200": {"description": "List of pipelines"}
                     }
@@ -1005,6 +1005,10 @@ mod tests {
         assert!(paths.contains_key("/repos/{owner}/{repo}/commits/{sha}/status"));
         assert!(paths.contains_key("/users/{id}/role"));
         assert!(paths.contains_key("/pipelines"));
+        assert_eq!(
+            paths["/pipelines"]["get"]["description"],
+            "Returns active pipeline versions visible to the authenticated user. Retired versions are not included."
+        );
         assert!(paths.contains_key("/runners"));
         assert!(paths.contains_key("/artifacts"));
         assert!(paths.contains_key("/review-runs"));

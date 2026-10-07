@@ -658,11 +658,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             println!("  No pipelines found.");
                         } else {
                             for pipeline in pipelines {
-                                let status = if pipeline.enabled {
-                                    "active"
-                                } else {
-                                    "disabled"
-                                };
+                                let status = pipeline.status_label();
                                 println!(
                                     "  {:20} - {} [{}]",
                                     pipeline.name, pipeline.repo_id, status
@@ -682,7 +678,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("⚙️  Pipeline: {}", pipeline.name);
                         println!("   ID: {}", pipeline.id);
                         println!("   Repository: {}", pipeline.repo_id);
-                        println!("   Enabled: {}", pipeline.enabled);
+                        println!("   Status: {}", pipeline.status_label());
                     }
                     Err(e) => {
                         println!("❌ {e}");

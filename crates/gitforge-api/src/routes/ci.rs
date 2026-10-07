@@ -165,6 +165,9 @@ async fn list_pipelines(
                         "repo_id": p.repo_id.to_string(),
                         "name": p.name,
                         "trigger_type": p.trigger_type,
+                        // PipelineQueries::list returns only active
+                        // versions, so every row listed here is enabled.
+                        "enabled": true,
                         "created_at": p.created_at.to_rfc3339()
                     }));
                 }

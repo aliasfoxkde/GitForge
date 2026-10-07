@@ -104,10 +104,25 @@ pub struct PipelineResponse {
     pub id: String,
     pub name: String,
     pub repo_id: String,
-    /// The API list endpoint does not return `enabled`; default it so the
-    /// response still decodes (the run/list flows only need id/name/repo_id).
+    /// Whether this pipeline version is active. The list endpoint reports
+    /// `enabled: true` (it returns only active versions); the
+    /// single-pipeline endpoint omits the field, which decodes to `None`
+    /// and renders as `unknown` rather than a misleading "disabled".
     #[serde(default)]
-    pub enabled: bool,
+    pub enabled: Option<bool>,
+}
+
+impl PipelineResponse {
+    /// Human-facing activity label for the pipeline's enablement state:
+    /// `Some(true)` is `active`, `Some(false)` is `disabled`, and a missing
+    /// field (single-pipeline endpoint) is `unknown`.
+    pub fn status_label(&self) -> &'static str {
+        match self.enabled {
+            Some(true) => "active",
+            Some(false) => "disabled",
+            None => "unknown",
+        }
+    }
 }
 
 /// Create pipeline request
@@ -815,5 +830,36 @@ mod tests {
         // GitForgeClient is an alias for ApiClient
         let client = GitForgeClient::new("http://localhost:42780", None);
         assert_eq!(client.base_url, "http://localhost:42780");
+    }
+
+    /// The single-pipeline endpoint omits `enabled`; it must decode to
+    /// `None` and label as `unknown`, never as a misleading "disabled".
+    #[test]
+    fn pipeline_response_missing_enabled_is_unknown() {
+        let pipeline: PipelineResponse =
+            serde_json::from_str(r#"{"id":"p1","name":"ci","repo_id":"r1"}"#).unwrap();
+        assert_eq!(pipeline.enabled, None);
+        assert_eq!(pipeline.status_label(), "unknown");
+    }
+
+    /// The list endpoint reports active rows with `enabled: true`.
+    #[test]
+    fn pipeline_response_enabled_true_is_active() {
+        let pipeline: PipelineResponse =
+            serde_json::from_str(r#"{"id":"p1","name":"ci","repo_id":"r1","enabled":true}"#)
+                .unwrap();
+        assert_eq!(pipeline.enabled, Some(true));
+        assert_eq!(pipeline.status_label(), "active");
+    }
+
+    /// An explicit `enabled: false` must stay "disabled", not degrade to
+    /// the unknown label.
+    #[test]
+    fn pipeline_response_enabled_false_is_disabled() {
+        let pipeline: PipelineResponse =
+            serde_json::from_str(r#"{"id":"p1","name":"ci","repo_id":"r1","enabled":false}"#)
+                .unwrap();
+        assert_eq!(pipeline.enabled, Some(false));
+        assert_eq!(pipeline.status_label(), "disabled");
     }
 }
