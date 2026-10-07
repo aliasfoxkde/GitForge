@@ -41,5 +41,24 @@ hyper = "1.5"
 tempfile = "3"
 gitforge-review = { path = "../gitforge-review" }
 
+[features]
+# Test-only surface for the CI trigger delegation seam: the transport
+# injection trait, `CiTriggerClient::with_transport`, and the test-only
+# `with_test_endpoint` constructor. Ordinary production builds never
+# enable it, so no injection path is compiled into `cargo build` /
+# `--release`. The integration suites that exercise the seam declare it
+# as a required feature below, so plain `cargo test` skips those targets
+# instead of failing to compile while CI enables the feature explicitly
+# (see .gitforce.yml and the GitHub workflows).
+test-util = []
+
+[[test]]
+name = "ci_routes"
+required-features = ["test-util"]
+
+[[test]]
+name = "webhook_routes"
+required-features = ["test-util"]
+
 [lints]
 workspace = true

@@ -32,7 +32,10 @@ jobs:
 
       - name: Build
         run: |
-          cargo test --workspace --locked --no-fail-fast
+          # The feature-gated integration suites must run in this gate
+          # (see rust-ci.yml's clippy job); the release build below stays
+          # feature-free so shipped binaries carry no test-only seam.
+          cargo test --workspace --locked --features gitforge-api/test-util --no-fail-fast
           cargo build --release --locked --bin api --bin ci --bin git-server --bin runner
 
       - name: Package

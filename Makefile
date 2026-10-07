@@ -26,17 +26,20 @@ build-cross-all:
 	./scripts/cross-build.sh all
 
 # ─── Test ─────────────────────────────────────────────────────────────────────
+# test-util is a required feature of the ci_routes/webhook_routes suites
+# (crates/gitforge-api/Cargo.toml); without it plain `cargo test` silently
+# skips them, so mirror CI and enable it explicitly.
 TEST_TIMEOUT := 15m
 COVER_PROFILE := coverage.out
 
 test:
-	cargo test
+	cargo test --features gitforge-api/test-util
 
 test-release:
-	cargo test --release
+	cargo test --release --features gitforge-api/test-util
 
 test-race:
-	RUST_BACKTRACE=1 cargo test --release -- --test-threads=1
+	RUST_BACKTRACE=1 cargo test --release --features gitforge-api/test-util -- --test-threads=1
 
 # ─── Coverage ─────────────────────────────────────────────────────────────────
 coverage: test

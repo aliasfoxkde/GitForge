@@ -3,6 +3,10 @@
 //! Allows external services to trigger pipeline runs via webhooks.
 
 use crate::middleware::AuthenticatedUser;
+// Only the `test-util` injection seam uses the async-trait machinery; the
+// production wire path is a plain inherent async fn. Keeping the import
+// feature-gated keeps ordinary production builds free of both.
+#[cfg(feature = "test-util")]
 use async_trait::async_trait;
 use axum::{
     extract::{Extension, Path},
@@ -114,12 +118,15 @@ fn derive_webhook_job_plan(
 
 /// Outbound transport for one CI trigger delivery to the CI orchestrator.
 ///
-/// The trigger endpoint is pinned to the fixed loopback address
-/// ([`CI_TRIGGER_URL`]) as an SSRF bound: deployment configuration must
-/// never be able to point trigger deliveries at an arbitrary host, port,
-/// or path. [`CiTriggerClient::new`] enforces that bound before installing
-/// the reqwest-backed transport; tests deliver through injected transports
-/// instead, never by relaxing the endpoint bound.
+/// Compiled only under the non-default `test-util` feature: ordinary
+/// production builds carry no injection seam at all. Production always
+/// dispatches through the reqwest transport pinned to the fixed loopback
+/// endpoint ([`CI_TRIGGER_URL`]) — an SSRF bound: deployment configuration
+/// must never be able to point trigger deliveries at an arbitrary host,
+/// port, or path, and nothing outside `test-util` can build a
+/// [`CiTriggerClient`] around a foreign transport. Tests deliver through
+/// injected transports instead, never by relaxing the endpoint bound.
+#[cfg(feature = "test-util")]
 #[async_trait]
 pub trait CiTriggerTransport: Send + Sync + 'static {
     /// Deliver one trigger payload and report the `pipeline_run_id` the
@@ -132,16 +139,29 @@ pub trait CiTriggerTransport: Send + Sync + 'static {
     ) -> Result<Option<String>, String>;
 }
 
-/// reqwest-backed delivery to the fixed loopback orchestrator endpoint.
-/// Only [`CiTriggerClient::new`] constructs it, after validating that
-/// endpoint.
+/// reqwest-backed delivery to the orchestrator trigger endpoint. Only
+/// [`CiTriggerClient`] constructs it, after resolving its endpoint.
 #[derive(Clone)]
 struct ReqwestCiTriggerTransport {
     client: reqwest::Client,
+    endpoint: String,
 }
 
 impl ReqwestCiTriggerTransport {
+    /// Build the transport for THE fixed production endpoint. Production
+    /// dispatch never carries a runtime URL: the endpoint is the compiled
+    /// SSRF bound, and [`CiTriggerClient::new`] only ever constructs this
+    /// transport for it.
     fn new() -> Result<Self, String> {
+        Self::for_endpoint(CI_TRIGGER_URL.to_string())
+    }
+
+    /// Build the transport for an explicit endpoint. [`Self::new`] is the
+    /// only production caller and passes the pinned [`CI_TRIGGER_URL`];
+    /// under `test-util`, [`CiTriggerClient::with_test_endpoint`] is the
+    /// sole caller allowed to point the real reqwest wire at an ephemeral
+    /// local test stub.
+    fn for_endpoint(endpoint: String) -> Result<Self, String> {
         Ok(Self {
             client: reqwest::Client::builder()
                 // Must outlast the orchestrator's run-creation correlation
@@ -155,12 +175,13 @@ impl ReqwestCiTriggerTransport {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|error| format!("failed to build CI trigger client: {error}"))?,
+            endpoint,
         })
     }
-}
 
-#[async_trait]
-impl CiTriggerTransport for ReqwestCiTriggerTransport {
+    /// The single wire implementation, shared by production dispatch and
+    /// the `test-util` trait adapter: POST the trigger token and payload
+    /// to this transport's endpoint and parse the orchestrator's answer.
     async fn send(
         &self,
         trigger_token: &str,
@@ -168,9 +189,7 @@ impl CiTriggerTransport for ReqwestCiTriggerTransport {
     ) -> Result<Option<String>, String> {
         let response = self
             .client
-            // The configured value is validated at startup, but never
-            // reaches this request sink; the deployed CI endpoint is fixed.
-            .post(CI_TRIGGER_URL)
+            .post(&self.endpoint)
             .header("x-gitforge-trigger-token", trigger_token)
             .json(&payload)
             .send()
@@ -191,13 +210,32 @@ impl CiTriggerTransport for ReqwestCiTriggerTransport {
     }
 }
 
+// `dyn` dispatch routes through the same wire implementation production
+// uses; there is exactly one send path, feature-gated or not.
+#[cfg(feature = "test-util")]
+#[async_trait]
+impl CiTriggerTransport for ReqwestCiTriggerTransport {
+    async fn send(
+        &self,
+        trigger_token: &str,
+        payload: serde_json::Value,
+    ) -> Result<Option<String>, String> {
+        ReqwestCiTriggerTransport::send(self, trigger_token, payload).await
+    }
+}
+
 /// HTTP client for the separately deployed CI orchestrator. The API gateway
 /// must hand webhook execution to CI so CI can create the run-owned checkout,
 /// register the pipeline engine, and progress the dependency DAG.
 #[derive(Clone)]
 pub struct CiTriggerClient {
     token: String,
+    // Production: the reqwest transport pinned to the fixed loopback
+    // endpoint. `test-util`: whichever transport the test injected.
+    #[cfg(feature = "test-util")]
     transport: Arc<dyn CiTriggerTransport>,
+    #[cfg(not(feature = "test-util"))]
+    transport: ReqwestCiTriggerTransport,
 }
 
 impl CiTriggerClient {
@@ -211,17 +249,22 @@ impl CiTriggerClient {
             );
         }
 
+        let transport = ReqwestCiTriggerTransport::new()?;
+        #[cfg(feature = "test-util")]
+        let transport = Arc::new(transport);
         Ok(Self {
             token: token.into(),
-            transport: Arc::new(ReqwestCiTriggerTransport::new()?),
+            transport,
         })
     }
 
-    /// Build a client around an explicit transport. Production always goes
-    /// through [`CiTriggerClient::new`], whose URL validation is the SSRF
-    /// bound; this constructor exists so tests can observe the exact
-    /// delegation payload without binding the orchestrator's pinned
+    /// Build a client around an explicit transport. Compiled only under
+    /// `test-util` — production has no injection seam, and
+    /// [`CiTriggerClient::new`]'s URL validation (the SSRF bound) is the
+    /// only production construction path. Exists so tests can observe the
+    /// exact delegation payload without binding the orchestrator's pinned
     /// loopback port on the test host.
+    #[cfg(feature = "test-util")]
     pub fn with_transport(
         transport: Arc<dyn CiTriggerTransport>,
         token: impl Into<String>,
@@ -230,6 +273,23 @@ impl CiTriggerClient {
             token: token.into(),
             transport,
         }
+    }
+
+    /// Build a client around the real reqwest wire transport, pointed at an
+    /// explicit endpoint. Compiled only under `test-util` and used by
+    /// integration tests to drive the actual HTTP contract against an
+    /// ephemeral local stub (an owned port 0 binding can never collide with
+    /// a live deployment). Production never sees this constructor; the
+    /// fixed-loopback bound of [`CiTriggerClient::new`] is untouched.
+    #[cfg(feature = "test-util")]
+    pub fn with_test_endpoint(
+        url: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            token: token.into(),
+            transport: Arc::new(ReqwestCiTriggerTransport::for_endpoint(url.into())?),
+        })
     }
 
     /// The total request budget this client grants the orchestrator. Exposed

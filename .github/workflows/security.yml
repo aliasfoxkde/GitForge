@@ -194,8 +194,11 @@ jobs:
 
       - name: Run clippy with security-focused lints
         run: |
-          # Check for common security issues in Rust code
-          cargo clippy --workspace --all-targets --locked -- -D warnings
+          # Check for common security issues in Rust code. The test-util
+          # flag matches rust-ci.yml's clippy job: the CI-trigger seam is
+          # feature-gated and its integration suites are required-feature
+          # targets, so without it they silently drop out of --all-targets.
+          cargo clippy --workspace --all-targets --locked --features gitforge-api/test-util -- -D warnings
 
       - name: Check for unsafe code
         run: |
