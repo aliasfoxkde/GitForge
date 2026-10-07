@@ -692,11 +692,16 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 match api_client.run_pipeline(id, cli_ref.as_deref()).await {
                     Ok(triggered) => {
                         println!("🚀 Triggered pipeline: {id}");
-                        println!("   Run: {}", triggered.pipeline_run_id);
-                        println!(
-                            "   Watch it: gitforge pipeline --watch {}",
-                            triggered.pipeline_run_id
-                        );
+                        match triggered.pipeline_run_id {
+                            Some(run_id) => {
+                                println!("   Run: {run_id}");
+                                println!("   Watch it: gitforge pipeline --watch {run_id}");
+                            }
+                            None => println!(
+                                "   Accepted, but the orchestrator did not schedule a run \
+                                 (pipeline may not be registered with the scheduler)"
+                            ),
+                        }
                     }
                     Err(e) => println!("❌ {e}"),
                 }

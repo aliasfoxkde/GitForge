@@ -128,7 +128,10 @@ pub struct TriggerPipelineRunRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerPipelineRunResponse {
     pub pipeline_id: String,
-    pub pipeline_run_id: String,
+    /// The API returns `null` when the orchestrator accepts the trigger but
+    /// does not schedule a run (its `Ok(None)` path) — this is not a decode
+    /// error, so the field must stay optional.
+    pub pipeline_run_id: Option<String>,
 }
 
 /// Pipeline run response

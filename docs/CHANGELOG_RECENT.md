@@ -43,6 +43,30 @@ All notable changes to GitForge will be documented in this file.
   output (752ea428, absorbed into this cut from
   `fix/pipeline-list-active-20261002`).
 
+### Supply Chain
+
+- **cargo-vet fully-audited coverage raised from 87 to 133 crates**:
+  43 publishers whose audits are already attested across the peer
+  registries (mozilla, Bytecode Alliance, ISRG, zcash) are now declared
+  as `[[trusted.*]]` with a per-entry provenance note; the exemptions
+  list dropped 347 → 301. Nothing was self-certified — each trusted
+  publisher's crates.io owner id was resolved and confirmed against at
+  least two live peer-registry `audits.toml` files before the trust
+  entry was written (23262d13).
+
+### Tests
+
+- **Webhook CI-delegation ladder covered end-to-end**: a stub
+  orchestrator binds the pinned production trigger endpoint (the client
+  refuses any other URL by design) and scripts the four outcomes the
+  gateway must distinguish — run-id relay, honest queued answer, HTTP
+  failure, non-JSON body — asserting 202 relay vs fail-closed 502 and
+  that delegation never persists local runs (6c6df121). The route's
+  non-delegating path keeps its six existing tests, and
+  `derive_webhook_job_plan` gains eight unit tests covering entry-job
+  selection, step command collection, every definition rejection, and
+  timeout parsing.
+
 ## [0.6.12] - 2026-10-01
 
 ### Fixed
