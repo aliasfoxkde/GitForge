@@ -506,7 +506,7 @@ async fn webhook_delegation_ladder_relays_success_and_fails_closed() {
     let transport = Arc::new(ScriptedCiTriggerTransport::new(script));
     let app = ApiServer::new("test-secret", f.pool.clone())
         .with_ci_trigger_client(Arc::new(CiTriggerClient::with_transport(
-            transport,
+            transport.clone(),
             "stub-token",
         )))
         .into_router();
