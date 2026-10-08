@@ -24,8 +24,6 @@ env:
   GITFORGE_REPO_ID: ${{ vars.GITFORGE_REPO_ID || '' }}
   GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
-  GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
-  GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
 
 permissions:
   contents: read
@@ -44,6 +42,9 @@ jobs:
       build_status: ${{ steps.enqueue.outputs.status }}
     steps:
       - name: Validate GitForge configuration
+        env:
+          GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
+          GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
         run: |
           set -euo pipefail
           : "${GITFORGE_SCHEDULER_URL:?GITFORGE_SCHEDULER_URL is required}"
@@ -71,6 +72,7 @@ jobs:
           GITFORGE_REF: ${{ github.ref_name }}
           GITFORGE_OLD_SHA: ${{ github.event.before }}
           GITFORGE_NEW_SHA: ${{ github.sha }}
+          GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
         run: |
           set -euo pipefail
           # Enqueue and status polling intentionally use separate credentials:
@@ -122,6 +124,7 @@ jobs:
           # output into this script's source text would let API-supplied data
           # become shell code.
           RUN_ID: ${{ needs.enqueue-build.outputs.run_id }}
+          GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
         run: |
           set -euo pipefail
           : "${RUN_ID:?run_id output is required}"
