@@ -1160,8 +1160,21 @@ impl RunnerAgent {
     /// - `GITFORGE_RECONCILE_GRACE_SECS`: minimum non-running age before a
     ///   candidate is eligible (default 3600; must be positive).
     /// - `GITFORGE_RECONCILE_INTERVAL_SECS`: periodic pass interval
-    ///   (default 300).
-    /// - `GITFORGE_RECONCILE_RECEIPT`: optional path for a JSON receipt.
+    ///   (default 300). Lenient like grace: unset or unparseable values fall
+    ///   back to the default, and the resolved value is clamped to a
+    ///   30-second floor.
+    /// - `GITFORGE_RECONCILE_MAX_REMOVALS`: per-pass removal cap for the
+    ///   canary rollout. Unset keeps `ReconcilerPolicy::default().max_removals`
+    ///   (64). Explicit values are parsed strictly as positive integers;
+    ///   zero or malformed values fail the reconciler closed (the loop is
+    ///   not started) rather than silently falling back to the default. A
+    ///   valid explicit value is operator-trusted and is not otherwise
+    ///   capped.
+    /// - `GITFORGE_RECONCILE_RECEIPT`: destination for the JSON receipt.
+    ///   Removal requires it: deletion is only permitted when an existing
+    ///   valid receipt path is configured (absolute, `.json`, real parent
+    ///   directory), so every removal pass is auditable. Census-only
+    ///   operation does not need one.
     ///
     /// Every pass correlates against the authoritative local active-job
     /// set, so a container belonging to a job this runner is executing is
@@ -1731,26 +1744,67 @@ pub(crate) enum ReceiptWriteOutcome {
     SerializeFailed(String),
 }
 
-/// Read the reconciler env-var configuration and validate it.
+/// Read the reconciler env-var configuration and validate it. The env read
+/// is confined to this wrapper; all validation lives in
+/// [`load_reconciler_config`] so it is testable without process-global
+/// environment mutation.
 fn load_reconciler_config_from_env() -> std::result::Result<ReconcilerLoopConfig, String> {
-    let deletion_enabled = std::env::var("GITFORGE_RECONCILE_DELETE")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    let grace_secs: u64 = std::env::var("GITFORGE_RECONCILE_GRACE_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3600);
-    let interval_secs: u64 = std::env::var("GITFORGE_RECONCILE_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(300);
-    let receipt_path = match std::env::var("GITFORGE_RECONCILE_RECEIPT") {
-        Ok(raw) => match validate_reconciler_receipt_path(&raw) {
+    let max_removals = match std::env::var("GITFORGE_RECONCILE_MAX_REMOVALS") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("GITFORGE_RECONCILE_MAX_REMOVALS must be valid Unicode".to_string());
+        }
+    };
+    load_reconciler_config(
+        std::env::var("GITFORGE_RECONCILE_DELETE").ok(),
+        std::env::var("GITFORGE_RECONCILE_GRACE_SECS").ok(),
+        std::env::var("GITFORGE_RECONCILE_INTERVAL_SECS").ok(),
+        max_removals,
+        std::env::var("GITFORGE_RECONCILE_RECEIPT").ok(),
+    )
+}
+
+/// Resolve and validate the reconciler configuration from raw env values
+/// (`None` = unset). Validation is fail-closed: a malformed value aborts
+/// startup of the reconciler loop instead of silently falling back to a
+/// default for `GITFORGE_RECONCILE_MAX_REMOVALS` and the receipt path. The
+/// existing lenient fallback behavior for grace and interval values is
+/// unchanged. Deletion additionally requires a receipt destination, so every
+/// removal pass is auditable.
+fn load_reconciler_config(
+    delete: Option<String>,
+    grace_secs: Option<String>,
+    interval_secs: Option<String>,
+    max_removals: Option<String>,
+    receipt: Option<String>,
+) -> std::result::Result<ReconcilerLoopConfig, String> {
+    let deletion_enabled = delete.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let grace_secs: u64 = grace_secs.and_then(|v| v.parse().ok()).unwrap_or(3600);
+    let interval_secs: u64 = interval_secs.and_then(|v| v.parse().ok()).unwrap_or(300);
+    // Strict canary cap: unset keeps the policy default (64); any explicit
+    // value must be a positive integer. Zero or malformed values fail the
+    // reconciler closed rather than falling back to the default.
+    let max_removals = match max_removals.as_deref() {
+        None => ReconcilerPolicy::default().max_removals,
+        Some(raw) => {
+            let parsed: usize = raw
+                .parse()
+                .map_err(|_| format!("invalid GITFORGE_RECONCILE_MAX_REMOVALS value {raw:?}: must be a positive integer"))?;
+            if parsed == 0 {
+                return Err("GITFORGE_RECONCILE_MAX_REMOVALS must be positive, got 0".to_string());
+            }
+            parsed
+        }
+    };
+    let receipt_path = match receipt {
+        Some(raw) => match validate_reconciler_receipt_path(&raw) {
             Ok(path) => Some(path),
             Err(error) => {
                 return Err(format!("invalid receipt path: {error}"));
             }
         },
-        Err(_) => None,
+        None => None,
     };
 
     if deletion_enabled && receipt_path.is_none() {
@@ -1760,6 +1814,7 @@ fn load_reconciler_config_from_env() -> std::result::Result<ReconcilerLoopConfig
     let policy = ReconcilerPolicy {
         deletion_enabled,
         grace: Duration::from_secs(grace_secs),
+        max_removals,
         ..ReconcilerPolicy::default()
     };
     policy
@@ -1852,10 +1907,12 @@ pub(crate) async fn run_reconciler_loop(
     }
 }
 
-/// Validate the optional reconciler receipt destination before starting the
-/// background task.  Receipt paths are operator configuration, but accepting
+/// Validate the reconciler receipt destination before starting the
+/// background task. Removal requires a receipt: deletion is only permitted
+/// when an existing valid receipt path is configured, so every removal pass
+/// is auditable. Receipt paths are operator configuration, but accepting
 /// arbitrary relative paths or symlinked parents would let a typo redirect
-/// writes outside the service's artifact area.  The parent must already exist
+/// writes outside the service's artifact area. The parent must already exist
 /// so startup does not create directories as a side effect.
 fn validate_reconciler_receipt_path(raw: &str) -> std::result::Result<PathBuf, String> {
     let path = PathBuf::from(raw.trim());
@@ -1937,11 +1994,45 @@ mod receipt_tests {
 
     #[test]
     fn receipt_path_requires_existing_real_parent() {
-        let path = format!(
-            "/nas/Temp/work/reconciler-receipt-test-{}/receipt.json",
-            std::process::id()
-        );
-        assert!(validate_reconciler_receipt_path(&path).is_err());
+        let dir = tempfile::tempdir().expect("tempdir must succeed");
+        let path = dir.path().join("missing-parent").join("receipt.json");
+        let path = path.to_str().expect("utf-8 tempdir path");
+        assert!(validate_reconciler_receipt_path(path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_path_rejects_symlinked_parent() {
+        let dir = tempfile::tempdir().expect("tempdir must succeed");
+        // Canonicalize the temp root so the fixture holds exactly one
+        // symlink: the parent under test. Host temp roots are themselves
+        // reached through a symlink on some systems (macOS /tmp -> /private/tmp);
+        // leaving that second symlink in play would make it ambiguous which
+        // link the rejection is attributable to, since only the immediate
+        // parent's own metadata is examined.
+        let root = dir.path().canonicalize().expect("tempdir must canonicalize");
+        let real = root.join("real");
+        std::fs::create_dir(&real).expect("real parent must be creatable");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink must be creatable");
+        let path = link.join("receipt.json");
+        let error = validate_reconciler_receipt_path(path.to_str().expect("utf-8 tempdir path"))
+            .expect_err("symlinked parent must be rejected");
+        assert!(error.contains("real directory"), "got: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_path_rejects_symlinked_destination() {
+        let dir = tempfile::tempdir().expect("tempdir must succeed");
+        let root = dir.path().canonicalize().expect("tempdir must canonicalize");
+        let target = root.join("elsewhere.json");
+        std::fs::write(&target, "{}\n").expect("symlink target must be creatable");
+        let link = root.join("receipt.json");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink must be creatable");
+        let error = validate_reconciler_receipt_path(link.to_str().expect("utf-8 tempdir path"))
+            .expect_err("symlinked destination must be rejected");
+        assert!(error.contains("symlink"), "got: {error}");
     }
 }
 
@@ -2072,6 +2163,148 @@ mod reconciler_loop_tests {
         let path: PathBuf = dir.path().join("nested").join("receipt.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         assert!(validate_reconciler_receipt_path(path.to_str().unwrap()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod reconciler_env_config_tests {
+    use super::{load_reconciler_config, ReconcilerPolicy};
+
+    fn config(
+        delete: Option<&str>,
+        max_removals: Option<&str>,
+        receipt: Option<&str>,
+    ) -> std::result::Result<crate::agent::ReconcilerLoopConfig, String> {
+        load_reconciler_config(
+            delete.map(str::to_owned),
+            None,
+            None,
+            max_removals.map(str::to_owned),
+            receipt.map(str::to_owned),
+        )
+    }
+
+    /// Grace and interval boundary cases ride through the raw string inputs,
+    /// so this helper leaves deletion (which needs a receipt on disk) out.
+    fn config_with_timing(
+        grace: Option<&str>,
+        interval: Option<&str>,
+    ) -> std::result::Result<crate::agent::ReconcilerLoopConfig, String> {
+        load_reconciler_config(
+            None,
+            grace.map(str::to_owned),
+            interval.map(str::to_owned),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn unset_max_removals_keeps_policy_default() {
+        let config = config(None, None, None).expect("default config must resolve");
+        assert_eq!(
+            config.policy.max_removals,
+            ReconcilerPolicy::default().max_removals
+        );
+        assert_eq!(config.policy.max_removals, 64);
+    }
+
+    #[test]
+    fn explicit_max_removals_is_honored() {
+        let config = config(None, Some("1"), None).expect("explicit cap must resolve");
+        assert_eq!(config.policy.max_removals, 1);
+    }
+
+    #[test]
+    fn zero_max_removals_fails_closed() {
+        let error = config(None, Some("0"), None).expect_err("zero must be rejected");
+        assert!(error.contains("must be positive"), "got: {error}");
+    }
+
+    #[test]
+    fn malformed_max_removals_fails_closed() {
+        for raw in ["abc", "", "-1", "3.5", " 4", "64 "] {
+            let error = config(None, Some(raw), None).expect_err("malformed cap must be rejected");
+            assert!(
+                error.contains("GITFORGE_RECONCILE_MAX_REMOVALS"),
+                "value {raw:?} rejected with wrong message: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn deletion_requires_receipt_path() {
+        let error = config(Some("1"), None, None).expect_err("deletion without receipt");
+        assert_eq!(error, "deletion requires a receipt path");
+    }
+
+    #[test]
+    fn deletion_with_valid_receipt_path_resolves() {
+        let dir = tempfile::tempdir().expect("tempdir must succeed");
+        let receipt = dir.path().join("receipt.json");
+        let receipt_str = receipt.to_str().expect("utf-8 tempdir path");
+        let config = config(Some("1"), None, Some(receipt_str))
+            .expect("deletion with a valid receipt must resolve");
+        assert!(config.policy.deletion_enabled);
+        assert_eq!(config.receipt_path, Some(receipt));
+    }
+
+    #[test]
+    fn census_only_does_not_need_receipt() {
+        let config = config(Some("false"), None, None).expect("census-only must resolve");
+        assert!(!config.policy.deletion_enabled);
+        assert_eq!(config.receipt_path, None);
+    }
+
+    #[test]
+    fn unset_grace_and_interval_use_defaults() {
+        let config = config_with_timing(None, None).expect("defaults must resolve");
+        assert_eq!(config.policy.grace, std::time::Duration::from_secs(3600));
+        assert_eq!(config.interval, std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    fn unparseable_grace_and_interval_fall_back_to_defaults() {
+        // Lenient by design: anything u64 parsing rejects keeps the default,
+        // including negatives, whitespace-padded numbers, and non-decimal
+        // forms.
+        for raw in ["abc", "", "-1", "0x10", "3.5", " 60", "60 "] {
+            let config = config_with_timing(Some(raw), Some(raw))
+                .unwrap_or_else(|error| panic!("value {raw:?} must stay lenient: {error}"));
+            assert_eq!(config.policy.grace, std::time::Duration::from_secs(3600));
+            assert_eq!(config.interval, std::time::Duration::from_secs(300));
+        }
+    }
+
+    #[test]
+    fn zero_grace_fails_closed() {
+        // Unlike the interval, a zero grace period is a policy error: an
+        // explicit operator value is never silently reinterpreted.
+        let error = config_with_timing(Some("0"), None).expect_err("zero grace must be rejected");
+        assert!(error.contains("grace period must be positive"), "got: {error}");
+    }
+
+    #[test]
+    fn small_positive_grace_is_accepted_verbatim() {
+        let config = config_with_timing(Some("1"), None).expect("grace of 1s must resolve");
+        assert_eq!(config.policy.grace, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn interval_below_floor_is_clamped_never_fatal() {
+        for raw in ["0", "1", "29"] {
+            let config = config_with_timing(None, Some(raw))
+                .unwrap_or_else(|error| panic!("interval {raw:?} must not be fatal: {error}"));
+            assert_eq!(config.interval, std::time::Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn interval_at_and_above_floor_is_honored() {
+        let at_floor = config_with_timing(None, Some("30")).expect("interval 30 must resolve");
+        assert_eq!(at_floor.interval, std::time::Duration::from_secs(30));
+        let above = config_with_timing(None, Some("31")).expect("interval 31 must resolve");
+        assert_eq!(above.interval, std::time::Duration::from_secs(31));
     }
 }
 

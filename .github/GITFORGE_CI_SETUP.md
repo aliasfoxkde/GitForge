@@ -7,22 +7,32 @@ plane runs.
 Enable the integration only when one of these network arrangements is in
 place:
 
-1. A GitHub self-hosted runner is installed on the Fedora host and the
-   workflow is changed to target that runner label; or
+1. A GitHub self-hosted runner is installed on the Fedora host with the
+   labels already required by the workflow (`self-hosted`, `linux`, `x64`,
+   `gitforge-github`); or
 2. GitForge is exposed through a deliberately secured, reachable endpoint
    with TLS, authentication, and firewall policy reviewed.
 
 Configure these repository or organization values before enabling it:
 
+For the current Fedora self-hosted runner, the GitForge scheduler/CI control
+plane is reachable at `http://127.0.0.1:42781`. This loopback value is valid
+only because the jobs run on the Fedora host; do not use it with GitHub-hosted
+runners. The API gateway at port `42780` is not used by this workflow.
+
 | Name | Kind | Requirement |
 | --- | --- | --- |
 | `GITFORGE_ENABLED` | variable | Exactly `true` |
-| `GITFORGE_API_URL` | variable | Reachable GitForge API base URL |
 | `GITFORGE_SCHEDULER_URL` | variable | Reachable scheduler base URL |
 | `GITFORGE_REPO_ID` | variable | UUID of the mirrored GitForge repository |
 | `GITFORGE_POLL_TIMEOUT_SECONDS` | variable | Positive integer timeout |
 | `GITFORGE_POLL_INTERVAL_SECONDS` | variable | Positive integer interval |
-| `GITFORGE_API_TOKEN` | secret | Token accepted by the scheduler/API |
+| `GITFORGE_CI_TRIGGER_TOKEN` | secret | Credential accepted by the CI trigger endpoint for `POST /pipelines/trigger` |
+| `GITFORGE_SCHEDULER_OPERATOR_TOKEN` | secret | Scheduler operator credential for `GET /pipelines/runs/{run_id}` status polling |
+
+The credentials are intentionally separate: enqueue uses the CI trigger token;
+status polling uses the scheduler operator token. Do not substitute one for
+the other or use either token with the API gateway.
 
 The workflow validates all values and refuses to bypass GitForge if enqueue or
 polling fails. Until `GITFORGE_ENABLED=true` is intentionally configured, the
