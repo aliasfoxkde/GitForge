@@ -30,6 +30,10 @@ axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 
+# The CI orchestrator owns its trigger-request store: it creates the table and
+# runs the correlation queries itself rather than going through gitforge-db.
+sqlx = { workspace = true, features = ["sqlite"] }
+
 [dev-dependencies]
 reqwest = { workspace = true }
 
