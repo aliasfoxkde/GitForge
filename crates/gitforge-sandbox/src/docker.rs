@@ -449,12 +449,19 @@ fn compose_exec_env(has_workspace: bool, env: &[String]) -> Vec<String> {
     exec_env
 }
 
-/// MiB -> Docker memory-field bytes, hardened against overflow: the
-/// `u64` multiplication is checked, and the result must also fit the
-/// API's signed `i64` field. Either failure is a sandbox error rather
-/// than a silent wrap-around or truncation into a bogus (potentially
-/// tiny or negative) cap.
+/// Docker requires at least 6 MiB for a container memory limit.
+const DOCKER_MIN_MEMORY_MB: u64 = 6;
+
+/// MiB -> Docker memory-field bytes. Enforce Docker's minimum and guard
+/// conversion overflow: the `u64` multiplication is checked, and the
+/// result must also fit the API's signed `i64` field.
 fn memory_limit_bytes(memory_mb: u64) -> Result<i64> {
+    if memory_mb < DOCKER_MIN_MEMORY_MB {
+        return Err(Error::sandbox(format!(
+            "memory_mb {memory_mb} is below Docker's minimum of {DOCKER_MIN_MEMORY_MB} MiB"
+        )));
+    }
+
     let bytes = memory_mb.checked_mul(1024 * 1024).ok_or_else(|| {
         Error::sandbox(format!(
             "memory_mb {memory_mb} overflows the MiB-to-bytes conversion"
@@ -2158,6 +2165,32 @@ mod tests {
     // =====================================================================
     // Memory conversion hardening
     // =====================================================================
+
+    /// Docker memory limits below 6 MiB are rejected by the shared
+    /// preflight builder, while the documented minimum is accepted.
+    #[test]
+    fn host_config_builder_enforces_docker_minimum_memory_mb() {
+        for mb in [0, 1, 5] {
+            let limits = SandboxLimits {
+                memory_mb: mb,
+                ..Default::default()
+            };
+            let error = resource_host_config(&limits)
+                .expect_err("memory below Docker's minimum must fail before daemon interaction");
+            assert_eq!(error.kind, ErrorKind::Sandbox);
+            assert!(
+                error.to_string().contains("memory_mb"),
+                "error should name the offending field: {error}"
+            );
+        }
+
+        let limits = SandboxLimits {
+            memory_mb: DOCKER_MIN_MEMORY_MB,
+            ..Default::default()
+        };
+        let host_config = resource_host_config(&limits).expect("6 MiB is Docker's minimum");
+        assert_eq!(host_config.memory, Some(6 * 1024 * 1024));
+    }
 
     /// The largest MiB value whose byte conversion still fits Docker's
     /// signed memory field is accepted with the exact byte count.
