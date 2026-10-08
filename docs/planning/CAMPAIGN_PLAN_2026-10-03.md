@@ -202,3 +202,22 @@ that decision in an ADR rather than silently under-delivering.
 7. Mirror convergence: gitforge-ci main fast-forwarded to the release
    tip in this cycle; GitHub mirror via PR after (branch
    `feat/v0614-auth-updates`, 30 commits).
+
+   Convergence addendum (2026-10-08 ~13:45Z): gitforge-ci main, origin/main,
+   and local remotes all converged on merge commit `54f93c3b` (GitHub PR
+   #281 admin-merged under a temporary Safeguards bypass grant, restored
+   after). Main's own pipeline run `d9c964c4` graded succeeded 4/4 on that
+   exact SHA — the converged tree is green on the primary platform.
+   Two further ledger findings from the convergence window: (a) run
+   `99c463db` logged `persisted planned job rows planned=4` yet zero rows
+   exist — the plan persist is a one-shot write outside persist_with_retry
+   (F21/F23 class) and the run reconciler skipped on pool timeouts; (b) a
+   ~29 min global SQLite write freeze (WAL mtime frozen; btrfs-transaction
+   committing 11 MB/s under 84%-util spinner read load) stalled all
+   heartbeats/completions; run `4d07b0a9`'s test container finished its
+   work but its completion hit `cannot start a transaction within a
+   transaction` (nested-BEGIN on the completion path; retries fail on the
+   broken context) and the lease-dead fence graded it failed at 12:38:20,
+   leaving a running-forever durable row for boot reconcile. Correct
+   response to the freeze was to wait — a service restart clears nothing
+   and fences live jobs.
