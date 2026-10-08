@@ -14,6 +14,11 @@ place:
 
 Configure these repository or organization values before enabling it:
 
+For the current Fedora self-hosted runner, the GitForge API and scheduler
+are reachable locally at `http://127.0.0.1:42780` and
+`http://127.0.0.1:42781`. These loopback values are valid only because
+the jobs run on the Fedora host; do not use them with GitHub-hosted runners.
+
 | Name | Kind | Requirement |
 | --- | --- | --- |
 | `GITFORGE_ENABLED` | variable | Exactly `true` |
@@ -22,7 +27,7 @@ Configure these repository or organization values before enabling it:
 | `GITFORGE_REPO_ID` | variable | UUID of the mirrored GitForge repository |
 | `GITFORGE_POLL_TIMEOUT_SECONDS` | variable | Positive integer timeout |
 | `GITFORGE_POLL_INTERVAL_SECONDS` | variable | Positive integer interval |
-| `GITFORGE_API_TOKEN` | secret | Token accepted by the scheduler/API |
+| `GITFORGE_SCHEDULER_OPERATOR_TOKEN` | secret | Scheduler operator credential for pipeline submission and status inspection |
 
 The workflow validates all values and refuses to bypass GitForge if enqueue or
 polling fails. Until `GITFORGE_ENABLED=true` is intentionally configured, the

@@ -1160,12 +1160,16 @@ impl RunnerAgent {
     /// - `GITFORGE_RECONCILE_GRACE_SECS`: minimum non-running age before a
     ///   candidate is eligible (default 3600; must be positive).
     /// - `GITFORGE_RECONCILE_INTERVAL_SECS`: periodic pass interval
-    ///   (default 300).
+    ///   (default 300). Lenient like grace: unset or unparseable values fall
+    ///   back to the default, and the resolved value is clamped to a
+    ///   30-second floor.
     /// - `GITFORGE_RECONCILE_MAX_REMOVALS`: per-pass removal cap for the
     ///   canary rollout. Unset keeps `ReconcilerPolicy::default().max_removals`
     ///   (64). Explicit values are parsed strictly as positive integers;
     ///   zero or malformed values fail the reconciler closed (the loop is
-    ///   not started) rather than silently falling back to the default.
+    ///   not started) rather than silently falling back to the default. A
+    ///   valid explicit value is operator-trusted and is not otherwise
+    ///   capped.
     /// - `GITFORGE_RECONCILE_RECEIPT`: destination for the JSON receipt.
     ///   Removal requires it: deletion is only permitted when an existing
     ///   valid receipt path is configured (absolute, `.json`, real parent
@@ -1764,7 +1768,9 @@ fn load_reconciler_config_from_env() -> std::result::Result<ReconcilerLoopConfig
 /// Resolve and validate the reconciler configuration from raw env values
 /// (`None` = unset). Validation is fail-closed: a malformed value aborts
 /// startup of the reconciler loop instead of silently falling back to a
-/// default. Deletion additionally requires a receipt destination, so every
+/// default for `GITFORGE_RECONCILE_MAX_REMOVALS` and the receipt path. The
+/// existing lenient fallback behavior for grace and interval values is
+/// unchanged. Deletion additionally requires a receipt destination, so every
 /// removal pass is auditable.
 fn load_reconciler_config(
     delete: Option<String>,
@@ -1988,11 +1994,41 @@ mod receipt_tests {
 
     #[test]
     fn receipt_path_requires_existing_real_parent() {
-        let path = format!(
-            "/nas/Temp/work/reconciler-receipt-test-{}/receipt.json",
-            std::process::id()
-        );
-        assert!(validate_reconciler_receipt_path(&path).is_err());
+        let dir = tempfile::tempdir().expect("tempdir must succeed");
+        let path = dir.path().join("missing-parent").join("receipt.json");
+        let path = path.to_str().expect("utf-8 tempdir path");
+        assert!(validate_reconciler_receipt_path(path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_path_rejects_symlinked_parent() {
+        let dir = tempfile::tempdir().expect("tempdir must succeed");
+        // Canonicalize so a symlinked temp root cannot satisfy the parent
+        // check before the symlinked parent itself is examined.
+        let root = dir.path().canonicalize().expect("tempdir must canonicalize");
+        let real = root.join("real");
+        std::fs::create_dir(&real).expect("real parent must be creatable");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink must be creatable");
+        let path = link.join("receipt.json");
+        let error = validate_reconciler_receipt_path(path.to_str().expect("utf-8 tempdir path"))
+            .expect_err("symlinked parent must be rejected");
+        assert!(error.contains("real directory"), "got: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_path_rejects_symlinked_destination() {
+        let dir = tempfile::tempdir().expect("tempdir must succeed");
+        let root = dir.path().canonicalize().expect("tempdir must canonicalize");
+        let target = root.join("elsewhere.json");
+        std::fs::write(&target, "{}\n").expect("symlink target must be creatable");
+        let link = root.join("receipt.json");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink must be creatable");
+        let error = validate_reconciler_receipt_path(link.to_str().expect("utf-8 tempdir path"))
+            .expect_err("symlinked destination must be rejected");
+        assert!(error.contains("symlink"), "got: {error}");
     }
 }
 
@@ -2129,7 +2165,6 @@ mod reconciler_loop_tests {
 #[cfg(test)]
 mod reconciler_env_config_tests {
     use super::{load_reconciler_config, ReconcilerPolicy};
-    use std::path::PathBuf;
 
     fn config(
         delete: Option<&str>,
@@ -2157,7 +2192,7 @@ mod reconciler_env_config_tests {
 
     #[test]
     fn explicit_max_removals_is_honored() {
-        let config = config(Some("1"), Some("1"), None).expect("explicit cap must resolve");
+        let config = config(None, Some("1"), None).expect("explicit cap must resolve");
         assert_eq!(config.policy.max_removals, 1);
     }
 
