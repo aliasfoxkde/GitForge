@@ -1605,7 +1605,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_stub_network_disabled() {
-        // Note: stub_for_tests() ignores limits, but we verify the sandbox can be created
+        // Limits are validated in `resource_host_config` before the stub
+        // branch, so this exercises the same validation the real Docker
+        // path performs; the stub itself applies nothing to a container.
         let sandbox = DockerSandbox::stub_for_tests();
         let job_id = JobId::new();
 
