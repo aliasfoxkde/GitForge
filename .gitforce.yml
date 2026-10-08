@@ -38,14 +38,14 @@ trigger_on:
 environment: {}
 jobs:
   - name: fmt
-    image: dsc-ci-rust:7
+    image: dsc-ci-rust:8
     steps:
       - name: Check formatting
         run: cargo fmt --all -- --check
     timeout: 15m
 
   - name: clippy
-    image: dsc-ci-rust:7
+    image: dsc-ci-rust:8
     needs: [fmt]
     steps:
       - name: Strict lint (zero warnings)
@@ -53,7 +53,7 @@ jobs:
     timeout: 60m
 
   - name: test
-    image: dsc-ci-rust:7
+    image: dsc-ci-rust:8
     needs: [clippy]
     steps:
       - name: Workspace test suite
@@ -80,7 +80,7 @@ jobs:
     timeout: 90m
 
   - name: coverage
-    image: dsc-ci-rust:7
+    image: dsc-ci-rust:8
     needs: [test]
     steps:
       - name: Line coverage gate (fail 82, warn 84)
