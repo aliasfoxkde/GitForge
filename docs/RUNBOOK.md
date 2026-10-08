@@ -165,6 +165,7 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 | `GITFORGE_SCHEDULER_TOKEN` | No | _(none)_ | Bearer token for scheduler API authentication |
 | `GITFORGE_REGISTER_ATTEMPTS` | No | `6` | Registration attempts before giving up when the scheduler is unreachable |
 | `GITFORGE_REGISTER_BACKOFF_SECS` | No | `1` | Initial registration retry delay; doubles per attempt up to 30s |
+| `GITFORGE_RECONCILE_MAX_REMOVALS` | No | `64` | Per-pass removal cap for the abandoned-container reconciler (canary rollout). Unset keeps the policy default; explicit values must be positive integers — zero or malformed values fail the reconciler closed (the loop is not started) rather than falling back to the default |
 
 > **Startup behavior**: If `GITFORGE_SCHEDULER_URL` is missing or empty, the runner exits immediately
 > with a clear error message. Invalid values for numeric variables (non-integer) also cause a fast
@@ -179,6 +180,25 @@ running runner (for example, `remote-podman-runner-01`); leaving the default
 Historical stale rows are retained for audit and can be retired through the
 authenticated runner-retirement operation after confirming that they own no
 active jobs.
+
+### Abandoned-container reconciler
+
+The runner runs a background reconciler for containers abandoned by lost
+runner attempts. It is **census-only by default**; deletion stays disabled
+until it is explicitly enabled. Safeguards that cannot be switched off:
+ownership-label matching, correlation against the runner's active-job set,
+a grace period (`GITFORGE_RECONCILE_GRACE_SECS`, default 3600), and a
+per-pass removal cap (`GITFORGE_RECONCILE_MAX_REMOVALS`, default 64) for a
+canary rollout (`=1` removes at most one container per pass).
+
+Enabling removal (`GITFORGE_RECONCILE_DELETE=1`) additionally **requires**
+`GITFORGE_RECONCILE_RECEIPT`: a path to an existing valid receipt
+destination (absolute, `.json`, real existing parent directory). The
+receipt is not optional for deletion — every removal pass writes a JSON
+audit report there, and the reconciler refuses to start if the path is
+missing or invalid. Malformed `GITFORGE_RECONCILE_MAX_REMOVALS` values
+fail the reconciler closed rather than silently falling back to the
+default.
 
 ## Docker Compose
 
