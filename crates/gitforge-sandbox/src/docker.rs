@@ -1,6 +1,6 @@
 //! Docker-based sandbox implementation using bollard
 
-use crate::limits::SandboxLimits;
+use crate::limits::{SandboxLimits, CPU_PERIOD_MICROS};
 use async_trait::async_trait;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
@@ -449,6 +449,57 @@ fn compose_exec_env(has_workspace: bool, env: &[String]) -> Vec<String> {
     exec_env
 }
 
+/// MiB -> Docker memory-field bytes, hardened against overflow: the
+/// `u64` multiplication is checked, and the result must also fit the
+/// API's signed `i64` field. Either failure is a sandbox error rather
+/// than a silent wrap-around or truncation into a bogus (potentially
+/// tiny or negative) cap.
+fn memory_limit_bytes(memory_mb: u64) -> Result<i64> {
+    let bytes = memory_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+        Error::sandbox(format!(
+            "memory_mb {memory_mb} overflows the MiB-to-bytes conversion"
+        ))
+    })?;
+    i64::try_from(bytes).map_err(|_| {
+        Error::sandbox(format!(
+            "memory_mb {memory_mb} exceeds the maximum the Docker memory field can represent"
+        ))
+    })
+}
+
+/// Single `HostConfig` builder shared by `create` and
+/// `create_with_workspace`, so both paths hand Docker identical resource
+/// controls:
+///
+/// - `cpu_period`/`cpu_quota`: fixed 100 ms CFS period; the quota is the
+///   CPU *capacity* derived from `cpu_cores` (fail-closed validation via
+///   `validated_cpu_quota_micros`). `cpu_ms` is a declared budget and
+///   must never become a quota — the old `cpu_ms * 1000` mapping claimed
+///   36,000 cores for the 1-hour default and capped nothing on a real
+///   host.
+/// - `memory`: `memory_mb` converted with overflow checks via
+///   [`memory_limit_bytes`].
+/// - `network_mode`: `"none"` when networking is disabled; unset
+///   (daemon default) otherwise.
+///
+/// The workspace bind is deliberately not set here: the
+/// workspace-mounting caller augments the returned config itself.
+fn resource_host_config(limits: &SandboxLimits) -> Result<HostConfig> {
+    let cpu_quota = limits.validated_cpu_quota_micros()?;
+    let memory = memory_limit_bytes(limits.memory_mb)?;
+    Ok(HostConfig {
+        memory: Some(memory),
+        cpu_period: Some(CPU_PERIOD_MICROS), // 100 ms CFS period
+        cpu_quota: Some(cpu_quota),
+        network_mode: if limits.network {
+            None
+        } else {
+            Some("none".to_string())
+        },
+        ..Default::default()
+    })
+}
+
 #[async_trait]
 impl Sandbox for DockerSandbox {
     async fn create(
@@ -457,6 +508,10 @@ impl Sandbox for DockerSandbox {
         image: &str,
         limits: SandboxLimits,
     ) -> Result<SandboxInstance> {
+        // Shared builder validates the limits and assigns every resource
+        // control before any backend work, so invalid limits fail
+        // identically whether or not a daemon is reachable.
+        let host_config = resource_host_config(&limits)?;
         if let Some(ref docker) = self.docker {
             // Ensure image is available
             self.ensure_image(image).await?;
@@ -468,19 +523,6 @@ impl Sandbox for DockerSandbox {
                 ("com.gitforce.managed".to_owned(), "true".to_owned()),
                 ("com.gitforce.job_id".to_owned(), job_label.clone()),
             ]);
-
-            // Build host config with resource limits
-            let host_config = HostConfig {
-                memory: Some((limits.memory_mb * 1024 * 1024) as i64),
-                cpu_period: Some(100000), // 100ms in microseconds
-                cpu_quota: Some((limits.cpu_ms * 1000) as i64), // Convert ms to microseconds
-                network_mode: if limits.network {
-                    None
-                } else {
-                    Some("none".to_string())
-                },
-                ..Default::default()
-            };
 
             // Create container
             let config = ContainerCreateBody {
@@ -541,6 +583,9 @@ impl Sandbox for DockerSandbox {
             )));
         }
 
+        // Same shared builder as `create`: limits (CPU capacity, memory)
+        // are validated before any daemon interaction.
+        let mut host_config = resource_host_config(&limits)?;
         if let Some(ref docker) = self.docker {
             self.ensure_image(image).await?;
             self.remove_job_containers(job_id).await?;
@@ -550,23 +595,14 @@ impl Sandbox for DockerSandbox {
                 ("com.gitforce.managed".to_owned(), "true".to_owned()),
                 ("com.gitforce.job_id".to_owned(), job_label),
             ]);
-            let host_config = HostConfig {
-                memory: Some((limits.memory_mb * 1024 * 1024) as i64),
-                cpu_period: Some(100000),
-                cpu_quota: Some((limits.cpu_ms * 1000) as i64),
-                network_mode: if limits.network {
-                    None
-                } else {
-                    Some("none".to_string())
-                },
-                // Fedora's rootless container engine enforces SELinux labels on
-                // host mounts. The workspace is intentionally shared by jobs in
-                // one pipeline run, so use a shared relabel. Private `:Z`
-                // relabeling is racy when concurrent jobs mount the same
-                // checkout and can leave one container unable to see files.
-                binds: Some(vec![format!("{}:/workspace:z", workspace_path)]),
-                ..Default::default()
-            };
+            // The shared builder owns the resource controls; only the
+            // workspace-specific bind is layered on here.
+            // Fedora's rootless container engine enforces SELinux labels on
+            // host mounts. The workspace is intentionally shared by jobs in
+            // one pipeline run, so use a shared relabel. Private `:Z`
+            // relabeling is racy when concurrent jobs mount the same
+            // checkout and can leave one container unable to see files.
+            host_config.binds = Some(vec![format!("{}:/workspace:z", workspace_path)]);
             let config = ContainerCreateBody {
                 image: Some(image.to_owned()),
                 cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
@@ -934,6 +970,7 @@ async fn cleanup_workspace(docker: &Docker, container_id: &str, workspace: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::MAX_CPU_CORES;
     use gitforge_common::ErrorKind;
     use serial_test::serial;
     use std::sync::Mutex;
@@ -1970,5 +2007,211 @@ mod tests {
             result.is_ok(),
             "stub destroy must not fail even with workspace_path set"
         );
+    }
+
+    // =====================================================================
+    // CPU capacity wiring
+    //
+    // Validation happens inside the shared `resource_host_config` builder,
+    // ahead of the backend branch, so the stub (no daemon) exercises the
+    // exact limits validation the real Docker path performs: `cpu_cores`
+    // of 0 (which would disable the quota, so it is rejected) or above
+    // `MAX_CPU_CORES` fails identically without a daemon, and the quota
+    // sent to Docker is the capacity from `cpu_cores` (see limits.rs
+    // tests for the exact quota/period values).
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_create_rejects_invalid_cpu_capacity_without_docker() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let limits = SandboxLimits {
+            cpu_cores: MAX_CPU_CORES + 1,
+            ..Default::default()
+        };
+        let error = sandbox
+            .create(JobId::new(), "alpine:latest", limits)
+            .await
+            .expect_err("oversized cpu_cores must fail before any backend work");
+        assert_eq!(error.kind, ErrorKind::Sandbox);
+        assert!(
+            error.to_string().contains("cpu_cores"),
+            "error should name the offending field: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_with_workspace_rejects_invalid_cpu_capacity_without_docker() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        // Must pass the workspace-path precheck (existing absolute dir) so
+        // the limits validation is what produces the error.
+        let workspace = std::env::temp_dir().to_string_lossy().to_string();
+        let limits = SandboxLimits {
+            cpu_cores: u32::MAX,
+            ..Default::default()
+        };
+        let error = sandbox
+            .create_with_workspace(JobId::new(), "alpine:latest", limits, Some(&workspace))
+            .await
+            .expect_err("oversized cpu_cores must fail before any backend work");
+        assert_eq!(error.kind, ErrorKind::Sandbox);
+        assert!(
+            error.to_string().contains("cpu_cores"),
+            "error should name the offending field: {error}"
+        );
+    }
+
+    /// Fail closed: `cpu_cores = 0` would create an uncapped container, so
+    /// it is rejected before any backend work — identically with or
+    /// without a daemon.
+    #[tokio::test]
+    async fn test_create_rejects_zero_cpu_capacity_without_docker() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let limits = SandboxLimits {
+            cpu_cores: 0,
+            ..Default::default()
+        };
+        let error = sandbox
+            .create(JobId::new(), "alpine:latest", limits)
+            .await
+            .expect_err("zero cpu_cores must fail closed");
+        assert_eq!(error.kind, ErrorKind::Sandbox);
+        assert!(
+            error.to_string().contains("cpu_cores"),
+            "error should name the offending field: {error}"
+        );
+    }
+
+    /// The maximum boundary is accepted; only 0 and nonsense above
+    /// `MAX_CPU_CORES` are rejected.
+    #[tokio::test]
+    async fn test_create_accepts_max_cpu_capacity_on_stub() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let limits = SandboxLimits {
+            cpu_cores: MAX_CPU_CORES,
+            ..Default::default()
+        };
+        let instance = sandbox
+            .create(JobId::new(), "alpine:latest", limits)
+            .await
+            .expect("max cpu_cores must be accepted");
+        assert!(!instance.container_id.is_empty());
+    }
+
+    // =====================================================================
+    // Shared HostConfig builder
+    //
+    // `create` and `create_with_workspace` must hand Docker identical
+    // resource controls; these tests call `resource_host_config` directly
+    // and pin the exact values it wires.
+    // =====================================================================
+
+    #[test]
+    fn host_config_builder_sets_cpu_period_quota_memory_and_network() {
+        let limits = SandboxLimits {
+            cpu_cores: 4,
+            memory_mb: 512,
+            network: false,
+            ..Default::default()
+        };
+        let host_config = resource_host_config(&limits).expect("valid limits");
+        assert_eq!(host_config.cpu_period, Some(CPU_PERIOD_MICROS));
+        assert_eq!(host_config.cpu_quota, Some(400_000)); // 4 cores x 100ms period
+        assert_eq!(host_config.memory, Some(512 * 1024 * 1024));
+        assert_eq!(host_config.network_mode.as_deref(), Some("none"));
+
+        // Network-enabled limits leave the mode unset (daemon default).
+        let open = resource_host_config(&SandboxLimits {
+            network: true,
+            ..Default::default()
+        })
+        .expect("valid limits");
+        assert_eq!(open.network_mode, None);
+    }
+
+    /// The quota depends only on `cpu_cores`: `cpu_ms` is a declared
+    /// (unenforced) budget and must not influence the CFS quota.
+    #[test]
+    fn host_config_builder_quota_ignores_cpu_ms_budget() {
+        let base = SandboxLimits {
+            cpu_cores: 2,
+            ..Default::default()
+        };
+        let inflated = SandboxLimits {
+            cpu_ms: base.cpu_ms * 1000,
+            ..base.clone()
+        };
+        let base_config = resource_host_config(&base).unwrap();
+        let inflated_config = resource_host_config(&inflated).unwrap();
+        assert_eq!(base_config.cpu_quota, inflated_config.cpu_quota);
+        assert_eq!(base_config.cpu_quota, Some(200_000));
+        assert_eq!(base_config.cpu_period, Some(CPU_PERIOD_MICROS));
+    }
+
+    /// The shared builder sets no workspace bind: the workspace-mounting
+    /// caller augments the returned config itself.
+    #[test]
+    fn host_config_builder_leaves_binds_unset_for_caller() {
+        let host_config = resource_host_config(&SandboxLimits::default()).unwrap();
+        assert_eq!(host_config.binds, None);
+    }
+
+    // =====================================================================
+    // Memory conversion hardening
+    // =====================================================================
+
+    /// The largest MiB value whose byte conversion still fits Docker's
+    /// signed memory field is accepted with the exact byte count.
+    #[test]
+    fn memory_limit_bytes_accepts_exact_i64_boundary() {
+        let mb = i64::MAX as u64 / (1024 * 1024);
+        assert_eq!(
+            memory_limit_bytes(mb).expect("boundary MiB must convert"),
+            9_223_372_036_853_727_232 // i64::MAX rounded down to a whole MiB
+        );
+    }
+
+    /// One MiB past that boundary no longer fits the `i64` field: hard
+    /// sandbox error instead of a truncated or wrapped cap.
+    #[test]
+    fn memory_limit_bytes_rejects_mb_past_i64_boundary() {
+        let mb = i64::MAX as u64 / (1024 * 1024) + 1;
+        let error = memory_limit_bytes(mb).expect_err("past-boundary MiB must fail");
+        assert_eq!(error.kind, ErrorKind::Sandbox);
+        assert!(
+            error.to_string().contains("memory_mb"),
+            "error should name the offending field: {error}"
+        );
+    }
+
+    /// `u64::MAX` MiB cannot even be multiplied to bytes: the checked
+    /// multiplication fails closed rather than wrapping around.
+    #[test]
+    fn memory_limit_bytes_rejects_mib_multiplication_overflow() {
+        let error = memory_limit_bytes(u64::MAX).expect_err("MiB overflow must fail");
+        assert_eq!(error.kind, ErrorKind::Sandbox);
+        assert!(
+            error.to_string().contains("memory_mb"),
+            "error should name the offending field: {error}"
+        );
+    }
+
+    /// The shared builder propagates both memory failures, so either
+    /// creation path rejects a bogus cap before any daemon interaction.
+    #[test]
+    fn host_config_builder_rejects_overflowing_memory_mb() {
+        let boundary_mb = i64::MAX as u64 / (1024 * 1024);
+        for mb in [boundary_mb + 1, u64::MAX] {
+            let limits = SandboxLimits {
+                memory_mb: mb,
+                ..Default::default()
+            };
+            let error =
+                resource_host_config(&limits).expect_err("overflowing memory_mb must fail closed");
+            assert_eq!(error.kind, ErrorKind::Sandbox);
+            assert!(
+                error.to_string().contains("memory_mb"),
+                "error should name the offending field: {error}"
+            );
+        }
     }
 }
