@@ -4,7 +4,7 @@
 
 use axum::Router;
 use axum::{
-    extract::{Extension, Request},
+    extract::{Extension, Path, Request},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -38,6 +38,7 @@ use tower_http::trace::TraceLayer;
 
 type PipelineCache = HashMap<gitforge_common::RepoId, PipelineDefinition>;
 type PipelineRegistry = HashMap<gitforge_common::PipelineRunId, Arc<CiEngine>>;
+type TriggerWorkspacePaths = HashMap<uuid::Uuid, Option<String>>;
 
 /// Paths of the pipeline definition inside a repository checkout, in
 /// resolution order. `.gitforge.yml` is the product spelling; the
@@ -54,12 +55,365 @@ const JOB_TIMEOUT_SWEEP_SECS: u64 = 60;
 
 struct TriggerState {
     event_bus: Arc<dyn EventBus>,
-    workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    workspace_paths: Arc<std::sync::Mutex<TriggerWorkspacePaths>>,
     run_waiters: Arc<
         std::sync::Mutex<
             HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
         >,
     >,
+    tracker: Arc<TriggerTracker>,
+}
+
+/// A failed event-bus publish is a terminal trigger outcome. Record that
+/// outcome and release the correlation waiter before returning a non-2xx
+/// response, so clients never observe a permanently queued trigger that was
+/// not delivered to the consumer.
+async fn record_trigger_publish_failure(
+    trigger_state: &TriggerState,
+    event_id: uuid::Uuid,
+    error: &str,
+) {
+    trigger_state.tracker.record_failed(event_id, error).await;
+    trigger_state
+        .workspace_paths
+        .lock()
+        .expect("workspace cache lock poisoned")
+        .remove(&event_id);
+    trigger_state
+        .run_waiters
+        .lock()
+        .expect("run waiter lock poisoned")
+        .remove(&event_id);
+}
+
+fn take_trigger_workspace(
+    workspace_paths: &std::sync::Mutex<TriggerWorkspacePaths>,
+    event_id: uuid::Uuid,
+) -> Option<String> {
+    workspace_paths
+        .lock()
+        .expect("workspace cache lock poisoned")
+        .remove(&event_id)
+        .flatten()
+}
+
+/// Event type namespace reserved for CI trigger status rows in the existing
+/// `events` table. The trigger event itself is still published through the
+/// in-memory event bus; this journal is best-effort status correlation, not a
+/// durable event outbox.
+const CI_TRIGGER_STATUS_EVENT_TYPE: &str = "ci_trigger";
+
+/// How many recent journal rows a status lookup scans. Status reads serve
+/// callers that triggered a run moments earlier, so the newest slice of the
+/// journal is the relevant one; unbounded scans would grow with history.
+const CI_TRIGGER_STATUS_SCAN_LIMIT: i64 = 500;
+
+/// In-memory outcome cache bound. One entry per accepted trigger; the oldest
+/// entry is evicted once the cache exceeds this size. Durable mode keeps the
+/// full history in the journal, so eviction only moves a lookup to SQLite.
+const TRIGGER_OUTCOME_CACHE_LIMIT: usize = 1024;
+
+/// Lifecycle of an accepted trigger request, from the durable-correlation
+/// contract's point of view. `accepted` means a pipeline run was created for
+/// the trigger (the same word the trigger POST response uses when the run id
+/// was correlated within the request window); `failed` is terminal and means
+/// the event consumer could not create a run at all. Run progress after
+/// creation is run-status territory, not trigger-status territory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerStatus {
+    Queued,
+    Accepted,
+    Failed,
+}
+
+impl TriggerStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            TriggerStatus::Queued => "queued",
+            TriggerStatus::Accepted => "accepted",
+            TriggerStatus::Failed => "failed",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(TriggerStatus::Queued),
+            "accepted" => Some(TriggerStatus::Accepted),
+            "failed" => Some(TriggerStatus::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// The safe orchestration view of one trigger request: the fields a caller
+/// needs to correlate a 202 `queued` answer with the pipeline run that the
+/// durable queue eventually creates, or to stop waiting on a terminal
+/// failure. No request payload content is echoed back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TriggerStatusRecord {
+    trigger_id: uuid::Uuid,
+    status: TriggerStatus,
+    pipeline_run_id: Option<uuid::Uuid>,
+    error: Option<String>,
+}
+
+/// Journal row shape for `ci_trigger` events. `repo_id` and `new_hash` are
+/// recorded for operator forensics only; the status endpoint never echoes
+/// them.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct TriggerStatusPayload {
+    trigger_id: uuid::Uuid,
+    status: String,
+    #[serde(default)]
+    pipeline_run_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    repo_id: Option<String>,
+    #[serde(default)]
+    new_hash: Option<String>,
+}
+
+/// Trigger status correlation for accepted trigger requests.
+///
+/// The trigger POST answers `queued` when the correlation window elapses
+/// before the event consumer creates the run; the run id then exists only in
+/// the consumer's context and the caller has no way to learn it. The tracker
+/// closes that gap with two stores: an in-process cache for the live path and
+/// — when the scheduler runs with `GITFORGE_DATABASE_URL` and journal writes
+/// succeed — an append-only journal in the existing `events` table
+/// (`EventQueries` has no update path, so each transition appends a row and
+/// the newest row per trigger is the current status). This can preserve
+/// status correlation across restarts; it does not make event publication
+/// or processing durable. Without a database, only the process cache exists.
+struct TriggerTracker {
+    outcomes: std::sync::Mutex<HashMap<uuid::Uuid, (chrono::DateTime<Utc>, TriggerStatusRecord)>>,
+    pending_ids: std::sync::Mutex<HashSet<uuid::Uuid>>,
+    db: Option<gitforge_db::Pool>,
+}
+
+impl TriggerTracker {
+    fn new(db: Option<gitforge_db::Pool>) -> Self {
+        Self {
+            outcomes: std::sync::Mutex::new(HashMap::new()),
+            pending_ids: std::sync::Mutex::new(HashSet::new()),
+            db,
+        }
+    }
+
+    /// Whether this event id was registered by the trigger HTTP boundary and
+    /// is still awaiting consumer handling. Ordinary webhook pushes share the
+    /// same event type but must not create trigger-status journal entries.
+    fn is_pending(&self, trigger_id: uuid::Uuid) -> bool {
+        self.pending_ids
+            .lock()
+            .expect("pending trigger id lock poisoned")
+            .contains(&trigger_id)
+    }
+
+    /// Record that a trigger was accepted and is waiting for its run.
+    async fn record_queued(
+        &self,
+        trigger_id: uuid::Uuid,
+        repo_id: gitforge_common::RepoId,
+        new_hash: &str,
+    ) {
+        self.pending_ids
+            .lock()
+            .expect("pending trigger id lock poisoned")
+            .insert(trigger_id);
+        self.cache_insert(TriggerStatusRecord {
+            trigger_id,
+            status: TriggerStatus::Queued,
+            pipeline_run_id: None,
+            error: None,
+        });
+        self.append_journal(TriggerStatusPayload {
+            trigger_id,
+            status: TriggerStatus::Queued.as_str().to_string(),
+            pipeline_run_id: None,
+            error: None,
+            repo_id: Some(repo_id.to_string()),
+            new_hash: Some(new_hash.to_string()),
+        })
+        .await;
+    }
+
+    /// Record that the consumer created the pipeline run for a trigger.
+    async fn record_run_assigned(
+        &self,
+        trigger_id: uuid::Uuid,
+        pipeline_run_id: gitforge_common::PipelineRunId,
+    ) {
+        self.pending_ids
+            .lock()
+            .expect("pending trigger id lock poisoned")
+            .remove(&trigger_id);
+        self.cache_insert(TriggerStatusRecord {
+            trigger_id,
+            status: TriggerStatus::Accepted,
+            pipeline_run_id: Some(pipeline_run_id.0),
+            error: None,
+        });
+        self.append_journal(TriggerStatusPayload {
+            trigger_id,
+            status: TriggerStatus::Accepted.as_str().to_string(),
+            pipeline_run_id: Some(pipeline_run_id.0),
+            error: None,
+            repo_id: None,
+            new_hash: None,
+        })
+        .await;
+    }
+
+    /// Record that the consumer could not create a run for a trigger. This is
+    /// the terminal state a polling caller must observe instead of timing out
+    /// against a run that will never exist.
+    async fn record_failed(&self, trigger_id: uuid::Uuid, error: &str) {
+        self.pending_ids
+            .lock()
+            .expect("pending trigger id lock poisoned")
+            .remove(&trigger_id);
+        self.cache_insert(TriggerStatusRecord {
+            trigger_id,
+            status: TriggerStatus::Failed,
+            pipeline_run_id: None,
+            error: Some(error.to_string()),
+        });
+        self.append_journal(TriggerStatusPayload {
+            trigger_id,
+            status: TriggerStatus::Failed.as_str().to_string(),
+            pipeline_run_id: None,
+            error: Some(error.to_string()),
+            repo_id: None,
+            new_hash: None,
+        })
+        .await;
+    }
+
+    /// Current status of a trigger, cache first, journal second. A successful
+    /// journal write can preserve the answer across a service restart.
+    async fn status_of(&self, trigger_id: uuid::Uuid) -> Option<TriggerStatusRecord> {
+        if let Some((_, record)) = self
+            .outcomes
+            .lock()
+            .expect("trigger outcome cache lock poisoned")
+            .get(&trigger_id)
+        {
+            return Some(record.clone());
+        }
+        let pool = self.db.as_ref()?;
+        let events = match gitforge_db::queries::EventQueries::list_by_type(
+            pool,
+            CI_TRIGGER_STATUS_EVENT_TYPE,
+            CI_TRIGGER_STATUS_SCAN_LIMIT,
+        )
+        .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::warn!(
+                    %trigger_id,
+                    %error,
+                    "trigger status journal read failed"
+                );
+                return None;
+            }
+        };
+        latest_trigger_record(&events, trigger_id)
+    }
+
+    fn cache_insert(&self, record: TriggerStatusRecord) {
+        let mut outcomes = self
+            .outcomes
+            .lock()
+            .expect("trigger outcome cache lock poisoned");
+        let now = Utc::now();
+        if outcomes.len() >= TRIGGER_OUTCOME_CACHE_LIMIT {
+            if let Some(oldest) = outcomes
+                .iter()
+                .min_by_key(|(_, (recorded_at, _))| *recorded_at)
+                .map(|(trigger_id, _)| *trigger_id)
+            {
+                outcomes.remove(&oldest);
+            }
+        }
+        outcomes.insert(record.trigger_id, (now, record));
+    }
+
+    /// Append one status transition to the durable journal. Journal failures
+    /// degrade correlation to the in-process cache but must never fail the
+    /// trigger itself: an accepted build is not rejected because its receipt
+    /// could not be filed.
+    async fn append_journal(&self, payload: TriggerStatusPayload) {
+        let Some(pool) = self.db.as_ref() else {
+            return;
+        };
+        let payload_json = match serde_json::to_value(&payload) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "trigger status payload serialization failed");
+                return;
+            }
+        };
+        let event =
+            gitforge_db::models::Event::new(CI_TRIGGER_STATUS_EVENT_TYPE.to_string(), payload_json);
+        if let Err(error) = gitforge_db::queries::EventQueries::create(pool, &event).await {
+            tracing::warn!(
+                trigger_id = %payload_trigger_id(&event),
+                %error,
+                "trigger status journal write failed"
+            );
+        }
+    }
+}
+
+/// Recover the trigger id from a journal row's payload for diagnostics.
+fn payload_trigger_id(event: &gitforge_db::models::Event) -> String {
+    event
+        .payload
+        .get("trigger_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Newest journal row for a trigger, given rows ordered newest-first (the
+/// `EventQueries::list_by_type` order). Rows for other triggers and rows with
+/// an unparseable status are skipped.
+fn latest_trigger_record(
+    events: &[gitforge_db::models::Event],
+    trigger_id: uuid::Uuid,
+) -> Option<TriggerStatusRecord> {
+    events.iter().find_map(|event| {
+        let payload: TriggerStatusPayload = match serde_json::from_value(event.payload.clone()) {
+            Ok(payload) => payload,
+            Err(_) => return None,
+        };
+        if payload.trigger_id != trigger_id {
+            return None;
+        }
+        let status = TriggerStatus::parse(&payload.status)?;
+        Some(TriggerStatusRecord {
+            trigger_id: payload.trigger_id,
+            status,
+            pipeline_run_id: payload.pipeline_run_id,
+            error: payload.error,
+        })
+    })
+}
+
+/// Whether an envelope is a real CI trigger event. Deletion sentinels and
+/// foreign payloads never carry a trigger correlation record: the HTTP
+/// boundary rejects zero-hash triggers before publishing, and only
+/// PushReceived payloads originate from the trigger endpoint.
+fn is_ci_trigger_event(event: &EventEnvelope, tracker: &TriggerTracker) -> bool {
+    matches!(
+        &event.payload,
+        EventPayload::PushReceived(payload)
+            if !gitforge_common::is_zero_hash(&payload.new_hash)
+                && tracker.is_pending(event.event_id)
+    )
 }
 
 #[tokio::main]
@@ -125,10 +479,12 @@ async fn main() -> anyhow::Result<()> {
     let workspace_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let run_workspace_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let run_waiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let trigger_tracker = Arc::new(TriggerTracker::new(scheduler_db.clone()));
     let trigger_state = Arc::new(TriggerState {
         event_bus: event_bus.clone(),
         workspace_paths: workspace_paths.clone(),
         run_waiters: run_waiters.clone(),
+        tracker: trigger_tracker.clone(),
     });
 
     let scheduler_app = Router::new()
@@ -136,6 +492,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/pipelines/trigger",
             axum::routing::post(trigger_pipeline).layer(middleware::from_fn(require_trigger_auth)),
+        )
+        .route(
+            "/pipelines/trigger/{event_id}",
+            axum::routing::get(get_trigger_status).layer(middleware::from_fn(require_trigger_auth)),
         )
         .merge(scheduler_routes(scheduler_state))
         .layer(Extension(trigger_state))
@@ -165,6 +525,7 @@ async fn main() -> anyhow::Result<()> {
     let workspace_paths_clone = workspace_paths.clone();
     let run_workspace_paths_clone = run_workspace_paths.clone();
     let run_waiters_clone = run_waiters.clone();
+    let consumer_tracker = trigger_tracker.clone();
     let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let pipeline_registry_clone = pipeline_registry.clone();
@@ -228,6 +589,7 @@ async fn main() -> anyhow::Result<()> {
             run_workspace_paths_clone,
             pipeline_registry_clone,
             run_waiters_clone,
+            consumer_tracker,
             shutdown_consumer,
         )
         .await
@@ -411,21 +773,28 @@ struct PipelineTriggerRequest {
     old_hash: String,
     new_hash: String,
     working_dir: Option<String>,
+    #[serde(default)]
+    selected_pipeline_id: Option<String>,
 }
 
 /// Trigger a pipeline through the same typed push-event path used by Git
 /// webhooks. This endpoint is internal control-plane automation and requires
 /// a dedicated trigger token, falling back to the scheduler operator/shared
 /// token during migration.
-fn configured_trigger_token(get_var: impl Fn(&str) -> Option<String>) -> Option<String> {
+fn configured_trigger_tokens(get_var: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    // Prefer the credential actually provisioned to the CI workflow. Accept
+    // only one configured credential so rotating a dedicated token revokes
+    // it immediately instead of leaving older shared operator secrets valid.
     [
-        "GITFORGE_TRIGGER_TOKEN",
         "GITFORGE_CI_TRIGGER_TOKEN",
+        "GITFORGE_TRIGGER_TOKEN",
         "GITFORGE_SCHEDULER_OPERATOR_TOKEN",
         "GITFORGE_SCHEDULER_TOKEN",
     ]
     .into_iter()
     .find_map(|name| get_var(name).filter(|token| !token.is_empty()))
+    .into_iter()
+    .collect()
 }
 
 /// Compare trigger credentials without leaking the first differing byte or
@@ -450,27 +819,96 @@ fn trigger_token_matches(expected: &str, supplied: Option<&str>) -> bool {
 }
 
 async fn require_trigger_auth(request: Request, next: Next) -> Response {
-    let expected = configured_trigger_token(|name| std::env::var(name).ok());
-    let Some(expected) = expected else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "trigger_auth_not_configured"})),
-        )
-            .into_response();
-    };
+    let expected = configured_trigger_tokens(|name| std::env::var(name).ok());
     let supplied = request
         .headers()
         .get("x-gitforge-trigger-token")
         .or_else(|| request.headers().get(header::AUTHORIZATION))
         .and_then(|value| value.to_str().ok());
-    if trigger_token_matches(&expected, supplied) {
-        next.run(request).await
+    match trigger_auth_verdict(expected, supplied) {
+        Ok(()) => next.run(request).await,
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TriggerAuthRejection {
+    status: StatusCode,
+    code: &'static str,
+}
+
+impl IntoResponse for TriggerAuthRejection {
+    fn into_response(self) -> Response {
+        (self.status, Json(serde_json::json!({"error": self.code}))).into_response()
+    }
+}
+
+/// Pure auth verdict for the trigger control plane, split out of the
+/// middleware so the credential rules are testable without process-global
+/// environment mutation. The small error value is converted to an HTTP
+/// response only at the middleware boundary.
+fn trigger_auth_verdict(
+    expected: Vec<String>,
+    supplied: Option<&str>,
+) -> Result<(), TriggerAuthRejection> {
+    if expected.is_empty() {
+        return Err(TriggerAuthRejection {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "trigger_auth_not_configured",
+        });
+    }
+    if expected
+        .iter()
+        .any(|token| trigger_token_matches(token, supplied))
+    {
+        Ok(())
     } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "trigger_auth_required"})),
+        Err(TriggerAuthRejection {
+            status: StatusCode::UNAUTHORIZED,
+            code: "trigger_auth_required",
+        })
+    }
+}
+
+/// Read-only trigger correlation status. Callers that received a 202
+/// `queued` answer poll this endpoint by the returned `event_id` until the
+/// event consumer creates the pipeline run (`accepted` plus
+/// `pipeline_run_id`) or the trigger reaches a terminal `failed`. Same
+/// control-plane authentication as the trigger POST. The CI trigger token is
+/// preferred; legacy aliases are used only when newer names are absent.
+async fn get_trigger_status(
+    Extension(trigger_state): Extension<Arc<TriggerState>>,
+    Path(event_id): Path<String>,
+) -> Response {
+    let Ok(trigger_id) = uuid::Uuid::parse_str(&event_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_event_id",
+                "message": "event_id must be a UUID"
+            })),
         )
-            .into_response()
+            .into_response();
+    };
+    match trigger_state.tracker.status_of(trigger_id).await {
+        Some(record) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": record.trigger_id.to_string(),
+                "status": record.status.as_str(),
+                "pipeline_run_id": record.pipeline_run_id.map(|id| id.to_string()),
+                "error": record.error,
+            })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "trigger_not_found",
+                "message": "no status record exists for this trigger event id"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -502,6 +940,22 @@ async fn trigger_pipeline(
         }
     };
 
+    let selected_pipeline_id = match request.selected_pipeline_id {
+        Some(id) => match uuid::Uuid::parse_str(&id) {
+            Ok(id) => Some(gitforge_common::PipelineId::from(id)),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_pipeline_id",
+                        "message": "selected_pipeline_id must be a UUID"
+                    })),
+                )
+            }
+        },
+        None => None,
+    };
+
     let working_dir = match request.working_dir {
         Some(path) => match validate_workspace_path(&path) {
             Ok(path) => Some(path),
@@ -518,13 +972,7 @@ async fn trigger_pipeline(
         None => None,
     };
 
-    trigger_state
-        .workspace_paths
-        .lock()
-        .expect("workspace cache lock poisoned")
-        .insert(repo_id, working_dir);
-
-    let event = EventEnvelope::new(
+    let mut event = EventEnvelope::new(
         EventType::PushReceived,
         EventPayload::PushReceived(PushReceivedPayload {
             repo_id,
@@ -536,6 +984,23 @@ async fn trigger_pipeline(
         Some(repo_id),
         None,
     );
+    if let Some(pipeline_id) = selected_pipeline_id {
+        event = event.with_selected_pipeline(pipeline_id);
+    }
+    trigger_state
+        .workspace_paths
+        .lock()
+        .expect("workspace cache lock poisoned")
+        .insert(event.event_id, working_dir);
+
+    // File the durable correlation record before the event is published, so
+    // the moment a caller holds an event_id a status read can find it. A
+    // journal write failure only degrades correlation to the in-process
+    // cache; it must not fail an accepted build.
+    trigger_state
+        .tracker
+        .record_queued(event.event_id, repo_id, &request.new_hash)
+        .await;
 
     let (run_tx, run_rx) = tokio::sync::oneshot::channel();
     trigger_state
@@ -579,13 +1044,17 @@ async fn trigger_pipeline(
                 })),
             )
         }
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "event_publish_failed",
-                "message": error.to_string(),
-            })),
-        ),
+        Err(error) => {
+            record_trigger_publish_failure(&trigger_state, event.event_id, &error.to_string())
+                .await;
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "event_publish_failed",
+                    "message": error.to_string(),
+                })),
+            )
+        }
     }
 }
 
@@ -1550,7 +2019,7 @@ async fn run_event_consumer(
     scheduler: Arc<Scheduler>,
     pipeline_cache: Arc<std::sync::Mutex<PipelineCache>>,
     scheduler_db: Option<gitforge_db::Pool>,
-    workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    workspace_paths: Arc<std::sync::Mutex<TriggerWorkspacePaths>>,
     run_workspace_paths: Arc<
         std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
     >,
@@ -1560,6 +2029,7 @@ async fn run_event_consumer(
             HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
         >,
     >,
+    trigger_tracker: Arc<TriggerTracker>,
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     tracing::info!("starting event consumer loop");
@@ -1586,11 +2056,24 @@ async fn run_event_consumer(
                         tracing::debug!("received event: {:?}", event.event_type);
                         match handle_push_event(&event, &scheduler, &pipeline_cache, scheduler_db.as_ref(), &workspace_paths, &run_workspace_paths, &pipeline_registry).await {
                             Ok(run_id) => {
+                                // The outcome is recorded before the waiter is
+                                // released so a trigger response and a status
+                                // read can never disagree about the transition.
+                                if is_ci_trigger_event(&event, &trigger_tracker) {
+                                    trigger_tracker
+                                        .record_run_assigned(event.event_id, run_id)
+                                        .await;
+                                }
                                 if let Some(waiter) = run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id) {
                                     let _ = waiter.send(run_id);
                                 }
                             }
                             Err(e) => {
+                                if is_ci_trigger_event(&event, &trigger_tracker) {
+                                    trigger_tracker
+                                        .record_failed(event.event_id, &e.to_string())
+                                        .await;
+                                }
                                 run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id);
                                 tracing::error!("failed to handle push event: {}", e);
                             }
@@ -1614,12 +2097,16 @@ async fn handle_push_event(
     scheduler: &Arc<Scheduler>,
     pipeline_cache: &Arc<std::sync::Mutex<PipelineCache>>,
     scheduler_db: Option<&gitforge_db::Pool>,
-    workspace_paths: &Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    workspace_paths: &Arc<std::sync::Mutex<TriggerWorkspacePaths>>,
     run_workspace_paths: &Arc<
         std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
     >,
     pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
 ) -> anyhow::Result<gitforge_common::PipelineRunId> {
+    // Consume the per-event workspace handoff even when the payload is a
+    // deletion or fails later validation; never leave stale request state.
+    let requested_workspace = take_trigger_workspace(workspace_paths, event.event_id);
+
     // Only handle PushReceived events
     let EventPayload::PushReceived(payload) = &event.payload else {
         return Ok(gitforge_common::PipelineRunId::new());
@@ -1650,56 +2137,68 @@ async fn handle_push_event(
         payload.new_hash
     );
 
-    // Get or create the pipeline definition for this repo. The definition
-    // committed at the pushed revision is authoritative: CI configuration is
-    // code, so a push that changes it must govern this and later runs without
-    // a control-plane restart. The in-memory cache and durable rows only
-    // apply when the revision carries no committed definition.
-    let committed_pipeline = match scheduler_db {
-        Some(pool) => match load_pipeline_from_commit(pool, repo_id, &payload.new_hash).await {
-            Ok(pipeline) => pipeline,
-            Err(error) => return Err(error),
-        },
-        None => None,
-    };
-    let pipeline = if let Some(committed) = committed_pipeline {
-        tracing::info!(
-            "using committed pipeline definition at {} for repo {}",
-            payload.new_hash,
-            repo_id
-        );
-        committed
-    } else {
-        let cached_pipeline = { pipeline_cache.lock().unwrap().get(&repo_id).cloned() };
-        if let Some(cached) = cached_pipeline {
-            cached
-        } else {
-            let persisted = if let Some(pool) = scheduler_db {
-                gitforge_db::queries::PipelineQueries::list_by_repo(pool, repo_id)
-                    .await?
-                    .into_iter()
-                    .find_map(|pipeline| {
-                        serde_json::from_value::<PipelineDefinition>(pipeline.config).ok()
-                    })
-            } else {
-                None
-            };
-            persisted.unwrap_or_else(|| create_default_pipeline(&repo_id.to_string()))
+    // Manual/API triggers carry an explicit active pipeline identity and
+    // must execute that stored definition. Ordinary pushes deliberately do
+    // not carry one: their committed definition remains authoritative, with
+    // the existing cache/database/default fallback only when no file exists.
+    let selected_pipeline_id = event.selected_pipeline_id;
+    let pipeline = if let Some(selected_id) = selected_pipeline_id {
+        let pool = scheduler_db.ok_or_else(|| {
+            anyhow::anyhow!("selected pipeline {selected_id} requires durable pipeline storage")
+        })?;
+        let selected = gitforge_db::queries::PipelineQueries::get_active(pool, selected_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("selected pipeline {selected_id} is not active"))?;
+        if selected.repo_id != repo_id {
+            anyhow::bail!("selected pipeline {selected_id} belongs to a different repository");
         }
+        serde_json::from_value::<PipelineDefinition>(selected.config).map_err(|error| {
+            anyhow::anyhow!(
+                "selected pipeline {selected_id} has an invalid stored definition: {error}"
+            )
+        })?
+    } else {
+        let committed_pipeline = match scheduler_db {
+            Some(pool) => load_pipeline_from_commit(pool, repo_id, &payload.new_hash).await?,
+            None => None,
+        };
+        let pipeline = if let Some(committed) = committed_pipeline {
+            tracing::info!(
+                "using committed pipeline definition at {} for repo {}",
+                payload.new_hash,
+                repo_id
+            );
+            committed
+        } else {
+            let cached_pipeline = { pipeline_cache.lock().unwrap().get(&repo_id).cloned() };
+            if let Some(cached) = cached_pipeline {
+                cached
+            } else {
+                let persisted = if let Some(pool) = scheduler_db {
+                    gitforge_db::queries::PipelineQueries::list_by_repo(pool, repo_id)
+                        .await?
+                        .into_iter()
+                        .find_map(|pipeline| {
+                            serde_json::from_value::<PipelineDefinition>(pipeline.config).ok()
+                        })
+                } else {
+                    None
+                };
+                persisted.unwrap_or_else(|| create_default_pipeline(&repo_id.to_string()))
+            }
+        };
+        pipeline_cache
+            .lock()
+            .unwrap()
+            .insert(repo_id, pipeline.clone());
+        pipeline
     };
-    pipeline_cache
-        .lock()
-        .unwrap()
-        .insert(repo_id, pipeline.clone());
-    let requested_workspace = workspace_paths
-        .lock()
-        .expect("workspace cache lock poisoned")
-        .get(&repo_id)
-        .cloned()
-        .flatten();
-
     // Create trigger event
-    let trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
+    let mut trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
+    if let Some(selected_id) = selected_pipeline_id {
+        trigger_event.pipeline_id = selected_id;
+        trigger_event.trigger_type = TriggerType::Manual;
+    }
     let pipeline_id = trigger_event.pipeline_id;
 
     // Create and start the CI engine
@@ -1718,26 +2217,32 @@ async fn handle_push_event(
 
     let state = engine.state().await;
     if let Some(pool) = scheduler_db {
-        let db_pipeline = DbPipeline {
-            id: pipeline_id,
-            repo_id,
-            name: pipeline.name.clone(),
-            trigger_type: "push".to_string(),
-            config: serde_json::to_value(&pipeline)?,
-            created_at: Utc::now(),
-        };
-        // Only one active pipeline version per (repo, name) is allowed by
-        // idx_pipelines_active_repo_name — retire the predecessor before
-        // recording this push's version, or every push after the first
-        // fails run creation with a constraint violation.
-        gitforge_db::queries::PipelineQueries::deactivate_active(pool, repo_id, &pipeline.name)
-            .await?;
-        gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
+        if selected_pipeline_id.is_none() {
+            let db_pipeline = DbPipeline {
+                id: pipeline_id,
+                repo_id,
+                name: pipeline.name.clone(),
+                trigger_type: "push".to_string(),
+                config: serde_json::to_value(&pipeline)?,
+                created_at: Utc::now(),
+            };
+            // Only one active pipeline version per (repo, name) is allowed by
+            // idx_pipelines_active_repo_name — retire the predecessor before
+            // recording this push's version, or every push after the first
+            // fails run creation with a constraint violation.
+            gitforge_db::queries::PipelineQueries::deactivate_active(pool, repo_id, &pipeline.name)
+                .await?;
+            gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
+        }
 
         let mut db_run = DbPipelineRun::new(
             pipeline_id,
             repo_id,
-            "push".to_string(),
+            if selected_pipeline_id.is_some() {
+                "manual".to_string()
+            } else {
+                "push".to_string()
+            },
             payload.new_hash.clone(),
         );
         db_run.id = state.run_id;
@@ -2425,31 +2930,43 @@ mod tests {
     static WORKSPACE_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
     #[test]
-    fn trigger_token_accepts_git_server_compatibility_name() {
-        let token = configured_trigger_token(|name| {
+    fn trigger_tokens_accept_git_server_compatibility_name() {
+        let tokens = configured_trigger_tokens(|name| {
             (name == "GITFORGE_CI_TRIGGER_TOKEN").then(|| "shared-secret".to_string())
         });
-        assert_eq!(token.as_deref(), Some("shared-secret"));
+        assert_eq!(tokens, vec!["shared-secret".to_string()]);
     }
 
     #[test]
-    fn trigger_token_prefers_dedicated_name_over_compatibility_alias() {
-        let token = configured_trigger_token(|name| match name {
+    fn trigger_tokens_prefer_ci_token_and_ignore_older_aliases() {
+        let tokens = configured_trigger_tokens(|name| match name {
             "GITFORGE_TRIGGER_TOKEN" => Some("dedicated".to_string()),
             "GITFORGE_CI_TRIGGER_TOKEN" => Some("compatibility".to_string()),
+            "GITFORGE_SCHEDULER_OPERATOR_TOKEN" => Some("operator".to_string()),
             _ => None,
         });
-        assert_eq!(token.as_deref(), Some("dedicated"));
+        assert_eq!(tokens, vec!["compatibility".to_string()]);
     }
 
     #[test]
-    fn trigger_token_ignores_empty_values_and_falls_back() {
-        let token = configured_trigger_token(|name| match name {
+    fn trigger_tokens_ignore_empty_values_and_keep_fallbacks() {
+        let tokens = configured_trigger_tokens(|name| match name {
             "GITFORGE_TRIGGER_TOKEN" => Some(String::new()),
             "GITFORGE_CI_TRIGGER_TOKEN" => Some("compatibility".to_string()),
+            "GITFORGE_SCHEDULER_OPERATOR_TOKEN" => Some("operator".to_string()),
             _ => None,
         });
-        assert_eq!(token.as_deref(), Some("compatibility"));
+        assert_eq!(tokens, vec!["compatibility".to_string()]);
+    }
+
+    #[test]
+    fn trigger_tokens_use_legacy_operator_only_without_dedicated_token() {
+        let tokens = configured_trigger_tokens(|name| match name {
+            "GITFORGE_SCHEDULER_OPERATOR_TOKEN" => Some("operator".to_string()),
+            "GITFORGE_SCHEDULER_TOKEN" => Some("scheduler".to_string()),
+            _ => None,
+        });
+        assert_eq!(tokens, vec!["operator".to_string()]);
     }
 
     #[test]
@@ -2462,6 +2979,27 @@ mod tests {
             "shared-secret",
             Some("Bearer shared-secret")
         ));
+    }
+
+    #[test]
+    fn trigger_workspace_paths_are_isolated_by_event_and_consumed_once() {
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let paths = std::sync::Mutex::new(HashMap::from([
+            (first, Some("/work/first".to_string())),
+            (second, Some("/work/second".to_string())),
+        ]));
+
+        assert_eq!(
+            take_trigger_workspace(&paths, first).as_deref(),
+            Some("/work/first")
+        );
+        assert_eq!(take_trigger_workspace(&paths, first), None);
+        assert_eq!(
+            take_trigger_workspace(&paths, second).as_deref(),
+            Some("/work/second")
+        );
+        assert!(paths.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2826,6 +3364,8 @@ mod tests {
                 owner_id: user.id,
                 visibility: "private".to_string(),
                 git_path: "/git/fail-run-test".to_string(),
+                required_checks: Vec::new(),
+                deny_non_fast_forward: false,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             },
@@ -4567,9 +5107,8 @@ jobs:
         let scheduler = Arc::new(Scheduler::new());
         let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let workspace_paths: Arc<
-            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
-        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<std::sync::Mutex<TriggerWorkspacePaths>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let run_workspace_paths = run_workspace_paths_cache();
         let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -4602,5 +5141,483 @@ jobs:
                 .is_empty(),
             "a ref-deletion push must not prepare a run workspace"
         );
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_event_rejects_retired_selected_pipeline() {
+        let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
+        gitforge_db::queries::PipelineQueries::deactivate_active(&pool, repo_id, "sweep-pipeline")
+            .await
+            .unwrap();
+
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "0".repeat(40),
+                new_hash: "1".repeat(40),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        )
+        .with_selected_pipeline(pipeline_id);
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<std::sync::Mutex<TriggerWorkspacePaths>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let error = handle_push_event(
+            &event,
+            &scheduler,
+            &pipeline_cache,
+            Some(&pool),
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        .expect_err("a retired explicit selection must fail closed");
+        assert!(error.to_string().contains("is not active"), "{error:#}");
+        assert!(pipeline_cache.lock().unwrap().is_empty());
+        assert!(gitforge_db::queries::PipelineRunQueries::list(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_event_persists_selected_pipeline_id_on_run() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let (bare, commit) = seed_pipeline_at_paths(&[PIPELINE_CONFIG_PATHS[0]]).await;
+        let (pool, repo_id) = test_pool_with_repository(bare.to_string_lossy().into_owned()).await;
+        let selected_id = gitforge_common::PipelineId::new();
+        let selected_definition = create_default_pipeline("manual-selected");
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &DbPipeline {
+                id: selected_id,
+                repo_id,
+                name: selected_definition.name.clone(),
+                trigger_type: "manual".to_string(),
+                config: serde_json::to_value(&selected_definition).unwrap(),
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-selected-pipeline-workspaces")
+            .join(repo_id.to_string());
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", &workspace_root);
+
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "0".repeat(40),
+                new_hash: commit.clone(),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        )
+        .with_selected_pipeline(selected_id);
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let run_id = handle_push_event(
+            &event,
+            &scheduler,
+            &pipeline_cache,
+            Some(&pool),
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        .expect("an active same-repository pipeline selection should create a run");
+
+        let run = gitforge_db::queries::PipelineRunQueries::get(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("the selected pipeline run should be persisted");
+        assert_eq!(run.pipeline_id, selected_id);
+        assert_eq!(run.triggered_by, "manual");
+        assert_eq!(run.commit_hash, commit);
+
+        tokio::fs::remove_dir_all(workspace_root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_event_rejects_selected_pipeline_from_another_repo() {
+        let (pool, repo_id, _) = sweep_test_pool().await;
+        let repo = gitforge_db::queries::RepoQueries::get(&pool, repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let other_repo = gitforge_db::models::Repository::new(
+            "other-sweep-repo".to_string(),
+            repo.owner_id,
+            "/tmp/other-sweep-repo".to_string(),
+        );
+        gitforge_db::queries::RepoQueries::create(&pool, &other_repo)
+            .await
+            .unwrap();
+        let other_pipeline = gitforge_db::models::Pipeline {
+            id: gitforge_common::PipelineId::new(),
+            repo_id: other_repo.id,
+            name: "other-pipeline".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: Utc::now(),
+        };
+        gitforge_db::queries::PipelineQueries::create(&pool, &other_pipeline)
+            .await
+            .unwrap();
+
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "0".repeat(40),
+                new_hash: "1".repeat(40),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        )
+        .with_selected_pipeline(other_pipeline.id);
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<std::sync::Mutex<TriggerWorkspacePaths>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let error = handle_push_event(
+            &event,
+            &scheduler,
+            &pipeline_cache,
+            Some(&pool),
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        .expect_err("a cross-repository selection must fail closed");
+        assert!(
+            error.to_string().contains("different repository"),
+            "{error:#}"
+        );
+        assert!(pipeline_cache.lock().unwrap().is_empty());
+        assert!(gitforge_db::queries::PipelineRunQueries::list(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // --- trigger correlation status (202 queued -> persisted run handoff) ---
+
+    use gitforge_events::RepoCreatedPayload;
+
+    fn test_trigger_state(tracker: Arc<TriggerTracker>) -> Arc<TriggerState> {
+        Arc::new(TriggerState {
+            event_bus: Arc::new(InMemoryEventBus::new()),
+            workspace_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            run_waiters: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            tracker,
+        })
+    }
+
+    async fn trigger_status_response(
+        state: Arc<TriggerState>,
+        event_id: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = get_trigger_status(Extension(state), Path(event_id.to_string())).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    async fn trigger_test_pool() -> gitforge_db::Pool {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        pool
+    }
+
+    #[test]
+    fn trigger_auth_verdict_unconfigured_returns_503() {
+        let rejection = trigger_auth_verdict(Vec::new(), Some("anything")).unwrap_err();
+        assert_eq!(rejection.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn trigger_auth_verdict_rejects_missing_and_wrong_credentials() {
+        let expected = vec!["secret".to_string()];
+        for supplied in [None, Some("wrong"), Some("Bearer wrong")] {
+            let rejection = trigger_auth_verdict(expected.clone(), supplied).unwrap_err();
+            assert_eq!(rejection.status, StatusCode::UNAUTHORIZED, "{supplied:?}");
+        }
+    }
+
+    #[test]
+    fn trigger_auth_verdict_accepts_raw_and_bearer_credentials() {
+        let expected = vec!["secret".to_string(), "operator".to_string()];
+        assert!(trigger_auth_verdict(expected.clone(), Some("secret")).is_ok());
+        assert!(trigger_auth_verdict(expected.clone(), Some("Bearer secret")).is_ok());
+        assert!(trigger_auth_verdict(expected, Some("Bearer operator")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn trigger_status_correlates_queued_to_accepted_across_restart() {
+        let pool = trigger_test_pool().await;
+        let trigger_id = uuid::Uuid::new_v4();
+        let run_id = gitforge_common::PipelineRunId::new();
+
+        let tracker = Arc::new(TriggerTracker::new(Some(pool.clone())));
+        tracker
+            .record_queued(trigger_id, gitforge_common::RepoId::new(), &"a".repeat(40))
+            .await;
+
+        // Pending: the safe shape behind a 202 queued answer.
+        let (status, body) =
+            trigger_status_response(test_trigger_state(tracker.clone()), &trigger_id.to_string())
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], trigger_id.to_string());
+        assert_eq!(body["status"], "queued");
+        assert!(body["pipeline_run_id"].is_null());
+        assert!(body["error"].is_null());
+
+        // The consumer creates the run and releases the waiter.
+        tracker.record_run_assigned(trigger_id, run_id).await;
+        let (_, body) =
+            trigger_status_response(test_trigger_state(tracker), &trigger_id.to_string()).await;
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["pipeline_run_id"], run_id.to_string());
+
+        // A fresh tracker models a service restart: the in-process cache is
+        // empty and the answer must come from the durable journal.
+        let restarted = Arc::new(TriggerTracker::new(Some(pool)));
+        let (status, body) =
+            trigger_status_response(test_trigger_state(restarted), &trigger_id.to_string()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["pipeline_run_id"], run_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn trigger_status_reports_terminal_failure_durably() {
+        let pool = trigger_test_pool().await;
+        let trigger_id = uuid::Uuid::new_v4();
+
+        let tracker = Arc::new(TriggerTracker::new(Some(pool.clone())));
+        tracker
+            .record_queued(trigger_id, gitforge_common::RepoId::new(), &"b".repeat(40))
+            .await;
+        tracker
+            .record_failed(trigger_id, "invalid .gitforge.yml at head: bad config")
+            .await;
+
+        for tracker in [
+            tracker,
+            // The failure must survive a restart exactly like an acceptance.
+            Arc::new(TriggerTracker::new(Some(pool))),
+        ] {
+            let (status, body) =
+                trigger_status_response(test_trigger_state(tracker), &trigger_id.to_string()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "failed");
+            assert!(body["pipeline_run_id"].is_null());
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invalid .gitforge.yml"),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_failure_marks_trigger_terminal_and_releases_waiter() {
+        let pool = trigger_test_pool().await;
+        let trigger_id = uuid::Uuid::new_v4();
+        let tracker = Arc::new(TriggerTracker::new(Some(pool.clone())));
+        tracker
+            .record_queued(trigger_id, gitforge_common::RepoId::new(), &"d".repeat(40))
+            .await;
+        let state = test_trigger_state(tracker);
+        state
+            .workspace_paths
+            .lock()
+            .unwrap()
+            .insert(trigger_id, Some("/work/unpublished-trigger".to_string()));
+        let (waiter, receiver) = tokio::sync::oneshot::channel();
+        state.run_waiters.lock().unwrap().insert(trigger_id, waiter);
+
+        record_trigger_publish_failure(&state, trigger_id, "event bus unavailable").await;
+
+        assert!(!state.run_waiters.lock().unwrap().contains_key(&trigger_id));
+        assert!(!state
+            .workspace_paths
+            .lock()
+            .unwrap()
+            .contains_key(&trigger_id));
+        assert!(receiver.await.is_err(), "removed waiter sender must close");
+        let (status, body) = trigger_status_response(state, &trigger_id.to_string()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["error"], "event bus unavailable");
+    }
+
+    #[tokio::test]
+    async fn trigger_status_unknown_or_malformed_event_ids_fail_closed() {
+        let pool = trigger_test_pool().await;
+        let state = test_trigger_state(Arc::new(TriggerTracker::new(Some(pool))));
+
+        let (status, body) =
+            trigger_status_response(state.clone(), &uuid::Uuid::new_v4().to_string()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "trigger_not_found");
+
+        let (status, body) = trigger_status_response(state, "not-a-uuid").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_event_id");
+    }
+
+    #[tokio::test]
+    async fn trigger_status_without_database_serves_the_process_cache() {
+        let tracker = Arc::new(TriggerTracker::new(None));
+        let trigger_id = uuid::Uuid::new_v4();
+        let run_id = gitforge_common::PipelineRunId::new();
+
+        tracker
+            .record_queued(trigger_id, gitforge_common::RepoId::new(), &"c".repeat(40))
+            .await;
+        tracker.record_run_assigned(trigger_id, run_id).await;
+
+        let (status, body) =
+            trigger_status_response(test_trigger_state(tracker.clone()), &trigger_id.to_string())
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["pipeline_run_id"], run_id.to_string());
+
+        // No journal backs an unknown id when the database is absent.
+        let (status, _) = trigger_status_response(
+            test_trigger_state(tracker),
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn latest_trigger_record_skips_foreign_and_unparseable_rows() {
+        let trigger_id = uuid::Uuid::new_v4();
+        let run_id = gitforge_common::PipelineRunId::new();
+        let row = |payload: serde_json::Value| {
+            gitforge_db::models::Event::new(CI_TRIGGER_STATUS_EVENT_TYPE.to_string(), payload)
+        };
+
+        // Rows in list_by_type order: newest first.
+        let events = vec![
+            row(serde_json::json!({
+                "trigger_id": uuid::Uuid::new_v4(),
+                "status": "failed",
+                "error": "someone else's failure"
+            })),
+            row(serde_json::json!({
+                "trigger_id": trigger_id,
+                "status": "accepted",
+                "pipeline_run_id": run_id
+            })),
+            // An unknown status word must not shadow the older valid row.
+            row(serde_json::json!({
+                "trigger_id": trigger_id,
+                "status": "mystery"
+            })),
+            row(serde_json::json!({
+                "trigger_id": trigger_id,
+                "status": "queued"
+            })),
+            row(serde_json::json!("not a trigger status object")),
+        ];
+
+        let record = latest_trigger_record(&events, trigger_id).unwrap();
+        assert_eq!(record.status, TriggerStatus::Accepted);
+        assert_eq!(record.pipeline_run_id, Some(run_id.0));
+        assert!(record.error.is_none());
+        assert!(latest_trigger_record(&events, uuid::Uuid::new_v4()).is_none());
+    }
+
+    #[tokio::test]
+    async fn trigger_event_gate_requires_registered_trigger_id() {
+        let repo_id = gitforge_common::RepoId::new();
+        let tracker = TriggerTracker::new(None);
+        let push = |new_hash: String| {
+            EventEnvelope::new(
+                EventType::PushReceived,
+                EventPayload::PushReceived(PushReceivedPayload {
+                    repo_id,
+                    ref_name: "refs/heads/main".to_string(),
+                    old_hash: "0".repeat(40),
+                    new_hash,
+                    pusher_id: None,
+                }),
+                Some(repo_id),
+                None,
+            )
+        };
+
+        let trigger_event = push("a".repeat(40));
+        assert!(!is_ci_trigger_event(&trigger_event, &tracker));
+        let new_hash = "a".repeat(40);
+        tracker
+            .record_queued(trigger_event.event_id, repo_id, &new_hash)
+            .await;
+        assert!(is_ci_trigger_event(&trigger_event, &tracker));
+        tracker
+            .record_run_assigned(
+                trigger_event.event_id,
+                gitforge_common::PipelineRunId::new(),
+            )
+            .await;
+        assert!(!is_ci_trigger_event(&trigger_event, &tracker));
+        // A deletion sentinel never entered through the trigger endpoint.
+        assert!(!is_ci_trigger_event(&push("0".repeat(40)), &tracker));
+        // Non-push payloads carry no trigger correlation.
+        let foreign = EventEnvelope::new(
+            EventType::RepoCreated,
+            EventPayload::RepoCreated(RepoCreatedPayload {
+                repo_id,
+                name: "somewhere-else".to_string(),
+                owner_id: gitforge_common::UserId::new(),
+                visibility: "private".to_string(),
+            }),
+            Some(repo_id),
+            None,
+        );
+        assert!(!is_ci_trigger_event(&foreign, &tracker));
     }
 }

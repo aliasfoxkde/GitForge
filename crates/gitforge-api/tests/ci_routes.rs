@@ -24,6 +24,10 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+mod common;
+
+use common::ScriptedCiTriggerTransport;
+
 /// Seed users, a repository with one pipeline and one pending run, and the
 /// matching auth tokens for each role.
 struct Fixture {
@@ -782,20 +786,26 @@ async fn webhook_replays_are_idempotent_and_map_to_one_durable_job() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// CI delegation (observed through the shared scripted transport; see
+// tests/common/mod.rs for why delegation is never tested by binding the
+// pinned orchestrator port)
+// ---------------------------------------------------------------------------
+
 /// The API gateway delegates webhook execution to the loopback CI
-/// orchestrator whenever the trigger client is configured. This deployment
-/// has no CI endpoint answering under the test's identity, so the gateway
-/// must fail closed with a 502 instead of silently dropping the delivery.
+/// orchestrator whenever the trigger client is configured. When the
+/// orchestrator cannot accept the delivery, the gateway must fail closed
+/// with a 502 instead of silently dropping the delivery.
 #[tokio::test]
 async fn webhook_delegation_fails_closed_when_ci_cannot_accept_the_trigger() {
     let f = seed().await;
-    let client = CiTriggerClient::new(
-        "http://127.0.0.1:42781/pipelines/trigger",
-        "not-a-real-token",
-    )
-    .unwrap();
+    let refusal = Err("CI trigger request failed: connection refused".to_string());
+    let transport = Arc::new(ScriptedCiTriggerTransport::new(vec![refusal]));
     let app = ApiServer::new("test-secret", f.pool.clone())
-        .with_ci_trigger_client(Arc::new(client))
+        .with_ci_trigger_client(Arc::new(CiTriggerClient::with_transport(
+            transport,
+            "not-a-real-token",
+        )))
         .into_router();
 
     let (status, body) = request_json(
@@ -1018,8 +1028,9 @@ async fn pipeline_create_enforces_authorization_and_shape() {
 // ---------------------------------------------------------------------------
 
 /// Seed a second repository whose storage is a real bare repository with
-/// one commit, plus an active pipeline for it. Returns (bare path, commit).
-async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, PipelineId, String) {
+/// one commit, plus an active pipeline for it. Returns the bare path, pipeline
+/// ID, commit hash, and owning repository ID.
+async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, PipelineId, String, RepoId) {
     let bare = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         std::process::Command::new("git")
@@ -1090,7 +1101,7 @@ async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, PipelineId, 
     };
     let pipeline_id = pipeline.id;
     PipelineQueries::create(&f.pool, &pipeline).await.unwrap();
-    (bare, pipeline_id, commit)
+    (bare, pipeline_id, commit, repo_id)
 }
 
 #[tokio::test]
@@ -1125,7 +1136,7 @@ async fn pipeline_run_trigger_rejects_hostile_refs_before_any_git_call() {
 #[tokio::test]
 async fn pipeline_run_trigger_resolves_revisions_in_repository_storage() {
     let f = seed().await;
-    let (_bare, pipeline_id, commit) = seed_real_storage_repo(&f).await;
+    let (_bare, pipeline_id, commit, _repo_id) = seed_real_storage_repo(&f).await;
 
     // The fixture repository's storage path does not exist, so its runs
     // must report the storage problem instead of running git.
@@ -1175,6 +1186,74 @@ async fn pipeline_run_trigger_resolves_revisions_in_repository_storage() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// The runs endpoint must hand CI the selected pipeline id, the resolved
+/// commit, and the owning repository — exactly once per trigger. The
+/// orchestrator endpoint is pinned to a fixed loopback URL by
+/// `CiTriggerClient::new` (an SSRF bound the test must not relax), so the
+/// delivery is observed through the injected scripted transport rather
+/// than a stub bound to the pinned port, which silently skipped whenever
+/// the port was already owned on the host.
+#[tokio::test]
+async fn pipeline_run_trigger_delegates_the_exact_selected_pipeline_id() {
+    let f = seed().await;
+    let (_bare, pipeline_id, commit, selected_repo_id) = seed_real_storage_repo(&f).await;
+    let relayed = Ok(Some("selected-pipeline-run".to_string()));
+    let transport = Arc::new(ScriptedCiTriggerTransport::new(vec![relayed]));
+    let app = ApiServer::new("test-secret", f.pool.clone())
+        .with_ci_trigger_client(Arc::new(CiTriggerClient::with_transport(
+            transport.clone(),
+            "selected-pipeline-token",
+        )))
+        .into_router();
+
+    let (status, body) = request_json(
+        app,
+        "POST",
+        &format!("/api/pipelines/{pipeline_id}/runs"),
+        Some(&f.owner_token),
+        Some(json!({"ref": commit})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["pipeline_id"], pipeline_id.to_string());
+    assert_eq!(body["pipeline_run_id"], "selected-pipeline-run");
+
+    let seen = transport.deliveries();
+    assert_eq!(seen.len(), 1, "exactly one delegation per trigger");
+    assert_eq!(seen[0].trigger_token, "selected-pipeline-token");
+    assert_eq!(
+        seen[0].payload,
+        json!({
+            "repo_id": selected_repo_id.to_string(),
+            "ref_name": commit.clone(),
+            "old_hash": "0".repeat(40),
+            "new_hash": commit,
+            "selected_pipeline_id": pipeline_id.to_string(),
+            "working_dir": null
+        }),
+        "the complete CI trigger wire payload must remain stable"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_run_trigger_rejects_retired_pipeline_ids() {
+    let f = seed().await;
+    PipelineQueries::deactivate_active(&f.pool, f.repo_id, "ci-routes-pipeline")
+        .await
+        .unwrap();
+
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipelines/{}/runs", f.pipeline_id),
+        Some(&f.owner_token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "not_found");
 }
 
 #[tokio::test]

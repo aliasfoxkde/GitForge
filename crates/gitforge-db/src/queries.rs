@@ -732,6 +732,25 @@ impl PipelineQueries {
         }
     }
 
+    /// Get a pipeline definition only while it is active. Retired versions
+    /// remain addressable for run history but cannot be selected for new
+    /// manual or webhook-triggered runs.
+    pub async fn get_active(
+        pool: &Pool,
+        id: PipelineId,
+    ) -> Result<Option<crate::models::Pipeline>> {
+        let row = sqlx::query("SELECT * FROM pipelines WHERE id = ? AND active = 1")
+            .bind(id.to_string())
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get active pipeline: {e}")))?;
+
+        match row {
+            Some(row) => hydrate_pipeline(row).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// List pipelines by repository
     pub async fn list_by_repo(
         pool: &Pool,
@@ -3474,6 +3493,24 @@ mod tests {
         // List all
         let all_pipelines = PipelineQueries::list(&pool).await.unwrap();
         assert_eq!(all_pipelines.len(), 1);
+
+        PipelineQueries::deactivate_active(&pool, repo.id, "Test Pipeline")
+            .await
+            .unwrap();
+        assert!(
+            PipelineQueries::get(&pool, pipeline.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "retired definition remains addressable for history"
+        );
+        assert!(
+            PipelineQueries::get_active(&pool, pipeline.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "retired definition cannot be selected for a new run"
+        );
     }
 
     #[tokio::test]

@@ -49,7 +49,14 @@ jobs:
     needs: [fmt]
     steps:
       - name: Strict lint (zero warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # The CI-trigger delegation seam is feature-gated behind the
+        # non-default gitforge-api/test-util feature (absent from
+        # production builds), and the two integration suites that exercise
+        # it declare that feature as required. Every invocation here that
+        # compiles test targets must enable it — without the flag,
+        # --all-targets silently drops those suites — while plain
+        # `cargo build` / `--release` stay feature-free.
+        run: cargo clippy --workspace --all-targets --features gitforge-api/test-util -- -D warnings
     timeout: 60m
 
   - name: test
@@ -67,7 +74,7 @@ jobs:
         # two-thread bound stays: it keeps the suite well inside the 60m
         # timeout and the gate deterministic without re-litigating default
         # parallelism on every image refresh.
-        run: cargo test --workspace -- --test-threads=2
+        run: cargo test --workspace --features gitforge-api/test-util -- --test-threads=2
     timeout: 60m
 
   - name: coverage
@@ -97,9 +104,13 @@ jobs:
         # redirected into a temp file inside the container, so the
         # captured step output is only the few verdict lines echoed
         # here, and they always survive intact.
+        #
+        # The test-util feature flag matches the clippy and test jobs:
+        # without it the feature-gated integration suites are skipped by
+        # required-features and the gate would measure a smaller tree.
         run: |
           summary=$(mktemp)
-          if cargo llvm-cov --workspace --all-targets --summary-only \
+          if cargo llvm-cov --workspace --all-targets --features gitforge-api/test-util --summary-only \
                --fail-under-lines 82 -- --test-threads=2 >"$summary" 2>&1
           then gate=ok
           else gate=fail

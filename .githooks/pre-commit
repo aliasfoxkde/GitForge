@@ -33,8 +33,10 @@ if ! cargo fmt --all -- --check; then
 fi
 
 # ─── Strict clippy ───────────────────────────────────────────────────────────
+# gitforge-api/test-util gates the ci_routes/webhook_routes suites; enable it
+# so they are linted here exactly as CI lints them (.github/workflows/rust-ci.yml).
 INFO "Running clippy (workspace, all targets, -D warnings)..."
-if ! cargo clippy --workspace --all-targets -- -D warnings; then
+if ! cargo clippy --workspace --all-targets --features gitforge-api/test-util -- -D warnings; then
     ERROR "clippy failed — fix the warnings before committing"
     exit 1
 fi

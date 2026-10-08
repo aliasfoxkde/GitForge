@@ -23,7 +23,9 @@ WARN() { echo -e "${YELLOW}[pre-push]${NC} $*"; }
 ERROR() { echo -e "${RED}[pre-push]${NC} $*"; }
 
 INFO "Running full test suite before push..."
-if ! cargo test --workspace --no-fail-fast -- --test-threads=2 2>&1; then
+# gitforge-api/test-util is a required feature of the ci_routes/webhook_routes
+# suites; without it cargo test silently skips them. Mirror CI's explicit enable.
+if ! cargo test --workspace --features gitforge-api/test-util --no-fail-fast -- --test-threads=2 2>&1; then
     ERROR "Tests failed — fix before pushing"
     exit 1
 fi

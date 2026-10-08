@@ -190,9 +190,14 @@ definition document (the committed `.gitforge.yml` contents) as `config`.
 The document must parse with a single active version; the caller must own
 the repository (admin/maintainer override applies).
 
-`POST /api/pipelines/{id}/runs` triggers a run of the stored definition,
-resolving the optional `ref` (default: repository HEAD) to a commit and
-rejecting ambiguous or hostile refs.
+`POST /api/pipelines/{id}/runs` triggers the active stored definition with
+that exact pipeline ID, resolving the optional `ref` (default: repository
+HEAD) to a commit and rejecting ambiguous or hostile refs. A retired pipeline
+ID cannot be used to create a new run. Ordinary Git push events remain
+governed by the pipeline configuration committed at the pushed revision. The
+CI trigger event preserves the selected pipeline ID, and the created run is
+recorded against that pipeline. This selection is validated as active and
+owned by the event's repository before a run is created.
 
 `DELETE /api/pipelines/{id}` deletes a runless pipeline outright and
 deactivates one with run history (the history stays queryable).
