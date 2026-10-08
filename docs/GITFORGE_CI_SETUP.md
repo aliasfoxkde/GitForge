@@ -5,6 +5,11 @@ orchestrator that runs it. Deployment enablement (variables, secrets, runner
 networking) lives in `.github/GITFORGE_CI_SETUP.md`; this document is the
 endpoint and secret contract those settings buy.
 
+The `ci_trigger_requests` table and indexes belong to
+`gitforge-db::Pool::migrate`; the CI service owns request lifecycle behavior,
+not a parallel schema-creation path. Database-backed service startup runs
+the shared migration before binding the listener.
+
 ## Enqueue: `POST /pipelines/trigger`
 
 Credential: `GITFORGE_CI_TRIGGER_TOKEN`, sent as
@@ -219,6 +224,11 @@ both panic and error-return restarts
 per-attempt recovery sweep fails only claims without a run row while a
 run-backed claim resolves through the run's verdict
 (`claim_recovery_fails_only_claims_without_a_run_and_run_verdicts_close_the_rest`).
+Recovery-store failure and subscription-health cleanup are covered by
+`recovery_sweep_failure_propagates_instead_of_reporting_zero` and
+`subscription_guard_marks_consumer_health_down_on_drop_and_panic`. The shared
+migration test also asserts that the trigger-request table and indexes are
+created and that rerunning the migration is idempotent (`test_migrations`).
 
 Nothing covers the `queued` response, read-time healing of a lost terminal
 trigger-status write, or a trigger POST without a database — and the harness
@@ -226,10 +236,8 @@ discards the service's stdout and stderr, so the suite observes no logs.
 
 ## Validation status
 
-None of the above has been verified in this working tree yet: no build, no
-`cargo test`, and no GitForge pipeline run has executed against these
-changes. The behaviors described here are documented from the source as it
-stands; treat every test result cited as pending until the local chain
-(`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
-warnings`, `cargo test --workspace`) and the self-hosted GitForge pipeline
-have run.
+Source formatting passed with `cargo fmt -p ci -- --check`; `git diff --check`
+also passed. No build, `cargo test`, Clippy, or GitForge pipeline has run
+against these changes. The test names above describe source coverage, not
+passing results; treat behavior as unverified until focused tests, workspace
+gates, and the self-hosted GitForge pipeline have run.

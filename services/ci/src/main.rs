@@ -170,11 +170,8 @@ async fn main() -> anyhow::Result<()> {
     {
         let pool = gitforge_db::Pool::new(&database_url).await?;
         pool.migrate().await?;
-        // The trigger-request store is created before the HTTP listener comes
-        // up on purpose: a service that accepts triggers it cannot correlate
-        // is the defect this table exists to fix, so an unusable store is a
-        // loud startup failure rather than a silent contract downgrade.
-        ensure_trigger_request_store(&pool).await?;
+        // Pool::migrate owns the durable trigger-request schema before the
+        // HTTP listener can accept a trigger the service cannot correlate.
         tracing::info!(database_url = %database_url, "using durable GitForge scheduler database");
         (
             Scheduler::with_db(pool.clone()).with_fence_grace_secs(job_fence_grace_secs_from_env()),
@@ -910,44 +907,11 @@ const TRIGGER_REQUEST_PROCESSING: &str = "processing";
 const TRIGGER_REQUEST_COMPLETED: &str = "completed";
 const TRIGGER_REQUEST_FAILED: &str = "failed";
 
-/// Schema of the durable trigger-request store. Owned by this service rather
-/// than the shared `gitforge_db` migrations because the CI orchestrator is
-/// its only writer and the columns are the contract of the status endpoint.
-const TRIGGER_REQUEST_STORE_DDL: &str = r#"
-    CREATE TABLE IF NOT EXISTS ci_trigger_requests (
-        id TEXT PRIMARY KEY,
-        event_id TEXT NOT NULL,
-        repo_id TEXT NOT NULL,
-        ref_name TEXT NOT NULL,
-        new_hash TEXT NOT NULL,
-        status TEXT NOT NULL,
-        pipeline_run_id TEXT,
-        error TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    )
-"#;
-
-/// Create the trigger-request store. Idempotent: the database file is shared
-/// with the gateway and scheduler, and an older file simply gains the table
-/// on the first boot of a service that correlates triggers.
-async fn ensure_trigger_request_store(pool: &gitforge_db::Pool) -> anyhow::Result<()> {
-    for statement in [
-        TRIGGER_REQUEST_STORE_DDL,
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ci_trigger_requests_event_id \
-         ON ci_trigger_requests (event_id)",
-        "CREATE INDEX IF NOT EXISTS idx_ci_trigger_requests_dedupe \
-         ON ci_trigger_requests (repo_id, ref_name, new_hash, status)",
-    ] {
-        sqlx::query(statement).execute(pool.pool()).await?;
-    }
-    Ok(())
-}
-
 /// A durable trigger request: the record behind `POST /pipelines/trigger`'s
 /// `trigger_id` and the lifecycle the status endpoint reports. The row's
 /// `event_id` column is the consumer's lookup key and is deliberately not
-/// part of this view.
+/// part of this view. The table and indexes are owned by
+/// `gitforge_db::Pool::migrate`, while this service owns lifecycle behavior.
 #[derive(Debug, Clone)]
 struct TriggerRequestRow {
     id: uuid::Uuid,
@@ -3970,7 +3934,6 @@ mod tests {
         gitforge_common::PipelineId,
     ) {
         let (pool, repo_id, pipeline_id) = sweep_test_pool().await;
-        ensure_trigger_request_store(&pool).await.unwrap();
         (pool, repo_id, pipeline_id)
     }
 
@@ -5165,7 +5128,6 @@ mod tests {
             .await
             .unwrap();
         pool.migrate().await.unwrap();
-        ensure_trigger_request_store(&pool).await.unwrap();
         // Remove the table the sweep writes, simulating an unusable store.
         sqlx::query("DROP TABLE ci_trigger_requests")
             .execute(pool.pool())

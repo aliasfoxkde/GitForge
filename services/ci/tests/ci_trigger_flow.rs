@@ -74,25 +74,6 @@ fn run_git(args: &[&str], cwd: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// Mirror of the trigger-request store the ci binary creates at startup
-/// (`TRIGGER_REQUEST_STORE_DDL` in `services/ci/src/main.rs`), so a fixture
-/// can write rows before the first boot observes them. The schema is the
-/// status endpoint's contract; a change here must land in both.
-const TRIGGER_REQUEST_STORE_DDL: &str = r#"
-    CREATE TABLE IF NOT EXISTS ci_trigger_requests (
-        id TEXT PRIMARY KEY,
-        event_id TEXT NOT NULL,
-        repo_id TEXT NOT NULL,
-        ref_name TEXT NOT NULL,
-        new_hash TEXT NOT NULL,
-        status TEXT NOT NULL,
-        pipeline_run_id TEXT,
-        error TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    )
-"#;
-
 /// A trigger-request row written into the database before the service boots,
 /// so the binary's startup sweeps run against known state.
 struct SeedTriggerRequest {
@@ -196,17 +177,6 @@ async fn spawn_ci_impl(
     // sweeps run against rows no live process could have written.
     if !seeds.is_empty() {
         assert!(with_database, "seeding trigger requests requires the store");
-        sqlx::query(TRIGGER_REQUEST_STORE_DDL)
-            .execute(pool.pool())
-            .await
-            .expect("create trigger-request fixture table");
-        sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ci_trigger_requests_event_id \
-             ON ci_trigger_requests (event_id)",
-        )
-        .execute(pool.pool())
-        .await
-        .expect("create trigger-request fixture index");
         for seed in seeds {
             let now = chrono::Utc::now().to_rfc3339();
             sqlx::query(
@@ -1151,17 +1121,6 @@ async fn test_queued_trigger_request_expires_after_the_correlation_window_while_
         .expect("reopen service database");
     let queued_event = uuid::Uuid::new_v4();
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(TRIGGER_REQUEST_STORE_DDL)
-        .execute(pool.pool())
-        .await
-        .expect("ensure trigger-request table");
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ci_trigger_requests_event_id
-         ON ci_trigger_requests (event_id)",
-    )
-    .execute(pool.pool())
-    .await
-    .expect("ensure trigger-request event index");
     sqlx::query(
         "INSERT INTO ci_trigger_requests
          (id, event_id, repo_id, ref_name, new_hash, status, pipeline_run_id, error,
