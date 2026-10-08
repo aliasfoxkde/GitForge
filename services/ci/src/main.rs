@@ -1290,7 +1290,7 @@ async fn mark_trigger_request_processing(
 async fn fail_trigger_request_for_event(
     pool: &gitforge_db::Pool,
     event_id: uuid::Uuid,
-    error: &impl std::fmt::Display,
+    error: &dyn std::fmt::Display,
 ) {
     let cause = error.to_string();
     if let Err(close_error) = sqlx::query(
