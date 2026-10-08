@@ -2247,4 +2247,100 @@ mod tests {
             );
         }
     }
+
+    // =====================================================================
+    // Memory limits on the stub creation paths
+    //
+    // As with the CPU capacity tests above: validation happens inside the
+    // shared `resource_host_config` builder, ahead of the backend branch,
+    // so the stub (no daemon) exercises the exact memory validation the
+    // real Docker path performs. `memory_mb` below Docker's 6 MiB minimum
+    // or past the MiB-to-bytes conversion fails identically without a
+    // daemon (see the unit tests above for the exact boundary values).
+    // =====================================================================
+
+    /// Fail closed: `memory_mb = 0` would hand the container an unbounded
+    /// (unset) memory limit, so it is rejected before any backend work —
+    /// identically with or without a daemon.
+    #[tokio::test]
+    async fn test_create_rejects_zero_memory_mb_without_docker() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let limits = SandboxLimits {
+            memory_mb: 0,
+            ..Default::default()
+        };
+        let error = sandbox
+            .create(JobId::new(), "alpine:latest", limits)
+            .await
+            .expect_err("zero memory_mb must fail before any backend work");
+        assert_eq!(error.kind, ErrorKind::Sandbox);
+        assert!(
+            error.to_string().contains("memory_mb"),
+            "error should name the offending field: {error}"
+        );
+    }
+
+    /// Both conversion-overflow shapes (bytes past the signed memory field,
+    /// and a MiB count that cannot even be multiplied) must fail through
+    /// `create` rather than reach Docker as a truncated cap.
+    #[tokio::test]
+    async fn test_create_rejects_overflowing_memory_mb_without_docker() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let boundary_mb = i64::MAX as u64 / (1024 * 1024);
+        for mb in [boundary_mb + 1, u64::MAX] {
+            let limits = SandboxLimits {
+                memory_mb: mb,
+                ..Default::default()
+            };
+            let error = sandbox
+                .create(JobId::new(), "alpine:latest", limits)
+                .await
+                .expect_err("overflowing memory_mb must fail before any backend work");
+            assert_eq!(error.kind, ErrorKind::Sandbox);
+            assert!(
+                error.to_string().contains("memory_mb"),
+                "error should name the offending field: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_with_workspace_rejects_zero_memory_mb_without_docker() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        // Must pass the workspace-path precheck (existing absolute dir) so
+        // the memory validation is what produces the error.
+        let workspace = std::env::temp_dir().to_string_lossy().to_string();
+        let limits = SandboxLimits {
+            memory_mb: 0,
+            ..Default::default()
+        };
+        let error = sandbox
+            .create_with_workspace(JobId::new(), "alpine:latest", limits, Some(&workspace))
+            .await
+            .expect_err("zero memory_mb must fail before any backend work");
+        assert_eq!(error.kind, ErrorKind::Sandbox);
+        assert!(
+            error.to_string().contains("memory_mb"),
+            "error should name the offending field: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_with_workspace_rejects_overflowing_memory_mb_without_docker() {
+        let sandbox = DockerSandbox::stub_for_tests();
+        let workspace = std::env::temp_dir().to_string_lossy().to_string();
+        let limits = SandboxLimits {
+            memory_mb: u64::MAX,
+            ..Default::default()
+        };
+        let error = sandbox
+            .create_with_workspace(JobId::new(), "alpine:latest", limits, Some(&workspace))
+            .await
+            .expect_err("overflowing memory_mb must fail before any backend work");
+        assert_eq!(error.kind, ErrorKind::Sandbox);
+        assert!(
+            error.to_string().contains("memory_mb"),
+            "error should name the offending field: {error}"
+        );
+    }
 }
