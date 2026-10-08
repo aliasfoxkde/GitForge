@@ -1028,8 +1028,9 @@ async fn pipeline_create_enforces_authorization_and_shape() {
 // ---------------------------------------------------------------------------
 
 /// Seed a second repository whose storage is a real bare repository with
-/// one commit, plus an active pipeline for it. Returns (bare path, commit).
-async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, PipelineId, String) {
+/// one commit, plus an active pipeline for it. Returns the bare path, pipeline
+/// ID, commit hash, and owning repository ID.
+async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, PipelineId, String, RepoId) {
     let bare = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         std::process::Command::new("git")
@@ -1100,7 +1101,7 @@ async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, PipelineId, 
     };
     let pipeline_id = pipeline.id;
     PipelineQueries::create(&f.pool, &pipeline).await.unwrap();
-    (bare, pipeline_id, commit)
+    (bare, pipeline_id, commit, repo_id)
 }
 
 #[tokio::test]
@@ -1135,7 +1136,7 @@ async fn pipeline_run_trigger_rejects_hostile_refs_before_any_git_call() {
 #[tokio::test]
 async fn pipeline_run_trigger_resolves_revisions_in_repository_storage() {
     let f = seed().await;
-    let (_bare, pipeline_id, commit) = seed_real_storage_repo(&f).await;
+    let (_bare, pipeline_id, commit, _repo_id) = seed_real_storage_repo(&f).await;
 
     // The fixture repository's storage path does not exist, so its runs
     // must report the storage problem instead of running git.
@@ -1197,7 +1198,7 @@ async fn pipeline_run_trigger_resolves_revisions_in_repository_storage() {
 #[tokio::test]
 async fn pipeline_run_trigger_delegates_the_exact_selected_pipeline_id() {
     let f = seed().await;
-    let (_bare, pipeline_id, commit) = seed_real_storage_repo(&f).await;
+    let (_bare, pipeline_id, commit, selected_repo_id) = seed_real_storage_repo(&f).await;
     let relayed = Ok(Some("selected-pipeline-run".to_string()));
     let transport = Arc::new(ScriptedCiTriggerTransport::new(vec![relayed]));
     let app = ApiServer::new("test-secret", f.pool.clone())
@@ -1225,7 +1226,7 @@ async fn pipeline_run_trigger_delegates_the_exact_selected_pipeline_id() {
     assert_eq!(
         seen[0].payload,
         json!({
-            "repo_id": f.repo_id.to_string(),
+            "repo_id": selected_repo_id.to_string(),
             "ref_name": commit.clone(),
             "old_hash": "0".repeat(40),
             "new_hash": commit,
