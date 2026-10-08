@@ -1,6 +1,6 @@
 # GitForge Runbook
 
-**Last Updated**: 2026-08-29
+**Last Updated**: 2026-10-08
 
 ## Overview
 
@@ -166,6 +166,7 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 | `GITFORGE_REGISTER_ATTEMPTS` | No | `6` | Registration attempts before giving up when the scheduler is unreachable |
 | `GITFORGE_REGISTER_BACKOFF_SECS` | No | `1` | Initial registration retry delay; doubles per attempt up to 30s |
 | `GITFORGE_RECONCILE_MAX_REMOVALS` | No | `64` | Per-pass removal cap for the abandoned-container reconciler (canary rollout). Unset keeps the policy default; explicit values must be positive integers — zero or malformed values fail the reconciler closed (the loop is not started) rather than falling back to the default. A valid explicit value is operator-trusted and is not otherwise capped |
+| `GITFORGE_RECONCILE_GRACE_SECS` | No | `3600` | Minimum age a container must have been non-running before the reconciler may consider it. Lenient for unset or unparseable values (the default applies); an explicit `0` is a policy error and fails the reconciler closed |
 | `GITFORGE_RECONCILE_INTERVAL_SECS` | No | `300` | Abandoned-container reconcile pass interval in seconds. Lenient: unset or unparseable values fall back to the default, and the resolved value is clamped to a 30-second floor. Never fatal — see the reconciler section below |
 
 > **Startup behavior**: If `GITFORGE_SCHEDULER_URL` is missing or empty, the runner exits immediately
@@ -180,8 +181,11 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 > reconciler loop, never the runner process. A malformed `GITFORGE_RECONCILE_MAX_REMOVALS` value,
 > or removal enabled without a valid `GITFORGE_RECONCILE_RECEIPT`, is fail-closed for the loop only —
 > the reconciler is not started and the reason is logged, while the runner keeps accepting jobs.
-> `GITFORGE_RECONCILE_GRACE_SECS` and `GITFORGE_RECONCILE_INTERVAL_SECS` are lenient: unset or
-> unparseable values fall back to their defaults, and the interval is clamped to a 30-second floor.
+> `GITFORGE_RECONCILE_GRACE_SECS` and `GITFORGE_RECONCILE_INTERVAL_SECS` are lenient about unset or
+> unparseable values: both fall back to their defaults, and the interval is clamped to a 30-second
+> floor (`0` for the interval is merely clamped, never fatal). The one strict case is an explicit
+> `GITFORGE_RECONCILE_GRACE_SECS=0`: a zero grace period is a policy error, so the reconciler loop
+> is not started while the runner keeps accepting jobs.
 
 Runner names are durable identities. Set a distinct name for every concurrently
 running runner (for example, `remote-podman-runner-01`); leaving the default
@@ -202,13 +206,14 @@ canary rollout (`=1` removes at most one container per pass), and a pass
 interval (`GITFORGE_RECONCILE_INTERVAL_SECS`, default 300, 30-second floor).
 
 Enabling removal (`GITFORGE_RECONCILE_DELETE=1`) additionally **requires**
-`GITFORGE_RECONCILE_RECEIPT`: a path to an existing valid receipt
-destination (absolute, `.json`, real existing parent directory). The
-receipt is not optional for deletion — every removal pass writes a JSON
-audit report there, and the reconciler refuses to start if the path is
-missing or invalid. Malformed `GITFORGE_RECONCILE_MAX_REMOVALS` values
-fail the reconciler closed rather than silently falling back to the
-default.
+`GITFORGE_RECONCILE_RECEIPT`: an absolute `.json` path whose parent directory
+already exists as a real (non-symlink) directory. The receipt file itself does
+not have to exist yet, but the configured destination must not be a symlink,
+and the path may not contain `..` components. Each pass writes the JSON audit
+report there atomically (a `<path>.tmp` write followed by a rename), and the
+reconciler refuses to start if the configured path is missing or invalid.
+Malformed `GITFORGE_RECONCILE_MAX_REMOVALS` values fail the reconciler closed
+rather than silently falling back to the default.
 
 ## Docker Compose
 

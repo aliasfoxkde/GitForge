@@ -2004,8 +2004,12 @@ mod receipt_tests {
     #[test]
     fn receipt_path_rejects_symlinked_parent() {
         let dir = tempfile::tempdir().expect("tempdir must succeed");
-        // Canonicalize so a symlinked temp root cannot satisfy the parent
-        // check before the symlinked parent itself is examined.
+        // Canonicalize the temp root so the fixture holds exactly one
+        // symlink: the parent under test. Host temp roots are themselves
+        // reached through a symlink on some systems (macOS /tmp -> /private/tmp);
+        // leaving that second symlink in play would make it ambiguous which
+        // link the rejection is attributable to, since only the immediate
+        // parent's own metadata is examined.
         let root = dir.path().canonicalize().expect("tempdir must canonicalize");
         let real = root.join("real");
         std::fs::create_dir(&real).expect("real parent must be creatable");
@@ -2180,6 +2184,21 @@ mod reconciler_env_config_tests {
         )
     }
 
+    /// Grace and interval boundary cases ride through the raw string inputs,
+    /// so this helper leaves deletion (which needs a receipt on disk) out.
+    fn config_with_timing(
+        grace: Option<&str>,
+        interval: Option<&str>,
+    ) -> std::result::Result<crate::agent::ReconcilerLoopConfig, String> {
+        load_reconciler_config(
+            None,
+            grace.map(str::to_owned),
+            interval.map(str::to_owned),
+            None,
+            None,
+        )
+    }
+
     #[test]
     fn unset_max_removals_keeps_policy_default() {
         let config = config(None, None, None).expect("default config must resolve");
@@ -2235,6 +2254,57 @@ mod reconciler_env_config_tests {
         let config = config(Some("false"), None, None).expect("census-only must resolve");
         assert!(!config.policy.deletion_enabled);
         assert_eq!(config.receipt_path, None);
+    }
+
+    #[test]
+    fn unset_grace_and_interval_use_defaults() {
+        let config = config_with_timing(None, None).expect("defaults must resolve");
+        assert_eq!(config.policy.grace, std::time::Duration::from_secs(3600));
+        assert_eq!(config.interval, std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    fn unparseable_grace_and_interval_fall_back_to_defaults() {
+        // Lenient by design: anything u64 parsing rejects keeps the default,
+        // including negatives, whitespace-padded numbers, and non-decimal
+        // forms.
+        for raw in ["abc", "", "-1", "0x10", "3.5", " 60", "60 "] {
+            let config = config_with_timing(Some(raw), Some(raw))
+                .unwrap_or_else(|error| panic!("value {raw:?} must stay lenient: {error}"));
+            assert_eq!(config.policy.grace, std::time::Duration::from_secs(3600));
+            assert_eq!(config.interval, std::time::Duration::from_secs(300));
+        }
+    }
+
+    #[test]
+    fn zero_grace_fails_closed() {
+        // Unlike the interval, a zero grace period is a policy error: an
+        // explicit operator value is never silently reinterpreted.
+        let error = config_with_timing(Some("0"), None).expect_err("zero grace must be rejected");
+        assert!(error.contains("grace period must be positive"), "got: {error}");
+    }
+
+    #[test]
+    fn small_positive_grace_is_accepted_verbatim() {
+        let config = config_with_timing(Some("1"), None).expect("grace of 1s must resolve");
+        assert_eq!(config.policy.grace, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn interval_below_floor_is_clamped_never_fatal() {
+        for raw in ["0", "1", "29"] {
+            let config = config_with_timing(None, Some(raw))
+                .unwrap_or_else(|error| panic!("interval {raw:?} must not be fatal: {error}"));
+            assert_eq!(config.interval, std::time::Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn interval_at_and_above_floor_is_honored() {
+        let at_floor = config_with_timing(None, Some("30")).expect("interval 30 must resolve");
+        assert_eq!(at_floor.interval, std::time::Duration::from_secs(30));
+        let above = config_with_timing(None, Some("31")).expect("interval 31 must resolve");
+        assert_eq!(above.interval, std::time::Duration::from_secs(31));
     }
 }
 
