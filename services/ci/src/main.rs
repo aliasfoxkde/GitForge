@@ -188,6 +188,7 @@ struct TriggerStatusPayload {
 /// or processing durable. Without a database, only the process cache exists.
 struct TriggerTracker {
     outcomes: std::sync::Mutex<HashMap<uuid::Uuid, (chrono::DateTime<Utc>, TriggerStatusRecord)>>,
+    pending_ids: std::sync::Mutex<HashSet<uuid::Uuid>>,
     db: Option<gitforge_db::Pool>,
 }
 
@@ -195,8 +196,19 @@ impl TriggerTracker {
     fn new(db: Option<gitforge_db::Pool>) -> Self {
         Self {
             outcomes: std::sync::Mutex::new(HashMap::new()),
+            pending_ids: std::sync::Mutex::new(HashSet::new()),
             db,
         }
+    }
+
+    /// Whether this event id was registered by the trigger HTTP boundary and
+    /// is still awaiting consumer handling. Ordinary webhook pushes share the
+    /// same event type but must not create trigger-status journal entries.
+    fn is_pending(&self, trigger_id: uuid::Uuid) -> bool {
+        self.pending_ids
+            .lock()
+            .expect("pending trigger id lock poisoned")
+            .contains(&trigger_id)
     }
 
     /// Record that a trigger was accepted and is waiting for its run.
@@ -206,6 +218,10 @@ impl TriggerTracker {
         repo_id: gitforge_common::RepoId,
         new_hash: &str,
     ) {
+        self.pending_ids
+            .lock()
+            .expect("pending trigger id lock poisoned")
+            .insert(trigger_id);
         self.cache_insert(TriggerStatusRecord {
             trigger_id,
             status: TriggerStatus::Queued,
@@ -229,6 +245,10 @@ impl TriggerTracker {
         trigger_id: uuid::Uuid,
         pipeline_run_id: gitforge_common::PipelineRunId,
     ) {
+        self.pending_ids
+            .lock()
+            .expect("pending trigger id lock poisoned")
+            .remove(&trigger_id);
         self.cache_insert(TriggerStatusRecord {
             trigger_id,
             status: TriggerStatus::Accepted,
@@ -250,6 +270,10 @@ impl TriggerTracker {
     /// the terminal state a polling caller must observe instead of timing out
     /// against a run that will never exist.
     async fn record_failed(&self, trigger_id: uuid::Uuid, error: &str) {
+        self.pending_ids
+            .lock()
+            .expect("pending trigger id lock poisoned")
+            .remove(&trigger_id);
         self.cache_insert(TriggerStatusRecord {
             trigger_id,
             status: TriggerStatus::Failed,
@@ -383,10 +407,12 @@ fn latest_trigger_record(
 /// foreign payloads never carry a trigger correlation record: the HTTP
 /// boundary rejects zero-hash triggers before publishing, and only
 /// PushReceived payloads originate from the trigger endpoint.
-fn is_ci_trigger_event(event: &EventEnvelope) -> bool {
+fn is_ci_trigger_event(event: &EventEnvelope, tracker: &TriggerTracker) -> bool {
     matches!(
         &event.payload,
-        EventPayload::PushReceived(payload) if !gitforge_common::is_zero_hash(&payload.new_hash)
+        EventPayload::PushReceived(payload)
+            if !gitforge_common::is_zero_hash(&payload.new_hash)
+                && tracker.is_pending(event.event_id)
     )
 }
 
@@ -756,14 +782,18 @@ struct PipelineTriggerRequest {
 /// a dedicated trigger token, falling back to the scheduler operator/shared
 /// token during migration.
 fn configured_trigger_tokens(get_var: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    // Prefer the credential actually provisioned to the CI workflow. Accept
+    // only one configured credential so rotating a dedicated token revokes
+    // it immediately instead of leaving older shared operator secrets valid.
     [
-        "GITFORGE_TRIGGER_TOKEN",
         "GITFORGE_CI_TRIGGER_TOKEN",
+        "GITFORGE_TRIGGER_TOKEN",
         "GITFORGE_SCHEDULER_OPERATOR_TOKEN",
         "GITFORGE_SCHEDULER_TOKEN",
     ]
     .into_iter()
-    .filter_map(|name| get_var(name).filter(|token| !token.is_empty()))
+    .find_map(|name| get_var(name).filter(|token| !token.is_empty()))
+    .into_iter()
     .collect()
 }
 
@@ -844,8 +874,8 @@ fn trigger_auth_verdict(
 /// `queued` answer poll this endpoint by the returned `event_id` until the
 /// event consumer creates the pipeline run (`accepted` plus
 /// `pipeline_run_id`) or the trigger reaches a terminal `failed`. Same
-/// control-plane authentication as the trigger POST: any non-empty dedicated
-/// trigger or scheduler compatibility token configured in the service.
+/// control-plane authentication as the trigger POST. The CI trigger token is
+/// preferred; legacy aliases are used only when newer names are absent.
 async fn get_trigger_status(
     Extension(trigger_state): Extension<Arc<TriggerState>>,
     Path(event_id): Path<String>,
@@ -2029,7 +2059,7 @@ async fn run_event_consumer(
                                 // The outcome is recorded before the waiter is
                                 // released so a trigger response and a status
                                 // read can never disagree about the transition.
-                                if is_ci_trigger_event(&event) {
+                                if is_ci_trigger_event(&event, &trigger_tracker) {
                                     trigger_tracker
                                         .record_run_assigned(event.event_id, run_id)
                                         .await;
@@ -2039,7 +2069,7 @@ async fn run_event_consumer(
                                 }
                             }
                             Err(e) => {
-                                if is_ci_trigger_event(&event) {
+                                if is_ci_trigger_event(&event, &trigger_tracker) {
                                     trigger_tracker
                                         .record_failed(event.event_id, &e.to_string())
                                         .await;
@@ -2908,16 +2938,14 @@ mod tests {
     }
 
     #[test]
-    fn trigger_tokens_accept_dedicated_and_compatibility_names() {
+    fn trigger_tokens_prefer_ci_token_and_ignore_older_aliases() {
         let tokens = configured_trigger_tokens(|name| match name {
             "GITFORGE_TRIGGER_TOKEN" => Some("dedicated".to_string()),
             "GITFORGE_CI_TRIGGER_TOKEN" => Some("compatibility".to_string()),
+            "GITFORGE_SCHEDULER_OPERATOR_TOKEN" => Some("operator".to_string()),
             _ => None,
         });
-        assert_eq!(
-            tokens,
-            vec!["dedicated".to_string(), "compatibility".to_string()]
-        );
+        assert_eq!(tokens, vec!["compatibility".to_string()]);
     }
 
     #[test]
@@ -2928,10 +2956,17 @@ mod tests {
             "GITFORGE_SCHEDULER_OPERATOR_TOKEN" => Some("operator".to_string()),
             _ => None,
         });
-        assert_eq!(
-            tokens,
-            vec!["compatibility".to_string(), "operator".to_string()]
-        );
+        assert_eq!(tokens, vec!["compatibility".to_string()]);
+    }
+
+    #[test]
+    fn trigger_tokens_use_legacy_operator_only_without_dedicated_token() {
+        let tokens = configured_trigger_tokens(|name| match name {
+            "GITFORGE_SCHEDULER_OPERATOR_TOKEN" => Some("operator".to_string()),
+            "GITFORGE_SCHEDULER_TOKEN" => Some("scheduler".to_string()),
+            _ => None,
+        });
+        assert_eq!(tokens, vec!["operator".to_string()]);
     }
 
     #[test]
@@ -5536,9 +5571,10 @@ jobs:
         assert!(latest_trigger_record(&events, uuid::Uuid::new_v4()).is_none());
     }
 
-    #[test]
-    fn trigger_event_gate_rejects_foreign_and_deletion_payloads() {
+    #[tokio::test]
+    async fn trigger_event_gate_requires_registered_trigger_id() {
         let repo_id = gitforge_common::RepoId::new();
+        let tracker = TriggerTracker::new(None);
         let push = |new_hash: String| {
             EventEnvelope::new(
                 EventType::PushReceived,
@@ -5554,9 +5590,22 @@ jobs:
             )
         };
 
-        assert!(is_ci_trigger_event(&push("a".repeat(40))));
+        let trigger_event = push("a".repeat(40));
+        assert!(!is_ci_trigger_event(&trigger_event, &tracker));
+        let new_hash = "a".repeat(40);
+        tracker
+            .record_queued(trigger_event.event_id, repo_id, &new_hash)
+            .await;
+        assert!(is_ci_trigger_event(&trigger_event, &tracker));
+        tracker
+            .record_run_assigned(
+                trigger_event.event_id,
+                gitforge_common::PipelineRunId::new(),
+            )
+            .await;
+        assert!(!is_ci_trigger_event(&trigger_event, &tracker));
         // A deletion sentinel never entered through the trigger endpoint.
-        assert!(!is_ci_trigger_event(&push("0".repeat(40))));
+        assert!(!is_ci_trigger_event(&push("0".repeat(40)), &tracker));
         // Non-push payloads carry no trigger correlation.
         let foreign = EventEnvelope::new(
             EventType::RepoCreated,
@@ -5569,6 +5618,6 @@ jobs:
             Some(repo_id),
             None,
         );
-        assert!(!is_ci_trigger_event(&foreign));
+        assert!(!is_ci_trigger_event(&foreign, &tracker));
     }
 }

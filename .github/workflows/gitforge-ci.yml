@@ -103,14 +103,14 @@ jobs:
           # pipeline_run_id skips that phase entirely.
           case "$HTTP_CODE" in
             2*)
-              RUN_ID=$(echo "$BODY" | jq -r '.pipeline_run_id // empty')
+              RUN_ID=$(jq -r '.pipeline_run_id // empty' <<<"$BODY" 2>/dev/null || true)
               if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
                 echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
                 echo "status=enqueued" >> "$GITHUB_OUTPUT"
                 echo "Successfully enqueued pipeline run $RUN_ID"
                 exit 0
               fi
-              EVENT_ID=$(echo "$BODY" | jq -r '.event_id // empty')
+              EVENT_ID=$(jq -r '.event_id // empty' <<<"$BODY" 2>/dev/null || true)
               if [ -n "$EVENT_ID" ] && [ "$EVENT_ID" != "null" ]; then
                 echo "trigger_event_id=$EVENT_ID" >> "$GITHUB_OUTPUT"
                 echo "status=queued" >> "$GITHUB_OUTPUT"
@@ -152,6 +152,7 @@ jobs:
           if [ '${{ needs.enqueue-build.outputs.build_status }}' = 'queued' ]; then
             : "${GITFORGE_TRIGGER_EVENT_ID:?queued trigger requires trigger_event_id}"
             TRIGGER_URL="$GITFORGE_SCHEDULER_URL/pipelines/trigger/$GITFORGE_TRIGGER_EVENT_ID"
+            not_found_count=0
             while :; do
               # curl failures (network hiccups) must be retried, not fatal.
               RESPONSE=$(curl --silent --show-error --max-time 30 \
@@ -164,12 +165,13 @@ jobs:
 
               case "$HTTP_CODE" in
                 2*)
-                  RUN_ID=$(echo "$BODY" | jq -r '.pipeline_run_id // empty')
+                  not_found_count=0
+                  RUN_ID=$(jq -r '.pipeline_run_id // empty' <<<"$BODY" 2>/dev/null || true)
                   if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
                     echo "Queued trigger $GITFORGE_TRIGGER_EVENT_ID resolved to pipeline run $RUN_ID"
                     break
                   fi
-                  TRIGGER_STATUS=$(echo "$BODY" | jq -r '.status // empty' | tr '[:upper:]' '[:lower:]')
+                  TRIGGER_STATUS=$(jq -r '.status // empty' <<<"$BODY" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
                   if [ "$TRIGGER_STATUS" = "failed" ]; then
                     echo "GitForge trigger $GITFORGE_TRIGGER_EVENT_ID failed terminally: $(echo "$BODY" | jq -r '.error // "unknown error"')" >&2
                     echo "terminal_status=failed" >> "$GITHUB_OUTPUT"
@@ -181,7 +183,17 @@ jobs:
                   echo "GitForge rejected the CI trigger credential for trigger status (HTTP $HTTP_CODE)" >&2
                   exit 1
                   ;;
+                404)
+                  not_found_count=$((not_found_count + 1))
+                  if [ "$not_found_count" -ge 3 ]; then
+                    echo "GitForge has no status record for accepted trigger $GITFORGE_TRIGGER_EVENT_ID after $not_found_count consecutive reads" >&2
+                    echo "terminal_status=trigger_not_found" >> "$GITHUB_OUTPUT"
+                    exit 1
+                  fi
+                  echo "GitForge has not exposed trigger status yet (HTTP 404, attempt $not_found_count/3)"
+                  ;;
                 *)
+                  not_found_count=0
                   echo "GitForge trigger status not readable yet (HTTP $HTTP_CODE)"
                   ;;
               esac
@@ -204,7 +216,7 @@ jobs:
               -H "Authorization: Bearer $GITFORGE_SCHEDULER_OPERATOR_TOKEN" \
               -H "Accept: application/json" \
               "$STATUS_URL")
-            STATUS=$(echo "$RESPONSE" | jq -r '.status // .state // empty' | tr '[:upper:]' '[:lower:]')
+            STATUS=$(jq -r '.status // .state // empty' <<<"$RESPONSE" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
             echo "GitForge pipeline run $RUN_ID status: ${STATUS:-unknown}"
 
             case "$STATUS" in

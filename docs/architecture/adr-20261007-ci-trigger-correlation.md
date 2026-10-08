@@ -28,15 +28,20 @@ durable-delivery receipt.
 4. Trigger status is held in a bounded in-process cache and appended to the
    existing event journal when the database is configured. The journal is a
    best-effort status ledger, not an outbox.
-5. Every explicitly configured non-empty trigger or scheduler compatibility
-   credential remains valid at this shared control-plane boundary. CI uses
-   the CI trigger credential for both the trigger POST and trigger-status
-   polling; scheduler-operator credentials remain available for run-status
-   polling.
+5. Trigger authentication selects one credential by precedence:
+   `GITFORGE_CI_TRIGGER_TOKEN`, `GITFORGE_TRIGGER_TOKEN`, then legacy
+   scheduler operator/shared tokens. Once a newer credential is configured,
+   older credentials are no longer accepted by the trigger control plane, so
+   rotating the active secret revokes it. CI uses the CI trigger credential
+   for trigger POST and trigger-status polling; scheduler-operator credentials
+   remain available for run-status polling.
 6. Request workspace handoffs are keyed by event ID and consumed exactly
    once, so concurrent triggers for the same repository cannot overwrite
    each other's workspace selection. If event publication fails, the trigger
    is recorded failed and its workspace handoff and run waiter are released.
+7. Consumer outcomes are recorded only for event IDs registered by the trigger
+   endpoint and still pending. Ordinary non-deletion push events share the
+   same event type but must not create trigger journal rows.
 
 ## Consequences
 
