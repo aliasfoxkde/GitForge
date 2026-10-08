@@ -111,9 +111,11 @@ jobs:
             fi
             if { [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; } || \
               { [ -n "$TRIGGER_ID" ] && [ "$TRIGGER_ID" != "null" ]; }; then
-              echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-              echo "trigger_id=$TRIGGER_ID" >> "$GITHUB_OUTPUT"
-              echo "status=enqueued" >> "$GITHUB_OUTPUT"
+              {
+                echo "run_id=$RUN_ID"
+                echo "trigger_id=$TRIGGER_ID"
+                echo "status=enqueued"
+              } >> "$GITHUB_OUTPUT"
               echo "GitForge accepted trigger ${TRIGGER_ID:-without trigger ID}; run correlation: ${RUN_ID:-pending}"
               exit 0
             fi
