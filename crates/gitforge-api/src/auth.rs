@@ -5,6 +5,15 @@ use gitforge_common::{Error, UserId};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
+/// JWT bearer lifetime (24 h). Short-lived by design: the long-lived
+/// state lives in the revocable refresh credential, not in the JWT.
+pub const ACCESS_TTL_SECS: i64 = 86_400;
+
+/// Refresh-credential lifetime (30 days). Stored server-side as a SHA-256
+/// digest and rotated on every use, so the plaintext lives only on the
+/// client and revocation is immediate.
+pub const REFRESH_TTL_SECS: i64 = 30 * 86_400;
+
 /// JWT claims for API authentication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -71,7 +80,7 @@ impl ApiAuth {
         username: &str,
         role: &str,
     ) -> Result<String, Error> {
-        let claims = Claims::new(user_id, username, role, 24); // 24 hour expiry
+        let claims = Claims::new(user_id, username, role, ACCESS_TTL_SECS / 3600);
 
         let token = encode(&Header::default(), &claims, &self.encoding_key)
             .map_err(|e| Error::auth(format!("failed to generate token: {e}")))?;

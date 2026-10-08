@@ -84,7 +84,14 @@ pub struct InMemoryEventBus {
 impl InMemoryEventBus {
     /// Create a new in-memory event bus
     pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(1024);
+        Self::with_capacity(1024)
+    }
+
+    /// Create an in-memory event bus with an explicit ring capacity. The
+    /// production default (1024) is sized well past any observed trigger
+    /// rate; a smaller capacity exists for tests that exercise lag.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity);
         Self { sender }
     }
 
@@ -113,13 +120,45 @@ impl EventBus for InMemoryEventBus {
     async fn subscribe(&self, filter: EventFilter) -> Result<Box<dyn EventStream>> {
         let rx = self.sender.subscribe();
 
-        Ok(Box::new(InMemoryEventStream { rx, filter }))
+        Ok(Box::new(InMemoryEventStream {
+            // The receiver is handed to the unfold stream below ONCE and
+            // owned for the subscription's whole life: broadcast::Receiver
+            // is not Clone in tokio 1.53 and resubscribe() starts at the
+            // ring tail, so any recreate-per-poll scheme silently drops
+            // everything published between subscribe and the first poll.
+            inner: std::sync::Mutex::new(Box::pin(stream_items(rx))),
+            filter,
+        }))
     }
+}
+
+/// What the unfold stream yields per receive: an event, a lag report, or
+/// end-of-bus.
+enum StreamItem {
+    Event(EventEnvelope),
+    Lagged(u64),
+}
+
+/// Own the receiver for the stream's entire lifetime. `recv()` takes `&mut
+/// self`, so the receiver threads through `unfold`'s state and never loses
+/// its ring position; a lag error reports and continues with the same
+/// receiver (recv has already advanced it past the lost slots).
+fn stream_items(rx: broadcast::Receiver<EventEnvelope>) -> impl futures::Stream<Item = StreamItem> {
+    futures::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Ok(event) => Some((StreamItem::Event(event), rx)),
+            Err(broadcast::error::RecvError::Lagged(lost)) => Some((StreamItem::Lagged(lost), rx)),
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
+    })
 }
 
 /// In-memory event stream
 struct InMemoryEventStream {
-    rx: broadcast::Receiver<EventEnvelope>,
+    /// The live receive engine. The mutex exists only to make the stream
+    /// `Sync` (the `EventStream` trait requires it) — the inner stream is
+    /// touched exclusively through `&mut self` in `poll_next`.
+    inner: std::sync::Mutex<Pin<Box<dyn Stream<Item = StreamItem> + Send>>>,
     filter: EventFilter,
 }
 
@@ -127,32 +166,39 @@ impl Stream for InMemoryEventStream {
     type Item = EventEnvelope;
 
     fn poll_next(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         use std::task::Poll;
+        let this = self.get_mut();
 
         loop {
-            match self.rx.try_recv() {
-                Ok(event) => {
-                    if self.filter.matches(&event) {
+            let mut inner = this
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(StreamItem::Event(event))) => {
+                    if this.filter.matches(&event) {
                         return Poll::Ready(Some(event));
                     }
                     // Continue looking for matching event
                 }
-                Err(broadcast::error::TryRecvError::Empty) => {
-                    // No message available, register waker and return pending
-                    let waker = cx.waker().clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        waker.wake();
-                    });
-                    return Poll::Pending;
+                Poll::Ready(Some(StreamItem::Lagged(lost))) => {
+                    // A subscriber that fell behind loses the oldest events
+                    // to the ring. Skipping ahead keeps the stream live, but
+                    // the loss must be observable: the durable trigger
+                    // request queue in the CI service recovers PushReceived
+                    // events from exactly this failure mode, and without the
+                    // log the recovery would be unfalsifiable.
+                    tracing::warn!(
+                        lost,
+                        "event subscriber fell behind the bus ring; \
+                         lost events must be recovered from durable state"
+                    );
                 }
-                Err(broadcast::error::TryRecvError::Closed) => return Poll::Ready(None),
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                    // Subscriber fell behind, continue with next event
-                }
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(None),
             }
         }
     }
@@ -169,6 +215,45 @@ impl EventStream for InMemoryEventStream {
 mod tests {
     use super::*;
     use crate::event::{EventPayload, EventType, PushReceivedPayload};
+
+    #[tokio::test]
+    async fn test_subscriber_survives_lag_without_hanging() {
+        // A tiny ring makes lag reachable: publish far past the capacity of
+        // a subscriber that is not polling. The stream must skip ahead and
+        // stay live rather than spin or silently close — recovery from lag
+        // is the durable queue's job, but the stream itself must never
+        // wedge the consumer (the old implementation woke itself by
+        // spawning a thread every 10 ms while idle).
+        let bus = InMemoryEventBus::with_capacity(2);
+        let stream = bus.subscribe(EventFilter::all()).await.unwrap();
+        tokio::pin!(stream);
+
+        let repo_id = gitforge_common::RepoId::new();
+        for i in 0..10 {
+            bus.publish(EventEnvelope::new(
+                EventType::PushReceived,
+                EventPayload::PushReceived(PushReceivedPayload {
+                    repo_id,
+                    ref_name: format!("refs/heads/lag{i}"),
+                    old_hash: "abc".to_string(),
+                    new_hash: "def".to_string(),
+                    pusher_id: None,
+                }),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        }
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            futures::StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("stream must stay live after lag");
+        assert!(received.is_some());
+    }
 
     #[tokio::test]
     async fn test_publish_subscribe() {

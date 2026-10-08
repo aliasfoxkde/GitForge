@@ -180,6 +180,43 @@ Historical stale rows are retained for audit and can be retired through the
 authenticated runner-retirement operation after confirming that they own no
 active jobs.
 
+## Release Cycling
+
+Releases are bundle-cut, not tag-cut: a release is a directory under
+`releases/` plus the `releases/gitforge-current` symlink the systemd drop-in
+pins. The full cycle is mechanical:
+
+```bash
+# 1. Gate: refuse to cut unless the live instance graded the exact
+#    source commit with a full, honest pipeline run (job rows must cover
+#    the persisted definition, name for name).
+scripts/gitforge-release-gate <40-hex-source-commit>
+
+# 2. Bundle: preflight + build release binaries + MANIFEST.sha256 + READY.
+GITFORGE_SOURCE_COMMIT=<sha> \
+  scripts/gitforge-release-bundle /nas/Temp/repos/GitForge \
+  /nas/Temp/repos/GitForge/releases gitforge-<shortsha>-<YYYYMMDD>
+
+# 3. Promote + restart, drain-gated and rollback-ready:
+./scripts/gitforge-release-auto            # dry-run: prints the plan
+./scripts/gitforge-release-auto --apply    # or AUTO_UPDATE=1
+```
+
+`gitforge-release-auto` refuses to run twice concurrently (flock on
+`releases/.auto-update.lock`), defers while any `gitforge-job-*` container is
+still running (drain gate — pending-only runs are just queued and do not
+block), flips `gitforge-current` atomically, restarts the `gitforge@*` units,
+and leaves the previous bundle in place for instant rollback (re-point the
+symlink and restart). Verify after cutover: `systemctl` unit states, `/health`
+on :42780/:42781/:42782, and `scripts/gitforge-status` with
+`GITFORGE_RELEASE_ROOT=/nas/Temp/repos/GitForge/releases/gitforge-current`
+(the default path reports false drift on this instance).
+
+Known boot behavior: the ci unit runs migrations, then the startup workspace
+sweep, then spawns the event consumer. Triggers published while the consumer
+is down or busy are durable and land once it drains — a `202` with a null
+`pipeline_run_id` means queued, not lost; re-query before re-triggering.
+
 ## Docker Compose
 
 Before `docker compose up`, set the required deployment variables in `.env`

@@ -273,3 +273,107 @@ checkpoint tuning for the gateway are the next levers if this recurs.
    with /tmp at 100%) — environment, not cutover; owner-side retry
    applies. CLI-token TTL (24h, no refresh) and job_log_chunks
    retention remain open product follow-ups from the same audit.
+## Phases 3 & 4 — Progress (2026-10-02/03, host under co-tenant load)
+
+- **Phase 4 supply chain executed** (23262d13): cargo-vet fully-audited
+  87 → 133 crates; exemptions 347 → 301; every `[[trusted.*]]`
+  publisher verified against ≥2 live peer-registry `audits.toml` files
+  before the entry was written — the no-self-certification rule held.
+- **Aegis baseline regenerated after triage** (4dbebfc1): 150
+  line-insensitive additions, 0 removals; every entry attributed
+  (cargo-vet public registry metadata, the webhook tests' pinned
+  loopback endpoint, digit-run false positives, baseline
+  self-reference, one changelog historical mention).
+- **Phase 3 webhook.rs route coverage advanced**: 55 → 76.5% (prior
+  #117 work), and the CI-delegation ladder is now covered end-to-end
+  against the pinned production endpoint (6c6df121), plus 8 unit tests
+  on `derive_webhook_job_plan`. Remaining api gaps by measured missed
+  lines: `ci.rs` (206), `artifacts.rs` (121), `webhook.rs` (107) —
+  the next session's ordered targets.
+- **Validation record** (branch `test/api-route-coverage-20261002`,
+  PR #252): fmt ✓; clippy `--workspace --all-targets -D warnings` ✓;
+  workspace tests 47/50 suites green at `--test-threads=2` — the 3
+  git-server spawned-protocol suites flake under co-tenant load and
+  pass 13/13 single-threaded (known class). GitForge pipeline run
+  ebbf21aa: fmt ✓ clippy ✓, `test` **timed out mid-compile** under
+  host load 111–382 (the sandbox compile was starved past the job
+  timeout before the test phase began); coverage cancelled by the
+  cascade. No in-sandbox coverage number was produced this cycle.
+- **New observation (defect class, owner: CI service)**: triggering a
+  run via `POST /api/pipelines/{id}/runs` during contention answered
+  202 with `pipeline_run_id: null` and materialized a **run row with
+  no job chain**, which reconcile later graded `cancelled` (run
+  431ac149). This is the synchronous api→ci trigger path; the
+  enqueue-only restructure already identified for the 10 s/502
+  symptom would fix both faces of the same defect.
+- Workspace coverage re-sweep status: two attempts died — the first on
+  a mid-flight compile break, the second to host load 111–382 making
+  instrumented builds non-viable. The authoritative in-sandbox number
+  rides the next clean pipeline `coverage` job.
+
+### Ghost-job defect observed during validation (2026-10-03, run 6799a7ac)
+
+The re-validation run for `d537df90` (push-triggered) surfaced a new
+platform failure class, recorded here as an F-candidate with evidence:
+
+- `fmt` + `clippy` succeeded (06:38–06:55Z). `test` (job
+  `093e53ef-3fb5-4dd8-a7f7-9480952dd911`, `timeout_secs=3600`) last
+  emitted a log chunk at 07:12:39Z ("Compiling api v0.1.0"), then went
+  permanently silent. At 08:1xZ the job's container was absent from
+  `docker ps -a` (not running, not exited) while five other jobs'
+  containers cycled to completion normally — the runner had lost it.
+- `data/abandoned-container-receipts.json` confirmed the runner's
+  in-memory view: `active_job_count: 0` for a job the DB graded
+  `running`. The orphan sweep only handles the inverse case (container
+  exists, no job); there is no reconciliation for "job exists, no
+  container".
+- Timeout enforcement fired at 08:24:46Z — **43 minutes past the
+  60-minute deadline**. The F37 cascade then behaved correctly
+  (coverage `cancelled` +42s, run graded `failed` +43s).
+- Under the same load, `POST /api/jobs/{id}/cancel` returned 500
+  `{"error":"database_error","message":"Failed to persist
+  cancellation"}` twice — the cancel path does not survive write-lock
+  contention (unlike the persist_with_retry-hardened write planes).
+
+Verdict: campaign code is not implicated — fmt/clippy green in-sandbox
+and the full local gate suite passed on this exact tip. Three platform
+defects to log for the durability ledger: (1) runner container loss
+with no liveness reconciliation and no firing timeout; (2) 43-minute
+timeout-enforcement lag under load; (3) cancel-persist not hardened
+against contention. A contributing environment factor: co-tenant
+/tmp-tmpfs exhaustion caused container-start failures the same night
+(see the v0.6.13 release record above); my run's container died at
+/tmp 100%. Re-validation will retry when host load clears.
+
+## Phase 3 — artifact routes + trigger-path coverage (2026-10-03)
+
+Measured per-line gaps in `crates/gitforge-api/src/routes/` (host
+llvm-cov on `e112e41c`) and closed the testable ones:
+
+- New `tests/artifact_routes.rs` (8 tests): the artifact endpoints
+  previously had only DTO unit tests — every handler body
+  (`list`, `get`, `content`, `delete`, `list_by_job`, `authorize_job`)
+  was uncovered. The suite drives the real router with an in-memory DB
+  and a temp-dir `FileStorage`, covering the owner/admin/intruder
+  authorization matrix, ID validation, download bytes/headers, and the
+  delete lifecycle.
+- New `tests/common/mod.rs`: the stub CI orchestrator moved out of
+  `webhook_routes.rs` so both the webhook and the pipeline-run trigger
+  routes can drive the pinned-endpoint delegation ladder (the stub
+  binds `127.0.0.1:42781` and skips when the live orchestrator owns the
+  port — coverage is collected in the CI sandbox where it is free).
+- `tests/ci_routes.rs` (+3 tests, 22→25): run-trigger validation order
+  (option-smuggling `ref` → 400 `invalid_ref`; missing storage → 500
+  `storage_unavailable`; unknown revision against a real bare repo →
+  400 `unknown_revision`; no orchestrator configured → 503
+  `ci_unavailable`), pipeline delete ID handling (400/404), and the
+  run-trigger delegation ladder (202 relay, 202 `queued`→null run id,
+  502 on orchestrator failure, zero local runs persisted).
+- `tests/webhook_routes.rs` (+1 test): pre-seeded idempotency key with
+  a different fingerprint → 409, run graded `failed`, no job persisted.
+
+Local gates on this tip: fmt clean, `clippy -p gitforge-api
+--all-targets -- -D warnings` clean, 41/41 tests green (the two
+port-gated ladders skip on this host by design). The remaining
+uncovered lines in these files are DB-error arms that require fault
+injection — out of scope without a seam for it.

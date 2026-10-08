@@ -228,6 +228,105 @@ impl Pool {
             }
         }
 
+        // Create pipeline_trigger_requests table: the durable hand-off
+        // between the CI trigger endpoint and the event consumer. The
+        // endpoint inserts here before publishing to the in-memory bus, so
+        // a restart or a dropped bus event can no longer lose a trigger
+        // after the git-server has already marked the webhook delivered.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pipeline_trigger_requests (
+                id TEXT PRIMARY KEY,
+                repo_id TEXT NOT NULL,
+                ref_name TEXT NOT NULL,
+                old_hash TEXT NOT NULL,
+                new_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                run_id TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (repo_id) REFERENCES repositories(id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!(
+                "failed to create pipeline_trigger_requests table: {e}"
+            ))
+        })?;
+
+        // At most one in-flight trigger per (repository, commit): the API
+        // and the webhook both fire on the same push, and the correlation
+        // window can answer `queued` to one of them while the other is still
+        // cloning — without this index every retry minted another duplicate
+        // run for the same commit. Completed and failed rows are excluded so
+        // an explicit re-trigger (manual re-run of an old commit) stays
+        // possible.
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_trigger_requests_active
+            ON pipeline_trigger_requests(repo_id, new_hash)
+            WHERE status IN ('pending', 'processing')
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create trigger request index: {e}")))?;
+
+        // The trigger-request sweep claims stale rows by status and age.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_trigger_requests_status
+            ON pipeline_trigger_requests(status, updated_at)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!(
+                "failed to create trigger request status index: {e}"
+            ))
+        })?;
+
+        // Refresh tokens: long-lived, revocable session credentials. Only
+        // the SHA-256 digest is stored (unsalted: the token is 244-bit
+        // random, so a leak cannot be reversed and equality lookup needs a
+        // deterministic digest) — a database leak must not yield usable
+        // credentials. Old databases gain
+        // the table on first boot after upgrade; tokens issued before the
+        // upgrade simply don't exist, which is the correct state.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create refresh_tokens table: {e}")))?;
+
+        // The login/refresh paths look tokens up by exact hash.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash
+            ON refresh_tokens(token_hash)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create refresh token index: {e}")))?;
+
         // Create runners table
         sqlx::query(
             r#"
@@ -558,6 +657,36 @@ impl Pool {
             .execute(&self.pool)
             .await
             .map_err(|e| Error::database(format!("failed to create idx_jobs_status: {e}")))?;
+
+        // The 60 s timeout watchdog scans exactly this shape every pass
+        // (`WHERE status = 'running' AND started_at IS NOT NULL`), and under
+        // load each unindexed pass added minutes of drift to timeout
+        // enforcement on top of the interval itself. The partial index keeps
+        // the scan proportional to the number of live jobs, not the table.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_running_started ON jobs(started_at) WHERE status = 'running'",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!("failed to create idx_jobs_running_started: {e}"))
+        })?;
+
+        // Same story for the evidence-strand sweep (F31 residual): it selects
+        // non-terminal rows carrying terminal evidence on every watchdog pass.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_jobs_stranded_evidence
+            ON jobs(finished_at)
+            WHERE finished_at IS NOT NULL
+              AND status IN ('pending', 'queued', 'assigned', 'running')
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!("failed to create idx_jobs_stranded_evidence: {e}"))
+        })?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_pipeline_run_id ON jobs(pipeline_run_id)")
             .execute(&self.pool)

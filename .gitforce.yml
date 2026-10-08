@@ -38,14 +38,14 @@ trigger_on:
 environment: {}
 jobs:
   - name: fmt
-    image: dsc-ci-rust:7
+    image: dsc-ci-rust:8
     steps:
       - name: Check formatting
         run: cargo fmt --all -- --check
     timeout: 15m
 
   - name: clippy
-    image: dsc-ci-rust:7
+    image: dsc-ci-rust:8
     needs: [fmt]
     steps:
       - name: Strict lint (zero warnings)
@@ -53,7 +53,7 @@ jobs:
     timeout: 60m
 
   - name: test
-    image: dsc-ci-rust:7
+    image: dsc-ci-rust:8
     needs: [clippy]
     steps:
       - name: Workspace test suite
@@ -64,14 +64,23 @@ jobs:
         # the child's readiness and failed with EPIPE (3 of 4 runs lost
         # that race while the same suite passed on the host). The daemon
         # has since moved to overlay2 and jobs run ~10x faster, but the
-        # two-thread bound stays: it keeps the suite well inside the 60m
+        # two-thread bound stays: it keeps the suite well inside the
         # timeout and the gate deterministic without re-litigating default
         # parallelism on every image refresh.
+        #
+        # The budget matches the coverage job's 90m (run b18b863f): with
+        # sibling CI runs saturating the host the cold-cache compile of
+        # the workspace test binaries alone can eat the hour the old 60m
+        # budget granted, and the job died to the watchdog mid-compile —
+        # an infrastructure kill, not a test verdict. 90m measured: the
+        # 2026-10-06 22:28 run finished test in ~36m under load ~40; the
+        # 23:29 run needed more than 60m under load ~45 with three
+        # concurrent runs.
         run: cargo test --workspace -- --test-threads=2
-    timeout: 60m
+    timeout: 90m
 
   - name: coverage
-    image: dsc-ci-rust:7
+    image: dsc-ci-rust:8
     needs: [test]
     steps:
       - name: Line coverage gate (fail 82, warn 84)

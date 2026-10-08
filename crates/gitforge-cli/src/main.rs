@@ -281,10 +281,81 @@ fn bare_repo_name(arg: &str) -> &str {
     arg.trim_matches('/').rsplit('/').next().unwrap_or(arg)
 }
 
+/// Renew the stored session when the JWT is missing or about to lapse.
+///
+/// The durable secret is the 30-day refresh credential persisted at
+/// login; the JWT it mints is a 24-hour bearer. Renewing here — before
+/// any command runs — is what keeps credentials valid across reboots
+/// and idle periods without re-running `gitforge auth --login`.
+/// Renewal rotates the credential server-side, so the new pair is
+/// persisted before the command proceeds.
+async fn renew_session(server: &str, config: &mut Config) -> Result<()> {
+    use chrono::{DateTime, Utc};
+
+    // Legacy credentials (pre-refresh servers) carry no renew path; the
+    // normal 401 hint still directs a re-login at expiry.
+    let Some(stored_refresh) = config.refresh_token.clone() else {
+        return Ok(());
+    };
+
+    let needs_renewal = match config
+        .token_expires_at
+        .as_deref()
+        .and_then(|stamp| DateTime::parse_from_rfc3339(stamp).ok())
+    {
+        Some(expires_at) => {
+            expires_at.with_timezone(&Utc) < Utc::now() + chrono::Duration::minutes(10)
+        }
+        // No recorded expiry means the stored JWT's lifetime is unknown;
+        // attempting one renewal is cheaper than a doomed request.
+        None => true,
+    };
+    if !needs_renewal {
+        return Ok(());
+    }
+
+    let client = GitForgeClient::new(server, None);
+    match client.refresh(&stored_refresh).await {
+        Ok(response) => {
+            config.token = Some(response.token);
+            config.token_expires_at =
+                Some((Utc::now() + chrono::Duration::seconds(response.expires_in)).to_rfc3339());
+            if let Some(rotated) = response.refresh_token {
+                config.refresh_token = Some(rotated);
+            }
+            if let Some(refresh_expires_in) = response.refresh_expires_in {
+                config.refresh_expires_at =
+                    Some((Utc::now() + chrono::Duration::seconds(refresh_expires_in)).to_rfc3339());
+            }
+            config.save()?;
+        }
+        Err(error) => {
+            // A definitive server rejection means the credential is dead
+            // (expired, revoked, or rotated by another login): drop the
+            // stale pair so the next command's hint is a plain re-login.
+            // Anything else (server down, network) is transient — keep
+            // the stored credentials rather than logging out spuriously.
+            if error.to_string().contains("401") {
+                config.token = None;
+                config.token_expires_at = None;
+                config.refresh_token = None;
+                config.refresh_expires_at = None;
+                if let Err(save_error) = config.save() {
+                    tracing::warn!("failed to persist credential reset: {save_error}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run the CLI command handler (extracted for testing)
 pub async fn run_cli(cli: Cli) -> Result<()> {
-    let config = Config::load().unwrap_or_default();
+    let mut config = Config::load().unwrap_or_default();
     let server = cli.server.unwrap_or_else(|| config.server_url.clone());
+    if let Err(error) = renew_session(&server, &mut config).await {
+        tracing::debug!("session renewal skipped: {error}");
+    }
     let token = cli.token.or_else(|| config.token.clone());
 
     match &cli.command {
@@ -307,15 +378,29 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     Ok(response) => {
                         println!("✅ Login successful!");
                         println!("   Token expires in {} seconds", response.expires_in);
+                        if let Some(refresh_expires_in) = response.refresh_expires_in {
+                            println!(
+                                "   Session renewable for {} days",
+                                refresh_expires_in / 86_400
+                            );
+                        }
                         println!();
-                        println!(
-                            "   Token: {}...",
-                            &response.token[..response.token.len().min(20)]
-                        );
 
                         // Save token to config
                         let mut config = config.clone();
                         config.token = Some(response.token);
+                        config.token_expires_at = Some(
+                            (chrono::Utc::now() + chrono::Duration::seconds(response.expires_in))
+                                .to_rfc3339(),
+                        );
+                        config.refresh_token = response.refresh_token;
+                        if let Some(refresh_expires_in) = response.refresh_expires_in {
+                            config.refresh_expires_at = Some(
+                                (chrono::Utc::now()
+                                    + chrono::Duration::seconds(refresh_expires_in))
+                                .to_rfc3339(),
+                            );
+                        }
                         if let Err(e) = config.save() {
                             tracing::warn!("Failed to save token: {}", e);
                         }
@@ -326,8 +411,19 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     }
                 }
             } else if *logout {
+                // Revoke the refresh credential server-side first so the
+                // dead credential can't be replayed; a server outage must
+                // not block a local logout, so that call is best-effort.
                 let mut config = config.clone();
+                if let Some(refresh_token) = config.refresh_token.take() {
+                    let revoker = GitForgeClient::new(&server, None);
+                    if let Err(e) = revoker.logout(&refresh_token).await {
+                        println!("⚠️  Server-side revocation skipped: {e}");
+                    }
+                }
                 config.token = None;
+                config.token_expires_at = None;
+                config.refresh_expires_at = None;
                 if let Err(e) = config.save() {
                     println!("⚠️  Warning: Failed to clear credentials: {e}");
                 }
@@ -341,6 +437,25 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             println!("   Username: {}", status.username.unwrap_or_default());
                             if let Some(role) = status.role {
                                 println!("   Role: {role}");
+                            }
+                            match (config.token_expires_at.as_deref(), &config.refresh_token) {
+                                (Some(expires_at), Some(_)) => {
+                                    println!("   JWT expires: {expires_at}");
+                                    if let Some(stamp) = &config.refresh_expires_at {
+                                        println!("   Refresh credential expires: {stamp}");
+                                    }
+                                }
+                                (Some(expires_at), None) => {
+                                    println!("   JWT expires: {expires_at}");
+                                    println!(
+                                        "   No refresh credential stored — re-login to enable \
+                                         automatic renewal."
+                                    );
+                                }
+                                (None, Some(_)) => {
+                                    println!("   Renewal credential stored (expiry unknown).");
+                                }
+                                (None, None) => {}
                             }
                         } else {
                             println!("❌ Not authenticated.");
@@ -692,11 +807,16 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 match api_client.run_pipeline(id, cli_ref.as_deref()).await {
                     Ok(triggered) => {
                         println!("🚀 Triggered pipeline: {id}");
-                        println!("   Run: {}", triggered.pipeline_run_id);
-                        println!(
-                            "   Watch it: gitforge pipeline --watch {}",
-                            triggered.pipeline_run_id
-                        );
+                        match triggered.pipeline_run_id {
+                            Some(run_id) => {
+                                println!("   Run: {run_id}");
+                                println!("   Watch it: gitforge pipeline --watch {run_id}");
+                            }
+                            None => println!(
+                                "   Accepted, but the orchestrator did not schedule a run \
+                                 (pipeline may not be registered with the scheduler)"
+                            ),
+                        }
                     }
                     Err(e) => println!("❌ {e}"),
                 }

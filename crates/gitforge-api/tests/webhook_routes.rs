@@ -16,20 +16,22 @@
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
-    response::IntoResponse,
-    routing::post,
     Router,
 };
 use gitforge_api::{ApiAuth, ApiServer, CiTriggerClient};
-use gitforge_common::{PipelineId, RepoId};
+use gitforge_common::{JobId, PipelineId, RepoId};
 use gitforge_db::{
     models::{JobStatus, Pipeline, Repository, User},
     queries::{JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries, UserQueries},
     Pool,
 };
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tower::ServiceExt;
+
+mod common;
+
+use common::serve_stub_ci;
 
 struct Fixture {
     app: Router,
@@ -409,84 +411,6 @@ async fn webhook_route_never_mutates_the_stored_pipeline() {
 // Delegation paths (a configured CI trigger client)
 // ---------------------------------------------------------------------------
 
-/// What the stub orchestrator recorded for each delegated trigger.
-#[derive(Debug)]
-struct StubTrigger {
-    token: String,
-    body: Value,
-}
-
-/// Shared state for the stub orchestrator: what it has received and the
-/// scripted responses it still owes.
-#[derive(Clone)]
-struct StubCiState {
-    seen: Arc<Mutex<Vec<StubTrigger>>>,
-    script: Arc<Mutex<Vec<(u16, Value)>>>,
-}
-
-/// The stub's only route, mirroring the production trigger contract:
-/// a `x-gitforge-trigger-token` header and a JSON trigger payload. A
-/// scripted `Value::String` is served raw (`text/plain`) to exercise the
-/// client's non-JSON branch; any other value is served as JSON.
-async fn stub_trigger(
-    axum::extract::State(state): axum::extract::State<StubCiState>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    let token = headers
-        .get("x-gitforge-trigger-token")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let text = String::from_utf8_lossy(&body).into_owned();
-    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
-    state.seen.lock().unwrap().push(StubTrigger {
-        token,
-        body: parsed,
-    });
-    let next = {
-        let mut script = state.script.lock().unwrap();
-        if script.is_empty() {
-            (500, json!({"error": "script exhausted"}))
-        } else {
-            script.remove(0)
-        }
-    };
-    let status = axum::http::StatusCode::from_u16(next.0).unwrap();
-    match next.1 {
-        Value::String(raw) => (status, raw).into_response(),
-        payload => (status, axum::Json(payload)).into_response(),
-    }
-}
-
-/// Bind the *pinned production endpoint* (`http://127.0.0.1:42781/
-/// pipelines/trigger`) and serve a scripted sequence of orchestrator
-/// responses. The client refuses any other URL by design, so owning the
-/// real port for the test's lifetime is the only honest way to drive the
-/// delegation ladder end-to-end.
-///
-/// Returns `None` when the port is already owned — the live orchestrator
-/// on a developer host — and the caller skips; the CI sandbox where the
-/// gate runs always has the port free, so coverage is collected there.
-async fn serve_stub_ci(script: Vec<(u16, Value)>) -> Option<Arc<Mutex<Vec<StubTrigger>>>> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:42781")
-        .await
-        .ok()?;
-    let received = Arc::new(Mutex::new(Vec::new()));
-    let state = StubCiState {
-        seen: received.clone(),
-        script: Arc::new(Mutex::new(script)),
-    };
-
-    let app: Router = Router::new()
-        .route("/pipelines/trigger", post(stub_trigger))
-        .with_state(state);
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    Some(received)
-}
-
 /// The full delegation ladder through the pinned endpoint: a healthy
 /// orchestrator answer relays its run id, the honest `queued` answer
 /// relays "no run yet", and any orchestrator failure (HTTP error status,
@@ -583,4 +507,48 @@ async fn webhook_delegation_ladder_relays_success_and_fails_closed() {
         "0000000000000000000000000000000000000000"
     );
     assert_eq!(seen[0].body["new_hash"], "1".repeat(40));
+}
+
+#[tokio::test]
+async fn webhook_replaying_a_key_with_a_different_job_conflicts() {
+    let f = seed().await;
+    let commit = "d".repeat(40);
+
+    // Pre-seed the durable idempotency key this delivery would derive,
+    // stored under a fingerprint that cannot match the handler's plan.
+    let scope = format!("webhook:{}", f.valid_pipeline);
+    let key = format!("webhook:{}:{commit}", f.valid_pipeline);
+    JobQueries::reserve_idempotency(
+        &f.pool,
+        &scope,
+        &key,
+        "{\"fingerprint\":\"stale\"}",
+        JobId::new(),
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = post_webhook(
+        f.app,
+        &f.valid_pipeline,
+        &f.owner_token,
+        webhook_payload(&f.repo_id, &commit),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["success"], false);
+    assert_eq!(
+        body["message"],
+        "Webhook idempotency key was reused with a different job"
+    );
+    assert!(body["pipeline_id"].is_null());
+
+    // The conflicted delivery grades the run it created `failed` and
+    // leaves no job behind: one idempotency key maps to one executable
+    // job, and the loser of the key never queues work.
+    let runs = PipelineRunQueries::list(&f.pool).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, "failed");
+    let jobs = JobQueries::list_by_run(&f.pool, runs[0].id).await.unwrap();
+    assert!(jobs.is_empty());
 }

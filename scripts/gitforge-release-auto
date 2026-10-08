@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# Cycle the live GitForge services onto the newest verified release bundle.
+#
+# This is the update channel: every READY-marked bundle under releases/ is a
+# candidate, the newest one that differs from the promoted bundle wins, and
+# the promote -> restart -> health-verify -> rollback-on-failure chain is the
+# same chain an operator runs by hand, executed mechanically.
+#
+# Default mode is a dry-run report: what is promoted now, what would change,
+# whether the runners are busy. Acting requires --apply (or AUTO_UPDATE=1,
+# which is how the systemd timer opt-in works). Two safety gates sit in
+# front of any action:
+#   - a bundle must pass gitforge-release-verify (binaries, manifest, READY)
+#   - ci/runner are only restarted when no `gitforce-job-*` container is
+#     running; a busy fleet defers the whole cutover to the next pass
+#     (pending-only runs are just queued work — restarting ci mid-flight is
+#     the heartbeat-loss incident class, not a maintenance no-op)
+#
+# Usage: gitforge-release-auto [--apply]
+# Environment:
+#   GITFORGE_AUTO_REPO     checkout root (default: derived from this script)
+#   GITFORGE_AUTO_API      api health URL (default http://localhost:42780)
+#   GITFORGE_AUTO_WAIT     seconds to wait for post-restart health (default 60)
+# Exit codes: 0 nothing to do / updated / deferred cleanly, 1 real failure.
+set -u -o pipefail
+
+apply=0
+case "${1:-}" in
+    "") ;;
+    --apply) apply=1 ;;
+    -h|--help)
+        sed -n '2,28p' "$0"
+        exit 0
+        ;;
+    *)
+        printf 'usage: gitforge-release-auto [--apply]\n' >&2
+        exit 64
+        ;;
+esac
+if [[ "${AUTO_UPDATE:-0}" == "1" ]]; then
+    apply=1
+fi
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root="${GITFORGE_AUTO_REPO:-$(cd -- "$script_dir/.." && pwd)}"
+releases_dir="$repo_root/releases"
+current_link="$releases_dir/gitforge-current"
+api_url="${GITFORGE_AUTO_API:-http://localhost:42780}"
+health_wait="${GITFORGE_AUTO_WAIT:-60}"
+lock_file="$releases_dir/.auto-update.lock"
+
+say() { printf 'release-auto: %s\n' "$1"; }
+die() { printf 'release-auto: %s\n' "$1" >&2; exit 1; }
+
+# One cutover at a time, across operators and timer ticks.
+mkdir -p "$releases_dir"
+exec 9>"$lock_file"
+if ! flock -n 9; then
+    say "another auto-update pass holds the lock; skipping"
+    exit 0
+fi
+
+[[ -d "$releases_dir" ]] || die "no releases directory: $releases_dir"
+[[ -L "$current_link" ]] || die "no promoted bundle link: $current_link"
+
+promoted=$(readlink -- "$current_link")
+promoted_id=$(basename -- "$promoted")
+
+# Recency key for a bundle: its cut date (the name's trailing yyyymmdd —
+# short SHAs sort in no chronological order) with the READY marker's mtime
+# as the same-day tiebreak.
+bundle_key() {
+    local day
+    day=$(basename -- "$1" | awk -F- '{print $NF}')
+    case "$day" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+        *) day=00000000 ;;
+    esac
+    printf '%s %s\n' "$day" "$(stat -c %Y -- "$1/READY" 2>/dev/null || echo 0)"
+}
+
+promoted_key=$(bundle_key "$releases_dir/$promoted_id")
+
+# Lexicographic "day mtime" comparison — `[[ a > b ]]` has locale traps,
+# so order via sort and require the keys to differ.
+key_gt() {  # key_gt <a> <b> -> true when a > b
+    [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | LC_ALL=C sort -r | head -1)" == "$1" ]]
+}
+
+# Candidate = READY-marked bundle strictly newer than the promoted one.
+# A lexically-greater name is NOT a newer bundle, so old bundles can never
+# downgrade the channel.
+candidate=""
+candidate_id=""
+candidate_key=""
+for dir in "$releases_dir"/gitforge-*-*; do
+    [[ -d "$dir" && -s "$dir/READY" ]] || continue
+    id=$(basename -- "$dir")
+    [[ "$id" == "$promoted_id" ]] && continue
+    key=$(bundle_key "$dir")
+    if key_gt "$key" "$promoted_key" && { [[ -z "$candidate_key" ]] || key_gt "$key" "$candidate_key"; }; then
+        candidate=$dir
+        candidate_id=$id
+        candidate_key=$key
+    fi
+done
+
+if [[ -z "$candidate" ]]; then
+    say "promoted=$promoted_id; no newer verified bundle — nothing to do"
+    exit 0
+fi
+
+# Runners busy? Any live `gitforce-job-*` container defers the cutover.
+job_containers=$(docker ps -q --filter "name=gitforce-job-" 2>/dev/null | wc -l)
+
+say "promoted=$promoted_id candidate=$candidate_id apply=$apply job_containers=$job_containers"
+
+if [[ "$job_containers" -gt 0 ]]; then
+    say "deferred: $job_containers job container(s) running; retry on the next pass"
+    exit 0
+fi
+
+if ! "$script_dir/gitforge-release-verify" "$candidate"; then
+    die "candidate bundle failed verification; leaving $promoted_id promoted"
+fi
+
+if [[ "$apply" -ne 1 ]]; then
+    say "dry-run: would promote $candidate_id and restart gitforge@api gitforge@git-server, then gitforge@ci gitforge@runner"
+    exit 0
+fi
+
+restart_units() {
+    local batch="$1"
+    if ! sudo -n systemctl restart gitforge@api gitforge@git-server; then
+        return 1
+    fi
+    if [[ "$batch" == "all" ]]; then
+        sudo -n systemctl restart gitforge@ci gitforge@runner || return 1
+    fi
+    return 0
+}
+
+wait_healthy() {
+    local deadline=$((SECONDS + health_wait))
+    while (( SECONDS < deadline )); do
+        if curl -fsS --max-time 5 "$api_url/health" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+rollback() {
+    say "cutover failed; rolling back to $promoted_id"
+    if "$script_dir/gitforge-release-promote" --apply "$releases_dir/$promoted_id" "$current_link"; then
+        restart_units all || say "rollback restart failed; units need manual attention"
+        if wait_healthy; then
+            say "rollback healthy: $promoted_id is live again"
+        else
+            say "rollback restart did not become healthy; INVESTIGATE MANUALLY"
+        fi
+    else
+        say "rollback promote failed; INVESTIGATE MANUALLY"
+    fi
+    exit 1
+}
+
+# Re-read the link immediately before acting: a co-tenant may have promoted
+# between detection and now, and the promote script's atomic mv makes the
+# last writer the live bundle.
+now_promoted=$(basename -- "$(readlink -- "$current_link")")
+if [[ "$now_promoted" != "$promoted_id" ]]; then
+    say "promoted bundle changed mid-pass ($promoted_id -> $now_promoted); re-running on the next pass"
+    exit 0
+fi
+
+if ! "$script_dir/gitforge-release-promote" --apply "$candidate" "$current_link"; then
+    die "promote failed; previous bundle untouched"
+fi
+say "promoted $candidate_id"
+
+if ! restart_units stateless; then
+    rollback
+fi
+if ! wait_healthy; then
+    rollback
+fi
+say "api + git-server healthy on $candidate_id"
+
+if ! restart_units all; then
+    rollback
+fi
+say "ci + runner restarted (fleet was drained)"
+
+if ! wait_healthy; then
+    rollback
+fi
+
+if GITFORGE_RELEASE_ROOT="$current_link" "$script_dir/gitforge-status" >/dev/null 2>&1; then
+    say "cutover complete and healthy: $candidate_id is live"
+else
+    say "cutover complete, but gitforge-status reports drift; check its output"
+fi

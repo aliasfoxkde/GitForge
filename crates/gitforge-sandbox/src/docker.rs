@@ -436,6 +436,27 @@ pub trait Sandbox: Send + Sync {
     async fn destroy(&self, instance: SandboxInstance) -> Result<()>;
 }
 
+/// Whether the daemon still knows the container. A 404 is authoritative
+/// loss; any other inspect error is inconclusive and reported as present —
+/// callers must not grade a job infrastructure-failed on a transient API
+/// hiccup alone.
+async fn container_present(docker: &Docker, container_id: &str) -> bool {
+    match docker.inspect_container(container_id, None).await {
+        Ok(_) => true,
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => false,
+        Err(e) => {
+            tracing::warn!(
+                %container_id,
+                error = %e,
+                "container existence check failed; assuming present"
+            );
+            true
+        }
+    }
+}
+
 /// Compose the env for one docker exec: workspace git trust vars first (when
 /// the instance mounts a workspace), then the caller's `KEY=VALUE` pairs.
 /// Caller env is layered over the container environment; it can add or
@@ -659,7 +680,6 @@ impl Sandbox for DockerSandbox {
 
             let mut stdout = String::new();
             let mut stderr = String::new();
-            let mut exit_code = 0i32;
 
             if let StartExecResults::Attached { mut output, .. } = result {
                 loop {
@@ -680,7 +700,21 @@ impl Sandbox for DockerSandbox {
                                 }
                                 Some(Ok(_)) => {}
                                 Some(Err(e)) => {
+                                    // A mid-stream error usually means the
+                                    // container died under the exec (OOM kill,
+                                    // removal, daemon restart). Confirm against
+                                    // the daemon before grading: a vanished
+                                    // container is an infrastructure failure,
+                                    // never a silent pass. Any other error
+                                    // keeps the tolerant behavior — the poll
+                                    // below still recovers the real outcome.
                                     tracing::warn!("exec output error: {}", e);
+                                    if !container_present(docker, &instance.container_id).await {
+                                        return Err(Error::sandbox(format!(
+                                            "container lost while exec {} was streaming output",
+                                            exec.id
+                                        )));
+                                    }
                                 }
                                 None => break,
                             }
@@ -696,16 +730,40 @@ impl Sandbox for DockerSandbox {
                 }
             }
 
-            // Inspect to get exit code
-            match docker.inspect_exec(&exec.id).await {
-                Ok(inspect) => {
-                    exit_code = inspect.exit_code.unwrap_or(0) as i32;
+            // Inspect to get the exit code. The old code defaulted any
+            // unreadable outcome to 0, so a container that vanished between
+            // the output stream and the inspect graded its step as passed —
+            // the false-green class. Poll briefly for a definitive answer,
+            // then fail loudly: an unknown outcome is not a pass, and the
+            // executor grades the error as an infrastructure failure.
+            let mut resolved: Option<i32> = None;
+            for attempt in 0..5u32 {
+                match docker.inspect_exec(&exec.id).await {
+                    Ok(inspect) if inspect.running == Some(false) => {
+                        resolved = Some(inspect.exit_code.unwrap_or(0) as i32);
+                        break;
+                    }
+                    Ok(_) => {
+                        tracing::trace!(attempt, "exec still running at inspect");
+                    }
+                    Err(e) => {
+                        tracing::warn!(attempt, error = %e, "failed to inspect exec");
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("failed to inspect exec: {}", e);
-                }
+                sleep(Duration::from_millis(250)).await;
             }
-
+            let Some(exit_code) = resolved else {
+                if !container_present(docker, &instance.container_id).await {
+                    return Err(Error::sandbox(format!(
+                        "container lost before exec {} reported its exit code",
+                        exec.id
+                    )));
+                }
+                return Err(Error::sandbox(format!(
+                    "exec {} finished but its exit code could not be read",
+                    exec.id
+                )));
+            };
             Ok(StepResult {
                 exit_code,
                 stdout,

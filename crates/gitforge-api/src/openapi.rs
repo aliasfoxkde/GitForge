@@ -43,7 +43,7 @@ pub fn get_openapi_spec() -> serde_json::Value {
                 "post": {
                     "tags": ["auth"],
                     "summary": "Authenticate a user",
-                    "description": "Authenticates a persisted user and returns a 24-hour bearer token. This public route is mounted at /auth/login, not under /api.",
+                    "description": "Authenticates a persisted user and returns a 24-hour bearer token plus a 30-day refresh credential for silent renewal. This public route is mounted at /auth/login, not under /api.",
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -70,13 +70,81 @@ pub fn get_openapi_spec() -> serde_json::Value {
                                         "properties": {
                                             "token": {"type": "string"},
                                             "token_type": {"type": "string", "example": "Bearer"},
-                                            "expires_in": {"type": "integer", "format": "int64", "example": 86400}
+                                            "expires_in": {"type": "integer", "format": "int64", "example": 86400},
+                                            "refresh_token": {"type": "string", "description": "Long-lived credential; rotate via /auth/refresh. Omitted when its row could not be persisted."},
+                                            "refresh_expires_in": {"type": "integer", "format": "int64", "example": 2592000}
                                         }
                                     }
                                 }
                             }
                         },
                         "401": {"description": "Invalid username or password"}
+                    }
+                }
+            },
+            "/auth/refresh": {
+                "post": {
+                    "tags": ["auth"],
+                    "summary": "Exchange a refresh credential for a fresh token pair",
+                    "description": "Rotates on use: the presented credential is revoked and a new credential accompanies the fresh 24-hour bearer token. Replaying a rotated credential fails closed with 401. This public route is mounted at /auth/refresh, not under /api.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["refresh_token"],
+                                    "properties": {
+                                        "refresh_token": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Fresh token pair",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["token", "token_type", "expires_in"],
+                                        "properties": {
+                                            "token": {"type": "string"},
+                                            "token_type": {"type": "string", "example": "Bearer"},
+                                            "expires_in": {"type": "integer", "format": "int64", "example": 86400},
+                                            "refresh_token": {"type": "string", "description": "The rotated replacement credential."},
+                                            "refresh_expires_in": {"type": "integer", "format": "int64", "example": 2592000}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "401": {"description": "Invalid, expired, or rotated credential"}
+                    }
+                }
+            },
+            "/auth/logout": {
+                "post": {
+                    "tags": ["auth"],
+                    "summary": "Revoke a refresh credential",
+                    "description": "Revokes the presented credential server-side. Idempotent: unknown or already-revoked credentials still answer 200 so logout never leaks whether a credential existed. This public route is mounted at /auth/logout, not under /api.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["refresh_token"],
+                                    "properties": {
+                                        "refresh_token": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {"description": "Credential revoked (or already dead)"}
                     }
                 }
             },
@@ -998,6 +1066,8 @@ mod tests {
         let spec = get_openapi_spec();
         let paths = spec.get("paths").unwrap().as_object().unwrap();
         assert!(paths.contains_key("/auth/login"));
+        assert!(paths.contains_key("/auth/refresh"));
+        assert!(paths.contains_key("/auth/logout"));
         assert!(paths.contains_key("/auth/status"));
         assert!(paths.contains_key("/health"));
         assert!(paths.contains_key("/repos"));

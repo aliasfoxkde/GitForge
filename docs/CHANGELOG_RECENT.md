@@ -2,6 +2,76 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [0.6.15] - 2026-10-07
+
+### Added
+
+- **Persistent sessions via rotating refresh credentials**: the API
+  issued a 24-hour bearer JWT with no renewal path, so every client
+  re-authenticated daily. Login now also returns a 30-day refresh
+  credential (stored server-side as a SHA-256 digest only, never the
+  plaintext); `POST /auth/refresh` rotates it on use and fails closed
+  on replay, and `POST /auth/logout` revokes it server-side,
+  idempotently. The CLI persists the pair (0600 config), silently
+  renews before any command when the JWT is within ten minutes of
+  expiry, clears itself fail-closed if the server rejects the
+  credential, and revokes on logout. Verified end to end against a
+  scratch instance: login → forced-expiry renewal with rotation →
+  replay rejection → logout revocation (405fc6ad).
+
+- **Auto-update channel**: `scripts/gitforge-release-auto` cycles the
+  live services onto the newest verified release bundle — newest by
+  cut date (old bundles can never downgrade the channel), drained
+  fleet required before ci/runner restart (no `gitforce-job-*`
+  containers), post-restart health gate, and automatic rollback to
+  the previously promoted bundle if health fails. Dry-run by default;
+  a pair of systemd units runs the pass every six hours with a safe
+  dry-run default until the operator sets `AUTO_UPDATE=1` (cafc316f).
+
+### Fixed
+
+- **Ghost job rows swept durably**: finalization paths that predated
+  the per-run sweeps left never-dispatched (`pending`/`queued`) rows
+  stranded under terminal runs — 1478 had accumulated, undispatchable
+  and forever counted as open work. `cancel_unclaimed_in_terminal_runs`
+  reclaims them across all runs at ci startup and every reconciliation
+  tick, so the first boot of this release cleans the historical
+  backlog without manual database surgery. Only runner-untouched
+  states are swept; live runs and claimed rows are never candidates
+  (f39d6e01).
+
+- **Platform durability sweep** (merged `fix/platform-durability`):
+  jobs whose container vanishes fail honestly instead of hanging
+  (d388a241); watchdog reaps grade runs `timed_out` end-to-end
+  (01978860); the publication outbox stays pending on failure so the
+  next pass retries rather than losing the event (984c9705); webhook
+  triggers gained per-repo lanes and a durable queue with watchdog
+  indexes, and the event stream survives bus lag (20f3cd77,
+  49563211, 066ac18d).
+
+- **CLI no longer crashes on unscheduled triggers**: a pipeline
+  trigger the scheduler could not immediately place returned a null
+  `pipeline_run_id` that the CLI decoded into a hard error
+  (8d66cfde).
+
+### Supply Chain
+
+- **cargo-vet trusted publishers delegated to peer registries**: 43
+  publishers whose audits are attested by the mozilla, Bytecode
+  Alliance, ISRG, and zcash registries are declared `[[trusted.*]]`
+  with per-entry provenance, dropping exemptions 347 → 301
+  (23262d13). Aegis baseline regenerated after the new tests landed
+  (4dbebfc1).
+
+### Tests
+
+- Webhook CI-delegation ladder covered end-to-end against a stub
+  orchestrator (run-id relay, honest queued, HTTP failure, non-JSON
+  body), plus eight `derive_webhook_job_plan` unit tests (6c6df121);
+  artifact routes, run-trigger validation, and webhook conflicts
+  covered (7427dec6); ghost sweep, refresh rotation/replay, and
+  logout-idempotence regression tests ship with their fixes.
+
 ## [0.6.14] - 2026-10-03
 
 ### Added
@@ -42,6 +112,30 @@ All notable changes to GitForge will be documented in this file.
   the accumulation of per-push duplicate pipeline records in list
   output (752ea428, absorbed into this cut from
   `fix/pipeline-list-active-20261002`).
+
+### Supply Chain
+
+- **cargo-vet fully-audited coverage raised from 87 to 133 crates**:
+  43 publishers whose audits are already attested across the peer
+  registries (mozilla, Bytecode Alliance, ISRG, zcash) are now declared
+  as `[[trusted.*]]` with a per-entry provenance note; the exemptions
+  list dropped 347 → 301. Nothing was self-certified — each trusted
+  publisher's crates.io owner id was resolved and confirmed against at
+  least two live peer-registry `audits.toml` files before the trust
+  entry was written (23262d13).
+
+### Tests
+
+- **Webhook CI-delegation ladder covered end-to-end**: a stub
+  orchestrator binds the pinned production trigger endpoint (the client
+  refuses any other URL by design) and scripts the four outcomes the
+  gateway must distinguish — run-id relay, honest queued answer, HTTP
+  failure, non-JSON body — asserting 202 relay vs fail-closed 502 and
+  that delegation never persists local runs (6c6df121). The route's
+  non-delegating path keeps its six existing tests, and
+  `derive_webhook_job_plan` gains eight unit tests covering entry-job
+  selection, step command collection, every definition rejection, and
+  timeout parsing.
 
 ## [0.6.12] - 2026-10-01
 

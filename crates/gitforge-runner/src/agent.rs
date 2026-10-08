@@ -1531,10 +1531,15 @@ impl RunnerAgent {
         });
         // The backend, not the commit, failed this job: say so explicitly
         // so the durable row lands as infrastructure_failure (R6.3), not as
-        // a code failure. Omitted for ordinary outcomes; the scheduler's
-        // default mapping keeps the wire contract backward compatible.
+        // a code failure. The scheduler already accepts `timed_out`; the
+        // runner used to grade its own deadline kill as `failed`, which the
+        // durable watchdog then could not distinguish from a real red X.
+        // Omitted for ordinary outcomes; the scheduler's default mapping
+        // keeps the wire contract backward compatible.
         if result.infrastructure_failure {
             complete_request["outcome"] = serde_json::json!("infrastructure_failure");
+        } else if result.timed_out {
+            complete_request["outcome"] = serde_json::json!("timed_out");
         }
 
         let mut complete_request_builder = client.post(&complete_url).json(&complete_request);
