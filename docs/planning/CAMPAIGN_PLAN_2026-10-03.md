@@ -138,3 +138,67 @@ that decision in an ADR rather than silently under-delivering.
 - [`unwrap_used` / `expect_used` / `panic` lints](https://doc.rust-lang.org/clippy/lints.html)
 - [paiml/duende lint policy (deny unwrap/expect/panic, tests exempt)](https://github.com/paiml/duende)
 - [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) — coverage-gate patterns in flagship Rust repos
+
+## Release v0.6.15 (executed 2026-10-08)
+
+1. ✅ Content: persistent sessions via rotating refresh credentials
+   (`405fc6ad` — ends the every-reboot re-auth; login now returns
+   `refresh_token` and `POST /auth/refresh` rotates both tokens), CLI
+   null `pipeline_run_id` decode fix (`8d66cfde`), 0.6.14 changelog
+   (`34a39086`), 0.6.15 changelog (`5e731a10`), CI image bump
+   `dsc-ci-rust:7 → :8` (`2c9fda95` — the branch's Cargo.lock adds
+   hex + sha2 0.11.0, so the :7 offline registry no longer matched the
+   lockfile; :8 baked from the release tip per the ci-rust.Dockerfile
+   contract and mirrored to fedora, sha256-verified both sides), and a
+   real delegation-ladder test fix (`b6d13e69` — the assertion counted
+   runs in an unfiltered list while the fixture seeds one; the bug was
+   invisible on the host because `serve_stub_ci` skips when the live ci
+   owns :42781 and only executes in the sandbox).
+2. ✅ Validation on the exact release SHA `b6d13e69`: run `3995b675`
+   green 4/4 (fmt, clippy, test, coverage) — and it executed on the
+   NEW ci process, making it the post-cutover smoke run as well. Gate
+   passed mechanically: `release gate: PASSED — run 3995b675 green,
+   4/4 jobs covering the persisted definition`.
+3. ✅ Cutover (absorbed a mid-cycle collision, do not race): bundle
+   `gitforge-b6d13e69-20261008` (built 08:47:01Z, RELEASE_METADATA
+   source_commit exact-matches the gated SHA) was bundled and promoted
+   by a co-tenant arm at 08:48Z before the green run existed; this arm
+   verified the metadata, produced the gated green run on the promoted
+   ci, and adopted the cutover instead of re-cutting. All four units
+   have run the bundle binaries since the 10:19:32Z restart. The
+   restart honestly fenced this arm's in-flight attempt-10 test job
+   (`scheduler_restart_fenced_running_job`).
+4. ✅ Post-cutover verification: `/health` 200 on :42780/:42781/:42782;
+   boot journal shows migrations → event consumer (10:20:11Z) →
+   workspace sweep (10:20:23Z, removed=3); `gitforge-status` clean with
+   `GITFORGE_RELEASE_ROOT=…/releases/gitforge-current`; durable trigger
+   queue proven in production — a trigger published at 10:33Z landed
+   as a run row at 10:38Z while the consumer was busy with a co-tenant
+   checkout (late, never lost — the pre-0.6.15 hollow-trigger loss is
+   closed); auth rotation verified live (login → refresh rotates
+   access+refresh); CLI rebuilt from the release tip and live via the
+   existing `~/.local/bin/gitforge` symlink, `auth --status` works and
+   leaves a copied config byte-identical (the old CLI's save-drops-
+   tokens defect no longer reproduces on read paths).
+5. Incident ledger for this release cycle — 11 trigger attempts, 10
+   infra/environment kills, each root-caused with journal+DB evidence:
+   runner_lost (heartbeat UPDATE stalled 140s under DB pressure →
+   stale sweep fenced a healthy job), ghost runs ×2 (run row created,
+   checkout never spawned — both formed while ci's sequential consumer
+   was mid-clone on a CO-TENANT workspace; every idle-consumer creation
+   succeeded), NAS rmeta EIO mid-clippy (btrfs read failure under
+   load), sandbox acquisition timeout at load 66 (60s hard cap,
+   Docker daemon saturated), one REAL test defect (fixed in the release
+   SHA), and the restart fence above. Re-fire, don't debug: every
+   infra kill re-triggered clean on the next window.
+6. 0.6.16 candidates from this cycle: spawn the event consumer before
+   the inline engine rebuild; grade a run failed when its checkout
+   spawn errors (and move per-run checkouts off the sequential
+   consumer); cascade manual job cancels to pending descendants (F37
+   covers failure-grading only); load-aware or raised sandbox
+   acquisition cap; checkpoint/requeue for jobs fenced by
+   `scheduler_restart` (retry_count stayed 0); persist_with_retry for
+   the runner heartbeat write.
+7. Mirror convergence: gitforge-ci main fast-forwarded to the release
+   tip in this cycle; GitHub mirror via PR after (branch
+   `feat/v0614-auth-updates`, 30 commits).
