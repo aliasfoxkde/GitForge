@@ -1546,9 +1546,16 @@ async fn run_trigger_delegation_ladder_relays_the_orchestrator_answers() {
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["error"], "ci_trigger_failed");
 
-    // Delegation is CI's custody: nothing is persisted locally.
+    // Delegation is CI's custody: nothing is persisted locally beyond the
+    // run the fixture itself seeds (list() is an unfiltered SELECT, so the
+    // contract is "no run added by the three trigger calls", not emptiness).
     let runs = PipelineRunQueries::list(&f.pool).await.unwrap();
-    assert!(runs.is_empty(), "delegation must not persist local runs");
+    assert_eq!(
+        runs.len(),
+        1,
+        "delegation must not persist local runs beyond the fixture seed"
+    );
+    assert_eq!(runs[0].id, f.run_id, "the only run is the fixture seed");
 
     // The stub saw the production trigger contract: the configured
     // token header, the repository, and the requested revision carried
