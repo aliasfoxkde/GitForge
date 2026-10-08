@@ -67,5 +67,8 @@ service-specific DDL path.
 
 The implementation adds migration, recovery, health-gating, and trigger-flow
 tests. `cargo fmt -p ci -- --check` and `git diff --check` passed for the
-initial implementation commit. Build, tests, Clippy, Aegis, and GitForge
-pipeline results remain pending until the current branch gates complete.
+initial implementation commit. A live adapter attempt on 2026-10-08 observed
+the deployed scheduler return `queued` without `trigger_id`; the backend/API
+version on Fedora must be updated before the end-to-end adapter gate can pass.
+Build, tests, Clippy, Aegis, and current-head GitForge pipeline results remain
+pending.

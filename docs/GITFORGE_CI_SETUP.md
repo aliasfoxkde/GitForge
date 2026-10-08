@@ -12,24 +12,38 @@ the shared migration before binding the listener.
 
 ## Enqueue: `POST /pipelines/trigger`
 
-Credential: `GITFORGE_CI_TRIGGER_TOKEN`, sent as
-`Authorization: Bearer <token>` or the git-server compatibility header
-`x-gitforge-trigger-token: <token>`.
+Credential: `GITFORGE_CI_TRIGGER_TOKEN`, sent in the HTTP Authorization bearer
+header or the git-server compatibility header `x-gitforge-trigger-token`.
 
 The request is recorded durably before anything is planned. A deduplicated
 repeat answers `202` immediately; a new request holds the connection for at
 most `CI_TRIGGER_CORRELATION_WINDOW` (15 seconds in current builds) while the
 orchestrator plans the run. Either way the answer is `202` and always carries
 a **stable `trigger_id`** (a UUID), including on a deduplicated request.
-The response includes `status`, `trigger_id`, `deduplicated`, `event_id`,
-`pipeline_run_id`, `repo_id`, and `new_hash`; `pipeline_run_id` is absent
-until a run has been correlated.
+The response includes these fields; `pipeline_run_id` is absent until a run
+has been correlated.
+
+| Field | Meaning |
+| --- | --- |
+| `trigger_id` | Stable UUID used to poll this request. Required for the asynchronous workflow path. |
+| `event_id` | UUID of the published event. |
+| `pipeline_run_id` | UUID of the correlated run; absent while planning is pending. |
+| `repo_id` | GitForge repository UUID. |
+| `new_hash` | Commit hash requested by the trigger. |
+| `deduplicated` | Whether the request reused an existing open trigger. |
+| `status` | One of the lifecycle values below. |
 
 | `status` | Meaning |
 | --- | --- |
 | `accepted` | The run was planned and `pipeline_run_id` was correlated inside the trigger window. |
 | `queued` | The correlation window (see above) elapsed before the waiter fired. By design the in-process consumer still plans the run afterwards, so the caller polls the `trigger_id` for its id — but see the coverage note below. |
 | `deduplicated` | A request for the same repository, ref, and commit is still open; no new run was planned, and `pipeline_run_id` is absent. |
+
+The GitHub Actions adapter must preserve `trigger_id` from every successful
+enqueue and poll the status endpoint when `pipeline_run_id` is not yet
+available. It must fail with an explicit compatibility error if the server
+returns `queued` without a `trigger_id`; resubmitting cannot safely recover
+the correlation.
 
 Coverage note: the integration tests exercise the `accepted` and
 `deduplicated` answers end to end. The `queued` answer itself is still not
@@ -100,26 +114,25 @@ database, so treat that part as intended/unverified.
 
 ## Status: `GET /pipelines/trigger-requests/{trigger_id}`
 
-Credential: `GITFORGE_SCHEDULER_OPERATOR_TOKEN`, sent as
-`Authorization: Bearer <token>`. The shared scheduler token
+Credential: `GITFORGE_SCHEDULER_OPERATOR_TOKEN`, sent in the HTTP Authorization
+bearer header. The shared scheduler token
 (`GITFORGE_SCHEDULER_TOKEN`) is accepted only when no operator token is
 configured, mirroring `GET /pipelines/runs/{run_id}`; the operator-first
 resolution order is unit-tested at the credential resolver, while acceptance
 of the shared token itself is not exercised end to end.
 
-```json
-{
-  "trigger_id": "0d3fc1a2-…",
-  "status": "processing",
-  "repo_id": "…",
-  "ref_name": "refs/heads/main",
-  "new_hash": "…",
-  "pipeline_run_id": "c5829e10-…",
-  "error": null,
-  "created_at": "2026-10-08T00:00:00+00:00",
-  "updated_at": "2026-10-08T00:00:05+00:00"
-}
-```
+The response fields are:
+
+| Field | Meaning |
+| --- | --- |
+| `trigger_id` | Stable UUID returned by the submit endpoint. |
+| `status` | `pending`, `claimed`, `processing`, `completed`, or `failed`. |
+| `repo_id` | GitForge repository UUID. |
+| `ref_name` | Git ref associated with the request. |
+| `new_hash` | Requested commit hash. |
+| `pipeline_run_id` | Correlated run UUID, absent until a run is linked. |
+| `error` | Failure cause when the request reaches `failed`; otherwise null. |
+| `created_at`, `updated_at` | RFC3339 lifecycle timestamps. |
 
 | Status | Meaning |
 | --- | --- |
@@ -238,6 +251,10 @@ discards the service's stdout and stderr, so the suite observes no logs.
 
 Source formatting passed with `cargo fmt -p ci -- --check`; `git diff --check`
 also passed. No build, `cargo test`, Clippy, or GitForge pipeline has run
-against these changes. The test names above describe source coverage, not
-passing results; treat behavior as unverified until focused tests, workspace
-gates, and the self-hosted GitForge pipeline have run.
+against these changes. On 2026-10-08, PR #283's first live GitForge adapter
+attempt received HTTP 202 with `status=queued` but no `trigger_id` from the
+currently deployed scheduler, so the workflow could not poll the request.
+This is an observed deployment/API-version mismatch, not a passing end-to-end
+test. The test names above describe source coverage, not passing results;
+treat behavior as unverified until focused tests, workspace gates, and the
+self-hosted GitForge pipeline have run against a scheduler with this API.
