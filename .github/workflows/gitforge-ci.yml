@@ -50,7 +50,6 @@ jobs:
           : "${GITFORGE_SCHEDULER_URL:?GITFORGE_SCHEDULER_URL is required}"
           : "${GITFORGE_REPO_ID:?GITFORGE_REPO_ID is required (GitForge UUID, not GitHub repository_id)}"
           : "${GITFORGE_CI_TRIGGER_TOKEN:?GITFORGE_CI_TRIGGER_TOKEN is required}"
-          : "${GITFORGE_SCHEDULER_OPERATOR_TOKEN:?GITFORGE_SCHEDULER_OPERATOR_TOKEN is required}"
           [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
             echo "GITFORGE_REPO_ID must be a UUID" >&2
             exit 1
