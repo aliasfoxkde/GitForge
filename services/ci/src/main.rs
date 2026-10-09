@@ -65,6 +65,15 @@ const TRIGGER_PENDING_REPUBLISH_AFTER_SECS: i64 = 60;
 /// live request would double-run the commit.
 const TRIGGER_PROCESSING_STALE_AFTER_SECS: i64 = 30 * 60;
 
+/// How often a control-plane pass re-attempts startup engine rebuilds for
+/// non-terminal runs no live engine holds. A rebuild that failed at startup
+/// (transient clone outage, unreadable row) is otherwise never retried
+/// within the process lifetime, leaving the run's pending rows parked until
+/// the next restart. Custody makes passes idempotent: runs an engine
+/// already holds are skipped, so a periodic call is a no-op in the healthy
+/// case.
+const ENGINE_REDRIVE_INTERVAL_SECS: u64 = 300;
+
 /// How many consumer attempts a trigger request gets before its failure is
 /// terminal and visible (`failed`) instead of retried.
 const TRIGGER_MAX_ATTEMPTS: i64 = 5;
@@ -280,6 +289,38 @@ async fn main() -> anyhow::Result<()> {
         .await;
         if rebuilt > 0 {
             tracing::info!(rebuilt, "startup engine rebuild complete");
+        }
+
+        // The startup rebuild is one-shot: a rebuild that failed (transient
+        // clone outage, unreadable row) would otherwise leave the run's
+        // pending rows parked until the NEXT restart. Redrive periodically;
+        // the custody skip keeps passes idempotent, so healthy runs are
+        // untouched and only registry-absent runs are re-attempted.
+        {
+            let redrive_pool = pool.clone();
+            let redrive_scheduler = scheduler_arc.clone();
+            let redrive_registry = pipeline_registry.clone();
+            let redrive_workspaces = run_workspace_paths.clone();
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(Duration::from_secs(ENGINE_REDRIVE_INTERVAL_SECS));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Consume the immediate first tick: startup just rebuilt.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let rebuilt = rebuild_live_engines(
+                        &redrive_pool,
+                        &redrive_scheduler,
+                        &redrive_registry,
+                        &redrive_workspaces,
+                    )
+                    .await;
+                    if rebuilt > 0 {
+                        tracing::warn!(rebuilt, "periodic engine redrive recovered stalled runs");
+                    }
+                }
+            });
         }
 
         let sweep_pool = pool.clone();
@@ -2755,6 +2796,13 @@ async fn rebuild_live_engines(
 
     let mut rebuilt = 0;
     for run in runs {
+        if pipeline_registry.read().await.contains_key(&run.id) {
+            // Live custody: an in-memory engine already drives this run, so
+            // a redrive pass (or a second startup) must not graft a second
+            // engine over it. At startup the registry is empty and this
+            // check is a no-op.
+            continue;
+        }
         if matches!(
             run.status.as_str(),
             "succeeded" | "failed" | "cancelled" | "timed_out" | "timeout" | "timed-out"
@@ -4010,6 +4058,11 @@ mod tests {
         let queue = scheduler.queue_status().await.unwrap();
         assert_eq!(queue.in_memory_queued, 2);
         assert_eq!(queue.durable_pending, Some(2));
+
+        // A later redrive pass must not disturb an engine under live
+        // custody: periodic redrive relies on this skip to stay idempotent.
+        let redriven = rebuild_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        assert_eq!(redriven, 0, "custody-held runs are not rebuilt again");
 
         tokio::fs::remove_dir_all(&test_root).await.unwrap();
     }
