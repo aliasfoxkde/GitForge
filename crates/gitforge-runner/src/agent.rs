@@ -830,7 +830,7 @@ impl RunnerAgent {
             .map_err(|e| Error::internal(format!("failed to create HTTP client: {e}")))?;
 
         let sandbox = DockerSandbox::connect_required().await?;
-        let executor = JobExecutor::new().await?;
+        let executor = JobExecutor::with_capacity(config.capacity.max(1) as usize).await?;
 
         Ok(Self {
             config,

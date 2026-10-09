@@ -36,22 +36,122 @@ fn sandbox_acquire_timeout() -> Duration {
     )
 }
 
-/// Sandbox memory ceiling in megabytes. Debug codegen and linking of
-/// test binaries that statically link native crypto (aws-lc-sys via
-/// jsonwebtoken 11, libgit2) transiently pins the full 4GiB default and
-/// gets SIGKILLed by the cgroup, so operators on CI-capable hosts can
-/// raise the ceiling per deployment.
-fn sandbox_limits() -> SandboxLimits {
-    const DEFAULT_MB: u64 = 4096;
-    let memory_mb = std::env::var("GITFORGE_SANDBOX_MEMORY_MB")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|mb| *mb >= 128)
-        .unwrap_or(DEFAULT_MB);
-    SandboxLimits {
-        memory_mb,
-        ..SandboxLimits::default()
+/// Per-job resource policy enforced at the container/cgroup boundary
+/// (issue #277).
+///
+/// CPU and process-slot caps are real cgroup constraints applied by the
+/// container runtime at container creation — not advisory environment
+/// variables. `cargo_build_jobs` is the parallelism handed to build tools
+/// (injected as `CARGO_BUILD_JOBS`), derived from the per-job CPU allowance
+/// so `capacity` concurrent jobs cannot exceed the host's core count.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JobResourcePolicy {
+    /// Memory ceiling per job in megabytes (container cgroup `memory`)
+    pub memory_mb: u64,
+    /// CPU cores per job, fractional allowed (cgroup `cpu_quota`/`cpu_period`)
+    pub cpus: f64,
+    /// Maximum processes/threads per job (cgroup `pids`); 0 disables the cap
+    pub pids_limit: i64,
+}
+
+impl JobResourcePolicy {
+    /// Default per-job process-slot cap. Cargo/rustc builds routinely hold
+    /// dozens of processes and threads (linker workers, rayon pools); 512
+    /// leaves generous headroom while still stopping runaway fork bombs.
+    const DEFAULT_PIDS_LIMIT: i64 = 512;
+    /// Default per-job memory ceiling in megabytes.
+    const DEFAULT_MEMORY_MB: u64 = 4096;
+
+    /// Resolve the policy for a runner on a host with `host_cores` logical
+    /// cores and a declared capacity of `capacity` concurrent jobs.
+    ///
+    /// Per-job CPU defaults to `host_cores / capacity`, so full concurrency
+    /// saturates — but never exceeds — the host. Explicit environment
+    /// overrides win when set and valid:
+    /// - `GITFORGE_SANDBOX_CPUS` — per-job core allowance (> 0)
+    /// - `GITFORGE_SANDBOX_MAX_PIDS` — per-job process-slot cap (>= 0; 0 disables)
+    /// - `GITFORGE_SANDBOX_MEMORY_MB` — per-job memory ceiling (>= 128)
+    pub fn resolve(host_cores: usize, capacity: usize) -> Self {
+        let cpus = std::env::var("GITFORGE_SANDBOX_CPUS")
+            .ok()
+            .and_then(|value| parse_cpus_override(&value))
+            .unwrap_or_else(|| derive_cpus_per_job(host_cores, capacity));
+        let pids_limit = std::env::var("GITFORGE_SANDBOX_MAX_PIDS")
+            .ok()
+            .and_then(|value| parse_pids_override(&value))
+            .unwrap_or(Self::DEFAULT_PIDS_LIMIT);
+        let memory_mb = std::env::var("GITFORGE_SANDBOX_MEMORY_MB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|mb| *mb >= 128)
+            .unwrap_or(Self::DEFAULT_MEMORY_MB);
+        Self {
+            memory_mb,
+            cpus,
+            pids_limit,
+        }
     }
+
+    /// Build-tool parallelism for a job with this policy: the whole-job CPU
+    /// allowance, floored to whole build jobs (at least one).
+    pub fn cargo_build_jobs(&self) -> u32 {
+        self.cpus.floor().max(1.0) as u32
+    }
+
+    /// The sandbox limits one job's container is created with.
+    pub fn sandbox_limits(&self) -> SandboxLimits {
+        SandboxLimits {
+            cpus: self.cpus,
+            memory_mb: self.memory_mb,
+            pids_limit: self.pids_limit,
+            ..SandboxLimits::default()
+        }
+    }
+}
+
+/// Explicit `GITFORGE_SANDBOX_CPUS` override: finite and strictly positive.
+fn parse_cpus_override(raw: &str) -> Option<f64> {
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|cpus| cpus.is_finite() && *cpus > 0.0)
+}
+
+/// Explicit `GITFORGE_SANDBOX_MAX_PIDS` override: non-negative integer,
+/// where 0 disables the cap.
+fn parse_pids_override(raw: &str) -> Option<i64> {
+    raw.trim().parse::<i64>().ok().filter(|pids| *pids >= 0)
+}
+
+/// Per-job CPU allowance when no explicit override is set: the host's cores
+/// divided across the runner's declared capacity, never fewer than one core
+/// per job. This ties build parallelism to the capacity the runner actually
+/// registered instead of the host-wide CPU count (issue #277).
+fn derive_cpus_per_job(host_cores: usize, capacity: usize) -> f64 {
+    let capacity = capacity.max(1);
+    let cores = host_cores.max(1);
+    (cores as f64 / capacity as f64).max(1.0)
+}
+
+/// Compose one step's exec env: derived resource vars, then job-level env,
+/// then step-level env — later layers win, and an explicit `CARGO_BUILD_JOBS`
+/// from job or step configuration always beats the derived value.
+fn compose_step_env(
+    job_env: &HashMap<String, String>,
+    step_env: Option<&HashMap<String, String>>,
+    cargo_build_jobs: u32,
+) -> Vec<String> {
+    let mut env_pairs: Vec<String> = Vec::new();
+    if !job_env.contains_key("CARGO_BUILD_JOBS")
+        && !step_env.is_some_and(|env| env.contains_key("CARGO_BUILD_JOBS"))
+    {
+        env_pairs.push(format!("CARGO_BUILD_JOBS={cargo_build_jobs}"));
+    }
+    env_pairs.extend(job_env.iter().map(|(key, value)| format!("{key}={value}")));
+    if let Some(step_env) = step_env {
+        env_pairs.extend(step_env.iter().map(|(key, value)| format!("{key}={value}")));
+    }
+    env_pairs
 }
 
 /// Recognize a step failure as the container backend failing rather than
@@ -124,16 +224,24 @@ fn runtime_toolchain_fetch(steps: &[JobStep]) -> Option<String> {
 pub struct ContainerPool {
     pools: Arc<RwLock<HashMap<String, Vec<SandboxInstance>>>>, // image -> instances
     sandbox: Arc<DockerSandbox>,
+    /// Resource policy applied to every container this pool creates.
+    limits: SandboxLimits,
 }
 
 impl ContainerPool {
-    /// Create a new container pool
-    pub async fn new() -> Result<Self> {
+    /// Create a new container pool with an explicit resource policy
+    pub async fn with_limits(limits: SandboxLimits) -> Result<Self> {
         let sandbox = DockerSandbox::connect_required().await?;
         Ok(Self {
             pools: Arc::new(RwLock::new(HashMap::new())),
             sandbox: Arc::new(sandbox),
+            limits,
         })
+    }
+
+    /// Create a new container pool with default resource limits
+    pub async fn new() -> Result<Self> {
+        Self::with_limits(SandboxLimits::default()).await
     }
 
     /// Pre-warm containers for an image
@@ -143,7 +251,7 @@ impl ContainerPool {
 
         while instances.len() < count {
             let id = JobId::new();
-            match self.sandbox.create(id, image, sandbox_limits()).await {
+            match self.sandbox.create(id, image, self.limits.clone()).await {
                 Ok(instance) => {
                     tracing::info!("pre-warmed container for image {}", image);
                     instances.push(instance);
@@ -167,7 +275,7 @@ impl ContainerPool {
         if workspace_path.is_some() {
             return self
                 .sandbox
-                .create_with_workspace(*job_id, image, sandbox_limits(), workspace_path)
+                .create_with_workspace(*job_id, image, self.limits.clone(), workspace_path)
                 .await;
         }
         let mut pools = self.pools.write().await;
@@ -182,7 +290,9 @@ impl ContainerPool {
 
         // Pool empty or no pool for this image, create new
         tracing::debug!("creating new container for job {} (pool empty)", job_id);
-        self.sandbox.create(*job_id, image, sandbox_limits()).await
+        self.sandbox
+            .create(*job_id, image, self.limits.clone())
+            .await
     }
 
     /// Return a container to the pool
@@ -208,7 +318,7 @@ impl ContainerPool {
             }
             // Create fresh instance for the pool
             let id = JobId::new();
-            match self.sandbox.create(id, image, sandbox_limits()).await {
+            match self.sandbox.create(id, image, self.limits.clone()).await {
                 Ok(new_instance) => {
                     instances.push(new_instance);
                     tracing::debug!("returned container to pool");
@@ -234,12 +344,40 @@ pub struct JobExecutor {
     active_instances: Arc<RwLock<HashMap<JobId, (String, Option<String>, SandboxInstance)>>>, // job_id -> (image, workspace, instance)
     artifact_storage: Arc<FileStorage>,
     log_store: Arc<FileJobLogStore>,
+    /// Resolved per-job resource policy (cgroup limits + build parallelism).
+    policy: JobResourcePolicy,
 }
 
 impl JobExecutor {
-    /// Create a new job executor
+    /// Create a new job executor. The per-job resource policy is derived
+    /// from `GITFORGE_RUNNER_CAPACITY` (default 2) and the host's core
+    /// count; see `JobResourcePolicy::resolve`.
     pub async fn new() -> Result<Self> {
-        let pool = ContainerPool::new().await?;
+        let capacity = std::env::var("GITFORGE_RUNNER_CAPACITY")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|capacity| *capacity > 0)
+            .unwrap_or(2);
+        Self::with_capacity(capacity).await
+    }
+
+    /// Create a new job executor with the runner's declared capacity. The
+    /// per-job CPU allowance (and with it `CARGO_BUILD_JOBS`) is derived
+    /// from host cores ÷ capacity, so the runner's registered capacity —
+    /// not the host-wide CPU count — drives build parallelism.
+    pub async fn with_capacity(capacity: usize) -> Result<Self> {
+        let host_cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let policy = JobResourcePolicy::resolve(host_cores, capacity);
+        tracing::info!(
+            cpus_per_job = policy.cpus,
+            memory_mb = policy.memory_mb,
+            pids_limit = policy.pids_limit,
+            cargo_build_jobs = policy.cargo_build_jobs(),
+            host_cores,
+            capacity,
+            "resolved per-job resource policy"
+        );
+        let pool = ContainerPool::with_limits(policy.sandbox_limits()).await?;
         let storage_root = std::env::var("GITFORGE_ARTIFACT_ROOT")
             .unwrap_or_else(|_| "target/gitforge-artifacts".to_string());
         let artifact_storage = FileStorage::new(storage_root.clone()).await?;
@@ -250,7 +388,13 @@ impl JobExecutor {
             active_job_count: Arc::new(RwLock::new(0)),
             artifact_storage: Arc::new(artifact_storage),
             log_store: Arc::new(log_store),
+            policy,
         })
+    }
+
+    /// The resolved per-job resource policy.
+    pub fn policy(&self) -> &JobResourcePolicy {
+        &self.policy
     }
 
     async fn collect_artifacts(
@@ -533,15 +677,11 @@ impl JobExecutor {
             tracing::debug!("executing step: {}", step.name);
             let cmd = vec!["sh", "-c", &step.run];
 
-            // Job-level env first, step-level env layered over it (step wins).
-            let mut env_pairs: Vec<String> = job
-                .env
-                .iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect();
-            if let Some(step_env) = &step.env {
-                env_pairs.extend(step_env.iter().map(|(key, value)| format!("{key}={value}")));
-            }
+            // Derived resource vars first, then job-level env, then
+            // step-level env — later layers win, so pipeline configuration
+            // can always override the derived build parallelism.
+            let env_pairs =
+                compose_step_env(&job.env, step.env.as_ref(), self.policy.cargo_build_jobs());
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             let result = if remaining.is_zero() {
@@ -962,21 +1102,145 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_limits_default_and_env_override() {
+    fn test_sandbox_memory_default_and_env_override() {
         // Default: the historical 4GiB ceiling.
         std::env::remove_var("GITFORGE_SANDBOX_MEMORY_MB");
-        assert_eq!(sandbox_limits().memory_mb, 4096);
+        let policy = JobResourcePolicy::resolve(20, 2);
+        assert_eq!(policy.memory_mb, 4096);
 
         // CI-capable hosts can raise it for the native-crypto link step.
         std::env::set_var("GITFORGE_SANDBOX_MEMORY_MB", "6144");
-        assert_eq!(sandbox_limits().memory_mb, 6144);
+        let policy = JobResourcePolicy::resolve(20, 2);
+        assert_eq!(policy.memory_mb, 6144);
 
         // Garbage and sub-floor values fall back to the default.
         std::env::set_var("GITFORGE_SANDBOX_MEMORY_MB", "not-a-number");
-        assert_eq!(sandbox_limits().memory_mb, 4096);
+        let policy = JobResourcePolicy::resolve(20, 2);
+        assert_eq!(policy.memory_mb, 4096);
         std::env::set_var("GITFORGE_SANDBOX_MEMORY_MB", "64");
-        assert_eq!(sandbox_limits().memory_mb, 4096);
+        let policy = JobResourcePolicy::resolve(20, 2);
+        assert_eq!(policy.memory_mb, 4096);
         std::env::remove_var("GITFORGE_SANDBOX_MEMORY_MB");
+    }
+
+    // --- per-job resource policy (issue #277) ---------------------------
+
+    #[test]
+    fn test_derive_cpus_per_job_divides_host_cores_by_capacity() {
+        // 20 cores, 2 concurrent jobs → 10 cores per job.
+        assert_eq!(derive_cpus_per_job(20, 2), 10.0);
+        // Fractional division is kept so capacity can exceed cores.
+        assert_eq!(derive_cpus_per_job(20, 8), 2.5);
+        // Never fewer than one core per job.
+        assert_eq!(derive_cpus_per_job(4, 16), 1.0);
+        // Degenerate inputs still resolve to a usable value.
+        assert_eq!(derive_cpus_per_job(0, 0), 1.0);
+        assert_eq!(derive_cpus_per_job(1, 1), 1.0);
+    }
+
+    #[test]
+    fn test_parse_cpus_override() {
+        assert_eq!(parse_cpus_override("4"), Some(4.0));
+        assert_eq!(parse_cpus_override(" 2.5 "), Some(2.5));
+        // Zero, negative, garbage, and non-finite values are not overrides.
+        assert_eq!(parse_cpus_override("0"), None);
+        assert_eq!(parse_cpus_override("-1"), None);
+        assert_eq!(parse_cpus_override("not-a-number"), None);
+        assert_eq!(parse_cpus_override(""), None);
+        assert_eq!(parse_cpus_override("inf"), None);
+        assert_eq!(parse_cpus_override("NaN"), None);
+    }
+
+    #[test]
+    fn test_parse_pids_override() {
+        assert_eq!(parse_pids_override("512"), Some(512));
+        assert_eq!(parse_pids_override(" 256 "), Some(256));
+        // 0 legitimately disables the cap; negatives are rejected.
+        assert_eq!(parse_pids_override("0"), Some(0));
+        assert_eq!(parse_pids_override("-5"), None);
+        assert_eq!(parse_pids_override("nope"), None);
+        assert_eq!(parse_pids_override(""), None);
+    }
+
+    #[test]
+    fn test_policy_env_overrides_win_over_derivation() {
+        std::env::set_var("GITFORGE_SANDBOX_CPUS", "3.5");
+        std::env::set_var("GITFORGE_SANDBOX_MAX_PIDS", "256");
+        let policy = JobResourcePolicy::resolve(20, 2);
+        assert_eq!(policy.cpus, 3.5);
+        assert_eq!(policy.pids_limit, 256);
+        std::env::remove_var("GITFORGE_SANDBOX_CPUS");
+        std::env::remove_var("GITFORGE_SANDBOX_MAX_PIDS");
+
+        // Invalid overrides fall back to the derived/default values.
+        std::env::set_var("GITFORGE_SANDBOX_CPUS", "bogus");
+        std::env::set_var("GITFORGE_SANDBOX_MAX_PIDS", "-2");
+        let policy = JobResourcePolicy::resolve(20, 2);
+        assert_eq!(policy.cpus, 10.0);
+        assert_eq!(policy.pids_limit, 512);
+        std::env::remove_var("GITFORGE_SANDBOX_CPUS");
+        std::env::remove_var("GITFORGE_SANDBOX_MAX_PIDS");
+    }
+
+    #[test]
+    fn test_policy_cargo_build_jobs_and_sandbox_limits() {
+        let policy = JobResourcePolicy {
+            memory_mb: 2048,
+            cpus: 2.5,
+            pids_limit: 512,
+        };
+        // Build parallelism is the whole-job allowance floored, min 1.
+        assert_eq!(policy.cargo_build_jobs(), 2);
+        let single = JobResourcePolicy {
+            memory_mb: 512,
+            cpus: 0.5,
+            pids_limit: 128,
+        };
+        assert_eq!(single.cargo_build_jobs(), 1);
+
+        let limits = policy.sandbox_limits();
+        assert_eq!(limits.cpus, 2.5);
+        assert_eq!(limits.memory_mb, 2048);
+        assert_eq!(limits.pids_limit, 512);
+        // Untouched defaults carry through (timeout, network).
+        assert_eq!(limits.timeout_secs, 3600);
+        assert!(limits.network);
+    }
+
+    // --- derived CARGO_BUILD_JOBS env composition ------------------------
+
+    #[test]
+    fn test_compose_step_env_injects_derived_build_jobs() {
+        let job_env = HashMap::new();
+        let pairs = compose_step_env(&job_env, None, 10);
+        assert_eq!(pairs, vec!["CARGO_BUILD_JOBS=10".to_string()]);
+    }
+
+    #[test]
+    fn test_compose_step_env_layering_and_explicit_override() {
+        // Job-level env is layered over the derived var; step-level wins.
+        let job_env = HashMap::from([("RUST_BACKTRACE".to_string(), "1".to_string())]);
+        let step_env = HashMap::from([("RUSTFLAGS".to_string(), "-Dwarnings".to_string())]);
+        let pairs = compose_step_env(&job_env, Some(&step_env), 5);
+        assert_eq!(
+            pairs,
+            vec![
+                "CARGO_BUILD_JOBS=5".to_string(),
+                "RUST_BACKTRACE=1".to_string(),
+                "RUSTFLAGS=-Dwarnings".to_string(),
+            ]
+        );
+
+        // An explicit job-level CARGO_BUILD_JOBS replaces the derived one.
+        let job_env = HashMap::from([("CARGO_BUILD_JOBS".to_string(), "2".to_string())]);
+        let pairs = compose_step_env(&job_env, None, 5);
+        assert_eq!(pairs, vec!["CARGO_BUILD_JOBS=2".to_string()]);
+
+        // A step-level override beats the derived value too.
+        let job_env = HashMap::new();
+        let step_env = HashMap::from([("CARGO_BUILD_JOBS".to_string(), "1".to_string())]);
+        let pairs = compose_step_env(&job_env, Some(&step_env), 5);
+        assert_eq!(pairs, vec!["CARGO_BUILD_JOBS=1".to_string()]);
     }
 
     #[test]
