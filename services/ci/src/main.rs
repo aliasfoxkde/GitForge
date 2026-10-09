@@ -65,13 +65,16 @@ const TRIGGER_PENDING_REPUBLISH_AFTER_SECS: i64 = 60;
 /// live request would double-run the commit.
 const TRIGGER_PROCESSING_STALE_AFTER_SECS: i64 = 30 * 60;
 
-/// How often a control-plane pass re-attempts startup engine rebuilds for
-/// non-terminal runs no live engine holds. A rebuild that failed at startup
-/// (transient clone outage, unreadable row) is otherwise never retried
-/// within the process lifetime, leaving the run's pending rows parked until
-/// the next restart. Custody makes passes idempotent: runs an engine
-/// already holds are skipped, so a periodic call is a no-op in the healthy
-/// case.
+/// How often a control-plane pass redrives stalled chains: every
+/// non-terminal run with live rows gets a fresh engine grafted from the
+/// durable rows, its ready stages released, and its dispatchable rows
+/// re-enqueued. This retries startup rebuilds that failed (otherwise never
+/// retried within the process lifetime), re-seeds queued rows lost from the
+/// scheduler's in-memory queue while no runner was available, and re-releases
+/// tails whose completion event never reached the live engine — the ~21h
+/// stalled chains observed across a control-plane restart. Runs with rows
+/// actively executing are left to the timeout watchdog, and healthy runs
+/// re-drive as a no-op (graft of identical truth, deduplicated enqueue).
 const ENGINE_REDRIVE_INTERVAL_SECS: u64 = 300;
 
 /// How many consumer attempts a trigger request gets before its failure is
@@ -2796,13 +2799,6 @@ async fn rebuild_live_engines(
 
     let mut rebuilt = 0;
     for run in runs {
-        if pipeline_registry.read().await.contains_key(&run.id) {
-            // Live custody: an in-memory engine already drives this run, so
-            // a redrive pass (or a second startup) must not graft a second
-            // engine over it. At startup the registry is empty and this
-            // check is a no-op.
-            continue;
-        }
         if matches!(
             run.status.as_str(),
             "succeeded" | "failed" | "cancelled" | "timed_out" | "timeout" | "timed-out"
@@ -2848,6 +2844,11 @@ async fn rebuild_live_engines(
         if !has_live_row {
             continue;
         }
+        // Computed before the graftable loop consumes `rows`: only rows
+        // actively executing on a runner block the re-drive.
+        let in_flight = rows
+            .iter()
+            .any(|job| matches!(job.status.as_str(), "running" | "assigned"));
         let mut durable_rows = Vec::with_capacity(rows.len());
         let mut graftable = true;
         for job in rows {
@@ -2870,6 +2871,22 @@ async fn rebuild_live_engines(
         if !graftable {
             continue;
         }
+        let held = pipeline_registry.read().await.contains_key(&run.id);
+        if held && in_flight {
+            // A live engine with rows actively executing: replacing it would
+            // orphan the in-flight leases (#243 re-adoption covers scheduler
+            // restarts, not live-process swaps). The timeout watchdog owns
+            // this class.
+            continue;
+        }
+        // Custody is not protection here: rebuilding over a held engine is
+        // loss-free exactly when nothing is executing, because the fresh
+        // engine grafts the same durable truth. The stall classes this pass
+        // exists for — a startup rebuild that failed, queued rows lost from
+        // the scheduler's in-memory queue, a completion event dropped before
+        // the engine absorbed it — all leave no running row behind, and the
+        // stalled chains observed live (tail rows pending for ~21h across a
+        // control-plane restart) are exactly of that shape.
         let engine = match CiEngine::rebuild(
             run.id,
             run.pipeline_id,
@@ -2885,18 +2902,30 @@ async fn rebuild_live_engines(
                 continue;
             }
         };
-        let workspace_path =
-            match prepare_run_workspace(pool, run.repo_id, run.id, &run.commit_hash).await {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    tracing::error!(
-                        run = %run.id,
-                        %error,
-                        "engine rebuild skipped: workspace could not be restored"
-                    );
-                    continue;
+        // Bound the guard to its own statement so it never spans the
+        // `prepare_run_workspace` await (the future must stay Send).
+        let cached_workspace = run_workspace_paths
+            .lock()
+            .expect("workspace cache lock poisoned")
+            .get(&run.id)
+            .cloned()
+            .flatten();
+        let workspace_path = match cached_workspace {
+            Some(path) => Some(path),
+            None => {
+                match prepare_run_workspace(pool, run.repo_id, run.id, &run.commit_hash).await {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        tracing::error!(
+                            run = %run.id,
+                            %error,
+                            "engine rebuild skipped: workspace could not be restored"
+                        );
+                        continue;
+                    }
                 }
-            };
+            }
+        };
         run_workspace_paths
             .lock()
             .expect("workspace cache lock poisoned")
@@ -2913,7 +2942,11 @@ async fn rebuild_live_engines(
             tracing::warn!(run = %run.id, %error, "post-rebuild stage release failed");
         }
         enqueue_ready_jobs(scheduler, &engine, run.id, run.repo_id, workspace_path).await;
-        tracing::info!(run = %run.id, "rebuilt live engine for interrupted run");
+        if held {
+            tracing::info!(run = %run.id, "redrove stalled chain over live engine");
+        } else {
+            tracing::info!(run = %run.id, "rebuilt live engine for interrupted run");
+        }
         rebuilt += 1;
     }
     rebuilt
@@ -4059,10 +4092,183 @@ mod tests {
         assert_eq!(queue.in_memory_queued, 2);
         assert_eq!(queue.durable_pending, Some(2));
 
-        // A later redrive pass must not disturb an engine under live
-        // custody: periodic redrive relies on this skip to stay idempotent.
+        // A later pass re-drives the same run: nothing is executing, so the
+        // fresh engine grafts identical durable truth and the chain is
+        // re-seeded without disturbing live state.
         let redriven = rebuild_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
-        assert_eq!(redriven, 0, "custody-held runs are not rebuilt again");
+        assert_eq!(
+            redriven, 1,
+            "an idle custody-held run is re-driven, not skipped"
+        );
+        let engine = registry.read().await.get(&run.id).cloned().expect("engine");
+        let state = engine.state().await;
+        assert_eq!(
+            state.jobs[&planned["a"]].status(),
+            gitforge_common::JobStatus::Succeeded
+        );
+        // These two mirror the durable rows (this test bypasses the
+        // completion consumer, so the engine-side successes above were never
+        // persisted); a released stage is not re-parked by the re-drive.
+        assert_eq!(
+            state.jobs[&planned["b"]].status(),
+            gitforge_common::JobStatus::Queued
+        );
+        assert_eq!(
+            state.jobs[&planned["c"]].status(),
+            gitforge_common::JobStatus::Queued
+        );
+
+        tokio::fs::remove_dir_all(&test_root).await.unwrap();
+    }
+
+    // The stalled-chain class observed live: a runner completes stage a and
+    // the durable row flips to `succeeded`, but the completion never reaches
+    // the live engine (event dropped, control-plane swap) — so the tail
+    // stays `pending` for hours while the registry still holds the stale
+    // engine. A redrive pass grafts the durable truth over the stale engine
+    // and releases the tail.
+    #[tokio::test]
+    async fn test_periodic_redrive_releases_chain_stalled_on_lost_completion() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-planning-tests")
+            .join(gitforge_common::PipelineRunId::new().to_string());
+        let source = test_root.join("source.git");
+        let seed = test_root.join("seed");
+        tokio::fs::create_dir_all(&test_root).await.unwrap();
+        run_git(["init", "--bare", source.to_str().unwrap()], None).await;
+        tokio::fs::create_dir_all(&seed).await.unwrap();
+        run_git(["init", seed.to_str().unwrap()], None).await;
+        run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
+        run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
+        tokio::fs::write(seed.join("marker.txt"), "stalled\n")
+            .await
+            .unwrap();
+        run_git(["add", "marker.txt"], Some(&seed)).await;
+        run_git(["commit", "-m", "stall fixture"], Some(&seed)).await;
+        let commit = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
+        run_git(
+            ["push", source.to_str().unwrap(), "HEAD:refs/heads/main"],
+            Some(&seed),
+        )
+        .await;
+
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", test_root.join("workspaces"));
+        let (pool, repo_id) =
+            test_pool_with_repository(source.to_string_lossy().into_owned()).await;
+
+        let chained = |name: &str, needs: &[&str]| JobDefinition {
+            name: name.to_string(),
+            image: "rust:latest".to_string(),
+            needs: needs.iter().map(ToString::to_string).collect(),
+            env: HashMap::new(),
+            steps: vec![StepDefinition {
+                name: format!("{name}-step"),
+                run: "true".to_string(),
+                env: None,
+                working_directory: None,
+                condition: None,
+            }],
+            timeout: None,
+            retry: None,
+        };
+        let definition = PipelineDefinition {
+            name: "stall-test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![
+                chained("a", &[]),
+                chained("b", &["a"]),
+                chained("c", &["b"]),
+            ],
+        };
+        let pipeline_id = gitforge_common::PipelineId::new();
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: definition.name.clone(),
+                trigger_type: "push".to_string(),
+                config: serde_json::to_value(&definition).unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline_id,
+            repo_id,
+            "push".to_string(),
+            commit.clone(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+        gitforge_db::queries::PipelineRunQueries::update_status(&pool, run.id, "running")
+            .await
+            .unwrap();
+
+        let event =
+            PipelineTriggerEvent::new(pipeline_id, repo_id, commit.clone(), TriggerType::Push);
+        let engine = CiEngine::new_with_run_id(event, definition, run.id)
+            .await
+            .unwrap();
+        let planned: HashMap<String, gitforge_common::JobId> = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(id, name)| (name, id))
+            .collect();
+        persist_planned_jobs(&pool, &engine, run.id, None)
+            .await
+            .unwrap();
+
+        // The live process: the registry holds this engine, and stage a is
+        // executing on a runner (released, assigned, started).
+        engine.queue_ready_jobs().await.unwrap();
+        let runner_id = gitforge_common::RunnerId::new();
+        engine.assign_job(planned["a"], runner_id).await.unwrap();
+        engine.start_job(planned["a"]).await.unwrap();
+
+        // The runner completes stage a; the durable row records it, but the
+        // completion never reaches the engine.
+        gitforge_db::queries::JobQueries::update_status(&pool, planned["a"], "succeeded")
+            .await
+            .unwrap();
+
+        let registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        registry.write().await.insert(run.id, Arc::new(engine));
+        let run_workspaces: Arc<
+            std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let scheduler = Arc::new(Scheduler::with_db(pool.clone()));
+
+        let redriven = rebuild_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        assert_eq!(redriven, 1, "the stalled chain is re-driven");
+
+        // The fresh engine grafted the durable completion...
+        let engine = registry.read().await.get(&run.id).cloned().expect("engine");
+        let state = engine.state().await;
+        assert_eq!(
+            state.jobs[&planned["a"]].status(),
+            gitforge_common::JobStatus::Succeeded
+        );
+
+        // ...released the tail durably...
+        let row = gitforge_db::queries::JobQueries::get(&pool, planned["b"])
+            .await
+            .unwrap()
+            .expect("row b");
+        assert_eq!(row.status, "queued", "released stage becomes dispatchable");
+
+        // ...and the scheduler can dispatch it.
+        let queue = scheduler.queue_status().await.unwrap();
+        assert_eq!(queue.in_memory_queued, 1);
 
         tokio::fs::remove_dir_all(&test_root).await.unwrap();
     }
