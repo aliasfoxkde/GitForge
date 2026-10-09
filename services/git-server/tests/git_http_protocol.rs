@@ -7,6 +7,8 @@
 //! child processes.
 
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gitforge_common::{RepoId, UserId};
@@ -32,6 +34,12 @@ use common::{free_port, run_git};
 /// Spawn the real git-server binary with a prepared database containing a
 /// single `testowner/proto` repository backed by a bare git repository.
 async fn spawn_server() -> TestServer {
+    spawn_server_with(&[]).await
+}
+
+/// Spawn the real git-server binary with additional environment variables
+/// layered on top of the base configuration (e.g. CI trigger settings).
+async fn spawn_server_with(extra_env: &[(&str, &str)]) -> TestServer {
     let unique = uuid::Uuid::new_v4();
     let base = std::env::temp_dir().join(format!("git-server-proto-{unique}"));
     let git_root = base.join("git");
@@ -78,12 +86,17 @@ async fn spawn_server() -> TestServer {
 
     let http_port = free_port();
     let ssh_port = free_port();
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_git-server"))
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_git-server"));
+    command
         .env("HTTP_PORT", http_port.to_string())
         .env("SSH_PORT", ssh_port.to_string())
         .env("GIT_ROOT", &git_root)
         .env("DATABASE_URL", format!("sqlite:{}", db_path.display()))
-        .env("RUST_LOG", "warn")
+        .env("RUST_LOG", "warn");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -190,6 +203,172 @@ async fn test_ls_remote_unknown_repository_fails() {
     assert!(
         stderr.contains("not found") || stderr.contains("404"),
         "expected repository-not-found diagnostics, got: {stderr}"
+    );
+
+    common::shutdown_gracefully(&mut server.child).await;
+}
+
+/// A local CI trigger endpoint that accepts TCP connections and never
+/// responds for the lifetime of the test.
+///
+/// This is the only injected component in the issue-#288 regression: a
+/// real, bounded, local listener with the exact failure shape observed
+/// live (CI accepted the connection but produced no HTTP response). The
+/// sockets are held open without reading or writing — a trigger payload is
+/// far smaller than kernel socket buffers, so the client's POST lands and
+/// the client then simply waits for a response that never comes. The
+/// returned counter records every accepted connection so the test can
+/// prove delivery attempts happen without the push response depending on
+/// them.
+async fn hung_ci_receiver() -> (u16, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local hung CI receiver");
+    let port = listener.local_addr().expect("local addr").port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_task = hits.clone();
+    tokio::spawn(async move {
+        // Held sockets keep the clients waiting; dropping them early would
+        // turn the hang into a connection error instead.
+        let mut held = Vec::new();
+        while let Ok((socket, _addr)) = listener.accept().await {
+            hits_task.fetch_add(1, Ordering::SeqCst);
+            held.push(socket);
+        }
+    });
+    (port, hits)
+}
+
+/// Regression for issue #288: an already-accepted push must not wait on
+/// downstream CI trigger delivery.
+///
+/// `git_receive_pack` used to await `deliver_pending_ci_events` inline
+/// before writing its response. That function performs real network sends
+/// (60 s HTTP timeout per row, up to 50 rows sequentially), so a slow or
+/// hung CI endpoint pinned the whole push — live, a real push timed out at
+/// 150 s and the branch ref never reached the client even though git had
+/// accepted the pack. The durable `ci_delivery_loop` (2 s cadence,
+/// lease-claimed, retried) already exists for exactly this delivery, so
+/// the receive-pack response must return as soon as the pack is accepted
+/// and the trigger row is durable.
+///
+/// Red/green contract: against the hung receiver the push must complete
+/// within a bound far below the 60 s HTTP-client timeout, the ref must
+/// land, and the background worker must attempt delivery asynchronously.
+#[tokio::test]
+async fn test_push_response_not_blocked_by_hung_ci_trigger() {
+    // ─── Local hung CI trigger endpoint (the only test dependency) ──────
+    let (ci_port, ci_hits) = hung_ci_receiver().await;
+
+    let mut server = spawn_server_with(&[
+        (
+            "GITFORGE_CI_TRIGGER_URL",
+            &format!("http://127.0.0.1:{ci_port}/internal/ci/trigger"),
+        ),
+        ("GITFORGE_CI_TRIGGER_TOKEN", "test-ci-trigger-token"),
+    ])
+    .await;
+    let base = server.git_root.parent().unwrap().to_path_buf();
+    let origin_url = format!("http://127.0.0.1:{}/testowner/proto.git", server.http_port);
+
+    let work = base.join("work");
+    std::fs::create_dir_all(&work).expect("create work dir");
+    run_git(&["init", "--initial-branch=main"], &work, &[]);
+    run_git(&["config", "user.email", "dev@example.com"], &work, &[]);
+    run_git(&["config", "user.name", "Outbox Regression"], &work, &[]);
+    std::fs::write(work.join("outbox.txt"), "push must not wait on ci\n").expect("write file");
+    run_git(&["add", "."], &work, &[]);
+    run_git(&["commit", "-m", "outbox regression commit"], &work, &[]);
+    run_git(&["remote", "add", "origin", &origin_url], &work, &[]);
+
+    // ─── Push under a hard bound far below the 60 s delivery timeout ────
+    // The bound must stay below `ci_http_client`'s 60 s request timeout so
+    // a red run fails fast instead of merely looking slow; the normal push
+    // here takes about a second.
+    const PUSH_BOUND: Duration = Duration::from_secs(25);
+    let mut push = tokio::process::Command::new("git")
+        .args(["push", "origin", "main"])
+        .current_dir(&work)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git push");
+    let started = tokio::time::Instant::now();
+    let waited = tokio::time::timeout(PUSH_BOUND, push.wait()).await;
+    let push_elapsed = started.elapsed();
+    match waited {
+        Ok(Ok(status)) => {
+            assert!(
+                status.success(),
+                "git push must succeed once the response is unblocked (status: {status})"
+            );
+        }
+        Ok(Err(error)) => panic!("git push wait failed: {error}"),
+        Err(_) => {
+            let _ = push.start_kill();
+            // Reap the killed child so it does not linger as a zombie with
+            // piped stdio for the rest of the test process.
+            let _ = push.wait().await;
+            panic!(
+                "git push did not return within {PUSH_BOUND:?} (took {push_elapsed:?}); \
+                 the accepted push is blocked on downstream CI trigger delivery (issue #288)"
+            );
+        }
+    }
+
+    // ─── The accepted ref must have landed ──────────────────────────────
+    let bare = server.git_root.join(server.repo_id.to_string());
+    let pushed = run_git(&["rev-parse", "refs/heads/main"], &bare, &[]);
+    let local = run_git(&["rev-parse", "refs/heads/main"], &work, &[]);
+    assert_eq!(
+        String::from_utf8_lossy(&local.stdout).trim(),
+        String::from_utf8_lossy(&pushed.stdout).trim(),
+        "the pushed ref must be durable on the server"
+    );
+
+    // ─── Delivery is owned by the durable background worker ────────────
+    // The hung endpoint must see at least one real delivery attempt after
+    // the response returned, proving the trigger row was durably persisted
+    // and is being retried asynchronously (2 s loop cadence) rather than
+    // dropped with the inline path.
+    let mut observed = false;
+    for _ in 0..30 {
+        if ci_hits.load(Ordering::SeqCst) >= 1 {
+            observed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        observed,
+        "the durable outbox must attempt CI delivery in the background after the push returned"
+    );
+
+    // ─── Exactly one durable trigger row, still awaiting delivery ───────
+    // The row must exist (persistence preserved), be unique (no duplicate
+    // enqueues), and still be pending/delivering (the hung endpoint means
+    // it can never be marked delivered; the lease/retry machinery keeps
+    // owning it).
+    let reader = gitforge_db::Pool::new(&base.join("gitforge.db").display().to_string())
+        .await
+        .expect("open read-only pool over the server database");
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT event_type FROM events WHERE event_type LIKE 'ci.trigger.%'")
+            .fetch_all(reader.pool())
+            .await
+            .expect("query trigger rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one durable trigger row; got {rows:?}"
+    );
+    assert!(
+        rows[0].0 == "ci.trigger.pending" || rows[0].0 == "ci.trigger.delivering",
+        "the trigger must still be awaiting/retrying delivery against the hung endpoint, got {}",
+        rows[0].0
     );
 
     common::shutdown_gracefully(&mut server.child).await;

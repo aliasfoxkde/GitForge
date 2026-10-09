@@ -599,9 +599,15 @@ async fn git_receive_pack(
                     );
                 }
             }
-            if let Err(error) = deliver_pending_ci_events(&state).await {
-                tracing::warn!(error = %error, "CI outbox delivery deferred after push");
-            }
+            // Delivery is deliberately not awaited here: the durable
+            // `ci_delivery_loop` spawned at startup owns network delivery
+            // (lease-claimed, 2 s cadence, retried). Awaiting it inline made
+            // an already-accepted push block on a 60 s HTTP timeout per
+            // outstanding row — a slow or hung CI endpoint pinned the whole
+            // receive-pack response. The regression test reproduces this
+            // failure mode; the live timeout in issue #288 is consistent
+            // with it, but was not causally confirmed from server logs. The
+            // rows above are durable, so the background loop redelivers.
             finish_response(
                 Response::builder()
                     .status(StatusCode::OK)
