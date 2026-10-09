@@ -15,6 +15,17 @@
 #     cannot prove coverage, so the gate fails closed (unlike run
 #     reconciliation, which keeps row-only grading for legacy rows)
 #
+# Evidence reader: the sqlite3 CLI is preferred. When it is absent (some
+# hosts ship Python's sqlite3 module without the CLI — Fedora among
+# them), the gate falls back to the Python standard-library sqlite3
+# module, reproducing exactly the CLI behavior the queries rely on: a
+# read-only connection (mode=ro, so a missing database fails instead of
+# being created), a 15s busy timeout (`.timeout 15000`), and list-mode
+# output (pipe-delimited rows, NULL rendered as empty). The fallback
+# requires a python3 whose SQLite has JSON1; that is probed up front and
+# its absence refuses the gate. Both readers fail closed on any query
+# error, and no grading check differs between them.
+#
 # Usage: gitforge-release-gate <40-hex-source-commit>
 # Environment:
 #   GITFORGE_RELEASE_DB         database to query (default <repo>/data/gitforge.db)
@@ -39,15 +50,66 @@ if [[ ! -f "$db_path" ]]; then
   printf 'release gate: live database not found: %s (set GITFORGE_RELEASE_DB)\n' "$db_path" >&2
   exit 1
 fi
-if ! command -v sqlite3 >/dev/null 2>&1; then
-  printf 'release gate: sqlite3 is required to read run evidence\n' >&2
-  exit 1
+# Every value interpolated into SQL below is strictly validated first
+# (40-hex commit; hex-and-dash run id) — nothing else reaches a query,
+# and both readers execute the identical SQL text.
+if command -v sqlite3 >/dev/null 2>&1; then
+  db_reader=cli
+else
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'release gate: sqlite3 CLI not found and no python3 for the fallback; one of them is required to read run evidence\n' >&2
+    exit 1
+  fi
+  if ! python3 -c 'import sqlite3' >/dev/null 2>&1; then
+    printf 'release gate: sqlite3 CLI not found and python3 lacks the sqlite3 module; install either to read run evidence\n' >&2
+    exit 1
+  fi
+  # The coverage query needs SQLite JSON1 (json_each / json_extract /
+  # json_group_array); a Python built against a SQLite without it cannot
+  # grade the gate, so refuse up front instead of failing mid-evidence.
+  if ! python3 -c "import sqlite3; sqlite3.connect(':memory:').execute(\"select json_array_length('[1]')\")" >/dev/null 2>&1; then
+    printf 'release gate: python3 sqlite3 fallback lacks SQLite JSON1 support; install the sqlite3 CLI to read run evidence\n' >&2
+    exit 1
+  fi
+  db_reader=python
+  printf 'release gate: sqlite3 CLI not found; reading run evidence via the python3 sqlite3 fallback\n' >&2
 fi
 
-# Read-only access with a busy timeout: the live services hold write locks
-# and the CLI default is to fail instantly instead of waiting.
+# Read-only access with a busy timeout: the live services hold write
+# locks and a bare reader default is to fail instantly instead of
+# waiting. Both readers emit the sqlite3 CLI's list-mode text: rows
+# separated by newlines, columns by '|', NULL as an empty field.
 db_query() {
-  sqlite3 -batch -readonly "$db_path" ".timeout 15000" "$1"
+  if [[ "$db_reader" == "cli" ]]; then
+    sqlite3 -batch -readonly "$db_path" ".timeout 15000" "$1"
+  else
+    python3 - "$db_path" "$1" <<'PY'
+import os
+import sqlite3
+import sys
+from urllib.parse import quote
+
+db_path, sql = sys.argv[1], sys.argv[2]
+# mode=ro never writes and never creates a database; timeout=15.0 is the
+# Python equivalent of `.timeout 15000`. The path is percent-escaped so
+# filesystem characters that are URI metacharacters survive.
+try:
+    connection = sqlite3.connect(
+        "file:" + quote(os.path.abspath(db_path)) + "?mode=ro",
+        uri=True,
+        timeout=15.0,
+    )
+    try:
+        rows = connection.execute(sql).fetchall()
+    finally:
+        connection.close()
+except sqlite3.Error as error:
+    print(f"release gate: python sqlite3 fallback: query failed: {error}", file=sys.stderr)
+    sys.exit(1)
+for row in rows:
+    print("|".join("" if value is None else str(value) for value in row))
+PY
+  fi
 }
 
 refuse() {
@@ -93,13 +155,19 @@ fi
 # carry a generated name ('job-<uuid>' — step names are not persisted, plan
 # finding F12), but their commands column mirrors the definition's step
 # `run` strings in order. A definition job whose command list has no
-# matching durable row is exactly the lazy-enqueue false green.
+# matching durable row is exactly the lazy-enqueue false green. NULL
+# commands rows are excluded from the match set: under SQL three-valued
+# logic a single NULL in the subquery turns every NOT IN comparison
+# UNKNOWN, so one unreadable durable row would silently pass coverage for
+# the whole run — a NULL commands row matches no definition job and
+# therefore covers nothing.
 missing=$(db_query "SELECT json_extract(d.value, '\$.name')
 FROM pipelines p, json_each(json_extract(p.config, '\$.jobs')) d
 WHERE p.id = (SELECT pipeline_id FROM pipeline_runs WHERE id = '$run_id')
   AND (SELECT json_group_array(json_extract(s.value, '\$.run'))
        FROM json_each(json_extract(d.value, '\$.steps')) s)
-      NOT IN (SELECT commands FROM jobs WHERE pipeline_run_id = '$run_id');")
+      NOT IN (SELECT commands FROM jobs
+              WHERE pipeline_run_id = '$run_id' AND commands IS NOT NULL);")
 missing_count=$(grep -c . <<< "$missing" || true)
 failing=$(db_query "SELECT '  ' || name || '=' || status FROM jobs
 WHERE pipeline_run_id = '$run_id' AND status <> 'succeeded';")
