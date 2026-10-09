@@ -212,6 +212,43 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline_runs table: {e}")))?;
 
+        // Durable CI trigger correlation is shared database schema: the CI
+        // service may use the table, but schema creation remains owned by
+        // this migration path so every database-backed service sees the same
+        // contract before accepting traffic.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS ci_trigger_requests (
+                id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                repo_id TEXT NOT NULL,
+                ref_name TEXT NOT NULL,
+                new_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                pipeline_run_id TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create ci_trigger_requests table: {e}")))?;
+        for statement in [
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ci_trigger_requests_event_id \
+             ON ci_trigger_requests (event_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ci_trigger_requests_dedupe \
+             ON ci_trigger_requests (repo_id, ref_name, new_hash, status)",
+        ] {
+            sqlx::query(statement)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    Error::database(format!("failed to migrate CI trigger requests: {e}"))
+                })?;
+        }
+
         // Durable cause for a non-success run verdict. A planning-stage
         // failure (workspace prep, job planning) produces a run with zero
         // job rows, and a job-backed failure leaves the reason only in the
@@ -608,6 +645,25 @@ mod tests {
         let pool = Pool::memory().await.unwrap();
         let result = pool.migrate().await;
         assert!(result.is_ok());
+        let trigger_schema_objects: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE (type = 'table' AND name = 'ci_trigger_requests') \
+                OR (type = 'index' AND name IN ( \
+                    'idx_ci_trigger_requests_event_id', \
+                    'idx_ci_trigger_requests_dedupe' \
+                ))",
+        )
+        .fetch_one(pool.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            trigger_schema_objects, 3,
+            "trigger request table and indexes belong to shared migrations"
+        );
+
+        // Startup migrations are intentionally idempotent; the CI service and
+        // shared database owner may both initialize the same database.
+        pool.migrate().await.unwrap();
     }
 
     #[tokio::test]

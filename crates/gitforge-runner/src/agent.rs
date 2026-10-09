@@ -2010,7 +2010,10 @@ mod receipt_tests {
         // leaving that second symlink in play would make it ambiguous which
         // link the rejection is attributable to, since only the immediate
         // parent's own metadata is examined.
-        let root = dir.path().canonicalize().expect("tempdir must canonicalize");
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("tempdir must canonicalize");
         let real = root.join("real");
         std::fs::create_dir(&real).expect("real parent must be creatable");
         let link = root.join("link");
@@ -2025,7 +2028,10 @@ mod receipt_tests {
     #[test]
     fn receipt_path_rejects_symlinked_destination() {
         let dir = tempfile::tempdir().expect("tempdir must succeed");
-        let root = dir.path().canonicalize().expect("tempdir must canonicalize");
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("tempdir must canonicalize");
         let target = root.join("elsewhere.json");
         std::fs::write(&target, "{}\n").expect("symlink target must be creatable");
         let link = root.join("receipt.json");
@@ -2281,7 +2287,10 @@ mod reconciler_env_config_tests {
         // Unlike the interval, a zero grace period is a policy error: an
         // explicit operator value is never silently reinterpreted.
         let error = config_with_timing(Some("0"), None).expect_err("zero grace must be rejected");
-        assert!(error.contains("grace period must be positive"), "got: {error}");
+        assert!(
+            error.contains("grace period must be positive"),
+            "got: {error}"
+        );
     }
 
     #[test]
