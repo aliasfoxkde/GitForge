@@ -1287,10 +1287,14 @@ async fn mark_trigger_request_processing(
 /// consumer's failure paths run while it holds the row in `claimed` — the
 /// receipt it took before handling — so that state closes here too: only the
 /// consumer that claimed a row may fail its claim.
+///
+/// Generic over the cause rather than `&dyn Display`: the concrete
+/// `Send + Sync` argument keeps the returned future `Send` inside the
+/// supervised consumer task.
 async fn fail_trigger_request_for_event(
     pool: &gitforge_db::Pool,
     event_id: uuid::Uuid,
-    error: &dyn std::fmt::Display,
+    error: impl std::fmt::Display + Send + Sync,
 ) {
     let cause = error.to_string();
     if let Err(close_error) = sqlx::query(
@@ -2778,7 +2782,7 @@ async fn supervise_event_consumer(
     consumer_health: Arc<ConsumerHealth>,
     shutdown: Arc<AtomicBool>,
 ) {
-    supervise_consumer(consumer_health.clone(), shutdown, move || {
+    supervise_consumer(consumer_health.clone(), shutdown.clone(), move || {
         run_event_consumer(
             event_bus.clone(),
             scheduler.clone(),
@@ -4736,6 +4740,7 @@ mod tests {
         assert!(
             abandoned_row
                 .error
+                .as_ref()
                 .is_some_and(|cause| cause.contains("restart")),
             "the cause names the restart: {:?}",
             abandoned_row.error
