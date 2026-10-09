@@ -75,13 +75,15 @@ source_commit=$source_commit
 build_timestamp_utc=$build_timestamp
 toolchain=$toolchain
 EOF
-  sha256sum RELEASE_METADATA.txt bin/* scripts/* systemd/user/* | sort > MANIFEST.sha256
   cat > READY <<EOF
 release_id=$release_id
 source_commit=$source_commit
 manifest=MANIFEST.sha256
 EOF
+  sha256sum READY RELEASE_METADATA.txt bin/* scripts/* systemd/user/* | sort > MANIFEST.sha256
 )
+
+"$(dirname "$0")/gitforge-release-verify" "$release_dir"
 
 printf 'release bundle: assembled %s\n' "$release_dir"
 printf 'release bundle: files=%s\n' "$(wc -l < "$release_dir/MANIFEST.sha256")"

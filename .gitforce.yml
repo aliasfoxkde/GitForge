@@ -132,3 +132,12 @@ jobs:
             echo "line coverage ${pct}% meets the 84% target"
           fi
     timeout: 90m
+
+  - name: release-contract
+    image: python:3.12-slim
+    needs: [coverage]
+    environment: {}
+    steps:
+      - name: Verify release bundle contract
+        run: python3 tests/test_release_bundle.py -v
+    timeout: 10m
