@@ -2,7 +2,8 @@
 
 use gitforge_common::{JobId, PipelineRunId, RepoId, Result};
 use gitforge_sandbox::{
-    DockerSandbox, OutputSink, Sandbox, SandboxInstance, SandboxLimits, StepResult,
+    limits::MAX_CPU_CORES, DockerSandbox, OutputSink, Sandbox, SandboxInstance, SandboxLimits,
+    StepResult,
 };
 use gitforge_storage::{
     Artifact, ArtifactReceipt, ArtifactStore, FileJobLogStore, FileStorage, JobReceipt, LogReceipt,
@@ -36,20 +37,44 @@ fn sandbox_acquire_timeout() -> Duration {
     )
 }
 
-/// Sandbox memory ceiling in megabytes. Debug codegen and linking of
-/// test binaries that statically link native crypto (aws-lc-sys via
-/// jsonwebtoken 11, libgit2) transiently pins the full 4GiB default and
-/// gets SIGKILLed by the cgroup, so operators on CI-capable hosts can
-/// raise the ceiling per deployment.
-fn sandbox_limits() -> SandboxLimits {
-    const DEFAULT_MB: u64 = 4096;
-    let memory_mb = std::env::var("GITFORGE_SANDBOX_MEMORY_MB")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+const DEFAULT_SANDBOX_MEMORY_MB: u64 = 4096;
+const DEFAULT_SANDBOX_CPU_CORES: u32 = 2;
+
+/// Resolve the sandbox memory ceiling in megabytes from the raw
+/// `GITFORGE_SANDBOX_MEMORY_MB` value, if present. Debug codegen and
+/// linking of test binaries that statically link native crypto
+/// (aws-lc-sys via jsonwebtoken 11, libgit2) transiently pins the full
+/// 4GiB default and gets SIGKILLed by the cgroup, so operators on
+/// CI-capable hosts can raise the ceiling per deployment. Absent,
+/// malformed, or sub-floor (below 128 MiB) values fall back to the
+/// 4GiB default.
+fn parse_sandbox_memory_mb(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.parse::<u64>().ok())
         .filter(|mb| *mb >= 128)
-        .unwrap_or(DEFAULT_MB);
+        .unwrap_or(DEFAULT_SANDBOX_MEMORY_MB)
+}
+
+/// Resolve the sandbox CPU capacity in whole cores from the raw
+/// `GITFORGE_SANDBOX_CPU_CORES` value, if present. Values outside the
+/// range `validated_cpu_quota_micros` accepts (`1..=MAX_CPU_CORES`)
+/// would fail every container creation, so — like absent or malformed
+/// input — they fall back to the default instead of wedging the runner.
+fn parse_sandbox_cpu_cores(raw: Option<&str>) -> u32 {
+    raw.and_then(|value| value.parse::<u32>().ok())
+        .filter(|cores| (1..=MAX_CPU_CORES).contains(cores))
+        .unwrap_or(DEFAULT_SANDBOX_CPU_CORES)
+}
+
+/// The limits every `JobExecutor`-spawned sandbox runs under, read from
+/// the process environment.
+fn sandbox_limits() -> SandboxLimits {
     SandboxLimits {
-        memory_mb,
+        memory_mb: parse_sandbox_memory_mb(
+            std::env::var("GITFORGE_SANDBOX_MEMORY_MB").ok().as_deref(),
+        ),
+        cpu_cores: parse_sandbox_cpu_cores(
+            std::env::var("GITFORGE_SANDBOX_CPU_CORES").ok().as_deref(),
+        ),
         ..SandboxLimits::default()
     }
 }
@@ -961,22 +986,57 @@ mod tests {
         std::env::remove_var("GITFORGE_SANDBOX_ACQUIRE_SECS");
     }
 
+    // These exercise the pure parsing seam rather than `sandbox_limits()`
+    // itself: mutating process-wide env from parallel unit tests races
+    // with every other test (and with `JobExecutor` construction) in the
+    // same process. The env-reading wrapper is a one-line composition of
+    // these helpers.
+
     #[test]
-    fn test_sandbox_limits_default_and_env_override() {
-        // Default: the historical 4GiB ceiling.
-        std::env::remove_var("GITFORGE_SANDBOX_MEMORY_MB");
-        assert_eq!(sandbox_limits().memory_mb, 4096);
+    fn test_parse_sandbox_memory_mb_default_and_override() {
+        // Default (unset): the historical 4GiB ceiling.
+        assert_eq!(parse_sandbox_memory_mb(None), 4096);
 
         // CI-capable hosts can raise it for the native-crypto link step.
-        std::env::set_var("GITFORGE_SANDBOX_MEMORY_MB", "6144");
-        assert_eq!(sandbox_limits().memory_mb, 6144);
+        assert_eq!(parse_sandbox_memory_mb(Some("6144")), 6144);
 
-        // Garbage and sub-floor values fall back to the default.
-        std::env::set_var("GITFORGE_SANDBOX_MEMORY_MB", "not-a-number");
-        assert_eq!(sandbox_limits().memory_mb, 4096);
-        std::env::set_var("GITFORGE_SANDBOX_MEMORY_MB", "64");
-        assert_eq!(sandbox_limits().memory_mb, 4096);
-        std::env::remove_var("GITFORGE_SANDBOX_MEMORY_MB");
+        // Garbage, empty, and sub-floor values fall back to the default.
+        assert_eq!(parse_sandbox_memory_mb(Some("not-a-number")), 4096);
+        assert_eq!(parse_sandbox_memory_mb(Some("")), 4096);
+        assert_eq!(parse_sandbox_memory_mb(Some("64")), 4096);
+        assert_eq!(parse_sandbox_memory_mb(Some("127")), 4096);
+        // Exactly the floor is accepted.
+        assert_eq!(parse_sandbox_memory_mb(Some("128")), 128);
+    }
+
+    #[test]
+    fn test_parse_sandbox_cpu_cores_default_and_override() {
+        // Default (unset): 2 whole cores (the SandboxLimits default).
+        assert_eq!(parse_sandbox_cpu_cores(None), 2);
+
+        // Operators can raise it for compile-heavy steps...
+        assert_eq!(parse_sandbox_cpu_cores(Some("8")), 8);
+        // ...and lower it on constrained hosts; 1 is the accepted minimum.
+        assert_eq!(parse_sandbox_cpu_cores(Some("1")), 1);
+        // The upper boundary is exactly MAX_CPU_CORES, which container
+        // creation accepts.
+        assert_eq!(
+            parse_sandbox_cpu_cores(Some(&MAX_CPU_CORES.to_string())),
+            MAX_CPU_CORES
+        );
+
+        // Garbage, empty, and every value container creation would
+        // reject — 0 (quota-disabling), just over max, far over max, and
+        // negatives (unparseable as u32) — fall back to the default
+        // instead of wedging the runner.
+        assert_eq!(parse_sandbox_cpu_cores(Some("not-a-number")), 2);
+        assert_eq!(parse_sandbox_cpu_cores(Some("")), 2);
+        assert_eq!(parse_sandbox_cpu_cores(Some("0")), 2);
+        assert_eq!(
+            parse_sandbox_cpu_cores(Some(&(MAX_CPU_CORES + 1).to_string())),
+            2
+        );
+        assert_eq!(parse_sandbox_cpu_cores(Some("-4")), 2);
     }
 
     #[test]
