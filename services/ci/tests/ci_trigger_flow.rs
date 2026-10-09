@@ -726,7 +726,7 @@ async fn test_repeat_trigger_stays_deduplicated_past_the_correlation_window() {
         .to_string();
 
     // The consumer planned the run and linked it into the request.
-    let mut linked: Option<serde_json::Value> = None;
+    let linked;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if Instant::now() >= deadline {
