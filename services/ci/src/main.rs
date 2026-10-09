@@ -5116,7 +5116,8 @@ mod tests {
         timeout(Duration::from_secs(5), handle)
             .await
             .expect("consumer joins for shutdown")
-            .expect("the consumer exits cleanly");
+            .expect("the consumer exits cleanly")
+            .expect("the consumer task succeeds");
     }
 
     /// An unavailable recovery store must fail the consumer attempt, not be
