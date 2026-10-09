@@ -470,6 +470,24 @@ fn compose_exec_env(has_workspace: bool, env: &[String]) -> Vec<String> {
     exec_env
 }
 
+/// Docker `cpu_quota` in microseconds for one 100 ms `cpu_period`, derived
+/// from a core allowance. This is the cgroup boundary that actually bounds a
+/// job's CPU: the previous formula (a total-time budget plugged into the
+/// per-period quota) produced a quota of ~36000 cores, which enforced
+/// nothing.
+fn cpu_quota_micros(cpus: f64) -> i64 {
+    const PERIOD_MICROS: i64 = 100_000;
+    // Docker treats a zero quota as unlimited; clamp so a degenerate
+    // allowance still yields a real (tiny) bound instead of no bound.
+    const MIN_CORES: f64 = 0.1;
+    let cores = if cpus.is_finite() {
+        cpus.max(MIN_CORES)
+    } else {
+        MIN_CORES
+    };
+    (cores * PERIOD_MICROS as f64).round() as i64
+}
+
 #[async_trait]
 impl Sandbox for DockerSandbox {
     async fn create(
@@ -494,7 +512,11 @@ impl Sandbox for DockerSandbox {
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
                 cpu_period: Some(100000), // 100ms in microseconds
-                cpu_quota: Some((limits.cpu_ms * 1000) as i64), // Convert ms to microseconds
+                cpu_quota: Some(cpu_quota_micros(limits.cpus)),
+                // Cgroup pids controller: bounds process/thread forks inside
+                // the container (issue #277). 0 means the operator disabled
+                // the cap; omit the setting entirely in that case.
+                pids_limit: (limits.pids_limit > 0).then_some(limits.pids_limit),
                 network_mode: if limits.network {
                     None
                 } else {
@@ -574,7 +596,8 @@ impl Sandbox for DockerSandbox {
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
                 cpu_period: Some(100000),
-                cpu_quota: Some((limits.cpu_ms * 1000) as i64),
+                cpu_quota: Some(cpu_quota_micros(limits.cpus)),
+                pids_limit: (limits.pids_limit > 0).then_some(limits.pids_limit),
                 network_mode: if limits.network {
                     None
                 } else {
@@ -1500,7 +1523,8 @@ mod tests {
     fn test_sandbox_limits_default() {
         let limits = SandboxLimits::default();
         assert_eq!(limits.memory_mb, 4096);
-        assert_eq!(limits.cpu_ms, 3600000);
+        assert_eq!(limits.cpus, 2.0);
+        assert_eq!(limits.pids_limit, 512);
         assert!(limits.network);
     }
 
@@ -1508,7 +1532,7 @@ mod tests {
     fn test_sandbox_limits_medium() {
         let limits = SandboxLimits::medium();
         assert_eq!(limits.memory_mb, 2048);
-        assert_eq!(limits.cpu_ms, 1800000);
+        assert_eq!(limits.cpus, 2.0);
         assert!(limits.network);
     }
 
@@ -1516,8 +1540,33 @@ mod tests {
     fn test_sandbox_limits_large() {
         let limits = SandboxLimits::large();
         assert_eq!(limits.memory_mb, 8192);
-        assert_eq!(limits.cpu_ms, 3600000);
+        assert_eq!(limits.cpus, 4.0);
         assert!(limits.network);
+    }
+
+    #[test]
+    fn test_cpu_quota_micros_bounds_cores() {
+        // One core: quota equals the period.
+        assert_eq!(cpu_quota_micros(1.0), 100_000);
+        // Fractional cores are honored exactly.
+        assert_eq!(cpu_quota_micros(2.5), 250_000);
+        assert_eq!(cpu_quota_micros(0.5), 50_000);
+        // A 20-core allowance quadruples the period budget.
+        assert_eq!(cpu_quota_micros(20.0), 2_000_000);
+    }
+
+    #[test]
+    fn test_cpu_quota_micros_never_yields_unlimited() {
+        // Zero, negative, and non-finite allowances clamp to the minimum
+        // bounded quota (10% of one core) instead of a zero quota, which
+        // Docker reads as "no limit".
+        assert_eq!(cpu_quota_micros(0.0), 10_000);
+        assert_eq!(cpu_quota_micros(-3.0), 10_000);
+        assert_eq!(cpu_quota_micros(f64::NAN), 10_000);
+        assert_eq!(cpu_quota_micros(f64::INFINITY), 10_000);
+        // Absurdly large allowances saturate instead of panicking or
+        // wrapping into a negative (unlimited-looking) quota.
+        assert_eq!(cpu_quota_micros(f64::MAX), i64::MAX);
     }
 
     #[test]
