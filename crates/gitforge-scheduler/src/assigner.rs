@@ -1637,39 +1637,104 @@ impl Scheduler {
 
     /// Return the current lease for a job, creating one for an existing
     /// assignment when needed. Repeated calls are idempotent.
+    ///
+    /// A lease is only handed to a runner while the durable job row still
+    /// carries (or accepts) it. When the durable row has already decided —
+    /// terminal grade, cancellation, or a superseding owner — the stale
+    /// in-memory assignment is dropped instead of offering a dead lease:
+    /// the job stops reappearing on later pending-jobs polls and stops
+    /// consuming runner capacity. Without this, a mirror that outlived its
+    /// durable row re-offered the job on every poll and every mark-started
+    /// rejected with `durable job lease is no longer active` (live
+    /// 2026-10-09, job 9bfbab3d-8e2d-4759-b972-18fa16e5df47: repeated
+    /// assignment + 409 loop until the runner gave up and went offline).
     pub async fn ensure_job_lease(&self, job_id: JobId) -> Option<String> {
-        let lease = {
+        let (lease, runner_id, mirror) = {
             let mut state = self.state.write().await;
-            if !state.assigned_jobs.contains_key(&job_id) {
-                return None;
-            }
-            state
+            let mirror @ (runner_id, _, _) = state.assigned_jobs.get(&job_id).copied()?;
+            let lease = state
                 .job_leases
                 .entry(job_id)
                 .or_insert_with(|| Uuid::new_v4().to_string())
-                .clone()
+                .clone();
+            (lease, runner_id, mirror)
         };
         // Keep the durable row in sync with the lease handed to the runner.
         // Lease validation reads the database, and a stale or missing row
         // would otherwise fence off every start request for this job.
         if let Some(pool) = &self.db_pool {
-            let runner_id = {
-                let state = self.state.read().await;
-                state
-                    .assigned_jobs
-                    .get(&job_id)
-                    .map(|(runner_id, _, _)| *runner_id)
-            };
-            if let Some(runner_id) = runner_id {
-                if let Err(error) =
-                    gitforge_db::queries::JobQueries::sync_lease(pool, job_id, runner_id, &lease)
-                        .await
-                {
+            match gitforge_db::queries::JobQueries::sync_lease(pool, job_id, runner_id, &lease)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Zero rows updated: the durable row is no longer in a
+                    // dispatchable pre-start state. A live execution — durable
+                    // `running` under this exact lease — is still valid, and a
+                    // runner legitimately re-polls while its job runs.
+                    // Everything else means this mirror entry is stale.
+                    let live = match gitforge_db::queries::JobQueries::get(pool, job_id).await {
+                        Ok(Some(job)) => {
+                            job.status == "running"
+                                && job.runner_id == Some(runner_id)
+                                && job.lease_token.as_deref() == Some(lease.as_str())
+                        }
+                        Ok(None) => false,
+                        Err(error) => {
+                            // Unreadable durable state must neither hand out a
+                            // lease nor drop the mirror on a guess: withhold
+                            // this poll's offer and let the next tick retry.
+                            tracing::warn!(
+                                %error,
+                                %job_id,
+                                "failed to read job for lease sync; withholding the offer"
+                            );
+                            return None;
+                        }
+                    };
+                    if live {
+                        return Some(lease);
+                    }
+                    self.drop_stale_assignment(job_id, mirror, &lease).await;
+                    return None;
+                }
+                Err(error) => {
+                    // Transient durable-write failure: keep the previous
+                    // behavior (offer the lease; the lease-gated start has its
+                    // own bounded retry and fence) rather than dropping a
+                    // possibly-healthy assignment because SQLite hiccuped.
                     tracing::warn!("failed to sync lease for job {}: {}", job_id, error);
                 }
             }
         }
         Some(lease)
+    }
+
+    /// Drop an in-memory assignment whose durable row is no longer
+    /// dispatchable. Guarded on the exact mirror tuple and lease token so a
+    /// concurrent re-assignment or completion is never dropped by mistake.
+    /// The durable row is deliberately left untouched here: a zero-row lease
+    /// sync means the durable state already decided, and requeueing terminal
+    /// work is exactly the resurrection this path must not perform.
+    async fn drop_stale_assignment(
+        &self,
+        job_id: JobId,
+        mirror: (RunnerId, PipelineRunId, RepoId),
+        lease: &str,
+    ) {
+        let mut state = self.state.write().await;
+        if state.assigned_jobs.get(&job_id) != Some(&mirror)
+            || state.job_leases.get(&job_id).map(String::as_str) != Some(lease)
+        {
+            return;
+        }
+        state.job_assignments.remove(&job_id);
+        state.assigned_jobs.remove(&job_id);
+        state.job_leases.remove(&job_id);
+        tracing::warn!(
+            %job_id,
+            "dropped stale scheduler assignment: the durable job row is no longer dispatchable"
+        );
     }
 
     /// Verify the runner's lease and persist the assigned-to-running
@@ -2948,6 +3013,153 @@ mod tests {
             events.try_recv().is_err(),
             "a requeued row is not terminal; no completion may be invented"
         );
+    }
+
+    #[tokio::test]
+    async fn test_terminal_durable_job_is_not_offered_and_frees_capacity() {
+        // Live failure (2026-10-09, job 9bfbab3d-8e2d-4759-b972-18fa16e5df47):
+        // the durable row went terminal while the scheduler's in-memory
+        // mirror kept the assignment. The lease sync then affected zero rows,
+        // but the poll path handed out a lease anyway, so the runner
+        // re-received the assignment on every poll and every mark-started
+        // rejected with "durable job lease is no longer active" until the
+        // runner gave up. The zero-row sync must refuse the offer, drop the
+        // stale mirror, and free the runner for queued work — without
+        // requeueing the terminal row.
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (run_id, repo_id) = seed_durable_run(&pool).await;
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        let runner_id = RunnerId::new();
+        scheduler
+            .register_runner(make_runner(runner_id, "lease-loop-runner", "online", 1))
+            .await;
+
+        let dead_job = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                dead_job,
+                run_id,
+                repo_id,
+                vec!["cargo test".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+        let queued_job = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                queued_job,
+                run_id,
+                repo_id,
+                vec!["cargo build".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Capacity 1: only the head job is assigned; the second stays queued.
+        scheduler.process_queue().await;
+        assert_eq!(scheduler.is_assigned(dead_job).await, Some(runner_id));
+        assert!(scheduler.is_assigned(queued_job).await.is_none());
+
+        // The durable row decides out-of-band (the timeout watchdog and
+        // API-side transitions write the row directly) while the assignment
+        // mirror keeps the stale entry. The lease offered before the flip is
+        // dead, exactly like the runner's live 409 loop.
+        let stale_lease = scheduler.ensure_job_lease(dead_job).await.unwrap();
+        gitforge_db::queries::JobQueries::update_status(&pool, dead_job, "failed")
+            .await
+            .unwrap();
+
+        // The poll path must never hand out a lease for the terminal row —
+        // on this poll or any later one. These assertions come BEFORE any
+        // start attempt so the fence path cannot mask the fix.
+        assert!(scheduler.ensure_job_lease(dead_job).await.is_none());
+        assert!(scheduler.ensure_job_lease(dead_job).await.is_none());
+        assert!(scheduler.is_assigned(dead_job).await.is_none());
+        {
+            let state = scheduler.state.read().await;
+            assert!(!state.job_assignments.contains_key(&dead_job));
+            assert!(!state.assigned_jobs.contains_key(&dead_job));
+            assert!(!state.job_leases.contains_key(&dead_job));
+            assert!(
+                !state.queue.contains(dead_job),
+                "a terminal job must not re-enter the queue"
+            );
+        }
+        // Terminal work stays terminal: no requeue, no dispatch.
+        let durable = gitforge_db::queries::JobQueries::get(&pool, dead_job)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, "failed");
+        assert_eq!(
+            scheduler.queue_len().await,
+            1,
+            "only the still-valid queued job remains"
+        );
+
+        // The stale lease taken before the flip is rejected either way.
+        assert!(
+            scheduler
+                .start_job(dead_job, runner_id, &stale_lease)
+                .await
+                .is_err(),
+            "a terminal row must reject the stale start"
+        );
+
+        // The freed capacity admits the queued job, and its lease is live.
+        scheduler.process_queue().await;
+        assert_eq!(scheduler.is_assigned(queued_job).await, Some(runner_id));
+        let live_lease = scheduler.ensure_job_lease(queued_job).await.unwrap();
+        scheduler
+            .start_job(queued_job, runner_id, &live_lease)
+            .await
+            .expect("the valid queued job must start against its synced lease");
+    }
+
+    #[tokio::test]
+    async fn test_running_durable_job_keeps_its_lease_on_repoll() {
+        // A runner legitimately re-polls pending jobs while its assignment
+        // is already durably `running` (duplicate poll, restarted poll
+        // loop). The zero-row lease sync must NOT drop that live mirror:
+        // only decided rows are stale.
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (run_id, repo_id) = seed_durable_run(&pool).await;
+
+        let scheduler = Scheduler::with_db(pool.clone());
+        let runner_id = RunnerId::new();
+        scheduler
+            .register_runner(make_runner(runner_id, "repoll-runner", "online", 1))
+            .await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                run_id,
+                repo_id,
+                vec!["cargo test".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+        scheduler.process_queue().await;
+        let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
+        scheduler
+            .start_job(job_id, runner_id, &lease)
+            .await
+            .unwrap();
+
+        // The durable row is `running` now; the re-poll still hands back the
+        // same live lease and the mirror stays intact.
+        assert_eq!(
+            scheduler.ensure_job_lease(job_id).await.as_deref(),
+            Some(lease.as_str())
+        );
+        assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
     }
 
     #[tokio::test]

@@ -1366,9 +1366,11 @@ impl JobQueries {
         Ok(true)
     }
 
-    /// Persist the scheduler's in-memory lease so durable lease validation
-    /// (which reads this row) accepts the lease handed to the runner.
-    /// Returns whether a row was updated.
+    /// Reconcile a scheduler lease only with a durable assignment already
+    /// owned by the same runner. Queue-to-assigned ownership is established
+    /// by `assign_with_lease`; this method must never claim a queued row or
+    /// overwrite a newer runner/lease after a stale async snapshot.
+    /// A legacy assigned row with no token may be repaired for its owner.
     pub async fn sync_lease(
         pool: &Pool,
         id: JobId,
@@ -1376,11 +1378,12 @@ impl JobQueries {
         lease_token: &str,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE jobs SET runner_id = ?, lease_token = ?, status = 'assigned' WHERE id = ? AND status IN ('queued', 'assigned')",
+            "UPDATE jobs SET lease_token = ? WHERE id = ? AND status = 'assigned' AND runner_id = ? AND (lease_token IS NULL OR lease_token = ?)",
         )
-        .bind(runner_id.to_string())
         .bind(lease_token)
         .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to sync job lease: {e}")))?;
@@ -5157,6 +5160,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sync_lease_cannot_overwrite_superseding_assignment() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "lease-race-owner".to_string(),
+            "lease-race@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo = crate::models::Repository::new(
+            "lease-race-repo".to_string(),
+            user.id,
+            "/git/lease-race".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "lease-race-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "main".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+        let job = crate::models::Job::new(run.id, "lease-race".to_string());
+        JobQueries::create(&pool, &job).await.unwrap();
+        JobQueries::update_status(&pool, job.id, "queued")
+            .await
+            .unwrap();
+
+        let old_runner = RunnerId::new();
+        let current_runner = RunnerId::new();
+        for (runner_id, name) in [
+            (old_runner, "old-lease-runner"),
+            (current_runner, "current-lease-runner"),
+        ] {
+            let mut runner = crate::models::Runner::new(
+                name.to_string(),
+                crate::models::RunnerType::Docker,
+                1,
+            );
+            runner.id = runner_id;
+            RunnerQueries::create(&pool, &runner).await.unwrap();
+        }
+        assert!(JobQueries::assign_with_lease(&pool, job.id, current_runner, "lease-current")
+            .await
+            .unwrap());
+
+        // Models ensure_job_lease's delayed DB write after the job was
+        // requeued and assigned to a different runner and fencing token.
+        assert!(!JobQueries::sync_lease(&pool, job.id, old_runner, "lease-stale")
+            .await
+            .unwrap());
+
+        let persisted = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(persisted.status, "assigned");
+        assert_eq!(persisted.runner_id, Some(current_runner));
+        assert_eq!(persisted.lease_token.as_deref(), Some("lease-current"));
+    }
+
+    #[tokio::test]
     async fn test_job_heartbeat_is_lease_gated_and_recovers_runner() {
         let pool = Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
@@ -5200,12 +5272,12 @@ mod tests {
         RunnerQueries::create(&pool, &runner).await.unwrap();
         let job = crate::models::Job::new(run.id, "beat".to_string());
         JobQueries::create(&pool, &job).await.unwrap();
-        // Lease sync parks the row at `assigned`; the row must be
-        // dispatchable first.
+        // Persist the same atomic assignment transition used by the
+        // scheduler before exercising lease-gated heartbeat behavior.
         JobQueries::update_status(&pool, job.id, "queued")
             .await
             .unwrap();
-        assert!(JobQueries::sync_lease(&pool, job.id, runner_id, "lease-1")
+        assert!(JobQueries::assign_with_lease(&pool, job.id, runner_id, "lease-1")
             .await
             .unwrap());
 
@@ -5321,7 +5393,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            JobQueries::sync_lease(&pool, legacy.id, stale_runner_id, "lease-legacy")
+            JobQueries::assign_with_lease(&pool, legacy.id, stale_runner_id, "lease-legacy")
                 .await
                 .unwrap()
         );
@@ -5335,7 +5407,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            JobQueries::sync_lease(&pool, alive.id, beat_runner_id, "lease-alive")
+            JobQueries::assign_with_lease(&pool, alive.id, beat_runner_id, "lease-alive")
                 .await
                 .unwrap()
         );
