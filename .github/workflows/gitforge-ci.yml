@@ -24,10 +24,6 @@ env:
   GITFORGE_REPO_ID: ${{ vars.GITFORGE_REPO_ID || '' }}
   GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
-  # CI trigger credential accepted by services/ci (GITFORGE_CI_TRIGGER_TOKEN).
-  GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
-  # Operator credential required by the scheduler's GET /pipelines/runs/{id}.
-  GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
 
 permissions:
   contents: read
@@ -41,6 +37,9 @@ jobs:
     name: Enqueue Build to GitForge
     if: vars.GITFORGE_ENABLED == 'true'
     runs-on: [self-hosted, linux, x64, gitforge-github]
+    env:
+      # Limit the trigger credential to the enqueue job.
+      GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
     outputs:
       run_id: ${{ steps.enqueue.outputs.run_id }}
       build_status: ${{ steps.enqueue.outputs.status }}
@@ -108,6 +107,9 @@ jobs:
     needs: enqueue-build
     if: needs.enqueue-build.outputs.build_status == 'enqueued'
     runs-on: [self-hosted, linux, x64, gitforge-github]
+    env:
+      # Limit the operator credential to the status-polling job.
+      GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
     outputs:
       terminal_status: ${{ steps.poll.outputs.terminal_status }}
     steps:
