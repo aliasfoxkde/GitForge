@@ -1023,7 +1023,7 @@ async fn pipeline_create_enforces_authorization_and_shape() {
 
 /// Seed a second repository whose storage is a real bare repository with
 /// one commit, plus an active pipeline for it. Returns (bare path, commit).
-async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, PipelineId, String) {
+async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, RepoId, PipelineId, String) {
     let bare = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         std::process::Command::new("git")
@@ -1094,7 +1094,7 @@ async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, PipelineId, 
     };
     let pipeline_id = pipeline.id;
     PipelineQueries::create(&f.pool, &pipeline).await.unwrap();
-    (bare, pipeline_id, commit)
+    (bare, repo_id, pipeline_id, commit)
 }
 
 #[tokio::test]
@@ -1129,7 +1129,7 @@ async fn pipeline_run_trigger_rejects_hostile_refs_before_any_git_call() {
 #[tokio::test]
 async fn pipeline_run_trigger_resolves_revisions_in_repository_storage() {
     let f = seed().await;
-    let (_bare, pipeline_id, commit) = seed_real_storage_repo(&f).await;
+    let (_bare, _repo_id, pipeline_id, commit) = seed_real_storage_repo(&f).await;
 
     // The fixture repository's storage path does not exist, so its runs
     // must report the storage problem instead of running git.
@@ -1204,6 +1204,128 @@ async fn pipeline_run_trigger_validates_pipeline_and_id() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "invalid_id");
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline run rerun (POST /api/pipeline-runs/{id}/rerun)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pipeline_run_rerun_validates_run_and_id() {
+    let f = seed().await;
+
+    // Malformed run id.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/pipeline-runs/not-a-uuid/rerun",
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_id");
+
+    // Unknown run id.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!(
+            "/api/pipeline-runs/{}/rerun",
+            gitforge_common::PipelineRunId::new()
+        ),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // Authorization applies before anything else runs.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipeline-runs/{}/rerun", f.run_id),
+        Some(&f.intruder_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn pipeline_run_rerun_reproduces_stored_commit() {
+    let f = seed().await;
+
+    // The fixture repository's storage does not exist: the rerun must
+    // report the storage problem instead of running git or minting a run
+    // doomed at clone time.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipeline-runs/{}/rerun", f.run_id),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "storage_unavailable");
+
+    let (_bare, repo_id, _pipeline_id, commit) = seed_real_storage_repo(&f).await;
+
+    // A stored commit that no longer resolves (rewritten history, pruned
+    // storage) is a request error, not a server fault or a doomed run.
+    let ghost = PipelineRun::new(
+        f.pipeline_id,
+        repo_id,
+        "webhook".to_string(),
+        "e".repeat(40),
+    );
+    PipelineRunQueries::create(&f.pool, &ghost).await.unwrap();
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipeline-runs/{}/rerun", ghost.id),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "unknown_revision");
+
+    // A stored hash failing the revision guard never reaches git.
+    let hostile = PipelineRun::new(
+        f.pipeline_id,
+        repo_id,
+        "webhook".to_string(),
+        "--upload-pack=/tmp/x".to_string(),
+    );
+    PipelineRunQueries::create(&f.pool, &hostile).await.unwrap();
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipeline-runs/{}/rerun", hostile.id),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_commit_hash");
+
+    // A resolvable stored commit walks the full pre-CI ladder; with CI
+    // unconfigured in the fixture it surfaces the missing orchestrator
+    // instead of pretending a run was created.
+    let real = PipelineRun::new(f.pipeline_id, repo_id, "webhook".to_string(), commit);
+    PipelineRunQueries::create(&f.pool, &real).await.unwrap();
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipeline-runs/{}/rerun", real.id),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "ci_unavailable");
 }
 
 // ---------------------------------------------------------------------------
