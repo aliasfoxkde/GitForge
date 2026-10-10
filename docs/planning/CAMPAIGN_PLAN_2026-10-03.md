@@ -221,3 +221,26 @@ that decision in an ADR rather than silently under-delivering.
    leaving a running-forever durable row for boot reconcile. Correct
    response to the freeze was to wait — a service restart clears nothing
    and fences live jobs.
+
+   0.6.16 cycle addendum (2026-10-10): every candidate from item 6 has a
+   verdict. Nested-BEGIN poisoning — two-layer defense landed
+   (`begin_immediate` recovery passes 0b16dd76; pool-wide
+   `before_acquire` heal 0dfc0f15), validated green by fedora pipeline
+   run `be5c03fd` on the exact commit. Planned-row persist — wrapped in
+   `persist_with_retry` (a4d52e44). Ghost-run class — checkout-spawn
+   failure grading and per-repo trigger lanes were already in tree;
+   the remaining boot-order fix landed (consumer before the inline
+   workspace rebuild, 69e3c859). Manual cancel cascade — descendants
+   cancelled and the pipeline finalized (09c91bfa); the live instance
+   exhibited the pre-fix signature the same day (run `ee2df0ec`'s jobs
+   all cancelled yet the run row stayed `running` on build 63427df).
+   Sandbox acquisition cap — now load-aware, scaling to 3× under
+   saturation with the env pin still winning (bdfc9a75). Runner
+   heartbeat write — through `persist_with_retry` (same commit).
+   Remaining candidates (checkpoint/requeue for restart-fenced jobs)
+   are covered by the redrive pair (50fede66, c71a87c2). Release
+   evidence discipline note: the 2026-10-10 operating directive routes
+   all CI through the fedora instance; its ci unit was found stopped
+   (clean SIGTERM, 02:41:32 CDT, no owning cron/timer) and restarted
+   manually — attribution unknown, recorded here because an absent
+   orchestrator silently turns every queued run into a ghost.
