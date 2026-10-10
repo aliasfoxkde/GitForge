@@ -281,3 +281,22 @@ that decision in an ADR rather than silently under-delivering.
    targets would be placeholder code by another name. Scheduled with
    the next image bump (the same one that will carry the coverage
    ratchet's in-sandbox recalibration), so one image refresh buys both.
+
+   Phase 1+2 exit (2026-10-10, feat/v0617-quality-foundation): the
+   unwrap/expect campaign drained the production surface from a
+   measured 112 sites to 5 — three documented invariants (metrics
+   constructor, static_regex table, pool semaphore) and two deliberate
+   fail-fast JWT startup aborts — in commits 1cd009cc (categorizer
+   lexer fix), 3744f00c (batch 1), 91f414c6 (batch 2), bbd69538
+   (batches 3+4 + enforcement), 309ae4a2 (panic deny). The first
+   measurement (191) was itself wrong: the categorizer's lexer
+   truncated `#[cfg(test)]` spans on raw-string literals, inflating
+   agent.rs by 71 phantom sites; the corrected string/comment-aware
+   counter (scripts/unwrap-production-count.py) is the ratchet's
+   instrument of record, with methodology and residuals in
+   docs/planning/QUALITY_BASELINE.md. unwrap_used/expect_used/panic
+   are now workspace deny (clippy.toml allows them in tests), so the
+   counts can only move by reviewed, documented `#[allow]`. Validation
+   rides the v0617 branch pipeline per the fedora-only directive;
+   clippy tripping anywhere means the categorizer and clippy
+   disagree — fix the site, not the measurement.
