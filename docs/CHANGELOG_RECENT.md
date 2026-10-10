@@ -2,6 +2,39 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Route-vs-docs drift gate** (48c41bc7): `scripts/check-route-docs.py`
+  cross-checks the axum routers against the hand-maintained OpenAPI spec
+  and docs/API.md at push time — a served route with no spec entry, a
+  spec path with no backing route, or a doc endpoint that serves nothing
+  now fails the `fmt` job instead of surfacing at review time. Parse-only
+  (no cargo, no network), `#[cfg(test)]`-aware. First run closed nine
+  real drift findings: two shipped features (`POST /auth/refresh`,
+  `POST /auth/logout`) had no spec or doc entry, and the rerun, SSH-key,
+  webhook, dashboard, and metrics surfaces were partially undocumented.
+- **CI image dsc-ci-rust:9** adds python3 (slim bookworm base ships
+  none) so the drift gate can run in the pipeline; bump follows the
+  baked-tooling rule (rebuild + tag bump, never pull at run time).
+
+### Changed
+
+- **The `/dashboard` page now reports measured state** (5c07b42a): the
+  panel was a fabricated status page — hardcoded version string,
+  permanent zeros, an unconditional "Connected" badge. It now renders
+  live aggregates from a new `StatsQueries::dashboard` (repositories,
+  pipelines, artifacts, runners online, 24h runs + success count; the
+  24h window binds an RFC3339 timestamp to match how write paths store
+  them — SQLite's space-separated `datetime('now')` compares wrongly
+  against the `T` separator inside a day). When the database read fails
+  the page says Unavailable and renders em dashes rather than quiet
+  zeros. The page also meets WCAG 2.1 AAA contrast (≥7:1 on every text
+  pair — the old green/red badges measured 5.2:1 and 3.8:1), adds a
+  `<main>` landmark, a `:focus-visible` outline, and hides decorative
+  emoji from assistive technology.
+
 ## [0.6.16] - 2026-10-10
 
 ### Added

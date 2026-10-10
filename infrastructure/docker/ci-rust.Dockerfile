@@ -34,7 +34,7 @@ FROM rust:1-slim-bookworm
 # supplies ssh-keygen, which the hermetic git_ssh_protocol suite spawns.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev curl ca-certificates git openssh-client \
+        pkg-config libssl-dev curl ca-certificates git openssh-client python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Slim images ship the minimal rustup profile; the pipeline needs both linters.

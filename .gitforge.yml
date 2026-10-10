@@ -12,12 +12,14 @@
 #   directory and corrupt each other's build locks.
 # - `environment: {}` is required by the parser (PipelineDefinition has no
 #   serde default) even though it is never forwarded.
-# - The image is pre-built on the host (dsc-ci-rust:8 — cargo, clippy,
-#   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, and the
-#   GitForge workspace cargo registry cache baked in for offline builds).
+# - The image is pre-built on the host (dsc-ci-rust:9 — cargo, clippy,
+#   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, python3
+#   for the route-docs drift gate, and the GitForge workspace cargo
+#   registry cache baked in for offline builds).
 #   Rebuild and bump the tag whenever Cargo.lock changes or the baked
 #   tooling changes — a stale cache fails every cargo job in seconds with
-#   "candidate versions found which didn't match" (v8 documents the
+#   "candidate versions found which didn't match" (v9 added python3 for
+#   the drift checker; v8 documents the
 #   current tag; v7 added the coverage toolchain; v6 existed because v5
 #   dropped openssh-client, which the hermetic ssh-protocol tests spawn
 #   via ssh-keygen; v5 itself existed because the audited-deps bump
@@ -38,14 +40,23 @@ trigger_on:
 environment: {}
 jobs:
   - name: fmt
-    image: dsc-ci-rust:8
+    image: dsc-ci-rust:9
     steps:
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Route-vs-docs drift gate
+        # Parse-only cross-check (no cargo, no network, <1s): every axum
+        # route under crates/gitforge-api must have an OpenAPI path entry
+        # and a docs/API.md endpoint, and neither doc surface may carry an
+        # entry with no backing route. Hand-maintained docs drift; this is
+        # the gate that catches it at push time instead of at review time.
+        # Exits 1 on drift; --report (always exit 0) exists for baseline
+        # sweeps, not for this gate.
+        run: python3 scripts/check-route-docs.py
     timeout: 15m
 
   - name: clippy
-    image: dsc-ci-rust:8
+    image: dsc-ci-rust:9
     needs: [fmt]
     steps:
       - name: Strict lint (zero warnings)
@@ -63,7 +74,7 @@ jobs:
     timeout: 60m
 
   - name: test
-    image: dsc-ci-rust:8
+    image: dsc-ci-rust:9
     needs: [clippy]
     steps:
       - name: Workspace test suite
@@ -90,7 +101,7 @@ jobs:
     timeout: 90m
 
   - name: coverage
-    image: dsc-ci-rust:8
+    image: dsc-ci-rust:9
     needs: [test]
     steps:
       - name: Line coverage gate (fail 82, warn 84)
