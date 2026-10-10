@@ -2,6 +2,89 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [0.6.16] - 2026-10-10
+
+### Added
+
+- **Rerun pipeline runs at their stored commit** (1bcf2539):
+  `POST /api/pipeline-runs/{id}/rerun` delegates to the orchestrator the
+  same way a push trigger does, but pins the revision to the run's own
+  commit hash — the reason to rerun is usually doubt about the original
+  verdict, and refs move. A commit that no longer resolves is refused
+  up front instead of minting a run doomed at clone time, and in-flight
+  duplicate protection rides the orchestrator's durable trigger dedup.
+
+### Fixed
+
+- **Connection poisoning self-heals at the pool boundary**
+  (0b16dd76, 0dfc0f15): when `BEGIN IMMEDIATE` fails under contention,
+  sqlx's transaction-depth counter and the SQLite handle desync — the
+  pooled connection then rejects every later explicit transaction, and
+  the silent flavor is worse: any single-statement autocommit write
+  routed to it joins the orphaned transaction and evaporates on
+  rollback (run `99c463db` logged `persisted planned job rows
+  planned=4` yet zero rows existed). Two layers close the class:
+  `begin_immediate` recovers with bounded bare-ROLLBACK passes on the
+  explicit-transaction paths, and a pool-wide `before_acquire` hook
+  heals (or retires) any connection still holding an orphaned
+  transaction before it is handed out.
+
+- **Manual job cancels cascade to pending descendants** (09c91bfa):
+  cancelling a running job left its not-yet-started descendants
+  pending, so the run never reached a terminal status and the chain
+  hung until heartbeat timeout. `cancel_job` now cancels each
+  non-terminal descendant and finalizes the pipeline as `Cancelled`
+  when every job is terminal — the live 2026-10-08 ghost signature
+  (all jobs cancelled, run status `running`) is the pre-fix behavior.
+
+- **Planned-job rows persist under contention** (a4d52e44): the
+  per-job row inserts of a run plan were one-shot writes; one
+  transient busy loss aborted the loop and stranded a half-planned
+  run. Each row now goes through `persist_with_retry` (F21/F23
+  durable-write discipline).
+
+- **Event consumer starts before the workspace rebuild** (69e3c859):
+  boot inlined `rebuild_live_engines` ahead of the event consumer, so
+  post-restart triggers sat unconsumed for the whole rebuild —
+  observed 2026-10-08 as triggers failing for 40+ minutes after a
+  restart under load. The consumer now spawns first; recovery is
+  independent of it (reconciliation grades from durable rows).
+
+- **Stalled runs redrive without a restart** (50fede66, c71a87c2):
+  nine runs held 35 pending rows for ~21h across a restart while
+  their engines sat in the registry. The startup engine rebuild is no
+  longer one-shot — a 300s pass re-attempts rebuilds for
+  registry-absent non-terminal runs, and `rebuild_live_engines`
+  rebuilds over a held engine whenever the durable rows show nothing
+  actively executing, re-enqueuing idempotently.
+
+- **Runner survives scheduler outages** (1dbdd121): the heartbeat loop
+  stopped the agent after 10 consecutive failures of any kind, so a
+  scheduler outage crash-looped the unit until a human ended it.
+  Transport failures and 5xx are no longer decisions: unreachable
+  streaks never stop the agent, while identity rejections (401/403/
+  404) keep the stop-for-re-registration behavior.
+
+- **Load-aware sandbox acquisition, retried runner heartbeat**
+  (bdfc9a75): acquisition timed out at host load 66 under a saturated
+  daemon and failed a job whose container would have landed (clean
+  re-fire wasted a pipeline cycle). The 60s ceiling now scales
+  linearly with load-per-core up to 3×, with `GITFORGE_SANDBOX_ACQUIRE_SECS`
+  still pinning it. The runner's heartbeat UPDATE is no longer a
+  single autocommit write — a heartbeat lost to transient DB pressure
+  is how a healthy runner gets fenced mid-job (runner_lost incident) —
+  it now goes through `persist_with_retry` like the other durable
+  writes.
+
+### Tests
+
+- Regression tests ship with each fix: a desynced-connection recovery
+  test and a cross-connection swallowed-write test (the write must
+  survive a pool close/reopen only when the hook is installed), a
+  chain-cancel cascade test, load-scaling table tests for the
+  acquisition ceiling, and the redrive passes reuse the existing
+  rebuild harness.
+
 ## [0.6.15] - 2026-10-07
 
 ### Added
