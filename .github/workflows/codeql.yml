@@ -57,9 +57,18 @@ jobs:
               - '**/*_test.rs'
               - 'template-parts/**'
 
+      # Provision the same pinned toolchain as rust-ci.yml jobs; the runner
+      # ships no cargo, so "Build Rust" fails with exit 127 without this.
+      - name: Install Rust
+        if: matrix.language == 'rust'
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
       - name: Build Rust
         if: matrix.language == 'rust'
         run: |
+          cargo --version
           cargo fetch --locked
           # CodeQL needs a complete instrumentable build, not release
           # optimizations. Debug mode keeps analysis bounded and avoids
