@@ -2,6 +2,7 @@
 //!
 //! This module provides real SQLite query implementations for all database operations.
 
+use crate::connection::begin_immediate;
 use crate::models::JobStatus;
 use crate::Pool;
 use chrono::{DateTime, Utc};
@@ -341,11 +342,7 @@ impl RepoQueries {
     ) -> Result<()> {
         let required_checks_json = serde_json::to_string(required_checks)
             .map_err(|e| Error::database(format!("failed to serialize required checks: {e}")))?;
-        let mut tx = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin policy update: {e}")))?;
+        let mut tx = begin_immediate(pool.pool(), "policy update").await?;
         let result = sqlx::query(
             "UPDATE repositories SET required_checks = ?, deny_non_fast_forward = ?, \
              updated_at = ? WHERE id = ?",
@@ -406,11 +403,7 @@ impl RepoQueries {
         // with completed or failed CI runs can be deleted just like an empty
         // repository. The schema intentionally keeps these foreign keys
         // restrictive to protect history during ordinary mutations.
-        let mut tx = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin repository delete: {e}")))?;
+        let mut tx = begin_immediate(pool.pool(), "repository delete").await?;
         let repo_id = id.to_string();
         for statement in [
             "DELETE FROM artifacts WHERE job_id IN (SELECT id FROM jobs WHERE pipeline_run_id IN (SELECT id FROM pipeline_runs WHERE repo_id = ?))",
@@ -755,11 +748,7 @@ impl PipelineQueries {
         pipeline: &crate::models::Pipeline,
         run: &crate::models::PipelineRun,
     ) -> Result<()> {
-        let mut transaction = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin pipeline activation: {e}")))?;
+        let mut transaction = begin_immediate(pool.pool(), "pipeline activation").await?;
         sqlx::query(
             "UPDATE pipelines SET active = 0 WHERE repo_id = ? AND name = ? AND active = 1",
         )
@@ -1331,11 +1320,7 @@ impl JobQueries {
         runner_id: RunnerId,
         lease_token: &str,
     ) -> Result<bool> {
-        let mut transaction = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin job heartbeat: {e}")))?;
+        let mut transaction = begin_immediate(pool.pool(), "job heartbeat").await?;
         let now = Utc::now().to_rfc3339();
         let job = sqlx::query(
             "UPDATE jobs SET heartbeat_at = ? WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
@@ -1813,11 +1798,7 @@ impl JobQueries {
         if provider.is_empty() || kind.is_empty() || payload.is_empty() {
             return Err(Error::invalid_input("publication fields must not be empty"));
         }
-        let mut tx = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin completion: {e}")))?;
+        let mut tx = begin_immediate(pool.pool(), "completion").await?;
         let updated = sqlx::query(
             "UPDATE jobs SET status = ?, finished_at = ?, result_json = ?, lease_token = NULL WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
         )
@@ -2008,11 +1989,7 @@ impl JobQueries {
     /// against the durable lease; only jobs that were already silent before
     /// the restart are failed here.
     pub async fn requeue_inflight(pool: &Pool, fence_grace_secs: i64) -> Result<u64> {
-        let mut transaction = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin recovery: {e}")))?;
+        let mut transaction = begin_immediate(pool.pool(), "recovery").await?;
         let queued_with_runner = sqlx::query(
             "UPDATE jobs SET runner_id = NULL, started_at = NULL, lease_token = NULL WHERE status = 'queued' AND runner_id IS NOT NULL",
         )
@@ -2290,11 +2267,7 @@ impl RunnerQueries {
     /// operations. Retired runners are already excluded by scheduler
     /// policies that select only `online` runners.
     pub async fn retire_if_idle(pool: &Pool, id: RunnerId) -> Result<RunnerRetirement> {
-        let mut transaction = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin runner retirement: {e}")))?;
+        let mut transaction = begin_immediate(pool.pool(), "runner retirement").await?;
 
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM runners WHERE id = ?")
             .bind(id.to_string())
@@ -2726,11 +2699,7 @@ impl ReviewQueries {
         id: Uuid,
         next: gitforge_review::domain::ReviewRunState,
     ) -> Result<Option<ReviewRun>> {
-        let mut tx = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin review transition: {e}")))?;
+        let mut tx = begin_immediate(pool.pool(), "review transition").await?;
 
         let current = sqlx::query("SELECT status FROM review_runs WHERE id = ?")
             .bind(id.to_string())
@@ -2832,11 +2801,7 @@ impl ReviewQueries {
     /// waits for the first to commit and then sees the candidate row
     /// already advanced out of `pending`.
     pub async fn claim_pending(pool: &Pool) -> Result<Option<ReviewRun>> {
-        let mut tx = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin review claim: {e}")))?;
+        let mut tx = begin_immediate(pool.pool(), "review claim").await?;
 
         // FIFO candidate selection. Held under the IMMEDIATE write lock so
         // no concurrent claimer can advance the same row before the
@@ -3046,13 +3011,8 @@ impl TriggerRequestQueries {
             return Ok((existing, false));
         }
         persist_with_retry(|| async {
-            let mut transaction = pool
-                .pool()
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(|e| {
-                    Error::database(format!("failed to begin trigger request insert: {e}"))
-                })?;
+            let mut transaction =
+                begin_immediate(pool.pool(), "trigger request insert").await?;
             let existing_id: Option<String> =
                 sqlx::query_scalar(
                     "SELECT id FROM pipeline_trigger_requests \
@@ -3257,11 +3217,7 @@ impl TriggerRequestQueries {
         let now = Utc::now();
         let pending_cutoff = (now - pending_after).to_rfc3339();
         let processing_cutoff = (now - processing_after).to_rfc3339();
-        let mut transaction = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin trigger requeue: {e}")))?;
+        let mut transaction = begin_immediate(pool.pool(), "trigger requeue").await?;
         let stale_processing: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM pipeline_trigger_requests \
              WHERE status = 'processing' AND updated_at <= ?",
@@ -3543,6 +3499,60 @@ mod tests {
             1,
             "a non-database error must not be retried"
         );
+    }
+
+    /// Regression for the 2026-10-08 completion failures: a pooled
+    /// connection whose SQLite handle is inside a transaction that sqlx's
+    /// depth counter does not know about poisons every subsequent
+    /// `begin_with` with `(code: 1) cannot start a transaction within a
+    /// transaction`, and the pool hands the same connection back to each
+    /// retry. `begin_immediate` must clear the desync with a bare ROLLBACK
+    /// and yield a usable transaction.
+    ///
+    /// The pool is capped at one connection so every borrower deterministically
+    /// gets the poisoned one; the poison itself is injected with a raw BEGIN,
+    /// which bypasses sqlx's depth counter exactly like the live desync did.
+    #[tokio::test]
+    async fn test_begin_immediate_recovers_desynced_connection() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Poison the pool's only connection.
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        // Sanity: the plain begin now fails with the live error signature.
+        let poisoned = pool.begin_with("BEGIN IMMEDIATE").await;
+        let message = format!("{}", poisoned.unwrap_err());
+        assert!(
+            message.contains("within a transaction"),
+            "expected the desynced begin to fail with the nested-transaction \
+             error, got: {message}"
+        );
+
+        // Recovery: the begin must succeed and the transaction must work.
+        let mut tx = begin_immediate(&pool, "completion").await.unwrap();
+        sqlx::query("CREATE TABLE poison_probe (id INTEGER)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // And the pool keeps serving healthy transactions afterwards.
+        let mut tx = begin_immediate(&pool, "completion").await.unwrap();
+        sqlx::query("INSERT INTO poison_probe (id) VALUES (1)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        pool.close().await;
     }
 
     #[tokio::test]
