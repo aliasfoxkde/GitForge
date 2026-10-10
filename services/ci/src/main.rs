@@ -31,7 +31,7 @@ use gitforge_storage::FileStorage;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tokio::time::timeout;
 use tower_http::trace::TraceLayer;
@@ -248,7 +248,12 @@ async fn main() -> anyhow::Result<()> {
     let scheduler_handle = tokio::spawn(async move {
         axum::serve(scheduler_listener, scheduler_app)
             .await
-            .unwrap();
+            .unwrap_or_else(|error| {
+                // The scheduler API dying is fatal to dispatch; surface it
+                // loudly rather than panicking inside a detached task where
+                // the panic would only surface as a silent JoinHandle error.
+                tracing::error!("scheduler HTTP API failed: {error}");
+            });
     });
 
     tracing::info!("Scheduler HTTP API listening on {}", scheduler_addr);
@@ -756,7 +761,7 @@ async fn trigger_pipeline(
     trigger_state
         .workspace_paths
         .lock()
-        .expect("workspace cache lock poisoned")
+        .unwrap_or_else(PoisonError::into_inner)
         .insert(repo_id, working_dir);
 
     // Record the trigger durably BEFORE publishing: the in-memory bus loses
@@ -831,7 +836,7 @@ async fn trigger_pipeline(
     trigger_state
         .run_waiters
         .lock()
-        .expect("run waiter lock poisoned")
+        .unwrap_or_else(PoisonError::into_inner)
         .insert(event.event_id, run_tx);
 
     match trigger_state.event_bus.publish(event.clone()).await {
@@ -856,7 +861,7 @@ async fn trigger_pipeline(
                 trigger_state
                     .run_waiters
                     .lock()
-                    .expect("run waiter lock poisoned")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .remove(&event.event_id);
             }
             (
@@ -881,7 +886,7 @@ async fn trigger_pipeline(
             trigger_state
                 .run_waiters
                 .lock()
-                .expect("run waiter lock poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .remove(&event.event_id);
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1037,27 +1042,31 @@ struct CleanupCommand {
     args: Vec<OsString>,
 }
 
-fn cleanup_command(backend: ContainerBackend, workspace: &std::path::Path) -> CleanupCommand {
+/// Build the container-assisted removal command for a validated run
+/// workspace. Returns `None` when the backend+path combination admits no
+/// safe command (only possible for a path with no parent or no final
+/// component — never true of GitForge-created `<root>/<run id>` paths);
+/// callers treat that as any other best-effort cleanup miss.
+fn cleanup_command(
+    backend: ContainerBackend,
+    workspace: &std::path::Path,
+) -> Option<CleanupCommand> {
     match backend {
-        ContainerBackend::Podman => CleanupCommand {
+        ContainerBackend::Podman => Some(CleanupCommand {
             program: "podman",
             args: ["unshare", "rm", "-rf", "--"]
                 .into_iter()
                 .map(OsString::from)
                 .chain(std::iter::once(workspace.as_os_str().to_os_string()))
                 .collect(),
-        },
+        }),
         ContainerBackend::Docker => {
             // Mount the trusted parent and remove only the validated run
             // directory from inside the container. No shell is involved, and
             // the container cannot follow a path outside this bind mount.
-            let parent = workspace
-                .parent()
-                .expect("validated run workspace always has a parent");
-            let name = workspace
-                .file_name()
-                .expect("validated run workspace always has a name");
-            CleanupCommand {
+            let parent = workspace.parent()?;
+            let name = workspace.file_name()?;
+            Some(CleanupCommand {
                 program: "docker",
                 args: [
                     "run",
@@ -1082,12 +1091,13 @@ fn cleanup_command(backend: ContainerBackend, workspace: &std::path::Path) -> Cl
                         .into_os_string(),
                 ))
                 .collect(),
-            }
+            })
         }
     }
 }
 
-async fn run_cleanup_command(command: CleanupCommand) -> Option<std::process::Output> {
+async fn run_cleanup_command(command: Option<CleanupCommand>) -> Option<std::process::Output> {
+    let command = command?;
     timeout(
         Duration::from_secs(120),
         tokio::process::Command::new(command.program)
@@ -2250,7 +2260,7 @@ async fn handle_push_event(
         .insert(repo_id, pipeline.clone());
     let requested_workspace = workspace_paths
         .lock()
-        .expect("workspace cache lock poisoned")
+        .unwrap_or_else(PoisonError::into_inner)
         .get(&repo_id)
         .cloned()
         .flatten();
@@ -2340,7 +2350,7 @@ async fn handle_push_event(
     };
     run_workspace_paths
         .lock()
-        .expect("workspace cache lock poisoned")
+        .unwrap_or_else(PoisonError::into_inner)
         .insert(state.run_id, workspace_path.clone());
     pipeline_registry
         .write()
@@ -2365,7 +2375,7 @@ async fn handle_push_event(
             pipeline_registry.write().await.remove(&state.run_id);
             if let Some(path) = run_workspace_paths
                 .lock()
-                .expect("workspace cache lock poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .remove(&state.run_id)
                 .flatten()
             {
@@ -2512,7 +2522,7 @@ async fn run_scheduler_event_consumer(
         let state = engine.state().await;
         let workspace_path = run_workspace_paths
             .lock()
-            .expect("workspace cache lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&state.run_id)
             .cloned()
             .flatten();
@@ -2585,7 +2595,7 @@ async fn finalize_run_if_terminal(
     }
     let workspace_path = run_workspace_paths
         .lock()
-        .expect("workspace cache lock poisoned")
+        .unwrap_or_else(PoisonError::into_inner)
         .remove(&state.run_id)
         .flatten();
     // Free the checkout once nothing references it. Spawned so a large delete
@@ -2916,7 +2926,7 @@ async fn rebuild_live_engines(
         // `prepare_run_workspace` await (the future must stay Send).
         let cached_workspace = run_workspace_paths
             .lock()
-            .expect("workspace cache lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&run.id)
             .cloned()
             .flatten();
@@ -2938,7 +2948,7 @@ async fn rebuild_live_engines(
         };
         run_workspace_paths
             .lock()
-            .expect("workspace cache lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(run.id, workspace_path.clone());
         pipeline_registry
             .write()
@@ -3793,7 +3803,7 @@ mod tests {
     fn test_cleanup_command_selects_backend_without_fallback() {
         let workspace = std::path::Path::new("/var/lib/gitforge/workspaces/run-123");
 
-        let podman = cleanup_command(ContainerBackend::Podman, workspace);
+        let podman = cleanup_command(ContainerBackend::Podman, workspace).unwrap();
         assert_eq!(podman.program, "podman");
         assert_eq!(
             podman.args,
@@ -3809,7 +3819,7 @@ mod tests {
             .collect::<Vec<_>>()
         );
 
-        let docker = cleanup_command(ContainerBackend::Docker, workspace);
+        let docker = cleanup_command(ContainerBackend::Docker, workspace).unwrap();
         assert_eq!(docker.program, "docker");
         assert_eq!(
             docker.args[0..10],
@@ -5226,7 +5236,7 @@ jobs:
     ) {
         cache
             .lock()
-            .expect("workspace cache lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(run_id, workspace_path);
     }
 
@@ -5238,7 +5248,7 @@ jobs:
     ) -> Option<String> {
         cache
             .lock()
-            .expect("workspace cache lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&run_id)
             .cloned()
             .flatten()
@@ -5252,7 +5262,7 @@ jobs:
     ) {
         cache
             .lock()
-            .expect("workspace cache lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .remove(&run_id);
     }
 
@@ -5491,7 +5501,7 @@ jobs:
         assert!(
             run_workspace_paths
                 .lock()
-                .expect("workspace cache lock poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .is_empty(),
             "a ref-deletion push must not prepare a run workspace"
         );
