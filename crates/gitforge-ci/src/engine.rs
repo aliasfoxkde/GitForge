@@ -460,13 +460,27 @@ impl CiEngine {
         }
     }
 
-    /// Cancel a specific job
+    /// Cancel a specific job. Everything downstream of it can never be
+    /// scheduled (`ready_jobs` requires succeeded dependencies), so the
+    /// same cascade that follows a failure follows a manual cancel —
+    /// without it the run holds its engine and workspace open forever on
+    /// jobs whose dependencies can never succeed. (F37 covered the
+    /// failure-grading path only; the durable descendant rows are still
+    /// cancelled by the reconciler's `cancel_doomed_rows` pass.)
     pub async fn cancel_job(&self, job_id: JobId) -> Result<()> {
         let mut state = self.state.write().await;
         if let Some(job_state) = state.jobs.get_mut(&job_id) {
             if !job_state.is_terminal() {
                 job_state.cancel()?;
             }
+        }
+        self.cancel_descendants(&mut state, job_id);
+        // Same reasoning as `fail_job`: wait for every job to reach a
+        // terminal state before finalizing, so siblings still executing in
+        // the run workspace are not fenced off mid-flight.
+        if state.all_jobs_finished() {
+            state.status = PipelineStatus::Cancelled;
+            state.finished_at = Some(chrono::Utc::now());
         }
         Ok(())
     }
@@ -711,6 +725,57 @@ mod tests {
             assert!(
                 job.is_terminal(),
                 "job {:?} left non-terminal",
+                job.status()
+            );
+        }
+    }
+
+    /// A manual cancel must cascade exactly like a failure: the cancelled
+    /// job's descendants can never be scheduled, so leaving them pending
+    /// holds the engine and workspace open forever.
+    #[tokio::test]
+    async fn test_engine_manual_cancel_cascades_to_descendants() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+
+        let mut chain = make_pipeline();
+        chain.jobs.push(JobDefinition {
+            name: "deploy".to_string(),
+            image: "rust:latest".to_string(),
+            needs: vec!["test".to_string()],
+            env: HashMap::new(),
+            steps: vec![StepDefinition {
+                name: "deploy".to_string(),
+                run: "echo deploy".to_string(),
+                env: None,
+                working_directory: None,
+                condition: None,
+            }],
+            timeout: None,
+            retry: None,
+        });
+
+        let engine = CiEngine::new(event, chain).await.unwrap();
+        engine.start().await.unwrap();
+
+        let ready = engine.ready_jobs().await;
+        assert_eq!(ready.len(), 1);
+        let runner_id = gitforge_common::RunnerId::new();
+        engine.assign_job(ready[0], runner_id).await.unwrap();
+        engine.start_job(ready[0]).await.unwrap();
+        engine.cancel_job(ready[0]).await.unwrap();
+
+        let state = engine.state().await;
+        assert_eq!(state.status, PipelineStatus::Cancelled);
+        assert!(state.finished_at.is_some());
+        for job in state.jobs.values() {
+            assert!(
+                job.is_terminal(),
+                "descendant of a manually cancelled job left non-terminal: {:?}",
                 job.status()
             );
         }
