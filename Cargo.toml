@@ -21,6 +21,9 @@ members = [
     "services/runner",
     "services/api",
 ]
+# The fuzz harness is its own nightly-only workspace (see fuzz/Cargo.toml);
+# excluded so stable workspace commands never try to build it.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

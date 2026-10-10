@@ -32,9 +32,11 @@ FROM rust:1-slim-bookworm
 # openssl-sys needs pkg-config + libssl headers; git is a test dependency
 # (ssh/https protocol suites drive a real git client) and openssh-client
 # supplies ssh-keygen, which the hermetic git_ssh_protocol suite spawns.
+# python3 runs the route-docs drift gate; g++ compiles libFuzzer's vendored
+# C++ runtime when the fuzz job builds its targets.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev curl ca-certificates git openssh-client python3 \
+        pkg-config libssl-dev curl ca-certificates git openssh-client python3 g++ \
     && rm -rf /var/lib/apt/lists/*
 
 # Slim images ship the minimal rustup profile; the pipeline needs both linters.
@@ -45,6 +47,13 @@ RUN rustup component add rustfmt clippy
 # job stays inside the offline contract. Network use is build-time only.
 RUN rustup component add llvm-tools-preview \
     && cargo install cargo-llvm-cov --locked
+
+# Fuzz gate: cargo-fuzz targets build with nightly and -Zbuild-std (needs
+# the rust-src component) and libfuzzer-sys links its vendored libFuzzer
+# via cc (needs g++ above). All baked here so the offline fuzz job can
+# build its targets in the container.
+RUN rustup toolchain install nightly --profile minimal --component rust-src \
+    && cargo +nightly install cargo-fuzz --locked
 
 # Toolchain contract (F25): the toolchain is frozen at image build time.
 # Jobs run with no egress — `rustup toolchain install` inside a job stalls
@@ -66,6 +75,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY services/ services/
 RUN cargo fetch --locked
+
+# The fuzz harness is a separate workspace with its own lockfile; its
+# dependency tree (libfuzzer-sys) is not in the main lockfile, so it gets
+# its own warm cache before the offline flag lands.
+COPY fuzz/ fuzz/
+RUN cd fuzz && cargo fetch --locked
 
 # Once the cache is warm, any crate that escapes it means the image is stale
 # relative to Cargo.lock — fail the job in seconds with a clear message

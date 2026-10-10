@@ -1,12 +1,15 @@
 # GitForge local CI pipeline (self-hosted GitForge at /nas/Temp/repos/GitForge).
 #
-# The project's own gates, run by the project itself: rustfmt --check, the
-# strict clippy pass, and the workspace test suite. Pushes to any branch run
-# the full chain, so a PR branch is validated here before it merges.
+# The project's own gates, run by the project itself: rustfmt --check plus
+# the route-docs drift gate, the strict clippy pass, the workspace test
+# suite, the line-coverage gate, and a bounded fuzz smoke over the
+# untrusted-input parsers. Pushes to any branch run the full chain, so a
+# PR branch is validated here before it merges.
 #
 # Documented constraints (same list proven in gods-eye-view's and dsc's
 # .gitforce.yml):
-# - The job graph is a LINEAR CHAIN (fmt → clippy → test), not a fan-out,
+# - The job graph is a LINEAR CHAIN (fmt → clippy → test → coverage →
+#   fuzz), not a fan-out,
 #   because all jobs of one run share the SAME workspace directory on this
 #   runner. Concurrent jobs would run cargo against the same target/
 #   directory and corrupt each other's build locks.
@@ -153,3 +156,31 @@ jobs:
             echo "line coverage ${pct}% meets the 84% target"
           fi
     timeout: 90m
+
+  - name: fuzz
+    image: dsc-ci-rust:9
+    needs: [coverage]
+    steps:
+      - name: Fuzz smoke (60s per target)
+        # Bounded libFuzzer smoke over the two untrusted-input surfaces:
+        # the .gitforge.yml pipeline parser (bytes controlled by anyone
+        # who can push to any repo) and the smart-HTTP path/header
+        # parsers (raw client strings ahead of auth). A crash here is a
+        # found vulnerability, not an infra failure: fix or bound it
+        # before the branch merges. 60s per target is a smoke, not a
+        # campaign — sustained fuzzing runs locally/off-schedule.
+        #
+        # Cold-cache note: the first fuzz job of a run compiles std from
+        # source (cargo-fuzz builds with -Zbuild-std by default) plus
+        # libfuzzer-sys plus the workspace deps for the nightly target —
+        # the 60m budget absorbs that, same rationale as the test job's.
+        # set -e is explicit: dash without it would run the second target
+        # even if the first crashed.
+        run: |
+          set -e
+          cd fuzz
+          cargo fuzz run --toolchain nightly pipeline_parse \
+              -- -max_total_time=60 -rss_limit_mb=2560
+          cargo fuzz run --toolchain nightly git_http_parsers \
+              -- -max_total_time=60 -rss_limit_mb=2560
+    timeout: 60m

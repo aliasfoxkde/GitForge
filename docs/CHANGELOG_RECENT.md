@@ -16,8 +16,17 @@ All notable changes to GitForge will be documented in this file.
   `POST /auth/logout`) had no spec or doc entry, and the rerun, SSH-key,
   webhook, dashboard, and metrics surfaces were partially undocumented.
 - **CI image dsc-ci-rust:9** adds python3 (slim bookworm base ships
-  none) so the drift gate can run in the pipeline; bump follows the
+  none) so the drift gate can run in the pipeline, plus g++, nightly
+  with rust-src, and cargo-fuzz for the fuzz gate; bump follows the
   baked-tooling rule (rebuild + tag bump, never pull at run time).
+- **Bounded fuzz smoke over the untrusted-input parsers**: a new final
+  pipeline job runs 60s of libFuzzer per target against the
+  `.gitforge.yml` pipeline parser (bytes controlled by anyone who can
+  push to any repo) and the smart-HTTP path/header parsers (raw client
+  strings ahead of authentication). Targets live in `fuzz/` as a
+  nightly-only workspace excluded from the stable one; a crash fails
+  the run and is a found vulnerability, not an infra failure. Sustained
+  campaigns stay off-schedule; the gate is a smoke.
 
 ### Changed
 
