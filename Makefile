@@ -63,7 +63,7 @@ clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
 
 shellcheck:
-	shellcheck scripts/*.sh systemd/*.sh
+	shellcheck scripts/*.sh systemd/*.sh scripts/gitforge-* scripts/qualityctl scripts/verify-user-systemd-policy
 
 # Security pattern scan (Aegis). The baseline records every finding triaged
 # as intentional or a false positive at audit time (see
