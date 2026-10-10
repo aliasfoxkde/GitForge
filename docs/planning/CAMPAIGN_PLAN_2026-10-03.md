@@ -271,3 +271,13 @@ that decision in an ADR rather than silently under-delivering.
    inside non-host-network containers, failing with git exit 128 every
    lane — an upstream pipeline-contract mismatch, recorded here only to
    keep it out of GitForge's own diagnosis.
+
+   Fuzz-target deferral verdict (2026-10-10): Phase 6's fuzz lane stays
+   deferred with rationale. A real target (cargo-fuzz/libFuzzer over the
+   #240 pkt-line parser) requires cargo-fuzz + libFuzzer tooling baked
+   into dsc-ci-rust — an image rebuild under the lockfile-changed
+   contract plus a new pipeline job, neither of which can be validated
+   locally under the fedora-only directive. Shipping unvalidated fuzz
+   targets would be placeholder code by another name. Scheduled with
+   the next image bump (the same one that will carry the coverage
+   ratchet's in-sandbox recalibration), so one image refresh buys both.
