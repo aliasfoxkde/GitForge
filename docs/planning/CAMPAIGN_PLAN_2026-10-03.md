@@ -244,3 +244,30 @@ that decision in an ADR rather than silently under-delivering.
    (clean SIGTERM, 02:41:32 CDT, no owning cron/timer) and restarted
    manually — attribution unknown, recorded here because an absent
    orchestrator silently turns every queued run into a ghost.
+
+   False-green incident, live confirmation of the orphan-finalize class
+   (2026-10-10 ~08:44 UTC, fedora build 63427df): the release-candidate
+   run `89f4b2a8` (pushed SHA `6a1e1f3b`) was created during a ci outage
+   — the API durably wrote the run row and the first chain job at
+   08:01:53 while the orchestrator was down. After the manual restart
+   (08:11:11 UTC) the rebuilt engine never adopted the run: the fmt
+   job's completion was logged
+   `completion received for unknown pipeline run 89f4b2a8` and dropped,
+   clippy/test/coverage were never lazy-enqueued, and the periodic
+   reconciler finalized the 1-of-4-job orphan as `succeeded` at
+   08:44:12. Every ingredient is one this cycle already fixed on the
+   new build — durable trigger consumption after restart (69e3c859
+   consumer-first boot), evidence-based reconcile grading (F31), and
+   the release gate's definition-coverage check, which refuses a run
+   whose durable rows do not cover the persisted pipeline (the gate
+   would have rejected `89f4b2a8` 1-vs-4; it was never offered the
+   chance because the watcher greped run status, not coverage). The
+   incident is why the RC was re-triggered as run `f5676f9f` with the
+   orchestrator alive, and why the gate — not a status string — is the
+   only accepted release evidence. Co-tenant observation the same
+   hour: four simultaneous 20-job Amortyx runs (pushed 08:45:24-54)
+   saturated the single runner's queue at 121 pending; and that
+   tenant's pipelines self-clone `http://127.0.0.1:42782/...` from
+   inside non-host-network containers, failing with git exit 128 every
+   lane — an upstream pipeline-contract mismatch, recorded here only to
+   keep it out of GitForge's own diagnosis.
