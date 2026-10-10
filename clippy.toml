@@ -1,7 +1,9 @@
-# Test code legitimately unwraps: assertions are the one place where a
-# panic IS the desired failure mode. Without these, the workspace-wide
-# unwrap_used/expect_used denies (see Cargo.toml [workspace.lints.clippy])
-# would flag the ~3200 test-context sites tracked in
-# docs/planning/QUALITY_BASELINE.md. Production code keeps the denies.
+# Test code legitimately unwraps and panics: assertions are the one
+# place where a panic IS the desired failure mode. Without these, the
+# workspace-wide unwrap_used/expect_used/panic denies (see Cargo.toml
+# [workspace.lints.clippy]) would flag the ~3200 test-context sites
+# tracked in docs/planning/QUALITY_BASELINE.md. Production code keeps
+# the denies.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
+allow-panic-in-tests = true
