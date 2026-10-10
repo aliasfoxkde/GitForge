@@ -59,7 +59,7 @@ fn render_dashboard(stats: Option<&DashboardStats>) -> String {
                 metric(Some(s.runners_online.to_string())),
             )
         }
-        None => (metric(None), "--%", metric(None)),
+        None => (metric(None), "--%".to_string(), metric(None)),
     };
 
     format!(

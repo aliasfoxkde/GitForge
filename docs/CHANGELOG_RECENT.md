@@ -4,6 +4,8 @@ All notable changes to GitForge will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.16] - 2026-10-10
+
 ### Added
 
 - **Route-vs-docs drift gate** (48c41bc7): `scripts/check-route-docs.py`
@@ -27,6 +29,13 @@ All notable changes to GitForge will be documented in this file.
   nightly-only workspace excluded from the stable one; a crash fails
   the run and is a found vulnerability, not an infra failure. Sustained
   campaigns stay off-schedule; the gate is a smoke.
+- **Rerun pipeline runs at their stored commit** (1bcf2539):
+  `POST /api/pipeline-runs/{id}/rerun` delegates to the orchestrator the
+  same way a push trigger does, but pins the revision to the run's own
+  commit hash — the reason to rerun is usually doubt about the original
+  verdict, and refs move. A commit that no longer resolves is refused
+  up front instead of minting a run doomed at clone time, and in-flight
+  duplicate protection rides the orchestrator's durable trigger dedup.
 
 ### Changed
 
@@ -43,18 +52,6 @@ All notable changes to GitForge will be documented in this file.
   pair — the old green/red badges measured 5.2:1 and 3.8:1), adds a
   `<main>` landmark, a `:focus-visible` outline, and hides decorative
   emoji from assistive technology.
-
-## [0.6.16] - 2026-10-10
-
-### Added
-
-- **Rerun pipeline runs at their stored commit** (1bcf2539):
-  `POST /api/pipeline-runs/{id}/rerun` delegates to the orchestrator the
-  same way a push trigger does, but pins the revision to the run's own
-  commit hash — the reason to rerun is usually doubt about the original
-  verdict, and refs move. A commit that no longer resolves is refused
-  up front instead of minting a run doomed at clone time, and in-flight
-  duplicate protection rides the orchestrator's durable trigger dedup.
 
 ### Fixed
 
@@ -117,6 +114,16 @@ All notable changes to GitForge will be documented in this file.
   is how a healthy runner gets fenced mid-job (runner_lost incident) —
   it now goes through `persist_with_retry` like the other durable
   writes.
+
+- **Strict lint gate made real**: the workspace-level
+  `unwrap_used`/`expect_used`/`panic` denies plus the CI image's
+  clippy bump surfaced a backlog the previous image's older clippy
+  never flagged — including a hard borrow error (E0502) in
+  gitforge-core's `GitRpcChild::drive` that the tip had never compiled
+  past, and the `allow-*-in-tests` boundary (fixture helpers in test
+  targets are neither `#[test]` fns nor `#[cfg(test)]`). The tip now
+  passes `cargo clippy --workspace --all-targets -- -D warnings` end
+  to end.
 
 ### Tests
 
