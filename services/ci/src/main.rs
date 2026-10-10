@@ -269,6 +269,39 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let pipeline_registry_clone = pipeline_registry.clone();
 
+    // Shared shutdown flag (created before the consumer so it can hold a
+    // handle; the handler itself spawns below, before the recovery passes).
+    let shutdown = create_shutdown_flag();
+    let shutdown_flag = shutdown.clone();
+    spawn_shutdown_handler(shutdown_flag);
+
+    // Start event consumer loop BEFORE the recovery passes below: the
+    // startup engine rebuild re-clones run workspaces and can take many
+    // minutes under load, and inlining it ahead of the consumer left
+    // post-restart triggers unpublished-to-nobody for that whole window
+    // (observed 2026-10-08: triggers 503ing 40+ minutes after a restart).
+    // The consumer is independent of recovery — reconciliation grades from
+    // durable rows, and a rebuild racing a fresh trigger only contends on
+    // the registry lock.
+    let shutdown_consumer = shutdown.clone();
+    let _consumer_handle = tokio::spawn(async move {
+        if let Err(e) = run_event_consumer(
+            event_bus_clone,
+            scheduler_clone,
+            pipeline_cache_clone,
+            scheduler_db_clone,
+            workspace_paths_clone,
+            run_workspace_paths_clone,
+            pipeline_registry_clone,
+            run_waiters_clone,
+            shutdown_consumer,
+        )
+        .await
+        {
+            tracing::error!("event consumer error: {}", e);
+        }
+    });
+
     // Recover runs stranded non-terminal by a previous process lifetime,
     // reclaim workspaces of already-terminal runs, then keep reconciling
     // periodically so runs stranded while running are finalized without
@@ -341,33 +374,6 @@ async fn main() -> anyhow::Result<()> {
             run_reconciliation_loop(sweep_pool).await;
         });
     }
-
-    // Shared shutdown flag
-    let shutdown = create_shutdown_flag();
-    let shutdown_flag = shutdown.clone();
-
-    // Spawn graceful shutdown handler
-    spawn_shutdown_handler(shutdown_flag);
-
-    // Start event consumer loop
-    let shutdown_consumer = shutdown.clone();
-    let _consumer_handle = tokio::spawn(async move {
-        if let Err(e) = run_event_consumer(
-            event_bus_clone,
-            scheduler_clone,
-            pipeline_cache_clone,
-            scheduler_db_clone,
-            workspace_paths_clone,
-            run_workspace_paths_clone,
-            pipeline_registry_clone,
-            run_waiters_clone,
-            shutdown_consumer,
-        )
-        .await
-        {
-            tracing::error!("event consumer error: {}", e);
-        }
-    });
 
     // Durable trigger-request sweep. A request recorded but never consumed
     // (bus ring lag, consumer death, a restart between the durable insert
