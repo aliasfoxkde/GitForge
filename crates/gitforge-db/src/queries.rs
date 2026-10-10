@@ -3566,7 +3566,7 @@ mod tests {
              VALUES ('r1', 'a', ?1, '/tmp/a.git', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
                     ('r2', 'b', ?1, '/tmp/b.git', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
         )
-        .bind(&owner.id)
+        .bind(owner.id.to_string())
         .execute(pool.pool())
         .await
         .unwrap();
