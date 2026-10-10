@@ -1,16 +1,49 @@
 # Quality Baseline — Unwrap Inventory (2026-10-10)
 
-Measured by `scripts/unwrap-count.sh` (line-based grep over each crate's
-`src/`; includes `#[cfg(test)]` modules — the point is the trend, and test
-code legitimately unwraps). This file is the ratchet: a crate's count may
-go down or hold, never up. When a crate reaches zero, its
-`Cargo.toml` gains the enforcement lints (`clippy::unwrap_used`,
-`clippy::expect_used` = "deny" for library crates; "warn" where a binary's
-main legitimately expects) under the workspace `[lints]` inheritance.
+Two counts, two purposes:
+
+- **Raw** (`scripts/unwrap-count.sh`): line-based grep over each crate's
+  `src/`, including `#[cfg(test)]` modules and everything else. Trend
+  metric only — test code legitimately unwraps.
+- **Production** (cfg-test-aware categorization, 2026-10-10, via
+  `scripts/unwrap-production-count.py`): sites outside `#[cfg(test)]`
+  items and outside `tests/` directories. This is the elimination
+  scope: **191 sites workspace-wide** (the raw 2135 is 93%
+  test-context).
+
+This file is the ratchet: either count may go down or hold, never up.
+When a crate's *production* count reaches zero, its `Cargo.toml` gains
+the enforcement lints (`clippy::unwrap_used`, `clippy::expect_used` =
+"deny" for library crates; "warn" where a binary's main legitimately
+expects) under the workspace `[lints]` inheritance.
 
 Per the 2026-10-10 operating directive, CI runs on the GitForge instance
 on the fedora remote; the elimination batches are validated there, one
 crate-batch per pipeline run.
+
+## Production sites (the campaign scope), by file
+
+| site count | file |
+|---:|---|
+| 71 | crates/gitforge-runner/src/agent.rs |
+| 32 | crates/gitforge-api/src/metrics.rs |
+| 20 | crates/gitforge-review/src/security.rs |
+| 14 | services/ci/src/main.rs |
+| 10 | crates/gitforge-storage/src/receipt_store.rs |
+| 8  | crates/gitforge-cli/src/config.rs |
+| 6  | crates/gitforge-review/src/lib.rs |
+| 6  | crates/gitforge-review/src/fix.rs |
+| 5  | crates/gitforge-process/src/pool.rs |
+| 4  | crates/gitforge-storage/src/job_logs.rs |
+| 4  | crates/gitforge-core/src/git_protocol/http.rs |
+| 4  | crates/gitforge-cli/src/sync.rs |
+| 2  | services/api/src/main.rs |
+| 2  | crates/gitforge-core/src/hooks.rs |
+| 1  | services/git-server/src/main.rs |
+| **191** | **workspace total** (remaining files hold the rest) |
+
+Raw per-crate counts (grep, includes test context — superseded as the
+campaign scope by the table above, kept for the trend ratchet):
 
 | crate | unwrap | expect | panic | total |
 |---|---:|---:|---:|---:|
@@ -35,16 +68,20 @@ crate-batch per pipeline run.
 | runner (service) | 4 | 1 | 0 | 5 |
 | **TOTAL** | **1933** | **185** | **17** | **2135** |
 
-## Elimination order (biggest library risk first, service shells last)
+## Elimination order (production sites only)
 
-1. `gitforge-db` (472) — the durability layer; every unwrap is a potential
-   panic inside a write path. Mostly `#[cfg(test)]` setup, so the real
-   split comes from `#[cfg(test)]`-aware counting once the crate is
-   opened up.
-2. `gitforge-storage`, `gitforge-scheduler` — same class.
-3. `gitforge-ci`, `gitforge-api`, `gitforge-core`, `gitforge-sandbox`.
-4. Services (`ci` first at 255) — binary code, `main()`-adjacent unwraps
-   may convert to documented `expect` with context, not silent `unwrap`.
+1. `gitforge-runner/agent.rs` (71) — heartbeat/exec paths; unwraps here
+   are the runner_lost/heartbeat incident class. First batch.
+2. `gitforge-api/metrics.rs` (32), `gitforge-review/security.rs` (20) —
+   parsing and analysis paths; convert to `Result` propagation.
+3. `services/ci/main.rs` (14), `storage/receipt_store.rs` (10),
+   `cli/config.rs` (8) — startup and config paths; `main()`-adjacent
+   unwraps may convert to documented `expect` with context, not silent
+   `unwrap`.
+4. The long tail (≤6 each) — one closing batch.
+5. `gitforge-db`, `gitforge-storage`, `gitforge-scheduler`, `gitforge-ci`
+   raw counts are 93-97% test context — their production sites are in
+   the files above; no separate crate campaigns needed.
 
 ## Related foundation
 
