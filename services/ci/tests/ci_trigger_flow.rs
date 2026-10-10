@@ -9,9 +9,9 @@
 //! service, and the run and job rows are asserted in the database the
 //! service itself wrote.
 
-// Test-harness exemption, same discipline as the gitforge-db integration
-// fixtures: `allow-unwrap-in-tests` covers `#[test]` bodies, but fixture
-// and boot-helper functions in a test target are neither `#[test]` fns nor
+// Test-harness exemption, same discipline as the sibling suites:
+// `allow-unwrap-in-tests` covers `#[test]` bodies, but boot/seed/fixture
+// helper functions in a test target are neither `#[test]` fns nor
 // `#[cfg(test)]`, a class the clippy.toml config cannot address. Setup
 // failing IS the assertion -- a panic aborts the run loudly. Production
 // code keeps the denies.

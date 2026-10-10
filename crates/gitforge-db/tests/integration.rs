@@ -2,13 +2,12 @@
 //!
 //! These tests use in-memory SQLite databases for testing.
 
-// Test-harness exemption, same discipline as the gitforge-ai provider_http
-// suite: `allow-unwrap-in-tests` covers `#[test]` bodies, but the fixture
-// helpers below (`review_fixture`, `seeded_pool`,
-// `insert_review_run_with_state`) are plain functions in a test target, a
-// class the config cannot address. Fixture setup failing IS the assertion —
-// a panic aborts the run loudly — so threading Results through every helper
-// would buy nothing. Production code keeps the denies.
+// Test-harness exemption, same discipline as the sibling suites:
+// `allow-unwrap-in-tests` covers `#[test]` bodies, but boot/seed/fixture
+// helper functions in a test target are neither `#[test]` fns nor
+// `#[cfg(test)]`, a class the clippy.toml config cannot address. Setup
+// failing IS the assertion -- a panic aborts the run loudly. Production
+// code keeps the denies.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use gitforge_common::{PipelineId, RunnerId};
