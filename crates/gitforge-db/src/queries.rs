@@ -2213,12 +2213,18 @@ impl RunnerQueries {
 
     /// Update runner heartbeat
     pub async fn heartbeat(pool: &Pool, id: RunnerId) -> Result<()> {
-        sqlx::query("UPDATE runners SET last_heartbeat = ? WHERE id = ?")
-            .bind(Utc::now().to_rfc3339())
-            .bind(id.to_string())
-            .execute(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to update heartbeat: {e}")))?;
+        // Durable-write discipline (F21/F23): a heartbeat lost to a transient
+        // busy is how a healthy runner gets fenced by the stale sweep while
+        // its job is mid-flight (runner_lost, 2026-09-29 incident ledger).
+        persist_with_retry(|| async {
+            sqlx::query("UPDATE runners SET last_heartbeat = ? WHERE id = ?")
+                .bind(Utc::now().to_rfc3339())
+                .bind(id.to_string())
+                .execute(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to update heartbeat: {e}")))
+        })
+        .await?;
         Ok(())
     }
 

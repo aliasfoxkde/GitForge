@@ -25,15 +25,50 @@ const POOL_SIZE: usize = 2;
 /// instead of watching jobs fail before the daemon ever answered. Storage
 /// has since moved to overlay2 and creation is fast, but the escape hatch
 /// stays for loaded hosts.
+///
+/// The ceiling is also load-aware: when the 1-minute load average already
+/// exceeds the CPU count, the daemon is saturated and container creation
+/// queues behind everything else — failing the job there wastes a whole
+/// pipeline cycle for an acquisition that would have landed (the
+/// 2026-10-03 incident ledger: acquisition timeout at load 66, clean
+/// re-fire on the next window). The cap scales linearly with load up to
+/// three times the default. An explicit GITFORGE_SANDBOX_ACQUIRE_SECS
+/// still wins over any load scaling.
 fn sandbox_acquire_timeout() -> Duration {
     const DEFAULT_SECS: u64 = 60;
-    Duration::from_secs(
-        std::env::var("GITFORGE_SANDBOX_ACQUIRE_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|secs| *secs > 0)
-            .unwrap_or(DEFAULT_SECS),
-    )
+    if let Some(pinned) = std::env::var("GITFORGE_SANDBOX_ACQUIRE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+    {
+        return Duration::from_secs(pinned);
+    }
+    let load1 = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| {
+            text.split_whitespace()
+                .next()
+                .and_then(|field| field.parse::<f64>().ok())
+        });
+    let cores = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    Duration::from_secs(acquire_timeout_secs(DEFAULT_SECS, load1, cores))
+}
+
+/// Pure scaling rule for the acquisition ceiling: `default_secs` while the
+/// load per core is under 1.0, then linear growth to `3 × default_secs`
+/// at (or past) 3 loads per core. Unreadable load or a zero core count
+/// degrades to the plain default.
+fn acquire_timeout_secs(default_secs: u64, load1: Option<f64>, cores: usize) -> u64 {
+    const MAX_FACTOR: f64 = 3.0;
+    let Some(load) = load1 else {
+        return default_secs;
+    };
+    let cores = cores.max(1) as f64;
+    let loads_per_core = (load / cores).max(1.0);
+    let factor = loads_per_core.min(MAX_FACTOR);
+    ((default_secs as f64) * factor).round() as u64
 }
 
 /// Sandbox memory ceiling in megabytes. Debug codegen and linking of
@@ -944,20 +979,42 @@ mod tests {
     use gitforge_sandbox::StepResult;
 
     #[test]
+    fn test_acquire_timeout_scales_with_host_load() {
+        // No readable load (non-Linux, odd sandbox): plain default.
+        assert_eq!(acquire_timeout_secs(60, None, 8), 60);
+
+        // Idle and lightly loaded: the historical 60-second ceiling.
+        assert_eq!(acquire_timeout_secs(60, Some(0.5), 8), 60);
+        assert_eq!(acquire_timeout_secs(60, Some(8.0), 8), 60);
+
+        // Saturated daemon (the load-66 incident shape): linear growth,
+        // capped at 3× default.
+        assert_eq!(acquire_timeout_secs(60, Some(16.0), 8), 120);
+        assert_eq!(acquire_timeout_secs(60, Some(66.0), 8), 180);
+        assert_eq!(acquire_timeout_secs(60, Some(500.0), 8), 180);
+
+        // Degenerate inputs degrade to the default, never panic.
+        assert_eq!(acquire_timeout_secs(60, Some(4.0), 0), 180);
+        assert_eq!(acquire_timeout_secs(60, Some(f64::NAN), 8), 60);
+    }
+
+    #[test]
     fn test_sandbox_acquire_timeout_default_and_env_override() {
-        // Default: the historical 60-second ceiling.
+        // Unset: 60s or the load-scaled value above it (the host may be
+        // busy), never below the historical default.
         std::env::remove_var("GITFORGE_SANDBOX_ACQUIRE_SECS");
-        assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(60));
+        assert!(sandbox_acquire_timeout() >= Duration::from_secs(60));
 
         // Operators on slow storage can raise it.
         std::env::set_var("GITFORGE_SANDBOX_ACQUIRE_SECS", "300");
         assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(300));
 
-        // Garbage and non-positive values fall back to the default.
+        // Garbage and non-positive values ignore the pin (60s floor, load
+        // scaling may still raise it on a busy host).
         std::env::set_var("GITFORGE_SANDBOX_ACQUIRE_SECS", "not-a-number");
-        assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(60));
+        assert!(sandbox_acquire_timeout() >= Duration::from_secs(60));
         std::env::set_var("GITFORGE_SANDBOX_ACQUIRE_SECS", "0");
-        assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(60));
+        assert!(sandbox_acquire_timeout() >= Duration::from_secs(60));
         std::env::remove_var("GITFORGE_SANDBOX_ACQUIRE_SECS");
     }
 
