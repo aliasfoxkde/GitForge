@@ -32,11 +32,12 @@ make aegis-baseline       # regenerate baseline AFTER triaging findings
 make coverage
 ```
 
-The authoritative CI chain is this repo's **own GitForge pipeline** (`.gitforge.yml`, self-hosted): `fmt → clippy → test → coverage` on `dsc-ci-rust:7`, linear chain (one shared workspace per run). Before pushing, mirror it locally:
+The authoritative CI chain is this repo's **own GitForge pipeline** (`.gitforge.yml`, self-hosted): `fmt → clippy (+ rustdoc gate) → test → coverage` on `dsc-ci-rust:8`, linear chain (one shared workspace per run). Before pushing, mirror it locally:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo test --workspace -- --test-threads=2   # the 2-thread bound is deliberate (see .gitforge.yml)
 ```
 

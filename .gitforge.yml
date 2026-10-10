@@ -12,16 +12,16 @@
 #   directory and corrupt each other's build locks.
 # - `environment: {}` is required by the parser (PipelineDefinition has no
 #   serde default) even though it is never forwarded.
-# - The image is pre-built on the host (dsc-ci-rust:7 — cargo, clippy,
+# - The image is pre-built on the host (dsc-ci-rust:8 — cargo, clippy,
 #   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, and the
 #   GitForge workspace cargo registry cache baked in for offline builds).
 #   Rebuild and bump the tag whenever Cargo.lock changes or the baked
 #   tooling changes — a stale cache fails every cargo job in seconds with
-#   "candidate versions found which didn't match" (v7 adds the coverage
-#   toolchain; v6 existed because v5 dropped openssh-client, which the
-#   hermetic ssh-protocol tests spawn via ssh-keygen; v5 itself existed
-#   because the audited-deps bump moved jsonwebtoken to 11.1.0 ahead of
-#   v4's cache). The recipe lives at
+#   "candidate versions found which didn't match" (v8 documents the
+#   current tag; v7 added the coverage toolchain; v6 existed because v5
+#   dropped openssh-client, which the hermetic ssh-protocol tests spawn
+#   via ssh-keygen; v5 itself existed because the audited-deps bump
+#   moved jsonwebtoken to 11.1.0 ahead of v4's cache). The recipe lives at
 #   infrastructure/docker/ci-rust.Dockerfile. The image must exist on the
 #   host before the first run: the runner's hard 60-second
 #   sandbox-acquisition cap rules out building or pulling at run time.
@@ -50,6 +50,16 @@ jobs:
     steps:
       - name: Strict lint (zero warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rustdoc gate (zero warnings, no broken links)
+        # Rides the clippy job instead of taking its own position in the
+        # chain: every job here pays a cold-cache dependency compile (no
+        # cache mount), while this step runs in the container whose
+        # target/ clippy just populated, so rustdoc reuses the dependency
+        # metadata instead of rebuilding it. RUSTDOCFLAGS="-D warnings"
+        # makes broken_intra_doc_links and every other rustdoc lint
+        # fatal; --no-deps scopes the gate to this workspace's docs
+        # rather than several hundred dependency crates.
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
     timeout: 60m
 
   - name: test
