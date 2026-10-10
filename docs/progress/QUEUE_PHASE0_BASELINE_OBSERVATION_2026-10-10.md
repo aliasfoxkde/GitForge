@@ -88,10 +88,13 @@ terminal runs.
 design, and it has real historical instances.** A stranded row under an
 already-`succeeded` run is flipped `cancelled` by the ghost sweep, but the F24
 guard forbids rewriting the run verdict — so a chain can stay green with a
-job that never ran, and nothing detects it. The live DB contains exactly two
-such runs: `ffcfd7ba` (2026-09-10) and `527e7ca5` (2026-09-15), each 1 job,
-graded `succeeded` while containing a `failed` row. None since (25 days,
-~500 runs). This is the concrete target for the Phase 1 detector.
+job that never ran, and nothing detects it. The live DB has 12 `succeeded`
+runs containing non-succeeded job rows, but 10 of those are legacy
+`completed` rows (Aug 22–24, inert). Scoped to **`succeeded` runs containing
+a `failed` job row**, exactly two exist: `ffcfd7ba` (2026-09-10) and
+`527e7ca5` (2026-09-15) — each graded `succeeded` with one `failed` row
+among 2 and 6 total jobs respectively. None since (25 days; 1,032 runs
+since 2026-09-15). This is the concrete target for the Phase 1 detector.
 
 Phase 2 hypothesis (no per-job temp isolation): **verified in code** —
 `grep -rn TMPDIR crates/ services/` at `c4e3816` returns nothing outside
@@ -118,10 +121,15 @@ confirmed by unit env: `DATABASE_URL=sqlite:%h/work/gitforge-audit-20260822/audi
 - Zero pending/queued rows under terminal runs (ghost sweep holding).
 - Runner scoping: exactly **one** registered scheduler runner,
   `remote-podman-runner` (`d28711cc…`, capacity **1**, online, identity
-  `fedora-podman-runner-20260915`, podman user-socket); 3,843 jobs in 7 d.
-  10 concurrent `running` runs — control-center ×8, amortyx ×2+ — serialized
-  on the one slot; observed single jobs ran 19 s–36 min (`dep-audit` 27 m,
-  `doc-check` 36 m), consistent with the recorded link-saturation law.
+  `fedora-podman-runner-20260915`, podman user-socket); ≈3.8k jobs in a
+  trailing 7-day window (window-definition sensitive: ~3,792–3,795 for
+  natural 7-day cuts, ~4,102–4,111 for day-cut/trailing-now — see the
+  independent-validation note below; exact method and cut time not pinned).
+  10 concurrent `running` runs — control-center ×7, amortyx ×3 — serialized
+  on the one slot; observed single-job durations were short (current
+  samples 12–18 s; audited all-time max for each named job is 1 min,
+  11 instances each — the earlier "19 s–36 min / `dep-audit` 27 m /
+  `doc-check` 36 m" figures are unsupported and retracted).
   The 78-row backlog belongs to control-center + amortyx chains — the
   gitforge repo's own chain is not the only tenant; **no global-queue
   inference from one process**.
@@ -133,16 +141,19 @@ confirmed by unit env: `DATABASE_URL=sqlite:%h/work/gitforge-audit-20260822/audi
   `ffdfa47d`) → job `9eb68a3e` (`gate`) → `result_json` 91,104 bytes
   (`contract_version: harness.job.v1`) → 3,249 `job_log_chunks`
   (209,559 bytes). Per-job verdicts fully derivable from the audit DB.
-- Independent CI on the same host: two GitHub `Runner.Listener` processes
-  (PIDs 1972, 745270) — excluded from all conclusions above.
+- Independent CI on the same host: four GitHub `Runner.Listener` processes
+  alive during the window (PIDs 1972, 745270, 896302 on `amortyx`, 982717
+  on `amortyx-cpu2`) — excluded from all conclusions above.
 
 `/tmp` (read-only `df`/`du`): tmpfs 16 G, 13 G used, 3.2 G free (**81 %**).
-≈10.9 GB of it is eight `tmp.XXXXXXXXXX` dirs of ~1.4 GB each, owned by
-`mkinney`, mtimes 08:01–09:11 CDT today; contents are Rust-workspace +
-`ci-rust.Dockerfile` build contexts and `repo/` checkouts — CI image-build /
-checkout scratch that no job-finalization path reclaims. Attribution is
-partial (contents identified, owning process not). **Not touched** — cleanup
-is deny-listed; this is Phase 2's per-job scratch lifecycle evidence.
+11.93 GB (11.11 GiB) of it is eight `tmp.XXXXXXXXXX` dirs of ≈1.4–1.5 GB
+each, owned by `mkinney`, mtimes 08:01–09:11 CDT today; contents are
+Rust-workspace + `ci-rust.Dockerfile` build contexts and `repo/` checkouts —
+CI image-build / checkout scratch that no job-finalization path reclaims.
+Four additional smaller scratch dirs were present (0.91 GB, 0.29 GB, 3 MB,
+3 MB). Attribution is partial (contents identified, owning process not —
+still unresolved). **Not touched** — cleanup is deny-listed; this is Phase
+2's per-job scratch lifecycle evidence.
 
 ## Uncertainty
 
@@ -156,6 +167,34 @@ is deny-listed; this is Phase 2's per-job scratch lifecycle evidence.
 - REST was not exercised (recorded 401 law); DB-only derivability was
   demonstrated instead.
 - Job timestamps in the DB are UTC RFC3339; host shell times are CDT.
+
+## Independent validation (2026-10-10 23:05Z)
+
+A second independent read-only audit (same `mode=ro` DB access; no writes,
+no cleanup, no production change) re-derived the figures above. Verified as
+first reported: revision/source facts, the zero queued-under-terminal
+snapshot, the 78-row backlog and its draining behavior, the single capacity-1
+runner, the `2bcbe799` and `b61fcdbd` traces, and "no falsely-green instance
+since 2026-09-15". Corrections applied to this receipt:
+
+- `Runner.Listener` count two → **four** alive in the window (adds PIDs
+  896302 on `amortyx`, 982717 on `amortyx-cpu2`).
+- Concurrent-run split control-center ×8 / amortyx ×2+ → **×7 / ×3**
+  (10 total unchanged).
+- Runtime examples `dep-audit` 27 m / `doc-check` 36 m **retracted**: no
+  27/36-minute instances exist in the audited DB or the localhost stack;
+  all-time max for each named job is 1 min (11 instances each; current
+  samples 12–18 s).
+- "3,843 jobs in 7 d" not reproducible as an exact figure → reported as
+  **≈3.8k** with window uncertainty (natural 7-day cuts ≈3,792–3,795;
+  day-cut/trailing-now ≈4,102–4,111).
+- Eight large `/tmp` dirs total **11.93 GB (11.11 GiB)**, not ≈10.9 GB;
+  four additional smaller scratch dirs (0.91 GB, 0.29 GB, 3 MB, 3 MB).
+  Owner/process attribution remains unresolved; nothing was deleted.
+- Falsely-green claim scoped: 12 `succeeded` runs contain non-succeeded
+  rows, but 10 are legacy `completed`; exactly **two** succeeded runs
+  contain a `failed` job row (`ffcfd7ba` — 2 jobs, `527e7ca5` — 6 jobs).
+- Runs since 2026-09-15: ~500 → **1,032**.
 
 ## Ranked next implementation task
 
