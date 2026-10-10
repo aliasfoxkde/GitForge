@@ -15,13 +15,6 @@
 // failing IS the assertion -- a panic aborts the run loudly. Production
 // code keeps the denies.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// Test-harness exemption, same discipline as the campaign's documented
-// per-site allows: provider construction here is static configuration (an
-// env var + a local URL) that cannot fail in practice, so `expect` is the
-// honest way to abort the whole run loudly on an unexpected harness
-// misbuild, and `expect_error`'s panic is an assertion, not control flow.
-// Draining these would thread Results through every test for no gain.
-#![allow(clippy::expect_used, clippy::panic)]
 
 use std::collections::VecDeque;
 use std::sync::Arc;
