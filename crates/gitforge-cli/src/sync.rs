@@ -142,8 +142,8 @@ impl HttpClient for MockHttpClient {
     ) -> Result<R> {
         match &self.push_response {
             Some(Ok(resp)) => {
-                let json = serde_json::to_string(resp).unwrap();
-                Ok(serde_json::from_str(&json).unwrap())
+                let json = serde_json::to_string(resp)?;
+                Ok(serde_json::from_str(&json)?)
             }
             Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
             None => anyhow::bail!("mock push not configured"),
@@ -157,8 +157,8 @@ impl HttpClient for MockHttpClient {
     ) -> Result<T> {
         match &self.pull_response {
             Some(Ok(resp)) => {
-                let json = serde_json::to_string(resp).unwrap();
-                Ok(serde_json::from_str(&json).unwrap())
+                let json = serde_json::to_string(resp)?;
+                Ok(serde_json::from_str(&json)?)
             }
             Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
             None => anyhow::bail!("mock pull not configured"),

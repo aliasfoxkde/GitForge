@@ -27,6 +27,66 @@ def skip_raw_string(src, k):
     return (end + hashes + 1) if end != -1 else len(src)
 
 
+def code_only(src):
+    """Copy of `src` with string-literal, char-literal, and comment
+    contents blanked (offsets preserved), so text matches inside them
+    never count as sites."""
+    out = list(src)
+
+    def blank(a, b):
+        for i in range(a, b):
+            if out[i] not in "\r\n":
+                out[i] = " "
+
+    k = 0
+    n = len(src)
+    while k < n:
+        c = src[k]
+        nxt = src[k + 1] if k + 1 < n else ""
+        if c == "/" and nxt == "/":
+            j = src.find("\n", k)
+            j = n if j == -1 else j
+            blank(k, j)
+            k = j
+        elif c == "/" and nxt == "*":
+            j = src.find("*/", k + 2)
+            j = n if j == -1 else j + 2
+            blank(k, j)
+            k = j
+        elif c == '"':
+            j = k + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 1
+                elif src[j] == '"':
+                    break
+                j += 1
+            blank(k, min(j + 1, n))
+            k = j + 1
+        elif c == "r" and (k == 0 or not (src[k - 1].isalnum() or src[k - 1] == "_")):
+            end = skip_raw_string(src, k + 1)
+            if end != -1:
+                blank(k, end)
+                k = end
+            else:
+                k += 1
+        elif c == "'" and (k == 0 or not (src[k - 1].isalnum() or src[k - 1] == "_")):
+            close = src.find("'", k + 1, k + 6)
+            if close != -1:
+                if src[close - 1] == "\\":
+                    close = src.find("'", close + 1, close + 6)
+                if close != -1:
+                    blank(k, close + 1)
+                    k = close + 1
+                else:
+                    k += 1
+            else:
+                k += 1  # lifetime — nothing to blank
+        else:
+            k += 1
+    return "".join(out)
+
+
 def cfg_test_spans(src):
     """Spans (start, end) of top-level items preceded by #[cfg(test)]."""
     spans = []
@@ -116,9 +176,10 @@ def main(paths):
     for root in paths:
         for path in sorted(root.rglob("*.rs")):
             src = path.read_text(errors="replace")
-            spans = cfg_test_spans(src)
-            n_all = len(PAT.findall(src))
-            n_test = sum(len(PAT.findall(src[a:b + 1])) for a, b in spans)
+            code = code_only(src)
+            spans = cfg_test_spans(code)
+            n_all = len(PAT.findall(code))
+            n_test = sum(len(PAT.findall(code[a:b + 1])) for a, b in spans)
             # integration-test files (tests/ dirs) are test-context wholesale
             if "tests" in path.parts:
                 test += n_all

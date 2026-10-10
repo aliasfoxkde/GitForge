@@ -4,7 +4,7 @@
 //! concurrent builds to prevent resource exhaustion.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use tokio::process::Command;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Duration};
@@ -69,13 +69,20 @@ impl ProcessPool {
         Self::new(PoolConfig::default())
     }
 
-    /// Get a permit for running a job
+    /// Get a permit for running a job.
+    ///
+    /// The pool's semaphore is never closed — no code path calls
+    /// `Semaphore::close` — so `acquire_owned` cannot fail with the
+    /// "closed" error its `Result` shape allows for. The expect records
+    /// that invariant rather than threading an unreachable error through
+    /// every pool caller.
+    #[allow(clippy::expect_used)] // semaphore is never closed — see doc comment
     pub async fn acquire(&self, _weight: JobWeight) -> OwnedSemaphorePermit {
         self.semaphore
             .clone()
             .acquire_owned()
             .await
-            .expect("semaphore closed")
+            .expect("pool semaphore is never closed")
     }
 
     /// Spawn a managed process
@@ -97,7 +104,7 @@ impl ProcessPool {
         let pid = child.id().unwrap_or(0);
 
         {
-            let mut running = self.running.lock().unwrap();
+            let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
             running.insert(pid, ManagedProcess { pid, weight });
         }
 
@@ -128,7 +135,7 @@ impl ProcessPool {
                     let _ = child.kill().await;
                 }
             }
-            let mut running = running.lock().unwrap();
+            let mut running = running.lock().unwrap_or_else(PoisonError::into_inner);
             running.remove(&pid_for_handler);
             drop(permit);
         });
@@ -138,12 +145,18 @@ impl ProcessPool {
 
     /// Get count of running processes
     pub fn running_count(&self) -> usize {
-        self.running.lock().unwrap().len()
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// Check if a process is running
     pub fn is_running(&self, pid: u32) -> bool {
-        self.running.lock().unwrap().contains_key(&pid)
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&pid)
     }
 }
 

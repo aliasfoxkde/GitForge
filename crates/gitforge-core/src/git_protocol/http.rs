@@ -72,18 +72,20 @@ impl GitRpcChild {
         })
     }
 
+    /// Borrow the child for setup/teardown, preserving the ownership
+    /// invariant as a checked precondition instead of an unchecked expect.
+    fn owned_child(&mut self) -> Result<&mut tokio::process::Child> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| gitforge_common::Error::git(OWNED_CHILD_INVARIANT.to_string()))
+    }
+
     /// Feed `input` to the child's stdin and collect its response.
     ///
     /// The child stays owned by `self` across every await point, so dropping
     /// this future at any point still runs the reaping `Drop`.
     async fn drive(mut self, input: Vec<u8>) -> Result<Vec<u8>> {
-        if let Some(mut stdin) = self
-            .child
-            .as_mut()
-            .expect(OWNED_CHILD_INVARIANT)
-            .stdin
-            .take()
-        {
+        if let Some(mut stdin) = self.owned_child()?.stdin.take() {
             stdin.write_all(&input).await.map_err(|error| {
                 gitforge_common::Error::git(format!(
                     "failed to send {} request: {error}",
@@ -96,18 +98,8 @@ impl GitRpcChild {
         // Drain stdout and stderr concurrently so a chatty child cannot fill
         // a pipe buffer and deadlock, mirroring `Child::wait_with_output`
         // while keeping the child owned by the guard at every await point.
-        let stdout_pipe = self
-            .child
-            .as_mut()
-            .expect(OWNED_CHILD_INVARIANT)
-            .stdout
-            .take();
-        let stderr_pipe = self
-            .child
-            .as_mut()
-            .expect(OWNED_CHILD_INVARIANT)
-            .stderr
-            .take();
+        let stdout_pipe = self.owned_child()?.stdout.take();
+        let stderr_pipe = self.owned_child()?.stderr.take();
         let (stdout, stderr) = tokio::join!(drain_pipe(stdout_pipe), drain_pipe(stderr_pipe));
         let wait_error = |error: std::io::Error| {
             gitforge_common::Error::git(format!("failed to wait for {}: {error}", self.service))
@@ -115,13 +107,7 @@ impl GitRpcChild {
         let stdout = stdout.map_err(wait_error)?;
         let stderr = stderr.map_err(wait_error)?;
 
-        let status = self
-            .child
-            .as_mut()
-            .expect(OWNED_CHILD_INVARIANT)
-            .wait()
-            .await
-            .map_err(wait_error)?;
+        let status = self.owned_child()?.wait().await.map_err(wait_error)?;
         // Fully reaped: tell the Drop guard to stand down.
         self.child = None;
 

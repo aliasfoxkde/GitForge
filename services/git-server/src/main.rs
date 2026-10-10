@@ -175,7 +175,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn HTTP server
     let http_handle = tokio::spawn(async move {
-        axum::serve(http_listener, app).await.unwrap();
+        axum::serve(http_listener, app)
+            .await
+            .unwrap_or_else(|error| {
+                // The Git HTTP endpoint dying is fatal to the service; surface
+                // it loudly rather than panicking inside a detached task where
+                // the panic would only surface as a silent JoinHandle error.
+                tracing::error!("Git HTTP server failed: {error}");
+            });
     });
 
     // Start SSH server for Git operations. The host key is generated on

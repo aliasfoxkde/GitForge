@@ -111,12 +111,17 @@ strip = true
 # satisfy, and they keep formatting/Option-handling consistent. The rest of
 # pedantic is surveyed in docs/audits and stays advisory. The warn entries
 # are the 2026-10-10 anti-pattern guards (debug macros and unimplemented
-# placeholders); enforcement-grade restriction lints (unwrap_used et al.)
-# attach per crate as the unwrap campaign drains each one.
+# placeholders). The unwrap/expect campaign drained the production
+# surface to zero undocumentated sites (2026-10-10 — see
+# docs/planning/QUALITY_BASELINE.md), so the restriction lints are
+# enforced workspace-wide; the three remaining expects carry per-site
+# #[allow] with their invariants documented in place.
 [workspace.lints.clippy]
 uninlined_format_args = "deny"
 map_unwrap_or = "deny"
 redundant_closure_for_method_calls = "deny"
 ignored_unit_patterns = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
 dbg_macro = "warn"
 unimplemented = "warn"

@@ -2,7 +2,10 @@
 //!
 //! Detects common security vulnerabilities in code changes.
 
-use crate::{HunkLine, ParsedDiff};
+// The default pattern table compiles through the crate-wide
+// `static_regex` helper (lib.rs), which documents why `Regex::new`'s
+// fallibility never becomes a runtime input condition.
+use crate::{static_regex, HunkLine, ParsedDiff};
 use regex::Regex;
 
 /// A detected security vulnerability
@@ -85,19 +88,6 @@ impl Default for SecurityScanner {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Compile a static rule pattern from the default table.
-///
-/// Every pattern passed here is a compile-time literal that the unit tests
-/// exercise against live match cases; a syntax error in one is a defect in
-/// the table itself, surfacing at first scanner construction — never a
-/// runtime input condition. Panicking with the pattern text is therefore
-/// the correct failure mode, and `Regex::new`'s fallibility is not
-/// propagated into an input-validation path it can never occupy.
-#[allow(clippy::expect_used)] // static pattern table — see doc comment
-fn static_regex(pattern: &str) -> Regex {
-    Regex::new(pattern).expect("static vulnerability pattern must compile")
 }
 
 impl SecurityScanner {

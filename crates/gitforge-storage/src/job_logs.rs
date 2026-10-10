@@ -5,6 +5,7 @@ use gitforge_common::{Error, JobId, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::PoisonError;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -89,25 +90,25 @@ impl JobLogStore for InMemoryJobLogStore {
             created_at: chrono::Utc::now(),
         };
 
-        let mut logs = self.logs.lock().unwrap();
+        let mut logs = self.logs.lock().unwrap_or_else(PoisonError::into_inner);
         logs.insert(job_id, (data, meta));
         tracing::debug!("stored job log for job {} ({} bytes)", job_id, size_bytes);
         Ok(())
     }
 
     async fn get(&self, job_id: &JobId) -> Result<Option<Vec<u8>>> {
-        let logs = self.logs.lock().unwrap();
+        let logs = self.logs.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(logs.get(job_id).map(|(data, _)| data.clone()))
     }
 
     async fn delete(&self, job_id: &JobId) -> Result<()> {
-        let mut logs = self.logs.lock().unwrap();
+        let mut logs = self.logs.lock().unwrap_or_else(PoisonError::into_inner);
         logs.remove(job_id);
         Ok(())
     }
 
     async fn list(&self) -> Result<Vec<JobLogMeta>> {
-        let logs = self.logs.lock().unwrap();
+        let logs = self.logs.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(logs.values().map(|(_, meta)| meta.clone()).collect())
     }
 }
