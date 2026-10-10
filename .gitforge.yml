@@ -176,11 +176,15 @@ jobs:
         # the 60m budget absorbs that, same rationale as the test job's.
         # set -e is explicit: dash without it would run the second target
         # even if the first crashed.
+        #
+        # Nightly is selected with the +channel syntax: cargo-fuzz 0.13
+        # (dsc-ci-rust:9) dropped `run --toolchain`, and the image's
+        # default toolchain is stable, which cannot build -Zbuild-std.
         run: |
           set -e
           cd fuzz
-          cargo fuzz run --toolchain nightly pipeline_parse \
+          cargo +nightly fuzz run pipeline_parse \
               -- -max_total_time=60 -rss_limit_mb=2560
-          cargo fuzz run --toolchain nightly git_http_parsers \
+          cargo +nightly fuzz run git_http_parsers \
               -- -max_total_time=60 -rss_limit_mb=2560
     timeout: 60m
