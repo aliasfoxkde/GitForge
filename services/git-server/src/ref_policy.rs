@@ -6,7 +6,7 @@
 //! command list as a self-delimiting pkt-line block terminated by a flush
 //! packet. That lets the repository's ref-update policy be evaluated BEFORE
 //! spawning the child and declined with a standard receive-pack status
-//! report ("ng <ref> <reason>"), which git clients render as
+//! report (`ng <ref> <reason>`), which git clients render as
 //! `! [remote rejected] <ref> (reason)`.
 //!
 //! Two mechanisms cooperate:
