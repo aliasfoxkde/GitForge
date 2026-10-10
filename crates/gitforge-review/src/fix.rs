@@ -79,7 +79,7 @@ impl FixGenerator {
         templates.insert(
             "sql_injection_concat".to_string(),
             FixTemplate {
-                pattern: Regex::new(r#"(\w+)\s*\(\s*["'][^"']*\+[^"']*["']\s*\)"#).unwrap(),
+                pattern: crate::static_regex(r#"(\w+)\s*\(\s*["'][^"']*\+[^"']*["']\s*\)"#),
                 generate: |code: &str| {
                     // Convert string concatenation to parameterized query
                     Some(FixSuggestion {
@@ -101,7 +101,7 @@ impl FixGenerator {
         templates.insert(
             "hardcoded_password".to_string(),
             FixTemplate {
-                pattern: Regex::new(r#"(\w+)\s*=\s*["'][^"']{4,}["']"#).unwrap(),
+                pattern: crate::static_regex(r#"(\w+)\s*=\s*["'][^"']{4,}["']"#),
                 generate: |code: &str| {
                     let var_name = code.split('=').next()?.trim();
                     Some(FixSuggestion {
@@ -120,7 +120,7 @@ impl FixGenerator {
         templates.insert(
             "weak_hash".to_string(),
             FixTemplate {
-                pattern: Regex::new(r#"(md5|sha1|des|rc4)\s*\("#).unwrap(),
+                pattern: crate::static_regex(r#"(md5|sha1|des|rc4)\s*\("#),
                 generate: |code: &str| {
                     Some(FixSuggestion {
                         file: String::new(),
@@ -138,7 +138,7 @@ impl FixGenerator {
         templates.insert(
             "insecure_random".to_string(),
             FixTemplate {
-                pattern: Regex::new(r#"Math\.random\s*\("#).unwrap(),
+                pattern: crate::static_regex(r#"Math\.random\s*\("#),
                 generate: |_code: &str| {
                     Some(FixSuggestion {
                         file: String::new(),
@@ -156,7 +156,7 @@ impl FixGenerator {
         templates.insert(
             "eval_usage".to_string(),
             FixTemplate {
-                pattern: Regex::new(r#"eval\s*\("#).unwrap(),
+                pattern: crate::static_regex(r#"eval\s*\("#),
                 generate: |_code: &str| {
                     Some(FixSuggestion {
                         file: String::new(),

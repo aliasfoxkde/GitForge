@@ -111,15 +111,15 @@ impl JobStateMachine {
     /// Transition to failed state
     pub fn fail(&mut self, exit_code: i32, error: String) -> Result<()> {
         self.ensure_valid_transition(JobStatus::Failed)?;
-        self.status = JobStatus::Failed;
-        self.exit_code = Some(exit_code);
-        self.error_message = Some(error);
         tracing::error!(
             "job {} failed with exit code {}: {}",
             self.job_id,
             exit_code,
-            self.error_message.as_ref().unwrap()
+            error
         );
+        self.status = JobStatus::Failed;
+        self.exit_code = Some(exit_code);
+        self.error_message = Some(error);
         Ok(())
     }
 

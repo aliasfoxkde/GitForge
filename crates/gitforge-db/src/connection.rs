@@ -8,6 +8,114 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// How many poisoned-connection recovery passes `begin_immediate` attempts
+/// before giving up. Each pass takes a fresh connection, so the cap bounds
+/// the added latency without masking a genuinely dead database.
+const BEGIN_RECOVERY_PASSES: usize = 3;
+
+/// Begin a `BEGIN IMMEDIATE` transaction, recovering a poisoned connection.
+///
+/// sqlx tracks transaction depth per connection, but a write that loses a
+/// race against task cancellation or a write freeze can leave the SQLite
+/// handle inside a transaction while the depth counter says zero (the
+/// rollback paths that would resync the pair only run when the original
+/// command both succeeded and was acknowledged). The poisoned connection
+/// returns to the pool, and because the pool hands out the most recently
+/// used connection first, every subsequent `begin_with` fails with
+/// `(code: 1) cannot start a transaction within a transaction`. That is
+/// not a transient lock: `persist_with_retry` alone cannot clear it,
+/// because every retry is handed the same poisoned connection.
+///
+/// Recovery is a bare `ROLLBACK` on a fresh pooled connection — a no-op
+/// error on a healthy one — then the begin is retried. Observed live
+/// 2026-10-08: five `persist_with_retry` attempts at job completion all
+/// failed against the same poisoned connection while the runner's work had
+/// succeeded; the lease-dead fence then graded the run failed.
+pub(crate) async fn begin_immediate(
+    pool: &SqlitePool,
+    context: &str,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    match pool.begin_with("BEGIN IMMEDIATE").await {
+        Ok(tx) => Ok(tx),
+        Err(begin_error) => {
+            let mut last = begin_error;
+            for _ in 0..BEGIN_RECOVERY_PASSES {
+                let Ok(mut conn) = pool.acquire().await else {
+                    break;
+                };
+                // A bare ROLLBACK clears the desynced SQLite-side
+                // transaction. On a healthy connection it fails with
+                // "no transaction is active", which carries no signal.
+                let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+                // Return the healed connection BEFORE re-beginning:
+                // begin_with acquires its own connection, and holding this
+                // one across that wait deadlocks any pool already at its
+                // connection cap (a single-connection pool burns a full
+                // acquire timeout per recovery pass). The pool hands out
+                // the most recently used connection first, so the re-begin
+                // gets the connection just healed.
+                drop(conn);
+                match pool.begin_with("BEGIN IMMEDIATE").await {
+                    Ok(tx) => {
+                        tracing::warn!(
+                            context = %context,
+                            "recovered a desynced pooled connection with ROLLBACK"
+                        );
+                        return Ok(tx);
+                    }
+                    Err(error) => last = error,
+                }
+            }
+            Err(Error::database(format!(
+                "failed to begin {context}: {last}"
+            )))
+        }
+    }
+}
+
+/// Heal a pooled connection that still holds a SQLite-side transaction.
+///
+/// This is the `before_acquire` hook every GitForge pool installs. A
+/// connection whose SQLite handle is inside a transaction that sqlx's
+/// depth counter does not know about does not just fail the next
+/// `begin_with` — any *single-statement* write routed to it in
+/// autocommit silently joins the orphaned transaction and evaporates
+/// when that transaction is rolled back (observed live 2026-10-08: run
+/// `99c463db` logged `persisted planned job rows planned=4` yet zero
+/// rows existed afterwards). Healing at the idle->borrowed boundary
+/// closes the whole class for every caller, including plain queries
+/// that never open a transaction themselves.
+///
+/// A bare ROLLBACK is the probe and the cure in one statement: it
+/// succeeds exactly when an orphaned transaction existed (now cleared),
+/// fails with "no transaction is active" on a healthy connection, and
+/// any other failure retires the connection by reporting `false` (the
+/// pool closes it instead of handing it out).
+pub(crate) fn heal_poisoned_connection<'c>(
+    conn: &'c mut sqlx::SqliteConnection,
+) -> futures::future::BoxFuture<'c, sqlx::Result<bool>> {
+    Box::pin(async move {
+        match sqlx::raw_sql("ROLLBACK").execute(conn).await {
+            Ok(_) => {
+                tracing::warn!("healed an orphaned SQLite transaction on a pooled connection");
+                Ok(true)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no transaction is active") {
+                    Ok(true)
+                } else {
+                    tracing::warn!(
+                        %error,
+                        "retiring unusable pooled SQLite connection"
+                    );
+                    Ok(false)
+                }
+            }
+        }
+    })
+}
+
 /// SQLite connection pool wrapper
 #[derive(Clone)]
 pub struct Pool {
@@ -50,6 +158,7 @@ impl Pool {
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
+            .before_acquire(|conn, _meta| heal_poisoned_connection(conn))
             .connect_with(options)
             .await
             .map_err(|e| Error::database(format!("failed to connect to database: {e}")))?;
@@ -371,11 +480,7 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to check duplicate runner names: {e}")))?;
         if duplicate_names > 0 {
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(|e| Error::database(format!("failed to begin runner rename: {e}")))?;
+            let mut tx = begin_immediate(&self.pool, "runner rename").await?;
             sqlx::query(
                 r#"
                 UPDATE runners SET name = name || '-legacy-' || id

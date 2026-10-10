@@ -2,6 +2,12 @@
 
 A production-ready ViteJS + React PWA template optimized for CSR-first deployments on Cloudflare Pages and Vercel.
 
+> **This is a template part, not a standalone scaffold.** Layer it over a
+> fresh `npm create vite@latest my-app -- --template react-ts` skeleton:
+> the part supplies `src/`, `public/`, configs, and tests, while the
+> scaffold supplies the entry `index.html` (keep its `lang="en"` root
+> element — accessibility starts there) and the vite binary itself.
+
 ## Quick Start
 
 ```bash

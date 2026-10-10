@@ -1,27 +1,32 @@
 # GitForge local CI pipeline (self-hosted GitForge at /nas/Temp/repos/GitForge).
 #
-# The project's own gates, run by the project itself: rustfmt --check, the
-# strict clippy pass, and the workspace test suite. Pushes to any branch run
-# the full chain, so a PR branch is validated here before it merges.
+# The project's own gates, run by the project itself: rustfmt --check plus
+# the route-docs drift gate, the strict clippy pass, the workspace test
+# suite, the line-coverage gate, and a bounded fuzz smoke over the
+# untrusted-input parsers. Pushes to any branch run the full chain, so a
+# PR branch is validated here before it merges.
 #
 # Documented constraints (same list proven in gods-eye-view's and dsc's
 # .gitforce.yml):
-# - The job graph is a LINEAR CHAIN (fmt → clippy → test), not a fan-out,
+# - The job graph is a LINEAR CHAIN (fmt → clippy → test → coverage →
+#   fuzz), not a fan-out,
 #   because all jobs of one run share the SAME workspace directory on this
 #   runner. Concurrent jobs would run cargo against the same target/
 #   directory and corrupt each other's build locks.
 # - `environment: {}` is required by the parser (PipelineDefinition has no
 #   serde default) even though it is never forwarded.
-# - The image is pre-built on the host (dsc-ci-rust:7 — cargo, clippy,
-#   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, and the
-#   GitForge workspace cargo registry cache baked in for offline builds).
+# - The image is pre-built on the host (dsc-ci-rust:9 — cargo, clippy,
+#   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, python3
+#   for the route-docs drift gate, and the GitForge workspace cargo
+#   registry cache baked in for offline builds).
 #   Rebuild and bump the tag whenever Cargo.lock changes or the baked
 #   tooling changes — a stale cache fails every cargo job in seconds with
-#   "candidate versions found which didn't match" (v7 adds the coverage
-#   toolchain; v6 existed because v5 dropped openssh-client, which the
-#   hermetic ssh-protocol tests spawn via ssh-keygen; v5 itself existed
-#   because the audited-deps bump moved jsonwebtoken to 11.1.0 ahead of
-#   v4's cache). The recipe lives at
+#   "candidate versions found which didn't match" (v9 added python3 for
+#   the drift checker; v8 documents the
+#   current tag; v7 added the coverage toolchain; v6 existed because v5
+#   dropped openssh-client, which the hermetic ssh-protocol tests spawn
+#   via ssh-keygen; v5 itself existed because the audited-deps bump
+#   moved jsonwebtoken to 11.1.0 ahead of v4's cache). The recipe lives at
 #   infrastructure/docker/ci-rust.Dockerfile. The image must exist on the
 #   host before the first run: the runner's hard 60-second
 #   sandbox-acquisition cap rules out building or pulling at run time.
@@ -38,22 +43,41 @@ trigger_on:
 environment: {}
 jobs:
   - name: fmt
-    image: dsc-ci-rust:8
+    image: dsc-ci-rust:9
     steps:
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Route-vs-docs drift gate
+        # Parse-only cross-check (no cargo, no network, <1s): every axum
+        # route under crates/gitforge-api must have an OpenAPI path entry
+        # and a docs/API.md endpoint, and neither doc surface may carry an
+        # entry with no backing route. Hand-maintained docs drift; this is
+        # the gate that catches it at push time instead of at review time.
+        # Exits 1 on drift; --report (always exit 0) exists for baseline
+        # sweeps, not for this gate.
+        run: python3 scripts/check-route-docs.py
     timeout: 15m
 
   - name: clippy
-    image: dsc-ci-rust:8
+    image: dsc-ci-rust:9
     needs: [fmt]
     steps:
       - name: Strict lint (zero warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rustdoc gate (zero warnings, no broken links)
+        # Rides the clippy job instead of taking its own position in the
+        # chain: every job here pays a cold-cache dependency compile (no
+        # cache mount), while this step runs in the container whose
+        # target/ clippy just populated, so rustdoc reuses the dependency
+        # metadata instead of rebuilding it. RUSTDOCFLAGS="-D warnings"
+        # makes broken_intra_doc_links and every other rustdoc lint
+        # fatal; --no-deps scopes the gate to this workspace's docs
+        # rather than several hundred dependency crates.
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
     timeout: 60m
 
   - name: test
-    image: dsc-ci-rust:8
+    image: dsc-ci-rust:9
     needs: [clippy]
     steps:
       - name: Workspace test suite
@@ -80,7 +104,7 @@ jobs:
     timeout: 90m
 
   - name: coverage
-    image: dsc-ci-rust:8
+    image: dsc-ci-rust:9
     needs: [test]
     steps:
       - name: Line coverage gate (fail 82, warn 84)
@@ -132,3 +156,35 @@ jobs:
             echo "line coverage ${pct}% meets the 84% target"
           fi
     timeout: 90m
+
+  - name: fuzz
+    image: dsc-ci-rust:9
+    needs: [coverage]
+    steps:
+      - name: Fuzz smoke (60s per target)
+        # Bounded libFuzzer smoke over the two untrusted-input surfaces:
+        # the .gitforge.yml pipeline parser (bytes controlled by anyone
+        # who can push to any repo) and the smart-HTTP path/header
+        # parsers (raw client strings ahead of auth). A crash here is a
+        # found vulnerability, not an infra failure: fix or bound it
+        # before the branch merges. 60s per target is a smoke, not a
+        # campaign — sustained fuzzing runs locally/off-schedule.
+        #
+        # Cold-cache note: the first fuzz job of a run compiles std from
+        # source (cargo-fuzz builds with -Zbuild-std by default) plus
+        # libfuzzer-sys plus the workspace deps for the nightly target —
+        # the 60m budget absorbs that, same rationale as the test job's.
+        # set -e is explicit: dash without it would run the second target
+        # even if the first crashed.
+        #
+        # Nightly is selected with the +channel syntax: cargo-fuzz 0.13
+        # (dsc-ci-rust:9) dropped `run --toolchain`, and the image's
+        # default toolchain is stable, which cannot build -Zbuild-std.
+        run: |
+          set -e
+          cd fuzz
+          cargo +nightly fuzz run pipeline_parse \
+              -- -max_total_time=60 -rss_limit_mb=2560
+          cargo +nightly fuzz run git_http_parsers \
+              -- -max_total_time=60 -rss_limit_mb=2560
+    timeout: 60m

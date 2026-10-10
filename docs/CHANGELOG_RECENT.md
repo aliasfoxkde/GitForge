@@ -2,6 +2,149 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [Unreleased]
+
+## [0.6.16] - 2026-10-10
+
+### Added
+
+- **Route-vs-docs drift gate** (48c41bc7): `scripts/check-route-docs.py`
+  cross-checks the axum routers against the hand-maintained OpenAPI spec
+  and docs/API.md at push time — a served route with no spec entry, a
+  spec path with no backing route, or a doc endpoint that serves nothing
+  now fails the `fmt` job instead of surfacing at review time. Parse-only
+  (no cargo, no network), `#[cfg(test)]`-aware. First run closed nine
+  real drift findings: two shipped features (`POST /auth/refresh`,
+  `POST /auth/logout`) had no spec or doc entry, and the rerun, SSH-key,
+  webhook, dashboard, and metrics surfaces were partially undocumented.
+- **CI image dsc-ci-rust:9** adds python3 (slim bookworm base ships
+  none) so the drift gate can run in the pipeline, plus g++, nightly
+  with rust-src, and cargo-fuzz for the fuzz gate; bump follows the
+  baked-tooling rule (rebuild + tag bump, never pull at run time).
+- **Bounded fuzz smoke over the untrusted-input parsers**: a new final
+  pipeline job runs 60s of libFuzzer per target against the
+  `.gitforge.yml` pipeline parser (bytes controlled by anyone who can
+  push to any repo) and the smart-HTTP path/header parsers (raw client
+  strings ahead of authentication). Targets live in `fuzz/` as a
+  nightly-only workspace excluded from the stable one; a crash fails
+  the run and is a found vulnerability, not an infra failure. Sustained
+  campaigns stay off-schedule; the gate is a smoke.
+- **Rerun pipeline runs at their stored commit** (1bcf2539):
+  `POST /api/pipeline-runs/{id}/rerun` delegates to the orchestrator the
+  same way a push trigger does, but pins the revision to the run's own
+  commit hash — the reason to rerun is usually doubt about the original
+  verdict, and refs move. A commit that no longer resolves is refused
+  up front instead of minting a run doomed at clone time, and in-flight
+  duplicate protection rides the orchestrator's durable trigger dedup.
+
+### Changed
+
+- **The `/dashboard` page now reports measured state** (5c07b42a): the
+  panel was a fabricated status page — hardcoded version string,
+  permanent zeros, an unconditional "Connected" badge. It now renders
+  live aggregates from a new `StatsQueries::dashboard` (repositories,
+  pipelines, artifacts, runners online, 24h runs + success count; the
+  24h window binds an RFC3339 timestamp to match how write paths store
+  them — SQLite's space-separated `datetime('now')` compares wrongly
+  against the `T` separator inside a day). When the database read fails
+  the page says Unavailable and renders em dashes rather than quiet
+  zeros. The page also meets WCAG 2.1 AAA contrast (≥7:1 on every text
+  pair — the old green/red badges measured 5.2:1 and 3.8:1), adds a
+  `<main>` landmark, a `:focus-visible` outline, and hides decorative
+  emoji from assistive technology.
+
+### Fixed
+
+- **Connection poisoning self-heals at the pool boundary**
+  (0b16dd76, 0dfc0f15, f939ab64): when `BEGIN IMMEDIATE` fails under
+  contention, sqlx's transaction-depth counter and the SQLite handle
+  desync — the pooled connection then rejects every later explicit
+  transaction, and the silent flavor is worse: any single-statement
+  autocommit write routed to it joins the orphaned transaction and
+  evaporates on rollback (run `99c463db` logged `persisted planned job
+  rows planned=4` yet zero rows existed). Two layers close the class:
+  `begin_immediate` recovers with bounded bare-ROLLBACK passes on the
+  explicit-transaction paths, and a pool-wide `before_acquire` hook
+  heals (or retires) any connection still holding an orphaned
+  transaction before it is handed out. The recovery itself had a
+  deadlock at connection caps — it held the just-ROLLBACKed connection
+  while waiting for another to re-begin, stalling a full acquire
+  timeout per pass on a single-connection pool; the healed connection
+  is now returned before the re-begin and the pool's MRU handoff
+  hands it straight back.
+
+- **Manual job cancels cascade to pending descendants** (09c91bfa):
+  cancelling a running job left its not-yet-started descendants
+  pending, so the run never reached a terminal status and the chain
+  hung until heartbeat timeout. `cancel_job` now cancels each
+  non-terminal descendant and finalizes the pipeline as `Cancelled`
+  when every job is terminal — the live 2026-10-08 ghost signature
+  (all jobs cancelled, run status `running`) is the pre-fix behavior.
+
+- **Planned-job rows persist under contention** (a4d52e44): the
+  per-job row inserts of a run plan were one-shot writes; one
+  transient busy loss aborted the loop and stranded a half-planned
+  run. Each row now goes through `persist_with_retry` (F21/F23
+  durable-write discipline).
+
+- **Event consumer starts before the workspace rebuild** (69e3c859):
+  boot inlined `rebuild_live_engines` ahead of the event consumer, so
+  post-restart triggers sat unconsumed for the whole rebuild —
+  observed 2026-10-08 as triggers failing for 40+ minutes after a
+  restart under load. The consumer now spawns first; recovery is
+  independent of it (reconciliation grades from durable rows).
+
+- **Stalled runs redrive without a restart** (50fede66, c71a87c2):
+  nine runs held 35 pending rows for ~21h across a restart while
+  their engines sat in the registry. The startup engine rebuild is no
+  longer one-shot — a 300s pass re-attempts rebuilds for
+  registry-absent non-terminal runs, and `rebuild_live_engines`
+  rebuilds over a held engine whenever the durable rows show nothing
+  actively executing, re-enqueuing idempotently.
+
+- **Runner survives scheduler outages** (1dbdd121): the heartbeat loop
+  stopped the agent after 10 consecutive failures of any kind, so a
+  scheduler outage crash-looped the unit until a human ended it.
+  Transport failures and 5xx are no longer decisions: unreachable
+  streaks never stop the agent, while identity rejections (401/403/
+  404) keep the stop-for-re-registration behavior.
+
+- **Load-aware sandbox acquisition, retried runner heartbeat**
+  (bdfc9a75): acquisition timed out at host load 66 under a saturated
+  daemon and failed a job whose container would have landed (clean
+  re-fire wasted a pipeline cycle). The 60s ceiling now scales
+  linearly with load-per-core up to 3×, with `GITFORGE_SANDBOX_ACQUIRE_SECS`
+  still pinning it. The runner's heartbeat UPDATE is no longer a
+  single autocommit write — a heartbeat lost to transient DB pressure
+  is how a healthy runner gets fenced mid-job (runner_lost incident) —
+  it now goes through `persist_with_retry` like the other durable
+  writes.
+
+- **Strict lint gate made real**: the workspace-level
+  `unwrap_used`/`expect_used`/`panic` denies plus the CI image's
+  clippy bump surfaced a backlog the previous image's older clippy
+  never flagged — including a hard borrow error (E0502) in
+  gitforge-core's `GitRpcChild::drive` that the tip had never compiled
+  past, and the `allow-*-in-tests` boundary (fixture helpers in test
+  targets are neither `#[test]` fns nor `#[cfg(test)]`). The tip now
+  passes `cargo clippy --workspace --all-targets -- -D warnings` end
+  to end. The clippy job's second step — the rustdoc gate
+  (`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`) —
+  had its own never-reached backlog: private-intra-doc-links in
+  public docs (scheduler, runner), bare `<ref> <reason>` parsed as
+  unclosed HTML in the ref-policy module doc, and an out-of-scope
+  cross-crate link in the review route doc. All fixed; the gate now
+  passes at the release tip.
+
+### Tests
+
+- Regression tests ship with each fix: a desynced-connection recovery
+  test and a cross-connection swallowed-write test (the write must
+  survive a pool close/reopen only when the hook is installed), a
+  chain-cancel cascade test, load-scaling table tests for the
+  acquisition ceiling, and the redrive passes reuse the existing
+  rebuild harness.
+
 ## [0.6.15] - 2026-10-07
 
 ### Added

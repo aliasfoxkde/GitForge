@@ -92,6 +92,7 @@ pub fn ci_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/pipelines/{id}/runs", post(trigger_pipeline_run))
         .route("/pipeline-runs", get(list_pipeline_runs))
         .route("/pipeline-runs/{id}", get(get_pipeline_run))
+        .route("/pipeline-runs/{id}/rerun", post(rerun_pipeline_run))
         .route("/pipeline-runs/{id}/jobs", get(get_pipeline_run_jobs))
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/logs", get(get_job_logs))
@@ -564,6 +565,176 @@ async fn trigger_pipeline_run(
             .into_response(),
         Err(error) => {
             tracing::error!(%error, "CI orchestrator rejected the run trigger");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "ci_trigger_failed",
+                    "message": error
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Re-run an existing pipeline run at its original commit.
+///
+/// A rerun must reproduce THE commit that ran, not whatever the ref points
+/// at now — the reason to rerun is usually doubt about the original
+/// verdict, and refs move. The stored commit hash is therefore used
+/// verbatim as both the revision and the delivered `new_hash`. Delivery is
+/// the same delegation a push takes: the orchestrator records the durable
+/// trigger request, dedups racing triggers for the same (repo, commit),
+/// and creates the run.
+async fn rerun_pipeline_run(
+    Extension(pool): Extension<Arc<Pool>>,
+    user: AuthenticatedUser,
+    ci_trigger: Option<Extension<Arc<CiTriggerClient>>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let claims = user.claims;
+    let Ok(uuid) = Uuid::parse_str(&id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_id",
+                "message": "Invalid pipeline run ID format"
+            })),
+        )
+            .into_response();
+    };
+
+    let run = match PipelineRunQueries::get(&pool, PipelineRunId::from(uuid)).await {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "not_found",
+                    "message": "Pipeline run not found"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to load pipeline run for rerun");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "failed to load pipeline run"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(status) = authorize_repo(&pool, &claims, run.repo_id).await {
+        return status.into_response();
+    }
+
+    if !is_safe_revision(&run.commit_hash) {
+        // A stored hash failing the revision guard must not reach git or
+        // the orchestrator.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_commit_hash",
+                "message": "stored commit hash is not a safe revision"
+            })),
+        )
+            .into_response();
+    }
+
+    let repo = match RepoQueries::get(&pool, run.repo_id).await {
+        Ok(Some(repo)) => repo,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "not_found",
+                    "message": "repository not found"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, %run.repo_id, "failed to load repository for run rerun");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "failed to load repository"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if !std::path::Path::new(&repo.git_path).exists() {
+        tracing::error!(git_path = %repo.git_path, "repository storage unavailable for run rerun");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "storage_unavailable",
+                "message": "repository storage is unavailable"
+            })),
+        )
+            .into_response();
+    }
+
+    // Fail fast on a commit that no longer resolves (rewritten history,
+    // pruned storage) instead of minting a run doomed at clone time (F37).
+    let commit = match resolve_revision(&repo.git_path, &run.commit_hash).await {
+        Ok(commit) => commit,
+        Err(error) => {
+            tracing::info!(%error, "run rerun referenced an unresolvable commit");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "unknown_revision",
+                    "message": error
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(Extension(client)) = ci_trigger else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "ci_unavailable",
+                "message": "CI orchestrator trigger is not configured"
+            })),
+        )
+            .into_response();
+    };
+
+    match client
+        .trigger(run.repo_id, &run.commit_hash, None, &commit)
+        .await
+    {
+        Ok(Some(pipeline_run_id)) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "rerun_of": run.id.to_string(),
+                "pipeline_id": run.pipeline_id.to_string(),
+                "pipeline_run_id": pipeline_run_id,
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "rerun_of": run.id.to_string(),
+                "pipeline_id": run.pipeline_id.to_string(),
+                "pipeline_run_id": serde_json::Value::Null
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "CI orchestrator rejected the run rerun");
             (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({

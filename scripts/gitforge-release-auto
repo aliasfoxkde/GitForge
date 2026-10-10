@@ -52,6 +52,31 @@ lock_file="$releases_dir/.auto-update.lock"
 say() { printf 'release-auto: %s\n' "$1"; }
 die() { printf 'release-auto: %s\n' "$1" >&2; exit 1; }
 
+# A unit masked on this host is a retired component, not a failure: the
+# restart set is what the host actually runs. Failing the whole cutover on
+# a masked unit made every promote roll back forever (2026-10-10: the NAS
+# runner was retired via mask when CI moved to the fedora host).
+unit_masked() {
+    [[ "$(systemctl list-unit-files "$1" --no-legend 2>/dev/null | awk '{print $2}')" == "masked" ]]
+}
+RESTART_STATELESS=()
+for u in gitforge@api.service gitforge@git-server.service; do
+    if unit_masked "$u"; then
+        say "skipping $u: masked on this host"
+    else
+        RESTART_STATELESS+=("$u")
+    fi
+done
+RESTART_SCHED=()
+for u in gitforge@ci.service gitforge@runner.service; do
+    if unit_masked "$u"; then
+        say "skipping $u: masked on this host"
+    else
+        RESTART_SCHED+=("$u")
+    fi
+done
+restart_list() { [[ "${#@}" -gt 0 ]] && printf '%s ' "$@" || printf '(none)'; }
+
 # One cutover at a time, across operators and timer ticks.
 mkdir -p "$releases_dir"
 exec 9>"$lock_file"
@@ -125,17 +150,19 @@ if ! "$script_dir/gitforge-release-verify" "$candidate"; then
 fi
 
 if [[ "$apply" -ne 1 ]]; then
-    say "dry-run: would promote $candidate_id and restart gitforge@api gitforge@git-server, then gitforge@ci gitforge@runner"
+    say "dry-run: would promote $candidate_id and restart $(restart_list "${RESTART_STATELESS[@]}"), then $(restart_list "${RESTART_SCHED[@]}")"
     exit 0
 fi
 
 restart_units() {
     local batch="$1"
-    if ! sudo -n systemctl restart gitforge@api gitforge@git-server; then
-        return 1
+    if [[ "${#RESTART_STATELESS[@]}" -gt 0 ]]; then
+        if ! sudo -n systemctl restart "${RESTART_STATELESS[@]}"; then
+            return 1
+        fi
     fi
-    if [[ "$batch" == "all" ]]; then
-        sudo -n systemctl restart gitforge@ci gitforge@runner || return 1
+    if [[ "$batch" == "all" && "${#RESTART_SCHED[@]}" -gt 0 ]]; then
+        sudo -n systemctl restart "${RESTART_SCHED[@]}" || return 1
     fi
     return 0
 }
@@ -191,7 +218,11 @@ say "api + git-server healthy on $candidate_id"
 if ! restart_units all; then
     rollback
 fi
-say "ci + runner restarted (fleet was drained)"
+if [[ "${#RESTART_SCHED[@]}" -gt 0 ]]; then
+    say "$(restart_list "${RESTART_SCHED[@]}")restarted (fleet was drained)"
+else
+    say "scheduler batch: nothing to restart (all retired on this host)"
+fi
 
 if ! wait_healthy; then
     rollback

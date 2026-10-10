@@ -1,0 +1,36 @@
+[package]
+name = "gitforge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.gitforge-ci]
+path = "../crates/gitforge-ci"
+
+[dependencies.gitforge-core]
+path = "../crates/gitforge-core"
+
+# Detached from the parent workspace on purpose: cargo-fuzz builds with
+# nightly and -Zbuild-std, and the stable workspace must never inherit
+# either. The root Cargo.toml lists this directory in `exclude` as well.
+[workspace]
+
+[[bin]]
+name = "pipeline_parse"
+path = "fuzz_targets/pipeline_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "git_http_parsers"
+path = "fuzz_targets/git_http_parsers.rs"
+test = false
+doc = false
+bench = false

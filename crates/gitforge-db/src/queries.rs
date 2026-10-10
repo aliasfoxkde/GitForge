@@ -2,6 +2,7 @@
 //!
 //! This module provides real SQLite query implementations for all database operations.
 
+use crate::connection::begin_immediate;
 use crate::models::JobStatus;
 use crate::Pool;
 use chrono::{DateTime, Utc};
@@ -341,11 +342,7 @@ impl RepoQueries {
     ) -> Result<()> {
         let required_checks_json = serde_json::to_string(required_checks)
             .map_err(|e| Error::database(format!("failed to serialize required checks: {e}")))?;
-        let mut tx = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin policy update: {e}")))?;
+        let mut tx = begin_immediate(pool.pool(), "policy update").await?;
         let result = sqlx::query(
             "UPDATE repositories SET required_checks = ?, deny_non_fast_forward = ?, \
              updated_at = ? WHERE id = ?",
@@ -406,11 +403,7 @@ impl RepoQueries {
         // with completed or failed CI runs can be deleted just like an empty
         // repository. The schema intentionally keeps these foreign keys
         // restrictive to protect history during ordinary mutations.
-        let mut tx = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin repository delete: {e}")))?;
+        let mut tx = begin_immediate(pool.pool(), "repository delete").await?;
         let repo_id = id.to_string();
         for statement in [
             "DELETE FROM artifacts WHERE job_id IN (SELECT id FROM jobs WHERE pipeline_run_id IN (SELECT id FROM pipeline_runs WHERE repo_id = ?))",
@@ -755,11 +748,7 @@ impl PipelineQueries {
         pipeline: &crate::models::Pipeline,
         run: &crate::models::PipelineRun,
     ) -> Result<()> {
-        let mut transaction = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin pipeline activation: {e}")))?;
+        let mut transaction = begin_immediate(pool.pool(), "pipeline activation").await?;
         sqlx::query(
             "UPDATE pipelines SET active = 0 WHERE repo_id = ? AND name = ? AND active = 1",
         )
@@ -1331,11 +1320,7 @@ impl JobQueries {
         runner_id: RunnerId,
         lease_token: &str,
     ) -> Result<bool> {
-        let mut transaction = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin job heartbeat: {e}")))?;
+        let mut transaction = begin_immediate(pool.pool(), "job heartbeat").await?;
         let now = Utc::now().to_rfc3339();
         let job = sqlx::query(
             "UPDATE jobs SET heartbeat_at = ? WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
@@ -1813,11 +1798,7 @@ impl JobQueries {
         if provider.is_empty() || kind.is_empty() || payload.is_empty() {
             return Err(Error::invalid_input("publication fields must not be empty"));
         }
-        let mut tx = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin completion: {e}")))?;
+        let mut tx = begin_immediate(pool.pool(), "completion").await?;
         let updated = sqlx::query(
             "UPDATE jobs SET status = ?, finished_at = ?, result_json = ?, lease_token = NULL WHERE id = ? AND runner_id = ? AND lease_token = ? AND status IN ('assigned', 'running')",
         )
@@ -2008,11 +1989,7 @@ impl JobQueries {
     /// against the durable lease; only jobs that were already silent before
     /// the restart are failed here.
     pub async fn requeue_inflight(pool: &Pool, fence_grace_secs: i64) -> Result<u64> {
-        let mut transaction = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin recovery: {e}")))?;
+        let mut transaction = begin_immediate(pool.pool(), "recovery").await?;
         let queued_with_runner = sqlx::query(
             "UPDATE jobs SET runner_id = NULL, started_at = NULL, lease_token = NULL WHERE status = 'queued' AND runner_id IS NOT NULL",
         )
@@ -2236,12 +2213,18 @@ impl RunnerQueries {
 
     /// Update runner heartbeat
     pub async fn heartbeat(pool: &Pool, id: RunnerId) -> Result<()> {
-        sqlx::query("UPDATE runners SET last_heartbeat = ? WHERE id = ?")
-            .bind(Utc::now().to_rfc3339())
-            .bind(id.to_string())
-            .execute(pool.pool())
-            .await
-            .map_err(|e| Error::database(format!("failed to update heartbeat: {e}")))?;
+        // Durable-write discipline (F21/F23): a heartbeat lost to a transient
+        // busy is how a healthy runner gets fenced by the stale sweep while
+        // its job is mid-flight (runner_lost, 2026-09-29 incident ledger).
+        persist_with_retry(|| async {
+            sqlx::query("UPDATE runners SET last_heartbeat = ? WHERE id = ?")
+                .bind(Utc::now().to_rfc3339())
+                .bind(id.to_string())
+                .execute(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to update heartbeat: {e}")))
+        })
+        .await?;
         Ok(())
     }
 
@@ -2290,11 +2273,7 @@ impl RunnerQueries {
     /// operations. Retired runners are already excluded by scheduler
     /// policies that select only `online` runners.
     pub async fn retire_if_idle(pool: &Pool, id: RunnerId) -> Result<RunnerRetirement> {
-        let mut transaction = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin runner retirement: {e}")))?;
+        let mut transaction = begin_immediate(pool.pool(), "runner retirement").await?;
 
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM runners WHERE id = ?")
             .bind(id.to_string())
@@ -2726,11 +2705,7 @@ impl ReviewQueries {
         id: Uuid,
         next: gitforge_review::domain::ReviewRunState,
     ) -> Result<Option<ReviewRun>> {
-        let mut tx = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin review transition: {e}")))?;
+        let mut tx = begin_immediate(pool.pool(), "review transition").await?;
 
         let current = sqlx::query("SELECT status FROM review_runs WHERE id = ?")
             .bind(id.to_string())
@@ -2832,11 +2807,7 @@ impl ReviewQueries {
     /// waits for the first to commit and then sees the candidate row
     /// already advanced out of `pending`.
     pub async fn claim_pending(pool: &Pool) -> Result<Option<ReviewRun>> {
-        let mut tx = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin review claim: {e}")))?;
+        let mut tx = begin_immediate(pool.pool(), "review claim").await?;
 
         // FIFO candidate selection. Held under the IMMEDIATE write lock so
         // no concurrent claimer can advance the same row before the
@@ -3046,13 +3017,8 @@ impl TriggerRequestQueries {
             return Ok((existing, false));
         }
         persist_with_retry(|| async {
-            let mut transaction = pool
-                .pool()
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(|e| {
-                    Error::database(format!("failed to begin trigger request insert: {e}"))
-                })?;
+            let mut transaction =
+                begin_immediate(pool.pool(), "trigger request insert").await?;
             let existing_id: Option<String> =
                 sqlx::query_scalar(
                     "SELECT id FROM pipeline_trigger_requests \
@@ -3257,11 +3223,7 @@ impl TriggerRequestQueries {
         let now = Utc::now();
         let pending_cutoff = (now - pending_after).to_rfc3339();
         let processing_cutoff = (now - processing_after).to_rfc3339();
-        let mut transaction = pool
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| Error::database(format!("failed to begin trigger requeue: {e}")))?;
+        let mut transaction = begin_immediate(pool.pool(), "trigger requeue").await?;
         let stale_processing: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM pipeline_trigger_requests \
              WHERE status = 'processing' AND updated_at <= ?",
@@ -3504,12 +3466,176 @@ impl RefreshTokenQueries {
 }
 
 // ============================================================================
+// Dashboard aggregate stats
+// ============================================================================
+
+/// One scalar aggregate, rendered as a dashboard metric.
+///
+/// Counts are read with plain `COUNT(*)` outside any transaction: the
+/// dashboard is an approximation surface, not an invariant surface, and
+/// a mid-count concurrent write costs nothing (the next render corrects
+/// it). Every query is single-pass over an indexed-or-tiny table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardStats {
+    pub repositories: i64,
+    pub pipelines: i64,
+    pub artifacts: i64,
+    pub runners_online: i64,
+    pub runs_last_24h: i64,
+    pub runs_succeeded_24h: i64,
+}
+
+pub struct StatsQueries;
+
+impl StatsQueries {
+    /// Read every dashboard aggregate in one round trip per scalar.
+    ///
+    /// Timestamps are stored as RFC3339 strings (`to_rfc3339()` on every
+    /// write path), so the 24h window is bounded by an RFC3339 bound —
+    /// not SQLite's space-separated `datetime('now', ...)`, which
+    /// compares wrongly against the `T` separator inside the same day.
+    pub async fn dashboard(pool: &Pool) -> Result<DashboardStats> {
+        let count = |sql: &'static str| async move {
+            let row = sqlx::query(sql)
+                .fetch_one(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("dashboard count failed: {e}")))?;
+            Ok::<i64, Error>(row.get::<i64, _>(0))
+        };
+        let window_bound = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let run_row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded
+            FROM pipeline_runs
+            WHERE created_at > ?
+            "#,
+        )
+        .bind(window_bound)
+        .fetch_one(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("dashboard run stats failed: {e}")))?;
+        Ok(DashboardStats {
+            repositories: count("SELECT COUNT(*) FROM repositories").await?,
+            pipelines: count("SELECT COUNT(*) FROM pipelines").await?,
+            artifacts: count("SELECT COUNT(*) FROM artifacts").await?,
+            runners_online: count("SELECT COUNT(*) FROM runners WHERE status = 'online'").await?,
+            runs_last_24h: run_row.get::<i64, _>("total"),
+            runs_succeeded_24h: run_row.get::<Option<i64>, _>("succeeded").unwrap_or(0),
+        })
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_dashboard_stats_count_seeded_rows() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        let old = (Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        let insert = |sql: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(sql).execute(pool.pool()).await.unwrap();
+            }
+        };
+        // Two repositories, one pipeline, one artifact, two runners with
+        // only one online, and four runs: two succeeded plus one failed
+        // inside the 24h window, one succeeded outside it. Seeds respect
+        // foreign keys (pools enforce them): the user before the
+        // repositories that point at it, runs before jobs, jobs before the
+        // artifact that points at one.
+        let owner = crate::models::User::new(
+            "dash-owner".to_string(),
+            "dash-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO repositories (id, name, owner_id, git_path, created_at, updated_at)
+             VALUES ('r1', 'a', ?1, '/tmp/a.git', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                    ('r2', 'b', ?1, '/tmp/b.git', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(owner.id.to_string())
+        .execute(pool.pool())
+        .await
+        .unwrap();
+        for sql in [
+            "INSERT INTO pipelines (id, repo_id, name, trigger_type, created_at)
+             VALUES ('p1', 'r1', 'ci', 'push', '2026-01-01T00:00:00+00:00')",
+            "INSERT INTO runners (id, name, runner_type, status, created_at, updated_at)
+             VALUES ('n1', 'runner-1', 'docker', 'online', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                    ('n2', 'runner-2', 'docker', 'offline', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+        ] {
+            insert(sql).await;
+        }
+        sqlx::query(
+            "INSERT INTO pipeline_runs
+                 (id, pipeline_id, repo_id, status, triggered_by, commit_hash, created_at)
+             VALUES ('run1', 'p1', 'r1', 'succeeded', 'push', 'c1', ?1),
+                    ('run2', 'p1', 'r1', 'succeeded', 'push', 'c2', ?1),
+                    ('run3', 'p1', 'r1', 'failed', 'push', 'c3', ?1),
+                    ('run4', 'p1', 'r1', 'succeeded', 'push', 'c4', ?2)",
+        )
+        .bind(now)
+        .bind(old)
+        .execute(pool.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, pipeline_run_id, name, created_at)
+             VALUES ('j1', 'run1', 'fmt', '2026-01-01T00:00:00+00:00')",
+        )
+        .execute(pool.pool())
+        .await
+        .unwrap();
+        // The artifact row carries a real foreign key into jobs.
+        sqlx::query(
+            "INSERT INTO artifacts (id, job_id, name, path, checksum, size_bytes, created_at)
+             VALUES ('a1', 'j1', 'out.zip', '/tmp/out.zip', 'ck', 1, '2026-01-01T00:00:00+00:00')",
+        )
+        .execute(pool.pool())
+        .await
+        .unwrap();
+
+        let stats = StatsQueries::dashboard(&pool).await.unwrap();
+        assert_eq!(stats.repositories, 2);
+        assert_eq!(stats.pipelines, 1);
+        assert_eq!(stats.artifacts, 1);
+        assert_eq!(stats.runners_online, 1);
+        // The 48h-old succeeded run is outside the window and must not
+        // count in either the total or the success rate.
+        assert_eq!(stats.runs_last_24h, 3);
+        assert_eq!(stats.runs_succeeded_24h, 2);
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_stats_empty_database_is_all_zero() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let stats = StatsQueries::dashboard(&pool).await.unwrap();
+        assert_eq!(
+            stats,
+            DashboardStats {
+                repositories: 0,
+                pipelines: 0,
+                artifacts: 0,
+                runners_online: 0,
+                runs_last_24h: 0,
+                runs_succeeded_24h: 0,
+            }
+        );
+    }
 
     #[tokio::test]
     async fn test_persist_with_retry_succeeds_after_transient_failures() {
@@ -3543,6 +3669,154 @@ mod tests {
             1,
             "a non-database error must not be retried"
         );
+    }
+
+    /// Regression for the 2026-10-08 completion failures: a pooled
+    /// connection whose SQLite handle is inside a transaction that sqlx's
+    /// depth counter does not know about poisons every subsequent
+    /// `begin_with` with `(code: 1) cannot start a transaction within a
+    /// transaction`, and the pool hands the same connection back to each
+    /// retry. `begin_immediate` must clear the desync with a bare ROLLBACK
+    /// and yield a usable transaction.
+    ///
+    /// The pool is capped at one connection so every borrower deterministically
+    /// gets the poisoned one; the poison itself is injected with a raw BEGIN,
+    /// which bypasses sqlx's depth counter exactly like the live desync did.
+    #[tokio::test]
+    async fn test_begin_immediate_recovers_desynced_connection() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Poison the pool's only connection.
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        // Sanity: the plain begin now fails with the live error signature.
+        let poisoned = pool.begin_with("BEGIN IMMEDIATE").await;
+        let message = format!("{}", poisoned.unwrap_err());
+        assert!(
+            message.contains("within a transaction"),
+            "expected the desynced begin to fail with the nested-transaction \
+             error, got: {message}"
+        );
+
+        // Recovery: the begin must succeed and the transaction must work.
+        let mut tx = begin_immediate(&pool, "completion").await.unwrap();
+        sqlx::query("CREATE TABLE poison_probe (id INTEGER)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // And the pool keeps serving healthy transactions afterwards.
+        let mut tx = begin_immediate(&pool, "completion").await.unwrap();
+        sqlx::query("INSERT INTO poison_probe (id) VALUES (1)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        pool.close().await;
+    }
+
+    /// Regression for the swallowed-write flavor of connection poisoning
+    /// (run `99c463db`, 2026-10-08): a single-statement write routed in
+    /// autocommit to a connection with an orphaned SQLite transaction
+    /// joins that transaction and vanishes when it rolls back — the write
+    /// reports success and the row is gone. The pool's `before_acquire`
+    /// hook must heal the connection before the statement runs.
+    ///
+    /// Cross-connection truth is what makes this observable: the poisoned
+    /// transaction's uncommitted DDL is visible on its own connection, so
+    /// the probe closes the pool and reopens the file to check whether the
+    /// write actually committed. The no-hook variant documents the failure
+    /// mode this guards against.
+    #[tokio::test]
+    async fn test_before_acquire_heals_swallowed_writes() {
+        let db_path = std::env::temp_dir().join(format!("gitforge-swallow-{}.db", Uuid::new_v4()));
+        // mode=rwc to create the file — a bare sqlite: URL opens an
+        // existing database only (the same reason Pool::new appends it for
+        // file paths).
+        let url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+        // Poisoned pool WITHOUT the hook: the write is swallowed.
+        let bare = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let mut conn = bare.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        sqlx::query("CREATE TABLE swallow_probe (id INTEGER)")
+            .execute(&bare)
+            .await
+            .unwrap();
+        bare.close().await;
+
+        let reopened = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(&url)
+            .await
+            .unwrap();
+        let leaked: Option<i64> =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'swallow_probe'")
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        reopened.close().await;
+        assert_eq!(
+            leaked,
+            Some(0),
+            "the unhooked pool must demonstrate the swallowed write"
+        );
+
+        // Same shape WITH the hook (what Pool::new installs): healed at
+        // acquire, so the write commits and survives the reopen.
+        let hooked = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .before_acquire(|conn, _meta| crate::connection::heal_poisoned_connection(conn))
+            .connect(&url)
+            .await
+            .unwrap();
+        let mut conn = hooked.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        sqlx::query("CREATE TABLE swallow_probe (id INTEGER)")
+            .execute(&hooked)
+            .await
+            .unwrap();
+        hooked.close().await;
+
+        let reopened = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(&url)
+            .await
+            .unwrap();
+        let committed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'swallow_probe'")
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        reopened.close().await;
+        assert_eq!(
+            committed, 1,
+            "the hooked pool must heal the poison so the write commits"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
     }
 
     #[tokio::test]

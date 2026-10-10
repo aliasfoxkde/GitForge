@@ -4,7 +4,7 @@
 //! slice only persists runs and exposes read access; provider execution and
 //! worker dispatch are intentionally out of scope. The dispatch seam is the
 //! `pending` run row created here: a future worker claims pending runs and
-//! advances them through [`gitforge_review::domain::ReviewRunState`]
+//! advances them through `gitforge_review::domain::ReviewRunState`
 //! transitions via `gitforge_db::queries::ReviewQueries::transition_run`,
 //! the same durable control-plane pattern the CI scheduler uses.
 

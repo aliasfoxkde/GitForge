@@ -21,12 +21,25 @@ members = [
     "services/runner",
     "services/api",
 ]
+# The fuzz harness is its own nightly-only workspace (see fuzz/Cargo.toml);
+# excluded so stable workspace commands never try to build it.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 authors = ["GitForge Team"]
 license = "MIT"
+
+# Workspace-wide lint foundation. Every crate opts in via `[lints]
+# workspace = true`. Deliberately conservative: each entry here must stay
+# clean under the CI clippy gate (`-D warnings`), so enforcement-grade
+# restriction lints (unwrap_used, expect_used, panic) join only per-crate
+# as the unwrap-elimination campaign drains each crate — the
+# scripts/unwrap-count.sh metric tracks the drain.
+[workspace.lints.rust]
+rust_2018_idioms = "warn"
+unsafe_op_in_unsafe_fn = "warn"
 
 [workspace.dependencies]
 # Async runtime
@@ -99,9 +112,20 @@ strip = true
 
 # Selected pedantic lints promoted to workspace policy: mechanical to
 # satisfy, and they keep formatting/Option-handling consistent. The rest of
-# pedantic is surveyed in docs/audits and stays advisory.
+# pedantic is surveyed in docs/audits and stays advisory. The warn entries
+# are the 2026-10-10 anti-pattern guards (debug macros and unimplemented
+# placeholders). The unwrap/expect campaign drained the production
+# surface to zero undocumentated sites (2026-10-10 — see
+# docs/planning/QUALITY_BASELINE.md), so the restriction lints are
+# enforced workspace-wide; the three remaining expects carry per-site
+# #[allow] with their invariants documented in place.
 [workspace.lints.clippy]
 uninlined_format_args = "deny"
 map_unwrap_or = "deny"
 redundant_closure_for_method_calls = "deny"
 ignored_unit_patterns = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+dbg_macro = "warn"
+unimplemented = "warn"

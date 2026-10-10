@@ -47,7 +47,8 @@ fn fence_grace_secs_from_value(raw: Option<&str>) -> i64 {
     .unwrap_or(DEFAULT_JOB_FENCE_GRACE_SECS)
 }
 
-/// [`fence_grace_secs_from_value`] against the process environment.
+/// `fence_grace_secs_from_value` applied against the process environment
+/// (the helper stays private; the env knob is the public surface).
 pub fn job_fence_grace_secs_from_env() -> i64 {
     fence_grace_secs_from_value(
         std::env::var("GITFORGE_JOB_FENCE_GRACE_SECS")

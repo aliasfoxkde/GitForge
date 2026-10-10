@@ -124,7 +124,8 @@ for proc in /proc/[0-9]*; do
         marker=" [argv0]"
     fi
     bin_name="${exe##*/}"
-    case " api ci git-server runner " in
+    known_bins=" api ci git-server runner "
+    case "$known_bins" in
         *" $bin_name "*) ;;
         *) continue ;;
     esac
@@ -251,13 +252,24 @@ for unit in "${units[@]}"; do
         fi
     fi
 
-    if [[ "$active" != active ]]; then
+    # A masked unit is deliberately retired on this host (e.g. the NAS
+    # runner after CI moved to the fedora host): not an expected component,
+    # so it neither degrades the verdict nor reports a policy gap — but it
+    # stays in the table for visibility.
+    retired=false
+    [[ "$enabled" == masked ]] && retired=true
+
+    if [[ "$active" != active && "$retired" == false ]]; then
         overall=1
     fi
     policy_status="enforced"
-    case "$memory_max:$tasks_max" in
-        *infinity*|*unknown*) policy_status="missing"; overall=1 ;;
-    esac
+    if [[ "$retired" == true ]]; then
+        policy_status="retired"
+    else
+        case "$memory_max:$tasks_max" in
+            *infinity*|*unknown*) policy_status="missing"; overall=1 ;;
+        esac
+    fi
     case "$http_status" in
         not_applicable|2[0-9][0-9]) ;;
         *) overall=1 ;;

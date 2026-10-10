@@ -221,3 +221,82 @@ that decision in an ADR rather than silently under-delivering.
    leaving a running-forever durable row for boot reconcile. Correct
    response to the freeze was to wait — a service restart clears nothing
    and fences live jobs.
+
+   0.6.16 cycle addendum (2026-10-10): every candidate from item 6 has a
+   verdict. Nested-BEGIN poisoning — two-layer defense landed
+   (`begin_immediate` recovery passes 0b16dd76; pool-wide
+   `before_acquire` heal 0dfc0f15), validated green by fedora pipeline
+   run `be5c03fd` on the exact commit. Planned-row persist — wrapped in
+   `persist_with_retry` (a4d52e44). Ghost-run class — checkout-spawn
+   failure grading and per-repo trigger lanes were already in tree;
+   the remaining boot-order fix landed (consumer before the inline
+   workspace rebuild, 69e3c859). Manual cancel cascade — descendants
+   cancelled and the pipeline finalized (09c91bfa); the live instance
+   exhibited the pre-fix signature the same day (run `ee2df0ec`'s jobs
+   all cancelled yet the run row stayed `running` on build 63427df).
+   Sandbox acquisition cap — now load-aware, scaling to 3× under
+   saturation with the env pin still winning (bdfc9a75). Runner
+   heartbeat write — through `persist_with_retry` (same commit).
+   Remaining candidates (checkpoint/requeue for restart-fenced jobs)
+   are covered by the redrive pair (50fede66, c71a87c2). Release
+   evidence discipline note: the 2026-10-10 operating directive routes
+   all CI through the fedora instance; its ci unit was found stopped
+   (clean SIGTERM, 02:41:32 CDT, no owning cron/timer) and restarted
+   manually — attribution unknown, recorded here because an absent
+   orchestrator silently turns every queued run into a ghost.
+
+   False-green incident, live confirmation of the orphan-finalize class
+   (2026-10-10 ~08:44 UTC, fedora build 63427df): the release-candidate
+   run `89f4b2a8` (pushed SHA `6a1e1f3b`) was created during a ci outage
+   — the API durably wrote the run row and the first chain job at
+   08:01:53 while the orchestrator was down. After the manual restart
+   (08:11:11 UTC) the rebuilt engine never adopted the run: the fmt
+   job's completion was logged
+   `completion received for unknown pipeline run 89f4b2a8` and dropped,
+   clippy/test/coverage were never lazy-enqueued, and the periodic
+   reconciler finalized the 1-of-4-job orphan as `succeeded` at
+   08:44:12. Every ingredient is one this cycle already fixed on the
+   new build — durable trigger consumption after restart (69e3c859
+   consumer-first boot), evidence-based reconcile grading (F31), and
+   the release gate's definition-coverage check, which refuses a run
+   whose durable rows do not cover the persisted pipeline (the gate
+   would have rejected `89f4b2a8` 1-vs-4; it was never offered the
+   chance because the watcher greped run status, not coverage). The
+   incident is why the RC was re-triggered as run `f5676f9f` with the
+   orchestrator alive, and why the gate — not a status string — is the
+   only accepted release evidence. Co-tenant observation the same
+   hour: four simultaneous 20-job Amortyx runs (pushed 08:45:24-54)
+   saturated the single runner's queue at 121 pending; and that
+   tenant's pipelines self-clone `http://127.0.0.1:42782/...` from
+   inside non-host-network containers, failing with git exit 128 every
+   lane — an upstream pipeline-contract mismatch, recorded here only to
+   keep it out of GitForge's own diagnosis.
+
+   Fuzz-target deferral verdict (2026-10-10): Phase 6's fuzz lane stays
+   deferred with rationale. A real target (cargo-fuzz/libFuzzer over the
+   #240 pkt-line parser) requires cargo-fuzz + libFuzzer tooling baked
+   into dsc-ci-rust — an image rebuild under the lockfile-changed
+   contract plus a new pipeline job, neither of which can be validated
+   locally under the fedora-only directive. Shipping unvalidated fuzz
+   targets would be placeholder code by another name. Scheduled with
+   the next image bump (the same one that will carry the coverage
+   ratchet's in-sandbox recalibration), so one image refresh buys both.
+
+   Phase 1+2 exit (2026-10-10, feat/v0617-quality-foundation): the
+   unwrap/expect campaign drained the production surface from a
+   measured 112 sites to 5 — three documented invariants (metrics
+   constructor, static_regex table, pool semaphore) and two deliberate
+   fail-fast JWT startup aborts — in commits 1cd009cc (categorizer
+   lexer fix), 3744f00c (batch 1), 91f414c6 (batch 2), bbd69538
+   (batches 3+4 + enforcement), 309ae4a2 (panic deny). The first
+   measurement (191) was itself wrong: the categorizer's lexer
+   truncated `#[cfg(test)]` spans on raw-string literals, inflating
+   agent.rs by 71 phantom sites; the corrected string/comment-aware
+   counter (scripts/unwrap-production-count.py) is the ratchet's
+   instrument of record, with methodology and residuals in
+   docs/planning/QUALITY_BASELINE.md. unwrap_used/expect_used/panic
+   are now workspace deny (clippy.toml allows them in tests), so the
+   counts can only move by reviewed, documented `#[allow]`. Validation
+   rides the v0617 branch pipeline per the fedora-only directive;
+   clippy tripping anywhere means the categorizer and clippy
+   disagree — fix the site, not the measurement.
