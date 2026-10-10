@@ -26,14 +26,19 @@ Theme under audit (vite-react-pwa `src/styles/globals.css`):
 | 9 | 2.4.1 Bypass Blocks | A | **FAIL** (vite-ssr) — no skip link; nav-free template but the pattern every generated project inherits should include one | fixed |
 | 10 | 1.3.1 Info and Relationships | A | **PARTIAL** (vite-ssr) — page shell is `<div>`-only; no header/main landmarks for generated projects to extend | fixed |
 | 11 | 1.4.6 Contrast (Enhanced) | AAA | **PASS** — primary theme pair ≈ 18:1; ssr's `gray-100` on `gray-950` ≈ 17:1 | pass |
-| 12 | 3.1.1 Language of Page | A | **PASS (indirect)** — source `index.html` is not committed for either template; the committed `dist/index.html` outputs carry `lang="en"`; generated projects therefore inherit it. Noted as a hygiene issue instead (see below) | pass |
+| 12 | 3.1.1 Language of Page | A | **PASS (indirect)** — neither template ships a source `index.html` (they are graft-on parts layered over a fresh `npm create vite` scaffold, whose entry HTML carries `lang="en"`); both template READMEs now state this explicitly | pass |
 
 ## Hygiene findings (cross-ref: repo cleanup, 2026-10-10)
 
-- Both templates commit their **build output** (`dist/index.html`,
-  `dist/assets/`) into the repo — generated artifacts, not source; the
-  source `index.html` for each template is absent. Build outputs are
-  untracked and ignored; the source entries stay in the template.
+- **Corrected on verification:** the build outputs (`dist/`) are **not
+  committed** — both trees are untracked and covered by the root
+  `.gitignore`'s `dist/` rule (an earlier draft of this audit claimed
+  they were committed; `git ls-files` shows zero tracked `dist/`
+  files). No action needed.
+- Neither template ships a source `index.html`: they are template
+  *parts* grafted onto a fresh `npm create vite` scaffold rather than
+  standalone scaffolds. The READMEs now say so, so a consumer does not
+  expect `pnpm dev` to work straight from the part directory.
 
 ## Fix summary (this branch)
 
