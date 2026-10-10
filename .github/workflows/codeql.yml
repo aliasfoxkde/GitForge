@@ -82,8 +82,14 @@ jobs:
         with:
           toolchain: stable
 
+      # aws-lc-sys's build script invokes the GNU assembler, which writes
+      # scratch files to TMPDIR; on this host /tmp is quota-constrained and
+      # fills up mid-build (run 38094440919). Point TMPDIR at runner.temp,
+      # which lives on the unconstrained /home NVMe volume.
       - name: Build Rust
         if: matrix.language == 'rust'
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           cargo --version
           cargo fetch --locked
