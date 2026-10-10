@@ -3495,15 +3495,12 @@ impl StatsQueries {
     /// not SQLite's space-separated `datetime('now', ...)`, which
     /// compares wrongly against the `T` separator inside the same day.
     pub async fn dashboard(pool: &Pool) -> Result<DashboardStats> {
-        let count = |sql: &'static str| {
-            let pool = pool;
-            async move {
-                let row = sqlx::query(sql)
-                    .fetch_one(pool.pool())
-                    .await
-                    .map_err(|e| Error::database(format!("dashboard count failed: {e}")))?;
-                Ok::<i64, Error>(row.get::<i64, _>(0))
-            }
+        let count = |sql: &'static str| async move {
+            let row = sqlx::query(sql)
+                .fetch_one(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("dashboard count failed: {e}")))?;
+            Ok::<i64, Error>(row.get::<i64, _>(0))
         };
         let window_bound = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
         let run_row = sqlx::query(
