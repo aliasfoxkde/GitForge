@@ -50,9 +50,7 @@ fn sandbox_acquire_timeout() -> Duration {
                 .next()
                 .and_then(|field| field.parse::<f64>().ok())
         });
-    let cores = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(1);
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     Duration::from_secs(acquire_timeout_secs(DEFAULT_SECS, load1, cores))
 }
 

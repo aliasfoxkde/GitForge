@@ -101,8 +101,12 @@ impl GitRpcChild {
         let stdout_pipe = self.owned_child()?.stdout.take();
         let stderr_pipe = self.owned_child()?.stderr.take();
         let (stdout, stderr) = tokio::join!(drain_pipe(stdout_pipe), drain_pipe(stderr_pipe));
+        // Copy the 'static service label out of `self` first: the closure
+        // must not hold an immutable borrow across the `owned_child()` call,
+        // which takes `&mut self` (E0502).
+        let service = self.service;
         let wait_error = |error: std::io::Error| {
-            gitforge_common::Error::git(format!("failed to wait for {}: {error}", self.service))
+            gitforge_common::Error::git(format!("failed to wait for {service}: {error}"))
         };
         let stdout = stdout.map_err(wait_error)?;
         let stderr = stderr.map_err(wait_error)?;
