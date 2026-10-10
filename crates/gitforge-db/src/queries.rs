@@ -3550,12 +3550,27 @@ mod tests {
         // Two repositories, one pipeline, one artifact, two runners with
         // only one online, and four runs: two succeeded plus one failed
         // inside the 24h window, one succeeded outside it. Seeds respect
-        // foreign keys (pools enforce them): runs before jobs, jobs before
-        // the artifact that points at one.
-        for sql in [
+        // foreign keys (pools enforce them): the user before the
+        // repositories that point at it, runs before jobs, jobs before the
+        // artifact that points at one.
+        let owner = crate::models::User::new(
+            "dash-owner".to_string(),
+            "dash-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        sqlx::query(
             "INSERT INTO repositories (id, name, owner_id, git_path, created_at, updated_at)
-             VALUES ('r1', 'a', 'u1', '/tmp/a.git', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
-                    ('r2', 'b', 'u1', '/tmp/b.git', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+             VALUES ('r1', 'a', ?1, '/tmp/a.git', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                    ('r2', 'b', ?1, '/tmp/b.git', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(&owner.id)
+        .execute(pool.pool())
+        .await
+        .unwrap();
+        for sql in [
             "INSERT INTO pipelines (id, repo_id, name, trigger_type, created_at)
              VALUES ('p1', 'r1', 'ci', 'push', '2026-01-01T00:00:00+00:00')",
             "INSERT INTO runners (id, name, runner_type, status, created_at, updated_at)
