@@ -12,6 +12,21 @@ PAT = re.compile(r"\.unwrap\(\)|\.expect\(|panic!\(")
 CFG = re.compile(r"#\[cfg\(test\)\]")
 
 
+def skip_raw_string(src, k):
+    """k points just past an `r` (or the first `#` of `br#`). Return the
+    index just past the closing quote-hashes, or -1 if not a raw string."""
+    hashes = 0
+    j = k
+    while j < len(src) and src[j] == "#":
+        hashes += 1
+        j += 1
+    if j >= len(src) or src[j] != '"':
+        return -1
+    j += 1
+    end = src.find('"' + "#" * hashes, j)
+    return (end + hashes + 1) if end != -1 else len(src)
+
+
 def cfg_test_spans(src):
     """Spans (start, end) of top-level items preceded by #[cfg(test)]."""
     spans = []
@@ -64,8 +79,26 @@ def cfg_test_spans(src):
                 k += 1
             elif c == '"':
                 in_str = True
-            elif c == "'":
-                in_chr = True
+            elif c == "r" and (k == 0 or not (src[k - 1].isalnum() or src[k - 1] == "_")):
+                # raw string r"..." / r#"..."# — a quote inside it does not
+                # open a normal string, and braces inside stay literal
+                end = skip_raw_string(src, k + 1)
+                if end != -1:
+                    k = end - 1
+            elif c == "'" and (k == 0 or not (src[k - 1].isalnum() or src[k - 1] == "_")):
+                # char literal vs lifetime: a char literal has its closing
+                # quote within a few chars ('a', '\n', '\\''); a lifetime
+                # ('static) does not. Only enter escape-aware state on a
+                # nearby close, else skip the quote as generic syntax.
+                close = src.find("'", k + 1, k + 6)
+                if close != -1:
+                    in_chr = True
+                    if src[close - 1] == "\\":
+                        close = src.find("'", close + 1, close + 6)
+                        if close == -1:
+                            in_chr = False
+                    if in_chr:
+                        k = close  # bottom k += 1 lands past the literal
             elif c == "{":
                 depth += 1
             elif c == "}":

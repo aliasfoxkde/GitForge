@@ -8,8 +8,19 @@ Two counts, two purposes:
 - **Production** (cfg-test-aware categorization, 2026-10-10, via
   `scripts/unwrap-production-count.py`): sites outside `#[cfg(test)]`
   items and outside `tests/` directories. This is the elimination
-  scope: **191 sites workspace-wide** (the raw 2135 is 93%
+  scope: **112 sites workspace-wide** (the raw 2135 is 95%
   test-context).
+
+  Measurement caveat (fixed same day): the first cut of the
+  categorizer's lexer mishandled raw string literals (`r#"…"#`) and
+  mis-gated char literals against lifetimes, which truncated
+  `#[cfg(test)]` brace spans early — e.g. it reported 71 "production"
+  sites in `gitforge-runner/agent.rs` that are all inside its test
+  modules. After the lexer fix the workspace count dropped 191 → 112,
+  and the top-15 table below sums to exactly 112 (no hidden tail).
+  Cross-checked per file with a line-bound grep against each file's
+  `#[cfg(test)]` marker (metrics.rs 32, security.rs 20, ci/main.rs 14,
+  receipt_store.rs 10 — all match exactly).
 
 This file is the ratchet: either count may go down or hold, never up.
 When a crate's *production* count reaches zero, its `Cargo.toml` gains
@@ -25,12 +36,10 @@ crate-batch per pipeline run.
 
 | site count | file |
 |---:|---|
-| 71 | crates/gitforge-runner/src/agent.rs |
 | 32 | crates/gitforge-api/src/metrics.rs |
 | 20 | crates/gitforge-review/src/security.rs |
 | 14 | services/ci/src/main.rs |
 | 10 | crates/gitforge-storage/src/receipt_store.rs |
-| 8  | crates/gitforge-cli/src/config.rs |
 | 6  | crates/gitforge-review/src/lib.rs |
 | 6  | crates/gitforge-review/src/fix.rs |
 | 5  | crates/gitforge-process/src/pool.rs |
@@ -40,7 +49,9 @@ crate-batch per pipeline run.
 | 2  | services/api/src/main.rs |
 | 2  | crates/gitforge-core/src/hooks.rs |
 | 1  | services/git-server/src/main.rs |
-| **191** | **workspace total** (remaining files hold the rest) |
+| 1  | crates/gitforge-process/src/subreaper.rs |
+| 1  | crates/gitforge-ci/src/state.rs |
+| **112** | **workspace total** (the table is exhaustive) |
 
 Raw per-crate counts (grep, includes test context — superseded as the
 campaign scope by the table above, kept for the trend ratchet):
@@ -70,15 +81,16 @@ campaign scope by the table above, kept for the trend ratchet):
 
 ## Elimination order (production sites only)
 
-1. `gitforge-runner/agent.rs` (71) — heartbeat/exec paths; unwraps here
-   are the runner_lost/heartbeat incident class. First batch.
-2. `gitforge-api/metrics.rs` (32), `gitforge-review/security.rs` (20) —
-   parsing and analysis paths; convert to `Result` propagation.
-3. `services/ci/main.rs` (14), `storage/receipt_store.rs` (10),
-   `cli/config.rs` (8) — startup and config paths; `main()`-adjacent
-   unwraps may convert to documented `expect` with context, not silent
-   `unwrap`.
-4. The long tail (≤6 each) — one closing batch.
+1. `gitforge-api/metrics.rs` (32), `gitforge-review/security.rs` (20) —
+   parsing and analysis paths; convert to `Result` propagation. First
+   batch (the original first batch, `gitforge-runner/agent.rs`, was a
+   miscount — all 99 of its sites are test-context).
+2. `services/ci/main.rs` (14), `storage/receipt_store.rs` (10) —
+   startup and dispatch paths; `main()`-adjacent unwraps may convert
+   to documented `expect` with context, not silent `unwrap`.
+3. `review/lib.rs` + `review/fix.rs` (12) and `process/pool.rs` (5) —
+   review analysis and child-process plumbing.
+4. The long tail (≤4 each, 28 sites) — one closing batch.
 5. `gitforge-db`, `gitforge-storage`, `gitforge-scheduler`, `gitforge-ci`
    raw counts are 93-97% test context — their production sites are in
    the files above; no separate crate campaigns needed.
