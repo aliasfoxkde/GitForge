@@ -87,27 +87,42 @@ impl Default for SecurityScanner {
     }
 }
 
+/// Compile a static rule pattern from the default table.
+///
+/// Every pattern passed here is a compile-time literal that the unit tests
+/// exercise against live match cases; a syntax error in one is a defect in
+/// the table itself, surfacing at first scanner construction — never a
+/// runtime input condition. Panicking with the pattern text is therefore
+/// the correct failure mode, and `Regex::new`'s fallibility is not
+/// propagated into an input-validation path it can never occupy.
+#[allow(clippy::expect_used)] // static pattern table — see doc comment
+fn static_regex(pattern: &str) -> Regex {
+    Regex::new(pattern).expect("static vulnerability pattern must compile")
+}
+
 impl SecurityScanner {
     /// Create a new security scanner with default patterns
     pub fn new() -> Self {
         let patterns = vec![
             // SQL Injection patterns
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)(?:execute|exec|query|cursor)\s*\([^)]*\+"#).unwrap(),
+                pattern: static_regex(r#"(?i)(?:execute|exec|query|cursor)\s*\([^)]*\+"#),
                 vuln_type: VulnerabilityType::SqlInjection,
                 description: "Potential SQL injection - string concatenation in query",
                 suggestion: "Use parameterized queries or an ORM",
-                extensions: Some(vec!["py", "js", "ts", "java", "rb", "go", "rs", "php", "cs"]),
+                extensions: Some(vec![
+                    "py", "js", "ts", "java", "rb", "go", "rs", "php", "cs",
+                ]),
             },
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)f["'].*?\{.*?\}.*?["']"#).unwrap(),
+                pattern: static_regex(r#"(?i)f["'].*?\{.*?\}.*?["']"#),
                 vuln_type: VulnerabilityType::SqlInjection,
                 description: "F-string/formatted string in SQL query",
                 suggestion: "Use parameterized queries instead",
                 extensions: Some(vec!["py", "js", "ts"]),
             },
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)\.format\s*\(\s*["'].*?\%.*?["']"#).unwrap(),
+                pattern: static_regex(r#"(?i)\.format\s*\(\s*["'].*?\%.*?["']"#),
                 vuln_type: VulnerabilityType::SqlInjection,
                 description: "String formatting in SQL query",
                 suggestion: "Use parameterized queries",
@@ -115,14 +130,16 @@ impl SecurityScanner {
             },
             // Command Injection patterns
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)(?:system|exec|spawn|popen|shell_exec|exec\s*\()\s*\(\s*.*?(?:input|args?|cmd|command)"#).unwrap(),
+                pattern: static_regex(
+                    r#"(?i)(?:system|exec|spawn|popen|shell_exec|exec\s*\()\s*\(\s*.*?(?:input|args?|cmd|command)"#,
+                ),
                 vuln_type: VulnerabilityType::CommandInjection,
                 description: "Dynamic command execution with user input",
                 suggestion: "Avoid shell commands, use proper input validation",
                 extensions: None,
             },
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)(?:eval|Function\))\s*\("#).unwrap(),
+                pattern: static_regex(r#"(?i)(?:eval|Function\))\s*\("#),
                 vuln_type: VulnerabilityType::CommandInjection,
                 description: "Use of eval() or dynamic function execution",
                 suggestion: "Avoid eval() - use safer alternatives",
@@ -130,21 +147,23 @@ impl SecurityScanner {
             },
             // Hardcoded secrets
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)(?:api[_-]?key|secret[_-]??key|access[_-]?token|auth[_-]?token)\s*=\s*["'][a-zA-Z0-9_\-]{20,}["']"#).unwrap(),
+                pattern: static_regex(
+                    r#"(?i)(?:api[_-]?key|secret[_-]??key|access[_-]?token|auth[_-]?token)\s*=\s*["'][a-zA-Z0-9_\-]{20,}["']"#,
+                ),
                 vuln_type: VulnerabilityType::HardcodedCredential,
                 description: "Hardcoded API key or token detected",
                 suggestion: "Use environment variables or a secrets manager",
                 extensions: None,
             },
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)(?:password|passwd|pwd)\s*=\s*["'][^"']{4,}["']"#).unwrap(),
+                pattern: static_regex(r#"(?i)(?:password|passwd|pwd)\s*=\s*["'][^"']{4,}["']"#),
                 vuln_type: VulnerabilityType::HardcodedCredential,
                 description: "Hardcoded password detected",
                 suggestion: "Use environment variables or secure password storage",
                 extensions: None,
             },
             VulnerabilityPattern {
-                pattern: Regex::new(r#"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"#).unwrap(),
+                pattern: static_regex(r#"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"#),
                 vuln_type: VulnerabilityType::SecretHardcoded,
                 description: "Hardcoded private key detected",
                 suggestion: "Use a secrets manager, never commit private keys",
@@ -152,14 +171,14 @@ impl SecurityScanner {
             },
             // Insecure cryptography
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)(?:md5|sha1|des|rc4)\s*\("#).unwrap(),
+                pattern: static_regex(r#"(?i)(?:md5|sha1|des|rc4)\s*\("#),
                 vuln_type: VulnerabilityType::WeakHash,
                 description: "Use of weak hash algorithm (MD5, SHA1, DES, RC4)",
                 suggestion: "Use SHA-256 or stronger, or dedicated crypto libraries",
                 extensions: None,
             },
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)Crypto\.createCipher\s*\("#).unwrap(),
+                pattern: static_regex(r#"(?i)Crypto\.createCipher\s*\("#),
                 vuln_type: VulnerabilityType::InsecureCrypto,
                 description: "Node.js Crypto createCipher is deprecated and insecure",
                 suggestion: "Use crypto.createCipheriv with a proper IV",
@@ -167,14 +186,16 @@ impl SecurityScanner {
             },
             // Path traversal
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)(?:readFile|readFileSync|open|include|require)\s*\(\s*.*?(?:fileName|file|path|filename)"#).unwrap(),
+                pattern: static_regex(
+                    r#"(?i)(?:readFile|readFileSync|open|include|require)\s*\(\s*.*?(?:fileName|file|path|filename)"#,
+                ),
                 vuln_type: VulnerabilityType::PathTraversal,
                 description: "File operation with potentially unvalidated path",
                 suggestion: "Validate and sanitize all file paths, use allowlists",
                 extensions: Some(vec!["js", "ts", "py", "java", "rb", "go", "rs"]),
             },
             VulnerabilityPattern {
-                pattern: Regex::new(r#"\.\./"#).unwrap(),
+                pattern: static_regex(r#"\.\./"#),
                 vuln_type: VulnerabilityType::PathTraversal,
                 description: "Path traversal sequence '../' detected",
                 suggestion: "Ensure paths are validated and normalized",
@@ -182,14 +203,18 @@ impl SecurityScanner {
             },
             // XSS patterns (for web code)
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)(?:innerHTML|dangerouslySetInnerHTML|html\s*\(|document\.write)"#).unwrap(),
+                pattern: static_regex(
+                    r#"(?i)(?:innerHTML|dangerouslySetInnerHTML|html\s*\(|document\.write)"#,
+                ),
                 vuln_type: VulnerabilityType::Xss,
                 description: "Potential XSS - directly setting HTML content",
                 suggestion: "Use textContent or sanitization libraries",
                 extensions: Some(vec!["js", "ts"]),
             },
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)echo\s+\$_GET|echo\s+\$_POST|print\s+\$_GET|print\s+\$_POST"#).unwrap(),
+                pattern: static_regex(
+                    r#"(?i)echo\s+\$_GET|echo\s+\$_POST|print\s+\$_GET|print\s+\$_POST"#,
+                ),
                 vuln_type: VulnerabilityType::Xss,
                 description: "Direct output of request parameters",
                 suggestion: "Always sanitize and escape user input",
@@ -197,7 +222,9 @@ impl SecurityScanner {
             },
             // Unsafe deserialization
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)(?:pickle\.loads?|yaml\.load|json\.decode|Marshal\.loads|ObjectInputStream)"#).unwrap(),
+                pattern: static_regex(
+                    r#"(?i)(?:pickle\.loads?|yaml\.load|json\.decode|Marshal\.loads|ObjectInputStream)"#,
+                ),
                 vuln_type: VulnerabilityType::UnsafeDeserialization,
                 description: "Unsafe deserialization - can lead to RCE",
                 suggestion: "Use safe deserialization formats (JSON) or validate input",
@@ -205,7 +232,7 @@ impl SecurityScanner {
             },
             // Missing authentication/authorization
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)(?:@app\.route|@router\.get|@api)\s*\("#).unwrap(),
+                pattern: static_regex(r#"(?i)(?:@app\.route|@router\.get|@api)\s*\("#),
                 vuln_type: VulnerabilityType::MissingAuth,
                 description: "API route defined - ensure authentication is applied",
                 suggestion: "Ensure proper auth middleware is applied",
@@ -213,7 +240,7 @@ impl SecurityScanner {
             },
             // Insecure random
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)Math\.random\s*\("#).unwrap(),
+                pattern: static_regex(r#"(?i)Math\.random\s*\("#),
                 vuln_type: VulnerabilityType::InsecureRandom,
                 description: "Math.random() is not cryptographically secure",
                 suggestion: "Use crypto.randomBytes() or crypto.randomUUID()",
@@ -221,7 +248,9 @@ impl SecurityScanner {
             },
             // Unvalidated redirects
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)(?:redirect|window\.location|response\.sendRedirect)"#).unwrap(),
+                pattern: static_regex(
+                    r#"(?i)(?:redirect|window\.location|response\.sendRedirect)"#,
+                ),
                 vuln_type: VulnerabilityType::UnvalidatedRedirect,
                 description: "Redirect with potentially unvalidated URL",
                 suggestion: "Validate redirect URLs against an allowlist",
@@ -229,14 +258,14 @@ impl SecurityScanner {
             },
             // Buffer overflow (C/C++)
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)\bgets\s*\("#).unwrap(),
+                pattern: static_regex(r#"(?i)\bgets\s*\("#),
                 vuln_type: VulnerabilityType::BufferOverflow,
                 description: "Use of gets() - no bounds checking, buffer overflow",
                 suggestion: "Use fgets() or safer alternatives",
                 extensions: Some(vec!["c", "cpp", "cc"]),
             },
             VulnerabilityPattern {
-                pattern: Regex::new(r#"(?i)\bstrcpy\s*\(|strcat\s*\("#).unwrap(),
+                pattern: static_regex(r#"(?i)\bstrcpy\s*\(|strcat\s*\("#),
                 vuln_type: VulnerabilityType::BufferOverflow,
                 description: "Use of strcpy/strcat - potential buffer overflow",
                 suggestion: "Use strncpy/strncat with proper size limits",
