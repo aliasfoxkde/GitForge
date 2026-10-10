@@ -5,6 +5,14 @@
 //! requires an administrator or maintainer. These tests drive all of that
 //! through the real router with an in-memory database.
 
+// Test-harness exemption, same discipline as the sibling route suites and
+// the gitforge-db integration fixtures: `allow-unwrap-in-tests` covers
+// `#[test]` bodies, but the boot/seed helper functions in a test target
+// are neither `#[test]` fns nor `#[cfg(test)]`, a class the clippy.toml
+// config cannot address. Setup failing IS the assertion -- a panic aborts
+// the run loudly. Production code keeps the denies.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
