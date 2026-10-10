@@ -28,6 +28,20 @@ edition = "2021"
 authors = ["GitForge Team"]
 license = "MIT"
 
+# Workspace-wide lint foundation. Every crate opts in via `[lints]
+# workspace = true`. Deliberately conservative: each entry here must stay
+# clean under the CI clippy gate (`-D warnings`), so enforcement-grade
+# restriction lints (unwrap_used, expect_used, panic) join only per-crate
+# as the unwrap-elimination campaign drains each crate — the
+# scripts/unwrap-count.sh metric tracks the drain.
+[workspace.lints.rust]
+rust_2018_idioms = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+unimplemented = "warn"
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
