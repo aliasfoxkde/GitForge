@@ -47,6 +47,14 @@ pub(crate) async fn begin_immediate(
                 // transaction. On a healthy connection it fails with
                 // "no transaction is active", which carries no signal.
                 let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+                // Return the healed connection BEFORE re-beginning:
+                // begin_with acquires its own connection, and holding this
+                // one across that wait deadlocks any pool already at its
+                // connection cap (a single-connection pool burns a full
+                // acquire timeout per recovery pass). The pool hands out
+                // the most recently used connection first, so the re-begin
+                // gets the connection just healed.
+                drop(conn);
                 match pool.begin_with("BEGIN IMMEDIATE").await {
                     Ok(tx) => {
                         tracing::warn!(

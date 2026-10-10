@@ -3549,15 +3549,15 @@ mod tests {
         };
         // Two repositories, one pipeline, one artifact, two runners with
         // only one online, and four runs: two succeeded plus one failed
-        // inside the 24h window, one succeeded outside it.
+        // inside the 24h window, one succeeded outside it. Seeds respect
+        // foreign keys (pools enforce them): runs before jobs, jobs before
+        // the artifact that points at one.
         for sql in [
             "INSERT INTO repositories (id, name, owner_id, git_path, created_at, updated_at)
              VALUES ('r1', 'a', 'u1', '/tmp/a.git', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
                     ('r2', 'b', 'u1', '/tmp/b.git', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
             "INSERT INTO pipelines (id, repo_id, name, trigger_type, created_at)
              VALUES ('p1', 'r1', 'ci', 'push', '2026-01-01T00:00:00+00:00')",
-            "INSERT INTO artifacts (id, job_id, name, path, checksum, size_bytes, created_at)
-             VALUES ('a1', 'j1', 'out.zip', '/tmp/out.zip', 'ck', 1, '2026-01-01T00:00:00+00:00')",
             "INSERT INTO runners (id, name, runner_type, status, created_at, updated_at)
              VALUES ('n1', 'runner-1', 'docker', 'online', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
                     ('n2', 'runner-2', 'docker', 'offline', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
@@ -3577,10 +3577,17 @@ mod tests {
         .execute(pool.pool())
         .await
         .unwrap();
-        // The artifact row carries a real foreign key into jobs.
         sqlx::query(
             "INSERT INTO jobs (id, pipeline_run_id, name, created_at)
              VALUES ('j1', 'run1', 'fmt', '2026-01-01T00:00:00+00:00')",
+        )
+        .execute(pool.pool())
+        .await
+        .unwrap();
+        // The artifact row carries a real foreign key into jobs.
+        sqlx::query(
+            "INSERT INTO artifacts (id, job_id, name, path, checksum, size_bytes, created_at)
+             VALUES ('a1', 'j1', 'out.zip', '/tmp/out.zip', 'ck', 1, '2026-01-01T00:00:00+00:00')",
         )
         .execute(pool.pool())
         .await
@@ -3718,7 +3725,10 @@ mod tests {
     #[tokio::test]
     async fn test_before_acquire_heals_swallowed_writes() {
         let db_path = std::env::temp_dir().join(format!("gitforge-swallow-{}.db", Uuid::new_v4()));
-        let url = format!("sqlite:{}", db_path.display());
+        // mode=rwc to create the file — a bare sqlite: URL opens an
+        // existing database only (the same reason Pool::new appends it for
+        // file paths).
+        let url = format!("sqlite:{}?mode=rwc", db_path.display());
 
         // Poisoned pool WITHOUT the hook: the write is swallowed.
         let bare = sqlx::sqlite::SqlitePoolOptions::new()
