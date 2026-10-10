@@ -3466,12 +3466,157 @@ impl RefreshTokenQueries {
 }
 
 // ============================================================================
+// Dashboard aggregate stats
+// ============================================================================
+
+/// One scalar aggregate, rendered as a dashboard metric.
+///
+/// Counts are read with plain `COUNT(*)` outside any transaction: the
+/// dashboard is an approximation surface, not an invariant surface, and
+/// a mid-count concurrent write costs nothing (the next render corrects
+/// it). Every query is single-pass over an indexed-or-tiny table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardStats {
+    pub repositories: i64,
+    pub pipelines: i64,
+    pub artifacts: i64,
+    pub runners_online: i64,
+    pub runs_last_24h: i64,
+    pub runs_succeeded_24h: i64,
+}
+
+pub struct StatsQueries;
+
+impl StatsQueries {
+    /// Read every dashboard aggregate in one round trip per scalar.
+    ///
+    /// Timestamps are stored as RFC3339 strings (`to_rfc3339()` on every
+    /// write path), so the 24h window is bounded by an RFC3339 bound —
+    /// not SQLite's space-separated `datetime('now', ...)`, which
+    /// compares wrongly against the `T` separator inside the same day.
+    pub async fn dashboard(pool: &Pool) -> Result<DashboardStats> {
+        let count = |sql: &'static str| {
+            let pool = pool;
+            async move {
+                let row = sqlx::query(sql)
+                    .fetch_one(pool.pool())
+                    .await
+                    .map_err(|e| Error::database(format!("dashboard count failed: {e}")))?;
+                Ok::<i64, Error>(row.get::<i64, _>(0))
+            }
+        };
+        let window_bound = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let run_row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded
+            FROM pipeline_runs
+            WHERE created_at > ?
+            "#,
+        )
+        .bind(window_bound)
+        .fetch_one(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("dashboard run stats failed: {e}")))?;
+        Ok(DashboardStats {
+            repositories: count("SELECT COUNT(*) FROM repositories").await?,
+            pipelines: count("SELECT COUNT(*) FROM pipelines").await?,
+            artifacts: count("SELECT COUNT(*) FROM artifacts").await?,
+            runners_online: count("SELECT COUNT(*) FROM runners WHERE status = 'online'").await?,
+            runs_last_24h: run_row.get::<i64, _>("total"),
+            runs_succeeded_24h: run_row.get::<Option<i64>, _>("succeeded").unwrap_or(0),
+        })
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_dashboard_stats_count_seeded_rows() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        let old = (Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        let insert = |sql: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(sql).execute(pool.pool()).await.unwrap();
+            }
+        };
+        // Two repositories, one pipeline, one artifact, two runners with
+        // only one online, and four runs: two succeeded plus one failed
+        // inside the 24h window, one succeeded outside it.
+        for sql in [
+            "INSERT INTO repositories (id, name, owner_id, git_path, created_at, updated_at)
+             VALUES ('r1', 'a', 'u1', '/tmp/a.git', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                    ('r2', 'b', 'u1', '/tmp/b.git', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+            "INSERT INTO pipelines (id, repo_id, name, trigger_type, created_at)
+             VALUES ('p1', 'r1', 'ci', 'push', '2026-01-01T00:00:00+00:00')",
+            "INSERT INTO artifacts (id, job_id, name, path, checksum, size_bytes, created_at)
+             VALUES ('a1', 'j1', 'out.zip', '/tmp/out.zip', 'ck', 1, '2026-01-01T00:00:00+00:00')",
+            "INSERT INTO runners (id, name, runner_type, status, created_at, updated_at)
+             VALUES ('n1', 'runner-1', 'docker', 'online', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                    ('n2', 'runner-2', 'docker', 'offline', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+        ] {
+            insert(sql).await;
+        }
+        sqlx::query(
+            "INSERT INTO pipeline_runs
+                 (id, pipeline_id, repo_id, status, triggered_by, commit_hash, created_at)
+             VALUES ('run1', 'p1', 'r1', 'succeeded', 'push', 'c1', ?1),
+                    ('run2', 'p1', 'r1', 'succeeded', 'push', 'c2', ?1),
+                    ('run3', 'p1', 'r1', 'failed', 'push', 'c3', ?1),
+                    ('run4', 'p1', 'r1', 'succeeded', 'push', 'c4', ?2)",
+        )
+        .bind(now)
+        .bind(old)
+        .execute(pool.pool())
+        .await
+        .unwrap();
+        // The artifact row carries a real foreign key into jobs.
+        sqlx::query(
+            "INSERT INTO jobs (id, pipeline_run_id, name, created_at)
+             VALUES ('j1', 'run1', 'fmt', '2026-01-01T00:00:00+00:00')",
+        )
+        .execute(pool.pool())
+        .await
+        .unwrap();
+
+        let stats = StatsQueries::dashboard(&pool).await.unwrap();
+        assert_eq!(stats.repositories, 2);
+        assert_eq!(stats.pipelines, 1);
+        assert_eq!(stats.artifacts, 1);
+        assert_eq!(stats.runners_online, 1);
+        // The 48h-old succeeded run is outside the window and must not
+        // count in either the total or the success rate.
+        assert_eq!(stats.runs_last_24h, 3);
+        assert_eq!(stats.runs_succeeded_24h, 2);
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_stats_empty_database_is_all_zero() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let stats = StatsQueries::dashboard(&pool).await.unwrap();
+        assert_eq!(
+            stats,
+            DashboardStats {
+                repositories: 0,
+                pipelines: 0,
+                artifacts: 0,
+                runners_online: 0,
+                runs_last_24h: 0,
+                runs_succeeded_24h: 0,
+            }
+        );
+    }
 
     #[tokio::test]
     async fn test_persist_with_retry_succeeds_after_transient_failures() {
