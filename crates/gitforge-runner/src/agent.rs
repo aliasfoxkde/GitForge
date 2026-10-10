@@ -48,7 +48,8 @@ pub struct RunnerConfig {
     /// scheduler's listener is up.
     pub register_attempts: u32,
     /// Initial delay in seconds between registration attempts. Doubles after
-    /// every failed attempt up to [`REGISTER_BACKOFF_CAP_SECS`].
+    /// every failed attempt up to the `REGISTER_BACKOFF_CAP_SECS` bound
+    /// (30 s; the constant stays private to the backoff math).
     pub register_backoff_secs: u64,
     /// Whether registration failure may fall back to standalone execution.
     /// Defaults to `false`: a runner that cannot register exits instead of
