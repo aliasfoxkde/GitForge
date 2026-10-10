@@ -17,6 +17,7 @@ use gitforge_ci::{
 };
 use gitforge_common::PipelineStatus;
 use gitforge_db::models::{Pipeline as DbPipeline, PipelineRun as DbPipelineRun};
+use gitforge_db::queries::persist_with_retry;
 use gitforge_events::{
     EventBus, EventEnvelope, EventFilter, EventPayload, EventType, InMemoryEventBus,
     PushReceivedPayload,
@@ -2755,7 +2756,10 @@ async fn persist_planned_jobs(
         db_job.image = plan.image;
         db_job.working_dir = plan.working_dir;
         db_job.timeout_secs = plan.timeout_secs;
-        gitforge_db::queries::JobQueries::create(pool, &db_job).await?;
+        // Durable-write discipline (F21/F23): losing one row to a transient
+        // busy aborts the whole loop and strands a half-planned run (the
+        // caller fails it), so each row fights contention instead.
+        persist_with_retry(|| gitforge_db::queries::JobQueries::create(pool, &db_job)).await?;
     }
     tracing::info!(run = %run_id, planned = planned.len(), "persisted planned job rows");
     Ok(planned.len())
