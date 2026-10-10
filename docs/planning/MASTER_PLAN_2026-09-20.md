@@ -947,3 +947,53 @@ idempotence/fencing
 (`test_cancel_is_idempotent_and_never_clobbers_a_terminal_job`),
 persist_with_retry semantics (2 tests), flag-driven timeout
 grading (rewritten `test_job_result_status`).
+
+## 13. Fedora false-green incident (2026-10-10, fedora CI instance)
+
+Found while gating the v0.6.16 release: the release gate requires a
+green exact-SHA pipeline run with full definition coverage, and the
+candidate run f5676f9f (6a1e1f3b, RC) graded `succeeded` with **one
+of four** definition jobs — fmt only, 11 seconds, no clippy/test/
+coverage ever enqueued. Two findings, both evidenced on the live
+fedora instance (audit.db, unit journals).
+
+**F38 (stale-deployment orphan finalizer grades truncated chains
+succeeded — found 2026-10-10 gating v0.6.16).** The deployed fedora
+release is `gitforge-63427df-20260923` (17 days old at discovery);
+every chain-integrity fix since — #212 interrupted-chain grading, F37
+doom cascade deployment, the boot consumer-ordering fix 69e3c859 — is
+undeployed. When the ci process restarts, runs created under the dead
+process are not adopted by the new one (no `rebuilt live engine`
+lines in the 06:42:28 boot window), so their lazy chains never
+resume: at first-job completion the engine logs `WARN ci: completion
+received for unknown pipeline run f5676f9f…` (07:01:29), and the
+periodic orphan reconciler then grades the run from its observed jobs
+— `finalized orphaned run f5676f9f status="succeeded"` (07:02:00,
+three runs in one sweep, including co-tenant 3b1be60c). A chain with
+one observed succeeded job cannot grade anything but succeeded. The
+run count check (definition coverage: 4 planned rows for gitforge-ci,
+observed 1) is the only thing that catches it — run status alone is
+not evidence on this deployment. Disposition: deploy-is-the-fix (the
+RC being gated carries the adoption logging, honest interrupted-chain
+grading, and doom cascade); interim operational rule recorded in
+memory — never trust a terminal grade without counting job rows
+against the committed definition. Evidence: fedora ci journal
+2026-10-10 07:01:14–07:02:00 CDT; audit.db runs f5676f9f (4-shape:
+fmt succeeded, 3 absent), 3b1be60c, 80755be1.
+
+**F39 (delayed trigger consumption mints a second run row — found
+2026-10-10 re-triggering the RC).** A push whose RPC response failed
+client-side (curl 7 mid-sideband) had landed server-side: the ref
+existed and the api had created run row e370bd23 (12:11:19Z). The
+trigger event was consumed by ci 2m later (12:13:20Z) and the engine
+minted its own run row db0397db instead of adopting the api's — two
+rows for one push, one of them (`e370bd23`) a permanent zero-job
+`running` ghost no finalizer owns (zero rows → `has_live_row` false
+→ rebuild skips; nothing grades it). The real run db0397db planned
+all four rows correctly (persisted planned=4) and is the release
+gate's subject. Disposition: open defect — the api-side row and the
+engine-side row must share identity or the loser must be finalized;
+until fixed, gate checks select the run row that owns the job rows,
+never the first row matching the commit. Evidence: audit.db rows
+e370bd23 (0 jobs, running) and db0397db (4 jobs) both at commit
+6a1e1f3b; ci journal 07:13:20 push-received line.
