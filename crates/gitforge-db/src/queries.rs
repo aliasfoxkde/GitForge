@@ -3555,6 +3555,97 @@ mod tests {
         pool.close().await;
     }
 
+    /// Regression for the swallowed-write flavor of connection poisoning
+    /// (run `99c463db`, 2026-10-08): a single-statement write routed in
+    /// autocommit to a connection with an orphaned SQLite transaction
+    /// joins that transaction and vanishes when it rolls back — the write
+    /// reports success and the row is gone. The pool's `before_acquire`
+    /// hook must heal the connection before the statement runs.
+    ///
+    /// Cross-connection truth is what makes this observable: the poisoned
+    /// transaction's uncommitted DDL is visible on its own connection, so
+    /// the probe closes the pool and reopens the file to check whether the
+    /// write actually committed. The no-hook variant documents the failure
+    /// mode this guards against.
+    #[tokio::test]
+    async fn test_before_acquire_heals_swallowed_writes() {
+        let db_path = std::env::temp_dir().join(format!("gitforge-swallow-{}.db", Uuid::new_v4()));
+        let url = format!("sqlite:{}", db_path.display());
+
+        // Poisoned pool WITHOUT the hook: the write is swallowed.
+        let bare = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let mut conn = bare.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        sqlx::query("CREATE TABLE swallow_probe (id INTEGER)")
+            .execute(&bare)
+            .await
+            .unwrap();
+        bare.close().await;
+
+        let reopened = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(&url)
+            .await
+            .unwrap();
+        let leaked: Option<i64> =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'swallow_probe'")
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        reopened.close().await;
+        assert_eq!(
+            leaked,
+            Some(0),
+            "the unhooked pool must demonstrate the swallowed write"
+        );
+
+        // Same shape WITH the hook (what Pool::new installs): healed at
+        // acquire, so the write commits and survives the reopen.
+        let hooked = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .before_acquire(|conn, _meta| crate::connection::heal_poisoned_connection(conn))
+            .connect(&url)
+            .await
+            .unwrap();
+        let mut conn = hooked.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        sqlx::query("CREATE TABLE swallow_probe (id INTEGER)")
+            .execute(&hooked)
+            .await
+            .unwrap();
+        hooked.close().await;
+
+        let reopened = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(&url)
+            .await
+            .unwrap();
+        let committed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'swallow_probe'")
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        reopened.close().await;
+        assert_eq!(
+            committed, 1,
+            "the hooked pool must heal the poison so the write commits"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
     #[tokio::test]
     async fn test_cancel_is_idempotent_and_never_clobbers_a_terminal_job() {
         let pool = Pool::memory().await.unwrap();

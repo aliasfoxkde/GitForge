@@ -65,6 +65,49 @@ pub(crate) async fn begin_immediate(
     }
 }
 
+/// Heal a pooled connection that still holds a SQLite-side transaction.
+///
+/// This is the `before_acquire` hook every GitForge pool installs. A
+/// connection whose SQLite handle is inside a transaction that sqlx's
+/// depth counter does not know about does not just fail the next
+/// `begin_with` — any *single-statement* write routed to it in
+/// autocommit silently joins the orphaned transaction and evaporates
+/// when that transaction is rolled back (observed live 2026-10-08: run
+/// `99c463db` logged `persisted planned job rows planned=4` yet zero
+/// rows existed afterwards). Healing at the idle->borrowed boundary
+/// closes the whole class for every caller, including plain queries
+/// that never open a transaction themselves.
+///
+/// A bare ROLLBACK is the probe and the cure in one statement: it
+/// succeeds exactly when an orphaned transaction existed (now cleared),
+/// fails with "no transaction is active" on a healthy connection, and
+/// any other failure retires the connection by reporting `false` (the
+/// pool closes it instead of handing it out).
+pub(crate) fn heal_poisoned_connection<'c>(
+    conn: &'c mut sqlx::SqliteConnection,
+) -> futures::future::BoxFuture<'c, sqlx::Result<bool>> {
+    Box::pin(async move {
+        match sqlx::raw_sql("ROLLBACK").execute(conn).await {
+            Ok(_) => {
+                tracing::warn!("healed an orphaned SQLite transaction on a pooled connection");
+                Ok(true)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no transaction is active") {
+                    Ok(true)
+                } else {
+                    tracing::warn!(
+                        %error,
+                        "retiring unusable pooled SQLite connection"
+                    );
+                    Ok(false)
+                }
+            }
+        }
+    })
+}
+
 /// SQLite connection pool wrapper
 #[derive(Clone)]
 pub struct Pool {
@@ -107,6 +150,7 @@ impl Pool {
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
+            .before_acquire(|conn, _meta| heal_poisoned_connection(conn))
             .connect_with(options)
             .await
             .map_err(|e| Error::database(format!("failed to connect to database: {e}")))?;
