@@ -56,17 +56,22 @@ All notable changes to GitForge will be documented in this file.
 ### Fixed
 
 - **Connection poisoning self-heals at the pool boundary**
-  (0b16dd76, 0dfc0f15): when `BEGIN IMMEDIATE` fails under contention,
-  sqlx's transaction-depth counter and the SQLite handle desync — the
-  pooled connection then rejects every later explicit transaction, and
-  the silent flavor is worse: any single-statement autocommit write
-  routed to it joins the orphaned transaction and evaporates on
-  rollback (run `99c463db` logged `persisted planned job rows
-  planned=4` yet zero rows existed). Two layers close the class:
+  (0b16dd76, 0dfc0f15, f939ab64): when `BEGIN IMMEDIATE` fails under
+  contention, sqlx's transaction-depth counter and the SQLite handle
+  desync — the pooled connection then rejects every later explicit
+  transaction, and the silent flavor is worse: any single-statement
+  autocommit write routed to it joins the orphaned transaction and
+  evaporates on rollback (run `99c463db` logged `persisted planned job
+  rows planned=4` yet zero rows existed). Two layers close the class:
   `begin_immediate` recovers with bounded bare-ROLLBACK passes on the
   explicit-transaction paths, and a pool-wide `before_acquire` hook
   heals (or retires) any connection still holding an orphaned
-  transaction before it is handed out.
+  transaction before it is handed out. The recovery itself had a
+  deadlock at connection caps — it held the just-ROLLBACKed connection
+  while waiting for another to re-begin, stalling a full acquire
+  timeout per pass on a single-connection pool; the healed connection
+  is now returned before the re-begin and the pool's MRU handoff
+  hands it straight back.
 
 - **Manual job cancels cascade to pending descendants** (09c91bfa):
   cancelling a running job left its not-yet-started descendants
@@ -123,7 +128,13 @@ All notable changes to GitForge will be documented in this file.
   past, and the `allow-*-in-tests` boundary (fixture helpers in test
   targets are neither `#[test]` fns nor `#[cfg(test)]`). The tip now
   passes `cargo clippy --workspace --all-targets -- -D warnings` end
-  to end.
+  to end. The clippy job's second step — the rustdoc gate
+  (`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`) —
+  had its own never-reached backlog: private-intra-doc-links in
+  public docs (scheduler, runner), bare `<ref> <reason>` parsed as
+  unclosed HTML in the ref-policy module doc, and an out-of-scope
+  cross-crate link in the review route doc. All fixed; the gate now
+  passes at the release tip.
 
 ### Tests
 
