@@ -262,6 +262,15 @@ Fedora operational notes:
   unwritable from confined containers, which presents as `Permission
   denied` on writes the modes clearly allow. The runner's own job
   workspaces already handle their labeling.
+- **Cut over the full service set together — never migrate the shared DB
+  under a running peer.** sqlx caches per-statement column metadata at
+  prepare time; when one service `ALTER TABLE`s the shared SQLite DB while
+  another still holds prepared `SELECT *` statements, SQLite's
+  auto-reprepare pairs a new column count with the stale metadata and the
+  peer panics (`SqliteRow::current`: `index out of bounds: the len is 16
+  but the index is 16`; ledger F40, 2026-10-10). `Restart=on-failure`
+  bounds the damage to one aborted process, but the drain-gated
+  stop-everything-then-start-together sequence avoids the window entirely.
 
 ### Two-instance topology (as of 2026-10-10)
 
