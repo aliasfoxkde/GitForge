@@ -139,7 +139,8 @@ success, "Install Rust" success — and the Build job completed green in
   These are feature-contract mismatches in this branch's async-trigger
   work, surfaced for the first time now that CI can run at all; they are
   out of scope for the workflow closeout (no `services/` code altered by
-  tasking constraint).
+  tasking constraint). **Both fixed 2026-10-11 on the stacked follow-up
+  branch — see §9.**
 - Still pending on the single backlogged runner at receipt time: Format,
   Clippy, Test, Test (Serialized), Security Audit, secrets-scan, Cargo
   Audit, Aegis Changed-Line Scan, Rust Security, Analyze (rust/go),
@@ -202,3 +203,64 @@ rust-ci.yml only:
   here`, confirming the diagnosis and the lint's sensitivity to it.
   actionlint is now the pre-push gate for workflow edits on this host
   (`/var/tmp/actionlint-bin/actionlint`).
+
+## 9. Follow-up: trigger-contract fixes (2026-10-11)
+
+Both §6 Coverage failures are fixed on
+`codex/gitforge-pr293-trigger-contract-20261011`, stacked on the §4
+workflow fix. No test was weakened or edited: the two failing tests pin
+real production contracts (the `gitforge-ci.yml` correlation loop reads
+exactly these response fields), and both pass unmodified at this head.
+
+### Root causes (both in `services/ci/src/main.rs`)
+
+1. `test_duplicate_trigger_dedups_onto_single_run` — the duplicate-trigger
+   dedup branch answered `{"deduplicated":true,...}` with **no
+   `trigger_id`**. The echo is load-bearing: the gitforge-ci workflow's
+   correlation loop re-POSTs the byte-identical tuple and compares
+   `.trigger_id` to the enqueued id; an empty echo silently skipped its
+   "original settled without a runnable trace" fast-fail and burned the
+   full correlation timeout. Fix: the dedup response now echoes the
+   original request id under `trigger_id`. Additive field — the only
+   other consumer of this endpoint (`CiTriggerClient` in
+   `crates/gitforge-api/src/routes/webhook.rs`) reads only
+   `pipeline_run_id` and treats 2xx generically.
+2. `test_settled_trigger_retry_mints_fresh_trigger` — for a registered
+   repository whose git path is gone, `load_pipeline_from_commit`
+   misread the missing `--git-dir` as "no committed config" (`git
+   cat-file` fails exactly like an absent file), the default pipeline
+   was planned, `activate_pipeline_and_create_run` **minted the run
+   row**, and `prepare_run_workspace` graded it failed one step later:
+   one ghost `failed` run per trigger and per retry of the settled
+   request (2 observed in the CI failure). Fix: `handle_push_event`
+   now resolves the repository and validates its git path BEFORE any
+   durable row exists, failing the request terminally with the same
+   `git path is unavailable` cause; `prepare_run_workspace` reuses the
+   shared resolver `resolve_repository_git_path` (error strings
+   unchanged). The unregistered-repository path keeps its existing
+   retryable classification — it still errors out of the config loader
+   before the gate.
+
+### Regression coverage added
+
+`tests::test_handle_push_event_fails_terminal_without_run_for_missing_git_path`
+(unit, `services/ci/src/main.rs`): `handle_push_event` against a pool
+whose repo row points at a nonexistent git path must return a
+non-retryable failure with `run_id == None`, name the unavailable git
+path, and leave zero `pipeline_runs` rows and no prepared workspace.
+
+### Bounded local verification (NVMe worktree, `TMPDIR=/tmp`)
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy -p ci --all-targets -- -D warnings` — clean (one
+  `clippy::err_expect` finding in the new test fixed during the pass).
+- `cargo test -p ci --test ci_trigger_flow` — **3/3 passed (1.62s)**,
+  including both previously-failing tests:
+  `test_duplicate_trigger_dedups_onto_single_run`,
+  `test_settled_trigger_retry_mints_fresh_trigger`.
+- `cargo test -p ci --bin ci prepare_run_workspace` — 6/6 passed
+  (the resolver refactor preserved clone/adopt/unknown-repo/unavailable/
+  non-directory/invalid-commit behavior).
+- Not run locally per tasking constraint (no broad/heavy cargo runs):
+  full workspace fmt/clippy/test/coverage — delegated to GitHub Actions
+  and the self-hosted GitForge pipeline on the stacked PR.
