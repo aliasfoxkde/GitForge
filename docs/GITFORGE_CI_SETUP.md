@@ -22,7 +22,27 @@ Configure these repository or organization values before enabling it:
 | `GITFORGE_REPO_ID` | variable | UUID of the mirrored GitForge repository |
 | `GITFORGE_POLL_TIMEOUT_SECONDS` | variable | Positive integer timeout |
 | `GITFORGE_POLL_INTERVAL_SECONDS` | variable | Positive integer interval |
-| `GITFORGE_API_TOKEN` | secret | Token accepted by the scheduler/API |
+| `GITFORGE_CI_TRIGGER_TOKEN` | secret | Bearer token for `POST /pipelines/trigger` and trigger correlation retries only |
+| `GITFORGE_SCHEDULER_OPERATOR_TOKEN` | secret | Bearer token for run-status reads (`GET /pipelines/runs/{id}`) only |
+
+### Least privilege
+
+The workflow holds two distinct scheduler credentials, never one shared
+token:
+
+- `GITFORGE_CI_TRIGGER_TOKEN` is presented ONLY to `POST /pipelines/trigger`
+  — the enqueue step and the correlation re-POSTs of the poll job (re-POSTs
+  must carry the same credential as the original enqueue so the scheduler's
+  dedup echo contract applies).
+- `GITFORGE_SCHEDULER_OPERATOR_TOKEN` is presented ONLY to `GET
+  /pipelines/runs/{id}` — the status-poll loop. The scheduler rejects the
+  trigger credential on this route (401). Neither secret is used for the
+  gateway route `/api/pipeline-runs/{id}`, which requires a user JWT the
+  workflow deliberately never holds.
+
+The workflow validates both secrets are present and distinct without
+printing their values; identical values fail the run rather than silently
+re-creating a shared super-token.
 
 The workflow validates all values and refuses to bypass GitForge if enqueue or
 polling fails. Until `GITFORGE_ENABLED=true` is intentionally configured, the

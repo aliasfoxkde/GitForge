@@ -29,6 +29,20 @@ jobs:
     runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Expose the runner's rustup on PATH: the job PATH omits $HOME/.cargo,
+      # so dtolnay/rust-toolchain falls through to its rustup bootstrap and
+      # fails instantly on the Fedora runner (run 38100998153; run 38074059170
+      # on main). See codeql.yml for the original diagnosis.
+      - name: Expose runner rustup on PATH
+        run: |
+          set -euo pipefail
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "rustup not found or not executable at $CARGO_HOME/bin/rustup; expected the runner's Fedora rustup install" >&2
+            exit 1
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" --version
       - name: Install Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
@@ -43,12 +57,29 @@ jobs:
     runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Same runner PATH fix as the fmt job (see codeql.yml).
+      - name: Expose runner rustup on PATH
+        run: |
+          set -euo pipefail
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "rustup not found or not executable at $CARGO_HOME/bin/rustup; expected the runner's Fedora rustup install" >&2
+            exit 1
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" --version
       - name: Install Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
           components: clippy
       - name: Run clippy
+        # aws-lc-sys's build script writes assembler scratch to TMPDIR; /tmp is
+        # quota-constrained on this runner (see codeql.yml Build Rust). Step
+        # env, not job env: the runner context is unavailable at jobs.<id>.env
+        # and its use there invalidates the whole workflow file.
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # ─── Shell linting ──────────────────────────────────────────────────────────
@@ -92,11 +123,27 @@ jobs:
       GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Same runner PATH fix as the fmt job (see codeql.yml).
+      - name: Expose runner rustup on PATH
+        run: |
+          set -euo pipefail
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "rustup not found or not executable at $CARGO_HOME/bin/rustup; expected the runner's Fedora rustup install" >&2
+            exit 1
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" --version
       - name: Install Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
       - name: Run tests
+        # /tmp is quota-constrained on this runner (see codeql.yml Build Rust).
+        # Step env, not job env: the runner context is unavailable at
+        # jobs.<id>.env and its use there invalidates the workflow file.
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo test --workspace --locked --no-fail-fast
 
   # ─── Serialized test run ───────────────────────────────────────────────────
@@ -110,6 +157,17 @@ jobs:
       GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Same runner PATH fix as the fmt job (see codeql.yml).
+      - name: Expose runner rustup on PATH
+        run: |
+          set -euo pipefail
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "rustup not found or not executable at $CARGO_HOME/bin/rustup; expected the runner's Fedora rustup install" >&2
+            exit 1
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" --version
       - name: Install Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
@@ -120,6 +178,11 @@ jobs:
           pkg-config --exists systemd libudev openssl
           echo "native development dependencies are available on the managed runner"
       - name: Run serialized tests
+        # /tmp is quota-constrained on this runner (see codeql.yml Build Rust).
+        # Step env, not job env: the runner context is unavailable at
+        # jobs.<id>.env and its use there invalidates the workflow file.
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
   # ─── Coverage ───────────────────────────────────────────────────────────────
@@ -136,6 +199,17 @@ jobs:
       GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Same runner PATH fix as the fmt job (see codeql.yml).
+      - name: Expose runner rustup on PATH
+        run: |
+          set -euo pipefail
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "rustup not found or not executable at $CARGO_HOME/bin/rustup; expected the runner's Fedora rustup install" >&2
+            exit 1
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" --version
       - name: Install Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
@@ -148,6 +222,11 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@562f912bf8a1174eb1007c4afe216a9187a8d722 # cargo-llvm-cov
       - name: Generate coverage report
+        # /tmp is quota-constrained on this runner (see codeql.yml Build Rust).
+        # Step env, not job env: the runner context is unavailable at
+        # jobs.<id>.env and its use there invalidates the workflow file.
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo llvm-cov --workspace --all-features --locked --no-fail-fast --cobertura --output-path cobertura.xml -- --test-threads=1
 
       - name: Publish coverage diagnostics
@@ -195,6 +274,17 @@ jobs:
     runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Same runner PATH fix as the fmt job (see codeql.yml).
+      - name: Expose runner rustup on PATH
+        run: |
+          set -euo pipefail
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "rustup not found or not executable at $CARGO_HOME/bin/rustup; expected the runner's Fedora rustup install" >&2
+            exit 1
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" --version
       - name: Install Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
@@ -229,10 +319,26 @@ jobs:
     runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Same runner PATH fix as the fmt job (see codeql.yml).
+      - name: Expose runner rustup on PATH
+        run: |
+          set -euo pipefail
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "rustup not found or not executable at $CARGO_HOME/bin/rustup; expected the runner's Fedora rustup install" >&2
+            exit 1
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" --version
       - name: Install Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
           targets: x86_64-unknown-linux-musl
       - name: Build release
+        # /tmp is quota-constrained on this runner (see codeql.yml Build Rust).
+        # Step env, not job env: the runner context is unavailable at
+        # jobs.<id>.env and its use there invalidates the workflow file.
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo build --workspace --release --locked

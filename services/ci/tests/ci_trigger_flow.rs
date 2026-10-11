@@ -283,3 +283,221 @@ async fn test_trigger_requires_token_and_runs_committed_pipeline() {
 
     common::shutdown_gracefully(&mut service.child).await;
 }
+
+/// A 202 with `status: "queued"` and a null `pipeline_run_id` is a durable
+/// pending request, and a client retrying the byte-identical trigger tuple
+/// must land on the same in-flight request instead of minting a second run.
+/// The gitforge-ci workflow correlates exactly this way: it re-POSTs the
+/// same repo/ref/old_hash/new_hash until a response carries the run ID, so
+/// the response schema and the dedup echo are load-bearing contract.
+#[tokio::test]
+async fn test_duplicate_trigger_dedups_onto_single_run() {
+    let mut service = spawn_ci().await;
+
+    let trigger_body = format!(
+        "{{\"repo_id\":\"{}\",\"ref_name\":\"refs/heads/main\",\
+          \"old_hash\":\"{}\",\"new_hash\":\"{}\",\"working_dir\":null}}",
+        service.repo_id,
+        "0".repeat(40),
+        service.commit_hash
+    );
+
+    // Two identical triggers fired concurrently: the first creates the
+    // durable request, the second must dedup onto it. The consumer cannot
+    // settle the row between the two requests landing (its path spawns git
+    // and writes several rows), so the racing duplicate observes an active
+    // request.
+    let port = service.scheduler_port;
+    let (first, second) = tokio::join!(
+        post_trigger(port, Some("harness-trigger-token"), &trigger_body),
+        post_trigger(port, Some("harness-trigger-token"), &trigger_body)
+    );
+
+    let mut payloads = Vec::new();
+    for (label, (status, body)) in [("first", first), ("second", second)] {
+        assert_eq!(status, reqwest::StatusCode::ACCEPTED, "{label}: {body}");
+        let payload: serde_json::Value =
+            serde_json::from_str(&body).expect("parse trigger response");
+        // The response schema every consumer of this endpoint parses.
+        assert!(
+            payload["status"] == "accepted" || payload["status"] == "queued",
+            "{label}: status must be accepted|queued: {body}"
+        );
+        assert!(
+            payload["pipeline_run_id"].is_null()
+                || payload["pipeline_run_id"]
+                    .as_str()
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()),
+            "{label}: pipeline_run_id must be null or a UUID: {body}"
+        );
+        let trigger_id = payload["trigger_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: trigger_id must be present: {body}"));
+        assert!(
+            uuid::Uuid::parse_str(trigger_id).is_ok(),
+            "{label}: trigger_id must be a UUID: {body}"
+        );
+        payloads.push(payload);
+    }
+
+    // The racing duplicate echoed the in-flight request, not a fresh one.
+    let id_a = payloads[0]["trigger_id"].as_str().expect("trigger_id");
+    let id_b = payloads[1]["trigger_id"].as_str().expect("trigger_id");
+    assert_eq!(id_a, id_b, "both responses must name the same trigger");
+    let deduped = payloads
+        .iter()
+        .find(|payload| payload["deduplicated"] == true)
+        .unwrap_or_else(|| panic!("the racing duplicate must be marked deduplicated"));
+    assert_eq!(
+        deduped["pipeline_run_id"],
+        serde_json::Value::Null,
+        "an active request carries no run ID yet: {deduped}"
+    );
+
+    // Exactly one run exists for the commit: the duplicate produced no
+    // second event and no second run.
+    let pool = gitforge_db::Pool::new(&service.db_path.display().to_string())
+        .await
+        .expect("reopen service database");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let runs = loop {
+        let runs = gitforge_db::queries::PipelineRunQueries::list(&pool)
+            .await
+            .expect("list runs");
+        if !runs.is_empty() || tokio::time::Instant::now() >= deadline {
+            break runs;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(runs.len(), 1, "dedup must yield exactly one run");
+    assert_eq!(runs[0].repo_id, service.repo_id);
+    assert_eq!(runs[0].commit_hash, service.commit_hash);
+
+    // Whichever response correlated synchronously named that same run.
+    let correlated = payloads
+        .iter()
+        .filter_map(|payload| payload["pipeline_run_id"].as_str())
+        .next();
+    if let Some(run_id) = correlated {
+        assert_eq!(runs[0].id.to_string(), run_id);
+    }
+
+    common::shutdown_gracefully(&mut service.child).await;
+}
+
+/// A trigger whose repository git path is gone settles terminally inside
+/// the consumer while the endpoint has already answered `queued` with only
+/// a trigger id — the response shape cannot distinguish "pending" from
+/// "failed". A retry of the identical tuple then dedups onto nothing (only
+/// pending/processing rows count as active) and mints a FRESH trigger id.
+/// The gitforge-ci correlation loop fails fast on exactly that signal: a
+/// fresh echo means the original settled without a run the client could
+/// identify, and no amount of retrying recovers it. Observed live
+/// 2026-10-10: a repo row still pointed at a retired runtime-repos
+/// directory, so every trigger failed `git path is unavailable`
+/// (retryable=false) and no run ever existed.
+#[tokio::test]
+async fn test_settled_trigger_retry_mints_fresh_trigger() {
+    let mut service = spawn_ci().await;
+    let port = service.scheduler_port;
+
+    // A second repository whose git path does not exist: event handling
+    // fails non-retryably before any run or job row can be created.
+    let pool = gitforge_db::Pool::new(&service.db_path.display().to_string())
+        .await
+        .expect("reopen service database");
+    let owner_id = gitforge_db::queries::RepoQueries::get(&pool, service.repo_id)
+        .await
+        .expect("read seeded repository")
+        .expect("seeded repository exists")
+        .owner_id;
+    let ghost = gitforge_db::models::Repository::new(
+        "ghost".to_string(),
+        owner_id,
+        "/nonexistent/ghost.git".to_string(),
+    );
+    let ghost_id = ghost.id;
+    gitforge_db::queries::RepoQueries::create(&pool, &ghost)
+        .await
+        .expect("create ghost repository");
+    drop(pool);
+
+    let trigger_body = format!(
+        "{{\"repo_id\":\"{ghost_id}\",\"ref_name\":\"refs/heads/main\",\
+          \"old_hash\":\"{}\",\"new_hash\":\"{}\",\"working_dir\":null}}",
+        "0".repeat(40),
+        service.commit_hash
+    );
+
+    // First POST: accepted durably (202, queued) with only a trigger id.
+    // The consumer settles the request terminally moments later, but the
+    // response shape is already fixed at null pipeline_run_id.
+    let (status, body) = post_trigger(port, Some("harness-trigger-token"), &trigger_body).await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "body: {body}");
+    let first: serde_json::Value = serde_json::from_str(&body).expect("parse first response");
+    assert_eq!(first["status"], "queued", "body: {first}");
+    assert!(
+        first["pipeline_run_id"].is_null(),
+        "no run can exist for a missing repository: {first}"
+    );
+    let original_id = first["trigger_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("trigger_id must be present: {first}"));
+    let original_id = uuid::Uuid::parse_str(original_id).expect("trigger_id is a UUID");
+
+    // The consumer marks the request failed, naming the git-path cause.
+    let pool = gitforge_db::Pool::new(&service.db_path.display().to_string())
+        .await
+        .expect("reopen service database");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let settled = loop {
+        let row = gitforge_db::queries::TriggerRequestQueries::get(&pool, original_id)
+            .await
+            .expect("read trigger request");
+        match row {
+            Some(row) if row.status == "failed" => break row,
+            _ if tokio::time::Instant::now() >= deadline => {
+                panic!("trigger request never settled to failed: {row:?}")
+            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    };
+    assert!(
+        settled
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("git path is unavailable")),
+        "terminal cause must name the unavailable git path: {settled:?}"
+    );
+
+    // The identical retry dedups onto nothing and mints a fresh trigger:
+    // exactly the signal the workflow treats as "original settled without
+    // an identifiable run".
+    let (status, body) = post_trigger(port, Some("harness-trigger-token"), &trigger_body).await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "body: {body}");
+    let second: serde_json::Value = serde_json::from_str(&body).expect("parse second response");
+    assert_eq!(second["status"], "queued", "body: {second}");
+    let retry_id = second["trigger_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("trigger_id must be present: {second}"));
+    assert_ne!(
+        uuid::Uuid::parse_str(retry_id).expect("retry trigger_id is a UUID"),
+        original_id,
+        "a settled trigger must not dedup the retry: {second}"
+    );
+    assert!(
+        second["pipeline_run_id"].is_null(),
+        "the retry mints a fresh request, not a correlated run: {second}"
+    );
+
+    // And no run was ever created for the ghost repository.
+    let runs = gitforge_db::queries::PipelineRunQueries::list(&pool)
+        .await
+        .expect("list runs");
+    assert!(
+        runs.iter().all(|run| run.repo_id != ghost_id),
+        "no run may exist for a repository with no git path: {runs:?}"
+    );
+
+    common::shutdown_gracefully(&mut service.child).await;
+}

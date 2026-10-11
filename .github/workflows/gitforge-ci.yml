@@ -20,12 +20,17 @@ env:
   # this workflow only after a reachable endpoint or self-hosted runner is
   # deliberately configured at repository/organization scope.
   GITFORGE_ENABLED: ${{ vars.GITFORGE_ENABLED || 'false' }}
-  GITFORGE_API_URL: ${{ vars.GITFORGE_API_URL || '' }}
   GITFORGE_SCHEDULER_URL: ${{ vars.GITFORGE_SCHEDULER_URL || '' }}
   GITFORGE_REPO_ID: ${{ vars.GITFORGE_REPO_ID || '' }}
   GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
-  GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
+  # How long the poll job waits for a queued trigger to be correlated to its
+  # pipeline run. The scheduler answers POST /pipelines/trigger with
+  # `status: "queued"` and a null pipeline_run_id once the trigger request is
+  # durable but the asynchronous consumer has not created the run yet (its
+  # in-request correlation window is 15s; under load it elapses). A queued
+  # response is a pending request, not a failed enqueue.
+  GITFORGE_CORRELATE_TIMEOUT_SECONDS: ${{ vars.GITFORGE_CORRELATE_TIMEOUT_SECONDS || '300' }}
 
 permissions:
   contents: read
@@ -41,15 +46,26 @@ jobs:
     runs-on: [self-hosted, linux, x64, gitforge-github]
     outputs:
       run_id: ${{ steps.enqueue.outputs.run_id }}
+      trigger_id: ${{ steps.enqueue.outputs.trigger_id }}
       build_status: ${{ steps.enqueue.outputs.status }}
     steps:
       - name: Validate GitForge configuration
+        env:
+          GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
+          GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
         run: |
           set -euo pipefail
-          : "${GITFORGE_API_URL:?GITFORGE_API_URL is required}"
           : "${GITFORGE_SCHEDULER_URL:?GITFORGE_SCHEDULER_URL is required}"
           : "${GITFORGE_REPO_ID:?GITFORGE_REPO_ID is required (GitForge UUID, not GitHub repository_id)}"
-          : "${GITFORGE_API_TOKEN:?GITFORGE_API_TOKEN is required}"
+          : "${GITFORGE_CI_TRIGGER_TOKEN:?GITFORGE_CI_TRIGGER_TOKEN is required (POST /pipelines/trigger)}"
+          : "${GITFORGE_SCHEDULER_OPERATOR_TOKEN:?GITFORGE_SCHEDULER_OPERATOR_TOKEN is required (GET /pipelines/runs/{id})}"
+          # Least privilege requires two distinct credentials; sharing one
+          # value across both roles silently re-creates the old super-token.
+          # This comparison never prints either value.
+          if [ "$GITFORGE_CI_TRIGGER_TOKEN" = "$GITFORGE_SCHEDULER_OPERATOR_TOKEN" ]; then
+            echo "GITFORGE_CI_TRIGGER_TOKEN and GITFORGE_SCHEDULER_OPERATOR_TOKEN must be distinct credentials" >&2
+            exit 1
+          fi
           [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
             echo "GITFORGE_REPO_ID must be a UUID" >&2
             exit 1
@@ -62,22 +78,42 @@ jobs:
             echo "GITFORGE_POLL_INTERVAL_SECONDS must be a positive integer" >&2
             exit 1
           }
+          [[ "$GITFORGE_CORRELATE_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+            echo "GITFORGE_CORRELATE_TIMEOUT_SECONDS must be a positive integer" >&2
+            exit 1
+          }
       - name: Enqueue build job
         id: enqueue
+        env:
+          # GitHub context values are passed through the environment rather
+          # than interpolated into this script's source text: a ref name is
+          # attacker-controlled data and must never become shell code.
+          GITFORGE_REF: ${{ github.ref_name }}
+          GITFORGE_OLD_SHA: ${{ github.event.before }}
+          GITFORGE_NEW_SHA: ${{ github.sha }}
+          GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
         run: |
           set -euo pipefail
-          # Trigger the GitForge CI service. The service returns the durable
-          # pipeline-run ID; polling the API by pipeline ID was a protocol
-          # mismatch and could never observe the created run.
+          # Trigger the GitForge CI service. The service durably records the
+          # trigger request, then tries to correlate the created run within
+          # its in-request window. A 202 with `pipeline_run_id` is a
+          # correlated run; a 202 with only a `trigger_id` is a durable
+          # queued request the poll job correlates. This step uses ONLY the
+          # least-privilege CI trigger credential
+          # (secrets.GITFORGE_CI_TRIGGER_TOKEN), which the scheduler rejects
+          # on run-status reads; status is polled with the separate scheduler
+          # operator credential (secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN).
+          # The gateway route /api/pipeline-runs/{id} requires a user JWT,
+          # which this workflow deliberately never holds.
           PAYLOAD=$(jq -n \
             --arg repo "$GITFORGE_REPO_ID" \
-            --arg ref "${{ github.ref_name }}" \
-            --arg old "${{ github.event.before }}" \
-            --arg new "${{ github.sha }}" \
+            --arg ref "$GITFORGE_REF" \
+            --arg old "$GITFORGE_OLD_SHA" \
+            --arg new "$GITFORGE_NEW_SHA" \
             '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "$GITFORGE_SCHEDULER_URL/pipelines/trigger" \
-            -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+            -H "Authorization: Bearer $GITFORGE_CI_TRIGGER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" 2>&1)
 
@@ -89,12 +125,35 @@ jobs:
 
           if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
             RUN_ID=$(echo "$BODY" | jq -r '.pipeline_run_id // empty')
+            TRIGGER_ID=$(echo "$BODY" | jq -r '.trigger_id // empty')
             if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
-              echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-              echo "status=enqueued" >> "$GITHUB_OUTPUT"
+              [[ "$RUN_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
+                echo "GitForge returned an invalid pipeline_run_id: $RUN_ID" >&2
+                exit 1
+              }
+              {
+                echo "run_id=$RUN_ID"
+                echo "trigger_id=$TRIGGER_ID"
+                echo "status=enqueued"
+              } >> "$GITHUB_OUTPUT"
               echo "Successfully enqueued pipeline run $RUN_ID"
               exit 0
             fi
+            if [ -n "$TRIGGER_ID" ] && [ "$TRIGGER_ID" != "null" ]; then
+              [[ "$TRIGGER_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
+                echo "GitForge returned an invalid trigger_id: $TRIGGER_ID" >&2
+                exit 1
+              }
+              {
+                echo "run_id="
+                echo "trigger_id=$TRIGGER_ID"
+                echo "status=enqueued"
+              } >> "$GITHUB_OUTPUT"
+              echo "GitForge accepted trigger $TRIGGER_ID; run correlation pending"
+              exit 0
+            fi
+            echo "GitForge accepted nothing durable (no pipeline_run_id, no trigger_id); refusing to bypass GitForge" >&2
+            exit 1
           fi
 
           echo "GitForge enqueue failed (HTTP $HTTP_CODE); refusing to bypass GitForge" >&2
@@ -111,29 +170,168 @@ jobs:
     steps:
       - name: Poll for build completion
         id: poll
+        env:
+          # IDs arrive through the environment; never interpolate API output
+          # directly into this script's source text.
+          RUN_ID: ${{ needs.enqueue-build.outputs.run_id }}
+          TRIGGER_ID: ${{ needs.enqueue-build.outputs.trigger_id }}
+          GITFORGE_REF: ${{ github.ref_name }}
+          GITFORGE_OLD_SHA: ${{ github.event.before }}
+          GITFORGE_NEW_SHA: ${{ github.sha }}
+          GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
+          GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
         run: |
           set -euo pipefail
-          echo "Build enqueued, polling GitForge for status..."
-          RUN_ID='${{ needs.enqueue-build.outputs.run_id }}'
-          STATUS_URL="$GITFORGE_API_URL/api/pipeline-runs/$RUN_ID"
+          if [ -n "$RUN_ID" ] && ! [[ "$RUN_ID" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+            echo "run_id output must be a UUID" >&2
+            exit 1
+          fi
+          if [ -z "$RUN_ID" ]; then
+            : "${TRIGGER_ID:?trigger_id output is required when no run ID is returned}"
+            [[ "$TRIGGER_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
+              echo "trigger_id output must be a UUID" >&2
+              exit 1
+            }
+          fi
+
+          # A queued trigger carries only its durable request ID. Correlate
+          # it to its run by re-POSTing the byte-identical trigger tuple.
+          # The scheduler dedups ACTIVE (pending/processing) trigger
+          # requests on (repo_id, new_hash): while the original request is
+          # in flight the response echoes the SAME trigger_id and never
+          # mints a second run. Once the original settles it is invisible
+          # to dedup, and the endpoint reports a terminal trigger failure
+          # and a post-window completion identically (`queued`, null run
+          # id) — so a response echoing a DIFFERENT trigger_id means the
+          # original can no longer be identified. If that fresh response
+          # carries no run id, retrying cannot recover the original and
+          # only mints more doomed requests: fail immediately. If it does
+          # carry a run id, that run built the identical commit tuple; log
+          # the substitution and poll it. The trigger-status endpoint on
+          # codex/pr280-trigger-status-20261008 removes this blind spot
+          # once deployed.
+          if [ -z "$RUN_ID" ]; then
+            PAYLOAD=$(jq -n \
+              --arg repo "$GITFORGE_REPO_ID" \
+              --arg ref "$GITFORGE_REF" \
+              --arg old "$GITFORGE_OLD_SHA" \
+              --arg new "$GITFORGE_NEW_SHA" \
+              '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
+            deadline=$(( $(date +%s) + GITFORGE_CORRELATE_TIMEOUT_SECONDS ))
+            echo "Trigger $TRIGGER_ID queued; correlating to its pipeline run..."
+            while [ -z "$RUN_ID" ]; do
+              RESPONSE=""
+              HTTP_CODE="000"
+              BODY=""
+              # Re-POSTs carry the SAME trigger credential as the original
+              # enqueue so the scheduler's dedup echo contract applies.
+              if RESPONSE=$(curl --silent --show-error --max-time 30 \
+                --write-out "\n%{http_code}" \
+                -X POST \
+                -H "Authorization: Bearer $GITFORGE_CI_TRIGGER_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$PAYLOAD" \
+                "$GITFORGE_SCHEDULER_URL/pipelines/trigger"); then
+                HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -n1)
+                BODY=$(printf '%s' "$RESPONSE" | sed '$d')
+              fi
+
+              case "$HTTP_CODE" in
+                200|201|202)
+                  CANDIDATE=$(printf '%s' "$BODY" | jq -r '.pipeline_run_id // empty')
+                  if [ -n "$CANDIDATE" ]; then
+                    [[ "$CANDIDATE" =~ ^[0-9a-fA-F-]{36}$ ]] || {
+                      echo "GitForge correlation returned an invalid pipeline_run_id: $CANDIDATE" >&2
+                      exit 1
+                    }
+                    RUN_ID="$CANDIDATE"
+                    echo "Trigger $TRIGGER_ID correlated to pipeline run $RUN_ID"
+                    break
+                  fi
+                  ECHOED=$(printf '%s' "$BODY" | jq -r '.trigger_id // empty')
+                  if [ -n "$ECHOED" ] && [ "$ECHOED" != "$TRIGGER_ID" ]; then
+                    echo "GitForge settled trigger $TRIGGER_ID without a run id (terminal trigger failure, or completed after the correlation window); its run cannot be identified through this contract and re-POSTing only mints more doomed requests" >&2
+                    echo "terminal_status=trigger_lost" >> "$GITHUB_OUTPUT"
+                    exit 1
+                  fi
+                  ;;
+                000|408|429|5??)
+                  # Transport loss, rate limiting, and server errors are
+                  # transient; the durable request outlives them.
+                  ;;
+                *)
+                  echo "GitForge trigger correlation returned non-retryable HTTP $HTTP_CODE: $BODY" >&2
+                  exit 1
+                  ;;
+              esac
+
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "GitForge trigger did not produce a run within ${GITFORGE_CORRELATE_TIMEOUT_SECONDS}s" >&2
+                echo "terminal_status=timeout" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+              sleep "$GITFORGE_POLL_INTERVAL_SECONDS"
+            done
+          fi
+
+          # Pipeline runs are served by the scheduler control plane
+          # (GET /pipelines/runs/{id}) under the scheduler operator
+          # credential ONLY — the scheduler rejects the trigger credential
+          # on this route (401).
+          STATUS_URL="$GITFORGE_SCHEDULER_URL/pipelines/runs/$RUN_ID"
+          echo "Build enqueued, polling GitForge scheduler for status..."
 
           deadline=$(( $(date +%s) + GITFORGE_POLL_TIMEOUT_SECONDS ))
           while :; do
-            RESPONSE=$(curl --fail-with-body --silent --show-error \
-              --max-time 30 \
-              -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+            RESPONSE=""
+            HTTP_CODE="000"
+            BODY=""
+            # Transport and 5xx failures are transient: keep polling until the
+            # deadline instead of failing the check on the first bad response.
+            if RESPONSE=$(curl --silent --show-error --max-time 30 \
+              --write-out "\n%{http_code}" \
+              -H "Authorization: Bearer $GITFORGE_SCHEDULER_OPERATOR_TOKEN" \
               -H "Accept: application/json" \
-              "$STATUS_URL")
-            STATUS=$(echo "$RESPONSE" | jq -r '.status // .state // empty' | tr '[:upper:]' '[:lower:]')
-            echo "GitForge pipeline run $RUN_ID status: ${STATUS:-unknown}"
+              "$STATUS_URL"); then
+              HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -n1)
+              BODY=$(printf '%s' "$RESPONSE" | sed '$d')
+            fi
+
+            STATUS=""
+            if [ "$HTTP_CODE" = "200" ]; then
+              STATUS=$(printf '%s' "$BODY" | jq -r '.status // empty' 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+            fi
+            echo "GitForge pipeline run $RUN_ID status: ${STATUS:-unknown} (HTTP $HTTP_CODE)"
+
+            # Retry transport loss, rate limiting, and server errors only.
+            # Authentication, authorization, malformed IDs, and redirects are
+            # configuration/protocol failures; polling them for 30 minutes
+            # cannot recover and hides the actionable cause.
+            case "$HTTP_CODE" in
+              200|000|408|429|5??) ;;
+              [1-9][0-9][0-9])
+                echo "GitForge status endpoint returned non-retryable HTTP $HTTP_CODE" >&2
+                exit 1
+                ;;
+              *)
+                echo "GitForge status endpoint returned invalid HTTP code: $HTTP_CODE" >&2
+                exit 1
+                ;;
+            esac
 
             case "$STATUS" in
-              completed|succeeded|success|passed|failed|failure|cancelled|canceled|timed_out|timeout|error)
+              completed|succeeded|success|passed)
                 echo "terminal_status=$STATUS" >> "$GITHUB_OUTPUT"
-                case "$STATUS" in
-                  completed|succeeded|success|passed) exit 0 ;;
-                  *) echo "GitForge job reached unsuccessful terminal state: $STATUS" >&2; exit 1 ;;
-                esac
+                exit 0
+                ;;
+              failed|failure|cancelled|canceled|timed_out|timeout|error)
+                CAUSE=$(printf '%s' "$BODY" | jq -r '.error // empty' 2>/dev/null | head -c 400 || true)
+                if [ -n "$CAUSE" ]; then
+                  echo "GitForge failure cause: $CAUSE" >&2
+                fi
+                echo "GitForge job reached unsuccessful terminal state: $STATUS" >&2
+                echo "terminal_status=$STATUS" >> "$GITHUB_OUTPUT"
+                exit 1
                 ;;
               *)
                 if [ "$(date +%s)" -ge "$deadline" ]; then
