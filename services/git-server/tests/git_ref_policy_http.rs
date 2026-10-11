@@ -120,7 +120,7 @@ async fn seed_database(
     if !required_checks.is_empty() {
         let checks: Vec<String> = required_checks
             .iter()
-            .map(|name| name.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         gitforge_db::queries::RepoQueries::update_policy(&pool, repo_id, &checks, true)
             .await
