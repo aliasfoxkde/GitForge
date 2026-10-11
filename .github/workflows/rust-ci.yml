@@ -55,10 +55,6 @@ jobs:
   clippy:
     name: Clippy
     runs-on: [self-hosted, linux, x64, gitforge-github]
-    env:
-      # aws-lc-sys's build script writes assembler scratch to TMPDIR; /tmp is
-      # quota-constrained on this runner (see codeql.yml Build Rust).
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Same runner PATH fix as the fmt job (see codeql.yml).
@@ -78,6 +74,12 @@ jobs:
           toolchain: stable
           components: clippy
       - name: Run clippy
+        # aws-lc-sys's build script writes assembler scratch to TMPDIR; /tmp is
+        # quota-constrained on this runner (see codeql.yml Build Rust). Step
+        # env, not job env: the runner context is unavailable at jobs.<id>.env
+        # and its use there invalidates the whole workflow file.
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # ─── Shell linting ──────────────────────────────────────────────────────────
@@ -119,8 +121,6 @@ jobs:
     env:
       GITFORGE_DOCKER_TIMEOUT_SECS: "600"
       GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
-      # /tmp is quota-constrained on this runner (see codeql.yml Build Rust).
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Same runner PATH fix as the fmt job (see codeql.yml).
@@ -139,6 +139,11 @@ jobs:
         with:
           toolchain: stable
       - name: Run tests
+        # /tmp is quota-constrained on this runner (see codeql.yml Build Rust).
+        # Step env, not job env: the runner context is unavailable at
+        # jobs.<id>.env and its use there invalidates the workflow file.
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo test --workspace --locked --no-fail-fast
 
   # ─── Serialized test run ───────────────────────────────────────────────────
@@ -150,8 +155,6 @@ jobs:
     env:
       GITFORGE_DOCKER_TIMEOUT_SECS: "600"
       GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
-      # /tmp is quota-constrained on this runner (see codeql.yml Build Rust).
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Same runner PATH fix as the fmt job (see codeql.yml).
@@ -175,6 +178,11 @@ jobs:
           pkg-config --exists systemd libudev openssl
           echo "native development dependencies are available on the managed runner"
       - name: Run serialized tests
+        # /tmp is quota-constrained on this runner (see codeql.yml Build Rust).
+        # Step env, not job env: the runner context is unavailable at
+        # jobs.<id>.env and its use there invalidates the workflow file.
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
   # ─── Coverage ───────────────────────────────────────────────────────────────
@@ -189,8 +197,6 @@ jobs:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
       GITFORGE_DOCKER_TIMEOUT_SECS: "600"
       GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
-      # /tmp is quota-constrained on this runner (see codeql.yml Build Rust).
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Same runner PATH fix as the fmt job (see codeql.yml).
@@ -216,6 +222,11 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@562f912bf8a1174eb1007c4afe216a9187a8d722 # cargo-llvm-cov
       - name: Generate coverage report
+        # /tmp is quota-constrained on this runner (see codeql.yml Build Rust).
+        # Step env, not job env: the runner context is unavailable at
+        # jobs.<id>.env and its use there invalidates the workflow file.
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo llvm-cov --workspace --all-features --locked --no-fail-fast --cobertura --output-path cobertura.xml -- --test-threads=1
 
       - name: Publish coverage diagnostics
@@ -306,9 +317,6 @@ jobs:
   build:
     name: Build
     runs-on: [self-hosted, linux, x64, gitforge-github]
-    env:
-      # /tmp is quota-constrained on this runner (see codeql.yml Build Rust).
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Same runner PATH fix as the fmt job (see codeql.yml).
@@ -328,4 +336,9 @@ jobs:
           toolchain: stable
           targets: x86_64-unknown-linux-musl
       - name: Build release
+        # /tmp is quota-constrained on this runner (see codeql.yml Build Rust).
+        # Step env, not job env: the runner context is unavailable at
+        # jobs.<id>.env and its use there invalidates the workflow file.
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo build --workspace --release --locked
