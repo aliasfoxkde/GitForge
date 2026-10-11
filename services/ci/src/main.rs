@@ -783,12 +783,20 @@ async fn trigger_pipeline(
             Ok((existing, was_new)) => {
                 if !was_new {
                     let run_id = existing.run_id.map(|id| id.to_string());
+                    // The echo is load-bearing contract: clients correlate by
+                    // re-POSTing the byte-identical tuple and comparing
+                    // `trigger_id`, so an active request must answer with the
+                    // SAME id it minted — a fresh or absent id reads as "the
+                    // original settled without a runnable trace" and makes
+                    // the caller abandon recoverable work (the gitforge-ci
+                    // workflow fails fast on exactly that signal).
                     return (
                         StatusCode::ACCEPTED,
                         Json(serde_json::json!({
                             "status": if run_id.is_some() { "accepted" } else { "queued" },
                             "event_id": existing.id.to_string(),
                             "pipeline_run_id": run_id,
+                            "trigger_id": existing.id.to_string(),
                             "repo_id": repo_id.to_string(),
                             "new_hash": request.new_hash,
                             "deduplicated": true,
@@ -1726,16 +1734,20 @@ async fn sweep_terminal_workspaces(pool: &gitforge_db::Pool) -> usize {
     removed
 }
 
-/// Create an isolated checkout for a push-triggered run when the caller did
-/// not supply an already prepared workspace. The checkout is rooted under a
-/// configured directory and named by the immutable run ID, so concurrent runs
-/// cannot share mutable source state.
-async fn prepare_run_workspace(
+/// Resolve a repository's durable registration and verify its git storage is
+/// usable right now, returning the canonicalized repository path.
+///
+/// A registered repository whose git path has disappeared (a retired runtime
+/// directory, an unmounted volume) can never produce a checkout, and no
+/// amount of retrying restores it. Callers gate run creation on this BEFORE
+/// any durable row is written: minting the run first and failing in
+/// workspace prep left every trigger — and every retry of the same tuple
+/// after the request settled terminal — a ghost `failed` run with zero job
+/// rows (observed live 2026-10-10).
+async fn resolve_repository_git_path(
     pool: &gitforge_db::Pool,
     repo_id: gitforge_common::RepoId,
-    run_id: gitforge_common::PipelineRunId,
-    commit_hash: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<std::path::PathBuf> {
     let repository = gitforge_db::queries::RepoQueries::get(pool, repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repository {repo_id} is not registered"))?;
@@ -1754,6 +1766,20 @@ async fn prepare_run_workspace(
             source.display()
         ));
     }
+    Ok(source)
+}
+
+/// Create an isolated checkout for a push-triggered run when the caller did
+/// not supply an already prepared workspace. The checkout is rooted under a
+/// configured directory and named by the immutable run ID, so concurrent runs
+/// cannot share mutable source state.
+async fn prepare_run_workspace(
+    pool: &gitforge_db::Pool,
+    repo_id: gitforge_common::RepoId,
+    run_id: gitforge_common::PipelineRunId,
+    commit_hash: &str,
+) -> anyhow::Result<String> {
+    let source = resolve_repository_git_path(pool, repo_id).await?;
 
     let root = workspace_root();
     tokio::fs::create_dir_all(&root).await?;
@@ -2264,6 +2290,21 @@ async fn handle_push_event(
         .get(&repo_id)
         .cloned()
         .flatten();
+
+    // A repository whose git storage is gone can never produce a checkout,
+    // and the committed-config loader above cannot see it: `git --git-dir`
+    // against a missing path fails like an absent config file, the default
+    // pipeline gets selected, and the run row below was minted only to be
+    // graded failed moments later — one ghost run per trigger and per retry
+    // of the settled request (observed live 2026-10-10). Gate BEFORE any
+    // durable row exists. Terminal, not retryable: a retired git path does
+    // not heal, and the settled, error-bearing trigger request is the
+    // traceable artifact.
+    if let Some(pool) = scheduler_db {
+        if let Err(error) = resolve_repository_git_path(pool, repo_id).await {
+            return Err(TriggerFailure::terminal(error));
+        }
+    }
 
     // Create trigger event
     let trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
@@ -5504,6 +5545,89 @@ jobs:
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_empty(),
             "a ref-deletion push must not prepare a run workspace"
+        );
+    }
+
+    // --- Ghost-run gate regression test (observed live 2026-10-10) ---
+    //
+    // A registered repository whose git path is gone settles the trigger
+    // terminally. The committed-config loader cannot see the missing path
+    // (`git --git-dir` against it fails exactly like an absent config file),
+    // so without the pre-flight gate the default pipeline was planned, the
+    // run row was minted, and workspace prep graded it failed — one ghost
+    // `failed` run per trigger and per retry of the settled request. The
+    // gate must fire before any durable row exists and classify the failure
+    // non-retryable.
+
+    #[tokio::test]
+    async fn test_handle_push_event_fails_terminal_without_run_for_missing_git_path() {
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<
+            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let (pool, repo_id) = test_pool_with_repository("/nonexistent/ghost.git".to_string()).await;
+        let envelope = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "0".repeat(40),
+                new_hash: "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        );
+
+        let failure = handle_push_event(
+            &envelope,
+            &scheduler,
+            &pipeline_cache,
+            Some(&pool),
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        .expect_err("a missing git path is a trigger failure");
+
+        assert!(
+            !failure.retryable,
+            "a retired git path does not heal by retrying: {failure:?}"
+        );
+        assert!(
+            failure.run_id.is_none(),
+            "the gate fires before any run exists, so none is attached: {failure:?}"
+        );
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("git path is unavailable"),
+            "the terminal cause must name the unavailable git path: {failure:?}"
+        );
+
+        // The durable surface the e2e suite asserts: no run row may exist
+        // for a repository with no git path.
+        let runs = gitforge_db::queries::PipelineRunQueries::list(&pool)
+            .await
+            .unwrap();
+        assert!(
+            runs.is_empty(),
+            "the gate must fire before run creation: {runs:?}"
+        );
+        assert!(
+            run_workspace_paths
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "no workspace may be prepared for a repository with no git path"
         );
     }
 }
