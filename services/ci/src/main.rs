@@ -970,7 +970,12 @@ async fn load_pipeline_from_commit(
         }
 
         let yaml = String::from_utf8(show.stdout).map_err(|error| {
-            anyhow::anyhow!("{config_path} at {commit_hash} is not valid UTF-8: {error}")
+            // Bytes that are not valid UTF-8 can never parse as a pipeline
+            // definition, so re-attempting only spends the retry budget.
+            // Classify with the unparseable-definition failures: terminal.
+            anyhow::Error::new(InvalidPipelineConfig(format!(
+                "{config_path} at {commit_hash} is not valid UTF-8: {error}"
+            )))
         })?;
         return PipelineDefinition::parse(&yaml).map(Some).map_err(|error| {
             anyhow::Error::new(InvalidPipelineConfig(format!(
@@ -5504,6 +5509,239 @@ jobs:
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_empty(),
             "a ref-deletion push must not prepare a run workspace"
+        );
+    }
+
+    // --- Trigger settlement classification ---
+    //
+    // A committed definition that can never parse must fail terminally and
+    // visibly instead of spending the retry budget on an unfixable input.
+    // Both malformed shapes are classified at `load_pipeline_from_commit`:
+    // unparseable YAML and bytes that are not valid UTF-8.
+
+    /// Bare repository with one commit per committed-config shape, returning
+    /// the repository's git path and the (valid, unparseable, non-UTF-8)
+    /// commit hashes.
+    async fn commit_config_variants() -> (String, String, String, String) {
+        let base =
+            std::env::temp_dir().join(format!("gitforge-ci-loadpipe-{}", uuid::Uuid::new_v4()));
+        let bare = base.join("variants.git");
+        std::fs::create_dir_all(&bare).expect("create bare dir");
+        run_git(
+            &[
+                "init",
+                "--bare",
+                "--initial-branch=main",
+                bare.to_str().expect("utf8 bare path"),
+            ],
+            None,
+        )
+        .await;
+        let work = base.join("seed");
+        std::fs::create_dir_all(&work).expect("create seed dir");
+        run_git(&["init", "--initial-branch=main"], Some(&work)).await;
+        run_git(&["config", "user.email", "dev@example.test"], Some(&work)).await;
+        run_git(
+            &["config", "user.name", "Classification Harness"],
+            Some(&work),
+        )
+        .await;
+        run_git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                bare.to_str().expect("utf8 bare path"),
+            ],
+            Some(&work),
+        )
+        .await;
+
+        let valid = format!(
+            "name: variant\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment: {{}}\njobs:\n  - name: v\n    image: alpine:latest\n    steps:\n      - name: s\n        run: echo v\n"
+        );
+        std::fs::write(work.join(".gitforge.yml"), valid).expect("write valid config");
+        run_git(&["add", "."], Some(&work)).await;
+        run_git(&["commit", "-m", "valid"], Some(&work)).await;
+        run_git(&["push", "origin", "main"], Some(&work)).await;
+        let valid_hash = run_git(&["rev-parse", "HEAD"], Some(&work)).await;
+
+        std::fs::write(work.join(".gitforge.yml"), "name: [unclosed").expect("write yaml config");
+        run_git(&["add", "."], Some(&work)).await;
+        run_git(&["commit", "-m", "unparseable"], Some(&work)).await;
+        run_git(&["push", "-f", "origin", "main"], Some(&work)).await;
+        let yaml_hash = run_git(&["rev-parse", "HEAD"], Some(&work)).await;
+
+        std::fs::write(work.join(".gitforge.yml"), [0xffu8, 0xfe, b'c', b'i', 0x00])
+            .expect("write binary config");
+        run_git(&["add", "."], Some(&work)).await;
+        run_git(&["commit", "-m", "non-utf8"], Some(&work)).await;
+        run_git(&["push", "-f", "origin", "main"], Some(&work)).await;
+        let binary_hash = run_git(&["rev-parse", "HEAD"], Some(&work)).await;
+
+        (
+            bare.display().to_string(),
+            valid_hash,
+            yaml_hash,
+            binary_hash,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_load_pipeline_from_commit_classifies_config_errors_terminal() {
+        let (git_path, valid_hash, yaml_hash, binary_hash) = commit_config_variants().await;
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let user = gitforge_db::models::User::new(
+            "classification-test".to_string(),
+            "classification@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .expect("create user");
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "classification-test".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: git_path.clone(),
+                required_checks: Vec::new(),
+                deny_non_fast_forward: false,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("create repository");
+
+        // Control: a well-formed committed definition loads.
+        let valid = load_pipeline_from_commit(&pool, repo_id, &valid_hash)
+            .await
+            .expect("valid config loads");
+        assert_eq!(
+            valid.expect("valid config present").name,
+            "variant",
+            "the committed definition is authoritative"
+        );
+
+        // Unparseable YAML is terminal: `InvalidPipelineConfig`.
+        let yaml_error = load_pipeline_from_commit(&pool, repo_id, &yaml_hash)
+            .await
+            .expect_err("unparseable config must fail");
+        assert!(
+            yaml_error.is::<InvalidPipelineConfig>(),
+            "unparseable YAML must be classified terminal, got: {yaml_error:#}"
+        );
+
+        // Non-UTF-8 bytes can never parse either — same terminal class,
+        // not a retryable environment failure.
+        let binary_error = load_pipeline_from_commit(&pool, repo_id, &binary_hash)
+            .await
+            .expect_err("non-UTF-8 config must fail");
+        assert!(
+            binary_error.is::<InvalidPipelineConfig>(),
+            "non-UTF-8 config must be classified terminal, got: {binary_error:#}"
+        );
+    }
+
+    /// The retryable settle path. An unregistered repository is the one
+    /// retryable failure inducible deterministically: registration is an
+    /// out-of-band fix, so the request keeps its budget (`pending`, attempt
+    /// counted, no terminal error) instead of being marked `failed`. The
+    /// terminal paths are pinned by `tests/ci_trigger_settlement.rs`.
+    #[tokio::test]
+    async fn test_process_trigger_event_retries_unregistered_repo() {
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+
+        let repo_id = gitforge_common::RepoId::new();
+        let request = gitforge_db::models::PipelineTriggerRequest::new(
+            repo_id,
+            "refs/heads/main".to_string(),
+            "0".repeat(40),
+            "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
+        );
+        let request_id = request.id;
+        let (_, was_new) =
+            gitforge_db::queries::TriggerRequestQueries::create_or_existing(&pool, &request)
+                .await
+                .expect("create trigger request");
+        assert!(was_new, "the harness seeds a fresh request");
+
+        let event = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "0".repeat(40),
+                new_hash: "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        )
+        .with_correlation(request_id);
+
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<
+            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let run_waiters: Arc<
+            std::sync::Mutex<
+                HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
+            >,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        process_trigger_event(
+            &event,
+            &scheduler,
+            &pipeline_cache,
+            Some(&pool),
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+            &run_waiters,
+        )
+        .await;
+
+        let settled = gitforge_db::queries::TriggerRequestQueries::get(&pool, request_id)
+            .await
+            .expect("read settled request")
+            .expect("trigger request row survives");
+        assert_eq!(
+            settled.status, "pending",
+            "a retryable failure keeps the retry budget"
+        );
+        assert_eq!(settled.attempts, 1, "the consumed attempt is counted");
+        assert!(
+            settled.error.is_none(),
+            "a retryable failure is not recorded as terminal: {:?}",
+            settled.error
+        );
+        assert!(settled.run_id.is_none(), "no run was created");
+
+        let runs = gitforge_db::queries::PipelineRunQueries::list(&pool)
+            .await
+            .expect("list runs");
+        assert!(
+            runs.is_empty(),
+            "a retryable failure must not create a run row"
+        );
+        assert!(
+            pipeline_cache
+                .lock()
+                .expect("pipeline cache lock")
+                .is_empty(),
+            "no pipeline may be cached for a repo that is not registered"
         );
     }
 }
