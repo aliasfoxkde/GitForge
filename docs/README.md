@@ -27,6 +27,7 @@ This directory contains both current product documentation and historical planni
 | Build queue plan | [BUILD_QUEUE_PLAN.md](BUILD_QUEUE_PLAN.md) |
 | Dated audits | [audits/](audits/) |
 | Dated handoffs | [handoffs/](handoffs/) |
+| Aegis storage recovery handoff (2026-10-11) | [handoffs/GITFORGE_AEGIS_REPOSITORY_STORAGE_RECOVERY_2026-10-11.md](handoffs/GITFORGE_AEGIS_REPOSITORY_STORAGE_RECOVERY_2026-10-11.md) |
 | Comprehensive execution plan | [planning/COMPREHENSIVE_EXECUTION_PLAN_2026-08-28.md](planning/COMPREHENSIVE_EXECUTION_PLAN_2026-08-28.md) |
 
 `audits/` holds [CODE_SMELLS_2026-09-20.md](audits/CODE_SMELLS_2026-09-20.md) and
