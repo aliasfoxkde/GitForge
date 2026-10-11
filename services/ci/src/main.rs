@@ -953,7 +953,7 @@ async fn trigger_request_state(
     trigger_id: uuid::Uuid,
     repo_id: gitforge_common::RepoId,
     new_hash: &str,
-) -> Response {
+) -> (StatusCode, Json<serde_json::Value>) {
     let Some(pool) = db else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -961,8 +961,7 @@ async fn trigger_request_state(
                 "error": "trigger_state_unavailable",
                 "message": "trigger requests are not durable in this deployment; correlation by trigger_id is unavailable"
             })),
-        )
-            .into_response();
+        );
     };
     let row = match gitforge_db::queries::TriggerRequestQueries::get(pool, trigger_id).await {
         Ok(row) => row,
@@ -974,8 +973,7 @@ async fn trigger_request_state(
                     "error": "trigger_state_read_failed",
                     "message": error.to_string(),
                 })),
-            )
-                .into_response();
+            );
         }
     };
     let Some(row) = row else {
@@ -986,8 +984,7 @@ async fn trigger_request_state(
                 "message": "no durable trigger request carries this id",
                 "trigger_id": trigger_id.to_string(),
             })),
-        )
-            .into_response();
+        );
     };
     if row.repo_id != repo_id || row.new_hash != new_hash {
         return (
@@ -997,8 +994,7 @@ async fn trigger_request_state(
                 "message": "the addressed trigger request belongs to a different (repo_id, new_hash) tuple",
                 "trigger_id": row.id.to_string(),
             })),
-        )
-            .into_response();
+        );
     }
 
     let (status, pipeline_run_id, error) =
@@ -1047,7 +1043,6 @@ async fn trigger_request_state(
             "deduplicated": false,
         })),
     )
-        .into_response()
 }
 
 fn validate_workspace_path(path: &str) -> Result<String, String> {

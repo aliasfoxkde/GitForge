@@ -683,7 +683,7 @@ async fn test_failed_trigger_state_read_names_the_cause_without_minting() {
     assert_eq!(state["trigger_id"].as_str(), Some(original_id.as_str()));
     assert!(
         state["error"]
-            .as_deref()
+            .as_str()
             .is_some_and(|error| error.contains("git path is unavailable")),
         "the read must surface the recorded cause: {state}"
     );
