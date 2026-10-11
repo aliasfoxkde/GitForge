@@ -237,7 +237,7 @@ exist on the host at all. All rows are `visibility=private` except row 2
 
 ## 5. Root-cause investigation: how storage can and cannot disappear
 
-Code facts (this worktree, HEAD `8431f11`; the deployed engine is bundle
+Code facts (this worktree, HEAD `0fd54f7`; the deployed engine is bundle
 `gitforge-4d72efc2-20261010` — same lineage, lines re-verify at that SHA
 before citing in a code change):
 
@@ -253,22 +253,32 @@ before citing in a code change):
   path, so a staged sibling directory can never be resolved by accident.
 - The engine's only repo-storage delete primitive is
   `FileStorageBackend::delete` (`remove_dir_all`,
-  crates/gitforge-core/src/storage.rs:109-120). Its **only** production
-  caller is the create-rollback path in `create_repo`
-  (crates/gitforge-api/src/routes/repo.rs:286) — i.e. it runs only when the
-  DB insert just failed for a repo whose storage was created milliseconds
-  earlier.
+  crates/gitforge-core/src/storage.rs:109-120). Its only live caller is the
+  create-rollback path in `create_repo`
+  (crates/gitforge-api/src/routes/repo.rs:286) — it runs when the DB insert
+  just failed for storage created moments earlier. There is also a second
+  `StorageBackend::delete` caller, `RepoService::delete`
+  (crates/gitforge-core/src/repo.rs:124-136), which removes storage without
+  a DB interaction; it is currently dead code (`let _repo_service = …` in
+  services/git-server/src/main.rs:106), but could create this husk shape if
+  a future caller wires it into lifecycle code.
 - The user-facing delete route `DELETE /api/repos/{id}`
   (crates/gitforge-api/src/routes/repo.rs:360-417) deletes **only the DB
   row** (`RepoQueries::delete`, crates/gitforge-db/src/queries.rs:400) and
   never touches storage — the inverse hazard (orphaned storage), and it
   cannot produce this incident's shape (row present, storage absent).
-- Row deletion is FK-blocked in practice: `pipelines`
+- Row deletion is FK-gated in schema: `pipelines`
   (crates/gitforge-db/src/connection.rs:281), `pipeline_runs` (:316), and
-  `pipeline_trigger_requests` (:359) reference `repositories(id)`
-  (`jobs` at :686 is `ON DELETE SET NULL`). Rows with runs cannot be
-  deleted through the API at all — which is why "husking" (keeping the row,
-  removing storage out-of-band) was the only available cleanup shape.
+  `pipeline_trigger_requests` (:359) reference `repositories(id)`, but the
+  API path is not blocked. `RepoQueries::delete`
+  (crates/gitforge-db/src/queries.rs:400-426) manually cascades dependent
+  history before deleting the row in one `BEGIN IMMEDIATE` transaction, by
+  design. `review_runs` at `connection.rs:686` uses `ON DELETE SET NULL`;
+  `jobs` at `:509` references `pipeline_runs`, not `repositories`. Thus rows
+  with runs can be retired through the API (row and history), which would
+  orphan storage because `delete_repo` never touches it. What no live engine
+  path does is remove storage while keeping the row; that observed husk
+  shape still indicates an out-of-band removal, absent further evidence.
 
 Conclusion (matches and extends PA I1): **no engine code path removes
 registered storage while leaving the row**, and the retained journal shows
@@ -339,7 +349,7 @@ No candidate above is a recovery authority: each needs the
 `merge-base --is-ancestor <last-db-hash>` gate (U5) before it can be
 declared a superset, and every "no NAS candidate" row stays **unknown**, not
 "not found", until its bounded search completes (never label an
-inaccessible source as absent — TaskWizer handoff, Phase 0 step 6).
+inaccessible source as absent — TaskWizer handoff, completion criterion 7).
 
 ## 8. Fleet recovery phases
 
@@ -429,7 +439,9 @@ receipt. For each restored row, in order:
 
 ## 11. Rollback
 
-Recovery only ever adds a missing directory; the DB is never written.
+Recovery never changes an existing database row: the `repositories` row
+must remain byte-identical (§10.4). Verification pushes append
+`pipeline_runs` evidence (§10.3); no existing run or row is edited/deleted.
 
 - Before §10 passes: `mv -T "$LIVE" "$STAGE"` — move the published tree
   back to the staging name and **preserve it there**; never delete or
@@ -486,10 +498,11 @@ the PA S2 fallback and `6e005c62` witness.
 
 ## 14. Exit criteria (measurable)
 
-1. 21/21 rows have an evidence-backed disposition: restored-and-proven,
-   husk-retained (documented), or retired-with-receipt. Zero rows remain
-   "unknown" except explicitly-unavailable sources recorded with
-   follow-ups (never labeled absent).
+1. All 15 missing rows have an evidence-backed disposition:
+   restored-and-proven, husk-retained (documented), or retired-with-receipt.
+   The 6 surviving rows are receipted as live in the closing census (§8
+   Phase 4). Zero missing rows remain "unknown" except explicitly
+   unavailable sources recorded with follow-ups (never labeled absent).
 2. Every *restored* row passes §10: both transports answer `ls-remote`
    with the receipt SHA; a fresh clone's `rev-parse HEAD` matches; a new
    non-zero-`commit_hash` run exists with a populated job workspace; the
