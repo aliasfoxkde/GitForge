@@ -111,6 +111,28 @@ impl std::fmt::Display for InvalidPipelineConfig {
 
 impl std::error::Error for InvalidPipelineConfig {}
 
+/// A repository lookup that failed on the database itself — busy, pool
+/// exhausted, connection lost — rather than a definitive answer about the
+/// repository or its git storage. `resolve_repository_git_path` wraps the
+/// `RepoQueries` error in this so the trigger gate can keep the request's
+/// retry budget for a contention failure; a lookup that *succeeded* with a
+/// bad answer (unregistered repository, missing git path) stays untyped and
+/// is classified terminal.
+#[derive(Debug)]
+struct RepositoryLookupUnavailable(gitforge_common::Error);
+
+impl std::fmt::Display for RepositoryLookupUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "repository lookup failed on the database: {}", self.0)
+    }
+}
+
+impl std::error::Error for RepositoryLookupUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 /// How a trigger request's processing ended. `Ignored` covers payloads that
 /// legitimately produce no run (non-push envelopes, ref-deletion sentinels);
 /// it is reported without a run id rather than with a fabricated one.
@@ -1744,12 +1766,19 @@ async fn sweep_terminal_workspaces(pool: &gitforge_db::Pool) -> usize {
 /// workspace prep left every trigger — and every retry of the same tuple
 /// after the request settled terminal — a ghost `failed` run with zero job
 /// rows (observed live 2026-10-10).
+///
+/// The `RepoQueries` read failing on the database itself is a different
+/// class: it carries no verdict about the repository at all. It is wrapped
+/// in [`RepositoryLookupUnavailable`] so [`classify_repository_path_failure`]
+/// can keep the trigger's retry budget for it; a definitive answer never
+/// carries the marker.
 async fn resolve_repository_git_path(
     pool: &gitforge_db::Pool,
     repo_id: gitforge_common::RepoId,
 ) -> anyhow::Result<std::path::PathBuf> {
     let repository = gitforge_db::queries::RepoQueries::get(pool, repo_id)
-        .await?
+        .await
+        .map_err(|error| anyhow::Error::new(RepositoryLookupUnavailable(error)))?
         .ok_or_else(|| anyhow::anyhow!("repository {repo_id} is not registered"))?;
     let source = std::fs::canonicalize(&repository.git_path).map_err(|error| {
         anyhow::anyhow!(
@@ -1767,6 +1796,19 @@ async fn resolve_repository_git_path(
         ));
     }
     Ok(source)
+}
+
+/// Classify a `resolve_repository_git_path` failure for the trigger
+/// contract. A lookup that failed on the database itself is contention the
+/// request may outlive — retryable. Every other failure is a definitive
+/// answer (unregistered repository, missing or non-directory git path) that
+/// no retry heals — terminal, while no durable row exists to attach.
+fn classify_repository_path_failure(error: anyhow::Error) -> TriggerFailure {
+    if error.is::<RepositoryLookupUnavailable>() {
+        TriggerFailure::retryable(error)
+    } else {
+        TriggerFailure::terminal(error)
+    }
 }
 
 /// Create an isolated checkout for a push-triggered run when the caller did
@@ -2297,12 +2339,16 @@ async fn handle_push_event(
     // pipeline gets selected, and the run row below was minted only to be
     // graded failed moments later — one ghost run per trigger and per retry
     // of the settled request (observed live 2026-10-10). Gate BEFORE any
-    // durable row exists. Terminal, not retryable: a retired git path does
-    // not heal, and the settled, error-bearing trigger request is the
-    // traceable artifact.
+    // durable row exists. The split is typed, not string-matched: a lookup
+    // that failed on the database itself (busy, pool exhausted) keeps the
+    // request's retry budget — this read runs after the loader's, and pool
+    // exhaustion between the two is real contention; a definitive verdict
+    // (unregistered repository, missing or non-directory git path) settles
+    // terminal, because a retired git path does not heal and the settled,
+    // error-bearing trigger request is the traceable artifact.
     if let Some(pool) = scheduler_db {
         if let Err(error) = resolve_repository_git_path(pool, repo_id).await {
-            return Err(TriggerFailure::terminal(error));
+            return Err(classify_repository_path_failure(error));
         }
     }
 
@@ -5628,6 +5674,162 @@ jobs:
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_empty(),
             "no workspace may be prepared for a repository with no git path"
+        );
+    }
+
+    // --- Retry classification of the git-path preflight ---
+    //
+    // `resolve_repository_git_path` has two fundamentally different failure
+    // classes: the `RepoQueries::get` lookup failing on the database itself
+    // (busy, pool exhausted — contention a retry may outlive), and a
+    // definitive answer that no retry heals (unregistered repository, a git
+    // path that is missing or not a directory). The trigger gate must keep
+    // the request's retry budget for the former and settle terminally only
+    // for the latter — in both cases before any durable row exists.
+
+    /// A closed pool is the deterministic stand-in for the transient
+    /// database-error class at this seam: the query layer returns a genuine
+    /// `ErrorKind::Database` failure without timing dependence. (This pool
+    /// is WAL with a 30 s busy timeout, so a live SQLITE_BUSY cannot be
+    /// produced on demand without stalling the test for the whole timeout;
+    /// the typed contract asserted here is what the trigger gate classifies
+    /// on.) The registered repository's missing git path provides the
+    /// control: a definitive verdict must not carry the lookup marker.
+    #[tokio::test]
+    async fn test_resolve_repository_git_path_types_db_lookup_error_as_transient() {
+        let (pool, repo_id) = test_pool_with_repository("/nonexistent/ghost.git".to_string()).await;
+
+        let definitive = resolve_repository_git_path(&pool, repo_id)
+            .await
+            .expect_err("a missing git path is a resolution failure");
+        assert!(
+            !definitive.is::<RepositoryLookupUnavailable>(),
+            "a definitive missing git path must not be typed as a db lookup failure: {definitive:#}"
+        );
+
+        pool.pool().close().await;
+        let transient = resolve_repository_git_path(&pool, repo_id)
+            .await
+            .expect_err("a dead pool is a resolution failure");
+        assert!(
+            transient.is::<RepositoryLookupUnavailable>(),
+            "a database lookup failure must be typed transient, not a definitive path verdict: {transient:#}"
+        );
+    }
+
+    /// The gate's classification boundary: a typed database lookup failure
+    /// keeps the request's retry budget (no run exists yet to attach), and
+    /// every definitive path verdict settles terminal.
+    #[test]
+    fn test_classify_repository_path_failure_splits_transient_lookup_from_definitive() {
+        let db_busy = anyhow::Error::new(RepositoryLookupUnavailable(gitforge_common::Error::new(
+            gitforge_common::ErrorKind::Database,
+            "failed to get repository: pool closed",
+        )));
+        let failure = classify_repository_path_failure(db_busy);
+        assert!(
+            failure.retryable,
+            "database contention may clear on retry: {failure:?}"
+        );
+        assert!(
+            failure.run_id.is_none(),
+            "the lookup fires before any run exists: {failure:?}"
+        );
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("repository lookup failed"),
+            "the transient cause must stay diagnosable on the failure: {failure:?}"
+        );
+
+        let definitive = anyhow::anyhow!(
+            "repository {} git path is unavailable (/srv/repo.git): No such file or directory",
+            gitforge_common::RepoId::new()
+        );
+        let failure = classify_repository_path_failure(definitive);
+        assert!(
+            !failure.retryable,
+            "a retired git path does not heal by retrying: {failure:?}"
+        );
+        assert!(
+            failure.run_id.is_none(),
+            "the gate fires before any run exists: {failure:?}"
+        );
+    }
+
+    /// Observable seam contract: a database-layer failure while handling a
+    /// push keeps the retry budget and mints no durable trace. At this seam
+    /// the failure surfaces at the committed-config loader (the first db
+    /// read, already retryable before and after the typed-classification
+    /// fix), so this is a reorder guard: if the git-path gate ever runs
+    /// first, its `classify_repository_path_failure` path must still answer
+    /// retryable here. A transient failure isolated to the gate's own
+    /// lookup is not deterministically injectable at this seam — both reads
+    /// share one pool — so that boundary is pinned directly by the resolver
+    /// and classifier tests above. The zero-run-row assertion is likewise
+    /// out of reach here (the in-memory database dies with the closed pool);
+    /// the missing-path test above pins that shape against a live pool.
+    #[tokio::test]
+    async fn test_handle_push_event_retries_db_failure_before_run_creation() {
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<
+            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let (pool, repo_id) = test_pool_with_repository("/nonexistent/ghost.git".to_string()).await;
+        pool.pool().close().await;
+        let envelope = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: "0".repeat(40),
+                new_hash: "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        );
+
+        let failure = handle_push_event(
+            &envelope,
+            &scheduler,
+            &pipeline_cache,
+            Some(&pool),
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        .expect_err("a dead database is a trigger failure");
+
+        assert!(
+            failure.retryable,
+            "a database-layer failure keeps the request's retry budget: {failure:?}"
+        );
+        assert!(
+            failure.run_id.is_none(),
+            "no run may be minted when the database is unreachable: {failure:?}"
+        );
+        assert!(
+            pipeline_cache
+                .lock()
+                .expect("pipeline cache lock poisoned")
+                .is_empty(),
+            "no pipeline may be planned when the database is unreachable"
+        );
+        assert!(
+            run_workspace_paths
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "no workspace may be prepared when the database is unreachable"
         );
     }
 }
