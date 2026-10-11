@@ -5745,13 +5745,24 @@ mod tests {
             1,
         );
         RunnerQueries::create(&pool, &runner).await.unwrap();
+        // Drive the claim lifecycle the way dispatch really does: the
+        // scheduler assigns under a durable lease and the runner starts
+        // against that lease. The leaseless `assign`/`start` helpers leave
+        // `lease_token` NULL, and a lease-gated heartbeat would then
+        // (correctly) refuse the row.
         JobQueries::update_status(&pool, expired.id, "queued")
             .await
             .unwrap();
-        JobQueries::assign(&pool, expired.id, runner.id)
-            .await
-            .unwrap();
-        JobQueries::start(&pool, expired.id).await.unwrap();
+        assert!(
+            JobQueries::assign_with_lease(&pool, expired.id, runner.id, "wd-lease")
+                .await
+                .unwrap()
+        );
+        assert!(
+            JobQueries::start_with_lease(&pool, expired.id, runner.id, "wd-lease")
+                .await
+                .unwrap()
+        );
         let stale_beat = (Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
         assert!(
             JobQueries::heartbeat(&pool, expired.id, runner.id, "wd-lease")
