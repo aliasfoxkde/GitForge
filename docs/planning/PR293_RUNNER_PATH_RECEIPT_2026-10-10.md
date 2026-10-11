@@ -119,9 +119,36 @@ All commands run in the NVMe worktree
 
 ## 6. Check status — NOT claimed green
 
-At `6ce8b801` the following were queued/in-progress and were **not** verified
-passing; the pushed fix commit replaces them with fresh runs whose outcomes
-are pending at receipt time:
+**Observed at the fix head `59531eca` (2026-10-11 ~02:19–02:28Z).** The
+runner-environment fix is empirically confirmed: on Rust CI run 38104608536
+the previously-0s-failing steps now pass — "Expose runner rustup on PATH"
+success, "Install Rust" success — and the Build job completed green in
+3m10s. Lint Workflows (actionlint) passed, validating the workflow files.
+
+- **Coverage (run 38104608536) FAILED at 5m37s — cause is NOT this fix.**
+  Steps 1–6 succeeded through toolchain provisioning; the failure is two
+  tests in `services/ci/tests/ci_trigger_flow.rs`, a file ADDED by this
+  PR's own commits `c82747c7` (+101 lines) and `940cd8af` (+117 lines):
+  - `test_duplicate_trigger_dedups_onto_single_run` (ci_trigger_flow.rs:335)
+    — asserts `trigger_id` is present in the dedup response; the
+    implementation returns `{"deduplicated":true,...,"pipeline_run_id":null}`
+    with no `trigger_id`.
+  - `test_settled_trigger_retry_mints_fresh_trigger` (ci_trigger_flow.rs:497)
+    — asserts no runs are minted for a repo with no git path; the
+    implementation created 2 `failed` PipelineRuns for the ghost repo.
+  These are feature-contract mismatches in this branch's async-trigger
+  work, surfaced for the first time now that CI can run at all; they are
+  out of scope for the workflow closeout (no `services/` code altered by
+  tasking constraint).
+- Still pending on the single backlogged runner at receipt time: Format,
+  Clippy, Test, Test (Serialized), Security Audit, secrets-scan, Cargo
+  Audit, Aegis Changed-Line Scan, Rust Security, Analyze (rust/go),
+  Enqueue Build to GitForge.
+- Passed at `59531eca`: Build, Supply Chain, Lint Workflows, ShellCheck,
+  integration, e2e, try-merge, check, CodeRabbit; dependency-review
+  skipped by its `vars` gate.
+
+Historical status at the diagnosis head `6ce8b801` (all superseded):
 
 - rust-ci.yml (run 38100998239): Format 114356725640, Clippy 114356725712,
   Test 114356725501, Test (Serialized) 114356725709, Coverage 114356725689,
