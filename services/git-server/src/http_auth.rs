@@ -248,7 +248,7 @@ pub async fn authorize_git_http(
         }
     };
 
-    match (&actor, operation) {
+    match (actor, operation) {
         (None, GitOperation::Read) if repo.is_public() => {
             GitHttpAccess::Authorized { repo, actor: None }
         }
@@ -257,9 +257,10 @@ pub async fn authorize_git_http(
             repo,
             actor: Some(actor),
         },
-        (Some(_), GitOperation::Read) if repo.is_public() => {
-            GitHttpAccess::Authorized { repo, actor }
-        }
+        (Some(actor), GitOperation::Read) if repo.is_public() => GitHttpAccess::Authorized {
+            repo,
+            actor: Some(actor),
+        },
         // A public repository's existence is already public; a 403 states
         // the boundary instead of pretending the repository is missing.
         (Some(actor), GitOperation::Write) if repo.is_public() => {

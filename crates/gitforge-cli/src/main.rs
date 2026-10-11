@@ -395,8 +395,7 @@ fn credential_for(
     // lets a prior helper or prompt produce a working answer instead.
     if let Some(expires_at) = config.refresh_expires_at.as_deref() {
         if chrono::DateTime::parse_from_rfc3339(expires_at)
-            .map(|t| t.with_timezone(&chrono::Utc) <= chrono::Utc::now())
-            .unwrap_or(false)
+            .is_ok_and(|t| t.with_timezone(&chrono::Utc) <= chrono::Utc::now())
         {
             return None;
         }
