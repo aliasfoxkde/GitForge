@@ -21,5 +21,9 @@ futures = { workspace = true }
 # SQLite for MVP - embedded, no server needed
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json"] }
 
+# Refresh-credential digest computation (see RefreshTokenQueries::credential_digest)
+sha2 = { workspace = true }
+hex = { workspace = true }
+
 [lints]
 workspace = true

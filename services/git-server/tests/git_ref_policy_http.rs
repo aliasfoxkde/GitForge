@@ -33,6 +33,9 @@ struct TestServer {
     repo_id: RepoId,
     db_path: std::path::PathBuf,
     base: std::path::PathBuf,
+    /// Live refresh credential for `testowner` (the seeded owner); git
+    /// pushes present it over the transport's auth gate.
+    owner_credential: String,
 }
 
 impl Drop for TestServer {
@@ -64,7 +67,7 @@ async fn spawn_server(required_checks: &[&str]) -> TestServer {
     let db_path = base.join("gitforge.db");
     std::fs::create_dir_all(&git_root).expect("create git root");
 
-    let repo_id = seed_database(&db_path, &git_root, required_checks).await;
+    let (repo_id, owner_credential) = seed_database(&db_path, &git_root, required_checks).await;
 
     let http_port = free_port();
     let ssh_port = free_port();
@@ -88,16 +91,18 @@ async fn spawn_server(required_checks: &[&str]) -> TestServer {
         repo_id,
         db_path,
         base,
+        owner_credential,
     }
 }
 
-/// Seed a database with `testowner/proto`, create its bare repository under
-/// the git root, and configure the repository's ref-update policy.
+/// Seed a database with `testowner/proto` (plus a live owner credential),
+/// create its bare repository under the git root, and configure the
+/// repository's ref-update policy.
 async fn seed_database(
     db_path: &std::path::Path,
     git_root: &std::path::Path,
     required_checks: &[&str],
-) -> RepoId {
+) -> (RepoId, String) {
     let pool = gitforge_db::Pool::new(&db_path.display().to_string())
         .await
         .expect("create sqlite pool");
@@ -111,6 +116,12 @@ async fn seed_database(
     gitforge_db::queries::UserQueries::create(&pool, &user)
         .await
         .expect("create user");
+    let owner_credential = common::seed_refresh_credential(
+        &pool,
+        user_id,
+        chrono::Utc::now() + chrono::Duration::days(30),
+    )
+    .await;
     let repository =
         gitforge_db::models::Repository::new("proto".to_string(), user_id, "git".to_string());
     let repo_id = repository.id;
@@ -139,7 +150,7 @@ async fn seed_database(
         git_root,
         &[],
     );
-    repo_id
+    (repo_id, owner_credential)
 }
 
 async fn wait_healthy(mut child: tokio::process::Child, http_port: u16) -> tokio::process::Child {
@@ -178,7 +189,13 @@ fn make_commit(server: &TestServer, name: &str) -> (String, std::path::PathBuf) 
             "remote",
             "add",
             "origin",
-            &format!("http://127.0.0.1:{}/testowner/proto", server.http_port),
+            &common::authed_remote_url(
+                server.http_port,
+                "testowner",
+                &server.owner_credential,
+                "testowner",
+                "proto",
+            ),
         ],
         &work,
         &[],

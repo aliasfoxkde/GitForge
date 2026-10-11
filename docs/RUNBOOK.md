@@ -104,6 +104,19 @@ curl -X POST http://localhost:42780/api/ssh-keys \
 git clone "ssh://gitforge@localhost:42022/<owner>/<repo>.git"
 ```
 
+**Git over HTTP:** Smart HTTP on :42782 requires authentication since
+2026-10-11 (see `docs/AUTH_DESIGN.md` Appendix A). Reads are anonymous
+only for explicitly public repositories; pushes always need an account
+that may manage the repository (owner/admin/maintainer). The credential
+is the CLI session's refresh credential, served to git by the CLI's
+credential helper:
+
+```bash
+gitforge auth login <username>   # stores the session the helper serves
+git config --global credential.helper '!gitforge auth git-credential'
+git clone "http://localhost:42782/<owner>/<repo>.git"
+```
+
 ### 3. CI Orchestrator (includes Scheduler)
 
 The CI orchestrator manages pipeline execution and job scheduling. The scheduler HTTP API runs within this service on port 42781.

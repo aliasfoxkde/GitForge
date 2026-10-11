@@ -33,6 +33,15 @@ struct TestServer {
     repo_id: RepoId,
     db_path: std::path::PathBuf,
     base: std::path::PathBuf,
+    /// Live refresh credential for `testowner` (the seeded owner).
+    owner_credential: String,
+}
+
+impl TestServer {
+    /// `Authorization` header presenting the owner's credential.
+    fn owner_auth(&self) -> String {
+        common::basic_auth("testowner", &self.owner_credential)
+    }
 }
 
 impl Drop for TestServer {
@@ -57,7 +66,7 @@ async fn spawn_seeded_server(extra_env: &[(&str, &str)]) -> TestServer {
     let db_path = base.join("gitforge.db");
     std::fs::create_dir_all(&git_root).expect("create git root");
 
-    let (repo_id, db_url) = seed_database(&db_path, &git_root).await;
+    let (repo_id, db_url, owner_credential) = seed_database(&db_path, &git_root).await;
 
     let http_port = free_port();
     let ssh_port = free_port();
@@ -82,6 +91,7 @@ async fn spawn_seeded_server(extra_env: &[(&str, &str)]) -> TestServer {
         repo_id,
         db_path,
         base,
+        owner_credential,
     }
 }
 
@@ -112,12 +122,17 @@ async fn spawn_dbless_server() -> TestServer {
         repo_id: RepoId::new(),
         db_path: base.join("none.db"),
         base,
+        owner_credential: String::new(),
     }
 }
 
-/// Seed a database with `testowner/proto` and create its bare repository
-/// under the git root, exactly as the storage layout expects.
-async fn seed_database(db_path: &std::path::Path, git_root: &std::path::Path) -> (RepoId, String) {
+/// Seed a database with `testowner/proto` (plus a live owner credential)
+/// and create its bare repository under the git root, exactly as the
+/// storage layout expects.
+async fn seed_database(
+    db_path: &std::path::Path,
+    git_root: &std::path::Path,
+) -> (RepoId, String, String) {
     // A bare path (no scheme) makes Pool::new create the file via ?mode=rwc.
     let pool = gitforge_db::Pool::new(&db_path.display().to_string())
         .await
@@ -132,6 +147,12 @@ async fn seed_database(db_path: &std::path::Path, git_root: &std::path::Path) ->
     gitforge_db::queries::UserQueries::create(&pool, &user)
         .await
         .expect("create user");
+    let owner_credential = common::seed_refresh_credential(
+        &pool,
+        user_id,
+        chrono::Utc::now() + chrono::Duration::days(30),
+    )
+    .await;
     let repository =
         gitforge_db::models::Repository::new("proto".to_string(), user_id, "git".to_string());
     let repo_id = repository.id;
@@ -151,7 +172,7 @@ async fn seed_database(db_path: &std::path::Path, git_root: &std::path::Path) ->
         git_root,
         &[],
     );
-    (repo_id, db_path.display().to_string())
+    (repo_id, db_path.display().to_string(), owner_credential)
 }
 
 async fn wait_healthy(mut child: tokio::process::Child, http_port: u16) -> tokio::process::Child {
@@ -235,9 +256,16 @@ async fn spawn_trigger_receiver(
     )
 }
 
-/// A commit pushed through the real `git` client; returns its sha.
+/// A commit pushed through the real `git` client as the repo owner;
+/// returns its sha.
 async fn push_a_commit(server: &TestServer, name: &str) -> String {
-    let origin_url = format!("http://127.0.0.1:{}/testowner/proto", server.http_port);
+    let origin_url = common::authed_remote_url(
+        server.http_port,
+        "testowner",
+        &server.owner_credential,
+        "testowner",
+        "proto",
+    );
     let work = server.base.join(format!("work-{name}"));
     std::fs::create_dir_all(&work).expect("create work dir");
     run_git(&["init", "--initial-branch=main"], &work, &[]);
@@ -274,16 +302,19 @@ async fn event_rows(db_path: &std::path::Path) -> Vec<(String, String, i64)> {
 }
 
 /// A legacy route, a path-suffixed route, and both Smart HTTP ref
-/// advertisements are served; malformed packs are rejected with 500.
+/// advertisements are served to the authorized owner; malformed packs are
+/// rejected with 500.
 #[tokio::test]
 async fn test_routes_advertisements_and_malformed_packs() {
     let mut server = spawn_seeded_server(&[]).await;
     let client = reqwest::Client::new();
     let root = format!("http://127.0.0.1:{}", server.http_port);
+    let owner_auth = server.owner_auth();
 
     // Legacy explicit upload-pack route still serves the advertisement.
     let response = client
         .get(format!("{root}/git-upload-pack/testowner/proto"))
+        .header("Authorization", &owner_auth)
         .send()
         .await
         .expect("legacy upload-pack");
@@ -297,6 +328,7 @@ async fn test_routes_advertisements_and_malformed_packs() {
     // The path-suffixed variant delegates to the same handler.
     let response = client
         .get(format!("{root}/git-upload-pack/testowner/proto/extra/path"))
+        .header("Authorization", &owner_auth)
         .send()
         .await
         .expect("path upload-pack");
@@ -307,6 +339,7 @@ async fn test_routes_advertisements_and_malformed_packs() {
         .get(format!(
             "{root}/testowner/proto/info/refs?service=git-receive-pack"
         ))
+        .header("Authorization", &owner_auth)
         .send()
         .await
         .expect("receive-pack advertisement");
@@ -318,6 +351,7 @@ async fn test_routes_advertisements_and_malformed_packs() {
 
     let response = client
         .get(format!("{root}/testowner/proto/info/refs"))
+        .header("Authorization", &owner_auth)
         .send()
         .await
         .expect("default advertisement");
@@ -336,6 +370,7 @@ async fn test_routes_advertisements_and_malformed_packs() {
     ] {
         let response = client
             .post(format!("{root}{path}"))
+            .header("Authorization", &owner_auth)
             .body(b"this is not pkt-line data".to_vec())
             .send()
             .await
@@ -356,7 +391,9 @@ async fn test_unknown_and_unbacked_repositories_are_not_served() {
     let client = reqwest::Client::new();
     let root = format!("http://127.0.0.1:{}", server.http_port);
 
-    // A repository row that does not exist at all.
+    // A repository row that does not exist at all: anonymous callers get
+    // the uniform challenge (indistinguishable from a private repo),
+    // authenticated callers get 404.
     for path in [
         "/testowner/does-not-exist/info/refs?service=git-receive-pack",
         "/testowner/does-not-exist/info/refs",
@@ -365,8 +402,16 @@ async fn test_unknown_and_unbacked_repositories_are_not_served() {
             .get(format!("{root}{path}"))
             .send()
             .await
-            .expect("unknown repo info/refs");
-        assert_eq!(response.status(), 404, "{path}");
+            .expect("anonymous unknown repo info/refs");
+        assert_eq!(response.status(), 401, "anonymous {path}");
+
+        let response = client
+            .get(format!("{root}{path}"))
+            .header("Authorization", server.owner_auth())
+            .send()
+            .await
+            .expect("authenticated unknown repo info/refs");
+        assert_eq!(response.status(), 404, "authenticated {path}");
     }
     for path in [
         "/testowner/does-not-exist/git-upload-pack",
@@ -374,6 +419,7 @@ async fn test_unknown_and_unbacked_repositories_are_not_served() {
     ] {
         let response = client
             .post(format!("{root}{path}"))
+            .header("Authorization", server.owner_auth())
             .body(b"0000".to_vec())
             .send()
             .await
@@ -382,27 +428,26 @@ async fn test_unknown_and_unbacked_repositories_are_not_served() {
     }
 
     // A repository row exists in the database but no bare repository was
-    // provisioned in storage: the storage check must 404, not 500.
+    // provisioned in storage: the storage check must 404, not 500. The
+    // requester must be authorized past the auth gate first, so the row is
+    // owned by the seeded testowner.
     let pool = gitforge_db::Pool::new(&server.db_path.display().to_string())
         .await
         .expect("open db");
-    let user = gitforge_db::models::User::new(
-        "ghostowner".to_string(),
-        "ghost@example.com".to_string(),
-        "hash".to_string(),
-    );
-    gitforge_db::queries::UserQueries::create(&pool, &user)
+    let testowner = gitforge_db::queries::UserQueries::get_by_username(&pool, "testowner")
         .await
-        .expect("create ghost user");
+        .expect("lookup testowner")
+        .expect("testowner exists");
     let ghost =
-        gitforge_db::models::Repository::new("ghost".to_string(), user.id, "git".to_string());
+        gitforge_db::models::Repository::new("ghost".to_string(), testowner.id, "git".to_string());
     gitforge_db::queries::RepoQueries::create(&pool, &ghost)
         .await
         .expect("create ghost repo");
     drop(pool);
 
     let response = client
-        .get(format!("{root}/ghostowner/ghost/info/refs"))
+        .get(format!("{root}/testowner/ghost/info/refs"))
+        .header("Authorization", server.owner_auth())
         .send()
         .await
         .expect("ghost repo info/refs");
@@ -473,6 +518,7 @@ async fn test_oversized_git_bodies_are_rejected() {
 
     let response = client
         .post(format!("{root}/testowner/proto/git-receive-pack"))
+        .header("Authorization", server.owner_auth())
         .body(oversized.clone())
         .send()
         .await
@@ -481,6 +527,7 @@ async fn test_oversized_git_bodies_are_rejected() {
 
     let response = client
         .post(format!("{root}/testowner/proto/git-upload-pack"))
+        .header("Authorization", server.owner_auth())
         .body(oversized)
         .send()
         .await

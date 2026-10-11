@@ -29,6 +29,8 @@ tower-http = { workspace = true }
 futures = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
+# HTTP Basic credential decoding for the Smart HTTP auth gate (http_auth.rs)
+base64 = { workspace = true }
 reqwest = { workspace = true }
 russh = "0.63.2"
 # Host key generation (ThreadRng implements CryptoRng for rand_core 0.10).
