@@ -51,12 +51,21 @@ jobs:
     steps:
       - name: Validate GitForge configuration
         env:
-          GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
+          GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
+          GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
         run: |
           set -euo pipefail
           : "${GITFORGE_SCHEDULER_URL:?GITFORGE_SCHEDULER_URL is required}"
           : "${GITFORGE_REPO_ID:?GITFORGE_REPO_ID is required (GitForge UUID, not GitHub repository_id)}"
-          : "${GITFORGE_API_TOKEN:?GITFORGE_API_TOKEN is required}"
+          : "${GITFORGE_CI_TRIGGER_TOKEN:?GITFORGE_CI_TRIGGER_TOKEN is required (POST /pipelines/trigger)}"
+          : "${GITFORGE_SCHEDULER_OPERATOR_TOKEN:?GITFORGE_SCHEDULER_OPERATOR_TOKEN is required (GET /pipelines/runs/{id})}"
+          # Least privilege requires two distinct credentials; sharing one
+          # value across both roles silently re-creates the old super-token.
+          # This comparison never prints either value.
+          if [ "$GITFORGE_CI_TRIGGER_TOKEN" = "$GITFORGE_SCHEDULER_OPERATOR_TOKEN" ]; then
+            echo "GITFORGE_CI_TRIGGER_TOKEN and GITFORGE_SCHEDULER_OPERATOR_TOKEN must be distinct credentials" >&2
+            exit 1
+          fi
           [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
             echo "GITFORGE_REPO_ID must be a UUID" >&2
             exit 1
@@ -82,18 +91,20 @@ jobs:
           GITFORGE_REF: ${{ github.ref_name }}
           GITFORGE_OLD_SHA: ${{ github.event.before }}
           GITFORGE_NEW_SHA: ${{ github.sha }}
-          GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
+          GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
         run: |
           set -euo pipefail
           # Trigger the GitForge CI service. The service durably records the
           # trigger request, then tries to correlate the created run within
           # its in-request window. A 202 with `pipeline_run_id` is a
           # correlated run; a 202 with only a `trigger_id` is a durable
-          # queued request the poll job correlates. Run status is served by
-          # the scheduler control plane under the same credential
-          # (GET /pipelines/runs/{id}); the gateway route
-          # /api/pipeline-runs/{id} requires a user JWT, which this workflow
-          # deliberately never holds.
+          # queued request the poll job correlates. This step uses ONLY the
+          # least-privilege CI trigger credential
+          # (secrets.GITFORGE_CI_TRIGGER_TOKEN), which the scheduler rejects
+          # on run-status reads; status is polled with the separate scheduler
+          # operator credential (secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN).
+          # The gateway route /api/pipeline-runs/{id} requires a user JWT,
+          # which this workflow deliberately never holds.
           PAYLOAD=$(jq -n \
             --arg repo "$GITFORGE_REPO_ID" \
             --arg ref "$GITFORGE_REF" \
@@ -102,7 +113,7 @@ jobs:
             '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "$GITFORGE_SCHEDULER_URL/pipelines/trigger" \
-            -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+            -H "Authorization: Bearer $GITFORGE_CI_TRIGGER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" 2>&1)
 
@@ -167,7 +178,8 @@ jobs:
           GITFORGE_REF: ${{ github.ref_name }}
           GITFORGE_OLD_SHA: ${{ github.event.before }}
           GITFORGE_NEW_SHA: ${{ github.sha }}
-          GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
+          GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
+          GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
         run: |
           set -euo pipefail
           if [ -n "$RUN_ID" ] && ! [[ "$RUN_ID" =~ ^[0-9a-fA-F-]{36}$ ]]; then
@@ -211,10 +223,12 @@ jobs:
               RESPONSE=""
               HTTP_CODE="000"
               BODY=""
+              # Re-POSTs carry the SAME trigger credential as the original
+              # enqueue so the scheduler's dedup echo contract applies.
               if RESPONSE=$(curl --silent --show-error --max-time 30 \
                 --write-out "\n%{http_code}" \
                 -X POST \
-                -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+                -H "Authorization: Bearer $GITFORGE_CI_TRIGGER_TOKEN" \
                 -H "Content-Type: application/json" \
                 -d "$PAYLOAD" \
                 "$GITFORGE_SCHEDULER_URL/pipelines/trigger"); then
@@ -260,8 +274,10 @@ jobs:
             done
           fi
 
-          # Pipeline runs are served by the scheduler control plane under the
-          # trigger/operator credential (GET /pipelines/runs/{id}).
+          # Pipeline runs are served by the scheduler control plane
+          # (GET /pipelines/runs/{id}) under the scheduler operator
+          # credential ONLY — the scheduler rejects the trigger credential
+          # on this route (401).
           STATUS_URL="$GITFORGE_SCHEDULER_URL/pipelines/runs/$RUN_ID"
           echo "Build enqueued, polling GitForge scheduler for status..."
 
@@ -274,7 +290,7 @@ jobs:
             # deadline instead of failing the check on the first bad response.
             if RESPONSE=$(curl --silent --show-error --max-time 30 \
               --write-out "\n%{http_code}" \
-              -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+              -H "Authorization: Bearer $GITFORGE_SCHEDULER_OPERATOR_TOKEN" \
               -H "Accept: application/json" \
               "$STATUS_URL"); then
               HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -n1)
