@@ -651,6 +651,15 @@ struct PipelineTriggerRequest {
     old_hash: String,
     new_hash: String,
     working_dir: Option<String>,
+    /// When present, the call is a state read of THIS durable trigger
+    /// request rather than a fresh trigger: nothing is recorded, published,
+    /// or deduped, and the response carries the request's settled outcome
+    /// (`accepted` + run id, `failed` + cause) or `queued` while it is still
+    /// in flight. This is the only correlation channel that outlives
+    /// settlement: the active-row dedup stops matching once the consumer
+    /// completes or fails a request, so a plain re-POST can no longer reach
+    /// the original request's outcome at all.
+    trigger_id: Option<uuid::Uuid>,
 }
 
 /// Trigger a pipeline through the same typed push-event path used by Git
@@ -757,6 +766,24 @@ async fn trigger_pipeline(
         },
         None => None,
     };
+
+    // A correlation retry addresses the durable request by id instead of
+    // re-deriving it from the tuple. Once the consumer settles a request —
+    // `completed` with its run seconds after enqueue under load, or
+    // terminally `failed` — the active-row dedup stops matching the tuple
+    // and a plain re-POST can only mint a fresh request: the shape of live
+    // run 38106742159 passing while the gitforge-ci poll job declared
+    // `trigger_lost`. The read is pure: no row is created, no event is
+    // published, no workspace path is recorded.
+    if let Some(correlate) = request.trigger_id {
+        return trigger_request_state(
+            trigger_state.db.as_ref(),
+            correlate,
+            repo_id,
+            &request.new_hash,
+        )
+        .await;
+    }
 
     trigger_state
         .workspace_paths
@@ -905,6 +932,117 @@ async fn trigger_pipeline(
             )
         }
     }
+}
+
+/// Report the durable state of one trigger request. This is the correlation
+/// channel that survives settlement: the endpoint's dedup only matches
+/// `pending`/`processing` rows, so once a request completes (naming its run)
+/// or fails terminally (naming its cause) a tuple-based re-POST can never
+/// surface that outcome — it mints a fresh request instead, which is how a
+/// passing build was reported `trigger_lost` (live run 38106742159 vs poll
+/// job 114377797491, 2026-10-10). The read is side-effect free and bound to
+/// the (repo_id, new_hash) tuple it claims, so a trigger id cannot be
+/// replayed against another tuple to fish for a different request's run.
+///
+/// The response reuses the trigger endpoint's status vocabulary so clients
+/// parse one shape: `accepted` with the run id once the request completed,
+/// `failed` with the recorded cause, `queued` (null run id) while the
+/// request is still pending or processing.
+async fn trigger_request_state(
+    db: Option<&gitforge_db::Pool>,
+    trigger_id: uuid::Uuid,
+    repo_id: gitforge_common::RepoId,
+    new_hash: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(pool) = db else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "trigger_state_unavailable",
+                "message": "trigger requests are not durable in this deployment; correlation by trigger_id is unavailable"
+            })),
+        );
+    };
+    let row = match gitforge_db::queries::TriggerRequestQueries::get(pool, trigger_id).await {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::error!(%error, trigger = %trigger_id, "failed to read trigger request state");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "trigger_state_read_failed",
+                    "message": error.to_string(),
+                })),
+            );
+        }
+    };
+    let Some(row) = row else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "trigger_not_found",
+                "message": "no durable trigger request carries this id",
+                "trigger_id": trigger_id.to_string(),
+            })),
+        );
+    };
+    if row.repo_id != repo_id || row.new_hash != new_hash {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "trigger_tuple_mismatch",
+                "message": "the addressed trigger request belongs to a different (repo_id, new_hash) tuple",
+                "trigger_id": row.id.to_string(),
+            })),
+        );
+    }
+
+    let (status, pipeline_run_id, error) =
+        match row.status.as_str() {
+            "completed" => match row.run_id {
+                Some(run_id) => ("accepted", Some(run_id.to_string()), None),
+                // A completed request that names no run cannot be correlated.
+                // Reporting it as `queued` would leave the caller polling
+                // forever; reporting it as a failed request with the
+                // inconsistency named fails closed and points at the defect.
+                None => (
+                    "failed",
+                    None,
+                    Some(
+                        "trigger request completed without a run id (inconsistent durable state)"
+                            .to_string(),
+                    ),
+                ),
+            },
+            // A failed request can still name the run row created before the
+            // failure; surfacing it lets the caller grade the real outcome.
+            "failed" => (
+                "failed",
+                row.run_id.map(|id| id.to_string()),
+                Some(row.error.unwrap_or_else(|| {
+                    "trigger request failed without a recorded cause".to_string()
+                })),
+            ),
+            // `pending` and `processing` (and the sweep-recovered states between
+            // them) mean the run may still materialize: null run id, keep
+            // polling.
+            _ => ("queued", None, None),
+        };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": status,
+            "event_id": serde_json::Value::Null,
+            "pipeline_run_id": pipeline_run_id,
+            "trigger_id": row.id.to_string(),
+            "repo_id": row.repo_id.to_string(),
+            "new_hash": row.new_hash,
+            "error": error,
+            "attempts": row.attempts,
+            "deduplicated": false,
+        })),
+    )
 }
 
 fn validate_workspace_path(path: &str) -> Result<String, String> {
