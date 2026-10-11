@@ -1145,6 +1145,17 @@ pub struct JobLogChunk {
     pub created_at: String,
 }
 
+/// One expired-running row as read by the timeout watchdog: the job id plus
+/// the runner/lease/heartbeat/started stamps its reconciliation receipt
+/// carries as provenance (F-series audit 2026-10-11).
+type ExpiredJobRow = (
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
 impl JobQueries {
     /// Append a log chunk only when the runner still owns the active lease.
     /// `None` means the job is missing, terminal, or fenced by another lease.
@@ -2039,13 +2050,7 @@ impl JobQueries {
     /// the bulk form, so a job completing between the listing and the write
     /// keeps its own receipt and the reconcile affects zero rows.
     pub async fn reconcile_expired(pool: &Pool) -> Result<u64> {
-        let expired: Vec<(
-            String,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-        )> = sqlx::query_as(
+        let expired: Vec<ExpiredJobRow> = sqlx::query_as(
             "SELECT id, runner_id, lease_generation, heartbeat_at, started_at FROM jobs \
                  WHERE status = 'running' AND started_at IS NOT NULL \
                  AND datetime(started_at, '+' || timeout_secs || ' seconds') <= datetime('now')",
