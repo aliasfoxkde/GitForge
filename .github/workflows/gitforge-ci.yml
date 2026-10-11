@@ -112,10 +112,14 @@ jobs:
       # absent) read from there — so the event's commit must be IN that
       # storage before POST /pipelines/trigger. Delivery uses the same
       # receive-pack path every developer push uses, landing the commit
-      # under a per-SHA scratch ref (refs/ci/github-bridge/<sha>); no
-      # branch or tag ever moves. The ref update itself fires a native
-      # trigger, which the trigger endpoint dedups onto the same
-      # (repo_id, new_hash) tuple as this workflow's POST below — one
+      # under a per-SHA tag (refs/tags/github-bridge/<sha>); no branch or
+      # tag ever moves. The namespace must be refs/tags/* (or refs/heads/*):
+      # the run workspace is materialized by a plain `git clone`, which
+      # fetches only refs/heads/* and refs/tags/* — a commit parked solely
+      # under refs/ci/* is present in storage yet unreachable at checkout
+      # (observed live 2026-10-11, run ec8b84ca). The ref update itself
+      # fires a native trigger, which the trigger endpoint dedups onto the
+      # same (repo_id, new_hash) tuple as this workflow's POST below — one
       # active run either way. Validation is deterministic end to end:
       # the fetched head must equal github.sha, and `git ls-remote` must
       # serve the scratch ref at exactly that SHA before the enqueue POST
@@ -143,7 +147,7 @@ jobs:
             refs/*) ;;
             *) echo "GITFORGE_FETCH_REF must be a fully qualified ref, got: $GITFORGE_FETCH_REF" >&2; exit 1 ;;
           esac
-          BRIDGE_REF="refs/ci/github-bridge/$GITFORGE_NEW_SHA"
+          BRIDGE_REF="refs/tags/github-bridge/$GITFORGE_NEW_SHA"
           SCRATCH="$(mktemp -d "$RUNNER_TEMP/github-bridge.XXXXXX")"
           trap 'rm -rf "$SCRATCH"' EXIT
           export GIT_TERMINAL_PROMPT=0

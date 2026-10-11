@@ -48,17 +48,54 @@ GitHub merge commit dies the same way. `git ls-remote` on the instance repo
 shows **zero `refs/pull/*`** and no `d79419a7` object: the commit was never
 delivered.
 
+### 2b. Second-round evidence (after the register step shipped)
+
+Instance repos named `gitforge` — the split the first round missed:
+
+| repo_id | owner | git_path contents |
+|---|---|---|
+| `6905d6ea…` | `b4ada040` (codex-audit) | stale audit seed: no `main`, no post-August branches, mtime Oct 10 19:52 CDT — untouched by any push |
+| `4509402f…` | `584fccb1` (operator) | live mirror: `refs/heads/main` = `c71a87c2`, this branch at `3e6eac82`, bridge refs, objects for both |
+
+Trigger attribution around the second failure (merge sha `1f0cc779…`,
+GitHub run `38111104070`, all times UTC):
+
+| trigger | repo_id | ref | status | run | outcome |
+|---|---|---|---|---|---|
+| `fc9d4875` | `6905d6ea…` | `296/merge` | failed | `0ed179f6` | checkout failed: commit absent from that repo's storage |
+| `7a7eecc7` | `6905d6ea…` | `296/merge` | failed | `09294f94` | identical (poll re-POST duplicate) |
+| `b24be7d8` | `4509402f…` | `refs/ci/github-bridge/1f0cc779…` | failed | `ec8b84ca` | commit IS in this repo, still `unable to read tree` — workspace clone does not fetch `refs/ci/*` |
+| `db119398` | `4509402f…` | `refs/heads/codex/gitforge-trigger-fixture-registration-20261011` | completed | `00520636` | branch push, `refs/heads/*` namespace: clone + checkout succeeded, run went green into the pipeline |
+
 ## 3. Corrected diagnosis
 
-1. **Root cause (harness/bridge, fixed here)**: the `gitforge-ci.yml`
-   bridge enqueues `(repo_id, "N/merge", <GitHub merge sha>)`, but no
-   mechanism delivered that commit into the instance's repository storage.
-   The run was created and failed at `prepare_run_workspace` checkout
-   (`unable to read tree`). Worse, `load_pipeline_from_commit` reads the
-   committed `.gitforge.yml` from the same storage via `git cat-file`, and a
-   missing object reads exactly like an absent file — the run would have
-   executed the **default pipeline**, not the committed one.
-2. **Observability gap (product, NOT fixed here)**: the trigger settled
+The first fix round (register step + `GITFORGE_GIT_*` credentials) was
+necessary but not sufficient: this branch's own PR bridge run (GitHub run
+`38111104070`, merge sha `1f0cc779…`) reproduced the failure **with
+registration verified green** — the push landed, `ls-remote` confirmed the
+scratch ref, and the run still died at checkout 4 s later. The instance
+record splits the failure into two stacked harness defects:
+
+1. **Wrong repository in the trigger tuple (primary)**: the instance has
+   TWO `gitforge` repos — `6905d6ea…` owned by `b4ada040` (codex-audit; a
+   stale audit-seeded mirror, git_path has no `main`) and `4509402f…` owned
+   by `584fccb1` (operator; the live mirror every push lands in).
+   `GITFORGE_REPO_ID` was set to `6905d6ea…` while `GITFORGE_GIT_URL`
+   (`…/operator/gitforge.git`) serves `4509402f…`. Every workflow POST
+   therefore minted a trigger and run for the stale repo, whose storage
+   never receives any push — checkout fails for ANY new commit, merge or
+   not. This alone explains the PR #294/#295 failures.
+2. **`refs/ci/*` is invisible to run workspaces**: the registration push
+   itself fired a native trigger on the LIVE repo (`b24be7d8`, repo
+   `4509402f…`, ref `refs/ci/github-bridge/1f0cc779…`). Its run `ec8b84ca`
+   had the commit IN storage and still failed `unable to read tree` — the
+   run workspace is materialized by a plain `git clone`, which fetches only
+   `refs/heads/*` and `refs/tags/*`. The same event delivered under
+   `refs/heads/codex/…` (branch push, trigger `db119398`) cloned and
+   checked out fine (run `00520636`, still running at the time of writing).
+   Fixed here by moving the bridge namespace to
+   `refs/tags/github-bridge/<sha>`.
+3. **Observability gap (product, NOT fixed here)**: the trigger settled
    (`status=failed`, `run_id` recorded) at 03:21:14Z, *before* the poll
    job's first re-POST at 03:21:42Z. Settled rows are excluded from the
    `(repo_id, new_hash)` active dedup index, so the re-POST minted a second
@@ -70,30 +107,43 @@ delivered.
 
 ## 4. Fix
 
-`.github/workflows/gitforge-ci.yml` gains a `Register commit in GitForge
-storage` step between configuration validation and the enqueue POST:
+Two changes, both harness/config:
 
-1. Fetch `github.ref` (`refs/pull/N/merge` on pull_request events,
-   `refs/heads/*` / `refs/tags/*` on push events) from the GitHub mirror —
-   full history, never `--depth` (a shallow push would install a shallow
-   boundary in the instance's storage repo).
-2. Require the fetched head to equal `github.sha` (peel-aware for annotated
-   tags), then push to `GITFORGE_GIT_URL` under the per-SHA scratch ref
-   `refs/ci/github-bridge/<sha>` — content-addressed, never force-pushed,
-   no branch/tag ever moves, race-free under concurrent PRs. Delivery is
-   ordinary receive-pack, the same mechanism every developer push uses; the
-   ref update fires a native trigger which the trigger endpoint dedups onto
-   the same `(repo_id, new_hash)` tuple as the workflow's POST.
-3. Deterministically verify `git ls-remote` serves the scratch ref at
-   exactly the event's SHA; only then enqueue.
+1. **`GITFORGE_REPO_ID` repointed** to `4509402f-03c1-402a-be78-eca700e5d66b`
+   (instance config, GitHub variable): the repo behind `GITFORGE_GIT_URL`,
+   the one the git server actually serves and every push lands in. The
+   validate step cannot cross-check a UUID against the URL offline; the
+   documented failure signature for a future mismatch is: registration
+   verifies the scratch ref via `ls-remote`, the run still fails
+   `unable to read tree`.
+2. **`.github/workflows/gitforge-ci.yml` gains a `Register commit in
+   GitForge storage` step** between configuration validation and the
+   enqueue POST:
 
-New configuration: `GITFORGE_GIT_URL` (variable, git HTTP URL of the same
-repository) and `GITFORGE_GIT_USERNAME` / `GITFORGE_GIT_TOKEN` (secrets,
-dedicated push account, validated distinct from both scheduler credentials;
-presented via an inline credential helper so they never reach argv, remote
-URLs, or logs). No host path is hardcoded; an unreachable repo fails the
-step before any run exists, and the scheduler-side storage preflight stays
-as the terminal backstop.
+   1. Fetch `github.ref` (`refs/pull/N/merge` on pull_request events,
+      `refs/heads/*` / `refs/tags/*` on push events) from the GitHub
+      mirror — full history, never `--depth` (a shallow push would install
+      a shallow boundary in the instance's storage repo).
+   2. Require the fetched head to equal `github.sha` (peel-aware for
+      annotated tags), then push to `GITFORGE_GIT_URL` under the per-SHA
+      tag `refs/tags/github-bridge/<sha>` — content-addressed, never
+      force-pushed, no branch/tag ever moves, race-free under concurrent
+      PRs, and reachable from the run-workspace clone (which fetches only
+      `refs/heads/*` + `refs/tags/*`; see diagnosis #2). Delivery is
+      ordinary receive-pack; the ref update fires a native trigger which
+      the trigger endpoint dedups onto the same `(repo_id, new_hash)` tuple
+      as the workflow's POST. A lightweight tag keeps `new_hash` = the
+      commit sha, so the dedup tuples match exactly.
+   3. Deterministically verify `git ls-remote` serves the scratch ref at
+      exactly the event's SHA; only then enqueue.
+
+   New configuration: `GITFORGE_GIT_URL` (variable, git HTTP URL of the
+   same repository) and `GITFORGE_GIT_USERNAME` / `GITFORGE_GIT_TOKEN`
+   (secrets, dedicated push account, validated distinct from both scheduler
+   credentials; presented via an inline credential helper so they never
+   reach argv, remote URLs, or logs). No host path is hardcoded; an
+   unreachable repo fails the step before any run exists, and the
+   scheduler-side storage preflight stays as the terminal backstop.
 
 ## 5. Bounded local validation (NVMe worktree)
 
@@ -152,3 +202,16 @@ Run in `/home/mkinney/worktrees/gitforge-trigger-fixture-registration-20261011`
    inconsistently by GitHub; the step accepts either the tag object or its
    peel, but `prepare_run_workspace` checks out `new_hash` as a commit, so
    annotated-tag builds remain a pre-existing bridge gap (untouched here).
+5. **`GITFORGE_REPO_ID` ↔ `GITFORGE_GIT_URL` invariant is unchecked**: the
+   validate step cannot resolve which repository a git URL serves without
+   an authenticated repository read the workflow deliberately does not
+   hold. A future mismatch reproduces the exact failure this receipt
+   documents (registration green, run dies `unable to read tree`); the
+   signature is documented in `docs/GITFORGE_CI_SETUP.md` as the
+   diagnostic.
+6. **Bridge-tag visibility**: `refs/tags/github-bridge/<sha>` is fetched by
+   every clone of the mirror (that is the point — run workspaces need it),
+   so developer clones accumulate one namespaced tag per built SHA. Tags
+   are a GC candidate on the instance like any CI by-product; they never
+   move once created, so pruning old ones cannot race an in-flight build
+   of the SAME sha.
