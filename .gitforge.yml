@@ -56,6 +56,15 @@ jobs:
         # Exits 1 on drift; --report (always exit 0) exists for baseline
         # sweeps, not for this gate.
         run: python3 scripts/check-route-docs.py
+      - name: Release workflow contract gate
+        # Same class of gate: parse-only, no cargo, no network. Pins
+        # .github/workflows/release.yml to its publication contract —
+        # tag-only publishing, the repository's pinned dtolnay toolchain on
+        # every build platform, the self-hosted rustup PATH/TMPDIR guards —
+        # so a gating regression fails closed here instead of publishing
+        # (or burning a cross-platform build) from a tag push. Exits 1 on
+        # any violation.
+        run: python3 scripts/check-release-workflow.py
     timeout: 15m
 
   - name: clippy

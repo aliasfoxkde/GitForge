@@ -11,6 +11,11 @@ on:
       - '**/Cargo.lock'
       - 'supply-chain/**'
       - '.github/workflows/rust-ci.yml'
+      # Release workflow edits get the full hosted gate: the release
+      # workflow publishes real artifacts, and its contract checker (and
+      # actionlint) run in workflow-lint below.
+      - '.github/workflows/release.yml'
+      - 'scripts/check-release-workflow.py'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -105,6 +110,11 @@ jobs:
         run: |
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           ~/go/bin/actionlint -color
+      - name: Check release workflow contract
+        # Mirrors the in-file `contract` job of release.yml and the
+        # .gitforge.yml fmt gate: tag-only publication, pinned toolchain on
+        # every build platform, self-hosted rustup PATH/TMPDIR guards.
+        run: python3 scripts/check-release-workflow.py
 
   # ─── Testing ────────────────────────────────────────────────────────────────
   # This runner shares the NAS Docker daemon with GitForge CI sandbox jobs.
