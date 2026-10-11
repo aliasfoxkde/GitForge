@@ -330,18 +330,29 @@ async fn test_tags_bypass_gate_and_deletions_trigger_nothing() {
         "tag push must enqueue a CI trigger"
     );
 
-    // Land the branch so there is something to delete, then delete it. The
-    // deletion itself must not mint a trigger (its new hash is all-zero).
+    // Land the branch and a secondary branch so there is something to
+    // delete, then delete the secondary one. The deletion must be accepted
+    // (deletion of the bare repo's *current* branch is denied by git
+    // plumbing on the platform, exactly as upstream git configures it) and
+    // must not mint a trigger (its new hash is all-zero).
     seed_green_run(&server, &sha).await;
     run_git(&["push", "origin", "main"], &work, &[]);
-    run_git(&["push", "origin", "--delete", "main"], &work, &[]);
-    let probe = try_git(&["rev-parse", "refs/heads/main"], &bare_repo(&server));
+    run_git(&["push", "origin", "main:refs/heads/topic"], &work, &[]);
+    run_git(&["push", "origin", "--delete", "topic"], &work, &[]);
+    let probe = try_git(&["rev-parse", "refs/heads/topic"], &bare_repo(&server));
     assert!(!probe.status.success(), "deleted branch must be gone");
 
+    // Tag push, branch land, and the topic branch creation each minted a
+    // trigger; the accepted deletion minted none (its new hash is zero and
+    // the handler filters deletions before enqueueing).
     let rows = trigger_rows(&server).await;
     assert_eq!(
-        rows.len(),
-        2,
+        rows,
+        vec![
+            ("refs/tags/v1".to_string(), sha.clone()),
+            ("refs/heads/main".to_string(), sha.clone()),
+            ("refs/heads/topic".to_string(), sha.clone()),
+        ],
         "deletion must not enqueue a CI trigger: {rows:?}"
     );
     assert!(
