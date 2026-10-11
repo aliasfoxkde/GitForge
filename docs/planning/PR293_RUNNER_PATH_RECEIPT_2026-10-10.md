@@ -3,9 +3,9 @@
 - **PR**: aliasfoxkde/GitForge#293 (`codex/codeql-cargo-path-fix-20261010`)
 - **Base**: `main` @ `c4e3816bf19dd3a4ca06b9861257e4a925ad3c71`
 - **Head at diagnosis**: `6ce8b801c294be1174c679ce9f97aff0e8479ab7`
-- **Fix commit**: `abbb9dd91f508f8709951ef9902842a0cab9d553`
-  (`fix(ci): expose runner rustup to CI jobs`) — the commit directly
-  below this receipt commit on the PR branch.
+- **Fix commits**: `abbb9dd91f508f8709951ef9902842a0cab9d553`
+  (`fix(ci): expose runner rustup to CI jobs`), corrected by
+  `133476fd` (`fix(ci): scope TMPDIR env to job steps`, see §8).
 - **Scope of fix**: `.github/workflows/security.yml`, `.github/workflows/rust-ci.yml`
   only. No gate semantics changed, no suppressions added, no `.rs` sources touched.
 
@@ -71,9 +71,11 @@ Port the established `codeql.yml` pattern, nothing else:
   on the scanner build; `rust-security` clippy step gets `TMPDIR`.
 - **rust-ci.yml** — "Expose runner rustup on PATH" added to the seven
   self-hosted jobs (`fmt`, `clippy`, `test`, `test-serialized`, `coverage`,
-  `security`, `build`); `TMPDIR: ${{ runner.temp }}` added to the five jobs
-  that build the workspace (`clippy`, `test`, `test-serialized`, `coverage`,
-  `build`), mirroring the documented aws-lc-sys TMPDIR failure on this host.
+  `security`, `build`); step-level `TMPDIR: ${{ runner.temp }}` added to the
+  cargo step of the five workspace-building jobs (`clippy`, `test`,
+  `test-serialized`, `coverage`, `build`), mirroring the documented
+  aws-lc-sys TMPDIR failure on this host. The TMPDIR env lives at step
+  level, not job level — see §8 for why.
 - Untouched by design: `secrets-scan` (no cargo), `shellcheck`,
   `workflow-lint`, `supply-chain` (run on GitHub-hosted `ubuntu-latest`),
   `integration.yml` (Go-only via setup-go), `codeql.yml` (already fixed in
@@ -100,9 +102,10 @@ All commands run in the NVMe worktree
   are dicts (no parse or shape errors). 150 insertions, 0 deletions.
 - `shellcheck -s bash -S warning` over all 31 embedded `run:` blocks of both
   workflows — 0 findings (11 of the blocks are this fix's insertions).
-- `actionlint` not installed on this host; the authoritative workflow lint is
-  the `workflow-lint` job in rust-ci.yml (actionlint v1.7.12, GitHub-hosted
-  `ubuntu-latest`, unaffected by this defect) and runs on the pushed head.
+- `actionlint` was not installed on this host at validation time; the
+  authoritative workflow lint is the `workflow-lint` job in rust-ci.yml
+  (actionlint v1.7.12, GitHub-hosted `ubuntu-latest`, unaffected by this
+  defect). It was installed locally later in the session — see §8.
 - Receipt-claim cross-checks against the parsed YAML: all 7 rust-ci.yml
   self-hosted jobs carry the PATH step and the 5 workspace-building jobs
   carry `TMPDIR`; the 3 cargo-invoking security.yml jobs carry the PATH step
@@ -138,5 +141,37 @@ skipped by its `vars` gate.
 ## 7. Constraints honored
 
 No merge, no deploy, no live GitForge service/database/mirror contact, no
-credentials printed, no full local builds/tests, no additional queue triggers
-beyond the single fix push.
+credentials printed, no full local builds/tests, and no queue triggers beyond
+the PR-branch pushes themselves (the first closeout push, then the §8
+corrective push; superseded runs cancel via `cancel-in-progress`).
+
+## 8. Closeout addendum: workflow-file rejection and TMPDIR fix
+
+The first closeout push (`abbb9dd9` + `4a0f8136`) was rejected by GitHub for
+rust-ci.yml only:
+
+- **Observation** (API, 2026-10-11T02:07Z): rust-ci run 38104098842 at
+  `4a0f8136` completed `failure` with **zero jobs** and the run name is the
+  file path `.github/workflows/rust-ci.yml` instead of the workflow's
+  `name:` — the signature of a workflow-file-level parse/validation
+  rejection. security.yml jobs from the same push queued normally.
+- **Cause**: the commit placed `TMPDIR: ${{ runner.temp }}` in five
+  **job-level** `env` blocks. Per GitHub's context-availability table, the
+  `runner` context is NOT available at `jobs.<job_id>.env` (only `github`,
+  `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs`), so the whole
+  file fails validation ("Unrecognized named-value: 'runner'"). It is
+  available at `jobs.<job_id>.steps.env`, which is where codeql.yml and
+  security.yml (both valid) already used it. PyYAML cannot catch this —
+  it parsed the broken file cleanly.
+- **Fix**: TMPDIR moved from job-level `env` to step-level `env` on the
+  single cargo step of each of the five jobs (matching the proven
+  codeql.yml/security.yml placement).
+- **Corrective commit**: `133476fd` `fix(ci): scope TMPDIR env to job
+  steps`.
+- **Local actionlint** (v1.7.12, built from source via the go toolchain —
+  the same version the `workflow-lint` job installs): 0 findings across all
+  workflow files after the fix. Positive control: a scratch copy carrying
+  the broken job-level pattern is flagged `context "runner" is not allowed
+  here`, confirming the diagnosis and the lint's sensitivity to it.
+  actionlint is now the pre-push gate for workflow edits on this host
+  (`/var/tmp/actionlint-bin/actionlint`).
