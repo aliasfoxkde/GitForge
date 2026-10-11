@@ -336,7 +336,7 @@ fn parse_credential_request(input: &str) -> CredentialRequest {
     CredentialRequest { host }
 }
 
-/// Host[:port] portion of a configured server URL, so credential requests
+/// Host\[:port\] portion of a configured server URL, so credential requests
 /// can be matched without pulling in a URL crate for one split.
 fn server_host_of(server_url: &str) -> &str {
     let without_scheme = server_url
@@ -351,7 +351,7 @@ fn server_host_of(server_url: &str) -> &str {
 /// server (`:42782`) — without an extra config field.
 const DEFAULT_GIT_HTTP_AUTHORITY_SUFFIX: &str = ":42782";
 
-/// Authorities (host[:port]) the stored session may be served to:
+/// Authorities (host\[:port\]) the stored session may be served to:
 /// `server_url`'s own authority, an explicit `git_server_url` override,
 /// and the same hostname on the platform's default git port. Never the
 /// bare hostname — a sibling service on another port of the same host
