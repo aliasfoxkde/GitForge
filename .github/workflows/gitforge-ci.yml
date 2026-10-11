@@ -28,8 +28,9 @@ env:
   GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
   # Git transport to the git-server, used only by pull_request events to
   # import GitHub's merge commit into the store (required for PRs, unused
-  # for push events). GITFORGE_REPO_PATH overrides the git-server
-  # owner/repo path when it differs from the GitHub repository full name.
+  # for push events). GITFORGE_GIT_URL may be the complete repository URL
+  # (ending in .git) or a server base URL; GITFORGE_REPO_PATH is only used
+  # with the latter and overrides the default GitHub owner/repo path.
   GITFORGE_GIT_URL: ${{ vars.GITFORGE_GIT_URL || '' }}
   GITFORGE_REPO_PATH: ${{ vars.GITFORGE_REPO_PATH || '' }}
 
@@ -87,7 +88,16 @@ jobs:
           # treats that namespace as plumbing that never triggers CI, so the
           # enqueue below is the run's only trigger.
           : "${GITFORGE_GIT_URL:?GITFORGE_GIT_URL is required for pull_request events}"
-          REPO_PATH="${GITFORGE_REPO_PATH:-${GITHUB_REPOSITORY}}"
+          GITFORGE_TARGET_URL="${GITFORGE_GIT_URL%/}"
+          if [[ "$GITFORGE_TARGET_URL" == *.git ]]; then
+            if [[ -n "$GITFORGE_REPO_PATH" ]]; then
+              echo "GITFORGE_REPO_PATH must be empty when GITFORGE_GIT_URL is a complete .git URL" >&2
+              exit 1
+            fi
+          else
+            REPO_PATH="${GITFORGE_REPO_PATH:-${GITHUB_REPOSITORY}}"
+            GITFORGE_TARGET_URL="${GITFORGE_TARGET_URL}/${REPO_PATH#/}"
+          fi
           MERGE_SHA="${{ github.sha }}"
           PR_NUMBER="${{ github.event.number }}"
           TAG_REF="refs/tags/gitforge-ci/pr-${PR_NUMBER}-${MERGE_SHA}"
@@ -105,7 +115,7 @@ jobs:
             exit 1
           fi
           git -C "$BRIDGE/repo.git" push -q \
-            "$GITFORGE_GIT_URL/${REPO_PATH}" "${TAG_REF}:${TAG_REF}"
+            "$GITFORGE_TARGET_URL" "${TAG_REF}:${TAG_REF}"
           echo "Imported ${MERGE_SHA} as ${TAG_REF}"
 
       - name: Enqueue build job
