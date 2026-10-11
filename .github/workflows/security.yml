@@ -36,6 +36,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The Fedora runner has rustup under $HOME/.cargo but the job PATH omits
+      # that directory, so dtolnay/rust-toolchain falls through to its rustup
+      # bootstrap and fails instantly (run 38100998153 on this PR; run
+      # 38074059170 on main). Expose the existing install to this job's PATH
+      # instead of letting the action re-provision one, matching codeql.yml.
+      - name: Expose runner rustup on PATH
+        run: |
+          set -euo pipefail
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "rustup not found or not executable at $CARGO_HOME/bin/rustup; expected the runner's Fedora rustup install" >&2
+            exit 1
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" --version
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
@@ -95,11 +111,35 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Same runner environment gap as codeql.yml: the job PATH omits the
+      # runner's rustup and the runner ships no cargo on PATH, so the scanner
+      # build fails within seconds (run 38100998153 on this PR; run
+      # 38074059170 on main). Expose rustup, then provision the pinned
+      # toolchain before invoking cargo.
+      - name: Expose runner rustup on PATH
+        run: |
+          set -euo pipefail
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "rustup not found or not executable at $CARGO_HOME/bin/rustup; expected the runner's Fedora rustup install" >&2
+            exit 1
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" --version
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
       - name: Build pinned Aegis scanner
         env:
           # Pin the source-qualified Aegis revision; update only after the
           # Platform-Architecture Fedora qualification receipt is green.
           AEGIS_COMMIT: 04685c76c5488569b447fd8c1aefbedd01343459
+          # Keep rustc scratch off the quota-constrained /tmp on this host
+          # (see codeql.yml Build Rust, run 38094440919).
+          TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
           git clone --filter=blob:none --no-checkout https://github.com/aliasfoxkde/aegis.git "$RUNNER_TEMP/aegis"
@@ -186,6 +226,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Same runner PATH fix as cargo-audit above; see codeql.yml for the
+      # original diagnosis.
+      - name: Expose runner rustup on PATH
+        run: |
+          set -euo pipefail
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "rustup not found or not executable at $CARGO_HOME/bin/rustup; expected the runner's Fedora rustup install" >&2
+            exit 1
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" --version
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
@@ -193,6 +246,10 @@ jobs:
           components: clippy
 
       - name: Run clippy with security-focused lints
+        env:
+          # aws-lc-sys's build script writes assembler scratch to TMPDIR;
+          # /tmp is quota-constrained on this host (see codeql.yml).
+          TMPDIR: ${{ runner.temp }}
         run: |
           # Check for common security issues in Rust code
           cargo clippy --workspace --all-targets --locked -- -D warnings
