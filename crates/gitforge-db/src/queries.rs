@@ -2025,16 +2025,65 @@ impl JobQueries {
     /// Mark running jobs whose persisted deadline has elapsed as timed out.
     /// The status predicate makes this safe against a concurrent completion:
     /// only a still-running job can be reconciled by the watchdog.
+    ///
+    /// Each expired row is reconciled individually and its forensic trail is
+    /// stamped into `result_json` before the lease columns are cleared: which
+    /// runner held the job, its lease generation, when it last checked in,
+    /// and how far past its deadline the row was. The previous bulk UPDATE
+    /// nulled `runner_id` with a static reason, so a timeout with no
+    /// runner-side receipt was undiagnosable — no way to tell whether the
+    /// runner died mid-job or coasted past the deadline with a live
+    /// heartbeat (2026-10-11, F-series audit: every watchdog-reconciled row
+    /// carried only `{"status":"timed_out","reason":...}` with runner and
+    /// heartbeat NULL). The per-row UPDATE keeps the same status guard as
+    /// the bulk form, so a job completing between the listing and the write
+    /// keeps its own receipt and the reconcile affects zero rows.
     pub async fn reconcile_expired(pool: &Pool) -> Result<u64> {
-        let result = sqlx::query(
-            "UPDATE jobs SET status = 'timed_out', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE status = 'running' AND started_at IS NOT NULL AND datetime(started_at, '+' || timeout_secs || ' seconds') <= datetime('now')",
+        let expired: Vec<(
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT id, runner_id, lease_generation, heartbeat_at, started_at FROM jobs \
+                 WHERE status = 'running' AND started_at IS NOT NULL \
+                 AND datetime(started_at, '+' || timeout_secs || ' seconds') <= datetime('now')",
         )
-        .bind(Utc::now().to_rfc3339())
-        .bind(r#"{"status":"timed_out","reason":"job_timeout_reconciled_by_watchdog"}"#)
-        .execute(pool.pool())
+        .fetch_all(pool.pool())
         .await
-        .map_err(|e| Error::database(format!("failed to reconcile expired jobs: {e}")))?;
-        Ok(result.rows_affected())
+        .map_err(|e| Error::database(format!("failed to list expired jobs: {e}")))?;
+        let mut reconciled = 0u64;
+        for (job_id, runner_id, lease_generation, heartbeat_at, started_at) in expired {
+            let now = Utc::now();
+            let heartbeat_age_secs = heartbeat_at.as_deref().and_then(|h| {
+                DateTime::parse_from_rfc3339(h)
+                    .ok()
+                    .map(|h| (now - h.with_timezone(&Utc)).num_seconds())
+            });
+            let receipt = serde_json::json!({
+                "status": "timed_out",
+                "reason": "job_timeout_reconciled_by_watchdog",
+                "runner_id": runner_id,
+                "lease_generation": lease_generation,
+                "heartbeat_at": heartbeat_at,
+                "started_at": started_at,
+                "heartbeat_age_secs": heartbeat_age_secs,
+                "reconciled_at": now.to_rfc3339(),
+            })
+            .to_string();
+            let result = sqlx::query(
+                "UPDATE jobs SET status = 'timed_out', runner_id = NULL, lease_token = NULL, finished_at = ?, result_json = ? WHERE id = ? AND status = 'running'",
+            )
+            .bind(now.to_rfc3339())
+            .bind(&receipt)
+            .bind(&job_id)
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to reconcile expired job {job_id}: {e}")))?;
+            reconciled += result.rows_affected();
+        }
+        Ok(reconciled)
     }
 
     /// Grade non-terminal job rows that already carry terminal evidence.
@@ -5630,6 +5679,157 @@ mod tests {
         let alive_recovered = JobQueries::get(&pool, alive.id).await.unwrap().unwrap();
         assert_eq!(alive_recovered.status, "running");
         assert!(alive_recovered.lease_token.is_some());
+    }
+
+    // The silent-failure class (2026-10-10 audit): a terminal row whose
+    // result_json is empty or absent is undiagnosable — nothing on the
+    // platform may grade a job terminal without stamping a reason. The
+    // watchdog reconcile additionally owes the operator provenance: which
+    // runner held the job, its lease generation, and how stale its
+    // heartbeat was, because the bulk form used to null runner_id and leave
+    // a static reason behind.
+    #[tokio::test]
+    async fn test_watchdog_reconcile_stamps_provenance_and_reason() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "wd-owner".to_string(),
+            "wd@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+        let repo =
+            crate::models::Repository::new("wd-repo".to_string(), user.id, "/git/wd".to_string());
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "wd-pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        let run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "main".to_string(),
+            "abc123".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &run).await.unwrap();
+
+        // Expired job held by a runner whose last heartbeat is 10 minutes
+        // old: reconcile must time it out, clear the lease columns, and
+        // stamp the full forensic receipt.
+        let expired = crate::models::Job::new(run.id, "wd-expired".to_string());
+        JobQueries::create(&pool, &expired).await.unwrap();
+        JobQueries::set_definition_with_image_and_timeout(
+            &pool,
+            expired.id,
+            &["true".to_string()],
+            "rust:latest",
+            None,
+            5,
+        )
+        .await
+        .unwrap();
+        let runner = crate::models::Runner::new(
+            "wd-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        RunnerQueries::create(&pool, &runner).await.unwrap();
+        JobQueries::update_status(&pool, expired.id, "queued")
+            .await
+            .unwrap();
+        JobQueries::assign(&pool, expired.id, runner.id)
+            .await
+            .unwrap();
+        JobQueries::start(&pool, expired.id).await.unwrap();
+        let stale_beat = (Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
+        assert!(
+            JobQueries::heartbeat(&pool, expired.id, runner.id, "wd-lease")
+                .await
+                .unwrap()
+        );
+        sqlx::query("UPDATE jobs SET heartbeat_at = ?, started_at = ? WHERE id = ?")
+            .bind(&stale_beat)
+            .bind((Utc::now() - chrono::Duration::seconds(60)).to_rfc3339())
+            .bind(expired.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(JobQueries::reconcile_expired(&pool).await.unwrap(), 1);
+        let row = JobQueries::get(&pool, expired.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "timed_out");
+        assert!(row.finished_at.is_some());
+        // The lease columns are cleared, but the provenance lives on in the
+        // receipt — that is the entire point of the per-row reconcile.
+        assert!(row.runner_id.is_none());
+        let receipt: serde_json::Value = serde_json::from_str(
+            row.result_json
+                .as_deref()
+                .expect("watchdog receipt present"),
+        )
+        .unwrap();
+        assert_eq!(receipt["reason"], "job_timeout_reconciled_by_watchdog");
+        assert_eq!(receipt["runner_id"], runner.id.to_string());
+        assert_eq!(receipt["lease_generation"], 1);
+        assert_eq!(receipt["heartbeat_at"], stale_beat.as_str());
+        assert!(receipt["heartbeat_age_secs"].as_i64().unwrap() >= 600);
+        assert!(receipt["reconciled_at"].as_str().is_some());
+
+        // A genuinely completed row is untouchable: the per-row status guard
+        // leaves its own receipt and terminal grade alone.
+        let completed = crate::models::Job::new(run.id, "wd-completed".to_string());
+        JobQueries::create(&pool, &completed).await.unwrap();
+        JobQueries::set_definition_with_image_and_timeout(
+            &pool,
+            completed.id,
+            &["true".to_string()],
+            "rust:latest",
+            None,
+            5,
+        )
+        .await
+        .unwrap();
+        JobQueries::start(&pool, completed.id).await.unwrap();
+        sqlx::query("UPDATE jobs SET started_at = ? WHERE id = ?")
+            .bind((Utc::now() - chrono::Duration::seconds(60)).to_rfc3339())
+            .bind(completed.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        JobQueries::complete(
+            &pool,
+            completed.id,
+            "succeeded",
+            r#"{"status":"succeeded","exit_code":0}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(JobQueries::reconcile_expired(&pool).await.unwrap(), 0);
+        let survivor = JobQueries::get(&pool, completed.id).await.unwrap().unwrap();
+        assert_eq!(survivor.status, "succeeded");
+        assert!(survivor
+            .result_json
+            .as_deref()
+            .is_some_and(|receipt| receipt.contains("exit_code")));
+
+        // The runner-loss fence carries a reason too — no terminal grade
+        // without one, ever.
+        let lost = crate::models::Job::new(run.id, "wd-lost".to_string());
+        JobQueries::create(&pool, &lost).await.unwrap();
+        JobQueries::start(&pool, lost.id).await.unwrap();
+        JobQueries::fail_lost(&pool, lost.id).await.unwrap();
+        let lost_row = JobQueries::get(&pool, lost.id).await.unwrap().unwrap();
+        assert_eq!(lost_row.status, "failed");
+        assert!(lost_row
+            .result_json
+            .as_deref()
+            .is_some_and(|receipt| receipt.contains("runner_lost_while_running")));
     }
 
     #[tokio::test]
