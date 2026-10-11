@@ -1,6 +1,6 @@
 # Handoff: GitHub PR trigger — merge object missing from GitForge store
 
-**Date:** 2026-10-12
+**Date:** 2026-10-11
 **Status:** Documentation only. Nothing in this document is implemented or
 validated. No source, workflow, or test was modified while producing it; the
 failure path is established by code reading, and the PR #309 incident is
@@ -94,7 +94,7 @@ All in `services/ci/src/main.rs` `#[cfg(test)]`:
 
 ## 2. Observed failure — PR #309
 
-Operator-observed on the live GitForge instance (2026-10-12 window): the
+Operator-observed on the live GitForge instance (2026-10-11 window): the
 GitHub `pull_request` event for PR #309 enqueued a run with
 `new_hash = github.sha` — GitHub's merge-ref commit. That commit object does
 not exist in the GitForge bare repository for the repo (the store only holds
