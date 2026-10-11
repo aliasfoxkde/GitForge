@@ -47,6 +47,23 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The Fedora runner already has rustup under $HOME/.cargo, but the job
+      # PATH omits that directory, so dtolnay/rust-toolchain falls through to
+      # its rustup bootstrap, which downloads rustup-init into /tmp and fails
+      # there with curl exit 23 (run 38106742220, job 114373763080) — skipping
+      # every review step. Expose the existing install to this job's PATH
+      # instead of letting the action re-provision one, matching codeql.yml.
+      - name: Expose runner rustup on PATH
+        run: |
+          set -euo pipefail
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "rustup not found or not executable at $CARGO_HOME/bin/rustup; expected the runner's Fedora rustup install" >&2
+            exit 1
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" --version
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
