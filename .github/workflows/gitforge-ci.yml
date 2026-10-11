@@ -29,7 +29,9 @@ env:
   # `status: "queued"` and a null pipeline_run_id once the trigger request is
   # durable but the asynchronous consumer has not created the run yet (its
   # in-request correlation window is 15s; under load it elapses). A queued
-  # response is a pending request, not a failed enqueue.
+  # response is a pending request, not a failed enqueue; the poll job
+  # correlates by reading the durable request's state (trigger_id in the
+  # body), which keeps working after the request settles.
   GITFORGE_CORRELATE_TIMEOUT_SECONDS: ${{ vars.GITFORGE_CORRELATE_TIMEOUT_SECONDS || '300' }}
 
 permissions:
@@ -195,36 +197,40 @@ jobs:
           fi
 
           # A queued trigger carries only its durable request ID. Correlate
-          # it to its run by re-POSTing the byte-identical trigger tuple.
-          # The scheduler dedups ACTIVE (pending/processing) trigger
-          # requests on (repo_id, new_hash): while the original request is
-          # in flight the response echoes the SAME trigger_id and never
-          # mints a second run. Once the original settles it is invisible
-          # to dedup, and the endpoint reports a terminal trigger failure
-          # and a post-window completion identically (`queued`, null run
-          # id) — so a response echoing a DIFFERENT trigger_id means the
-          # original can no longer be identified. If that fresh response
-          # carries no run id, retrying cannot recover the original and
-          # only mints more doomed requests: fail immediately. If it does
-          # carry a run id, that run built the identical commit tuple; log
-          # the substitution and poll it. The trigger-status endpoint on
-          # codex/pr280-trigger-status-20261008 removes this blind spot
-          # once deployed.
+          # it to its run by re-POSTing the trigger tuple ADDRESSED to that
+          # request (trigger_id in the body): the scheduler then reads the
+          # durable request's state instead of minting anything, so the
+          # correlation works even after the consumer settled the request —
+          # `completed` answers with its run id, a terminal `failed` answers
+          # with the recorded cause, and a still-active request answers
+          # `queued` (dedup echo, null run id) exactly as before. Settlement
+          # used to be a blind spot: the active-row dedup stops matching once
+          # the request completes, a plain re-POST minted a fresh trigger,
+          # and a passing build was reported trigger_lost (run 38106742159
+          # passed while poll job 114377797491 failed, 2026-10-10). A
+          # response echoing a DIFFERENT trigger_id still means this
+          # scheduler build did not honor the addressed read (or the original
+          # settled without a durable trace): its run cannot be identified
+          # through this contract and retrying only mints more requests —
+          # fail immediately.
           if [ -z "$RUN_ID" ]; then
             PAYLOAD=$(jq -n \
               --arg repo "$GITFORGE_REPO_ID" \
               --arg ref "$GITFORGE_REF" \
               --arg old "$GITFORGE_OLD_SHA" \
               --arg new "$GITFORGE_NEW_SHA" \
-              '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
+              --arg trigger "$TRIGGER_ID" \
+              '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null,trigger_id:$trigger}')
             deadline=$(( $(date +%s) + GITFORGE_CORRELATE_TIMEOUT_SECONDS ))
             echo "Trigger $TRIGGER_ID queued; correlating to its pipeline run..."
             while [ -z "$RUN_ID" ]; do
               RESPONSE=""
               HTTP_CODE="000"
               BODY=""
-              # Re-POSTs carry the SAME trigger credential as the original
-              # enqueue so the scheduler's dedup echo contract applies.
+              # Correlation reads carry the SAME trigger credential as the
+              # original enqueue: trigger-request state is trigger-scoped
+              # data, and the scheduler operator credential stays reserved
+              # for run-status reads below.
               if RESPONSE=$(curl --silent --show-error --max-time 30 \
                 --write-out "\n%{http_code}" \
                 -X POST \
@@ -250,10 +256,38 @@ jobs:
                   fi
                   ECHOED=$(printf '%s' "$BODY" | jq -r '.trigger_id // empty')
                   if [ -n "$ECHOED" ] && [ "$ECHOED" != "$TRIGGER_ID" ]; then
-                    echo "GitForge settled trigger $TRIGGER_ID without a run id (terminal trigger failure, or completed after the correlation window); its run cannot be identified through this contract and re-POSTing only mints more doomed requests" >&2
+                    echo "GitForge minted trigger $ECHOED for the correlation read of $TRIGGER_ID: the addressed trigger-state read was not honored (scheduler predates the contract) or the original settled without a durable trace; its outcome cannot be identified and retrying only mints more requests" >&2
                     echo "terminal_status=trigger_lost" >> "$GITHUB_OUTPUT"
                     exit 1
                   fi
+                  STATUS=$(printf '%s' "$BODY" | jq -r '.status // empty')
+                  case "$STATUS" in
+                    failed)
+                      # Terminal trigger failure with the cause the durable
+                      # request recorded: actionable, and the gate stays
+                      # red (this is not a transport problem to retry).
+                      CAUSE=$(printf '%s' "$BODY" | jq -r '.error // empty' 2>/dev/null | head -c 400 || true)
+                      echo "GitForge trigger $TRIGGER_ID failed terminally: ${CAUSE:-no cause recorded}" >&2
+                      echo "terminal_status=trigger_failed" >> "$GITHUB_OUTPUT"
+                      exit 1
+                      ;;
+                    accepted)
+                      # `accepted` always names a run; without one the
+                      # durable state is inconsistent and cannot be polled.
+                      echo "GitForge reported trigger $TRIGGER_ID accepted with no pipeline_run_id; durable trigger state is inconsistent" >&2
+                      echo "terminal_status=trigger_lost" >> "$GITHUB_OUTPUT"
+                      exit 1
+                      ;;
+                    queued|"")
+                      # Still pending or processing (or a dedup echo from a
+                      # scheduler mid-rollout): the run may still appear.
+                      ;;
+                    *)
+                      echo "GitForge trigger state returned unknown status: $STATUS" >&2
+                      echo "terminal_status=trigger_lost" >> "$GITHUB_OUTPUT"
+                      exit 1
+                      ;;
+                  esac
                   ;;
                 000|408|429|5??)
                   # Transport loss, rate limiting, and server errors are
