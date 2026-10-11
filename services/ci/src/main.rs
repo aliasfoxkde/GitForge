@@ -2137,31 +2137,42 @@ async fn process_trigger_event(
                 "failed to handle push event"
             );
             if let (Some(pool), Some(request_id)) = (scheduler_db, request_id) {
-                // Retrying is only honest while the budget lasts and the
-                // failure could plausibly resolve: contention and lost
-                // config reads retry, a provably invalid committed config
-                // or an already-failed run is terminal and visible.
-                let attempts = gitforge_db::queries::TriggerRequestQueries::get(pool, request_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map_or(0, |request| request.attempts);
-                let settled = if !failure.retryable || attempts >= TRIGGER_MAX_ATTEMPTS {
-                    gitforge_db::queries::TriggerRequestQueries::mark_failed(
-                        pool,
-                        request_id,
-                        &failure.error.to_string(),
-                        failure.run_id,
-                    )
-                    .await
-                } else {
-                    gitforge_db::queries::TriggerRequestQueries::mark_retry(pool, request_id).await
-                };
-                if let Err(error) = settled {
-                    tracing::error!(%error, trigger = %request_id, "failed to settle trigger request after failure");
-                }
+                settle_trigger_failure(pool, request_id, &failure).await;
             }
         }
+    }
+}
+
+/// Settle a trigger request whose processing failed: terminal when a retry
+/// provably cannot help or the budget is spent, otherwise back to `pending`
+/// where the sweep republishes it after the backoff. Split out from the
+/// consumer so the decision is directly unit-testable — every retryable
+/// failure inducible through the full flow (DB busy, git spawn) is
+/// environment-dependent, and the durable queue's FK to `repositories`
+/// means the unregistered-repo branch can never hold a durable row.
+async fn settle_trigger_failure(
+    pool: &gitforge_db::Pool,
+    request_id: uuid::Uuid,
+    failure: &TriggerFailure,
+) {
+    let attempts = gitforge_db::queries::TriggerRequestQueries::get(pool, request_id)
+        .await
+        .ok()
+        .flatten()
+        .map_or(0, |request| request.attempts);
+    let settled = if !failure.retryable || attempts >= TRIGGER_MAX_ATTEMPTS {
+        gitforge_db::queries::TriggerRequestQueries::mark_failed(
+            pool,
+            request_id,
+            &failure.error.to_string(),
+            failure.run_id,
+        )
+        .await
+    } else {
+        gitforge_db::queries::TriggerRequestQueries::mark_retry(pool, request_id).await
+    };
+    if let Err(error) = settled {
+        tracing::error!(%error, trigger = %request_id, "failed to settle trigger request after failure");
     }
 }
 
@@ -5646,17 +5657,35 @@ jobs:
         );
     }
 
-    /// The retryable settle path. An unregistered repository is the one
-    /// retryable failure inducible deterministically: registration is an
-    /// out-of-band fix, so the request keeps its budget (`pending`, attempt
-    /// counted, no terminal error) instead of being marked `failed`. The
-    /// terminal paths are pinned by `tests/ci_trigger_settlement.rs`.
-    #[tokio::test]
-    async fn test_process_trigger_event_retries_unregistered_repo() {
-        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
-        pool.migrate().await.expect("migrate");
+    /// The settle decision, exercised directly through `settle_trigger_failure`.
+    /// Every retryable failure inducible through the full flow is
+    /// environment-dependent, and the durable queue's FK to `repositories`
+    /// means a trigger row can never exist for an unregistered repo — so the
+    /// decision is pinned here with synthetic failures instead of through
+    /// `process_trigger_event`. The end-to-end terminal paths are pinned by
+    /// `tests/ci_trigger_settlement.rs`.
+    async fn seeded_trigger_request(
+        pool: &gitforge_db::Pool,
+    ) -> (uuid::Uuid, gitforge_common::RepoId) {
+        // The FK to `repositories` requires a real repo row behind the request.
+        let user = gitforge_db::models::User::new(
+            "settle-test".to_string(),
+            "settle-test@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(pool, &user)
+            .await
+            .expect("create user");
+        let repository = gitforge_db::models::Repository::new(
+            "settle-test".to_string(),
+            user.id,
+            "unused".to_string(),
+        );
+        let repo_id = repository.id;
+        gitforge_db::queries::RepoQueries::create(pool, &repository)
+            .await
+            .expect("create repository");
 
-        let repo_id = gitforge_common::RepoId::new();
         let request = gitforge_db::models::PipelineTriggerRequest::new(
             repo_id,
             "refs/heads/main".to_string(),
@@ -5665,49 +5694,28 @@ jobs:
         );
         let request_id = request.id;
         let (_, was_new) =
-            gitforge_db::queries::TriggerRequestQueries::create_or_existing(&pool, &request)
+            gitforge_db::queries::TriggerRequestQueries::create_or_existing(pool, &request)
                 .await
                 .expect("create trigger request");
         assert!(was_new, "the harness seeds a fresh request");
+        (request_id, repo_id)
+    }
 
-        let event = EventEnvelope::new(
-            EventType::PushReceived,
-            EventPayload::PushReceived(PushReceivedPayload {
-                repo_id,
-                ref_name: "refs/heads/main".to_string(),
-                old_hash: "0".repeat(40),
-                new_hash: "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
-                pusher_id: None,
-            }),
-            Some(repo_id),
-            None,
-        )
-        .with_correlation(request_id);
+    #[tokio::test]
+    async fn test_settle_retryable_failure_keeps_budget() {
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let (request_id, _repo) = seeded_trigger_request(&pool).await;
 
-        let scheduler = Arc::new(Scheduler::new());
-        let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let workspace_paths: Arc<
-            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
-        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let run_workspace_paths = run_workspace_paths_cache();
-        let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
-            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-        let run_waiters: Arc<
-            std::sync::Mutex<
-                HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
-            >,
-        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // One consumed attempt (what mark_processing does on pickup).
+        gitforge_db::queries::TriggerRequestQueries::mark_processing(&pool, request_id)
+            .await
+            .expect("mark processing");
 
-        process_trigger_event(
-            &event,
-            &scheduler,
-            &pipeline_cache,
-            Some(&pool),
-            &workspace_paths,
-            &run_workspace_paths,
-            &pipeline_registry,
-            &run_waiters,
+        settle_trigger_failure(
+            &pool,
+            request_id,
+            &TriggerFailure::retryable(anyhow::anyhow!("database is busy")),
         )
         .await;
 
@@ -5725,21 +5733,84 @@ jobs:
             "a retryable failure is not recorded as terminal: {:?}",
             settled.error
         );
-        assert!(settled.run_id.is_none(), "no run was created");
+        assert!(settled.run_id.is_none(), "no run exists to attribute");
+    }
 
-        let runs = gitforge_db::queries::PipelineRunQueries::list(&pool)
+    #[tokio::test]
+    async fn test_settle_terminal_failure_marks_failed() {
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let (request_id, _repo) = seeded_trigger_request(&pool).await;
+        let run_id = gitforge_common::PipelineRunId::new();
+
+        settle_trigger_failure(
+            &pool,
+            request_id,
+            &TriggerFailure::terminal_after_run(
+                anyhow::anyhow!("pipeline config is not valid"),
+                run_id,
+            ),
+        )
+        .await;
+
+        let settled = gitforge_db::queries::TriggerRequestQueries::get(&pool, request_id)
             .await
-            .expect("list runs");
-        assert!(
-            runs.is_empty(),
-            "a retryable failure must not create a run row"
+            .expect("read settled request")
+            .expect("trigger request row survives");
+        assert_eq!(
+            settled.status, "failed",
+            "a terminal failure is visible, not retried"
+        );
+        assert_eq!(
+            settled.run_id,
+            Some(run_id),
+            "the run produced before the failure is traceable"
         );
         assert!(
-            pipeline_cache
-                .lock()
-                .expect("pipeline cache lock")
-                .is_empty(),
-            "no pipeline may be cached for a repo that is not registered"
+            settled
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not valid")),
+            "the failure cause is recorded: {:?}",
+            settled.error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_settle_retryable_failure_at_exhausted_budget_fails_visible() {
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let (request_id, _repo) = seeded_trigger_request(&pool).await;
+
+        // Burn the whole budget with consumed attempts.
+        for _ in 0..TRIGGER_MAX_ATTEMPTS {
+            gitforge_db::queries::TriggerRequestQueries::mark_processing(&pool, request_id)
+                .await
+                .expect("mark processing");
+        }
+
+        settle_trigger_failure(
+            &pool,
+            request_id,
+            &TriggerFailure::retryable(anyhow::anyhow!("git spawn keeps failing")),
+        )
+        .await;
+
+        let settled = gitforge_db::queries::TriggerRequestQueries::get(&pool, request_id)
+            .await
+            .expect("read settled request")
+            .expect("trigger request row survives");
+        assert_eq!(
+            settled.status, "failed",
+            "a retryable failure at exhausted budget becomes visible"
+        );
+        assert!(
+            settled
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("git spawn")),
+            "the failure cause is recorded: {:?}",
+            settled.error
         );
     }
 }
