@@ -118,7 +118,10 @@ async fn seed_database(
         .await
         .expect("create repository");
     if !required_checks.is_empty() {
-        let checks: Vec<String> = required_checks.iter().map(|name| name.to_string()).collect();
+        let checks: Vec<String> = required_checks
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
         gitforge_db::queries::RepoQueries::update_policy(&pool, repo_id, &checks, true)
             .await
             .expect("configure ref policy");
@@ -314,11 +317,7 @@ async fn test_tags_bypass_gate_and_deletions_trigger_nothing() {
     let (sha, work) = make_commit(&server, "tagged");
     run_git(&["tag", "v1"], &work, &[]);
     run_git(&["push", "origin", "v1"], &work, &[]);
-    let tag = run_git(
-        &["rev-parse", "refs/tags/v1"],
-        &bare_repo(&server),
-        &[],
-    );
+    let tag = run_git(&["rev-parse", "refs/tags/v1"], &bare_repo(&server), &[]);
     assert_eq!(
         String::from_utf8_lossy(&tag.stdout).trim(),
         sha,
@@ -346,7 +345,8 @@ async fn test_tags_bypass_gate_and_deletions_trigger_nothing() {
         "deletion must not enqueue a CI trigger: {rows:?}"
     );
     assert!(
-        rows.iter().all(|(_, new_hash)| !new_hash.chars().all(|c| c == '0')),
+        rows.iter()
+            .all(|(_, new_hash)| !new_hash.chars().all(|c| c == '0')),
         "no trigger may carry an all-zero new hash: {rows:?}"
     );
 
