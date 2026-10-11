@@ -93,9 +93,13 @@ lists a repo whose directory is gone. The failure only surfaces when
 something needs the path: a run trigger checks `repo.git_path` existence and
 returns 500 `storage_unavailable`
 (`crates/gitforge-api/src/routes/ci.rs:508-518`); a Git smart-HTTP request
-for an unbacked repo 404s. A 200 on `/health` and a 200 on `/api/repos` are
-therefore **liveness, not storage truth**. Recovery must never be declared
-complete from them.
+for an unbacked repo 404s — both the unknown-repo case and the
+row-exists-but-storage-absent ("orphan row") case are pinned as tests in
+`test_unknown_and_unbacked_repositories_are_not_served`
+(`services/git-server/tests/git_http_edges.rs:353-412`; unknown repo
+`:359-382`, storage-less row `:384-409`). A 200 on `/health` and a 200 on
+`/api/repos` are therefore **liveness, not storage truth**. Recovery must
+never be declared complete from them.
 
 ## 3. What is *not* broken (as of the dated observations)
 
@@ -126,9 +130,9 @@ handoff.
 3. Row contents for the affected repos (owner, visibility,
    `required_checks`, `deny_non_fast_forward`, timestamps) and the
    pipelines' `config` payloads — not yet captured.
-4. The live deployment's actual `DATABASE_URL`, `GIT_ROOT`,
-   `GITFORGE_ARTIFACT_ROOT`, and port values (env var *names* are
-   [VERIFIED-SOURCE], §6; values were never captured).
+4. The live deployment's actual `DATABASE_URL`, `GITFORGE_DATABASE_URL`,
+   `GIT_ROOT`, `GITFORGE_ARTIFACT_ROOT`, and port values (env var *names*
+   are [VERIFIED-SOURCE], §6; values were never captured).
 5. Whether the retired parent root `/home/mkinney/work/gitforge-audit-20260822/`
    still exists at all, and what else lives under it.
 6. Historical CI runs/logs/artifacts for these repos (scheduler DB,
@@ -181,9 +185,11 @@ All **[VERIFIED-SOURCE]** at `8431f1170608bc8fc86862777e2619bdfa5d8387`:
 - `crates/gitforge-api/tests/ci_routes.rs:1192-1215` —
   `pipeline_run_trigger_validates_pipeline_and_id`: unknown pipeline → 404;
   malformed id → 400 `invalid_id`.
-- `services/git-server/tests/git_http_edges.rs:353-370` —
+- `services/git-server/tests/git_http_edges.rs:353-412` —
   `test_unknown_and_unbacked_repositories_are_not_served`: unknown repo →
-  404 on info/refs.
+  404 (`:359-382`; info/refs and both service endpoints); a row that
+  exists in the DB with no provisioned storage → 404, not 500
+  (`:384-409`).
 
 ## 7. Standing rules (all phases, no exceptions)
 
@@ -256,13 +262,18 @@ is not.
    STAGE=/var/tmp/gitforge-aegis-recovery-20261011   # NVMe per scratch policy
    install -d "$STAGE/db" "$STAGE/receipts"
    sqlite3 "$API_DB_PATH" ".backup '$STAGE/db/api-snapshot-$(date +%Y%m%dT%H%M%S).db'"
-   # repeat for the CI scheduler DB if its DATABASE_URL differs
+   # Then snapshot the CI scheduler DB the same way: it is a separate
+   # database, configured by the CI unit's GITFORGE_DATABASE_URL
+   # (services/ci/src/main.rs:188) — NOT DATABASE_URL.
    sqlite3 "$SNAP" 'PRAGMA integrity_check;'     # must print: ok
    sha256sum "$STAGE"/db/*.db | tee "$STAGE/receipts/db-snapshot.sha256"
    ```
 
    `API_DB_PATH` comes from the API unit's `DATABASE_URL`
-   (default `sqlite:/gitforge.db`, `services/api/src/main.rs:182`).
+   (default `sqlite:/gitforge.db`, `services/api/src/main.rs:182`). The
+   CI scheduler's DB path comes from the **CI unit's**
+   `GITFORGE_DATABASE_URL` (`services/ci/src/main.rs:188`) — a different
+   variable, pointing at a different database; both must be snapshotted.
 5. **Record baseline state hashes:** sha256 of the snapshot(s), sizes, and
    a read-only dump of the affected rows from the **snapshot** (§8 Phase 1)
    — this is the preserved "before" evidence.
@@ -281,7 +292,7 @@ Any miss → G0 not met; stop and report.
 filesystem.
 
 1. From the **snapshot**, dump every repository row and every pipeline row
-   to the census files:
+   to the census files, including the classifier input consumed by step 2:
 
    ```bash
    sqlite3 -header -csv "$SNAP" \
@@ -291,27 +302,50 @@ filesystem.
      "SELECT id,repo_id,name,trigger_type,created_at FROM pipelines ORDER BY repo_id;" \
      > "$STAGE/receipts/census-pipelines.csv"
    # pipelines.config per row into a separate file (needed at Phase 3)
+
+   # Classifier input for step 2, exactly the pipe-delimited id|name|path
+   # it consumes — derived from the Phase 0 `.backup` snapshot (read-only)
+   # with `sqlite3 -separator '|'`. Never read, cat, or parse the live
+   # database file. A `|` inside git_path is harmless: it stays inside
+   # `path`, the final read field.
+   sqlite3 -separator '|' "$SNAP" \
+     "SELECT id,name,git_path FROM repositories ORDER BY name;" \
+     > "$STAGE/receipts/repos.txt"
    ```
-2. Classify **every** repository row. Taxonomy (binary, mutually
-   exclusive): `missing` / `non_directory` / `present_not_openable` /
-   `non_bare` / `openable_no_refs` / `refs_available`. Plus the inverse
-   class `orphan` for directories under any storage root with no DB row.
+2. Classify **every** repository row. Taxonomy — mutually exclusive, one
+   class per row, decided by the **first matching rule in this order**:
+   `missing` (path does not exist) / `non_directory` (exists, not a
+   directory) / `present_not_openable` (directory, not a git repo) /
+   `non_bare` (openable, not bare — decided **before** any ref check: a
+   non-bare repo with refs is `non_bare`, never `refs_available`) /
+   `openable_no_refs` (bare, zero refs) / `refs_available` (bare, ≥1
+   ref). Plus the inverse class `orphan` for directories under any
+   storage root with no DB row.
 
    ```bash
    while IFS='|' read -r id name path; do
      st=missing
      if   [ -e "$path" ] && [ ! -d "$path" ]; then st=non_directory
      elif [ -d "$path" ]; then
-       st=present_not_openable
-       if git -C "$path" rev-parse --git-dir >/dev/null 2>&1; then
+       if ! git -C "$path" rev-parse --git-dir >/dev/null 2>&1; then
+         st=present_not_openable
+       elif ! git -C "$path" rev-parse --is-bare-repository | grep -q true; then
+         st=non_bare                  # precedence: non-bare beats ref state
+       elif [ "$(git -C "$path" show-ref 2>/dev/null | wc -l)" -eq 0 ]; then
          st=openable_no_refs
-         git -C "$path" rev-parse --is-bare-repository | grep -q true || st=non_bare
-         [ "$(git -C "$path" show-ref 2>/dev/null | wc -l)" -gt 0 ] && st=refs_available
+       else
+         st=refs_available
        fi
      fi
      printf '%s|%s|%s|%s\n' "$id" "$name" "$path" "$st"
-   done < repos.txt | tee "$STAGE/receipts/census-classification.txt"
+   done < "$STAGE/receipts/repos.txt" | tee "$STAGE/receipts/census-classification.txt"
    ```
+
+   **Verifier protocol:** the Verifier re-executes **this exact
+   script** (copied into the receipt with its sha256), against the same
+   snapshot and `repos.txt` — not a re-derived or reformatted variant.
+   G1 agreement is a double-execution check of one classifier, not a
+   comparison of two.
 3. **Orphan scan:** list `mindepth 1 -maxdepth 1 -type d` under each known
    storage root (the captured `GIT_ROOT`, plus every parent directory of
    any `git_path` value in the census); set-difference against the DB UUID
@@ -335,8 +369,8 @@ filesystem.
 **G1 (binary):** 100% of repository rows classified; all storage roots'
 orphans enumerated; every `missing` repo has a recorded candidate-search
 verdict (found-with-hashes, or not-found-after-listed-search). Verifier
-reproduces the classification and agrees. Spot-checks, sampling, or
-"probably fine" do not satisfy G1.
+re-runs the same classifier script per the step-2 protocol and agrees.
+Spot-checks, sampling, or "probably fine" do not satisfy G1.
 
 ---
 
@@ -424,13 +458,23 @@ Any `fsck` error or unexplained ref delta → abort that repo to disposition
    ```bash
    T=<registered-parent-of-git_path>            # e.g. .../runtime-repos
    cp -a "$STAGE/stage/<uuid>" "$T/.<uuid>.incoming"   # copy onto target fs
-   mv "$T/.<uuid>.incoming" "$T/<uuid>"                # atomic within target fs
+   test ! -e "$T/<uuid>"   # HARD GATE: destination must not exist — if it
+                           # did, mv would nest the staged copy INSIDE it
+                           # (as $T/<uuid>/.<uuid>.incoming), not replace it
+   mv "$T/.<uuid>.incoming" "$T/<uuid>"                # rename: atomic within target fs
    git -C "$T/<uuid>" fsck --full --no-progress        # post-move re-proof
    ```
 
-   The staged copy stays in `$STAGE` until G6 (dual evidence). Rollback at
-   any instant: `mv "$T/<uuid>" "$STAGE/rollback/<uuid>"` — the registered
-   path returns to absent, exactly the pre-incident state.
+   The staged copy stays in `$STAGE` until G6 (dual evidence). Rollback
+   at any instant, two hops: first
+   `mv "$T/<uuid>" "$T/.<uuid>.rolled-back"` — a rename within the
+   target filesystem (atomic), after which the registered path has
+   returned to absent, exactly the pre-incident state. Only then move
+   `.rolled-back` into `$STAGE/rollback/<uuid>` for retention: that
+   second hop crosses filesystems (`$T` → `/var/tmp`), so it is
+   copy-plus-unlink, **not atomic** — it is interruptible and touches
+   only the already-unregistered copy; re-verify it (`fsck` + hash vs
+   dossier) once it arrives.
 3. **Canary probes, in order; stop at the first unexpected response:**
    1. Authenticated API lookup of the repo returns the row (owner username
       resolved from `owner_id` in the snapshot; endpoint per `docs/API.md`).
@@ -514,8 +558,10 @@ path-redaction changes around
   (`crates/gitforge-db/src/queries.rs:429-441`) — the same hydration this
   incident exploited (no path validation).
 - Classify each repo path: `missing` / `malformed` (exists, not a
-  directory) / `non_bare` / `ok`; enumerate orphan directories under
-  `GIT_ROOT` vs the row set (layout per
+  directory) / `non_bare` / `ok` — with the same precedence as the
+  Phase 1 census: `non_bare` is decided before any ref check, so a
+  non-bare repo with refs reports `non_bare`, never `ok`; enumerate
+  orphan directories under `GIT_ROOT` vs the row set (layout per
   `crates/gitforge-core/src/storage.rs:85-87`).
 - Emit **metrics** (counters per classification) and a **structured,
   redacted `tracing` warning + serializable receipt** per pass — receipt
@@ -551,10 +597,13 @@ This is hardening *after* recovery; it does not recover anything.
 - **Phases 0–3:** nothing has touched live state; rollback is discarding
   staging artifacts (after the retention decision).
 - **Phase 4/5 placement:** `mv` the placed directory back out of the
-  registered path (see §8 Phase 4 step 2) — the registered path returns to
-  its pre-incident (absent) state; DB rows were never modified; services
-  were never restarted; the staged verified copy remains intact for a
-  later retry.
+  registered path (see §8 Phase 4 step 2) — the first hop is the rename
+  into `$T/.<uuid>.rolled-back`, atomic within the target filesystem,
+  and it alone restores the pre-incident (absent) registered state; the
+  subsequent move into `$STAGE/rollback/` may cross filesystems and is
+  copy-plus-unlink, not atomic (re-verify on arrival). DB rows were
+  never modified; services were never restarted; the staged verified
+  copy remains intact for a later retry.
 - **No rollback ever requires SQL, because no SQL was ever run against the
   live DB.**
 
