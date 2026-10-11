@@ -150,8 +150,11 @@ Two changes, both harness/config:
 Run in `/home/mkinney/worktrees/gitforge-trigger-fixture-registration-20261011`
 (ext4, not NAS), `TMPDIR=/tmp`:
 
-- `actionlint` (v1.7.12 at `/var/tmp/actionlint-bin/actionlint`, the
-  pre-push gate for workflow edits): 0 findings on the edited workflow.
+- `actionlint` (v1.7.12 at `/var/tmp/actionlint-bin/actionlint`): 0
+  findings on the edited workflow. This was a supplementary local check
+  mirroring the GitHub Actions `rust-ci.yml` "Run actionlint" step, which
+  is where actionlint is actually enforced; neither the local GitForge
+  pipeline (`.gitforge.yml`) nor the installed git hooks run it.
 - `shellcheck -s bash -S warning` over the four shell scripts this change
   touches or sits beside (validate, register, enqueue, poll): 0 findings.
   The fifth block (`report-status`, untouched by this change) interpolates
@@ -176,6 +179,13 @@ Run in `/home/mkinney/worktrees/gitforge-trigger-fixture-registration-20261011`
   itself); past the window, the documented dedup-echo/substitution contract
   correlates the poll to the run. Authoritative proof lands with this
   branch's own PR run.
+- **Outstanding evidence — NOT yet satisfied**: this PR's own end-to-end
+  GitForge merge-SHA registration run is still pending at the time of
+  writing. GitHub workflow run `38112175025` had not advanced past the
+  poll step since 04:38Z; no `pipeline_run_id` correlation and no green
+  GitForge run for this PR's merge SHA has been observed. The acceptance
+  bullet above is therefore a design claim backed by partial evidence
+  (§2b), not a passed gate — this receipt does not mark it passed.
 - **"intentionally unavailable repo still fails terminal before run"**: the
   PR #293 preflight is untouched (`test_handle_push_event_fails_terminal_
   without_run_for_missing_git_path` still pins it), and the registration
@@ -191,7 +201,7 @@ Run in `/home/mkinney/worktrees/gitforge-trigger-fixture-registration-20261011`
    outcome either way, at the cost of a second full build. The product fix
    is the PR #280 trigger-status endpoint (or echo-on-settle dedup); out of
    scope here by tasking constraint.
-2. **Scratch-ref accumulation**: `refs/ci/github-bridge/<sha>` grows one
+2. **Scratch-ref accumulation**: `refs/tags/github-bridge/<sha>` grows one
    ref per built SHA (objects are per-PR merge commits, mostly unique). GC
    candidate for the instance, like any CI by-product; never referenced by
    runs (checkout is by SHA), so dropping old ones is safe.
@@ -215,3 +225,9 @@ Run in `/home/mkinney/worktrees/gitforge-trigger-fixture-registration-20261011`
    are a GC candidate on the instance like any CI by-product; they never
    move once created, so pruning old ones cannot race an in-flight build
    of the SAME sha.
+7. **Plain-HTTP push transport (pre-existing, low severity)**: the
+   instance's git endpoint is `http://` without TLS (git server on port
+   42782, private LAN), so registration pushes — including the
+   credential-helper exchange — transit unencrypted. Unchanged by this
+   PR; exposing the instance beyond the LAN requires the secured-endpoint
+   arrangement documented in `docs/GITFORGE_CI_SETUP.md`.
