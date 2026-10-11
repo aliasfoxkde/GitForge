@@ -26,6 +26,12 @@ env:
   GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
   GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
+  # Git transport to the git-server, used only by pull_request events to
+  # import GitHub's merge commit into the store (required for PRs, unused
+  # for push events). GITFORGE_REPO_PATH overrides the git-server
+  # owner/repo path when it differs from the GitHub repository full name.
+  GITFORGE_GIT_URL: ${{ vars.GITFORGE_GIT_URL || '' }}
+  GITFORGE_REPO_PATH: ${{ vars.GITFORGE_REPO_PATH || '' }}
 
 permissions:
   contents: read
@@ -62,6 +68,46 @@ jobs:
             echo "GITFORGE_POLL_INTERVAL_SECONDS must be a positive integer" >&2
             exit 1
           }
+      - name: Import PR merge object
+        id: import
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A pull_request event's github.sha is GitHub's synthetic merge
+          # commit: an object that exists only in GitHub's store and is
+          # reachable from no branch GitForge holds, while workspace prep
+          # checks out by hash from the registered bare repository alone.
+          # Transfer the exact object before enqueueing: fetch the PR merge
+          # ref from GitHub and push it to the git-server under the
+          # gitforge-ci import namespace. It must be a tag — the CI clone
+          # transfers refs/heads/* and tags only, so a plain refs/ci/...
+          # staging ref would never reach the checkout — and the git-server
+          # treats that namespace as plumbing that never triggers CI, so the
+          # enqueue below is the run's only trigger.
+          : "${GITFORGE_GIT_URL:?GITFORGE_GIT_URL is required for pull_request events}"
+          REPO_PATH="${GITFORGE_REPO_PATH:-${GITHUB_REPOSITORY}}"
+          MERGE_SHA="${{ github.sha }}"
+          PR_NUMBER="${{ github.event.number }}"
+          TAG_REF="refs/tags/gitforge-ci/pr-${PR_NUMBER}-${MERGE_SHA}"
+          BRIDGE="$(mktemp -d)"
+          trap 'rm -rf "$BRIDGE"' EXIT
+          git init -q --bare "$BRIDGE/repo.git"
+          git -C "$BRIDGE/repo.git" fetch -q --no-tags \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}" \
+            "refs/pull/${PR_NUMBER}/merge:${TAG_REF}"
+          # Pointer contract: GitHub must serve the exact SHA this event
+          # reports as the build subject, or nothing downstream is honest.
+          FETCHED_SHA="$(git -C "$BRIDGE/repo.git" rev-parse "${TAG_REF}^{commit}")"
+          if [ "$FETCHED_SHA" != "$MERGE_SHA" ]; then
+            echo "GitHub merge ref resolved to $FETCHED_SHA, expected $MERGE_SHA" >&2
+            exit 1
+          fi
+          git -C "$BRIDGE/repo.git" push -q \
+            "$GITFORGE_GIT_URL/${REPO_PATH}" "${TAG_REF}:${TAG_REF}"
+          echo "Imported ${MERGE_SHA} as ${TAG_REF}"
+
       - name: Enqueue build job
         id: enqueue
         run: |

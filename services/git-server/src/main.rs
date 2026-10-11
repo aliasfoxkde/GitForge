@@ -645,6 +645,20 @@ async fn enqueue_ci_event(
         );
         return Ok(());
     }
+    // The import namespace is object plumbing, not a build subject: the
+    // GitHub Actions workflow pushes a pull request's merge commit here so
+    // the object exists in this store (GitHub's merge SHA is reachable from
+    // no branch GitForge holds), and then enqueues the run itself through
+    // the scheduler API. Treating the import push as a push event would
+    // grade a second, duplicate run for the same commit.
+    if update.ref_name.starts_with(GITFORGE_CI_IMPORT_NAMESPACE) {
+        tracing::info!(
+            repo_id = %repo_id,
+            ref_name = %update.ref_name,
+            "gitforge-ci import ref; not triggering CI"
+        );
+        return Ok(());
+    }
     let Some(pool) = &state.db_pool else {
         anyhow::bail!("database is required for durable CI delivery");
     };
@@ -695,6 +709,14 @@ async fn enqueue_ci_event(
 /// the git client is already waiting on the push response — but bounded so
 /// a persistently broken database cannot hang pushes forever.
 const CI_TRIGGER_SYNC_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Ref namespace the GitHub Actions workflow imports pull-request merge
+/// commits under (`refs/tags/gitforge-ci/pr-<number>-<sha>`). The tag shape
+/// matters twice over: the tag must carry the object through the CI
+/// service's `git clone` (which transfers only `refs/heads/*` and tags, so
+/// a plain `refs/ci/...` staging ref would not), and pushes here are import
+/// plumbing that must never fire the push-event trigger loop.
+const GITFORGE_CI_IMPORT_NAMESPACE: &str = "refs/tags/gitforge-ci/";
 
 /// Ceiling of the exponential insert backoff.
 const CI_TRIGGER_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1249,6 +1271,62 @@ mod tests {
             result.is_err(),
             "a real commit hash must still require the durable database path"
         );
+    }
+
+    // The GitHub PR import workflow pushes the pull request's merge commit
+    // as `refs/tags/gitforge-ci/pr-<n>-<sha>` so the object becomes
+    // checkout-able, and then enqueues its run through the scheduler API
+    // itself. The import push is plumbing: firing the push-event trigger on
+    // it would grade a second run for the same commit. The branch push below
+    // is the contrast case — the guard must be namespace-scoped, not a
+    // blanket trigger suppression.
+    #[tokio::test]
+    async fn test_enqueue_ci_event_skips_gitforge_ci_import_tags() {
+        let (pool, db_path) = storm_pool("import-tag-guard").await;
+        let storage = Arc::new(FileStorageBackend::new("target/test-git-root-import-tag"));
+        let state = AppState {
+            http_handler: Arc::new(HttpGitHandler::new((*storage).clone())),
+            storage,
+            db_pool: Some(Arc::new(pool.clone())),
+            ci_trigger_url: None,
+            ci_trigger_token: None,
+            http_client: ci_http_client(),
+        };
+        let repo_id = RepoId::new();
+
+        // Git's receive-pack creation sentinel — an all-zero object id, the
+        // same value `is_zero_hash` treats as the deletion sentinel (branch
+        // creation carries a zero OLD hash).
+        let creation_sentinel = "0".repeat(40);
+        let import = ReceiveUpdate {
+            old_hash: creation_sentinel.clone(),
+            new_hash: "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
+            ref_name: format!("{GITFORGE_CI_IMPORT_NAMESPACE}pr-309-{repo_id}"),
+        };
+        enqueue_ci_event(&state, repo_id, &import)
+            .await
+            .expect("an import push is accepted plumbing; it must be a silent no-op");
+        assert_eq!(
+            pending_trigger_count(&pool).await,
+            0,
+            "an import ref push must not enqueue a CI trigger"
+        );
+
+        let branch = ReceiveUpdate {
+            old_hash: creation_sentinel,
+            new_hash: "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
+            ref_name: "refs/heads/feature".to_string(),
+        };
+        enqueue_ci_event(&state, repo_id, &branch)
+            .await
+            .expect("a branch push still rides the durable trigger path");
+        assert_eq!(
+            pending_trigger_count(&pool).await,
+            1,
+            "the import guard must not suppress ordinary branch pushes"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
     }
 
     // --- F42 acceptance: the trigger outbox survives a real SQLITE_BUSY

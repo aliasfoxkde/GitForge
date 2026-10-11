@@ -3233,6 +3233,87 @@ mod tests {
         tokio::fs::remove_dir_all(&test_root_path).await.unwrap();
     }
 
+    // The GitHub PR import workflow lands a pull request's merge commit as
+    // `refs/tags/gitforge-ci/pr-<n>-<sha>` — a commit no branch points at.
+    // Workspace prep must still deliver it: the clone transfers `refs/heads/*`
+    // plus tags (and their objects), and checkout is by hash alone, so the
+    // import tag is what makes GitHub's merge SHA check-outable. This pins
+    // the assumption the whole import path rests on; a clone change that
+    // restricts transferred refs would break every PR run at checkout, and
+    // this test is where that shows up first.
+    #[tokio::test]
+    async fn test_prepare_run_workspace_checks_out_commit_only_reachable_from_import_tag() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let run_id = gitforge_common::PipelineRunId::new();
+        let test_root_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-workspace-tests")
+            .join(run_id.to_string());
+        let source = test_root_path.join("source.git");
+        let seed = test_root_path.join("seed");
+        tokio::fs::create_dir_all(&test_root_path).await.unwrap();
+        run_git(["init", "--bare", source.to_str().unwrap()], None).await;
+        tokio::fs::create_dir_all(&seed).await.unwrap();
+        run_git(["init", seed.to_str().unwrap()], None).await;
+        run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
+        run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
+        tokio::fs::write(seed.join("marker.txt"), "base\n")
+            .await
+            .unwrap();
+        run_git(["add", "marker.txt"], Some(&seed)).await;
+        run_git(["commit", "-m", "base"], Some(&seed)).await;
+        let base = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
+        run_git(
+            ["push", source.to_str().unwrap(), "HEAD:refs/heads/main"],
+            Some(&seed),
+        )
+        .await;
+        tokio::fs::write(seed.join("marker.txt"), "merge result\n")
+            .await
+            .unwrap();
+        run_git(["add", "marker.txt"], Some(&seed)).await;
+        run_git(["commit", "-m", "imported merge"], Some(&seed)).await;
+        let merge = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
+        // Import shape: reachable ONLY from the import tag, from no branch.
+        run_git(
+            [
+                "push",
+                source.to_str().unwrap(),
+                format!("HEAD:refs/tags/gitforge-ci/pr-7-{merge}").as_str(),
+            ],
+            Some(&seed),
+        )
+        .await;
+
+        let (pool, repo_id) =
+            test_pool_with_repository(source.to_string_lossy().into_owned()).await;
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", test_root_path.join("workspaces"));
+        assert_ne!(
+            merge, base,
+            "fixture: the imported commit must not be the branch head"
+        );
+        let workspace = prepare_run_workspace(&pool, repo_id, run_id, &merge)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_git(
+                ["rev-parse", "HEAD"],
+                Some(std::path::Path::new(&workspace))
+            )
+            .await,
+            merge
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(PathBuf::from(&workspace).join("marker.txt"))
+                .await
+                .unwrap(),
+            "merge result\n"
+        );
+        tokio::fs::remove_dir_all(&test_root_path).await.unwrap();
+    }
+
     // A restart leaves the previous process's workspace on disk. The second
     // prepare for the same run must adopt it (restoring the tracked tree and
     // clearing job leftovers), not fail — the failure path used to make the
@@ -5505,5 +5586,111 @@ jobs:
                 .is_empty(),
             "a ref-deletion push must not prepare a run workspace"
         );
+    }
+
+    // Fail-closed trigger outcome for a commit the store does not hold (the
+    // GitHub PR shape: `old_hash` empty, ref named `<n>/merge`, `new_hash` =
+    // GitHub's merge SHA — an object that exists only in GitHub's store
+    // until the import workflow transfers it). The run row must be graded
+    // `failed` with the checkout reason and zero job rows: legible, not a
+    // silent planning crash, and not a partially dispatched run.
+    #[tokio::test]
+    async fn test_handle_push_event_absent_commit_fails_run_with_zero_jobs() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let run_id = gitforge_common::PipelineRunId::new();
+        let test_root_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-workspace-tests")
+            .join(run_id.to_string());
+        let source = test_root_path.join("source.git");
+        let seed = test_root_path.join("seed");
+        tokio::fs::create_dir_all(&test_root_path).await.unwrap();
+        run_git(["init", "--bare", source.to_str().unwrap()], None).await;
+        tokio::fs::create_dir_all(&seed).await.unwrap();
+        run_git(["init", seed.to_str().unwrap()], None).await;
+        run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
+        run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
+        tokio::fs::write(seed.join("marker.txt"), "present\n")
+            .await
+            .unwrap();
+        run_git(["add", "marker.txt"], Some(&seed)).await;
+        run_git(["commit", "-m", "unrelated head"], Some(&seed)).await;
+        run_git(
+            ["push", source.to_str().unwrap(), "HEAD:refs/heads/main"],
+            Some(&seed),
+        )
+        .await;
+
+        let (pool, repo_id) =
+            test_pool_with_repository(source.to_string_lossy().into_owned()).await;
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", test_root_path.join("workspaces"));
+
+        let missing_commit = "3eadbeef3eadbeef3eadbeef3eadbeef3eadbeef";
+        let envelope = EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "309/merge".to_string(),
+                old_hash: String::new(),
+                new_hash: missing_commit.to_string(),
+                pusher_id: None,
+            }),
+            Some(repo_id),
+            None,
+        );
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let workspace_paths: Arc<
+            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let failure = handle_push_event(
+            &envelope,
+            &scheduler,
+            &pipeline_cache,
+            Some(&pool),
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        .expect_err("a commit absent from the store must fail the trigger");
+        assert!(
+            !failure.retryable,
+            "re-running the trigger for a failed run would only duplicate it"
+        );
+        let failed_run = failure
+            .run_id
+            .expect("the failure must trace to the run row it graded");
+
+        let run = gitforge_db::queries::PipelineRunQueries::get(&pool, failed_run)
+            .await
+            .unwrap()
+            .expect("the run row exists before the workspace is prepared");
+        assert_eq!(run.status, "failed");
+        let reason = run.error.expect("fail_run persists the checkout reason");
+        assert!(
+            reason.contains("checkout commit") && reason.contains(missing_commit),
+            "the stored reason must name the unresolvable commit, got {reason:?}"
+        );
+        assert_eq!(
+            failure.error.to_string(),
+            reason,
+            "the request failure and the durable reason are the same error"
+        );
+        assert!(
+            gitforge_db::queries::JobQueries::list_by_run(&pool, failed_run)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no job may be dispatched from a run whose workspace never existed"
+        );
+        tokio::fs::remove_dir_all(&test_root_path).await.unwrap();
     }
 }
