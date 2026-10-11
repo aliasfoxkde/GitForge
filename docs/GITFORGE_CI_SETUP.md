@@ -19,11 +19,14 @@ Configure these repository or organization values before enabling it:
 | `GITFORGE_ENABLED` | variable | Exactly `true` |
 | `GITFORGE_API_URL` | variable | Reachable GitForge API base URL |
 | `GITFORGE_SCHEDULER_URL` | variable | Reachable scheduler base URL |
-| `GITFORGE_REPO_ID` | variable | UUID of the mirrored GitForge repository |
+| `GITFORGE_REPO_ID` | variable | UUID of the SAME repository `GITFORGE_GIT_URL` serves (owner/name in the URL must resolve to this id) |
+| `GITFORGE_GIT_URL` | variable | Git HTTP URL of the SAME repository (`…/:42782/<owner>/<repo>.git`); must be the repo behind `GITFORGE_REPO_ID` |
 | `GITFORGE_POLL_TIMEOUT_SECONDS` | variable | Positive integer timeout |
 | `GITFORGE_POLL_INTERVAL_SECONDS` | variable | Positive integer interval |
 | `GITFORGE_CI_TRIGGER_TOKEN` | secret | Bearer token for `POST /pipelines/trigger` and trigger correlation retries only |
 | `GITFORGE_SCHEDULER_OPERATOR_TOKEN` | secret | Bearer token for run-status reads (`GET /pipelines/runs/{id}`) only |
+| `GITFORGE_GIT_USERNAME` | secret | Git HTTP username for commit-registration pushes to `GITFORGE_GIT_URL` |
+| `GITFORGE_GIT_TOKEN` | secret | Git HTTP password/token for those pushes; distinct from both scheduler credentials |
 
 ### Least privilege
 
@@ -47,6 +50,54 @@ re-creating a shared super-token.
 The workflow validates all values and refuses to bypass GitForge if enqueue or
 polling fails. Until `GITFORGE_ENABLED=true` is intentionally configured, the
 workflow is skipped rather than issuing requests to an invalid local endpoint.
+
+## Commit registration (why GITFORGE_GIT_* exists)
+
+GitForge runs read the commit from the repository's registered git storage:
+the run workspace is cloned from it, and the pipeline definition is loaded
+from the pushed revision (`git cat-file <sha>:<config>`) against it. A GitHub
+pull request's merge commit (`refs/pull/N/merge`, and `github.sha` with it)
+exists only on GitHub — enqueueing a trigger before the commit is in GitForge
+storage mints a run that fails at checkout ("unable to read tree"), observed
+live 2026-10-11 (trigger `dc3382f1`, run `89d2a80e`, GitHub run 38106742159).
+
+The `Register commit in GitForge storage` step closes that gap before the
+enqueue POST is allowed, using ordinary receive-pack pushes — the same
+mechanism every developer push uses:
+
+1. Fetch `github.ref` (for pull_request events that is `refs/pull/N/merge`;
+   full history, never shallow — a shallow push would install a shallow
+   boundary in the instance's storage) from the GitHub mirror and require the
+   fetched head to equal `github.sha`.
+2. Push it to `GITFORGE_GIT_URL` under the per-SHA tag
+   `refs/tags/github-bridge/<sha>`: content-addressed, never force-pushed,
+   never moves a branch or tag, safe under concurrent PRs. The namespace must
+   be `refs/tags/*` (or `refs/heads/*`) because the run workspace is
+   materialized by a plain `git clone`, which fetches only `refs/heads/*` and
+   `refs/tags/*` — a commit parked solely under `refs/ci/*` is present in
+   storage yet unreachable at checkout (observed live 2026-10-11, run
+   `ec8b84ca`). The push fires a native trigger for the ref update, which the
+   trigger endpoint dedups onto the same `(repo_id, new_hash)` tuple as the
+   workflow's own POST — at most one active run per commit.
+3. Verify `git ls-remote` serves that scratch ref at exactly the event's
+   SHA. Only then is `POST /pipelines/trigger` sent.
+
+`GITFORGE_REPO_ID` and `GITFORGE_GIT_URL` must name the same repository: the
+trigger carries the UUID, while the run clones the `git_path` of THAT row.
+Pointing the UUID at a different mirror than the push URL means every run
+fails at checkout with `unable to read tree` even though registration
+verified the commit (observed live 2026-10-11: the bridge triggered repo
+`6905d6ea…` while pushes landed in `operator/gitforge`, repo `4509402f…`).
+The failure signature — ls-remote verified the scratch ref, the run still
+cannot read the tree — is the diagnostic for this misconfiguration.
+
+Consequences: a missing or unreachable repository fails the step before any
+run exists (the scheduler-side repository-storage preflight remains the
+backstop and still fails such triggers terminally with no run row), and the
+scratch refs accumulate one ref per built SHA — a GC candidate on the
+instance, like any other CI by-product. The push credential is a dedicated
+user account with write access to that one repository, kept distinct from
+both scheduler credentials.
 
 The Fedora-native GitForge path remains the source-of-truth CI path for local
 Git pushes. The GitHub workflow is only an integration bridge and must not be
