@@ -567,11 +567,15 @@ async fn git_receive_pack(
                     "push declined by ref-update policy"
                 );
             }
+            // The report must speak the framing the client negotiated:
+            // raw pkt-lines for a plain client, band-1 multiplexing for the
+            // sideband client every modern git is.
+            let sideband = ref_policy::requests_sideband(&body);
             return finish_response(
                 Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", "application/x-git-receive-pack-result"),
-                Body::from(ref_policy::synthesize_rejection_report(&reasons)),
+                Body::from(ref_policy::synthesize_rejection_report(&reasons, sideband)),
             );
         }
     }

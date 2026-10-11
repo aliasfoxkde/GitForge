@@ -217,6 +217,79 @@ sweep, then spawns the event consumer. Triggers published while the consumer
 is down or busy are durable and land once it drains — a `202` with a null
 `pipeline_run_id` means queued, not lost; re-query before re-triggering.
 
+Bundle cuts are atomic as of 2026-10-10: `gitforge-release-bundle` assembles
+under `releases/.incomplete-<release-id>/` and renames into place only once
+`READY` exists, so a half-cut bundle can never sit at the final name (and a
+failed attempt's staging tree is cleared by the next run of the same
+release id). The `.incomplete-` prefix is dot-hidden and never matches the
+release-auto candidate glob.
+
+### Cutover on the fedora instance (user units)
+
+The fedora host runs a second, standalone GitForge instance under
+**user-level** systemd (`gitforge-{api,ci,git-server,runner}.service`),
+pinned to the promoted bundle through the `~/work/gitforge-current` symlink.
+It is the validation/audit instance: release cutoffs and coverage probes run
+there, isolated from the NAS control plane. Cut overs are drain-gated the
+same way the NAS promote is, via the parametrized script:
+
+```bash
+# Run ON the fedora host ("remote" refers to the instance, not the login site).
+scripts/gitforge-remote-cutover --units user \
+    --db    ~/work/gitforge-audit-20260822/audit.db \
+    --bundle ~/work/validation/releases/gitforge-<shortsha>-<YYYYMMDD> \
+    --link  ~/work/gitforge-current          # add --dry-run to inspect first
+```
+
+The script polls the job table until nothing is `assigned`/`running` (a
+pending-only backlog does not block), stops the scheduler units first
+(`ci`, then `runner`, then `api`/`git-server`), flips the symlink with
+`mv -T`, restarts stateless before schedulers, and prints the boot-adoption
+journal lines. Units that are not installed — or masked (retired) — on the
+host are reported and skipped. For system-level template-unit hosts
+(the NAS), pass `--units system`; the script then drives
+`gitforge@{api,ci,git-server,runner}.service` through `sudo -n systemctl`.
+
+Fedora operational notes:
+
+- Non-interactive ssh has no session bus: `systemctl --user` fails silently
+  unless `XDG_RUNTIME_DIR` is set (the cutover script exports
+  `/run/user/$(id -u)` itself when missing).
+- `systemctl --user list-unit-files` needs the `.service` suffix or a glob —
+  a bare unit name matches nothing.
+- Ad-hoc docker probes that bind-mount host directories must pass
+  `--security-opt label=disable`: SELinux labels `user_tmp_t` dirs as
+  unwritable from confined containers, which presents as `Permission
+  denied` on writes the modes clearly allow. The runner's own job
+  workspaces already handle their labeling.
+- **Cut over the full service set together — never migrate the shared DB
+  under a running peer.** sqlx caches per-statement column metadata at
+  prepare time; when one service `ALTER TABLE`s the shared SQLite DB while
+  another still holds prepared `SELECT *` statements, SQLite's
+  auto-reprepare pairs a new column count with the stale metadata and the
+  peer panics (`SqliteRow::current`: `index out of bounds: the len is 16
+  but the index is 16`; ledger F40, 2026-10-10). `Restart=on-failure`
+  bounds the damage to one aborted process, but the drain-gated
+  stop-everything-then-start-together sequence avoids the window entirely.
+
+### Two-instance topology (as of 2026-10-10)
+
+- **NAS (control plane).** System-level template units
+  `gitforge@{api,ci,git-server}.service` + the repo-of-record, the API
+  gateway (:42780), the scheduler (:42781), and git serving (:42782). The
+  NAS `gitforge@runner.service` unit is **masked — retired, not failed**:
+  local execution moved off the NAS, and `gitforge-release-auto` /
+  `gitforge-status` skip masked units instead of failing the promote (the
+  pre-fix behavior made every release roll back forever).
+- **Execution fleet.** Remote docker runners register into the NAS
+  scheduler: `fedora-docker` on 192.168.1.202 and `t5500-docker`, so jobs
+  dispatch off-host while pushes, runs, and logs stay on the NAS instance.
+  A fresh `online` runner row with a stale heartbeat is the stale-registry
+  defect class F26 — `gitforge-status` reports stale-online counts and
+  degrades the verdict.
+- **Fedora standalone instance.** The user-unit instance above for release
+  validation; cut over with `scripts/gitforge-remote-cutover --units user`.
+
 ## Docker Compose
 
 Before `docker compose up`, set the required deployment variables in `.env`

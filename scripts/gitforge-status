@@ -118,7 +118,7 @@ for proc in /proc/[0-9]*; do
     exe="${exe% (deleted)}"
     marker=""
     if [[ -z "$exe" ]]; then
-        argv0=$(cat "$proc/cmdline" 2>/dev/null | tr '\0' '\n' | head -1)
+        argv0=$(tr '\0' '\n' 2>/dev/null < "$proc/cmdline" | head -1)
         [[ -n "$argv0" ]] || continue
         exe=$(readlink -f -- "$argv0" 2>/dev/null || printf '%s' "$argv0")
         marker=" [argv0]"
@@ -202,7 +202,7 @@ for unit in "${units[@]}"; do
         exe="${exe% (deleted)}"
         if [[ -z "$exe" ]]; then
             # dumpable cleared (setuid launch): fall back to argv[0].
-            argv0=$(cat "/proc/$main_pid/cmdline" 2>/dev/null | tr '\0' '\n' | head -1)
+            argv0=$(tr '\0' '\n' 2>/dev/null < "/proc/$main_pid/cmdline" | head -1)
             [[ -n "$argv0" ]] && exe=$(readlink -f -- "$argv0" 2>/dev/null || printf '%s' "$argv0")
         fi
     fi

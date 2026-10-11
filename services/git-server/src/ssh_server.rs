@@ -401,7 +401,10 @@ impl GitSshSession {
                         "push declined by ref-update policy over SSH"
                     );
                 }
-                return self.send_push_report(channel, &reasons, session).await;
+                let sideband = ref_policy::requests_sideband(&buffer);
+                return self
+                    .send_push_report(channel, &reasons, sideband, session)
+                    .await;
             }
         }
 
@@ -430,6 +433,7 @@ impl GitSshSession {
         &mut self,
         channel: russh::ChannelId,
         reasons: &[(String, String)],
+        sideband: bool,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
         if let Some(process) = self.processes.get_mut(&channel) {
@@ -442,7 +446,10 @@ impl GitSshSession {
         }
         let handle = session.handle();
         let _ = handle
-            .data(channel, ref_policy::synthesize_rejection_report(reasons))
+            .data(
+                channel,
+                ref_policy::synthesize_rejection_report(reasons, sideband),
+            )
             .await;
         // Refusal is a normal protocol outcome, not a server failure: exit 0
         // with per-ref declines, like a real pre-receive hook rejection.

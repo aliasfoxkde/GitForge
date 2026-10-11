@@ -15,13 +15,14 @@
 #   directory and corrupt each other's build locks.
 # - `environment: {}` is required by the parser (PipelineDefinition has no
 #   serde default) even though it is never forwarded.
-# - The image is pre-built on the host (dsc-ci-rust:9 — cargo, clippy,
+# - The image is pre-built on the host (dsc-ci-rust:10 — cargo, clippy,
 #   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, python3
 #   for the route-docs drift gate, and the GitForge workspace cargo
 #   registry cache baked in for offline builds).
 #   Rebuild and bump the tag whenever Cargo.lock changes or the baked
 #   tooling changes — a stale cache fails every cargo job in seconds with
-#   "candidate versions found which didn't match" (v9 added python3 for
+#   "candidate versions found which didn't match" (v10 added shellcheck
+#   for the new head-of-chain lint job; v9 added python3 for
 #   the drift checker; v8 documents the
 #   current tag; v7 added the coverage toolchain; v6 existed because v5
 #   dropped openssh-client, which the hermetic ssh-protocol tests spawn
@@ -42,8 +43,24 @@ trigger_on:
   - push
 environment: {}
 jobs:
+  - name: lint
+    image: dsc-ci-rust:10
+    steps:
+      - name: Shellcheck (including extensionless ops scripts)
+        # The release-channel ops scripts (scripts/gitforge-*) are bash and
+        # ship in every release bundle; a bug in them breaks the update
+        # channel itself (2026-10-10: a hardcoded unit list made every
+        # promote roll back forever). Parse-only, no cargo, no network —
+        # so it heads the chain and fails fast before the expensive jobs.
+        # The aegis pattern scan stays host-side (make lint / make aegis):
+        # the binary is a locally-built tool, not distro-packaged, and is
+        # not baked into this image.
+        run: shellcheck scripts/*.sh scripts/gitforge-* scripts/qualityctl scripts/verify-user-systemd-policy systemd/*.sh
+    timeout: 10m
+
   - name: fmt
-    image: dsc-ci-rust:9
+    image: dsc-ci-rust:10
+    needs: [lint]
     steps:
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -59,7 +76,7 @@ jobs:
     timeout: 15m
 
   - name: clippy
-    image: dsc-ci-rust:9
+    image: dsc-ci-rust:10
     needs: [fmt]
     steps:
       - name: Strict lint (zero warnings)
@@ -77,7 +94,7 @@ jobs:
     timeout: 60m
 
   - name: test
-    image: dsc-ci-rust:9
+    image: dsc-ci-rust:10
     needs: [clippy]
     steps:
       - name: Workspace test suite
@@ -104,7 +121,7 @@ jobs:
     timeout: 90m
 
   - name: coverage
-    image: dsc-ci-rust:9
+    image: dsc-ci-rust:10
     needs: [test]
     steps:
       - name: Line coverage gate (fail 82, warn 84)
@@ -158,7 +175,7 @@ jobs:
     timeout: 90m
 
   - name: fuzz
-    image: dsc-ci-rust:9
+    image: dsc-ci-rust:10
     needs: [coverage]
     steps:
       - name: Fuzz smoke (60s per target)
@@ -178,7 +195,7 @@ jobs:
         # even if the first crashed.
         #
         # Nightly is selected with the +channel syntax: cargo-fuzz 0.13
-        # (dsc-ci-rust:9) dropped `run --toolchain`, and the image's
+        # (dsc-ci-rust:10) dropped `run --toolchain`, and the image's
         # default toolchain is stable, which cannot build -Zbuild-std.
         run: |
           set -e

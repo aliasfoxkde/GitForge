@@ -997,3 +997,33 @@ until fixed, gate checks select the run row that owns the job rows,
 never the first row matching the commit. Evidence: audit.db rows
 e370bd23 (0 jobs, running) and db0397db (4 jobs) both at commit
 6a1e1f3b; ci journal 07:13:20 push-received line.
+
+**F40 (sqlx stale prepared-statement metadata aborts ci across a live
+schema migration — found 2026-10-10 auditing fedora service journals;
+same incident window as F39 and its likely proximate cause).** At
+12:11:19Z, mid-trigger (`pipeline triggered … ci/rc-v0616-retry` →
+`enqueueing 1 ready jobs`), a `sqlx-sqlite` worker panicked in
+`SqliteRow::current` (`row.rs:43`: `index out of bounds: the len is
+16 but the index is 16`) and the release-profile abort turned it into
+a core dump. Mechanism: sqlx caches per-statement column metadata at
+prepare time; when another process migrates the shared SQLite DB
+(`ALTER TABLE … ADD COLUMN`), SQLite auto-reprepares the cached
+statement to the new schema (17 columns) while sqlx still holds the
+old metadata vec (16) — `columns[i]` runs off the end. The old ci
+binary had prepared `SELECT *` statements against the pre-migration
+jobs table; a co-booting service applied the migration underneath it.
+Disposition: upstream sqlx behavior, self-healed — systemd
+`Restart=on-failure` restarted ci in 13s (journal: restart counter 1,
+07:11:35 CDT) and the fresh process prepares statements post-migration;
+the standard drain-gated cutover restarts the full service set
+together, which is the operational mitigation. No in-repo code change:
+the alternative (sweeping every `SELECT *` into explicit column lists)
+converts an upstream panic into a clean error only at the cost of
+schema-drift errors in dozens of query paths; rejected as
+disproportionate. Residual: a service that boots before a pending
+migration while a peer holds cached statements can still lose one
+request to the panic — bounded by the restart policy. Evidence: fedora
+gitforge-ci journal 2026-10-10 07:11:19–07:11:35 CDT (panic message,
+core-dump, scheduled restart); sqlx-sqlite-0.9.0 row.rs:31–52; timing
+correlation with F39's delayed trigger consumption (the crash is why
+the event waited for the fresh process).
