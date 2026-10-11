@@ -22,6 +22,12 @@ env:
   GITFORGE_ENABLED: ${{ vars.GITFORGE_ENABLED || 'false' }}
   GITFORGE_SCHEDULER_URL: ${{ vars.GITFORGE_SCHEDULER_URL || '' }}
   GITFORGE_REPO_ID: ${{ vars.GITFORGE_REPO_ID || '' }}
+  # Git HTTP URL of the SAME repository on the GitForge instance (the repo
+  # behind GITFORGE_REPO_ID). The bridge pushes the event's commit here
+  # before triggering: GitHub PR merge commits exist only on GitHub, and a
+  # trigger for a commit absent from GitForge's repository storage mints a
+  # run that fails at checkout (observed live 2026-10-11, run 38106742159).
+  GITFORGE_GIT_URL: ${{ vars.GITFORGE_GIT_URL || '' }}
   GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
   # How long the poll job waits for a queued trigger to be correlated to its
@@ -53,10 +59,15 @@ jobs:
         env:
           GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
           GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
+          GITFORGE_GIT_USERNAME: ${{ secrets.GITFORGE_GIT_USERNAME }}
+          GITFORGE_GIT_TOKEN: ${{ secrets.GITFORGE_GIT_TOKEN }}
         run: |
           set -euo pipefail
           : "${GITFORGE_SCHEDULER_URL:?GITFORGE_SCHEDULER_URL is required}"
           : "${GITFORGE_REPO_ID:?GITFORGE_REPO_ID is required (GitForge UUID, not GitHub repository_id)}"
+          : "${GITFORGE_GIT_URL:?GITFORGE_GIT_URL is required (git HTTP URL of the same repository)}"
+          : "${GITFORGE_GIT_USERNAME:?GITFORGE_GIT_USERNAME is required (git push credential)}"
+          : "${GITFORGE_GIT_TOKEN:?GITFORGE_GIT_TOKEN is required (git push credential)}"
           : "${GITFORGE_CI_TRIGGER_TOKEN:?GITFORGE_CI_TRIGGER_TOKEN is required (POST /pipelines/trigger)}"
           : "${GITFORGE_SCHEDULER_OPERATOR_TOKEN:?GITFORGE_SCHEDULER_OPERATOR_TOKEN is required (GET /pipelines/runs/{id})}"
           # Least privilege requires two distinct credentials; sharing one
@@ -66,10 +77,21 @@ jobs:
             echo "GITFORGE_CI_TRIGGER_TOKEN and GITFORGE_SCHEDULER_OPERATOR_TOKEN must be distinct credentials" >&2
             exit 1
           fi
+          # The git push credential grants repository writes; sharing it
+          # with either scheduler role would recreate a cross-plane
+          # super-token.
+          if [ "$GITFORGE_GIT_TOKEN" = "$GITFORGE_CI_TRIGGER_TOKEN" ] || [ "$GITFORGE_GIT_TOKEN" = "$GITFORGE_SCHEDULER_OPERATOR_TOKEN" ]; then
+            echo "GITFORGE_GIT_TOKEN must be distinct from the scheduler credentials" >&2
+            exit 1
+          fi
           [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
             echo "GITFORGE_REPO_ID must be a UUID" >&2
             exit 1
           }
+          case "$GITFORGE_GIT_URL" in
+            http://*|https://*) ;;
+            *) echo "GITFORGE_GIT_URL must be an http(s) git URL" >&2; exit 1 ;;
+          esac
           [[ "$GITFORGE_POLL_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
             echo "GITFORGE_POLL_TIMEOUT_SECONDS must be a positive integer" >&2
             exit 1
@@ -82,6 +104,107 @@ jobs:
             echo "GITFORGE_CORRELATE_TIMEOUT_SECONDS must be a positive integer" >&2
             exit 1
           }
+      # GitHub PR merge commits (`refs/pull/N/merge`) exist only on GitHub.
+      # The GitForge run reads the commit from the repository's registered
+      # git storage — both the workspace clone/checkout and the
+      # committed-config loader (`git cat-file <sha>:<config>`, which
+      # silently falls back to the default pipeline when the object is
+      # absent) read from there — so the event's commit must be IN that
+      # storage before POST /pipelines/trigger. Delivery uses the same
+      # receive-pack path every developer push uses, landing the commit
+      # under a per-SHA scratch ref (refs/ci/github-bridge/<sha>); no
+      # branch or tag ever moves. The ref update itself fires a native
+      # trigger, which the trigger endpoint dedups onto the same
+      # (repo_id, new_hash) tuple as this workflow's POST below — one
+      # active run either way. Validation is deterministic end to end:
+      # the fetched head must equal github.sha, and `git ls-remote` must
+      # serve the scratch ref at exactly that SHA before the enqueue POST
+      # is allowed. An unreachable repo fails here, before any run exists.
+      - name: Register commit in GitForge storage
+        env:
+          GITFORGE_GIT_URL: ${{ vars.GITFORGE_GIT_URL }}
+          GITFORGE_GIT_USERNAME: ${{ secrets.GITFORGE_GIT_USERNAME }}
+          GITFORGE_GIT_TOKEN: ${{ secrets.GITFORGE_GIT_TOKEN }}
+          # github.ref is refs/pull/N/merge on pull_request events and
+          # refs/heads/<branch> (or refs/tags/<tag>) on push events — the
+          # one ref GitHub serves this event's commit at, for every event
+          # type this workflow accepts.
+          GITFORGE_FETCH_REF: ${{ github.ref }}
+          GITFORGE_NEW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # IDs and refs arrive through the environment; a ref name is
+          # attacker-controlled data and must never become shell code.
+          [[ "$GITFORGE_NEW_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo "GITFORGE_NEW_SHA must be a full SHA-1, got: $GITFORGE_NEW_SHA" >&2
+            exit 1
+          }
+          case "$GITFORGE_FETCH_REF" in
+            refs/*) ;;
+            *) echo "GITFORGE_FETCH_REF must be a fully qualified ref, got: $GITFORGE_FETCH_REF" >&2; exit 1 ;;
+          esac
+          BRIDGE_REF="refs/ci/github-bridge/$GITFORGE_NEW_SHA"
+          SCRATCH="$(mktemp -d "$RUNNER_TEMP/github-bridge.XXXXXX")"
+          trap 'rm -rf "$SCRATCH"' EXIT
+          export GIT_TERMINAL_PROMPT=0
+          git init --bare "$SCRATCH/bridge.git"
+          git -C "$SCRATCH/bridge.git" remote add github "https://github.com/${GITHUB_REPOSITORY}.git"
+          # Full history, never --depth: a shallow push would install a
+          # shallow boundary in the instance's storage repo and break
+          # later clones of it. Transport failures are transient and
+          # retried; a ref GitHub does not serve is terminal (the sha
+          # equality check below is the gate, not the fetch exit code).
+          attempts=0
+          until git -C "$SCRATCH/bridge.git" fetch --no-tags github "+$GITFORGE_FETCH_REF"; do
+            attempts=$((attempts + 1))
+            if [ "$attempts" -ge 3 ]; then
+              echo "GitHub fetch of $GITFORGE_FETCH_REF failed after 3 attempts" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          RAW_SHA=$(git -C "$SCRATCH/bridge.git" rev-parse --verify FETCH_HEAD) || {
+            echo "fetch of $GITFORGE_FETCH_REF produced no readable head" >&2
+            exit 1
+          }
+          COMMIT_SHA=$(git -C "$SCRATCH/bridge.git" rev-parse --verify "FETCH_HEAD^{commit}") || {
+            echo "fetched $GITFORGE_FETCH_REF does not resolve to a commit" >&2
+            exit 1
+          }
+          # github.sha names the commit for push events and the merge head
+          # for pull_request events; annotated-tag pushes may deliver the
+          # tag object itself, so either identity is accepted — the peel is
+          # what the instance stores.
+          if [ "$GITFORGE_NEW_SHA" != "$RAW_SHA" ] && [ "$GITFORGE_NEW_SHA" != "$COMMIT_SHA" ]; then
+            echo "GitHub serves $GITFORGE_FETCH_REF at $RAW_SHA (commit $COMMIT_SHA), expected $GITFORGE_NEW_SHA; refusing to trigger a build of a commit GitHub does not serve at this ref" >&2
+            exit 1
+          fi
+          git -C "$SCRATCH/bridge.git" update-ref refs/heads/github-bridge "$COMMIT_SHA"
+          # Clear inherited helpers first: the runner host may hold stored
+          # credentials for the GitForge host, and this step must present
+          # exactly the workflow's push credential, read from the
+          # environment inside the helper so it never appears in the
+          # process list, remote URLs, or logs. The single quotes on
+          # CRED_HELPER are the point: the helper's own shell expands the
+          # variables from the environment when git invokes it, so the
+          # secret never passes through this script's expansion.
+          # shellcheck disable=SC2016
+          CRED_HELPER='!f() { printf "username=%s\n" "$GITFORGE_GIT_USERNAME"; printf "password=%s\n" "$GITFORGE_GIT_TOKEN"; }; f'
+          GITFORGE_CRED=(-c credential.helper= -c "credential.helper=$CRED_HELPER")
+          git -C "$SCRATCH/bridge.git" "${GITFORGE_CRED[@]}" remote add gitforge "$GITFORGE_GIT_URL"
+          if ! git -C "$SCRATCH/bridge.git" "${GITFORGE_CRED[@]}" push gitforge "refs/heads/github-bridge:$BRIDGE_REF" 2>&1; then
+            echo "GitForge rejected the commit registration push ($BRIDGE_REF); refusing to enqueue a trigger for a commit absent from repository storage" >&2
+            exit 1
+          fi
+          # Deterministic postcondition: the instance must now SERVE the
+          # scratch ref at exactly the event's commit before anything is
+          # enqueued against it.
+          SERVED=$(git -C "$SCRATCH/bridge.git" "${GITFORGE_CRED[@]}" ls-remote gitforge "$BRIDGE_REF" | awk '{print $1}')
+          if [ "$SERVED" != "$COMMIT_SHA" ]; then
+            echo "GitForge does not serve $BRIDGE_REF at $COMMIT_SHA (got: ${SERVED:-nothing}); refusing to enqueue" >&2
+            exit 1
+          fi
+          echo "GitForge storage now serves $BRIDGE_REF at $COMMIT_SHA"
       - name: Enqueue build job
         id: enqueue
         env:
