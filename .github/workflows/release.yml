@@ -15,9 +15,34 @@ permissions:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
+  # Contract gate (parse-only: no cargo, no network)
+  # ─────────────────────────────────────────────────────────────────────────────
+  # scripts/check-release-workflow.py pins this workflow to its publication
+  # contract before any build spends runner capacity:
+  #   - the release job is reachable only from a `v*` tag push; a
+  #     workflow_dispatch on a branch runs this gate and the platform builds,
+  #     then skips publication;
+  #   - every build platform installs the repository's pinned
+  #     dtolnay/rust-toolchain revision (the same pin as rust-ci.yml) and no
+  #     cargo/rustc command runs before it;
+  #   - the self-hosted Fedora build exposes the runner's rustup on PATH (the
+  #     PR #293 defect class, see docs/planning/PR293_RUNNER_PATH_RECEIPT_
+  #     2026-10-10.md) and keeps compilation scratch off the host's
+  #     quota-constrained /tmp.
+  # A violation fails the run closed: no builds, no release.
+  contract:
+    name: Release contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check release workflow contract
+        run: python3 scripts/check-release-workflow.py
+
+  # ─────────────────────────────────────────────────────────────────────────────
   # Linux build (x86_64 only - cross-compilation not available)
   # ─────────────────────────────────────────────────────────────────────────────
   build-linux:
+    needs: [contract]
     runs-on: [self-hosted, linux, x64, gitforge-github]
     env:
       # Same F40 rationale as rust-ci.yml: the test step touches the shared
@@ -29,8 +54,36 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      # Expose the runner's rustup on PATH: the job PATH omits $HOME/.cargo,
+      # so dtolnay/rust-toolchain falls through to its rustup bootstrap and
+      # fails instantly on the Fedora runner (the PR #293 defect class; see
+      # rust-ci.yml for the canonical instance of this step and codeql.yml
+      # for the original diagnosis).
+      - name: Expose runner rustup on PATH
+        run: |
+          set -euo pipefail
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "rustup not found or not executable at $CARGO_HOME/bin/rustup; expected the runner's Fedora rustup install" >&2
+            exit 1
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" --version
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - name: Check cargo
+        run: |
+          cargo --version
+          rustc --version
 
       - name: Build
+        # /tmp is quota-constrained on this runner (see codeql.yml Build
+        # Rust). Step env, not job env: the runner context is unavailable at
+        # jobs.<id>.env and its use there invalidates the whole workflow file.
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           cargo test --workspace --locked --no-fail-fast
           cargo build --release --locked --bin api --bin ci --bin git-server --bin runner
@@ -50,15 +103,27 @@ jobs:
   # macOS build (both x86_64 and arm64)
   # ─────────────────────────────────────────────────────────────────────────────
   build-macos:
+    needs: [contract]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-
-      - name: Add targets
+      # Pinned toolchain + targets, not the runner image's preinstalled Rust:
+      # dtolnay/rust-toolchain runs `rustup default` for the requested
+      # toolchain and installs the cross targets in the same step, so the
+      # build no longer depends on whichever stable the hosted image happens
+      # to carry (or on a bare `rustup target add` against an unpinned
+      # default).
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: x86_64-apple-darwin aarch64-apple-darwin
+      - name: Check cargo
         run: |
-          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo --version
+          rustc --version
 
       - name: Build x86_64
         run: cargo build --release --locked --target x86_64-apple-darwin --bin api --bin ci --bin git-server --bin runner
@@ -81,11 +146,25 @@ jobs:
   # Windows build
   # ─────────────────────────────────────────────────────────────────────────────
   build-windows:
+    needs: [contract]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      # Same pinned-toolchain rationale as build-macos: the -gnu target is
+      # installed explicitly with the toolchain instead of assuming the
+      # image's preinstalled default covers it.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-gnu
+      - name: Check cargo
+        shell: bash
+        run: |
+          cargo --version
+          rustc --version
 
       - name: Build
         shell: bash
@@ -106,9 +185,18 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   # Create Release
   # ─────────────────────────────────────────────────────────────────────────────
+  # Publication is tag-only: the `if` below requires a real `v*` tag push, so
+  # a workflow_dispatch on a branch runs the contract gate and the platform
+  # builds above, then skips this job. The three conditions are deliberately
+  # redundant (event_name, ref_type, ref prefix) so no single dispatch or
+  # re-run quirk can reach a publish.
   release:
-    needs: [build-linux, build-macos, build-windows]
-    if: github.repository_owner == 'aliasfoxkde'
+    needs: [contract, build-linux, build-macos, build-windows]
+    if: >-
+      github.repository_owner == 'aliasfoxkde' &&
+      github.event_name == 'push' &&
+      github.ref_type == 'tag' &&
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: [self-hosted, linux, x64, gitforge-github]
     permissions:
       actions: read
