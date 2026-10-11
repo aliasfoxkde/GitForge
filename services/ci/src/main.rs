@@ -5557,9 +5557,7 @@ jobs:
         )
         .await;
 
-        let valid = format!(
-            "name: variant\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment: {{}}\njobs:\n  - name: v\n    image: alpine:latest\n    steps:\n      - name: s\n        run: echo v\n"
-        );
+        let valid = "name: variant\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment: {}\njobs:\n  - name: v\n    image: alpine:latest\n    steps:\n      - name: s\n        run: echo v\n";
         std::fs::write(work.join(".gitforge.yml"), valid).expect("write valid config");
         run_git(&["add", "."], Some(&work)).await;
         run_git(&["commit", "-m", "valid"], Some(&work)).await;
