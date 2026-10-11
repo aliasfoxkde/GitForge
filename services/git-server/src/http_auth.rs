@@ -69,7 +69,7 @@ pub enum GitHttpAccess {
     /// Serve the request against this repository, optionally attributing
     /// it to an authenticated actor.
     Authorized {
-        repo: Repository,
+        repo: Box<Repository>,
         actor: Option<Actor>,
     },
     /// `401` with a Basic challenge — anonymous or unacceptable
@@ -249,16 +249,17 @@ pub async fn authorize_git_http(
     };
 
     match (actor, operation) {
-        (None, GitOperation::Read) if repo.is_public() => {
-            GitHttpAccess::Authorized { repo, actor: None }
-        }
+        (None, GitOperation::Read) if repo.is_public() => GitHttpAccess::Authorized {
+            repo: Box::new(repo),
+            actor: None,
+        },
         (None, _) => GitHttpAccess::Challenge,
         (Some(actor), _) if actor.may_manage_repos(repo.owner_id) => GitHttpAccess::Authorized {
-            repo,
+            repo: Box::new(repo),
             actor: Some(actor),
         },
         (Some(actor), GitOperation::Read) if repo.is_public() => GitHttpAccess::Authorized {
-            repo,
+            repo: Box::new(repo),
             actor: Some(actor),
         },
         // A public repository's existence is already public; a 403 states

@@ -244,21 +244,23 @@ async fn require_git_access(
     owner: &str,
     repo_name: &str,
     operation: http_auth::GitOperation,
-) -> Result<(RepoId, Option<http_auth::Actor>), Response> {
+) -> Result<(RepoId, Option<http_auth::Actor>), Box<Response>> {
     match http_auth::authorize_git_http(&state.db_pool, headers, owner, repo_name, operation).await
     {
         http_auth::GitHttpAccess::Authorized { repo, actor } => Ok((repo.id, actor)),
         // denial_response answers Some for every denial variant; the None
         // arm is unreachable by construction and degrades like every other
         // static-response builder here.
-        denial => Err(denial
-            .denial_response(&format!("{owner}/{repo_name}"))
-            .unwrap_or_else(|| {
-                finish_response(
-                    Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR),
-                    Body::from("internal error"),
-                )
-            })),
+        denial => Err(Box::new(
+            denial
+                .denial_response(&format!("{owner}/{repo_name}"))
+                .unwrap_or_else(|| {
+                    finish_response(
+                        Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR),
+                        Body::from("internal error"),
+                    )
+                }),
+        )),
     }
 }
 
@@ -291,7 +293,7 @@ async fn git_upload_pack(
     .await
     {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     // Check if repository exists in storage
@@ -362,7 +364,7 @@ async fn git_info_refs(
     .await
     {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if !state.storage.exists(repo_id).await {
         return finish_response(
@@ -410,7 +412,7 @@ async fn git_upload_pack_standard(
     .await
     {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if !state.storage.exists(repo_id).await {
         tracing::warn!("repository not found in storage: {}", repo_path);
@@ -482,7 +484,7 @@ async fn git_receive_pack(
     .await
     {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if let Some(actor) = &actor {
         tracing::info!(
