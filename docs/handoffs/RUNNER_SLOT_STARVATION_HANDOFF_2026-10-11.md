@@ -36,39 +36,46 @@ related gap the current tree *does* exhibit.
 
 ## 2. The verified current-tree gap
 
-The self-hosted GitHub Actions fleet at label `[self-hosted, linux, x64, gitforge-github]` is a
-single shared lane for every workflow job in this repo — including the merge gate and a
-long-polling waiter — and the waiter's deadline is shorter than the work it awaits.
+The relevant self-hosted GitHub Actions jobs at label
+`[self-hosted, linux, x64, gitforge-github]` share a lane, including the merge gate and a
+long-polling waiter. Several lightweight/platform-specific jobs use GitHub-hosted runners instead;
+the self-hosted waiter's deadline is shorter than the work it awaits.
 
 Verified facts, each grounded in the current tree:
 
-1. **One shared lane.** Every job across all workflows in `.github/workflows/` uses exactly
+1. **Shared self-hosted lane (not every job).** The relevant jobs across workflows use
    `[self-hosted, linux, x64, gitforge-github]`: `auto-merge.yml` (`try-merge`),
-   `gitforge-ci.yml` (`enqueue-build`, `poll-build`, `report-status`), `rust-ci.yml` (fmt, clippy),
-   `release.yml` (`build-linux`, which runs `cargo test --workspace` plus a release build),
-   `security.yml` (5 jobs), `codeql.yml`, `integration.yml` (2 jobs), `always.yml`, `ai-review.yml`,
-   `wiki.yml`. Workflow-level `concurrency` groups are per-ref
-   (`${{ github.workflow }}-${{ github.ref }}`) and do not bound cross-workflow or cross-ref
-   contention on the fleet.
+   `gitforge-ci.yml` (`enqueue-build`, `poll-build`, `report-status`), Rust CI's fmt, clippy,
+   test, `test-serialized`, security, coverage, and build jobs, `release.yml` (`build-linux`,
+   `release`), `security.yml`, `codeql.yml`, `integration.yml`, `always.yml`, `ai-review.yml`,
+   and `wiki.yml`. Exceptions verified in source are `rust-ci.yml`'s shellcheck, workflow-lint,
+   and supply-chain jobs
+   (`ubuntu-latest`), plus `release.yml`'s macOS and Windows matrix jobs. These jobs can contend
+   with one another on the self-hosted lane. The cited `gitforge-ci.yml`, `rust-ci.yml`, and
+   `auto-merge.yml` concurrency groups are per-ref and do not bound cross-workflow contention;
+   `ai-review.yml` is per-PR, and `wiki.yml` declares no concurrency group.
 2. **A long-polling job parks on that lane.** `gitforge-ci.yml` job `poll-build` holds its runner
    for the full poll: a `while :; do ... done` loop that curls
    `GET $GITFORGE_API_URL/api/pipeline-runs/$RUN_ID` and sleeps
    `GITFORGE_POLL_INTERVAL_SECONDS` (default 15, line-level env at the `env:` block) until
    `GITFORGE_POLL_TIMEOUT_SECONDS` (default 1800). It cannot simply move to GitHub-hosted runners:
    the in-file comment states "GitHub-hosted runners cannot reach a private Fedora LAN address".
-   The workflow is additionally gated by `if: vars.GITFORGE_ENABLED == 'true'` — whether it is live
-   right now is runtime state and must be probed (§3).
+   `vars.GITFORGE_ENABLED == 'true'` is a job-level condition on `enqueue-build` and
+   `report-status`; `poll-build` is gated transitively by its dependency on the enqueue result.
+   Whether the variable is true right now is runtime state and must be probed (§3).
 3. **The awaited work outlasts the waiter.** `poll-build` awaits a GitForge pipeline run of this
    repo's own chain in `.gitforge.yml`: `lint` (10m) → `fmt` (15m) → `clippy` (60m) → `test` (90m)
-   → `coverage` (90m) → `fuzz` (60m), worst-case ≈ 5h25m of job time — before any queueing. On the
-   GitForge runner, capacity defaults to 2 (`RunnerConfig::default` /
+   → `coverage` (90m) → `fuzz` (60m), worst-case ≈ 5h25m of job time — before any queueing. The
+   source fallback is capacity 2 (`RunnerConfig::default` /
    `RunnerConfig::parse_from_iter` → `capacity.unwrap_or(2)` in
-   `crates/gitforge-runner/src/agent.rs`; `GITFORGE_RUNNER_CAPACITY`; examples recommend 4 in
-   `.env.example` and `config.toml.example`), and two concurrent runs can therefore hold both slots
-   for hours while further runs queue. The 30-minute default poll deadline is far below both, so
-   under load `poll-build` (a) occupies a scarce fleet slot the whole time and (b) exits red on
-   `timeout` while the GitForge run is still healthy — a false merge-gate failure, not just
-   latency. `docs/planning/CAMPAIGN_PLAN_2026-10-03.md` records the shape of this pressure
+   `crates/gitforge-runner/src/agent.rs`; `GITFORGE_RUNNER_CAPACITY`); examples recommend 4 in
+   `.env.example` and `config.toml.example`, and the production deployment command in
+   `docs/RUNBOOK.md` sets 4. **The live deployed capacity has not been established**, so this
+   handoff does not claim that two jobs currently occupy both slots. At any live capacity N, N
+   long runs can occupy all N slots while further work queues. The 30-minute default poll deadline
+   is below the declared chain ceiling, so under load `poll-build` can (a) occupy a scarce fleet
+   slot while waiting and (b) exit red on `timeout` while the GitForge run is still healthy — a
+   false merge-gate failure, not just latency. `docs/planning/CAMPAIGN_PLAN_2026-10-03.md` records the shape of this pressure
    live: four co-tenant 20-job runs saturating a runner's queue at 121 pending (2026-10-10
    addendum).
 4. **Host contention is real, per the tree's own comments.** `release.yml` `build-linux` sets
@@ -76,40 +83,48 @@ Verified facts, each grounded in the current tree:
    shared Docker daemon past the 120s client default — independent in-tree evidence that concurrent
    lanes on this host already contend.
 
-Consequence: when `gitforge-ci.yml` is enabled and multiple refs push concurrently, `poll-build`
-jobs are the slots, and the merge gate `try-merge` — plus `enqueue-build`, `report-status`, and
-every other lane — queues behind them. That is the current-tree mechanism matching the spirit of
-the historical report, with the roles inverted: the *pollers* starve the gate, not the other way
-around. The GitForge scheduler itself needs no change for this; the defect lives in the GitHub-side
-lane topology and the waiter's design.
+Consequence: when `gitforge-ci.yml` is enabled and concurrent runs exceed the actual shared
+self-hosted capacity, `poll-build` jobs can consume slots and delay the merge gate `try-merge`,
+`enqueue-build`, `report-status`, and other jobs. This is a source-supported risk, not proof that
+the fleet is currently saturated. The GitForge scheduler itself needs no change for this; the
+candidate defect is in GitHub-side lane topology and waiter design, subject to §3 runtime evidence.
 
 ## 3. Reproduce / probe FIRST (before any design work)
 
-The fleet size, `vars.GITFORGE_ENABLED`, and branch-protection check requirements are runtime state
-outside this repo. Probe before changing anything; record outputs in the execution receipt.
+The GitHub Actions fleet size, live GitForge runner capacity, `vars.GITFORGE_ENABLED`, and
+branch-protection check requirements are runtime state outside this repo. Probe before changing
+anything; record outputs in the execution receipt.
 
-1. **Fleet capacity.** Count runner registrations serving the label:
+1. **GitHub Actions fleet capacity.** Count runner registrations serving the label:
    `gh api repos/<owner>/<repo>/actions/runners --jq '.runners[] | {name, labels, busy}'`
    (host-side: inspect the `actions-runner` service config on the Fedora host). A fleet of N
    registrations executes at most N jobs concurrently; the rest queue.
-2. **Is the polling lane live?** `gh variable list | grep GITFORGE_ENABLED` and
+2. **Live GitForge runner capacity.** Inspect the deployed runner service's effective
+   `GITFORGE_RUNNER_CAPACITY` (or config override), count online registered runners, and compare
+   configured capacity with assigned/running jobs from authenticated `GET /queue/status`. Record
+   the source and timestamp; do not infer live capacity from `RunnerConfig::default`, examples, or
+   `RUNBOOK.md`. If capacity is not observable, record it as unknown and do not claim a slot-count
+   reproduction.
+3. **Is the polling lane live?** `gh variable list | grep GITFORGE_ENABLED` and
    `gh workflow view "GitForge CI"`. If `GITFORGE_ENABLED != 'true'`, `poll-build` never runs and
    the acute starvation path is dormant (record this; §4 Option A/B still removes the tripwire).
-3. **Starvation signature.** For recent runs of both workflows, compare job `created_at` vs
+4. **Starvation signature.** For recent runs of both workflows, compare job `created_at` vs
    `started_at` (`gh run list --workflow=<wf>` → `gh api repos/<owner>/<repo>/actions/jobs/<id>`).
    A `try-merge` (or `enqueue-build`) job with material queue time while a `poll-build` job of
    another run is `in_progress` on the same fleet is the starvation signature. Also grep Actions
    history for `poll-build` conclusions of `timeout` whose GitForge run
    (`GET /queue/status` on the CI orchestrator, port 42781, scheduler-token auth; run row via
    `pipeline_runs`) later succeeded — the false-red signature.
-4. **GitForge-side timeline.** During any deliberate probe push, correlate
+5. **GitForge-side timeline.** During any deliberate probe push, correlate
    `GET /queue/status` (`durable_pending`, `in_memory_queued`, `assigned_jobs`, `online_runners`)
    with the Actions job states above. Do not fabricate these observations; if no live episode is
    observable, say so.
 
 **Decision gate:** proceed to §4 if (a) `try-merge` p95 queue time under concurrent load exceeds
 ~60s, or (b) any `poll-build` false-red timeout is confirmed, or (c) `GITFORGE_ENABLED=true` with
-fleet size ≤ 3 and observed gate queueing. Otherwise record the probe receipt and close this
+GitHub self-hosted Actions fleet size ≤ 3 and observed gate queueing. Record live GitForge runner
+capacity separately to explain the downstream queue; neither capacity value substitutes for the
+observed Actions queue-time/starvation signature. Otherwise record the probe receipt and close this
 handoff as no-action; do not add capacity speculatively.
 
 ## 4. Smallest maintainable design (in preference order)
@@ -126,14 +141,22 @@ path plus a fine-scoped GitHub token managed per `AGENTS.md` secret rules ("Keep
 service-managed environment files"); a service change ⇒ full release discipline (§8). Choose this
 when probes confirm sustained starvation.
 
-**Option B — probe-don't-park (minimal workflow-only change; no service change).**
-Restructure `gitforge-ci.yml` so no job sleeps on the fleet: `enqueue-build` stays as-is; the wait
-becomes repeated short probes driven by GitHub scheduling (a `schedule`/`workflow_dispatch`-fed
-single-probe job that reads the run status once and exits, re-armed until terminal), each holding a
-slot for seconds. Constraint to design for explicitly: the required-check name that branch
-protection expects must remain stable across the re-arms (use a fixed check name / `checks:` API
-update rather than a per-attempt job name), otherwise the gate regresses into "pending forever".
-This is the fallback if Option A's egress/token prerequisites are blocked.
+**Option B — scheduled probe (workflow-only polling alternative; not yet validated).**
+Restructure `gitforge-ci.yml` so no job sleeps on the fleet: `enqueue-build` stays as-is; a
+single-shot scheduled job probes known run IDs and exits. GitHub schedules run no more often than
+every five minutes and only from the default branch. A workflow can also re-dispatch via
+`workflow_dispatch`: unlike most events, GitHub documents that `workflow_dispatch` and
+`repository_dispatch` runs are not suppressed when initiated with `GITHUB_TOKEN`. The dispatching
+job still needs the minimum relevant Actions permission (typically `actions: write` for the
+workflow-dispatch API), and repository/org Actions policy may restrict it. If the design writes a
+commit status or check, grant only the corresponding `statuses: write` or `checks: write` scope.
+The required-check name must remain stable across attempts or the gate can remain pending forever.
+Confirm where run IDs and required-check state are stored; compare permission, latency, and
+operations costs with Option A. Option B may avoid a separate PAT/App credential for re-dispatch,
+but it does not fix an expired GitForge API credential used by the probe itself. References:
+[GITHUB_TOKEN event exceptions](https://docs.github.com/en/actions/concepts/security/github_token)
+and [workflow dispatch API permissions](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event),
+plus [schedule trigger behavior](https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule).
 
 **Option C — lane separation via an additional runner registration (only if evidence supports).**
 A second self-hosted registration on a dedicated label (e.g. `gitforge-github-gate`) for the short
@@ -271,7 +294,9 @@ Per `AGENTS.md` and `CLAUDE.md`, any merged change validates through the self-ho
 
 ## 13. Dependencies and open unknowns
 
-- **Fleet size and `vars.GITFORGE_ENABLED`** — host/repo-settings state, not in-tree; §3 probe 1–2.
+- **GitHub Actions fleet size, live GitForge runner capacity, and `vars.GITFORGE_ENABLED`** —
+  host/repo-settings state, not in-tree; §3 probes 1–3. Runner capacity is a necessary input to
+  the downstream queue explanation, not a substitute for measuring Actions gate starvation.
 - **Branch protection's required check names** — governs whether `poll-build`'s check can be
   renamed/re-armed safely (Option B constraint) and what Option A must post. Repository settings,
   not in-tree.
@@ -290,7 +315,7 @@ Per `AGENTS.md` and `CLAUDE.md`, any merged change validates through the self-ho
 | Per-ref-only concurrency groups | `concurrency:` blocks of `gitforge-ci.yml`, `rust-ci.yml`, `auto-merge.yml` |
 | Long/heavy jobs on the same fleet | `.github/workflows/release.yml` `build-linux` (`cargo test --workspace` + Docker-daemon contention comment); `rust-ci.yml` `fmt`/`clippy`; `security.yml`; `integration.yml` |
 | This repo's awaited chain and ceilings | `.gitforge.yml` — `trigger_on: push`; jobs `lint`/`fmt`/`clippy`/`test`/`coverage`/`fuzz` with 10m/15m/60m/90m/90m/60m timeouts |
-| Runner slot model | `crates/gitforge-runner/src/agent.rs` — `RunnerConfig.capacity` (default 2, `GITFORGE_RUNNER_CAPACITY`), fetch loop over `/jobs/pending`, `JobChannel` per-job heartbeat |
+| Runner slot model | `crates/gitforge-runner/src/agent.rs` — `RunnerConfig.capacity` source default 2 (`GITFORGE_RUNNER_CAPACITY`); `.env.example`/`config.toml.example` recommend 4; `docs/RUNBOOK.md` production deployment sets 4. Live configured capacity is a §3 probe, not inferred from any of these. |
 | Capacity-bounded dispatch, fairness, skipped set | `crates/gitforge-scheduler/src/assigner.rs` — `process_queue` (`max_jobs_per_batch = available_capacity.max(1)`), `peek_fair` + `skipped` (F27), `resource_class` → `workspace-cargo-test` |
 | Scheduler serves only assigned jobs | `crates/gitforge-scheduler/src/server.rs` — route `/jobs/pending`, `get_pending_jobs`, `get_queue_status` (`/queue/status`) |
 | Liveness planes | `services/ci/src/main.rs` — 5s `process_queue` tick, `JOB_TIMEOUT_SWEEP_SECS`, `MissedTickBehavior::Skip`; `crates/gitforge-db/src/queries.rs` — `assign_with_lease`, `requeue_inflight`, `reconcile_expired`; `crates/gitforge-db/src/models/runner.rs` — `RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS = 90` |
@@ -300,8 +325,9 @@ Per `AGENTS.md` and `CLAUDE.md`, any merged change validates through the self-ho
 
 ## 15. Execution receipt requirements (for the implementing worker)
 
-Return: probe outputs of §3 (fleet census, `GITFORGE_ENABLED`, queue-time table, any false-red
-evidence), the chosen option with the rejected alternatives' reasons, changed-file list, the §7
+Return: probe outputs of §3 (GitHub Actions fleet census, live GitForge runner capacity,
+`GITFORGE_ENABLED`, GitForge-side queue timeline, queue-time table, any false-red evidence), the
+chosen option with the rejected alternatives' reasons, changed-file list, the §7
 lint output, one end-to-end gate validation on a real PR, and an explicit statement separating
 observed results from assumptions. No tokens, credentials, or invented run IDs. A prose "done"
 without these artifacts is a rejection (same bar as `docs/handoffs/CONTAINER_RECONCILER_HANDOFF.md`).
