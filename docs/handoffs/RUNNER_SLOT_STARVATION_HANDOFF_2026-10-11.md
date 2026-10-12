@@ -6,7 +6,12 @@
 `/home/mkinney/worktrees/gitforge-slot-deadlock-handoff-20261011`; shallow clone, depth 1 — git
 archaeology unavailable, see Blockers)
 **Status:** OPEN — the historical claim as stated is NOT supported by the current tree; a related,
-verifiable structural gap IS present and merits this handoff.
+verifiable structural gap IS present and merits this handoff. PR #312 (head `4e321edf`) is **not
+merge-ready**: green on CI, integration, e2e, Go CodeQL, and try-merge, but Rust CodeQL is red on
+a runner-environment failure (absent `cargo`, exit 127 — not a code-analysis finding); two open
+candidate PRs include the toolchain fix, and neither is fully merge-ready (§16).
+**Updated:** 2026-10-12 — §16 records PR #312 check state and both toolchain-fix candidates; edit made in
+worktree `/home/mkinney/worktrees/gitforge-runner-slot-handoff-closeout-20261012` @ `4e321edf`.
 
 ---
 
@@ -305,6 +310,12 @@ Per `AGENTS.md` and `CLAUDE.md`, any merged change validates through the self-ho
 - **Shallow worktree** — this tree is a depth-1 clone, so commit archaeology (when the
   "two try-merge" report originated, whether a since-reverted change ever introduced a polling
   `try-merge`) is impossible here; re-verify from a full clone if provenance matters.
+- **CodeQL toolchain-fix candidates and their exact gates** — PR #293 is an open, non-draft
+  candidate containing the Rust toolchain fix plus adjacent GitForge workflow changes; Rust
+  CodeQL and GitForge enqueue passed on its recorded run, but its serialized tests and coverage
+  failed. PR #306 is a narrower open draft that repeats the toolchain step; its Rust CodeQL passed,
+  while GitForge enqueue/report failed. Neither is merged; see §16. Avoid treating these as two
+  independently required fixes or merging duplicate toolchain changes.
 
 ## 14. Evidence index (current tree, verified 2026-10-11)
 
@@ -322,6 +333,7 @@ Per `AGENTS.md` and `CLAUDE.md`, any merged change validates through the self-ho
 | Queue telemetry contract | `docs/API.md` "Scheduler queue status"; `docs/planning/MASTER_PLAN_2026-09-20.md` F12/F27; `docs/planning/CAMPAIGN_PLAN_2026-10-03.md` 2026-10-10 addendum (121 pending) |
 | Static-gate precedent for §7 lint | `scripts/check-route-docs.py`, wired in `.gitforge.yml` `fmt` job |
 | Prior art for slot-free waiting | `crates/gitforge-cli/src/main.rs` — `watch_pipeline_run` (`WATCH_POLL_SECS = 2`, `WATCH_MAX_POLLS = 900`) is CLI-side and holds no fleet slot |
+| CodeQL Rust leg builds with no toolchain install at this head | `.github/workflows/codeql.yml` — `analyze` job on the shared label, `language: ["go", "rust"]` matrix; "Build Rust" step runs `cargo fetch --locked` / `cargo build --workspace --locked` directly (contrast: `rust-ci.yml` jobs install pinned `dtolnay/rust-toolchain`) |
 
 ## 15. Execution receipt requirements (for the implementing worker)
 
@@ -331,3 +343,42 @@ chosen option with the rejected alternatives' reasons, changed-file list, the §
 lint output, one end-to-end gate validation on a real PR, and an explicit statement separating
 observed results from assumptions. No tokens, credentials, or invented run IDs. A prose "done"
 without these artifacts is a rejection (same bar as `docs/handoffs/CONTAINER_RECONCILER_HANDOFF.md`).
+
+## 16. PR #312 gating state and the open toolchain-fix candidates (observed 2026-10-12)
+
+Check state on PR #312 (this handoff's change) at head `4e321edf`, observed
+2026-10-12 00:13 UTC (GitHub Actions runs 38186978679 / 38186978702):
+
+- **Green:** CI, integration, e2e, CodeQL Go leg, try-merge.
+- **Red:** CodeQL Rust leg.
+
+**The Rust CodeQL red is a runner-environment failure, not a code-analysis finding.** The
+`analyze` job (`.github/workflows/codeql.yml`; `runs-on: [self-hosted, linux, x64,
+gitforge-github]`, `language: ["go", "rust"]` matrix) runs a "Build Rust" step that executes
+`cargo fetch --locked` and `cargo build --workspace --locked` directly. The self-hosted runner
+host has no `cargo` on `PATH`, so the step fails with `cargo: command not found` (exit 127)
+before any analysis is produced — no analysis verdict about this docs-only change exists. The Go
+leg (CodeQL `autobuild`, no cargo build) was green. At this head `codeql.yml` installs no Rust
+toolchain, whereas `rust-ci.yml` jobs do (pinned `dtolnay/rust-toolchain`) — which is why CI is
+green while Rust CodeQL is red.
+
+Two open branches include the missing-toolchain fix; they are overlapping candidates, not two
+sequential dependencies:
+
+- **PR #293** (`fix(ci): provision Rust toolchain for CodeQL build`, head
+  `b394d72d20a47364ada9c8a3348accf47d9afec9`) adds runner PATH/toolchain/TMPDIR setup to CodeQL
+  and adjacent GitForge CI handling. Its recorded Rust CodeQL and GitForge enqueue checks passed;
+  its serialized tests and coverage failed on tests/coverage behavior specific to that branch.
+  It is open and not merged.
+- **PR #306** (`ci(codeql): install Rust toolchain before build`, head
+  `eb6c003de28a858d22b94ecaae3cd051ab4be44e`) adds a narrower pinned
+  `dtolnay/rust-toolchain` step before the CodeQL Rust build. Its Rust CodeQL gate passed, but its
+  GitForge enqueue/report checks failed. It is an open draft and not merged.
+
+At #312's head, `codeql.yml` still lacks a toolchain-install step. Do not claim #312 is merge-ready
+until the Rust CodeQL leg reruns green on the #312 head after one reviewed fix is merged or the
+missing-toolchain condition is otherwise resolved, with all other required checks green on that
+rerun. The open PRs need deduplication: prefer repairing/reviewing one candidate against current
+`main`, then close or rebase the redundant branch after confirming no unique changes are lost.
+Per `CLAUDE.md`, GitHub Actions mirrors the authoritative GitForge chain; each selected candidate
+must also have its applicable GitForge gates green before landing.
