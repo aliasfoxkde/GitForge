@@ -76,11 +76,15 @@ jobs:
       # container is per-job); each already paid a full cold dependency
       # compile, and building on local disk is faster than the mount.
       - name: Materialize checkout on local disk
+        # A clone, not a tar copy: this repo's own CLI unit tests run
+        # `git status/log/remote` against the checkout (crates/
+        # gitforge-cli/src/main.rs), so /wt must be a real worktree —
+        # tar-without-.git left 134/137 tests green and exactly those
+        # three red in run a6c9677c. A local clone reads the 830MiB pack
+        # through the mount once and writes worktree + objects onto
+        # local disk.
         run: |
-          mkdir -p /wt
-          tar -C /workspace -cf /tmp/src-tree.tar --exclude=./.git --exclude=./target --exclude=node_modules .
-          tar -C /wt -xf /tmp/src-tree.tar
-          rm /tmp/src-tree.tar
+          git clone /workspace /wt
           echo "materialized $(du -sh /wt | cut -f1) to /wt"
       - name: Strict lint (zero warnings)
         run: cd /wt && cargo clippy --workspace --all-targets -- -D warnings
@@ -114,11 +118,15 @@ jobs:
       # container is per-job); each already paid a full cold dependency
       # compile, and building on local disk is faster than the mount.
       - name: Materialize checkout on local disk
+        # A clone, not a tar copy: this repo's own CLI unit tests run
+        # `git status/log/remote` against the checkout (crates/
+        # gitforge-cli/src/main.rs), so /wt must be a real worktree —
+        # tar-without-.git left 134/137 tests green and exactly those
+        # three red in run a6c9677c. A local clone reads the 830MiB pack
+        # through the mount once and writes worktree + objects onto
+        # local disk.
         run: |
-          mkdir -p /wt
-          tar -C /workspace -cf /tmp/src-tree.tar --exclude=./.git --exclude=./target --exclude=node_modules .
-          tar -C /wt -xf /tmp/src-tree.tar
-          rm /tmp/src-tree.tar
+          git clone /workspace /wt
           echo "materialized $(du -sh /wt | cut -f1) to /wt"
       - name: Workspace test suite
         # Bounded test parallelism. Under the daemon's old vfs storage
@@ -161,11 +169,15 @@ jobs:
       # container is per-job); each already paid a full cold dependency
       # compile, and building on local disk is faster than the mount.
       - name: Materialize checkout on local disk
+        # A clone, not a tar copy: this repo's own CLI unit tests run
+        # `git status/log/remote` against the checkout (crates/
+        # gitforge-cli/src/main.rs), so /wt must be a real worktree —
+        # tar-without-.git left 134/137 tests green and exactly those
+        # three red in run a6c9677c. A local clone reads the 830MiB pack
+        # through the mount once and writes worktree + objects onto
+        # local disk.
         run: |
-          mkdir -p /wt
-          tar -C /workspace -cf /tmp/src-tree.tar --exclude=./.git --exclude=./target --exclude=node_modules .
-          tar -C /wt -xf /tmp/src-tree.tar
-          rm /tmp/src-tree.tar
+          git clone /workspace /wt
           echo "materialized $(du -sh /wt | cut -f1) to /wt"
       - name: Line coverage gate (fail 82, warn 84)
         # Thresholds are calibrated AGAINST THE SANDBOX the job runs in:
@@ -236,11 +248,15 @@ jobs:
       # container is per-job); each already paid a full cold dependency
       # compile, and building on local disk is faster than the mount.
       - name: Materialize checkout on local disk
+        # A clone, not a tar copy: this repo's own CLI unit tests run
+        # `git status/log/remote` against the checkout (crates/
+        # gitforge-cli/src/main.rs), so /wt must be a real worktree —
+        # tar-without-.git left 134/137 tests green and exactly those
+        # three red in run a6c9677c. A local clone reads the 830MiB pack
+        # through the mount once and writes worktree + objects onto
+        # local disk.
         run: |
-          mkdir -p /wt
-          tar -C /workspace -cf /tmp/src-tree.tar --exclude=./.git --exclude=./target --exclude=node_modules .
-          tar -C /wt -xf /tmp/src-tree.tar
-          rm /tmp/src-tree.tar
+          git clone /workspace /wt
           echo "materialized $(du -sh /wt | cut -f1) to /wt"
       - name: Fuzz smoke (60s per target)
         # Bounded libFuzzer smoke over the two untrusted-input surfaces:
