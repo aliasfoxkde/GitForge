@@ -62,8 +62,28 @@ jobs:
     image: dsc-ci-rust:9
     needs: [fmt]
     steps:
+      # Materialize the checkout onto container-local disk first. The
+      # runner's workspace directory lives on sshfs, which corrupts cargo
+      # artifact IO: runs f9846a10 and 49521409 both died mid-compile with
+      # "found invalid metadata files" (E0786) for a different random
+      # crate each time — one run also logged a plain EPERM on an rlib
+      # open and a .d write — while fmt (writing the same tree) passed
+      # both times. Root cause bisected on fedora 2026-10-13 (see dsc's
+      # .gitforce.yml): the mount rejects any symlink resolving outside
+      # its own directory and silently garbles some concurrent writes.
+      # Cargo artifact trees are exactly the workload it cannot carry.
+      # Every cargo job below re-materializes into its own /wt (the
+      # container is per-job); each already paid a full cold dependency
+      # compile, and building on local disk is faster than the mount.
+      - name: Materialize checkout on local disk
+        run: |
+          mkdir -p /wt
+          tar -C /workspace -cf /tmp/src-tree.tar --exclude=./.git --exclude=./target --exclude=node_modules .
+          tar -C /wt -xf /tmp/src-tree.tar
+          rm /tmp/src-tree.tar
+          echo "materialized $(du -sh /wt | cut -f1) to /wt"
       - name: Strict lint (zero warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cd /wt && cargo clippy --workspace --all-targets -- -D warnings
       - name: Rustdoc gate (zero warnings, no broken links)
         # Rides the clippy job instead of taking its own position in the
         # chain: every job here pays a cold-cache dependency compile (no
@@ -73,13 +93,33 @@ jobs:
         # makes broken_intra_doc_links and every other rustdoc lint
         # fatal; --no-deps scopes the gate to this workspace's docs
         # rather than several hundred dependency crates.
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+        run: cd /wt && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
     timeout: 60m
 
   - name: test
     image: dsc-ci-rust:9
     needs: [clippy]
     steps:
+      # Materialize the checkout onto container-local disk first. The
+      # runner's workspace directory lives on sshfs, which corrupts cargo
+      # artifact IO: runs f9846a10 and 49521409 both died mid-compile with
+      # "found invalid metadata files" (E0786) for a different random
+      # crate each time — one run also logged a plain EPERM on an rlib
+      # open and a .d write — while fmt (writing the same tree) passed
+      # both times. Root cause bisected on fedora 2026-10-13 (see dsc's
+      # .gitforce.yml): the mount rejects any symlink resolving outside
+      # its own directory and silently garbles some concurrent writes.
+      # Cargo artifact trees are exactly the workload it cannot carry.
+      # Every cargo job below re-materializes into its own /wt (the
+      # container is per-job); each already paid a full cold dependency
+      # compile, and building on local disk is faster than the mount.
+      - name: Materialize checkout on local disk
+        run: |
+          mkdir -p /wt
+          tar -C /workspace -cf /tmp/src-tree.tar --exclude=./.git --exclude=./target --exclude=node_modules .
+          tar -C /wt -xf /tmp/src-tree.tar
+          rm /tmp/src-tree.tar
+          echo "materialized $(du -sh /wt | cut -f1) to /wt"
       - name: Workspace test suite
         # Bounded test parallelism. Under the daemon's old vfs storage
         # driver, in-container fork/exec of the real `git` children spawned
@@ -100,13 +140,33 @@ jobs:
         # 2026-10-06 22:28 run finished test in ~36m under load ~40; the
         # 23:29 run needed more than 60m under load ~45 with three
         # concurrent runs.
-        run: cargo test --workspace -- --test-threads=2
+        run: cd /wt && cargo test --workspace -- --test-threads=2
     timeout: 90m
 
   - name: coverage
     image: dsc-ci-rust:9
     needs: [test]
     steps:
+      # Materialize the checkout onto container-local disk first. The
+      # runner's workspace directory lives on sshfs, which corrupts cargo
+      # artifact IO: runs f9846a10 and 49521409 both died mid-compile with
+      # "found invalid metadata files" (E0786) for a different random
+      # crate each time — one run also logged a plain EPERM on an rlib
+      # open and a .d write — while fmt (writing the same tree) passed
+      # both times. Root cause bisected on fedora 2026-10-13 (see dsc's
+      # .gitforce.yml): the mount rejects any symlink resolving outside
+      # its own directory and silently garbles some concurrent writes.
+      # Cargo artifact trees are exactly the workload it cannot carry.
+      # Every cargo job below re-materializes into its own /wt (the
+      # container is per-job); each already paid a full cold dependency
+      # compile, and building on local disk is faster than the mount.
+      - name: Materialize checkout on local disk
+        run: |
+          mkdir -p /wt
+          tar -C /workspace -cf /tmp/src-tree.tar --exclude=./.git --exclude=./target --exclude=node_modules .
+          tar -C /wt -xf /tmp/src-tree.tar
+          rm /tmp/src-tree.tar
+          echo "materialized $(du -sh /wt | cut -f1) to /wt"
       - name: Line coverage gate (fail 82, warn 84)
         # Thresholds are calibrated AGAINST THE SANDBOX the job runs in:
         # two identical in-sandbox sweeps of the campaign branch measured
@@ -131,6 +191,7 @@ jobs:
         # captured step output is only the few verdict lines echoed
         # here, and they always survive intact.
         run: |
+          cd /wt
           summary=$(mktemp)
           if cargo llvm-cov --workspace --all-targets --summary-only \
                --fail-under-lines 82 -- --test-threads=2 >"$summary" 2>&1
@@ -161,6 +222,26 @@ jobs:
     image: dsc-ci-rust:9
     needs: [coverage]
     steps:
+      # Materialize the checkout onto container-local disk first. The
+      # runner's workspace directory lives on sshfs, which corrupts cargo
+      # artifact IO: runs f9846a10 and 49521409 both died mid-compile with
+      # "found invalid metadata files" (E0786) for a different random
+      # crate each time — one run also logged a plain EPERM on an rlib
+      # open and a .d write — while fmt (writing the same tree) passed
+      # both times. Root cause bisected on fedora 2026-10-13 (see dsc's
+      # .gitforce.yml): the mount rejects any symlink resolving outside
+      # its own directory and silently garbles some concurrent writes.
+      # Cargo artifact trees are exactly the workload it cannot carry.
+      # Every cargo job below re-materializes into its own /wt (the
+      # container is per-job); each already paid a full cold dependency
+      # compile, and building on local disk is faster than the mount.
+      - name: Materialize checkout on local disk
+        run: |
+          mkdir -p /wt
+          tar -C /workspace -cf /tmp/src-tree.tar --exclude=./.git --exclude=./target --exclude=node_modules .
+          tar -C /wt -xf /tmp/src-tree.tar
+          rm /tmp/src-tree.tar
+          echo "materialized $(du -sh /wt | cut -f1) to /wt"
       - name: Fuzz smoke (60s per target)
         # Bounded libFuzzer smoke over the two untrusted-input surfaces:
         # the .gitforge.yml pipeline parser (bytes controlled by anyone
@@ -182,7 +263,7 @@ jobs:
         # default toolchain is stable, which cannot build -Zbuild-std.
         run: |
           set -e
-          cd fuzz
+          cd /wt/fuzz
           cargo +nightly fuzz run pipeline_parse \
               -- -max_total_time=60 -rss_limit_mb=2560
           cargo +nightly fuzz run git_http_parsers \
