@@ -546,6 +546,7 @@ impl Pool {
             // quiet instead of judging from the runner's global heartbeat,
             // which starves under host load while the build is healthy.
             "ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT",
+            "ALTER TABLE jobs ADD COLUMN assigned_at TEXT",
         ] {
             if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
                 let message = error.to_string();
