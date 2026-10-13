@@ -84,6 +84,9 @@ jobs:
         # through the mount once and writes worktree + objects onto
         # local disk.
         run: |
+          export GIT_CONFIG_GLOBAL=/tmp/gitconfig
+          git config --global --add safe.directory /workspace
+          git config --global --add safe.directory /workspace/.git
           git clone /workspace /wt
           echo "materialized $(du -sh /wt | cut -f1) to /wt"
       - name: Strict lint (zero warnings)
@@ -126,6 +129,9 @@ jobs:
         # through the mount once and writes worktree + objects onto
         # local disk.
         run: |
+          export GIT_CONFIG_GLOBAL=/tmp/gitconfig
+          git config --global --add safe.directory /workspace
+          git config --global --add safe.directory /workspace/.git
           git clone /workspace /wt
           echo "materialized $(du -sh /wt | cut -f1) to /wt"
       - name: Workspace test suite
@@ -177,6 +183,9 @@ jobs:
         # through the mount once and writes worktree + objects onto
         # local disk.
         run: |
+          export GIT_CONFIG_GLOBAL=/tmp/gitconfig
+          git config --global --add safe.directory /workspace
+          git config --global --add safe.directory /workspace/.git
           git clone /workspace /wt
           echo "materialized $(du -sh /wt | cut -f1) to /wt"
       - name: Line coverage gate (fail 82, warn 84)
@@ -256,6 +265,9 @@ jobs:
         # through the mount once and writes worktree + objects onto
         # local disk.
         run: |
+          export GIT_CONFIG_GLOBAL=/tmp/gitconfig
+          git config --global --add safe.directory /workspace
+          git config --global --add safe.directory /workspace/.git
           git clone /workspace /wt
           echo "materialized $(du -sh /wt | cut -f1) to /wt"
       - name: Fuzz smoke (60s per target)
