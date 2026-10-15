@@ -242,6 +242,29 @@ a push trigger does (202 with the new run id, riding its durable
 duplicate protection); 404 if the run does not exist, 503 when the CI
 trigger is not configured, 502 when the orchestrator rejects the trigger.
 
+#### CI trigger receipt (scheduler service)
+
+The scheduler service on port `42781` exposes a narrow read-only receipt for
+the durable request created by `POST /pipelines/trigger`:
+
+```text
+GET /pipeline-trigger-requests/{request_id}
+```
+
+Send the same `Authorization: Bearer <GITFORGE_TRIGGER_TOKEN>` credential
+(or `x-gitforge-trigger-token`) used for enqueue. This route returns only the
+trigger lifecycle, correlated pipeline run ID, and pipeline status; it does
+not expose the stored error text or general pipeline listings. A missing
+request returns `404`, a missing database returns `503`, and a database read
+failure returns `500`.
+
+`status` is `pending`, `processing`, `completed`, or `failed`. Until a run is
+materialized, `pipeline_run_id` and `pipeline_status` are `null`. Once present,
+`pipeline_status` is `pending`, `running`, `succeeded`, `failed`, or
+`cancelled`. CI clients should continue polling while the trigger is
+`pending`/`processing` or the pipeline is `pending`/`running`, and stop only at
+a terminal pipeline status.
+
 **Pipeline Run Response:**
 ```json
 {
