@@ -1,6 +1,6 @@
 # GitForge Runbook
 
-**Last Updated**: 2026-08-29
+**Last Updated**: 2026-10-09
 
 ## Overview
 
@@ -158,13 +158,16 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 |----------|----------|---------|-------------|
 | `GITFORGE_SCHEDULER_URL` | **Yes** | — | Scheduler HTTP endpoint (e.g. `http://localhost:42781`). Startup fails without this. |
 | `GITFORGE_RUNNER_NAME` | Recommended | `runner` | Stable unique identity; restarts refresh this row instead of creating another one |
-| `GITFORGE_RUNNER_CAPACITY` | No | `2` | Maximum concurrent jobs |
+| `GITFORGE_RUNNER_CAPACITY` | No | `2` | Maximum concurrent jobs; also drives the derived per-job CPU allowance (see resource governance below) |
 | `GITFORGE_HEARTBEAT_INTERVAL` | No | `30` | Heartbeat interval in seconds |
 | `GITFORGE_JOB_HEARTBEAT_INTERVAL` | No | `15` | Per-job lease-heartbeat interval in seconds (#243): sent while a job runs to renew its fence grace |
 | `GITFORGE_FETCH_INTERVAL` | No | `5` | Job-poll interval in seconds |
 | `GITFORGE_SCHEDULER_TOKEN` | No | _(none)_ | Bearer token for scheduler API authentication |
 | `GITFORGE_REGISTER_ATTEMPTS` | No | `6` | Registration attempts before giving up when the scheduler is unreachable |
 | `GITFORGE_REGISTER_BACKOFF_SECS` | No | `1` | Initial registration retry delay; doubles per attempt up to 30s |
+| `GITFORGE_SANDBOX_CPUS` | No | derived | Per-job CPU core allowance (fractional OK). Default: host cores ÷ `GITFORGE_RUNNER_CAPACITY`, floor 1. Enforced as a cgroup `cpu_quota`/`cpu_period` pair on the job container. |
+| `GITFORGE_SANDBOX_MAX_PIDS` | No | `512` | Per-job process/thread cap, enforced by the cgroup `pids` controller. `0` disables the cap (escape hatch, not recommended). |
+| `GITFORGE_SANDBOX_MEMORY_MB` | No | `4096` | Per-job memory ceiling in megabytes, enforced by the cgroup `memory` controller. Raise on CI-capable hosts whose debug links pin the default (native-crypto test binaries). |
 
 > **Startup behavior**: If `GITFORGE_SCHEDULER_URL` is missing or empty, the runner exits immediately
 > with a clear error message. Invalid values for numeric variables (non-integer) also cause a fast
@@ -172,6 +175,47 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 > merely unreachable or answering 503, registration retries up to `GITFORGE_REGISTER_ATTEMPTS`
 > times with exponential backoff before the fail-closed exit; credential rejections (401/403) are
 > never retried.
+
+### Resource governance (issue #277)
+
+Job containers are bounded at the container/cgroup boundary, not by convention:
+
+- **CPU**: every job container is created with `cpu_quota = cpus × 100 ms`
+  (fractional cores allowed). Previously the quota was computed from a
+  total-time budget and resolved to ~36000 cores — i.e. no bound at all,
+  which is how one cargo build could occupy every host core with linker
+  workers.
+- **Process slots**: `pids_limit` (default 512) caps processes and threads
+  inside the container, stopping runaway forking (the observed failure mode
+  was 19 concurrent `rust-lld` instances plus D-state thread pileup).
+- **Memory**: `memory_mb` (default 4096) has been enforced at container
+  creation all along and is unchanged.
+- **Build parallelism**: the runner injects `CARGO_BUILD_JOBS` into every
+  job step, derived from the per-job CPU allowance (floored, minimum 1), so
+  cargo parallelism follows the runner's registered capacity instead of the
+  host-wide CPU count. Jobs or pipeline steps that set `CARGO_BUILD_JOBS`
+  themselves always win over the derived value.
+
+**Observability**: at startup the runner logs one structured
+`resolved per-job resource policy` event with `cpus_per_job`, `memory_mb`,
+`pids_limit`, `cargo_build_jobs`, `host_cores`, and `capacity`. Verify what a
+live job actually got with `docker inspect gitforge-job-<job id>` under
+`HostConfig` (`CpuQuota`, `PidsLimit`, `Memory`).
+
+**Override policy**: set `GITFORGE_SANDBOX_CPUS` / `GITFORGE_SANDBOX_MAX_PIDS`
+/ `GITFORGE_SANDBOX_MEMORY_MB` on the runner service and restart it. Raise
+`GITFORGE_SANDBOX_CPUS` when a workload legitimately needs more per-job CPU
+and capacity × cpus stays within host cores; set `GITFORGE_SANDBOX_MAX_PIDS=0`
+only if a job provably forks more than 512 processes and you accept the
+fork-bomb exposure.
+
+**Rollout / rollback**: the policy resolves at runner startup, so rollout is
+"restart the runner service with the new binary"; there is no migration and no
+scheduler-side change. Rollback is the previous release bundle via
+`releases/gitforge-current` (standard cycle above) — or, without a rollback,
+setting the three environment variables back to explicit generous values
+(e.g. `GITFORGE_SANDBOX_CPUS=<host cores>`) restores effectively unbounded
+per-job CPU without redeploying.
 
 Runner names are durable identities. Set a distinct name for every concurrently
 running runner (for example, `remote-podman-runner-01`); leaving the default
