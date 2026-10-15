@@ -17,30 +17,27 @@ Configure these repository or organization values before enabling it:
 | Name | Kind | Requirement |
 | --- | --- | --- |
 | `GITFORGE_ENABLED` | variable | Exactly `true` |
-| `GITFORGE_API_URL` | variable | Reachable GitForge API base URL |
 | `GITFORGE_SCHEDULER_URL` | variable | Reachable scheduler base URL |
 | `GITFORGE_REPO_ID` | variable | UUID of the mirrored GitForge repository |
 | `GITFORGE_POLL_TIMEOUT_SECONDS` | variable | Positive integer timeout |
 | `GITFORGE_POLL_INTERVAL_SECONDS` | variable | Positive integer interval |
 | `GITFORGE_TRIGGER_TOKEN` | secret | Dedicated scheduler trigger credential |
-| `GITFORGE_READ_API_TOKEN` | secret | Preferred API credential with repository and pipeline read access |
 
-The enqueue and read credentials are intentionally separate: the scheduler
-accepts its dedicated trigger token, while receipt and pipeline-run routes use
-the API's authenticated-user middleware. Reusing the trigger secret for API
-polling can enqueue successfully and then fail with HTTP 401. For migration,
-`GITFORGE_TRIGGER_TOKEN` falls back to the existing
-`GITFORGE_CI_TRIGGER_TOKEN`, then the previous `GITFORGE_API_TOKEN` secret.
-Reads prefer `GITFORGE_READ_API_TOKEN`; until that secret is configured, the
-workflow temporarily falls back to `GITFORGE_API_TOKEN` so existing installs
-do not fail before making a request. The fallback may be more privileged than
-read-only. Provision a dedicated read credential and remove reliance on the
-fallback when GitForge provides a durable repository-scoped token contract.
-The workflow emits a warning when this compatibility fallback is active.
+`GITFORGE_TRIGGER_TOKEN` authenticates enqueue and the scheduler's
+read-only `GET /pipeline-trigger-requests/{request_id}` receipt endpoint. The
+receipt contains only request state, correlated run ID, and pipeline state;
+it does not require an API-user JWT or expose general pipeline listings. The
+endpoint must be deployed on the scheduler before enabling this workflow.
+For migration, `GITFORGE_TRIGGER_TOKEN` falls back to the existing
+`GITFORGE_CI_TRIGGER_TOKEN` secret. The workflow intentionally does not fall
+back to the general `GITFORGE_API_TOKEN`; configure a dedicated trigger token
+instead of reusing broader API credentials.
 
-The workflow validates all values and refuses to bypass GitForge if enqueue or
-polling fails. Until `GITFORGE_ENABLED=true` is intentionally configured, the
-workflow is skipped rather than issuing requests to an invalid local endpoint.
+The workflow validates its inputs and refuses to bypass GitForge if enqueue or
+polling fails. It polls the durable receipt until both trigger materialization
+and the pipeline reach a terminal state. Until `GITFORGE_ENABLED=true` is
+intentionally configured, it is skipped rather than issuing requests to an
+invalid endpoint.
 
 The Fedora-native GitForge path remains the source-of-truth CI path for local
 Git pushes. The GitHub workflow is only an integration bridge and must not be
