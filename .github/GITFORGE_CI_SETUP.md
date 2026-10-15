@@ -22,7 +22,16 @@ Configure these repository or organization values before enabling it:
 | `GITFORGE_REPO_ID` | variable | UUID of the mirrored GitForge repository |
 | `GITFORGE_POLL_TIMEOUT_SECONDS` | variable | Positive integer timeout |
 | `GITFORGE_POLL_INTERVAL_SECONDS` | variable | Positive integer interval |
-| `GITFORGE_API_TOKEN` | secret | Token accepted by the scheduler/API |
+| `GITFORGE_TRIGGER_TOKEN` | secret | Dedicated scheduler trigger credential |
+| `GITFORGE_READ_API_TOKEN` | secret | API user token with repository and pipeline read access |
+
+The enqueue and read credentials are intentionally separate: the scheduler
+accepts its dedicated trigger token, while receipt and pipeline-run routes use
+the API's authenticated-user middleware. Reusing the trigger secret for API
+polling can enqueue successfully and then fail with HTTP 401. For migration,
+`GITFORGE_TRIGGER_TOKEN` falls back to the existing
+`GITFORGE_CI_TRIGGER_TOKEN`, then the previous `GITFORGE_API_TOKEN` secret.
+The read token must be provisioned separately.
 
 The workflow validates all values and refuses to bypass GitForge if enqueue or
 polling fails. Until `GITFORGE_ENABLED=true` is intentionally configured, the

@@ -25,7 +25,9 @@ env:
   GITFORGE_REPO_ID: ${{ vars.GITFORGE_REPO_ID || '' }}
   GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
-  GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
+  # Scheduler enqueue and API polling have distinct authentication contracts.
+  GITFORGE_TRIGGER_TOKEN: ${{ secrets.GITFORGE_TRIGGER_TOKEN || secrets.GITFORGE_CI_TRIGGER_TOKEN || secrets.GITFORGE_API_TOKEN }}
+  GITFORGE_READ_API_TOKEN: ${{ secrets.GITFORGE_READ_API_TOKEN }}
 
 permissions:
   contents: read
@@ -50,7 +52,8 @@ jobs:
           : "${GITFORGE_API_URL:?GITFORGE_API_URL is required}"
           : "${GITFORGE_SCHEDULER_URL:?GITFORGE_SCHEDULER_URL is required}"
           : "${GITFORGE_REPO_ID:?GITFORGE_REPO_ID is required (GitForge UUID, not GitHub repository_id)}"
-          : "${GITFORGE_API_TOKEN:?GITFORGE_API_TOKEN is required}"
+          : "${GITFORGE_TRIGGER_TOKEN:?GITFORGE_TRIGGER_TOKEN is required}"
+          : "${GITFORGE_READ_API_TOKEN:?GITFORGE_READ_API_TOKEN is required}"
           [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
             echo "GITFORGE_REPO_ID must be a UUID" >&2
             exit 1
@@ -81,7 +84,7 @@ jobs:
             '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
           RESPONSE=$(curl --connect-timeout 5 --max-time 35 --silent --show-error -w "\n%{http_code}" -X POST \
             "$GITFORGE_SCHEDULER_URL/pipelines/trigger" \
-            -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+            -H "Authorization: Bearer $GITFORGE_TRIGGER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
 
@@ -148,7 +151,7 @@ jobs:
               if [ -n "$TRIGGER_REQUEST_ID" ] && [ "$USE_TRIGGER_RECEIPT" = "true" ]; then
                 RECEIPT_RESPONSE=$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
                   -w "\n%{http_code}" \
-                  -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+                  -H "Authorization: Bearer $GITFORGE_READ_API_TOKEN" \
                   -H "Accept: application/json" \
                   "$GITFORGE_API_URL/api/pipeline-trigger-requests/$TRIGGER_REQUEST_ID")
                 RECEIPT_HTTP_CODE=$(echo "$RECEIPT_RESPONSE" | tail -n1)
@@ -181,7 +184,11 @@ jobs:
                 elif [ "$RECEIPT_HTTP_CODE" = "404" ]; then
                   # Compatibility with older GitForge deployments that accept
                   # durable triggers but do not expose the receipt endpoint.
+                  echo "GitForge receipt endpoint is unavailable; using the legacy API lookup."
                   USE_TRIGGER_RECEIPT=false
+                elif [ "$RECEIPT_HTTP_CODE" = "401" ]; then
+                  echo "GitForge rejected the API read credential for trigger receipt lookup (HTTP 401)." >&2
+                  exit 1
                 else
                   echo "GitForge trigger receipt lookup failed (HTTP $RECEIPT_HTTP_CODE)" >&2
                   exit 1
@@ -190,10 +197,20 @@ jobs:
 
               if [ -z "$RUN_ID" ] && [ "$USE_TRIGGER_RECEIPT" = "false" ]; then
                 if [ -z "$PIPELINE_IDS_JSON" ]; then
-                  PIPELINES=$(curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 15 \
-                    -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+                  PIPELINES_RESPONSE=$(curl --silent --show-error --connect-timeout 5 --max-time 15 \
+                    -w "\n%{http_code}" \
+                    -H "Authorization: Bearer $GITFORGE_READ_API_TOKEN" \
                     -H "Accept: application/json" \
                     "$GITFORGE_API_URL/api/pipelines")
+                  PIPELINES_HTTP_CODE=$(echo "$PIPELINES_RESPONSE" | tail -n1)
+                  PIPELINES=$(echo "$PIPELINES_RESPONSE" | sed '$d')
+                  if [ "$PIPELINES_HTTP_CODE" = "401" ]; then
+                    echo "GitForge rejected GITFORGE_READ_API_TOKEN while listing pipelines (HTTP 401)." >&2
+                    exit 1
+                  elif [ "$PIPELINES_HTTP_CODE" != "200" ]; then
+                    echo "GitForge pipeline list failed (HTTP $PIPELINES_HTTP_CODE)." >&2
+                    exit 1
+                  fi
                   PIPELINE_IDS_JSON=$(echo "$PIPELINES" | jq -c --arg repo "$GITFORGE_REPO_ID" '[.[] | select(.repo_id == $repo) | .id]')
                   if [ "$PIPELINE_IDS_JSON" = "[]" ]; then
                     echo "GitForge has no visible pipeline configured for the requested repository" >&2
@@ -201,10 +218,20 @@ jobs:
                   fi
                 fi
 
-                RUNS=$(curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 15 \
-                  -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+                RUNS_RESPONSE=$(curl --silent --show-error --connect-timeout 5 --max-time 15 \
+                  -w "\n%{http_code}" \
+                  -H "Authorization: Bearer $GITFORGE_READ_API_TOKEN" \
                   -H "Accept: application/json" \
                   "$GITFORGE_API_URL/api/pipeline-runs")
+                RUNS_HTTP_CODE=$(echo "$RUNS_RESPONSE" | tail -n1)
+                RUNS=$(echo "$RUNS_RESPONSE" | sed '$d')
+                if [ "$RUNS_HTTP_CODE" = "401" ]; then
+                  echo "GitForge rejected GITFORGE_READ_API_TOKEN while listing runs (HTTP 401)." >&2
+                  exit 1
+                elif [ "$RUNS_HTTP_CODE" != "200" ]; then
+                  echo "GitForge pipeline-run lookup failed (HTTP $RUNS_HTTP_CODE)." >&2
+                  exit 1
+                fi
                 RUN_ID=$(echo "$RUNS" | jq -r --arg sha "$EXPECTED_COMMIT" --argjson pipeline_ids "$PIPELINE_IDS_JSON" \
                   '[.[] | select(.commit_hash == $sha and (.pipeline_id as $pipeline_id | $pipeline_ids | index($pipeline_id)))] | first | .id // empty')
                 if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
@@ -226,7 +253,7 @@ jobs:
           while :; do
             RESPONSE=$(curl --fail-with-body --silent --show-error \
               --max-time 30 \
-              -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+              -H "Authorization: Bearer $GITFORGE_READ_API_TOKEN" \
               -H "Accept: application/json" \
               "$STATUS_URL")
             STATUS=$(echo "$RESPONSE" | jq -r '.status // .state // empty' | tr '[:upper:]' '[:lower:]')
