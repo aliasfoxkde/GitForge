@@ -155,6 +155,12 @@ async fn spawn_ci() -> CiService {
             format!("sqlite:{}", db_path.display()),
         )
         .env("GITFORGE_TRIGGER_TOKEN", "harness-trigger-token")
+        .env_remove("GITFORGE_CI_TRIGGER_TOKEN")
+        .env(
+            "GITFORGE_SCHEDULER_OPERATOR_TOKEN",
+            "harness-operator-token",
+        )
+        .env_remove("GITFORGE_SCHEDULER_TOKEN")
         .env("GITFORGE_ARTIFACT_ROOT", &artifacts)
         .env("GITFORGE_WORKSPACE_ROOT", &workspaces)
         .env("RUST_LOG", "warn")
@@ -241,6 +247,16 @@ async fn test_trigger_requires_token_and_runs_committed_pipeline() {
     assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "body: {body}");
     assert!(body.contains("trigger_auth_required"), "body: {body}");
 
+    // The scheduler operator credential is read-only compatibility auth; it
+    // must never authorize a request that can enqueue pipeline work.
+    let (status, body) = post_trigger(
+        service.scheduler_port,
+        Some("harness-operator-token"),
+        &trigger_body,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "body: {body}");
+
     // With the token, the push event flows through the real in-process
     // consumer: the committed pipeline governs, the run is created, and its
     // id is reported synchronously.
@@ -264,6 +280,14 @@ async fn test_trigger_requires_token_and_runs_committed_pipeline() {
 
     let (status, body) = get_trigger_status(service.scheduler_port, None, &trigger_id).await;
     assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "body: {body}");
+
+    let (status, body) = get_trigger_status(
+        service.scheduler_port,
+        Some("harness-operator-token"),
+        &trigger_id,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
 
     let (status, body) = get_trigger_status(
         service.scheduler_port,

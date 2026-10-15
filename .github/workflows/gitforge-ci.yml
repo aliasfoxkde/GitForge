@@ -24,7 +24,7 @@ env:
   GITFORGE_REPO_ID: ${{ vars.GITFORGE_REPO_ID || '' }}
   GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
-  # Trigger and read-only receipt calls share the scheduler trigger credential.
+  # Enqueue requests use only the dedicated trigger credential.
   GITFORGE_TRIGGER_TOKEN: ${{ secrets.GITFORGE_TRIGGER_TOKEN || secrets.GITFORGE_CI_TRIGGER_TOKEN }}
 
 permissions:
@@ -140,6 +140,8 @@ jobs:
         id: poll
         env:
           ENQUEUED_TRIGGER_REQUEST_ID: ${{ needs.enqueue-build.outputs.trigger_request_id }}
+          # Scoped to the read-only receipt poll; never provided to enqueue.
+          GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
         run: |
           set -euo pipefail
           TRIGGER_REQUEST_ID="$ENQUEUED_TRIGGER_REQUEST_ID"
@@ -151,10 +153,12 @@ jobs:
           echo "Build enqueued, polling the durable GitForge receipt..."
 
           deadline=$(( $(date +%s) + GITFORGE_POLL_TIMEOUT_SECONDS ))
+          POLL_TOKEN="$GITFORGE_TRIGGER_TOKEN"
+          USING_OPERATOR_TOKEN=false
           while :; do
             if RESPONSE=$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
               -w "\n%{http_code}" \
-              -H "Authorization: Bearer $GITFORGE_TRIGGER_TOKEN" \
+              -H "Authorization: Bearer $POLL_TOKEN" \
               -H "Accept: application/json" \
               "$STATUS_URL"); then
               HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
@@ -211,6 +215,11 @@ jobs:
                   exit 1
                   ;;
               esac
+            elif [ "$HTTP_CODE" = "401" ] && [ "$USING_OPERATOR_TOKEN" = "false" ] && [ -n "${GITFORGE_SCHEDULER_OPERATOR_TOKEN:-}" ]; then
+              echo "GitForge receipt returned 401; retrying once with the read-only operator credential." >&2
+              POLL_TOKEN="$GITFORGE_SCHEDULER_OPERATOR_TOKEN"
+              USING_OPERATOR_TOKEN=true
+              continue
             elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
               echo "GitForge rejected the trigger credential for receipt status (HTTP $HTTP_CODE)." >&2
               exit 1
