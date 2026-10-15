@@ -90,10 +90,18 @@ jobs:
   aegis-scan:
     name: Aegis Changed-Line Scan
     runs-on: [self-hosted, linux, x64, gitforge-github]
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
 
       - name: Build pinned Aegis scanner
         env:
@@ -119,8 +127,6 @@ jobs:
           fi
 
       - name: Run Aegis changed-line scan
-        env:
-          AEGIS_BIN: /home/runner/work/_temp/aegis/target/release/aegis
         run: |
           set -euo pipefail
           # Resolve the actual temporary checkout path rather than relying on
