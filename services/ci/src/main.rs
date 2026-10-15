@@ -754,7 +754,7 @@ async fn get_trigger_request_status(
             }
         };
 
-    let pipeline_status = if let Some(run_id) = trigger_request.run_id.clone() {
+    let pipeline_status = if let Some(run_id) = trigger_request.run_id {
         match gitforge_db::queries::PipelineRunQueries::get(pool, run_id).await {
             Ok(Some(run)) => Some(run.status),
             Ok(None) => {
