@@ -102,9 +102,11 @@ jobs:
                 echo "GitForge returned a run without a valid durable trigger request ID" >&2
                 exit 1
               fi
-              echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-              echo "trigger_request_id=$TRIGGER_REQUEST_ID" >> "$GITHUB_OUTPUT"
-              echo "status=enqueued" >> "$GITHUB_OUTPUT"
+              {
+                echo "run_id=$RUN_ID"
+                echo "trigger_request_id=$TRIGGER_REQUEST_ID"
+                echo "status=enqueued"
+              } >> "$GITHUB_OUTPUT"
               echo "Successfully enqueued pipeline run $RUN_ID"
               exit 0
             fi
@@ -113,8 +115,10 @@ jobs:
                 echo "GitForge accepted the trigger without a valid durable request ID" >&2
                 exit 1
               fi
-              echo "trigger_request_id=$TRIGGER_REQUEST_ID" >> "$GITHUB_OUTPUT"
-              echo "status=accepted" >> "$GITHUB_OUTPUT"
+              {
+                echo "trigger_request_id=$TRIGGER_REQUEST_ID"
+                echo "status=accepted"
+              } >> "$GITHUB_OUTPUT"
               echo "GitForge durably accepted the event; the pipeline run is still being materialized."
               exit 0
             fi
