@@ -4,12 +4,9 @@ on:
   push:
     branches: [main, stable]
     tags: ['v*']
+  # Report Build Status is required by the branch ruleset, so this workflow
+  # must create its run for every PR, including docs-only changes.
   pull_request:
-    paths:
-      - '**.rs'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - '.github/workflows/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

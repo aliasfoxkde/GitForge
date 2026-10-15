@@ -8,12 +8,8 @@ on:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/security.yml'
+  # Required security contexts must exist for every PR, including docs-only changes.
   pull_request:
-    paths:
-      - '**.rs'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - '.github/workflows/security.yml'
   schedule:
     - cron: '0 6 * * 1'  # Weekly Monday 6am UTC
   workflow_dispatch:
