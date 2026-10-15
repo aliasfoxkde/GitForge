@@ -1188,6 +1188,115 @@ mod tests {
         assert_status(resp, StatusCode::OK);
     }
 
+    /// Live failure (2026-10-09, job 9bfbab3d-8e2d-4759-b972-18fa16e5df47):
+    /// the durable row went terminal while the scheduler mirror kept the
+    /// assignment, so every runner poll of `/jobs/pending` re-offered the
+    /// job with a lease whose mark-started then 409'd ("durable job lease is
+    /// no longer active") until the runner gave up and went offline. The
+    /// poll handler must never re-offer a decided row, and freeing the
+    /// stale assignment must let another queued job proceed.
+    #[tokio::test]
+    async fn test_pending_jobs_poll_does_not_reoffer_terminal_durable_job() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (dead_job, queued_job) = seed_restart_scenario(&pool, "lease-loop").await;
+        let run_id = gitforge_db::queries::JobQueries::get(&pool, dead_job)
+            .await
+            .unwrap()
+            .expect("seeded job row")
+            .pipeline_run_id;
+        let repo_id = gitforge_db::queries::PipelineRunQueries::get(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("seeded run row")
+            .repo_id;
+
+        let scheduler = crate::Scheduler::with_db(pool.clone());
+        let runner = Runner::new("lease-loop-runner".to_string(), RunnerType::Docker, 1);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+        scheduler
+            .enqueue_with_definition(
+                dead_job,
+                run_id,
+                repo_id,
+                vec!["cargo test".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+        scheduler
+            .enqueue_with_definition(
+                queued_job,
+                run_id,
+                repo_id,
+                vec!["cargo build".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+        let state = create_state(scheduler);
+
+        let poll = |state: SchedulerServerState| {
+            let runner_id = runner_id.to_string();
+            async move {
+                let response = get_pending_jobs(
+                    axum::extract::State(state),
+                    axum::extract::Query(PendingJobsQuery {
+                        runner_id: Some(runner_id),
+                    }),
+                )
+                .await;
+                let body = axum::body::to_bytes(response.into_response().into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Vec<serde_json::Value>>(&body).unwrap()
+            }
+        };
+
+        // First poll: the head job is offered with a lease.
+        let assignments = poll(state.clone()).await;
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            assignments[0]["job_id"].as_str().unwrap(),
+            dead_job.to_string()
+        );
+        assert!(assignments[0]["lease_token"].as_str().is_some());
+
+        // The durable row decides out-of-band (watchdog / API transition).
+        gitforge_db::queries::JobQueries::update_status(&pool, dead_job, "failed")
+            .await
+            .unwrap();
+
+        // Repeating the runner's exact request sequence: the terminal job
+        // must never be offered again — this is the request that used to
+        // return the dead lease on every poll.
+        let assignments = poll(state.clone()).await;
+        assert!(
+            assignments
+                .iter()
+                .all(|job| job["job_id"].as_str() != Some(dead_job.to_string().as_str())),
+            "terminal job re-offered after its durable row decided: {assignments:?}"
+        );
+
+        // The freed capacity admits the queued job on the next poll.
+        let assignments = poll(state.clone()).await;
+        let offered: Vec<&str> = assignments
+            .iter()
+            .map(|job| job["job_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(offered, vec![queued_job.to_string().as_str()]);
+        assert!(
+            assignments[0]["lease_token"].as_str().is_some(),
+            "the valid queued job must be offered with a lease"
+        );
+        let durable = gitforge_db::queries::JobQueries::get(&pool, dead_job)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, "failed");
+    }
+
     #[tokio::test]
     async fn test_get_queue_status_handler_reports_empty_in_memory_state() {
         let state = create_state(crate::Scheduler::new());
