@@ -27,7 +27,11 @@ env:
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
   # Scheduler enqueue and API polling have distinct authentication contracts.
   GITFORGE_TRIGGER_TOKEN: ${{ secrets.GITFORGE_TRIGGER_TOKEN || secrets.GITFORGE_CI_TRIGGER_TOKEN || secrets.GITFORGE_API_TOKEN }}
-  GITFORGE_READ_API_TOKEN: ${{ secrets.GITFORGE_READ_API_TOKEN }}
+  # Prefer a narrowly scoped read token. The legacy API token is a temporary
+  # compatibility fallback for existing installations that have not provisioned
+  # the new secret yet; replace it once GitForge supports durable scoped tokens.
+  GITFORGE_READ_API_TOKEN: ${{ secrets.GITFORGE_READ_API_TOKEN || secrets.GITFORGE_API_TOKEN }}
+  GITFORGE_READ_API_TOKEN_SOURCE: ${{ secrets.GITFORGE_READ_API_TOKEN != '' && 'dedicated' || 'legacy' }}
 
 permissions:
   contents: read
@@ -54,6 +58,9 @@ jobs:
           : "${GITFORGE_REPO_ID:?GITFORGE_REPO_ID is required (GitForge UUID, not GitHub repository_id)}"
           : "${GITFORGE_TRIGGER_TOKEN:?GITFORGE_TRIGGER_TOKEN is required}"
           : "${GITFORGE_READ_API_TOKEN:?GITFORGE_READ_API_TOKEN is required}"
+          if [[ "$GITFORGE_READ_API_TOKEN_SOURCE" = "legacy" ]]; then
+            echo "::warning::GITFORGE_READ_API_TOKEN is unset; using GITFORGE_API_TOKEN fallback. Configure a dedicated read credential when supported."
+          fi
           [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
             echo "GITFORGE_REPO_ID must be a UUID" >&2
             exit 1

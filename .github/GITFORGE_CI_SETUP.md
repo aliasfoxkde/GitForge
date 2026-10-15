@@ -23,7 +23,7 @@ Configure these repository or organization values before enabling it:
 | `GITFORGE_POLL_TIMEOUT_SECONDS` | variable | Positive integer timeout |
 | `GITFORGE_POLL_INTERVAL_SECONDS` | variable | Positive integer interval |
 | `GITFORGE_TRIGGER_TOKEN` | secret | Dedicated scheduler trigger credential |
-| `GITFORGE_READ_API_TOKEN` | secret | API user token with repository and pipeline read access |
+| `GITFORGE_READ_API_TOKEN` | secret | Preferred API credential with repository and pipeline read access |
 
 The enqueue and read credentials are intentionally separate: the scheduler
 accepts its dedicated trigger token, while receipt and pipeline-run routes use
@@ -31,7 +31,12 @@ the API's authenticated-user middleware. Reusing the trigger secret for API
 polling can enqueue successfully and then fail with HTTP 401. For migration,
 `GITFORGE_TRIGGER_TOKEN` falls back to the existing
 `GITFORGE_CI_TRIGGER_TOKEN`, then the previous `GITFORGE_API_TOKEN` secret.
-The read token must be provisioned separately.
+Reads prefer `GITFORGE_READ_API_TOKEN`; until that secret is configured, the
+workflow temporarily falls back to `GITFORGE_API_TOKEN` so existing installs
+do not fail before making a request. The fallback may be more privileged than
+read-only. Provision a dedicated read credential and remove reliance on the
+fallback when GitForge provides a durable repository-scoped token contract.
+The workflow emits a warning when this compatibility fallback is active.
 
 The workflow validates all values and refuses to bypass GitForge if enqueue or
 polling fails. Until `GITFORGE_ENABLED=true` is intentionally configured, the
