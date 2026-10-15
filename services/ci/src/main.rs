@@ -788,6 +788,7 @@ async fn trigger_pipeline(
                         Json(serde_json::json!({
                             "status": if run_id.is_some() { "accepted" } else { "queued" },
                             "event_id": existing.id.to_string(),
+                            "trigger_request_id": existing.id.to_string(),
                             "pipeline_run_id": run_id,
                             "repo_id": repo_id.to_string(),
                             "new_hash": request.new_hash,
@@ -870,7 +871,8 @@ async fn trigger_pipeline(
                     "status": if pipeline_run_id.is_some() { "accepted" } else { "queued" },
                     "event_id": event.event_id.to_string(),
                     "pipeline_run_id": pipeline_run_id.map(|id| id.to_string()),
-                    "trigger_id": trigger_request.map(|request| request.id.to_string()),
+                    "trigger_id": trigger_request.as_ref().map(|request| request.id.to_string()),
+                    "trigger_request_id": trigger_request.as_ref().map(|request| request.id.to_string()),
                     "repo_id": repo_id.to_string(),
                     "new_hash": request.new_hash,
                 })),

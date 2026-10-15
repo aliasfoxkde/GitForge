@@ -22,9 +22,13 @@ use gitforge_api::{ApiAuth, ApiServer, CiTriggerClient};
 use gitforge_ci::{JobDefinition, PipelineDefinition, StepDefinition, TriggerType};
 use gitforge_common::{PipelineId, PipelineRunId, RepoId};
 use gitforge_db::{
-    models::{Job, JobStatus, Pipeline, PipelineRun, Repository, Runner, RunnerType, User},
+    models::{
+        Job, JobStatus, Pipeline, PipelineRun, PipelineTriggerRequest, Repository, Runner,
+        RunnerType, User,
+    },
     queries::{
-        JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries, RunnerQueries, UserQueries,
+        JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries, RunnerQueries,
+        TriggerRequestQueries, UserQueries,
     },
     Pool,
 };
@@ -283,6 +287,69 @@ async fn pipeline_run_endpoints_scoped_and_expose_jobs_with_receipts() {
         f.app.clone(),
         "GET",
         &format!("/api/pipeline-runs/{}/jobs", uuid::Uuid::new_v4()),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing["error"], "not_found");
+}
+
+#[tokio::test]
+async fn pipeline_trigger_request_receipt_is_scoped_and_tracks_run_materialization() {
+    let f = seed().await;
+    let request = PipelineTriggerRequest::new(
+        f.repo_id,
+        "refs/heads/main".to_string(),
+        "0".repeat(40),
+        "a".repeat(40),
+    );
+    let request_id = request.id;
+    let (stored, was_new) = TriggerRequestQueries::create_or_existing(&f.pool, &request)
+        .await
+        .unwrap();
+    assert!(was_new);
+    assert_eq!(stored.id, request_id);
+    let uri = format!("/api/pipeline-trigger-requests/{request_id}");
+
+    let (status, pending) =
+        request_json(f.app.clone(), "GET", &uri, Some(&f.owner_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(pending["trigger_request_id"], request_id.to_string());
+    assert_eq!(pending["repo_id"], f.repo_id.to_string());
+    assert_eq!(pending["new_hash"], "a".repeat(40));
+    assert_eq!(pending["status"], "pending");
+    assert!(pending["pipeline_run_id"].is_null());
+
+    let (status, forbidden) =
+        request_json(f.app.clone(), "GET", &uri, Some(&f.intruder_token), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(forbidden["error"], "forbidden");
+
+    TriggerRequestQueries::mark_completed(&f.pool, request_id, f.run_id)
+        .await
+        .unwrap();
+    let (status, completed) =
+        request_json(f.app.clone(), "GET", &uri, Some(&f.owner_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["pipeline_run_id"], f.run_id.to_string());
+
+    let (status, invalid) = request_json(
+        f.app.clone(),
+        "GET",
+        "/api/pipeline-trigger-requests/not-a-uuid",
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(invalid["error"], "invalid_id");
+
+    let (status, missing) = request_json(
+        f.app.clone(),
+        "GET",
+        &format!("/api/pipeline-trigger-requests/{}", uuid::Uuid::new_v4()),
         Some(&f.owner_token),
         None,
     )
