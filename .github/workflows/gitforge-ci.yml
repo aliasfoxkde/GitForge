@@ -10,22 +10,22 @@ on:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/**'
+      - '.github/GITFORGE_CI_SETUP.md'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  # GitHub-hosted runners cannot reach a private Fedora LAN address. Enable
-  # this workflow only after a reachable endpoint or self-hosted runner is
-  # deliberately configured at repository/organization scope.
+  # Keep opt-in disabled until the Fedora-hosted runner, repo UUID, endpoint,
+  # and both distinct service credentials have been verified.
   GITFORGE_ENABLED: ${{ vars.GITFORGE_ENABLED || 'false' }}
-  GITFORGE_API_URL: ${{ vars.GITFORGE_API_URL || '' }}
   GITFORGE_SCHEDULER_URL: ${{ vars.GITFORGE_SCHEDULER_URL || '' }}
   GITFORGE_REPO_ID: ${{ vars.GITFORGE_REPO_ID || '' }}
   GITFORGE_POLL_TIMEOUT_SECONDS: ${{ vars.GITFORGE_POLL_TIMEOUT_SECONDS || '1800' }}
   GITFORGE_POLL_INTERVAL_SECONDS: ${{ vars.GITFORGE_POLL_INTERVAL_SECONDS || '15' }}
-  GITFORGE_API_TOKEN: ${{ secrets.GITFORGE_API_TOKEN }}
+  GITFORGE_CI_TRIGGER_TOKEN: ${{ secrets.GITFORGE_CI_TRIGGER_TOKEN }}
+  GITFORGE_SCHEDULER_OPERATOR_TOKEN: ${{ secrets.GITFORGE_SCHEDULER_OPERATOR_TOKEN }}
 
 permissions:
   contents: read
@@ -37,7 +37,10 @@ jobs:
   # Enqueue build job to GitForge queue instead of running directly
   enqueue-build:
     name: Enqueue Build to GitForge
-    if: vars.GITFORGE_ENABLED == 'true'
+    if: >-
+      vars.GITFORGE_ENABLED == 'true' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, linux, x64, gitforge-github]
     outputs:
       run_id: ${{ steps.enqueue.outputs.run_id }}
@@ -46,10 +49,10 @@ jobs:
       - name: Validate GitForge configuration
         run: |
           set -euo pipefail
-          : "${GITFORGE_API_URL:?GITFORGE_API_URL is required}"
           : "${GITFORGE_SCHEDULER_URL:?GITFORGE_SCHEDULER_URL is required}"
           : "${GITFORGE_REPO_ID:?GITFORGE_REPO_ID is required (GitForge UUID, not GitHub repository_id)}"
-          : "${GITFORGE_API_TOKEN:?GITFORGE_API_TOKEN is required}"
+          : "${GITFORGE_CI_TRIGGER_TOKEN:?GITFORGE_CI_TRIGGER_TOKEN is required}"
+          : "${GITFORGE_SCHEDULER_OPERATOR_TOKEN:?GITFORGE_SCHEDULER_OPERATOR_TOKEN is required}"
           [[ "$GITFORGE_REPO_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
             echo "GITFORGE_REPO_ID must be a UUID" >&2
             exit 1
@@ -64,20 +67,38 @@ jobs:
           }
       - name: Enqueue build job
         id: enqueue
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_REF: ${{ github.ref_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          # Trigger the GitForge CI service. The service returns the durable
-          # pipeline-run ID; polling the API by pipeline ID was a protocol
-          # mismatch and could never observe the created run.
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            REF_NAME="$PR_HEAD_REF"
+            OLD_HASH="$PR_BASE_SHA"
+            NEW_HASH="$PR_HEAD_SHA"
+          else
+            REF_NAME="$PUSH_REF"
+            OLD_HASH="$PUSH_BEFORE"
+            NEW_HASH="$PUSH_SHA"
+          fi
+
+          # Trigger the GitForge CI service. Poll by the durable run ID; a
+          # queued response without that ID fails closed rather than duplicating
+          # a trigger or claiming a build result that cannot be observed.
           PAYLOAD=$(jq -n \
             --arg repo "$GITFORGE_REPO_ID" \
-            --arg ref "${{ github.ref_name }}" \
-            --arg old "${{ github.event.before }}" \
-            --arg new "${{ github.sha }}" \
+            --arg ref "$REF_NAME" \
+            --arg old "$OLD_HASH" \
+            --arg new "$NEW_HASH" \
             '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "$GITFORGE_SCHEDULER_URL/pipelines/trigger" \
-            -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+            -H "Authorization: Bearer $GITFORGE_CI_TRIGGER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" 2>&1)
 
@@ -115,13 +136,13 @@ jobs:
           set -euo pipefail
           echo "Build enqueued, polling GitForge for status..."
           RUN_ID='${{ needs.enqueue-build.outputs.run_id }}'
-          STATUS_URL="$GITFORGE_API_URL/api/pipeline-runs/$RUN_ID"
+          STATUS_URL="$GITFORGE_SCHEDULER_URL/pipelines/runs/$RUN_ID"
 
           deadline=$(( $(date +%s) + GITFORGE_POLL_TIMEOUT_SECONDS ))
           while :; do
             RESPONSE=$(curl --fail-with-body --silent --show-error \
               --max-time 30 \
-              -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+              -H "Authorization: Bearer $GITFORGE_SCHEDULER_OPERATOR_TOKEN" \
               -H "Accept: application/json" \
               "$STATUS_URL")
             STATUS=$(echo "$RESPONSE" | jq -r '.status // .state // empty' | tr '[:upper:]' '[:lower:]')
@@ -150,7 +171,10 @@ jobs:
   report-status:
     name: Report Build Status
     needs: [enqueue-build, poll-build]
-    if: always() && vars.GITFORGE_ENABLED == 'true'
+    if: >-
+      always() && vars.GITFORGE_ENABLED == 'true' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, linux, x64, gitforge-github]
     steps:
       - name: Report completion
