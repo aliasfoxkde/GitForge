@@ -11,8 +11,22 @@ pub struct Config {
     /// Server URL
     pub server_url: String,
 
+    /// Base URL of the Git Smart HTTP server, when it is not reachable at
+    /// `server_url`'s authority nor at the platform's default git port
+    /// (`:42782`). The git-credential helper serves the stored session only
+    /// for these authorities; set this when the deployment moves the git
+    /// HTTP server to a non-default port.
+    #[serde(default)]
+    pub git_server_url: Option<String>,
+
     /// Auth token
     pub token: Option<String>,
+
+    /// Account the credentials belong to. Written at login so the
+    /// git-credential helper can answer `username=` without asking the
+    /// server; absent for configs written by older CLIs.
+    #[serde(default)]
+    pub username: Option<String>,
 
     /// Refresh credential minted with the token. Stored 0600 alongside it:
     /// whoever can read this file can act as the user regardless, so the
@@ -103,7 +117,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server_url: "http://localhost:42780".to_string(),
+            git_server_url: None,
             token: None,
+            username: None,
             refresh_token: None,
             token_expires_at: None,
             refresh_expires_at: None,
@@ -158,6 +174,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.token.as_ref().unwrap(), "test-token");
+    }
+
+    /// Configs written before the git-credential helper carry no
+    /// `username`; they must load unchanged rather than fail, and the
+    /// helper falls back to its default username for them.
+    #[test]
+    fn test_config_without_username_deserializes() {
+        let json = r#"{
+            "server_url": "http://localhost:42780",
+            "token": null,
+            "local_data_dir": "/tmp/gitforge",
+            "organization": null,
+            "editor": null,
+            "output_format": "Table",
+            "features": {}
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.username.is_none());
+    }
+
+    #[test]
+    fn test_config_username_round_trips() {
+        let config = Config {
+            username: Some("alice".to_string()),
+            ..Default::default()
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reloaded.username.as_deref(), Some("alice"));
     }
 
     #[test]

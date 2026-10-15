@@ -5,7 +5,7 @@
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     response::Response,
     routing::{get, post},
     Router,
@@ -14,6 +14,7 @@ use chrono::Utc;
 use gitforge_common::RepoId;
 use gitforge_core::git_protocol::{http::HttpGitHandler, GitProtocolHandler};
 
+mod http_auth;
 mod ref_policy;
 mod ssh_server;
 
@@ -233,27 +234,33 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-/// Look up RepoId from database using owner username and repo name
-async fn lookup_repo_id(
-    db_pool: &Option<Arc<Pool>>,
+/// Run the Smart HTTP auth gate for one git request: on success yield the
+/// repository id and the authenticated actor (if any) for attribution; on
+/// denial return the response the transport must answer with. See
+/// `http_auth` for the full contract.
+async fn require_git_access(
+    state: &AppState,
+    headers: &HeaderMap,
     owner: &str,
     repo_name: &str,
-) -> Option<RepoId> {
-    let pool = db_pool.as_ref()?;
-
-    match gitforge_db::queries::RepoQueries::get_by_owner_and_name(pool, owner, repo_name).await {
-        Ok(Some(repo)) => {
-            tracing::debug!("looked up repo {:?} for {}/{}", repo.id, owner, repo_name);
-            Some(repo.id)
-        }
-        Ok(None) => {
-            tracing::debug!("repo not found in DB for {}/{}", owner, repo_name);
-            None
-        }
-        Err(e) => {
-            tracing::warn!("DB lookup failed for {}/{}: {}", owner, repo_name, e);
-            None
-        }
+    operation: http_auth::GitOperation,
+) -> Result<(RepoId, Option<http_auth::Actor>), Box<Response>> {
+    match http_auth::authorize_git_http(&state.db_pool, headers, owner, repo_name, operation).await
+    {
+        http_auth::GitHttpAccess::Authorized { repo, actor } => Ok((repo.id, actor)),
+        // denial_response answers Some for every denial variant; the None
+        // arm is unreachable by construction and degrades like every other
+        // static-response builder here.
+        denial => Err(Box::new(
+            denial
+                .denial_response(&format!("{owner}/{repo_name}"))
+                .unwrap_or_else(|| {
+                    finish_response(
+                        Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR),
+                        Body::from("internal error"),
+                    )
+                }),
+        )),
     }
 }
 
@@ -271,30 +278,22 @@ fn finish_response(builder: axum::http::response::Builder, body: Body) -> Respon
 async fn git_upload_pack(
     Path((owner, repo)): Path<(String, String)>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Response {
     let repo_path = format!("{owner}/{repo}");
 
-    // Try to look up repo ID from database first
-    let repo_id = if let Some(_pool) = &state.db_pool {
-        match lookup_repo_id(&state.db_pool, &owner, &repo).await {
-            Some(id) => id,
-            None => {
-                tracing::warn!("repository not found in DB: {}", repo_path);
-                return finish_response(
-                    Response::builder().status(StatusCode::NOT_FOUND),
-                    Body::from(format!("Repository not found: {repo_path}")),
-                );
-            }
-        }
-    } else {
-        tracing::warn!(
-            "database not available, cannot look up repository: {}",
-            repo_path
-        );
-        return finish_response(
-            Response::builder().status(StatusCode::SERVICE_UNAVAILABLE),
-            Body::from("Database not available"),
-        );
+    // Reads: anonymous only for explicitly public repositories.
+    let (repo_id, _actor) = match require_git_access(
+        &state,
+        &headers,
+        &owner,
+        &repo,
+        http_auth::GitOperation::Read,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return *response,
     };
 
     // Check if repository exists in storage
@@ -335,8 +334,9 @@ async fn git_upload_pack(
 async fn git_upload_pack_path(
     Path((owner, repo, _path)): Path<(String, String, String)>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Response {
-    git_upload_pack(Path((owner, repo)), State(state)).await
+    git_upload_pack(Path((owner, repo)), State(state), headers).await
 }
 
 /// Standard Smart HTTP ref advertisement endpoint.
@@ -344,31 +344,27 @@ async fn git_info_refs(
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<InfoRefsQuery>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Response {
     let repo = repo.trim_end_matches(".git").to_string();
     if query.service.as_deref() != Some("git-receive-pack") {
-        return git_upload_pack(Path((owner, repo)), State(state)).await;
+        return git_upload_pack(Path((owner, repo)), State(state), headers).await;
     }
 
+    // The receive-pack advertisement is the first half of a push: gate it
+    // as a write so anonymous pushes never see a ref list.
     let repo_path = format!("{owner}/{repo}");
-    let repo_id = if state.db_pool.is_some() {
-        match lookup_repo_id(&state.db_pool, &owner, &repo).await {
-            Some(id) => id,
-            None => {
-                return finish_response(
-                    Response::builder().status(StatusCode::NOT_FOUND),
-                    Body::from(format!("Repository not found: {repo_path}")),
-                )
-            }
-        }
-    } else {
-        tracing::warn!(
-            "database not available for info/refs, cannot look up repository: {repo_path}"
-        );
-        return finish_response(
-            Response::builder().status(StatusCode::SERVICE_UNAVAILABLE),
-            Body::from("Database not available"),
-        );
+    let (repo_id, _actor) = match require_git_access(
+        &state,
+        &headers,
+        &owner,
+        &repo,
+        http_auth::GitOperation::Write,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return *response,
     };
     if !state.storage.exists(repo_id).await {
         return finish_response(
@@ -404,26 +400,19 @@ async fn git_upload_pack_standard(
     // instead of replaying the ref advertisement.
     let repo = repo.trim_end_matches(".git").to_string();
     let repo_path = format!("{owner}/{repo}");
-    let repo_id = if let Some(_pool) = &state.db_pool {
-        match lookup_repo_id(&state.db_pool, &owner, &repo).await {
-            Some(id) => id,
-            None => {
-                tracing::warn!("repository not found in DB: {}", repo_path);
-                return finish_response(
-                    Response::builder().status(StatusCode::NOT_FOUND),
-                    Body::from(format!("Repository not found: {repo_path}")),
-                );
-            }
-        }
-    } else {
-        tracing::warn!(
-            "database not available, cannot look up repository: {}",
-            repo_path
-        );
-        return finish_response(
-            Response::builder().status(StatusCode::SERVICE_UNAVAILABLE),
-            Body::from("Database not available"),
-        );
+    // Authored before the body is buffered: an unauthorized fetch must not
+    // cost the server the read of its request body.
+    let (repo_id, _actor) = match require_git_access(
+        &state,
+        request.headers(),
+        &owner,
+        &repo,
+        http_auth::GitOperation::Read,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return *response,
     };
     if !state.storage.exists(repo_id).await {
         tracing::warn!("repository not found in storage: {}", repo_path);
@@ -481,28 +470,30 @@ async fn git_receive_pack(
 ) -> Response {
     let repo_path = format!("{owner}/{repo}");
 
-    // Try to look up repo ID from database first
-    let repo_id = if let Some(_pool) = &state.db_pool {
-        match lookup_repo_id(&state.db_pool, &owner, &repo).await {
-            Some(id) => id,
-            None => {
-                tracing::warn!("repository not found in DB: {}", repo_path);
-                return finish_response(
-                    Response::builder().status(StatusCode::NOT_FOUND),
-                    Body::from(format!("Repository not found: {repo_path}")),
-                );
-            }
-        }
-    } else {
-        tracing::warn!(
-            "database not available, cannot look up repository: {}",
-            repo_path
-        );
-        return finish_response(
-            Response::builder().status(StatusCode::SERVICE_UNAVAILABLE),
-            Body::from("Database not available"),
-        );
+    // Writes always require an authenticated account that may manage the
+    // repository (owner/admin/maintainer) — anonymous pushes fail closed.
+    // Authorized before the body is read: a rejected push must not cost
+    // the server the buffering of its (potentially large) pack.
+    let (repo_id, actor) = match require_git_access(
+        &state,
+        request.headers(),
+        &owner,
+        &repo,
+        http_auth::GitOperation::Write,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return *response,
     };
+    if let Some(actor) = &actor {
+        tracing::info!(
+            repo_id = %repo_id,
+            user_id = %actor.user_id,
+            username = %actor.username,
+            "receive-pack authorized"
+        );
+    }
 
     // Check if repository exists in storage
     if !state.storage.exists(repo_id).await {
@@ -548,9 +539,9 @@ async fn git_receive_pack(
     // repository's ref-update policy (#240) can decline the push with a
     // standard receive-pack report instead of letting the refs advance.
     let Some(pool) = state.db_pool.as_ref() else {
-        // Unreachable in practice: the repository lookup above already
-        // declines pushes when the database is unavailable. Keep the
-        // invariant explicit instead of unwrapping.
+        // Unreachable in practice: the auth gate above already declines
+        // pushes when the database is unavailable. Keep the invariant
+        // explicit instead of unwrapping.
         return finish_response(
             Response::builder().status(StatusCode::SERVICE_UNAVAILABLE),
             Body::from("Database not available"),

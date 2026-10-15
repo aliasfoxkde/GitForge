@@ -53,6 +53,57 @@ pub fn free_port() -> u16 {
         .port()
 }
 
+/// Seed a refresh credential for `user_id` and return its plaintext.
+///
+/// The digest is computed by the same shared helper the API issuance path
+/// uses, so the git-server's Smart HTTP gate validates presentations of
+/// this credential exactly as it would one minted by a real
+/// `gitforge auth login`. `expires_at` in the past seeds an expired
+/// credential for rejection tests.
+#[allow(dead_code)]
+pub async fn seed_refresh_credential(
+    pool: &gitforge_db::Pool,
+    user_id: gitforge_common::UserId,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let value = format!(
+        "gfrt{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let digest = gitforge_db::queries::RefreshTokenQueries::credential_digest(&value);
+    gitforge_db::queries::RefreshTokenQueries::create(pool, user_id, &digest, expires_at)
+        .await
+        .expect("seed refresh credential");
+    value
+}
+
+/// `Authorization: Basic …` header value presenting a git credential the
+/// way the transport's auth gate expects (identity is advisory; the
+/// credential names the account).
+#[allow(dead_code)]
+pub fn basic_auth(username: &str, credential: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{credential}"))
+    )
+}
+
+/// Remote URL embedding the credential, the way a git client presents
+/// Basic auth without a helper. The credential is hex-only (`gfrt` + UUID
+/// simples) so it needs no URL encoding.
+#[allow(dead_code)]
+pub fn authed_remote_url(
+    http_port: u16,
+    username: &str,
+    credential: &str,
+    owner: &str,
+    repo: &str,
+) -> String {
+    format!("http://{username}:{credential}@127.0.0.1:{http_port}/{owner}/{repo}")
+}
+
 /// Terminate a spawned git-server with SIGTERM and wait for it to exit.
 ///
 /// The server traps SIGTERM for graceful shutdown, so this exercises the

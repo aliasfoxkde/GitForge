@@ -38,7 +38,7 @@
 | Sessions | 24 h JWT, `JWT_SECRET` env var, no refresh, no revocation |
 | Login | username + password only; CLI path was broken (double `/api` prefix, fixed in `fix/cli-api-url-double-prefix`) |
 | Bootstrap | `gitforge admin --bootstrap` creates the first admin locally; refuses once any admin exists |
-| Git transport | HTTP basic auth (username : JWT) on `:42782`; SSH on `:42022` |
+| Git transport | HTTP Basic (username : refresh credential) on `:42782`, gated per Appendix A since 2026-10-11; SSH on `:42022` |
 | First-use experience | Owner must know to run the bootstrap; no signup; no invitation |
 | Audit | `events` table exists (used by CI triggers); auth events not written |
 
@@ -225,3 +225,96 @@ migration chain.
   prefix, or does SSH stay key-file only? (Lean: key-file only in phase 1.)
 - Dashboard session cookie vs bearer for the web UI (needs a CSRF review
   of the existing dashboard routes before phase 2).
+
+## Appendix A — Decision record: Git Smart HTTP auth gate (2026-10-11)
+
+Shipped as `fix/git-smart-http-auth-20261011`. The Git Smart HTTP
+transport (`:42782`) previously served every route unauthenticated: an
+anonymous `git ls-remote` against a private repository succeeded. This
+record pins the interim contract and why; it is the bridge from §3's
+"HTTP basic auth (username : JWT)" line to the §6 PAT end-state — the PAT
+table and scopes remain the designed destination and are unchanged.
+
+### Contract
+
+- **Credential**: `Authorization: Basic <username:credential>` where the
+  credential is a live GitForge refresh credential (`gfrt…`, §6's 30-day
+  rotating token). Identity is resolved from the credential's stored
+  SHA-256 digest; the username field is advisory, exactly like a GitHub
+  PAT presentation. Validation is **read-only** (`find_active_by_hash`):
+  git use does not rotate the credential, so concurrent git operations
+  and credential helpers never invalidate each other. Rotation stays with
+  the API `/auth/refresh` path. Possession of the `gfrt` already grants
+  full account access via `/auth/refresh`, so accepting it at the git
+  transport adds no new exposure class.
+- **Authorization** (mirrors the REST API's `can_access_repo`): reads are
+  anonymous only for explicitly `public` repositories; authenticated
+  reads additionally allow owner/admin/maintainer on any repository;
+  writes are always authenticated and always owner/admin/maintainer.
+  Anonymous writes fail closed. Role is resolved fresh per request, so
+  demotions take effect immediately.
+- **No existence leak**: anonymous callers receive a uniform `401` +
+  `WWW-Authenticate: Basic realm="GitForge"` for private **and**
+  nonexistent repositories (identical bytes; the challenge is also what
+  makes `git` consult its credential helper). Authenticated callers
+  receive a uniform `404` for nonexistent and unauthorized-private
+  repositories — the same collapse the API's `resolve_policy_repo`
+  applies. `403` appears only for a write denial on a public repository,
+  whose existence is already public. `503` when the database is
+  unavailable: nothing is served unverified.
+- **Gating order**: authorization happens before the request body is
+  read on POST routes — a rejected push never costs the server buffering
+  its pack. Malformed/expired/revoked credentials are challenged, never
+  silently downgraded to anonymous.
+- **Client story**: `gitforge auth git-credential <get|store|erase>`
+  speaks the git-credential helper protocol from the CLI's stored session
+  (`git config --global credential.helper '!gitforge auth git-credential'`).
+  `get` serves the live credential only for the configured GitForge
+  authorities (the API authority, an optional explicit
+  `git_server_url`, and the same hostname on the platform's default git
+  port `:42782`); other hosts fall through to the user's other helpers.
+  `store`/`erase` are no-ops — the CLI config (0600) remains the
+  credential store, so git-side copies cannot go stale at rotation.
+
+### Alternatives rejected
+
+- **JWT as the Basic password** (the §3 line): requires `JWT_SECRET` in
+  the git-server's environment — a production configuration change plus
+  secret distribution to a second process — and 24 h expiry breaks
+  automation (the exact gap §6 calls out).
+- **New PAT table now**: the honest end-state, but the largest change
+  (schema, issuance UI, scopes). The refresh credential already exists,
+  is revocable, and is what the CLI persists; accepting it read-only is
+  the smallest maintainable gate. PATs (§6) replace it later without
+  touching the transport contract.
+
+### Compatibility (verified against the tree, 2026-10-11)
+
+- CI checkouts clone from filesystem paths (`services/ci`), not the HTTP
+  transport — the gate cannot break pipelines.
+- GitHub→GitForge mirrors push over SSH; the SSH transport is unchanged
+  (and already authenticated).
+- `gitforge git` CLI subcommands are stubs; no URL construction to
+  update.
+- Local developer clones/pushes over HTTP need the credential helper (or
+  a URL-embedded credential) after this change — that is the intended
+  behavior change.
+
+### Residual risks (accepted for the interim)
+
+- **Basic over plaintext HTTP on the LAN**: the presented credential is
+  interceptable on the network path by design of Basic auth. Deployments
+  that care should front the transport with TLS or use SSH (`:42022`),
+  which is the confidential path. Not fixed here: TLS termination is a
+  deployment concern, out of this change's scope.
+- **No rate limiting on git auth attempts**: repeated Basic attempts are
+  answered with challenges as fast as they arrive; brute-forcing a 244-bit
+  credential is infeasible, but the §5 lockout/rate-limit work should
+  eventually cover the git transport too.
+- **SSH per-repository authorization gap**: any registered SSH key can
+  currently push any repository — the SSH transport authenticates but
+  does not apply the per-repo rules this gate enforces over HTTP. Same
+  fix shape applies (reuse `http_auth`'s authorization matrix); left as
+  follow-up because it is a pre-existing, separate gap.
+- The PAT end-state (§6: scopes, `last_used_at`, user-chosen lifetimes)
+  is unchanged and still recommended.
