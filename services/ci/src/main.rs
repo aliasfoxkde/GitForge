@@ -4,7 +4,7 @@
 
 use axum::Router;
 use axum::{
-    extract::{Extension, Request},
+    extract::{Extension, Path, Request},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -236,6 +236,11 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/pipelines/trigger",
             axum::routing::post(trigger_pipeline).layer(middleware::from_fn(require_trigger_auth)),
+        )
+        .route(
+            "/pipeline-trigger-requests/{request_id}",
+            axum::routing::get(get_trigger_request_status)
+                .layer(middleware::from_fn(require_trigger_auth)),
         )
         .merge(scheduler_routes(scheduler_state))
         .layer(Extension(trigger_state))
@@ -712,6 +717,75 @@ async fn require_trigger_auth(request: Request, next: Next) -> Response {
         )
             .into_response()
     }
+}
+
+/// Read the durable trigger receipt and its pipeline state for CI clients.
+/// This exposes status only and uses the same narrow trigger credential as the
+/// enqueue endpoint; it does not require a user JWT or grant general API reads.
+async fn get_trigger_request_status(
+    Extension(trigger_state): Extension<Arc<TriggerState>>,
+    Path(request_id): Path<uuid::Uuid>,
+) -> Response {
+    let Some(pool) = trigger_state.db.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "trigger_status_unavailable"})),
+        )
+            .into_response();
+    };
+
+    let trigger_request =
+        match gitforge_db::queries::TriggerRequestQueries::get(pool, request_id).await {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "trigger_request_not_found"})),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                tracing::error!(%error, %request_id, "failed to read trigger request status");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "trigger_status_read_failed"})),
+                )
+                    .into_response();
+            }
+        };
+
+    let pipeline_status = if let Some(run_id) = trigger_request.run_id {
+        match gitforge_db::queries::PipelineRunQueries::get(pool, run_id).await {
+            Ok(Some(run)) => Some(run.status),
+            Ok(None) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": "trigger_pipeline_run_not_found"})),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                tracing::error!(%error, %request_id, %run_id, "failed to read triggered pipeline status");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "trigger_pipeline_status_read_failed"})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": trigger_request.status,
+            "pipeline_run_id": trigger_request.run_id.map(|id| id.to_string()),
+            "pipeline_status": pipeline_status,
+        })),
+    )
+        .into_response()
 }
 
 async fn trigger_pipeline(
