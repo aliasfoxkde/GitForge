@@ -1143,6 +1143,23 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 }
             }
 
+            // Aegis security scan (staged changes) if available.
+            if std::process::Command::new("aegis").arg("--version").output().is_ok_and(|o| o.status.success()) {
+                println!("\n▶ aegis scan (staged)");
+                let mut cmd = std::process::Command::new("aegis");
+                cmd.arg("scan").arg("--staged").arg(".");
+                let baseline = root.join(".github/aegis-baseline.json");
+                if baseline.exists() {
+                    cmd.arg("--baseline").arg(&baseline);
+                }
+                cmd.current_dir(&root);
+                match cmd.status() {
+                    Ok(st) if st.success() => println!("   ✅ aegis ok"),
+                    Ok(st) => println!("   ❌ aegis failed (exit {})", st.code().unwrap_or(-1)),
+                    Err(e) => println!("   ⚠️  aegis could not run: {e}"),
+                }
+            }
+
             println!("\n✅ gitforge check complete");
             return Ok(());
         }
