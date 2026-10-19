@@ -183,3 +183,12 @@ at `POST /api/review-runs` (submit, with an idempotency key),
 `GET /api/review-runs/{id}/findings` (findings). Submission creates a `pending`
 run; provider execution and worker dispatch are not wired up yet, so that row
 is the seam a future worker claims.
+
+## Impact graph (change-scoped validation)
+
+GitForge ships `crates/gitforge-graph`, a dependency and change-impact graph built
+from `cargo metadata`. It maps changed files to affected crates (including
+reverse-dependency closure), then to features (`docs/planning/FEATURES.yml`) and
+known issues (`docs/planning/KNOWN_ISSUES.yml`). The `gitforge check` CLI uses
+it to run fmt/clippy/tests only on affected crates; the graph is advisory for
+scoping and fails open to a full run on any error. See `docs/IMPACT_GRAPH.md`.
