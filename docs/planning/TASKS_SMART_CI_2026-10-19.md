@@ -15,18 +15,18 @@ Legend: `[ ]` pending · `[x]` done · `[-]` cancelled/blocked
 
 ## Phase 1 — Local fast gate
 
-- [ ] Add `gitforge check` CLI subcommand (`--fast`, `--changed`, `--full`)
+ - [x] Add `gitforge check` CLI subcommand (`--fast`, `--changed`, `--full`)
 - [ ] Implement changed-file → affected-crate resolver (cargo metadata)
-- [ ] Wire Aegis changed-lines scan into local gate
+- [ ] Wire Aegis changed-lines scan into local gate (pending Aegis CLI binary)
 - [ ] Wire fast clippy (affected crates) into local gate
-- [ ] Update pre-commit hook to call `gitforge check --fast --changed` with full-hook fallback
+- [x] Update pre-commit hook to call `gitforge check --fast --changed` with full-hook fallback
 - [ ] Unit tests for resolver + gate orchestration
 - [ ] Docs: CLI usage + pre-commit integration
 
 ## Phase 2 — Dependency graph crate
 
-- [ ] Create `crates/gitforge-graph` (or extend `gitforge-build`) with node/edge model
-- [ ] Ingest `cargo metadata` into graph (crate + dep edges)
+- [x] Create `crates/gitforge-graph` (or extend `gitforge-build`) with node/edge model
+ - [x] Ingest `cargo metadata` into graph (crate + dep edges)
 - [ ] Add SQLite storage (versioned by commit SHA)
 - [ ] Incremental refresh on push (only if Cargo.toml/lock changed)
 - [ ] Query API: reverse-deps, affected crates, tests_of
@@ -35,9 +35,9 @@ Legend: `[ ]` pending · `[x]` done · `[-]` cancelled/blocked
 
 ## Phase 3 — Feature tree & known issues
 
-- [ ] Define `docs/planning/FEATURES.yml` schema and seed file
+- [x] Define `docs/planning/FEATURES.yml` schema and seed file
 - [ ] Build feature → module → function → test tree
-- [ ] Ingest GitHub issues into `issue` nodes
+- [ ] Ingest GitHub issues into `issue` nodes (seeded KNOWN_ISSUES.yml; live ingest pending)
 - [ ] Ingest F-series ledger entries from MASTER_PLAN
 - [ ] Known-issue regression guard (adds tests, reports only)
 - [ ] Tests for feature impact computation (bitset intersection)

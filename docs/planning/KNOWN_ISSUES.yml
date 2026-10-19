@@ -1,0 +1,13 @@
+issues:
+  - id: "F2"
+    title: "Runner registry pollution: duplicate rows per start"
+    severity: high
+    status: open
+    crates: [gitforge-runner, gitforge-api]
+    tests: []
+  - id: "F3"
+    title: "Online status lies: stale heartbeats reported online"
+    severity: medium
+    status: open
+    crates: [gitforge-runner, gitforge-scheduler]
+    tests: []

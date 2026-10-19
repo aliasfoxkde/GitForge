@@ -204,6 +204,21 @@ enum Commands {
         #[arg(long)]
         init: Option<String>,
     },
+    /// Local fast quality gate (fmt, clippy, tests on affected crates)
+    Check {
+        /// Run the fast local gate (default)
+        #[arg(long)]
+        fast: bool,
+        /// Scope checks to changed files only
+        #[arg(long)]
+        changed: bool,
+        /// Base ref for change detection (default: HEAD)
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        /// Run full workspace checks
+        #[arg(long)]
+        full: bool,
+    },
     /// AI code review
     Review {
         /// Review staged changes (default)
@@ -991,6 +1006,145 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     println!("❌ Not authenticated. Run `gitforge auth login <username>` first.");
                 }
             }
+        }
+
+        Commands::Check {
+            fast,
+            changed,
+            base: _,
+            full,
+        } => {
+            use gitforge_graph::{find_workspace_root, git_changed_files_local, DependencyGraph};
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let root = find_workspace_root(&cwd).unwrap_or(cwd.clone());
+            println!("🔍 GitForge check");
+            println!("   workspace: {}", root.display());
+
+            // Determine changed files.
+            let changed_files = if *changed || *fast {
+                git_changed_files_local(&root).unwrap_or_default()
+            } else if *full {
+                Vec::new()
+            } else {
+                // default: changed
+                git_changed_files_local(&root).unwrap_or_default()
+            };
+
+            // Build dependency graph from cargo metadata (cached? no, fast enough for CLI).
+            let graph = match DependencyGraph::load_from_workspace(&root) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!(
+                        "⚠️  could not build dependency graph: {e}; falling back to full workspace"
+                    );
+                    DependencyGraph::new()
+                }
+            };
+
+            let affected = if changed_files.is_empty() || *full {
+                graph.crates()
+            } else {
+                let a = graph.affected_crates(&changed_files);
+                if a.is_empty() {
+                    graph.crates()
+                } else {
+                    a
+                }
+            };
+
+            println!("   changed files: {}", changed_files.len());
+            println!("   affected crates: {}", affected.join(", "));
+
+            // Known issues touching affected crates.
+            // Load features/issues if present (optional).
+            let features_path = root.join("docs/planning/FEATURES.yml");
+            if features_path.exists() {
+                if let Ok(yaml) = std::fs::read_to_string(&features_path) {
+                    let mut g = graph.clone();
+                    let _ = g.load_features_yaml(&yaml);
+                    let feats = g.affected_features(&affected);
+                    if !feats.is_empty() {
+                        println!("   affected features: {}", feats.join(", "));
+                        let tests = g.feature_tests(&feats);
+                        if !tests.is_empty() {
+                            println!("   feature tests: {}", tests.join(", "));
+                        }
+                    }
+                }
+            }
+            let issues_path = root.join("docs/planning/KNOWN_ISSUES.yml");
+            if issues_path.exists() {
+                if let Ok(yaml) = std::fs::read_to_string(&issues_path) {
+                    let mut g = graph.clone();
+                    let _ = g.load_issues_yaml(&yaml);
+                    let issues = g.issues_for_crates(&affected);
+                    if !issues.is_empty() {
+                        println!("   known issues touching affected crates: {}", issues.len());
+                        for i in &issues {
+                            println!("     - [{}] {} ({})", i.id, i.title, i.severity);
+                        }
+                    }
+                }
+            }
+
+            // Run fmt check (scoped: whole workspace fmt is fast).
+            println!("\n▶ cargo fmt --all -- --check");
+            let status = std::process::Command::new("cargo")
+                .arg("fmt")
+                .arg("--all")
+                .arg("--")
+                .arg("--check")
+                .current_dir(&root)
+                .status();
+            match status {
+                Ok(s) if s.success() => println!("   ✅ fmt ok"),
+                Ok(s) => println!("   ❌ fmt failed (exit {})", s.code().unwrap_or(-1)),
+                Err(e) => println!("   ⚠️  fmt could not run: {e}"),
+            }
+
+            // Run clippy on affected crates.
+            if !affected.is_empty() {
+                println!("\n▶ cargo clippy (affected crates)");
+                for c in &affected {
+                    print!("   clippy -p {c} ... ");
+                    let st = std::process::Command::new("cargo")
+                        .arg("clippy")
+                        .arg("-p")
+                        .arg(c)
+                        .arg("--")
+                        .arg("-D")
+                        .arg("warnings")
+                        .current_dir(&root)
+                        .status();
+                    match st {
+                        Ok(s) if s.success() => println!("✅"),
+                        Ok(s) => println!("❌ (exit {})", s.code().unwrap_or(-1)),
+                        Err(e) => println!("⚠️  {e}"),
+                    }
+                }
+            }
+
+            // Run tests on affected crates.
+            if !affected.is_empty() {
+                println!("\n▶ cargo test (affected crates)");
+                for c in &affected {
+                    print!("   test -p {c} ... ");
+                    let st = std::process::Command::new("cargo")
+                        .arg("test")
+                        .arg("-p")
+                        .arg(c)
+                        .current_dir(&root)
+                        .status();
+                    match st {
+                        Ok(s) if s.success() => println!("✅"),
+                        Ok(s) => println!("❌ (exit {})", s.code().unwrap_or(-1)),
+                        Err(e) => println!("⚠️  {e}"),
+                    }
+                }
+            }
+
+            println!("\n✅ gitforge check complete");
+            return Ok(());
         }
 
         Commands::Review {

@@ -9,6 +9,7 @@ authors = ["GitForge Team"]
 gitforge-common = { path = "../gitforge-common" }
 gitforge-db = { path = "../gitforge-db" }
 gitforge-review = { path = "../gitforge-review" }
+gitforge-graph = { path = "../gitforge-graph" }
 gitforge-ai = { path = "../gitforge-ai" }
 
 # CLI framework
