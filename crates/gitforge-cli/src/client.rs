@@ -117,10 +117,13 @@ pub struct PipelineResponse {
     pub id: String,
     pub name: String,
     pub repo_id: String,
-    /// The API list endpoint does not return `enabled`; default it so the
-    /// response still decodes (the run/list flows only need id/name/repo_id).
+    /// Whether this is the active version of its (repository, name) pair.
+    ///
+    /// The API reports the flag; a server that predates the field leaves
+    /// it absent, and the CLI must say "unknown" rather than assert a
+    /// state the server never sent.
     #[serde(default)]
-    pub enabled: bool,
+    pub active: Option<bool>,
 }
 
 /// Create pipeline request
@@ -865,5 +868,32 @@ mod tests {
         // GitForgeClient is an alias for ApiClient
         let client = GitForgeClient::new("http://localhost:42780", None);
         assert_eq!(client.base_url, "http://localhost:42780");
+    }
+
+    #[test]
+    fn pipeline_response_carries_the_state_the_api_sent() {
+        let active: PipelineResponse = serde_json::from_str(
+            r#"{"id":"11111111-1111-1111-1111-111111111111","name":"gates","repo_id":"22222222-2222-2222-2222-222222222222","active":true}"#,
+        )
+        .unwrap();
+        assert_eq!(active.active, Some(true));
+
+        let retired: PipelineResponse = serde_json::from_str(
+            r#"{"id":"11111111-1111-1111-1111-111111111111","name":"gates","repo_id":"22222222-2222-2222-2222-222222222222","active":false}"#,
+        )
+        .unwrap();
+        assert_eq!(retired.active, Some(false));
+    }
+
+    #[test]
+    fn pipeline_response_does_not_invent_a_state_the_api_never_sent() {
+        // A server that does not report the state must not be read as a
+        // disabled pipeline: the CLI prints "unknown" rather than assert
+        // something the server never said.
+        let unreported: PipelineResponse = serde_json::from_str(
+            r#"{"id":"11111111-1111-1111-1111-111111111111","name":"gates","repo_id":"22222222-2222-2222-2222-222222222222"}"#,
+        )
+        .unwrap();
+        assert_eq!(unreported.active, None);
     }
 }

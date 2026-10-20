@@ -435,7 +435,7 @@ pub fn get_openapi_spec() -> serde_json::Value {
                 "get": {
                     "tags": ["ci"],
                     "summary": "List pipelines",
-                    "description": "Returns a list of all pipelines",
+                    "description": "Returns the active version of each pipeline definition the caller may see. Every entry carries: id (the pipeline id the /pipelines/{id} routes accept), repo_id, name, trigger_type, active, created_at. Retired versions stay addressable by id but are not listed.",
                     "responses": {
                         "200": {"description": "List of pipelines"}
                     }
@@ -457,11 +457,13 @@ pub fn get_openapi_spec() -> serde_json::Value {
                 "get": {
                     "tags": ["ci"],
                     "summary": "Get pipeline",
+                    "description": "Returns one pipeline by id, including the active flag: a retired version stays addressable by id and reports active=false.",
                     "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+                        {"name": "id", "in": "path", "required": true, "description": "Pipeline id (UUID) as reported by GET /api/pipelines", "schema": {"type": "string", "format": "uuid"}}
                     ],
                     "responses": {
                         "200": {"description": "Pipeline found"},
+                        "400": {"description": "Invalid pipeline ID format"},
                         "404": {"description": "Pipeline not found"}
                     }
                 },
@@ -485,7 +487,7 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     "summary": "Trigger a pipeline run",
                     "description": "Resolves the requested revision (default HEAD) and hands the run to the CI orchestrator. Body: {\"ref\": \"branch-or-commit\"} (optional)",
                     "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+                        {"name": "id", "in": "path", "required": true, "description": "Pipeline id (UUID) as reported by GET /api/pipelines", "schema": {"type": "string", "format": "uuid"}}
                     ],
                     "responses": {
                         "202": {"description": "Run triggered"},

@@ -158,18 +158,55 @@ async fn list_pipelines(
     let claims = user.claims;
     match PipelineQueries::list(&pool).await {
         Ok(pipelines) => {
-            let mut response = Vec::new();
-            for p in pipelines {
-                if authorize_repo(&pool, &claims, p.repo_id).await.is_ok() {
-                    response.push(serde_json::json!({
-                        "id": p.id.to_string(),
-                        "repo_id": p.repo_id.to_string(),
-                        "name": p.name,
-                        "trigger_type": p.trigger_type,
-                        "created_at": p.created_at.to_rfc3339()
-                    }));
+            // The listing carries the active definition of each
+            // (repository, name) pair. Only the pipelines this caller may
+            // see are kept, and only those are asked for their state: the
+            // read is scoped to the rows this response reports on.
+            let mut visible = Vec::new();
+            for pipeline in pipelines {
+                if authorize_repo(&pool, &claims, pipeline.repo_id)
+                    .await
+                    .is_ok()
+                {
+                    visible.push(pipeline);
                 }
             }
+
+            let ids: Vec<PipelineId> = visible.iter().map(|pipeline| pipeline.id).collect();
+            // The active flag travels with every row: a client that prints
+            // pipeline state must report what the database says, not infer
+            // it from the shape of the listing.
+            let flags = match PipelineQueries::active_flags(&pool, &ids).await {
+                Ok(flags) => flags,
+                Err(e) => {
+                    tracing::error!("failed to read pipeline active flags: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "database_error",
+                            "message": "failed to list pipelines"
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+
+            let response: Vec<_> = visible
+                .iter()
+                .map(|pipeline| {
+                    // A row the flag read did not return is no longer in
+                    // the table, so it cannot be an active definition.
+                    let active = flags.get(&pipeline.id).copied().unwrap_or(false);
+                    serde_json::json!({
+                        "id": pipeline.id.to_string(),
+                        "repo_id": pipeline.repo_id.to_string(),
+                        "name": pipeline.name,
+                        "trigger_type": pipeline.trigger_type,
+                        "active": active,
+                        "created_at": pipeline.created_at.to_rfc3339()
+                    })
+                })
+                .collect();
             Json(response).into_response()
         }
         Err(e) => {
@@ -198,19 +235,25 @@ async fn get_pipeline(
     match Uuid::parse_str(&id) {
         Ok(uuid) => {
             let pipeline_id = PipelineId::from(uuid);
-            match PipelineQueries::get(&pool, pipeline_id).await {
-                    Ok(Some(pipeline)) => match authorize_repo(&pool, &claims, pipeline.repo_id).await {
-                        Ok(()) => (
-                            StatusCode::OK,
-                            Json(serde_json::json!({
-                                "id": pipeline.id.to_string(),
-                                "repo_id": pipeline.repo_id.to_string(),
-                                "name": pipeline.name,
-                                "trigger_type": pipeline.trigger_type,
-                                "created_at": pipeline.created_at.to_rfc3339()
-                            })),
-                        )
-                            .into_response(),
+            match PipelineQueries::get_with_state(&pool, pipeline_id).await {
+                    Ok(Some((pipeline, active))) => match authorize_repo(&pool, &claims, pipeline.repo_id).await {
+                        Ok(()) => {
+                            // A retired version stays addressable by id, so
+                            // this response must say which kind it is. The
+                            // flag came from the row that was read.
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "id": pipeline.id.to_string(),
+                                    "repo_id": pipeline.repo_id.to_string(),
+                                    "name": pipeline.name,
+                                    "trigger_type": pipeline.trigger_type,
+                                    "active": active,
+                                    "created_at": pipeline.created_at.to_rfc3339()
+                                })),
+                            )
+                                .into_response()
+                        }
                         Err(status) => (
                             status,
                             Json(serde_json::json!({"error": "forbidden", "message": "Pipeline access is not permitted"})),
@@ -408,6 +451,9 @@ async fn create_pipeline(
             "repo_id": pipeline.repo_id.to_string(),
             "name": pipeline.name,
             "trigger_type": pipeline.trigger_type,
+            // The registered definition is the active version of its
+            // (repository, name) pair; the response says so.
+            "active": true,
             "created_at": pipeline.created_at.to_rfc3339()
         })),
     )

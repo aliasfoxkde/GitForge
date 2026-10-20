@@ -17,6 +17,8 @@ mod sync;
 pub use client::GitForgeClient;
 pub use config::Config;
 
+use client::PipelineResponse;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "gitforge",
@@ -149,10 +151,10 @@ enum Commands {
         /// List all pipelines
         #[arg(short, long)]
         list: bool,
-        /// Show pipeline details
+        /// Show pipeline details by pipeline ID (from --list)
         #[arg(short, long)]
         show: Option<String>,
-        /// Trigger a pipeline run
+        /// Trigger a pipeline run by pipeline ID (from --list)
         #[arg(short, long)]
         run: Option<String>,
         /// Branch, tag, or commit for --run (default: HEAD)
@@ -167,7 +169,7 @@ enum Commands {
         /// Pipeline definition file for --create (default: .gitforge.yml)
         #[arg(long, requires = "create")]
         file: Option<String>,
-        /// Delete a pipeline (deactivated when it has run history)
+        /// Delete a pipeline by pipeline ID (deactivated when it has run history)
         #[arg(short, long)]
         delete: Option<String>,
     },
@@ -279,6 +281,36 @@ async fn watch_pipeline_run(client: &GitForgeClient, run_id: &str) -> Result<Str
 /// the name and make the repo unresolvable for git serving.
 fn bare_repo_name(arg: &str) -> &str {
     arg.trim_matches('/').rsplit('/').next().unwrap_or(arg)
+}
+
+/// Render the pipeline state the API reported.
+///
+/// `None` means the server did not report a state at all. The CLI says
+/// so instead of asserting a default: a pipeline the API never labelled
+/// must not be printed as "disabled", because that is a claim about the
+/// server's data that nobody made.
+fn pipeline_state_label(active: Option<bool>) -> &'static str {
+    match active {
+        Some(true) => "active",
+        Some(false) => "disabled",
+        None => "unknown",
+    }
+}
+
+/// Render one `gitforge pipeline --list` row.
+///
+/// The row carries the pipeline id — the identifier `--show`, `--run`,
+/// and `--delete` accept — next to the repository id. The repository id
+/// alone is not a pipeline handle: the API routes resolve it against the
+/// `pipelines` table, so a repository uuid answers "Pipeline not found".
+fn format_pipeline_line(pipeline: &PipelineResponse) -> String {
+    format!(
+        "  {:20} - {} (repo {}) [{}]",
+        pipeline.name,
+        pipeline.id,
+        pipeline.repo_id,
+        pipeline_state_label(pipeline.active)
+    )
 }
 
 /// Renew the stored session when the JWT is missing or about to lapse.
@@ -772,20 +804,13 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         if pipelines.is_empty() {
                             println!("  No pipelines found.");
                         } else {
-                            for pipeline in pipelines {
-                                let status = if pipeline.enabled {
-                                    "active"
-                                } else {
-                                    "disabled"
-                                };
-                                println!(
-                                    "  {:20} - {} [{}]",
-                                    pipeline.name, pipeline.repo_id, status
-                                );
+                            for pipeline in &pipelines {
+                                println!("{}", format_pipeline_line(pipeline));
                             }
                         }
                         println!();
                         println!("  Run `gitforge pipeline create <name>` to create a pipeline.");
+                        println!("  Use a pipeline ID with `gitforge pipeline --show <id>`.");
                     }
                     Err(e) => {
                         println!("❌ {e}");
@@ -797,7 +822,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("⚙️  Pipeline: {}", pipeline.name);
                         println!("   ID: {}", pipeline.id);
                         println!("   Repository: {}", pipeline.repo_id);
-                        println!("   Enabled: {}", pipeline.enabled);
+                        println!("   State: {}", pipeline_state_label(pipeline.active));
                     }
                     Err(e) => {
                         println!("❌ {e}");
@@ -1233,6 +1258,40 @@ mod tests {
             delete: None,
         });
         assert!(run_cli(cli).await.is_ok());
+    }
+
+    fn pipeline_response(active: Option<bool>) -> PipelineResponse {
+        PipelineResponse {
+            id: "11111111-1111-1111-1111-111111111111".to_string(),
+            name: "amortyx-gates".to_string(),
+            repo_id: "22222222-2222-2222-2222-222222222222".to_string(),
+            active,
+        }
+    }
+
+    #[test]
+    fn pipeline_state_label_reports_only_what_the_api_sent() {
+        assert_eq!(pipeline_state_label(Some(true)), "active");
+        assert_eq!(pipeline_state_label(Some(false)), "disabled");
+        // An unreported state is not a disabled pipeline: the API said
+        // nothing, and the CLI must not invent a claim about the server.
+        assert_eq!(pipeline_state_label(None), "unknown");
+    }
+
+    #[test]
+    fn pipeline_list_line_carries_the_pipeline_id_and_the_reported_state() {
+        let line = format_pipeline_line(&pipeline_response(Some(true)));
+        assert!(line.contains("11111111-1111-1111-1111-111111111111"));
+        assert!(line.contains("22222222-2222-2222-2222-222222222222"));
+        assert!(line.contains("[active]"));
+        assert!(!line.contains("disabled"));
+    }
+
+    #[test]
+    fn pipeline_list_line_never_labels_an_unreported_state_disabled() {
+        let line = format_pipeline_line(&pipeline_response(None));
+        assert!(!line.contains("disabled"));
+        assert!(line.contains("[unknown]"));
     }
 
     #[tokio::test]
