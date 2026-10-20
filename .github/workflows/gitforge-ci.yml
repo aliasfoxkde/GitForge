@@ -105,7 +105,9 @@ jobs:
 
           if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
             RUN_ID=$(echo "$BODY" | jq -r '.pipeline_run_id // empty')
-            TRIGGER_ID=$(echo "$BODY" | jq -r '.trigger_id // empty')
+            # First-time submissions use trigger_id; idempotent deduplication
+            # returns the same durable request as event_id.
+            TRIGGER_ID=$(echo "$BODY" | jq -r '.trigger_id // .event_id // empty')
             if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
               echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
               echo "status=enqueued" >> "$GITHUB_OUTPUT"
