@@ -12,11 +12,12 @@
 # baked; the manifest-and-source-only context keeps the 30GB+ target/
 # directory out of the build):
 #
-#   tmp=$(mktemp -d)
+#   tmp=$(mktemp -d /nas/Temp/gitforge-ci-rust.XXXXXX)
 #   git archive HEAD Cargo.toml Cargo.lock crates services fuzz \
 #       | tar -x -C "$tmp"
 #   cp infrastructure/docker/ci-rust.Dockerfile "$tmp"/
-#   docker build -f ci-rust.Dockerfile -t dsc-ci-rust:N "$tmp"
+#   podman build --jobs 1 --memory 8g --memory-swap 8g \
+#       -f ci-rust.Dockerfile -t localhost/dsc-ci-rust:N "$tmp"
 #
 # `fuzz` must be in the archive list — the Dockerfile COPYs it, and a
 # context without it fails with "COPY fuzz/ fuzz/: not found". The `cp`
