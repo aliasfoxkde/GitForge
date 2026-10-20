@@ -51,15 +51,17 @@ RUN rustup component add rustfmt clippy
 # Coverage gate: llvm-tools supplies llvm-profdata/llvm-cov and
 # cargo-llvm-cov drives them; both are baked so the pipeline's coverage
 # job stays inside the offline contract. Network use is build-time only.
+# Limit compiler parallelism during shared-host image refreshes; runtime CI
+# jobs retain their own test-thread and timeout policies.
 RUN rustup component add llvm-tools-preview \
-    && cargo install cargo-llvm-cov --locked
+    && CARGO_BUILD_JOBS=2 cargo install cargo-llvm-cov --locked
 
 # Fuzz gate: cargo-fuzz targets build with nightly and -Zbuild-std (needs
 # the rust-src component) and libfuzzer-sys links its vendored libFuzzer
 # via cc (needs g++ above). All baked here so the offline fuzz job can
 # build its targets in the container.
 RUN rustup toolchain install nightly --profile minimal --component rust-src \
-    && cargo +nightly install cargo-fuzz --locked
+    && CARGO_BUILD_JOBS=2 cargo +nightly install cargo-fuzz --locked
 
 # Toolchain contract (F25): the toolchain is frozen at image build time.
 # Jobs run with no egress — `rustup toolchain install` inside a job stalls
