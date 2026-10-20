@@ -15,14 +15,16 @@
 #   directory and corrupt each other's build locks.
 # - `environment: {}` is required by the parser (PipelineDefinition has no
 #   serde default) even though it is never forwarded.
-# - The image is pre-built on the host (dsc-ci-rust:10 — cargo, clippy,
+# - The image is pre-built in the runner's rootless Podman store
+#   (localhost/dsc-ci-rust:14 — cargo, clippy,
 #   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, python3
 #   for the route-docs drift gate, and the GitForge workspace cargo
 #   registry cache baked in for offline builds).
 #   Rebuild and bump the tag whenever Cargo.lock changes or the baked
 #   tooling changes — a stale cache fails every cargo job in seconds with
 #   "candidate versions found which didn't match" (v10 added shellcheck
-#   for the new head-of-chain lint job; v9 added python3 for
+#   for the new head-of-chain lint job; v13 refreshes the lockfile cache
+#   and replaces the missing host tag :10; v9 added python3 for
 #   the drift checker; v8 documents the
 #   current tag; v7 added the coverage toolchain; v6 existed because v5
 #   dropped openssh-client, which the hermetic ssh-protocol tests spawn
@@ -44,7 +46,7 @@ trigger_on:
 environment: {}
 jobs:
   - name: lint
-    image: dsc-ci-rust:10
+    image: localhost/dsc-ci-rust:14
     steps:
       - name: Shellcheck (including extensionless ops scripts)
         # The release-channel ops scripts (scripts/gitforge-*) are bash and
@@ -59,7 +61,7 @@ jobs:
     timeout: 10m
 
   - name: fmt
-    image: dsc-ci-rust:10
+    image: localhost/dsc-ci-rust:14
     needs: [lint]
     steps:
       - name: Check formatting
@@ -76,7 +78,7 @@ jobs:
     timeout: 15m
 
   - name: clippy
-    image: dsc-ci-rust:10
+    image: localhost/dsc-ci-rust:14
     needs: [fmt]
     steps:
       - name: Strict lint (zero warnings)
@@ -94,7 +96,7 @@ jobs:
     timeout: 60m
 
   - name: test
-    image: dsc-ci-rust:10
+    image: localhost/dsc-ci-rust:14
     needs: [clippy]
     steps:
       - name: Workspace test suite
@@ -121,7 +123,7 @@ jobs:
     timeout: 90m
 
   - name: coverage
-    image: dsc-ci-rust:10
+    image: localhost/dsc-ci-rust:14
     needs: [test]
     steps:
       - name: Line coverage gate (fail 82, warn 84)
@@ -175,7 +177,7 @@ jobs:
     timeout: 90m
 
   - name: fuzz
-    image: dsc-ci-rust:10
+    image: localhost/dsc-ci-rust:14
     needs: [coverage]
     steps:
       - name: Fuzz smoke (60s per target)
@@ -195,8 +197,8 @@ jobs:
         # even if the first crashed.
         #
         # Nightly is selected with the +channel syntax: cargo-fuzz 0.13
-        # (dsc-ci-rust:10) dropped `run --toolchain`, and the image's
-        # default toolchain is stable, which cannot build -Zbuild-std.
+        # cargo-fuzz 0.13 dropped `run --toolchain`, and the image's default
+        # toolchain is stable, which cannot build -Zbuild-std.
         run: |
           set -e
           cd fuzz

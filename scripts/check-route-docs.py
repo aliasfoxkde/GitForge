@@ -45,6 +45,7 @@ METHODS = "(?:get|post|put|patch|delete|head|options|trace)"
 ROUTE_HEAD = re.compile(r'\.route\(\s*("(?:[^"\\]|\\.)*")\s*,')
 DOC_LINE = re.compile(r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE)\s+(/\S+?)\s*$", re.M)
 DOC_INLINE = re.compile(r"`(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE)\s+(/[^`\s]+)`")
+HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 METHOD_WORD = re.compile(r"[.(]" + METHODS + r"\(")
 
 # Meta-endpoints that serve the API's own documentation (swagger UI and
@@ -263,12 +264,30 @@ def extract_openapi_paths() -> set[str]:
 
 
 def extract_doc_endpoints() -> set[str]:
+    """Extract API-gateway endpoints, excluding separately hosted services.
+
+    docs/API.md also documents the CI scheduler on port 42781. Its routes
+    intentionally do not appear in the API gateway router or OpenAPI spec, so
+    sections explicitly titled as scheduler sections are outside this gate.
+    """
     paths: set[str] = set()
-    text = API_MD.read_text()
-    for m in DOC_LINE.finditer(text):
-        paths.add(norm(m.group(2)))
-    for m in DOC_INLINE.finditer(text):
-        paths.add(norm(m.group(1)))
+    excluded_heading_level: int | None = None
+    for line in API_MD.read_text().splitlines():
+        heading = HEADING.match(line)
+        if heading:
+            level = len(heading.group(1))
+            if excluded_heading_level is not None and level <= excluded_heading_level:
+                excluded_heading_level = None
+            if "scheduler" in heading.group(2).lower():
+                excluded_heading_level = level
+            continue
+        if excluded_heading_level is not None:
+            continue
+        line_match = DOC_LINE.fullmatch(line)
+        if line_match:
+            paths.add(norm(line_match.group(2)))
+        for inline_match in DOC_INLINE.finditer(line):
+            paths.add(norm(inline_match.group(1)))
     return paths
 
 
