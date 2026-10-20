@@ -244,6 +244,15 @@ $ gitforge pipeline --show fb5a5461-…   # the pipeline id the listing prints
 A retired version of the same pipeline (the row the push path retires) is
 absent from the listing and reports `State: disabled` when addressed by id.
 
+Reproduced independently in a second pass: a fresh scratch instance
+(scratch database, scratch secret, port 42799, synthetic `amortyx` rows)
+answered the same way for a CLI built at `114c69f` and for a CLI built from
+this branch — the pre-fix listing printed the repository uuid with
+`[disabled]`, the fixed listing printed the pipeline id with `[active]`,
+and the id routes answered `404` for the repository uuid and `400` for the
+name. The scratch instance was stopped afterwards; no production service
+was contacted.
+
 ## Files changed
 
 ```
