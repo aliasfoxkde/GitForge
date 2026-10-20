@@ -6,6 +6,8 @@ Scope: `gitforge pipeline --list/--show/--run` contract against the
 pipeline, secret, or service mutation.
 
 Evidence receipt: `docs/handoffs/PIPELINE_CLI_API_CONTRACT_AUDIT_2026-10-20.md`
+Commits: `c95c959` (fix), `5499e36` / `3705b66` / `1aca2a5` (receipt).
+Draft PR: #326 — https://github.com/aliasfoxkde/GitForge/pull/326
 
 ## Task Checklist
 
