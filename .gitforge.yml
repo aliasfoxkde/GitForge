@@ -100,7 +100,19 @@ jobs:
         # 2026-10-06 22:28 run finished test in ~36m under load ~40; the
         # 23:29 run needed more than 60m under load ~45 with three
         # concurrent runs.
-        run: cargo test --workspace -- --test-threads=2
+        run: |
+          set -e
+          affected="$(python3 scripts/affected-crates.py)"
+          if [ -z "$affected" ] || echo "$affected" | grep -qx "ALL"; then
+            echo "Running full workspace tests (fallback)"
+            cargo test --workspace -- --test-threads=2
+          else
+            echo "Affected crates:"
+            echo "$affected"
+            pkgs=""
+            for c in $affected; do pkgs="$pkgs -p $c"; done
+            cargo test $pkgs -- --test-threads=2
+          fi
     timeout: 90m
 
   - name: coverage

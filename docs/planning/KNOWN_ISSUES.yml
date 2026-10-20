@@ -11,3 +11,15 @@ issues:
     status: open
     crates: [gitforge-runner, gitforge-scheduler]
     tests: []
+  - id: "F1"
+    title: "Deployment drift: stale binaries vs main"
+    severity: medium
+    status: open
+    crates: [gitforge-api, gitforge-cli]
+    tests: []
+  - id: "F4"
+    title: "Pipeline version-per-push growth"
+    severity: medium
+    status: open
+    crates: [gitforge-ci, gitforge-db]
+    tests: []

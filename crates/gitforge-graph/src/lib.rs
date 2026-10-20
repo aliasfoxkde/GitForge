@@ -76,6 +76,17 @@ pub struct KnownIssue {
     pub tests: Vec<String>,
 }
 
+/// A recorded impact run for observability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactRun {
+    pub commit_sha: String,
+    pub changed_files: Vec<String>,
+    pub affected_crates: Vec<String>,
+    pub affected_features: Vec<String>,
+    pub tests_run: Vec<String>,
+    pub duration_ms: u64,
+}
+
 /// Crate-level dependency graph plus feature/issue overlays.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DependencyGraph {
@@ -516,6 +527,57 @@ pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
             return None;
         }
     }
+}
+
+
+impl DependencyGraph {
+    /// Load a cached graph for the given commit SHA, or build + cache it.
+    pub fn load_or_build(workspace_root: &std::path::Path, commit_sha: &str) -> Result<Self> {
+        let cache_dir = workspace_root.join("target-ref");
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let cache_path = cache_dir.join(format!("graph-{commit_sha}.json"));
+        if cache_path.exists() {
+            if let Ok(g) = Self::load(&cache_path) {
+                return Ok(g);
+            }
+        }
+        let g = Self::load_from_workspace(workspace_root)?;
+        // Best-effort cache; ignore errors.
+        let _ = g.save(&cache_path);
+        Ok(g)
+    }
+
+    /// Append an impact run record (JSONL) for observability.
+    pub fn record_impact_run(workspace_root: &std::path::Path, run: &ImpactRun) -> Result<()> {
+        let path = workspace_root.join("target-ref").join("impact-runs.jsonl");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open impact-runs log")?;
+        let line = serde_json::to_string(run).context("serialize impact run")?;
+        writeln!(f, "{line}").context("write impact run")?;
+        Ok(())
+    }
+}
+
+/// SQL for the impact_runs table (Postgres), for DB-backed observability.
+pub fn impact_runs_table_sql() -> &'static str {
+    r#"CREATE TABLE IF NOT EXISTS impact_runs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    commit_sha TEXT NOT NULL,
+    changed_files JSONB NOT NULL DEFAULT '[]'::jsonb,
+    affected_crates JSONB NOT NULL DEFAULT '[]'::jsonb,
+    affected_features JSONB NOT NULL DEFAULT '[]'::jsonb,
+    tests_run JSONB NOT NULL DEFAULT '[]'::jsonb,
+    duration_ms BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_impact_runs_commit ON impact_runs(commit_sha);"#
 }
 
 #[cfg(test)]

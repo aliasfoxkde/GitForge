@@ -1021,6 +1021,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             println!("   workspace: {}", root.display());
 
             // Determine changed files.
+            let started = std::time::Instant::now();
             let changed_files = if *changed || *fast {
                 git_changed_files_local(&root).unwrap_or_default()
             } else if *full {
@@ -1159,6 +1160,32 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     Err(e) => println!("   ⚠️  aegis could not run: {e}"),
                 }
             }
+
+            // Record impact run (best-effort).
+            let _ = gitforge_graph::DependencyGraph::record_impact_run(
+                &root,
+                &gitforge_graph::ImpactRun {
+                    commit_sha: "local".to_string(),
+                    changed_files: changed_files.clone(),
+                    affected_crates: affected.clone(),
+                    affected_features: {
+                        // recompute features if possible
+                        let mut f = Vec::new();
+                        let fp = root.join("docs/planning/FEATURES.yml");
+                        if fp.exists() {
+                            if let Ok(yaml) = std::fs::read_to_string(&fp) {
+                                let mut g = graph.clone();
+                                if g.load_features_yaml(&yaml).is_ok() {
+                                    f = g.affected_features(&affected);
+                                }
+                            }
+                        }
+                        f
+                    },
+                    tests_run: Vec::new(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                },
+            );
 
             println!("\n✅ gitforge check complete");
             return Ok(());
