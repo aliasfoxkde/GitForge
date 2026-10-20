@@ -41,6 +41,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, gitforge-github]
     outputs:
       run_id: ${{ steps.enqueue.outputs.run_id }}
+      trigger_id: ${{ steps.enqueue.outputs.trigger_id }}
       build_status: ${{ steps.enqueue.outputs.status }}
     steps:
       - name: Validate GitForge configuration
