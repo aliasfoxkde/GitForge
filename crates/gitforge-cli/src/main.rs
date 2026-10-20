@@ -350,6 +350,13 @@ async fn renew_session(server: &str, config: &mut Config) -> Result<()> {
 }
 
 /// Run the CLI command handler (extracted for testing)
+fn format_pipeline_summary(pipeline: &client::PipelineResponse) -> String {
+    format!(
+        "{:20} - {} [trigger: {}]",
+        pipeline.name, pipeline.repo_id, pipeline.trigger_type
+    )
+}
+
 pub async fn run_cli(cli: Cli) -> Result<()> {
     let mut config = Config::load().unwrap_or_default();
     let server = cli.server.unwrap_or_else(|| config.server_url.clone());
@@ -773,15 +780,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             println!("  No pipelines found.");
                         } else {
                             for pipeline in pipelines {
-                                let status = if pipeline.enabled {
-                                    "active"
-                                } else {
-                                    "disabled"
-                                };
-                                println!(
-                                    "  {:20} - {} [{}]",
-                                    pipeline.name, pipeline.repo_id, status
-                                );
+                                println!("  {}", format_pipeline_summary(&pipeline));
                             }
                         }
                         println!();
@@ -797,7 +796,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("⚙️  Pipeline: {}", pipeline.name);
                         println!("   ID: {}", pipeline.id);
                         println!("   Repository: {}", pipeline.repo_id);
-                        println!("   Enabled: {}", pipeline.enabled);
+                        println!("   Trigger: {}", pipeline.trigger_type);
                     }
                     Err(e) => {
                         println!("❌ {e}");
@@ -1103,6 +1102,19 @@ mod tests {
             token: None,
             command,
         }
+    }
+
+    #[test]
+    fn pipeline_summary_reports_trigger_without_claiming_disabled_state() {
+        let summary = format_pipeline_summary(&client::PipelineResponse {
+            id: "pipeline-1".to_string(),
+            name: "quality".to_string(),
+            repo_id: "repo-1".to_string(),
+            trigger_type: "push".to_string(),
+        });
+
+        assert_eq!(summary, "quality              - repo-1 [trigger: push]");
+        assert!(!summary.contains("disabled"));
     }
 
     #[tokio::test]

@@ -117,10 +117,10 @@ pub struct PipelineResponse {
     pub id: String,
     pub name: String,
     pub repo_id: String,
-    /// The API list endpoint does not return `enabled`; default it so the
-    /// response still decodes (the run/list flows only need id/name/repo_id).
-    #[serde(default)]
-    pub enabled: bool,
+    /// Trigger policy returned by the pipeline list/get/create endpoints.
+    /// The list endpoint only exposes current definitions; it does not expose
+    /// an independent enabled/disabled flag.
+    pub trigger_type: String,
 }
 
 /// Create pipeline request
@@ -632,6 +632,16 @@ mod tests {
     #[derive(Debug, Serialize, Deserialize)]
     struct TestRequest {
         pub value: String,
+    }
+
+    #[test]
+    fn pipeline_response_decodes_trigger_without_fabricating_enabled_state() {
+        let pipeline: PipelineResponse = serde_json::from_str(
+            r#"{"id":"pipeline-1","name":"quality","repo_id":"repo-1","trigger_type":"push"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(pipeline.trigger_type, "push");
     }
 
     #[tokio::test]
