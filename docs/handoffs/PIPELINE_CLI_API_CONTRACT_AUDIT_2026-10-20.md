@@ -257,3 +257,15 @@ crates/gitforge-db/tests/integration.rs       flag and scoping regression tests
 docs/API.md                                   the pipeline payload contract
 docs/handoffs/PIPELINE_CLI_API_CONTRACT_AUDIT_2026-10-20.md   this receipt
 ```
+
+## Change record
+
+| Item | Value |
+|---|---|
+| Branch | `codex/pipeline-contract-audit-20261020` (base `114c69f`) |
+| Fix commit | `c95c959` — `fix(ci): align pipeline CLI and API identifiers` |
+| Receipt commit | `5499e36` — `docs(ci): record the live pipeline contract check` |
+| Pull request | [#326](https://github.com/aliasfoxkde/GitForge/pull/326) (draft) |
+
+The receipt is the evidence of record; the GitForge pipeline on the branch
+remains the authoritative gate for the merge decision.
