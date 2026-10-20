@@ -529,7 +529,6 @@ pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
-
 impl DependencyGraph {
     /// Load a cached graph for the given commit SHA, or build + cache it.
     pub fn load_or_build(workspace_root: &std::path::Path, commit_sha: &str) -> Result<Self> {

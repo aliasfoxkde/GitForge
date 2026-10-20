@@ -1145,7 +1145,11 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
 
             // Aegis security scan (staged changes) if available.
-            if std::process::Command::new("aegis").arg("--version").output().is_ok_and(|o| o.status.success()) {
+            if std::process::Command::new("aegis")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+            {
                 println!("\n▶ aegis scan (staged)");
                 let mut cmd = std::process::Command::new("aegis");
                 cmd.arg("scan").arg("--staged").arg(".");
