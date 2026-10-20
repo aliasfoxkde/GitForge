@@ -17,12 +17,18 @@ Configure these repository or organization values before enabling it:
 | Name | Kind | Requirement |
 | --- | --- | --- |
 | `GITFORGE_ENABLED` | variable | Exactly `true` |
-| `GITFORGE_API_URL` | variable | Reachable GitForge API base URL |
 | `GITFORGE_SCHEDULER_URL` | variable | Reachable scheduler base URL |
 | `GITFORGE_REPO_ID` | variable | UUID of the mirrored GitForge repository |
 | `GITFORGE_POLL_TIMEOUT_SECONDS` | variable | Positive integer timeout |
 | `GITFORGE_POLL_INTERVAL_SECONDS` | variable | Positive integer interval |
-| `GITFORGE_API_TOKEN` | secret | Token accepted by the scheduler/API |
+| `GITFORGE_CI_TRIGGER_TOKEN` | secret | Credential accepted by the CI trigger service for enqueue and trigger-receipt polling |
+| `GITFORGE_SCHEDULER_OPERATOR_TOKEN` | secret | Operator credential accepted by the scheduler for pipeline-run status polling |
+
+The workflow deliberately uses separate credentials and APIs: it submits
+through the CI trigger service, polls asynchronous trigger receipts there, and
+reads materialized run status through the scheduler's operator endpoint
+(`GET /pipelines/runs/{id}`). It does not send the scheduler token to the
+API-gateway JWT endpoint or reuse the trigger credential for operator reads.
 
 The workflow validates all values and refuses to bypass GitForge if enqueue or
 polling fails. Until `GITFORGE_ENABLED=true` is intentionally configured, the
