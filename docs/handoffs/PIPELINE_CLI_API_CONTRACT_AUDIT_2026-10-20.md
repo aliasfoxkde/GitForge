@@ -26,7 +26,8 @@ deployment was touched.
   was used.
 - **Tests**: focused suites only (`gitforge-db`, `gitforge-api`, `gitforge-cli`
   targets listed under *Verification*). No workspace-wide `cargo test`, no
-  coverage run, no e2e.
+  coverage run. The one live check was a scratch local API instance on a
+  throwaway database (see *Live check*), not a production service.
 - **Concurrency note**: an earlier invocation of this audit was still running
   in the same worktree while this one started; its writes were inspected, not
   discarded, and its changes were folded into the final diff. File mtimes were
@@ -54,8 +55,9 @@ The API had already been sending the pipeline id in the same payload
 Feeding that repository uuid back to the id route reproduces the reported
 `404` from source alone: `GET /api/pipelines/{id}` parses the path as a uuid
 (a repository id *is* a uuid, so parsing succeeds), then looks the value up in
-the `pipelines` table (`crates/gitforge-api/src/routes/ci.rs:238`), finds no
-row, and answers `404 {"error":"not_found","message":"Pipeline not found"}`.
+the `pipelines` table (`crates/gitforge-api/src/routes/ci.rs:238`; the same
+lookup stood at line 201 at `114c69f`), finds no row, and answers
+`404 {"error":"not_found","message":"Pipeline not found"}`.
 
 ### Symptom 2 — the name lookup answered `invalid_id`
 
@@ -66,7 +68,7 @@ format"}`. This is the contract working as designed, not a defect:
 
 - a pipeline **name** is unique only per repository, and
 - retired versions share the name with their successor (the single-active-
-  version invariant, `crates/gitforge-db/src/queries.rs:718-737`),
+  version invariant, `crates/gitforge-db/src/queries.rs:726`),
 
 so a name does not identify a row. The id is the only identifier the routes
 accept. The audit therefore did **not** add a name lookup route; it made the
@@ -87,7 +89,7 @@ pub enabled: bool,
 With `#[serde(default)]` and no `enabled` key in the payload, every pipeline
 decoded as `enabled = false`, and the CLI printed `disabled` for all of them.
 The database had the truth all along — `pipelines.active`
-(`crates/gitforge-db/src/connection.rs:273-283`) — but no route exposed it.
+(`crates/gitforge-db/src/connection.rs:280`) — but no route exposed it.
 
 ### The state the API already stored
 
@@ -96,9 +98,9 @@ The database had the truth all along — `pipelines.active`
 `(repo_id, name)`. Registering or pushing a new version retires the
 predecessor (`active = 0`), which stays addressable by id as history. The
 catalog listing already carried only active rows
-(`crates/gitforge-db/src/queries.rs:869`), which is why the reported listing
-showed a `disabled` pipeline that the API itself never listed: the label was
-fabricated by the client.
+(`crates/gitforge-db/src/queries.rs:891`; line 867 at `114c69f`), so the
+`disabled` label in the reported listing was fabricated by the client: the
+listing it came from contained active definitions only.
 
 ## Changes
 
@@ -152,7 +154,7 @@ fabricated by the client.
 |---|---|---|
 | `test_pipeline_active_flag_reports_retired_versions` | `crates/gitforge-db/tests/integration.rs:232` | the flag of a retired vs. active row, that `active_flags` is scoped to the requested ids, and that an empty request is answered without a query |
 | `pipeline_responses_report_the_active_state` | `crates/gitforge-api/tests/ci_routes.rs:208` | list/get report `active`, a retired row reports `active: false` and leaves the listing, and the id the listing prints is the id the id route accepts |
-| `pipeline_create_registers_active_definition_for_owner` | `crates/gitforge-api/tests/ci_routes.rs:919` | the create response carries `active: true` |
+| `pipeline_create_registers_active_definition_for_owner` | `crates/gitforge-api/tests/ci_routes.rs:947` | the create response carries `active: true` |
 | `pipeline_response_carries_the_state_the_api_sent` | `crates/gitforge-cli/src/client.rs:874` | the client decodes `active: true` / `false` as sent |
 | `pipeline_response_does_not_invent_a_state_the_api_never_sent` | `crates/gitforge-cli/src/client.rs:889` | an absent state decodes as "not reported", not as `disabled` |
 | `pipeline_state_label_reports_only_what_the_api_sent` | `crates/gitforge-cli/src/main.rs:1273` | `active` / `disabled` / `unknown` |
@@ -180,11 +182,10 @@ cargo test -p gitforge-cli --test cli                       # 49 passed; 0 faile
 
 ## Not verified, and residual risk
 
-- **No live service run.** The contract is pinned at the route and client
-  level; the CLI was not exercised against a running GitForge instance, and
-  no request was made to a production API. The reported `404` / `invalid_id`
-  answers were derived from the source paths cited above, not replayed
-  against production.
+- **Production was never exercised.** The live check below ran against a
+  throwaway API instance built from this checkout (see *Live check* above);
+  no production API, service, pipeline, or secret was contacted or mutated.
+  The production instance still runs the pre-fix CLI until it is upgraded.
 - **Coverage gate not measured.** The repository's coverage threshold
   (fail < 82%, warn < 84%, `.gitforge.yml`) is a sandbox measurement; the
   brief scoped this run to focused tests, so the number is not claimed here.
@@ -199,6 +200,49 @@ cargo test -p gitforge-cli --test cli                       # 49 passed; 0 faile
 - **Name lookup still unsupported.** `pipeline --show <name>` answers
   `invalid_id` by design. If name-based lookup is wanted later, it needs a
   repository scope to be unambiguous, and it is a separate contract change.
+
+## Live check
+
+The reported behaviour was reproduced against a **local, throwaway** API
+instance built from this checkout — `services/api` on a scratch SQLite file
+under `/tmp`, a scratch JWT secret, scratch ports (42799 / 42798), and
+synthetic rows (one repository `amortyx`, one pipeline `amortyx-gates`). No
+production service, secret, or pipeline was involved.
+
+Before (CLI built at `114c69f`, same server):
+
+```
+⚙️  Pipelines on http://127.0.0.1:42799:
+
+  amortyx-gates        - 3cdcd405-ae28-4e92-93a6-098d1e753c5d [disabled]
+```
+
+After (CLI built from this branch, same server):
+
+```
+⚙️  Pipelines on http://127.0.0.1:42799:
+
+  amortyx-gates        - fb5a5461-53a4-4895-a973-33267d0a0fa9 (repo 3cdcd405-ae28-4e92-93a6-098d1e753c5d) [active]
+```
+
+The reported answers reproduce verbatim against that instance:
+
+```
+$ gitforge pipeline --show 3cdcd405-…   # the repository uuid the listing printed
+❌ get pipeline failed: 404 Not Found — {"error":"not_found","message":"Pipeline not found"}
+
+$ gitforge pipeline --show amortyx-gates
+❌ get pipeline failed: 400 Bad Request — {"error":"invalid_id","message":"Invalid pipeline ID format"}
+
+$ gitforge pipeline --show fb5a5461-…   # the pipeline id the listing prints
+⚙️  Pipeline: amortyx-gates
+   ID: fb5a5461-53a4-4895-a973-33267d0a0fa9
+   Repository: 3cdcd405-ae28-4e92-93a6-098d1e753c5d
+   State: active
+```
+
+A retired version of the same pipeline (the row the push path retires) is
+absent from the listing and reports `State: disabled` when addressed by id.
 
 ## Files changed
 

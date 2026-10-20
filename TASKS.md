@@ -69,5 +69,7 @@ Evidence receipt: `docs/handoffs/PIPELINE_CLI_API_CONTRACT_AUDIT_2026-10-20.md`
 - No workspace-wide `cargo test` and no coverage measurement — the brief
   scoped this run to focused tests; the GitForge pipeline remains the
   coverage gate.
-- No live service run: the CLI was not exercised against a running GitForge,
-  and no request was made to a production API.
+- No production instance was exercised: the live check ran against a
+  throwaway local API instance on a scratch SQLite database with synthetic
+  rows (see the receipt), and no production service, secret, or pipeline
+  was contacted or mutated.
