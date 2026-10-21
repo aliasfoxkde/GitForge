@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# Drain-gated cutover of a GitForge instance onto a staged release bundle.
+#
+# Generalizes the 2026-10-10 v0.6.16 fedora cutover, which ran as a one-off
+# hand-edited script. Order of operations is the proven one:
+#   1. Wait for zero in-flight jobs (assigned/running) so no job container
+#      is orphaned mid-flight. A pending-only backlog is fine — that is just
+#      queued work, and waiting for it would deadlock a busy instance.
+#   2. Stop the scheduler units FIRST (ci is the dispatcher; stopping the
+#      api first would let push triggers pile onto a dead consumer).
+#   3. Flip the release symlink atomically (symlink-to-temp + mv -T).
+#   4. Start stateless units, then schedulers.
+#   5. Print boot-adoption evidence from the journal.
+# Losing the drain poll race costs at most one freshly-dispatched job, which
+# the new binary re-adopts at boot (restart-fence readoption) — the drain is
+# an optimization, not a correctness gate.
+#
+# Two supervision profiles:
+#   --units user    gitforge-{api,ci,git-server,runner} via `systemctl --user`
+#                   (fedora standalone instance; units not on this host are
+#                   reported and skipped)
+#   --units system  gitforge@{api,ci,git-server,runner} via `sudo -n systemctl`
+#                   (NAS instance; a masked unit is a retired component and
+#                   is skipped, not failed — see scripts/gitforge-release-auto)
+#
+# Run this ON the target host: it stops and starts local units and flips a
+# local symlink. The "remote" in the name refers to the instance being cut
+# over (a second deployment), not the invocation site.
+#
+# Usage:
+#   scripts/gitforge-remote-cutover --units user \
+#       --db <path/to/gitforge.db> \
+#       --bundle <staged releases/<release-id>> \
+#       --link <gitforge-current symlink path> [--dry-run]
+set -u -o pipefail
+
+usage() {
+    sed -n '2,40p' "$0"
+    exit 0
+}
+
+units_profile=""
+db_path=""
+bundle_dir=""
+link_path=""
+dry_run=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --units) units_profile="${2:-}"; shift 2 ;;
+        --db) db_path="${2:-}"; shift 2 ;;
+        --bundle) bundle_dir="${2:-}"; shift 2 ;;
+        --link) link_path="${2:-}"; shift 2 ;;
+        --dry-run) dry_run=1; shift ;;
+        -h|--help) usage ;;
+        *) printf 'unknown option: %s\n' "$1" >&2; exit 64 ;;
+    esac
+done
+
+say() { printf 'cutover: %s\n' "$1"; }
+die() { printf 'cutover: %s\n' "$1" >&2; exit 1; }
+
+[[ -n "$units_profile" ]] || die "--units user|system is required"
+[[ -n "$db_path" ]] || die "--db is required"
+[[ -n "$bundle_dir" ]] || die "--bundle is required"
+[[ -n "$link_path" ]] || die "--link is required"
+
+case "$units_profile" in
+    user)
+        scope=(--user)
+        # Non-interactive ssh has no session bus address: systemctl --user
+        # fails silently and every unit looks "not installed". The standard
+        # per-user runtime dir is the fix.
+        if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+            XDG_RUNTIME_DIR="/run/user/$(id -u)"
+            export XDG_RUNTIME_DIR
+        fi
+        api_unit="gitforge-api"
+        ci_unit="gitforge-ci"
+        git_unit="gitforge-git-server"
+        runner_unit="gitforge-runner"
+        ;;
+    system)
+        scope=()
+        api_unit="gitforge@api.service"
+        ci_unit="gitforge@ci.service"
+        git_unit="gitforge@git-server.service"
+        runner_unit="gitforge@runner.service"
+        ;;
+    *) die "--units must be 'user' or 'system'" ;;
+esac
+
+[[ -x "$bundle_dir/bin/ci" ]] || die "bundle not staged (no executable bin/ci): $bundle_dir"
+[[ -f "$db_path" ]] || die "database not found: $db_path"
+[[ -L "$link_path" ]] || die "release symlink not found: $link_path"
+
+# A masked unit is retired on this host; restarting it fails the whole
+# cutover for no operational reason (2026-10-10: the NAS runner mask made
+# every promote roll back). list-unit-files state 'masked' is the only
+# reliable discriminator — `systemctl cat` exits 0 even for masked units.
+# list-unit-files is strict about names: a bare "gitforge-ci" matches
+# nothing while "gitforge-ci.service" does (only globs are lenient).
+unit_file_name() { printf '%s.service' "${1%.service}"; }
+unit_masked() {
+    [[ "$(systemctl "${scope[@]}" list-unit-files "$(unit_file_name "$1")" --no-legend 2>/dev/null | awk '{print $2}')" == "masked" ]]
+}
+unit_present() {
+    systemctl "${scope[@]}" list-unit-files "$(unit_file_name "$1")" --no-legend 2>/dev/null | grep -q .
+}
+for u in "$api_unit" "$ci_unit" "$git_unit" "$runner_unit"; do
+    if ! unit_present "$u"; then
+        say "skipping $u: not installed on this host"
+    elif unit_masked "$u"; then
+        say "skipping $u: masked (retired on this host)"
+    fi
+done
+
+sched_units=()
+for u in "$ci_unit" "$runner_unit"; do
+    if unit_present "$u" && ! unit_masked "$u"; then sched_units+=("$u"); fi
+done
+stateless_units=()
+for u in "$api_unit" "$git_unit"; do
+    if unit_present "$u" && ! unit_masked "$u"; then stateless_units+=("$u"); fi
+done
+restart_list() {
+    if [[ "${#@}" -gt 0 ]]; then printf '%s ' "$@"; else printf '(none)'; fi
+}
+
+# System-profile template units are system-level and need the passwordless
+# sudo path; user-profile units must run as the invoking user (sudo would
+# target root's user bus, not this instance's).
+sysctl() {
+    if [[ "$units_profile" == "system" ]]; then
+        sudo -n systemctl "$@"
+    else
+        systemctl --user "$@"
+    fi
+}
+
+promoted=$(basename -- "$(readlink -- "$link_path")")
+say "profile=$units_profile promoted=$promoted candidate=$(basename -- "$bundle_dir") dry_run=$dry_run"
+say "drain gate: scheduler units $(restart_list "${sched_units[@]}")"
+say "stateless units: $(restart_list "${stateless_units[@]}")"
+
+if ((dry_run == 1)); then
+    say "dry-run: no units touched, symlink not flipped"
+    exit 0
+fi
+
+# --- 1. Drain ---------------------------------------------------------------
+while true; do
+    inflight=$(sqlite3 -readonly "$db_path" ".timeout 15000" \
+        "SELECT count(*) FROM jobs WHERE status IN ('assigned','running');" 2>/dev/null)
+    if [[ "$inflight" == "0" ]]; then
+        say "$(date +%H:%M:%S) drained; cutting over"
+        break
+    fi
+    say "$(date +%H:%M:%S) in-flight=${inflight:-unknown}; waiting"
+    sleep 5
+done
+
+# --- 2. Stop schedulers first, then stateless -------------------------------
+if (( ${#sched_units[@]} > 0 )); then
+    sysctl stop "${sched_units[@]}" || die "failed to stop scheduler units"
+fi
+if (( ${#stateless_units[@]} > 0 )); then
+    sysctl stop "${stateless_units[@]}" || die "failed to stop stateless units"
+fi
+
+# --- 3. Atomic symlink flip -------------------------------------------------
+ln -sfn "$bundle_dir" "$link_path.new.$$"
+mv -T "$link_path.new.$$" "$link_path"
+say "link -> $(readlink -f "$link_path")"
+
+# --- 4. Start stateless, then schedulers ------------------------------------
+if (( ${#stateless_units[@]} > 0 )); then
+    sysctl start "${stateless_units[@]}" || die "failed to start stateless units"
+fi
+if (( ${#sched_units[@]} > 0 )); then
+    sysctl start "${sched_units[@]}" || die "failed to start scheduler units"
+fi
+sleep 8
+
+sysctl is-active "${stateless_units[@]}" "${sched_units[@]}" 2>/dev/null || true
+echo "-- boot evidence --"
+if [[ "$units_profile" == "system" ]]; then
+    jscope=()
+else
+    jscope=(--user)
+fi
+journalctl "${jscope[@]}" -u "$ci_unit" --since "-1 min" --no-pager 2>/dev/null \
+    | grep -iE "rebuilt live engine|readopted|event consumer|listening" | head -12
+echo "=CUTOVER DONE"

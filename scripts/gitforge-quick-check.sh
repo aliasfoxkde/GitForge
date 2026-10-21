@@ -28,12 +28,38 @@ cd "$REPO_ROOT"
 
 # Determine scope
 SCOPE="${1:-full}"
+CHANGED_ONLY=false
 if [[ "$SCOPE" == "--changed" ]]; then
     CHANGED_ONLY=true
     INFO "Running changed-files-only scan..."
 else
-    CHANGED_ONLY=false
     INFO "Running full quick-check..."
+fi
+
+# Change classification drives which workspace-wide steps can be skipped.
+# The classification is the same one the CI pipeline uses (scripts/detect-changes.sh),
+# so a local "--changed" run prunes exactly what the remote skip_if gates prune.
+NEED_CODE=1
+NEED_TESTS=1
+if [[ "$CHANGED_ONLY" == true ]]; then
+    CLASSIFICATION="$(bash scripts/detect-changes.sh 2>/dev/null || true)"
+    if [[ -n "$CLASSIFICATION" ]]; then
+        NEED_CODE=0
+        NEED_TESTS=0
+        while IFS='=' read -r key value; do
+            case "$key" in
+                CI_CHANGE_INCLUDE_CODE|CI_CHANGE_INCLUDE_CRATES)
+                    if [[ "$value" == "1" ]]; then NEED_CODE=1; fi
+                    ;;
+                CI_CHANGE_INCLUDE_TESTS)
+                    if [[ "$value" == "1" ]]; then NEED_TESTS=1; fi
+                    ;;
+            esac
+        done <<< "$CLASSIFICATION"
+    fi
+    if [[ "$NEED_CODE" == 0 && "$NEED_TESTS" == 0 ]]; then
+        INFO "  no source/crates/tests changed — clippy and the test smoke are skipped"
+    fi
 fi
 
 FAILED=0
@@ -53,12 +79,16 @@ if ! python3 scripts/check-route-docs.py 2>&1; then
 fi
 
 # ── Step 3: Clippy with timeout ──────────────────────────────────────────
-INFO "[3/5] clippy (timeout 180s)..."
-# Run with TIMEOUT to catch infinite-compile edge cases
-# TIMEOUT measured in seconds; clippy cold-cache takes ~20-60s normally
-if ! timeout 180 cargo clippy --workspace --all-targets -- -D warnings 2>&1; then
-    ERROR "Clippy failed. Fix warnings/errors before pushing."
-    FAILED=1
+if [[ "$NEED_CODE" == 0 ]]; then
+    INFO "[3/5] clippy — SKIPPED (no source or crates changed)"
+else
+    INFO "[3/5] clippy (timeout 180s)..."
+    # Run with TIMEOUT to catch infinite-compile edge cases
+    # TIMEOUT measured in seconds; clippy cold-cache takes ~20-60s normally
+    if ! timeout 180 cargo clippy --workspace --all-targets -- -D warnings 2>&1; then
+        ERROR "Clippy failed. Fix warnings/errors before pushing."
+        FAILED=1
+    fi
 fi
 
 # ── Step 4: Aegis changed-files scan ─────────────────────────────────────
@@ -87,22 +117,26 @@ else
 fi
 
 # ── Step 5: Quick test smoke ───────────────────────────────────────────────
-INFO "[5/5] quick smoke test (first 3 crates, bounded threads)..."
-# Smoke: run unit tests only, skip integration/e2e/fuzz heavy targets.
-# Bounded threads matches the CI 2-thread bound.
-# --test-threads=2 also documented in .gitforge.yml rationale.
-# We don't fail-fast here because a failing test in one crate doesn't
-# mean we should skip checking the others — but we DO limit total time.
-if ! timeout 120 cargo test --workspace \
-    -- --test-threads=2 \
-       --skip '::integration' \
-       --skip '::e2e' \
-       --skip '::fuzz' \
-       --skip 'test_git_push_and_clone' \
-       --skip 'test_required_checks' \
-       2>&1 | tail -20; then
-    WARN "Smoke test had failures — full suite runs in CI"
-    # Don't fail here: smoke is advisory, CI runs the full suite
+if [[ "$NEED_CODE" == 0 && "$NEED_TESTS" == 0 ]]; then
+    INFO "[5/5] quick smoke test — SKIPPED (no source, crates, or tests changed)"
+else
+    INFO "[5/5] quick smoke test (first 3 crates, bounded threads)..."
+    # Smoke: run unit tests only, skip integration/e2e/fuzz heavy targets.
+    # Bounded threads matches the CI 2-thread bound.
+    # --test-threads=2 also documented in .gitforge.yml rationale.
+    # We don't fail-fast here because a failing test in one crate doesn't
+    # mean we should skip checking the others — but we DO limit total time.
+    if ! timeout 120 cargo test --workspace \
+        -- --test-threads=2 \
+           --skip '::integration' \
+           --skip '::e2e' \
+           --skip '::fuzz' \
+           --skip 'test_git_push_and_clone' \
+           --skip 'test_required_checks' \
+           2>&1 | tail -20; then
+        WARN "Smoke test had failures — full suite runs in CI"
+        # Don't fail here: smoke is advisory, CI runs the full suite
+    fi
 fi
 
 # ── Result ────────────────────────────────────────────────────────────────

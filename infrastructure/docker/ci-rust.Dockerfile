@@ -13,10 +13,15 @@
 # directory out of the build):
 #
 #   tmp=$(mktemp -d)
-#   git archive HEAD Cargo.toml Cargo.lock crates services \
+#   git archive HEAD Cargo.toml Cargo.lock crates services fuzz \
 #       | tar -x -C "$tmp"
 #   cp infrastructure/docker/ci-rust.Dockerfile "$tmp"/
 #   docker build -f ci-rust.Dockerfile -t dsc-ci-rust:N "$tmp"
+#
+# `fuzz` must be in the archive list — the Dockerfile COPYs it, and a
+# context without it fails with "COPY fuzz/ fuzz/: not found". The `cp`
+# is deliberate: it takes the WORKING-TREE Dockerfile, so uncommitted
+# tooling changes ride along; everything else is archived from HEAD.
 #
 # Then update the `image:` fields in .gitforge.yml to the new tag. The image
 # is shared with the dsc pipeline's toolchain naming, hence the dsc-ci-rust
@@ -33,10 +38,11 @@ FROM rust:1-slim-bookworm
 # (ssh/https protocol suites drive a real git client) and openssh-client
 # supplies ssh-keygen, which the hermetic git_ssh_protocol suite spawns.
 # python3 runs the route-docs drift gate; g++ compiles libFuzzer's vendored
-# C++ runtime when the fuzz job builds its targets.
+# C++ runtime when the fuzz job builds its targets; shellcheck is the lint
+# job's gate over the shell surfaces (scripts + systemd units).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev curl ca-certificates git openssh-client python3 g++ \
+        pkg-config libssl-dev curl ca-certificates git openssh-client python3 g++ shellcheck \
     && rm -rf /var/lib/apt/lists/*
 
 # Slim images ship the minimal rustup profile; the pipeline needs both linters.

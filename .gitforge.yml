@@ -1,10 +1,11 @@
 # GitForge local CI pipeline (self-hosted GitForge at /nas/Temp/repos/GitForge).
 #
-# The project's own gates, run by the project itself: rustfmt --check plus
-# the route-docs drift gate, the strict clippy pass, the workspace test
-# suite, the line-coverage gate, and a bounded fuzz smoke over the
-# untrusted-input parsers. Pushes to any branch run the full chain, so a
-# PR branch is validated here before it merges.
+# The project's own gates, run by the project itself: a shellcheck pass over
+# the release-channel ops scripts, rustfmt --check plus the route-docs drift
+# gate, the strict clippy pass, the workspace test suite, the line-coverage
+# gate, and a bounded fuzz smoke over the untrusted-input parsers. Pushes to
+# any branch run the full chain, so a PR branch is validated here before it
+# merges.
 #
 # CHANGE-DETECTION PRUNING: the detect-changes job enumerates files changed
 # vs the merge-base with origin/main and classifies them. Downstream jobs
@@ -13,25 +14,27 @@
 #   - test: skips when no source, crates/, or tests changed
 #   - coverage: skips when no source, crates/, or tests changed
 #   - fuzz: skips when no source or crates/ changed
-# A doc-only push (e.g. updating a README) runs detect-changes → fmt and stops.
-# A infra-only push (e.g. Dockerfile tweak) runs detect-changes → fmt and stops.
+# A doc-only push (e.g. updating a README) runs detect-changes → lint → fmt
+# and stops. A infra-only push (e.g. Dockerfile tweak) runs the same three
+# jobs and stops.
 #
 # Documented constraints (same list proven in gods-eye-view's and dsc's
 # .gitforce.yml):
-# - The job graph is a LINEAR CHAIN (detect-changes → fmt → clippy → test →
-#   coverage → fuzz), not a fan-out,
+# - The job graph is a LINEAR CHAIN (detect-changes → lint → fmt → clippy →
+#   test → coverage → fuzz), not a fan-out,
 #   because all jobs of one run share the SAME workspace directory on this
 #   runner. Concurrent jobs would run cargo against the same target/
 #   directory and corrupt each other's build locks.
 # - `environment: {}` is required by the parser (PipelineDefinition has no
 #   serde default) even though it is never forwarded.
-# - The image is pre-built on the host (dsc-ci-rust:9 — cargo, clippy,
+# - The image is pre-built on the host (dsc-ci-rust:10 — cargo, clippy,
 #   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, python3
 #   for the route-docs drift gate, and the GitForge workspace cargo
 #   registry cache baked in for offline builds).
 #   Rebuild and bump the tag whenever Cargo.lock changes or the baked
 #   tooling changes — a stale cache fails every cargo job in seconds with
-#   "candidate versions found which didn't match" (v9 added python3 for
+#   "candidate versions found which didn't match" (v10 added shellcheck
+#   for the new head-of-chain lint job; v9 added python3 for
 #   the drift checker; v8 documents the
 #   current tag; v7 added the coverage toolchain; v6 existed because v5
 #   dropped openssh-client, which the hermetic ssh-protocol tests spawn
@@ -53,7 +56,7 @@ trigger_on:
 environment: {}
 jobs:
   - name: detect-changes
-    image: dsc-ci-rust:9
+    image: dsc-ci-rust:10
     steps:
       - name: Enumerate changed files and classify
         # Populates CI_CHANGE_* vars used by downstream skip_if conditions.
@@ -61,9 +64,26 @@ jobs:
         run: bash scripts/detect-changes.sh
     timeout: 5m
 
-  - name: fmt
-    image: dsc-ci-rust:9
+  - name: lint
+    image: dsc-ci-rust:10
     needs: [detect-changes]
+    steps:
+      - name: Shellcheck (including extensionless ops scripts)
+        # The release-channel ops scripts (scripts/gitforge-*) are bash and
+        # ship in every release bundle; a bug in them breaks the update
+        # channel itself (2026-10-10: a hardcoded unit list made every
+        # promote roll back forever). Parse-only, no cargo, no network —
+        # so it heads the chain and fails fast before the expensive jobs.
+        # The aegis pattern scan stays host-side (make lint / make aegis):
+        # the binary is a locally-built tool, not distro-packaged, and is
+        # not baked into this image.
+        run: shellcheck scripts/*.sh scripts/gitforge-* scripts/qualityctl scripts/verify-user-systemd-policy systemd/*.sh
+    timeout: 10m
+
+  - name: fmt
+    image: dsc-ci-rust:10
+    needs: [lint]
+
     steps:
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -79,7 +99,7 @@ jobs:
     timeout: 15m
 
   - name: clippy
-    image: dsc-ci-rust:9
+    image: dsc-ci-rust:10
     needs: [fmt]
     skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" ]]'
     steps:
@@ -98,7 +118,7 @@ jobs:
     timeout: 60m
 
   - name: test
-    image: dsc-ci-rust:9
+    image: dsc-ci-rust:10
     needs: [clippy]
     skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" || "$CI_CHANGE_INCLUDE_TESTS" == "1" ]]'
     steps:
@@ -126,7 +146,7 @@ jobs:
     timeout: 90m
 
   - name: coverage
-    image: dsc-ci-rust:9
+    image: dsc-ci-rust:10
     needs: [test]
     skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" || "$CI_CHANGE_INCLUDE_TESTS" == "1" ]]'
     steps:
@@ -181,7 +201,7 @@ jobs:
     timeout: 90m
 
   - name: fuzz
-    image: dsc-ci-rust:9
+    image: dsc-ci-rust:10
     needs: [coverage]
     skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" ]]'
     steps:
@@ -202,7 +222,7 @@ jobs:
         # even if the first crashed.
         #
         # Nightly is selected with the +channel syntax: cargo-fuzz 0.13
-        # (dsc-ci-rust:9) dropped `run --toolchain`, and the image's
+        # (dsc-ci-rust:10) dropped `run --toolchain`, and the image's
         # default toolchain is stable, which cannot build -Zbuild-std.
         run: |
           set -e
