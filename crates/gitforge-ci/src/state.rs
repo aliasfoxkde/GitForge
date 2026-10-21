@@ -139,6 +139,16 @@ impl JobStateMachine {
         Ok(())
     }
 
+    /// Transition to skipped state (condition evaluated to false).
+    /// Terminal — counted as succeeded for dependency purposes so downstream
+    /// jobs run normally.
+    pub fn skip(&mut self) -> Result<()> {
+        self.ensure_valid_transition(JobStatus::Skipped)?;
+        self.status = JobStatus::Skipped;
+        tracing::info!("job {} skipped", self.job_id);
+        Ok(())
+    }
+
     /// Check if the job is in a terminal state
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
@@ -161,11 +171,13 @@ impl JobStateMachine {
             // From pending
             (JobStatus::Pending, JobStatus::Queued) => true,
             (JobStatus::Pending, JobStatus::Cancelled) => true,
+            (JobStatus::Pending, JobStatus::Skipped) => true,
 
             // From queued
             (JobStatus::Queued, JobStatus::Assigned) => true,
             (JobStatus::Queued, JobStatus::Cancelled) => true,
             (JobStatus::Queued, JobStatus::Failed) => true,
+            (JobStatus::Queued, JobStatus::Skipped) => true,
             // The timeout watchdog times jobs out from the durable rows, which
             // may be ahead of this engine's mirror: a job dispatched to a
             // runner that hung before reporting assignment/progress still sits

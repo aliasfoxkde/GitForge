@@ -6,7 +6,9 @@ use crate::state::JobStateMachine;
 use gitforge_common::{JobId, JobStatus, PipelineRunId, PipelineStatus, RepoId, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::RwLock;
+use tokio::time::{timeout, Duration};
 
 /// CI Engine state
 #[derive(Debug, Clone)]
@@ -18,6 +20,9 @@ pub struct CiEngineState {
     pub jobs: HashMap<JobId, JobStateMachine>,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Environment variables produced by the detect-changes job, read from its
+    /// job result. Used to evaluate `skip_if` on downstream jobs.
+    pub pipeline_env: HashMap<String, String>,
 }
 
 impl CiEngineState {
@@ -34,6 +39,18 @@ impl CiEngineState {
             jobs: HashMap::new(),
             started_at: None,
             finished_at: None,
+            pipeline_env: HashMap::new(),
+        }
+    }
+
+    /// Merge job output environment variables (from detect-changes) into pipeline_env.
+    /// Called by the orchestrator when a job completes with a result JSON that
+    /// contains CI_CHANGE_* vars — only detect-changes writes these.
+    pub fn merge_job_env(&mut self, _job_id: JobId, env_vars: &HashMap<String, String>) {
+        for (k, v) in env_vars {
+            if k.starts_with("CI_CHANGE_") {
+                self.pipeline_env.insert(k.clone(), v.clone());
+            }
         }
     }
 
@@ -44,11 +61,13 @@ impl CiEngineState {
             .all(super::state::JobStateMachine::is_terminal)
     }
 
-    /// Check if all jobs succeeded
+    /// Check if all jobs succeeded or were skipped.
+    /// Skipped jobs correctly didn't need to run (their skip_if was false);
+    /// they count as succeeded for pipeline outcome.
     pub fn all_jobs_succeeded(&self) -> bool {
         self.jobs
             .values()
-            .all(|j| j.status() == JobStatus::Succeeded)
+            .all(|j| matches!(j.status(), JobStatus::Succeeded | JobStatus::Skipped))
     }
 
     /// Get failed jobs
@@ -72,6 +91,62 @@ impl CiEngineState {
             })
             .map(|(id, _)| *id)
             .collect()
+    }
+}
+
+/// Evaluate a `skip_if` condition expression using the CI_CHANGE_* environment
+/// variables written by the `detect-changes` job. Returns `Ok(false)` if the
+/// job should be skipped, `Ok(true)` if it should run, or an error if the
+/// expression could not be evaluated. A `None` expression always runs.
+pub async fn eval_skip_if(skip_if: &Option<String>, env: &HashMap<String, String>) -> Result<bool> {
+    let Some(expr) = skip_if else {
+        return Ok(true); // No condition means always run
+    };
+    // Build the bash environment from the detect-changes output vars
+    let bash_env: Vec<String> = env
+        .iter()
+        .filter(|(k, _)| k.starts_with("CI_CHANGE_"))
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    // Add CI_CHANGE_FILE_COUNT for convenience (count of all changed files)
+    let file_count = env.get("CI_CHANGE_FILE_COUNT");
+    let combined_env = if bash_env.is_empty() && file_count.is_none() {
+        format!("set -e; {expr}")
+    } else {
+        let env_str = bash_env.join(" ")
+            + &format!(
+                " CI_CHANGE_FILE_COUNT={}",
+                file_count.unwrap_or(&"0".to_string())
+            );
+        format!("export {env_str}; set -e; {expr}")
+    };
+    // Timeout: 10s max to prevent a malicious expression from stalling the engine
+    let result = timeout(
+        Duration::from_secs(10),
+        Command::new("bash")
+            .arg("-c")
+            .arg(&combined_env)
+            .envs(env.iter().filter(|(k, _)| !k.starts_with("CI_CHANGE_")))
+            .output(),
+    )
+    .await;
+    match result {
+        Ok(Ok(output)) => {
+            let exit_ok = output.status.success();
+            if !exit_ok {
+                tracing::info!(
+                    "skip_if condition '{expr}' evaluated to false (exit {}); skipping job",
+                    output.status.code().unwrap_or(-1)
+                );
+            }
+            Ok(exit_ok)
+        }
+        Ok(Err(e)) => Err(gitforge_common::Error::invalid_input(format!(
+            "skip_if expression '{expr}' failed to execute: {e}"
+        ))),
+        Err(_) => Err(gitforge_common::Error::invalid_input(format!(
+            "skip_if expression '{expr}' timed out after 10 seconds"
+        ))),
     }
 }
 
@@ -279,7 +354,9 @@ impl CiEngine {
         state.status = PipelineStatus::Running;
         state.started_at = Some(chrono::Utc::now());
 
-        // Queue all entry point jobs
+        // Queue all entry point jobs. Entry points always run — they are the
+        // source of CI_CHANGE_* vars for downstream skip_if evaluation, and
+        // detect-changes must execute to populate them.
         for node in self.graph.entry_points() {
             if let Some(job_state) = state.jobs.get_mut(&node.id) {
                 job_state.queue()?;
@@ -311,12 +388,13 @@ impl CiEngine {
                 continue;
             }
 
-            // Check if all dependencies are satisfied
+            // Check if all dependencies are satisfied.
+            // Skipped jobs count as succeeded for dependency purposes so
+            // downstream jobs run normally (they were gated by a condition).
             let deps_satisfied = node.dependencies.iter().all(|dep_id| {
-                state
-                    .jobs
-                    .get(dep_id)
-                    .is_some_and(|s| s.status() == JobStatus::Succeeded)
+                state.jobs.get(dep_id).is_some_and(|s| {
+                    s.status() == JobStatus::Succeeded || s.status() == JobStatus::Skipped
+                })
             });
 
             if deps_satisfied {
@@ -330,6 +408,8 @@ impl CiEngine {
     /// Queue dependency-gated jobs after a predecessor succeeds and return
     /// the jobs that became schedulable. Entry-point jobs are queued by
     /// `start`; downstream jobs are released through this method.
+    /// Jobs with `skip_if` conditions that evaluate to false are transitioned
+    /// to `Skipped` instead of queued.
     pub async fn queue_ready_jobs(&self) -> Result<Vec<JobId>> {
         let mut state = self.state.write().await;
         let mut queued = Vec::new();
@@ -341,12 +421,22 @@ impl CiEngine {
                 continue;
             }
             let deps_satisfied = node.dependencies.iter().all(|dep_id| {
-                state
-                    .jobs
-                    .get(dep_id)
-                    .is_some_and(|dependency| dependency.status() == JobStatus::Succeeded)
+                state.jobs.get(dep_id).is_some_and(|dependency| {
+                    dependency.status() == JobStatus::Succeeded
+                        || dependency.status() == JobStatus::Skipped
+                })
             });
             if deps_satisfied {
+                // Evaluate skip_if condition using pipeline_env from detect-changes
+                let should_run =
+                    eval_skip_if(&node.definition.skip_if, &state.pipeline_env).await?;
+                if !should_run {
+                    // Condition evaluated to false — mark skipped instead of queued
+                    if let Some(job_state) = state.jobs.get_mut(&node.id) {
+                        job_state.skip()?;
+                    }
+                    continue;
+                }
                 if let Some(job_state) = state.jobs.get_mut(&node.id) {
                     job_state.queue()?;
                     queued.push(node.id);
@@ -500,6 +590,14 @@ impl CiEngine {
         Ok(())
     }
 
+    /// Merge job output into pipeline_env. Called by the orchestrator when a
+    /// job result arrives — the detect-changes job writes CI_CHANGE_* vars that
+    /// downstream skip_if conditions depend on.
+    pub async fn merge_job_result(&self, job_id: JobId, env_vars: &HashMap<String, String>) {
+        let mut state = self.state.write().await;
+        state.merge_job_env(job_id, env_vars);
+    }
+
     /// Get job info
     pub async fn get_job(&self, job_id: JobId) -> Option<JobStateMachine> {
         let state = self.state.read().await;
@@ -540,6 +638,7 @@ mod tests {
                     }],
                     timeout: None,
                     retry: None,
+                    skip_if: None,
                 },
                 JobDefinition {
                     name: "test".to_string(),
@@ -555,6 +654,7 @@ mod tests {
                     }],
                     timeout: None,
                     retry: None,
+                    skip_if: None,
                 },
             ],
         }
@@ -577,6 +677,7 @@ mod tests {
             }],
             timeout: None,
             retry: None,
+            skip_if: None,
         };
         PipelineDefinition {
             name: "test-parallel".to_string(),
@@ -702,6 +803,7 @@ mod tests {
             }],
             timeout: None,
             retry: None,
+            skip_if: None,
         });
 
         let engine = CiEngine::new(event, chain).await.unwrap();
@@ -757,6 +859,7 @@ mod tests {
             }],
             timeout: None,
             retry: None,
+            skip_if: None,
         });
 
         let engine = CiEngine::new(event, chain).await.unwrap();

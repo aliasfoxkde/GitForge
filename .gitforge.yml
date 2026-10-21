@@ -6,10 +6,20 @@
 # untrusted-input parsers. Pushes to any branch run the full chain, so a
 # PR branch is validated here before it merges.
 #
+# CHANGE-DETECTION PRUNING: the detect-changes job enumerates files changed
+# vs the merge-base with origin/main and classifies them. Downstream jobs
+# use skip_if to skip themselves when their class of file hasn't changed:
+#   - clippy: skips when no Rust source or crates/ changed
+#   - test: skips when no source, crates/, or tests changed
+#   - coverage: skips when no source, crates/, or tests changed
+#   - fuzz: skips when no source or crates/ changed
+# A doc-only push (e.g. updating a README) runs detect-changes → fmt and stops.
+# A infra-only push (e.g. Dockerfile tweak) runs detect-changes → fmt and stops.
+#
 # Documented constraints (same list proven in gods-eye-view's and dsc's
 # .gitforce.yml):
-# - The job graph is a LINEAR CHAIN (fmt → clippy → test → coverage →
-#   fuzz), not a fan-out,
+# - The job graph is a LINEAR CHAIN (detect-changes → fmt → clippy → test →
+#   coverage → fuzz), not a fan-out,
 #   because all jobs of one run share the SAME workspace directory on this
 #   runner. Concurrent jobs would run cargo against the same target/
 #   directory and corrupt each other's build locks.
@@ -42,8 +52,18 @@ trigger_on:
   - push
 environment: {}
 jobs:
+  - name: detect-changes
+    image: dsc-ci-rust:9
+    steps:
+      - name: Enumerate changed files and classify
+        # Populates CI_CHANGE_* vars used by downstream skip_if conditions.
+        # Always runs — it is the source of pipeline_env for the whole DAG.
+        run: bash scripts/detect-changes.sh
+    timeout: 5m
+
   - name: fmt
     image: dsc-ci-rust:9
+    needs: [detect-changes]
     steps:
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -61,6 +81,7 @@ jobs:
   - name: clippy
     image: dsc-ci-rust:9
     needs: [fmt]
+    skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" ]]'
     steps:
       - name: Strict lint (zero warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -79,6 +100,7 @@ jobs:
   - name: test
     image: dsc-ci-rust:9
     needs: [clippy]
+    skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" || "$CI_CHANGE_INCLUDE_TESTS" == "1" ]]'
     steps:
       - name: Workspace test suite
         # Bounded test parallelism. Under the daemon's old vfs storage
@@ -106,6 +128,7 @@ jobs:
   - name: coverage
     image: dsc-ci-rust:9
     needs: [test]
+    skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" || "$CI_CHANGE_INCLUDE_TESTS" == "1" ]]'
     steps:
       - name: Line coverage gate (fail 82, warn 84)
         # Thresholds are calibrated AGAINST THE SANDBOX the job runs in:
@@ -160,6 +183,7 @@ jobs:
   - name: fuzz
     image: dsc-ci-rust:9
     needs: [coverage]
+    skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" ]]'
     steps:
       - name: Fuzz smoke (60s per target)
         # Bounded libFuzzer smoke over the two untrusted-input surfaces:

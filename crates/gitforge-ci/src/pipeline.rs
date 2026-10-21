@@ -141,6 +141,19 @@ pub struct JobDefinition {
     pub steps: Vec<StepDefinition>,
     pub timeout: Option<String>,
     pub retry: Option<u32>,
+    /// Skip this job entirely when the shell expression evaluates to false.
+    /// The expression is evaluated in a bash subshell with access to CI-change
+    /// variables written by the `detect-changes` job:
+    ///   CHANGES_INCLUDE_CODE      — non-doc Rust/source files changed
+    ///   CHANGES_INCLUDE_DOCS      — documentation files changed
+    ///   CHANGES_INCLUDE_CRATES     — specific gitforge-* crates changed
+    ///   CHANGES_INCLUDE_TESTS      — test files changed
+    ///   CHANGES_INCLUDE_INFRA      — infrastructure/docker/scripts changed
+    ///   CHANGES_FILE_COUNT        — total number of changed files
+    /// When absent the job always runs. When the expression is false the job
+    /// transitions to Skipped (terminal, counted as succeeded for deps).
+    #[serde(default)]
+    pub skip_if: Option<String>,
 }
 
 impl JobDefinition {
@@ -253,6 +266,7 @@ jobs:
             steps: vec![],
             timeout: None,
             retry: None,
+            skip_if: None,
         };
         assert!(job.has_dependencies());
 
@@ -264,6 +278,7 @@ jobs:
             steps: vec![],
             timeout: None,
             retry: None,
+            skip_if: None,
         };
         assert!(!job2.has_dependencies());
     }
