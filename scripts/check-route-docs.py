@@ -13,6 +13,14 @@ A route that exists in (1) but not in (2)/(3) is undocumented surface;
 an entry in (2)/(3) with no backing route is stale documentation. Both
 directions fail the check.
 
+docs/API.md is the human contract for the whole GitForge HTTP surface,
+not only for the API gateway: the CI scheduler service (port 42781)
+serves its own endpoints (the trigger enqueue and the trigger receipt),
+and the git server (port 42782) serves the smart-HTTP routes. A
+documented endpoint backed by one of those peer services is not stale
+documentation, so those routers are parsed too — as evidence, never as
+a source of required OpenAPI or doc entries.
+
 Parse-only: no cargo, no network. `#[cfg(test)]` items are excluded via
 brace-span matching (same lexer as unwrap-production-count.py, which is
 raw-string/char-literal aware) so test-only routers don't pollute the
@@ -39,6 +47,15 @@ REPO = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO / "crates" / "gitforge-api" / "src"
 OPENAPI_RS = SRC_ROOT / "openapi.rs"
 API_MD = REPO / "docs" / "API.md"
+
+# Peer services: routers outside the API gateway whose endpoints may also
+# be documented in docs/API.md. The gateway binary (services/api) is not one
+# of them — it only mounts the gateway routers that (1) already covers.
+PEER_SERVICE_ROOTS = sorted(
+    p / "src"
+    for p in (REPO / "services").iterdir()
+    if p.is_dir() and p.name != "api" and (p / "src").is_dir()
+)
 
 CFG = re.compile(r"#\[cfg\(test\)\]")
 METHODS = "(?:get|post|put|patch|delete|head|options|trace)"
@@ -228,18 +245,24 @@ def norm(path: str) -> str:
 
 def extract_source_routes() -> dict[str, set[str]]:
     """normalized path -> set of method names seen."""
+    return extract_routes_from([SRC_ROOT])
+
+
+def extract_routes_from(roots: list[Path]) -> dict[str, set[str]]:
+    """normalized path -> set of method names seen, over the given roots."""
     routes: dict[str, set[str]] = {}
-    for rs in sorted(SRC_ROOT.rglob("*.rs")):
-        code = blank_comments(strip_test_items(rs.read_text()))
-        for m in ROUTE_HEAD.finditer(code):
-            raw = m.group(1)[1:-1]  # strip quotes
-            end = group_span(code, m.end() - 1)
-            body = code[m.end():end]
-            methods = set(METHOD_WORD.findall(body))
-            if not methods:
-                methods = {"?"}
-            key = norm(raw)
-            routes.setdefault(key, set()).update(methods)
+    for root in roots:
+        for rs in sorted(root.rglob("*.rs")):
+            code = blank_comments(strip_test_items(rs.read_text()))
+            for m in ROUTE_HEAD.finditer(code):
+                raw = m.group(1)[1:-1]  # strip quotes
+                end = group_span(code, m.end() - 1)
+                body = code[m.end():end]
+                methods = set(METHOD_WORD.findall(body))
+                if not methods:
+                    methods = {"?"}
+                key = norm(raw)
+                routes.setdefault(key, set()).update(methods)
     return routes
 
 
@@ -293,6 +316,7 @@ def main() -> int:
     args = ap.parse_args()
 
     routes = extract_source_routes()
+    peer_routes = extract_routes_from(PEER_SERVICE_ROOTS)
     spec_paths = extract_openapi_paths()
     doc_paths = extract_doc_endpoints()
 
@@ -311,12 +335,16 @@ def main() -> int:
             problems.append(f"OpenAPI path {path}: no backing route")
 
     for path in sorted(doc_paths):
-        if not covered(path, set(routes)):
-            problems.append(f"docs/API.md endpoint {path}: no backing route")
+        # A documented endpoint is backed by the gateway OR by a peer
+        # service's router (the CI scheduler's trigger endpoints, the git
+        # server's smart-HTTP routes). Both are parsed above.
+        if covered(path, set(routes)) or covered(path, set(peer_routes)):
+            continue
+        problems.append(f"docs/API.md endpoint {path}: no backing route")
 
     print(
         f"source routes: {len(routes)}, openapi paths: {len(spec_paths)}, "
-        f"doc endpoints: {len(doc_paths)}"
+        f"doc endpoints: {len(doc_paths)}, peer-service routes: {len(peer_routes)}"
     )
     if problems:
         print(f"\ndrift: {len(problems)} finding(s)")
