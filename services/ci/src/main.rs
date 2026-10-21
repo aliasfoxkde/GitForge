@@ -3034,6 +3034,7 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 ],
                 timeout: Some("30m".to_string()),
                 retry: Some(1),
+                skip_if: None,
             },
             JobDefinition {
                 name: "test".to_string(),
@@ -3049,6 +3050,7 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 }],
                 timeout: Some("30m".to_string()),
                 retry: Some(1),
+                skip_if: None,
             },
         ],
     }

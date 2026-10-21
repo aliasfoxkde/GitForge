@@ -391,7 +391,7 @@ impl DockerSandbox {
                         "image pull attempt {}/{} failed ({}): retrying in {}s",
                         attempt + 1,
                         PULL_RETRIES + 1,
-                        last_err.as_ref().map(|e| e.to_string()).unwrap_or_default(),
+                        last_err.as_ref().map(std::string::ToString::to_string).unwrap_or_default(),
                         PULL_RETRY_DELAY_SECS
                     );
                     sleep(Duration::from_secs(PULL_RETRY_DELAY_SECS)).await;
