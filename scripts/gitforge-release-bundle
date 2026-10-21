@@ -52,6 +52,15 @@ fi
 
 mkdir -p "$release_dir/bin" "$release_dir/scripts" "$release_dir/systemd/user"
 
+# The services run as the unprivileged `gitforge` user, which reaches the
+# bundle through the www-data group. mkdir honours the caller's umask, and
+# an umask of 077 produced group-unsearchable release directories: the
+# cutover flipped the symlink, every unit died with 203/EXEC ("Permission
+# denied"), and the rollback restored the previous bundle. Pin the modes
+# explicitly so a cut is correct under any umask.
+chmod 2755 "$release_dir" "$release_dir/bin" "$release_dir/scripts" \
+  "$release_dir/systemd" "$release_dir/systemd/user"
+
 for binary in api ci git-server runner; do
   install -m 0755 "$source_root/$binary" "$release_dir/bin/$binary"
 done
