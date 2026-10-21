@@ -34,6 +34,7 @@ fn create_sequential_pipeline() -> PipelineDefinition {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
             JobDefinition {
                 name: "test".to_string(),
@@ -49,6 +50,7 @@ fn create_sequential_pipeline() -> PipelineDefinition {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
         ],
     }
@@ -76,6 +78,7 @@ fn create_parallel_pipeline() -> PipelineDefinition {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
             JobDefinition {
                 name: "lint".to_string(),
@@ -91,6 +94,7 @@ fn create_parallel_pipeline() -> PipelineDefinition {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
             JobDefinition {
                 name: "test".to_string(),
@@ -106,6 +110,7 @@ fn create_parallel_pipeline() -> PipelineDefinition {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
         ],
     }
@@ -329,6 +334,7 @@ fn test_dag_builder_simple() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
             JobDefinition {
                 name: "test".to_string(),
@@ -344,6 +350,7 @@ fn test_dag_builder_simple() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
         ],
     };
@@ -413,6 +420,7 @@ fn test_dag_cycle_detection() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
             JobDefinition {
                 name: "b".to_string(),
@@ -428,6 +436,7 @@ fn test_dag_cycle_detection() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
             JobDefinition {
                 name: "c".to_string(),
@@ -443,6 +452,7 @@ fn test_dag_cycle_detection() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
         ],
     };
@@ -515,6 +525,7 @@ fn test_dag_max_depth() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
             JobDefinition {
                 name: "test".to_string(),
@@ -530,6 +541,7 @@ fn test_dag_max_depth() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
             JobDefinition {
                 name: "deploy".to_string(),
@@ -545,6 +557,7 @@ fn test_dag_max_depth() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
         ],
     };

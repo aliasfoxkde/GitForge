@@ -74,6 +74,7 @@ pub fn create_simple_pipeline_definition() -> PipelineDefinition {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
             JobDefinition {
                 name: "test".to_string(),
@@ -89,6 +90,7 @@ pub fn create_simple_pipeline_definition() -> PipelineDefinition {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
         ],
     }

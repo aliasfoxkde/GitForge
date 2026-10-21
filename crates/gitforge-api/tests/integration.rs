@@ -101,6 +101,7 @@ fn webhook_job(needs: Vec<String>, timeout: Option<&str>) -> JobDefinition {
         }],
         timeout: timeout.map(str::to_string),
         retry: None,
+        skip_if: None,
     }
 }
 
@@ -1949,6 +1950,7 @@ async fn test_api_webhook_trigger_success() {
             }],
             timeout: Some("30s".to_string()),
             retry: None,
+            skip_if: None,
         }],
     };
     let pipeline = gitforge_db::models::Pipeline {
