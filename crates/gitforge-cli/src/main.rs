@@ -17,6 +17,8 @@ mod sync;
 pub use client::GitForgeClient;
 pub use config::Config;
 
+const AUTH_LOGIN_USAGE: &str = "gitforge auth --login <username>";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "gitforge",
@@ -428,7 +430,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     println!("⚠️  Warning: Failed to clear credentials: {e}");
                 }
                 println!("👋 Logged out. Credentials cleared.");
-                println!("   Run `gitforge auth login <username>` to authenticate again.");
+                println!("   Run `{AUTH_LOGIN_USAGE}` to authenticate again.");
             } else if *status {
                 match api_client.auth_status().await {
                     Ok(status) => {
@@ -462,7 +464,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             if let Some(msg) = status.message {
                                 println!("   Reason: {msg}");
                             }
-                            println!("   Run `gitforge auth login <username>` to authenticate.");
+                            println!("   Run `{AUTH_LOGIN_USAGE}` to authenticate.");
                         }
                     }
                     Err(e) => {
@@ -518,7 +520,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 admin::bootstrap_first_admin(&database_url, username, email, &password, *confirm)
                     .await?;
             println!("✅ First administrator created successfully.");
-            println!("   Run `gitforge auth login --login <username>` to obtain a session token.");
+            println!("   Run `{AUTH_LOGIN_USAGE}` to obtain a session token.");
         }
 
         Commands::Repo {
@@ -969,7 +971,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         }
                     }
                 } else {
-                    println!("❌ Not authenticated. Run `gitforge auth login <username>` first.");
+                    println!("❌ Not authenticated. Run `{AUTH_LOGIN_USAGE}` first.");
                 }
             } else if *pull {
                 if let Some(ref t) = token {
@@ -988,7 +990,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         }
                     }
                 } else {
-                    println!("❌ Not authenticated. Run `gitforge auth login <username>` first.");
+                    println!("❌ Not authenticated. Run `{AUTH_LOGIN_USAGE}` first.");
                 }
             }
         }
@@ -1095,6 +1097,16 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_login_usage_is_parseable_by_the_cli() {
+        let cli = Cli::try_parse_from(AUTH_LOGIN_USAGE.split_whitespace())
+            .expect("the displayed login command must parse");
+        let Commands::Auth { login, .. } = cli.command else {
+            panic!("the displayed login command must select auth");
+        };
+        assert_eq!(login.as_deref(), Some("<username>"));
+    }
 
     fn test_cli(command: Commands) -> Cli {
         Cli {
