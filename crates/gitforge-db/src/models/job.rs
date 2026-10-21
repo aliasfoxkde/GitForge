@@ -17,6 +17,10 @@ pub enum JobStatus {
     TimedOut,
     /// The container backend — not the commit — failed the job (R6.3).
     InfrastructureFailure,
+    /// The job's `skip_if` condition evaluated to false, so the job was
+    /// never dispatched. Terminal, and distinct from `Succeeded`: the job
+    /// did not run, and a durable row that claims otherwise would be a lie.
+    Skipped,
 }
 
 impl JobStatus {
@@ -31,6 +35,7 @@ impl JobStatus {
             JobStatus::Cancelled => "cancelled",
             JobStatus::TimedOut => "timed_out",
             JobStatus::InfrastructureFailure => "infrastructure_failure",
+            JobStatus::Skipped => "skipped",
         }
     }
 
@@ -46,6 +51,7 @@ impl JobStatus {
             "cancelled" => Some(JobStatus::Cancelled),
             "timed_out" => Some(JobStatus::TimedOut),
             "infrastructure_failure" => Some(JobStatus::InfrastructureFailure),
+            "skipped" => Some(JobStatus::Skipped),
             _ => None,
         }
     }
@@ -59,6 +65,7 @@ impl JobStatus {
                 | JobStatus::Cancelled
                 | JobStatus::TimedOut
                 | JobStatus::InfrastructureFailure
+                | JobStatus::Skipped
         )
     }
 
@@ -79,6 +86,7 @@ impl JobStatus {
             JobStatus::Cancelled => gitforge_common::JobStatus::Cancelled,
             JobStatus::TimedOut => gitforge_common::JobStatus::TimedOut,
             JobStatus::InfrastructureFailure => gitforge_common::JobStatus::InfrastructureFailure,
+            JobStatus::Skipped => gitforge_common::JobStatus::Skipped,
         }
     }
 }
@@ -214,6 +222,17 @@ mod tests {
         assert!(JobStatus::Failed.is_terminal());
         assert!(JobStatus::Cancelled.is_terminal());
         assert!(JobStatus::TimedOut.is_terminal());
+    }
+
+    #[test]
+    fn test_job_status_skipped_round_trips_and_is_terminal() {
+        assert_eq!(JobStatus::Skipped.as_str(), "skipped");
+        assert_eq!(JobStatus::from_str("skipped"), Some(JobStatus::Skipped));
+        assert!(JobStatus::Skipped.is_terminal());
+        assert_eq!(
+            JobStatus::Skipped.to_common(),
+            gitforge_common::JobStatus::Skipped
+        );
     }
 
     #[test]

@@ -61,6 +61,31 @@ impl CiEngineState {
             .all(super::state::JobStateMachine::is_terminal)
     }
 
+    /// Settle the run's status once every job is terminal.
+    ///
+    /// Every terminal transition of a job funnels through here: the run's
+    /// status is a function of its jobs, so the last job to reach a terminal
+    /// state decides it. Skipping a job is such a transition — a run whose
+    /// tail was all skipped would otherwise stay `Running` forever with no
+    /// job left to settle it.
+    fn settle_status(&mut self) {
+        if !matches!(
+            self.status,
+            PipelineStatus::Pending | PipelineStatus::Running
+        ) {
+            return;
+        }
+        if !self.all_jobs_finished() {
+            return;
+        }
+        self.status = if self.all_jobs_succeeded() {
+            PipelineStatus::Succeeded
+        } else {
+            PipelineStatus::Failed
+        };
+        self.finished_at = Some(chrono::Utc::now());
+    }
+
     /// Check if all jobs succeeded or were skipped.
     /// Skipped jobs correctly didn't need to run (their skip_if was false);
     /// they count as succeeded for pipeline outcome.
@@ -92,6 +117,43 @@ impl CiEngineState {
             .map(|(id, _)| *id)
             .collect()
     }
+}
+
+/// Extract the `CI_CHANGE_*` variables a completed job published.
+///
+/// The `detect-changes` job prints its classification as `KEY=value` lines on
+/// stdout; the orchestrator parses the persisted job receipt and merges the
+/// result into the run's `pipeline_env` — the only environment `skip_if`
+/// expressions are evaluated against. A job receipt that carries no such
+/// lines contributes nothing.
+///
+/// Only `CI_CHANGE_`-prefixed keys are taken: the receipt is job output, and
+/// an untrusted job must not be able to seed arbitrary environment variables
+/// into the engine's expression sandbox.
+pub fn extract_change_env(result_json: &str) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    let Ok(receipt) = serde_json::from_str::<serde_json::Value>(result_json) else {
+        return env;
+    };
+    let Some(step_results) = receipt.get("step_results").and_then(|v| v.as_array()) else {
+        return env;
+    };
+    for step in step_results {
+        let Some(stdout) = step.get("stdout").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        for line in stdout.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if !key.starts_with("CI_CHANGE_") {
+                continue;
+            }
+            env.insert(key.to_string(), value.trim().to_string());
+        }
+    }
+    env
 }
 
 /// Evaluate a `skip_if` condition expression using the CI_CHANGE_* environment
@@ -410,23 +472,32 @@ impl CiEngine {
     /// `start`; downstream jobs are released through this method.
     /// Jobs with `skip_if` conditions that evaluate to false are transitioned
     /// to `Skipped` instead of queued.
+    ///
+    /// The release is iterated to a fixed point. A skipped job satisfies its
+    /// dependants' dependency check (skipped counts as succeeded), so a chain
+    /// of skips releases the next stage — and the release must not depend on
+    /// the definition listing a job before the job it depends on.
     pub async fn queue_ready_jobs(&self) -> Result<Vec<JobId>> {
         let mut state = self.state.write().await;
         let mut queued = Vec::new();
-        for node in &self.graph.nodes {
-            let Some(job_state) = state.jobs.get(&node.id) else {
-                continue;
-            };
-            if job_state.status() != JobStatus::Pending {
-                continue;
-            }
-            let deps_satisfied = node.dependencies.iter().all(|dep_id| {
-                state.jobs.get(dep_id).is_some_and(|dependency| {
-                    dependency.status() == JobStatus::Succeeded
-                        || dependency.status() == JobStatus::Skipped
-                })
-            });
-            if deps_satisfied {
+        loop {
+            let mut released = false;
+            for node in &self.graph.nodes {
+                let Some(job_state) = state.jobs.get(&node.id) else {
+                    continue;
+                };
+                if job_state.status() != JobStatus::Pending {
+                    continue;
+                }
+                let deps_satisfied = node.dependencies.iter().all(|dep_id| {
+                    state.jobs.get(dep_id).is_some_and(|dependency| {
+                        dependency.status() == JobStatus::Succeeded
+                            || dependency.status() == JobStatus::Skipped
+                    })
+                });
+                if !deps_satisfied {
+                    continue;
+                }
                 // Evaluate skip_if condition using pipeline_env from detect-changes
                 let should_run =
                     eval_skip_if(&node.definition.skip_if, &state.pipeline_env).await?;
@@ -435,14 +506,24 @@ impl CiEngine {
                     if let Some(job_state) = state.jobs.get_mut(&node.id) {
                         job_state.skip()?;
                     }
+                    released = true;
                     continue;
                 }
                 if let Some(job_state) = state.jobs.get_mut(&node.id) {
                     job_state.queue()?;
                     queued.push(node.id);
                 }
+                released = true;
+            }
+            if !released {
+                break;
             }
         }
+        // Skipping is a terminal transition like any other: without settling
+        // the run's status here, a run whose tail was all skipped stayed
+        // `Running` with no job left to settle it, and the durable row never
+        // reached a terminal state.
+        state.settle_status();
         Ok(queued)
     }
 
@@ -475,14 +556,7 @@ impl CiEngine {
             job_state.succeed(exit_code)?;
 
             // Check if pipeline is complete
-            if state.all_jobs_finished() {
-                state.status = if state.all_jobs_succeeded() {
-                    PipelineStatus::Succeeded
-                } else {
-                    PipelineStatus::Failed
-                };
-                state.finished_at = Some(chrono::Utc::now());
-            }
+            state.settle_status();
         }
         Ok(())
     }
@@ -502,10 +576,7 @@ impl CiEngine {
         // the run workspace, and finalizing here would fence off their
         // completions ("unknown pipeline run") and delete the checkout
         // out from under their containers.
-        if state.all_jobs_finished() {
-            state.status = PipelineStatus::Failed;
-            state.finished_at = Some(chrono::Utc::now());
-        }
+        state.settle_status();
         Ok(())
     }
 
@@ -518,10 +589,7 @@ impl CiEngine {
         self.cancel_descendants(&mut state, job_id);
         // Same reasoning as `fail_job`: wait for all jobs to finish
         // before declaring the pipeline failed.
-        if state.all_jobs_finished() {
-            state.status = PipelineStatus::Failed;
-            state.finished_at = Some(chrono::Utc::now());
-        }
+        state.settle_status();
         Ok(())
     }
 
@@ -596,6 +664,21 @@ impl CiEngine {
     pub async fn merge_job_result(&self, job_id: JobId, env_vars: &HashMap<String, String>) {
         let mut state = self.state.write().await;
         state.merge_job_env(job_id, env_vars);
+    }
+
+    /// The jobs whose `skip_if` condition evaluated to false.
+    ///
+    /// The orchestrator persists a durable row for each of them: a skipped
+    /// job never reaches a runner, so nothing else would ever move its row
+    /// off `pending` and the run would never settle.
+    pub async fn skipped_jobs(&self) -> Vec<JobId> {
+        let state = self.state.read().await;
+        state
+            .jobs
+            .iter()
+            .filter(|(_, job_state)| job_state.status() == JobStatus::Skipped)
+            .map(|(job_id, _)| *job_id)
+            .collect()
     }
 
     /// Get job info
@@ -1227,5 +1310,172 @@ mod tests {
         let queued = rebuilt.queue_ready_jobs().await.unwrap();
         assert_eq!(queued, vec![test_id]);
         assert_eq!(rebuilt.ready_jobs().await, vec![test_id]);
+    }
+
+    /// A pipeline whose tail is gated on the change classification.
+    fn make_gated_pipeline(skip_if: Option<String>) -> PipelineDefinition {
+        let step = |name: &str| StepDefinition {
+            name: name.to_string(),
+            run: "true".to_string(),
+            env: None,
+            working_directory: None,
+            condition: None,
+        };
+        PipelineDefinition {
+            name: "gated".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![
+                JobDefinition {
+                    name: "detect-changes".to_string(),
+                    image: "rust:latest".to_string(),
+                    needs: vec![],
+                    env: HashMap::new(),
+                    steps: vec![step("detect")],
+                    timeout: None,
+                    retry: None,
+                    skip_if: None,
+                },
+                JobDefinition {
+                    name: "clippy".to_string(),
+                    image: "rust:latest".to_string(),
+                    needs: vec!["detect-changes".to_string()],
+                    env: HashMap::new(),
+                    steps: vec![step("lint")],
+                    timeout: None,
+                    retry: None,
+                    skip_if,
+                },
+            ],
+        }
+    }
+
+    fn job_id(engine: &CiEngine, name: &str) -> JobId {
+        engine
+            .graph()
+            .nodes
+            .iter()
+            .find(|node| node.name == name)
+            .map(|node| node.id)
+            .expect("job exists in the graph")
+    }
+
+    #[test]
+    fn extract_change_env_reads_the_classification_from_a_receipt() {
+        let receipt = serde_json::json!({
+            "job_id": "b8c751e8",
+            "success": true,
+            "step_results": [
+                {
+                    "exit_code": 0,
+                    "stdout": "CI_CHANGE_FILE_COUNT=16\nCI_CHANGE_INCLUDE_CODE=1\nCI_CHANGE_INCLUDE_DOCS=0\n",
+                    "stderr": ""
+                }
+            ],
+            "artifacts": []
+        })
+        .to_string();
+
+        let env = extract_change_env(&receipt);
+        assert_eq!(
+            env.get("CI_CHANGE_FILE_COUNT").map(String::as_str),
+            Some("16")
+        );
+        assert_eq!(
+            env.get("CI_CHANGE_INCLUDE_CODE").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get("CI_CHANGE_INCLUDE_DOCS").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn extract_change_env_ignores_foreign_variables_and_junk() {
+        let receipt = serde_json::json!({
+            "step_results": [{"stdout": "PATH=/usr/bin\nHOME=/root\nnot an assignment\n"}]
+        })
+        .to_string();
+
+        assert!(extract_change_env(&receipt).is_empty());
+        assert!(extract_change_env("not json at all").is_empty());
+        assert!(extract_change_env("{}").is_empty());
+    }
+
+    /// The defect this guards: an unmerged receipt leaves the expression
+    /// environment empty, every condition evaluates false, and the engine
+    /// prunes the gate that should have run.
+    #[tokio::test]
+    async fn merged_change_env_keeps_the_gated_job_running() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let pipeline = make_gated_pipeline(Some(
+            r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string(),
+        ));
+        let engine = CiEngine::new(event, pipeline).await.unwrap();
+        engine.start().await.unwrap();
+
+        let detect = job_id(&engine, "detect-changes");
+        let clippy = job_id(&engine, "clippy");
+        engine
+            .assign_job(detect, gitforge_common::RunnerId::new())
+            .await
+            .unwrap();
+        engine.start_job(detect).await.unwrap();
+
+        let receipt = serde_json::json!({
+            "step_results": [{"stdout": "CI_CHANGE_INCLUDE_CODE=1\n"}]
+        })
+        .to_string();
+        engine
+            .merge_job_result(detect, &extract_change_env(&receipt))
+            .await;
+        engine.succeed_job(detect, 0).await.unwrap();
+
+        let queued = engine.queue_ready_jobs().await.unwrap();
+        assert_eq!(queued, vec![clippy]);
+        let state = engine.state().await;
+        assert_eq!(state.jobs[&clippy].status(), JobStatus::Queued);
+    }
+
+    /// The same pipeline with an empty environment: the gate does not apply,
+    /// so the job is skipped — and the run must still settle.
+    #[tokio::test]
+    async fn a_skipped_tail_settles_the_run() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let pipeline = make_gated_pipeline(Some(
+            r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string(),
+        ));
+        let engine = CiEngine::new(event, pipeline).await.unwrap();
+        engine.start().await.unwrap();
+
+        let detect = job_id(&engine, "detect-changes");
+        let clippy = job_id(&engine, "clippy");
+        engine
+            .assign_job(detect, gitforge_common::RunnerId::new())
+            .await
+            .unwrap();
+        engine.start_job(detect).await.unwrap();
+        engine.succeed_job(detect, 0).await.unwrap();
+
+        let queued = engine.queue_ready_jobs().await.unwrap();
+        assert!(queued.is_empty());
+        let state = engine.state().await;
+        assert_eq!(state.jobs[&clippy].status(), JobStatus::Skipped);
+        // The run settles: a skipped job is a terminal transition like any
+        // other, and the run's status is a function of its jobs.
+        assert_eq!(state.status, PipelineStatus::Succeeded);
+        assert_eq!(engine.skipped_jobs().await, vec![clippy]);
     }
 }

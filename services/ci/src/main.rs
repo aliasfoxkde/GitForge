@@ -2473,6 +2473,66 @@ async fn reconcile_fenced_engines(
     reconciled
 }
 
+/// Merge the `CI_CHANGE_*` variables a completed job published into the
+/// engine's run environment.
+///
+/// `skip_if` expressions are evaluated against exactly this environment, so a
+/// job whose variables are never merged prunes every gated downstream job:
+/// the expression sees an unset variable, evaluates false, and the gate that
+/// should have run is silently skipped. The receipt is read from the durable
+/// job row, which the scheduler writes before it publishes the completion.
+async fn merge_completed_job_env(
+    engine: &CiEngine,
+    pool: Option<&gitforge_db::Pool>,
+    job_id: gitforge_common::JobId,
+) {
+    let Some(pool) = pool else {
+        return;
+    };
+    let job = match gitforge_db::queries::JobQueries::get(pool, job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, %job_id, "failed to read completed job receipt");
+            return;
+        }
+    };
+    let Some(result_json) = job.result_json.as_deref() else {
+        return;
+    };
+    let env = gitforge_ci::engine::extract_change_env(result_json);
+    if env.is_empty() {
+        return;
+    }
+    engine.merge_job_result(job_id, &env).await;
+    tracing::info!(%job_id, variables = env.len(), "merged job output into pipeline env");
+}
+
+/// Persist a durable row for every job the engine skipped.
+///
+/// A skipped job never reaches a runner, so nothing else would move its
+/// planned row off `pending` — the run would never settle and the release
+/// gate would never see the row it requires. The receipt is deterministic, so
+/// a repeated write is idempotent.
+async fn persist_skipped_job_rows(pool: Option<&gitforge_db::Pool>, engine: &CiEngine) {
+    let Some(pool) = pool else {
+        return;
+    };
+    for job_id in engine.skipped_jobs().await {
+        let receipt = serde_json::json!({
+            "job_id": job_id.to_string(),
+            "skipped": true,
+            "status": "skipped",
+        })
+        .to_string();
+        if let Err(error) =
+            gitforge_db::queries::JobQueries::complete(pool, job_id, "skipped", &receipt).await
+        {
+            tracing::error!(%error, %job_id, "failed to persist skipped job row");
+        }
+    }
+}
+
 async fn run_scheduler_event_consumer(
     scheduler: Arc<Scheduler>,
     pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
@@ -2523,9 +2583,17 @@ async fn run_scheduler_event_consumer(
                 tracing::error!(%job_id, %error, "failed to mark job succeeded");
                 continue;
             }
+            // The job's receipt is the only source of the CI_CHANGE_* vars
+            // that `skip_if` conditions are evaluated against. Merging them
+            // has to happen before the downstream release: an unmerged
+            // receipt leaves the expression environment empty, every
+            // condition evaluates false, and the engine silently prunes
+            // every gated job.
+            merge_completed_job_env(&engine, scheduler_db.as_ref(), job_id).await;
             if let Err(error) = engine.queue_ready_jobs().await {
                 tracing::error!(%pipeline_run_id, %error, "failed to queue downstream jobs");
             }
+            persist_skipped_job_rows(scheduler_db.as_ref(), &engine).await;
         } else {
             if let Err(error) = engine
                 .fail_job(job_id, -1, "runner reported failure".to_string())
@@ -2887,11 +2955,14 @@ async fn rebuild_live_engines(
             .any(|job| matches!(job.status.as_str(), "running" | "assigned"));
         let mut durable_rows = Vec::with_capacity(rows.len());
         let mut graftable = true;
-        for job in rows {
+        for job in &rows {
             match gitforge_db::models::JobStatus::from_str(&job.status) {
-                Some(status) => {
-                    durable_rows.push((job.id, job.name, status.to_common(), job.started_at))
-                }
+                Some(status) => durable_rows.push((
+                    job.id,
+                    job.name.clone(),
+                    status.to_common(),
+                    job.started_at,
+                )),
                 None => {
                     tracing::warn!(
                         run = %run.id,
@@ -2974,9 +3045,26 @@ async fn rebuild_live_engines(
         // re-enqueued (the upsert refreshes the durable row; the scheduler
         // deduplicates its in-memory queue), and any stage whose
         // predecessors all succeeded is released now.
+        //
+        // The rebuilt engine starts with an empty run environment: the
+        // `CI_CHANGE_*` vars live in the detect-changes job's receipt, so
+        // they are re-merged from the durable rows before the release. A
+        // release evaluated against an empty environment would prune every
+        // gated job.
+        for job in &rows {
+            let Some(result_json) = job.result_json.as_deref() else {
+                continue;
+            };
+            let env = gitforge_ci::engine::extract_change_env(result_json);
+            if env.is_empty() {
+                continue;
+            }
+            engine.merge_job_result(job.id, &env).await;
+        }
         if let Err(error) = engine.queue_ready_jobs().await {
             tracing::warn!(run = %run.id, %error, "post-rebuild stage release failed");
         }
+        persist_skipped_job_rows(Some(pool), &engine).await;
         enqueue_ready_jobs(scheduler, &engine, run.id, run.repo_id, workspace_path).await;
         if held {
             tracing::info!(run = %run.id, "redrove stalled chain over live engine");
@@ -3992,6 +4080,7 @@ mod tests {
             }],
             timeout: None,
             retry: None,
+            skip_if: None,
         };
         let definition = PipelineDefinition {
             name: "planning-test".to_string(),
@@ -4212,6 +4301,7 @@ mod tests {
             }],
             timeout: None,
             retry: None,
+            skip_if: None,
         };
         let definition = PipelineDefinition {
             name: "stall-test".to_string(),
@@ -5814,5 +5904,206 @@ jobs:
             "the failure cause is recorded: {:?}",
             settled.error
         );
+    }
+
+    /// A gated pipeline: the classification job publishes `CI_CHANGE_*`, and
+    /// the gated job runs only when the environment says its class changed.
+    fn gated_definition(skip_if: Option<String>) -> PipelineDefinition {
+        let step = |name: &str| StepDefinition {
+            name: name.to_string(),
+            run: "true".to_string(),
+            env: None,
+            working_directory: None,
+            condition: None,
+        };
+        PipelineDefinition {
+            name: "gated-test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![
+                JobDefinition {
+                    name: "detect-changes".to_string(),
+                    image: "rust:latest".to_string(),
+                    needs: vec![],
+                    env: HashMap::new(),
+                    steps: vec![step("detect")],
+                    timeout: None,
+                    retry: None,
+                    skip_if: None,
+                },
+                JobDefinition {
+                    name: "clippy".to_string(),
+                    image: "rust:latest".to_string(),
+                    needs: vec!["detect-changes".to_string()],
+                    env: HashMap::new(),
+                    steps: vec![step("lint")],
+                    timeout: None,
+                    retry: None,
+                    skip_if,
+                },
+            ],
+        }
+    }
+
+    /// A durable pipeline and run for the gated fixtures — the planned job
+    /// rows reference the run.
+    async fn gated_run(
+        pool: &gitforge_db::Pool,
+        repo_id: gitforge_common::RepoId,
+        pipeline_id: gitforge_common::PipelineId,
+        definition: &PipelineDefinition,
+    ) -> gitforge_db::models::PipelineRun {
+        gitforge_db::queries::PipelineQueries::create(
+            pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: definition.name.clone(),
+                trigger_type: "push".to_string(),
+                config: serde_json::to_value(definition).unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline_id,
+            repo_id,
+            "push".to_string(),
+            "abc123".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(pool, &run)
+            .await
+            .unwrap();
+        run
+    }
+
+    /// The orchestration defect this guards: the completed job's receipt is
+    /// the only source of the classification, and an unmerged receipt leaves
+    /// the expression environment empty — every condition then evaluates
+    /// false and the engine prunes the gate that should have run.
+    #[tokio::test]
+    async fn test_completed_receipt_feeds_the_skip_environment() {
+        let (pool, repo_id) = test_pool_with_repository("/tmp/gated-repo".to_string()).await;
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let definition = gated_definition(Some(
+            r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string(),
+        ));
+        let run = gated_run(&pool, repo_id, pipeline_id, &definition).await;
+        let event = PipelineTriggerEvent::new(
+            pipeline_id,
+            repo_id,
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, definition).await.unwrap();
+        let planned: HashMap<String, gitforge_common::JobId> = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(id, name)| (name, id))
+            .collect();
+        persist_planned_jobs(&pool, &engine, run.id, None)
+            .await
+            .unwrap();
+
+        // The classification job's receipt, as the runner reported it.
+        let receipt = serde_json::json!({
+            "job_id": planned["detect-changes"].to_string(),
+            "success": true,
+            "exit_code": 0,
+            "step_results": [
+                {"exit_code": 0, "stdout": "CI_CHANGE_INCLUDE_CODE=1\n", "stderr": ""}
+            ],
+            "artifacts": []
+        })
+        .to_string();
+        gitforge_db::queries::JobQueries::complete(
+            &pool,
+            planned["detect-changes"],
+            "succeeded",
+            &receipt,
+        )
+        .await
+        .unwrap();
+
+        merge_completed_job_env(&engine, Some(&pool), planned["detect-changes"]).await;
+
+        let state = engine.state().await;
+        assert_eq!(
+            state
+                .pipeline_env
+                .get("CI_CHANGE_INCLUDE_CODE")
+                .map(String::as_str),
+            Some("1"),
+            "the receipt's classification reaches the expression environment"
+        );
+
+        // The gated job now runs instead of being pruned.
+        engine.start().await.unwrap();
+        engine
+            .assign_job(planned["detect-changes"], gitforge_common::RunnerId::new())
+            .await
+            .unwrap();
+        engine.start_job(planned["detect-changes"]).await.unwrap();
+        engine
+            .succeed_job(planned["detect-changes"], 0)
+            .await
+            .unwrap();
+        let queued = engine.queue_ready_jobs().await.unwrap();
+        assert_eq!(queued, vec![planned["clippy"]]);
+    }
+
+    /// A skipped job never reaches a runner, so nothing else moves its
+    /// planned row off `pending`: without a durable skip row the run never
+    /// settles and the release gate never sees the row it requires.
+    #[tokio::test]
+    async fn test_skipped_jobs_get_a_durable_row() {
+        let (pool, repo_id) = test_pool_with_repository("/tmp/gated-repo".to_string()).await;
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let definition = gated_definition(Some(
+            r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string(),
+        ));
+        let run = gated_run(&pool, repo_id, pipeline_id, &definition).await;
+        let event = PipelineTriggerEvent::new(
+            pipeline_id,
+            repo_id,
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, definition).await.unwrap();
+        let planned: HashMap<String, gitforge_common::JobId> = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(id, name)| (name, id))
+            .collect();
+        persist_planned_jobs(&pool, &engine, run.id, None)
+            .await
+            .unwrap();
+
+        // No classification was ever merged, so the condition is false and
+        // the gated job is skipped.
+        engine.start().await.unwrap();
+        engine
+            .assign_job(planned["detect-changes"], gitforge_common::RunnerId::new())
+            .await
+            .unwrap();
+        engine.start_job(planned["detect-changes"]).await.unwrap();
+        engine
+            .succeed_job(planned["detect-changes"], 0)
+            .await
+            .unwrap();
+        let queued = engine.queue_ready_jobs().await.unwrap();
+        assert!(queued.is_empty());
+        assert_eq!(engine.skipped_jobs().await, vec![planned["clippy"]]);
+
+        persist_skipped_job_rows(Some(&pool), &engine).await;
+
+        let row = gitforge_db::queries::JobQueries::get(&pool, planned["clippy"])
+            .await
+            .unwrap()
+            .expect("skipped job row");
+        assert_eq!(row.status, "skipped");
+        assert!(row.finished_at.is_some());
     }
 }
