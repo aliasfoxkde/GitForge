@@ -3410,6 +3410,25 @@ pub struct RefreshTokenRow {
 pub struct RefreshTokenQueries;
 
 impl RefreshTokenQueries {
+    /// Compute the storage/lookup digest for a refresh credential: an
+    /// unsalted SHA-256 hex string. Bcrypt cannot be used here — its random
+    /// salt makes every digest of the same value differ, so an equality
+    /// lookup could never match. Unsalted is the right call for a lookup key
+    /// over a credential with 244 bits of entropy (unguessable, so there is
+    /// nothing to brute-force); the slow, salted path stays reserved for
+    /// human passwords.
+    ///
+    /// Every consumer that must match a stored row — issuance (API login),
+    /// rotation (API refresh/logout), and read-only presentation (git-server
+    /// Smart HTTP Basic auth) — resolves the digest through this function so
+    /// the three paths can never drift apart.
+    pub fn credential_digest(value: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     /// Store a refresh token (digest only) for a user.
     pub async fn create(
         pool: &Pool,

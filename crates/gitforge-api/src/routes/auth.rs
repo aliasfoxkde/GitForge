@@ -43,18 +43,12 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
-/// Compute the storage/lookup digest for a refresh credential: an
-/// unsalted SHA-256 hex string. Bcrypt cannot be used here — its random
-/// salt makes every digest of the same value differ, so an equality
-/// lookup could never match. Unsalted is the right call for a lookup key
-/// over a credential with 244 bits of entropy (unguessable, so there is
-/// nothing to brute-force); the slow, salted path stays reserved for
-/// human passwords.
+/// Compute the storage/lookup digest for a refresh credential. Delegates
+/// to `RefreshTokenQueries::credential_digest` — the single digest
+/// definition shared with every other credential consumer (git-server's
+/// Smart HTTP Basic auth validates presentations of the same credential).
 fn refresh_credential_digest(value: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    hex::encode(hasher.finalize())
+    RefreshTokenQueries::credential_digest(value)
 }
 
 /// Mint a refresh credential, persist only its digest, and return the

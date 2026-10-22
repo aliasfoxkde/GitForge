@@ -59,6 +59,9 @@ enum Commands {
         /// Show user info
         #[arg(long)]
         whoami: bool,
+        /// git-credential helper entry point for Git over HTTP
+        #[command(subcommand)]
+        command: Option<AuthCommand>,
     },
     /// Local first-administrator bootstrap
     Admin {
@@ -233,6 +236,32 @@ enum Commands {
     },
 }
 
+/// Sub-commands of `gitforge auth`.
+#[derive(Subcommand, Debug, Clone)]
+enum AuthCommand {
+    /// Speak the git-credential helper protocol so standard git clients
+    /// authenticate to GitForge over HTTP from the CLI's stored session
+    /// (wire once: `git config --global credential.helper
+    /// '!gitforge auth git-credential'`). `get` serves the live refresh
+    /// credential for the configured server host; `store`/`erase` are
+    /// no-ops because the CLI config stays the source of truth.
+    GitCredential {
+        /// Operation git requests
+        #[command(subcommand)]
+        operation: GitCredentialOperation,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+enum GitCredentialOperation {
+    /// Serve credentials for a URL git is about to contact
+    Get,
+    /// Accept credentials git wants persisted (no-op; CLI owns the store)
+    Store,
+    /// Drop credentials for a URL (no-op; use `gitforge auth --logout`)
+    Erase,
+}
+
 fn run_git(args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
@@ -279,6 +308,146 @@ async fn watch_pipeline_run(client: &GitForgeClient, run_id: &str) -> Result<Str
 /// the name and make the repo unresolvable for git serving.
 fn bare_repo_name(arg: &str) -> &str {
     arg.trim_matches('/').rsplit('/').next().unwrap_or(arg)
+}
+
+/// One request delivered by git on the credential-helper protocol
+/// (gitcredentials(7)). Only the attributes the helper decision needs are
+/// captured; unknown attributes are ignored per the protocol.
+struct CredentialRequest {
+    /// `host[:port]` git is about to contact.
+    host: Option<String>,
+}
+
+/// Parse the newline-separated `key=value` request git writes to the
+/// helper's stdin. Reading to EOF (not just the blank line git terminates
+/// with) keeps git's writer side from seeing EPIPE.
+fn parse_credential_request(input: &str) -> CredentialRequest {
+    let mut host = None;
+    for line in input.lines() {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            if key == "host" {
+                host = Some(value.to_string());
+            }
+        }
+    }
+    CredentialRequest { host }
+}
+
+/// Host\[:port\] portion of a configured server URL, so credential requests
+/// can be matched without pulling in a URL crate for one split.
+fn server_host_of(server_url: &str) -> &str {
+    let without_scheme = server_url
+        .split_once("://")
+        .map_or(server_url, |(_, rest)| rest);
+    without_scheme.split('/').next().unwrap_or(without_scheme)
+}
+
+/// Platform-default Git Smart HTTP port (git-server `HTTP_PORT` default).
+/// Known-fixed so the helper can serve the standard deployment — where
+/// `server_url` names the API (`:42780`) and git traffic goes to the git
+/// server (`:42782`) — without an extra config field.
+const DEFAULT_GIT_HTTP_AUTHORITY_SUFFIX: &str = ":42782";
+
+/// Authorities (host\[:port\]) the stored session may be served to:
+/// `server_url`'s own authority, an explicit `git_server_url` override,
+/// and the same hostname on the platform's default git port. Never the
+/// bare hostname — a sibling service on another port of the same host
+/// must not be able to harvest the account credential.
+fn served_authorities(config: &Config, server_url: &str) -> Vec<String> {
+    let mut authorities = Vec::with_capacity(3);
+    let server_authority = server_host_of(server_url).to_string();
+    let server_hostname = server_authority
+        .split_once(':')
+        .map_or(server_authority.as_str(), |(hostname, _)| hostname);
+    authorities.push(server_authority.clone());
+    let default_git_authority = format!("{server_hostname}{DEFAULT_GIT_HTTP_AUTHORITY_SUFFIX}");
+    if server_authority != default_git_authority {
+        authorities.push(default_git_authority);
+    }
+    if let Some(git_server_url) = &config.git_server_url {
+        let authority = server_host_of(git_server_url).to_string();
+        if !authorities.contains(&authority) {
+            authorities.push(authority);
+        }
+    }
+    authorities
+}
+
+/// Decide which credentials to serve for a request, or `None` to let git
+/// fall through to the next helper or an interactive prompt.
+///
+/// Pure (config + request in, answer out) so the decision table is
+/// testable without stdin or a network. The served credential is the
+/// stored refresh credential — the same one the git-server's Smart HTTP
+/// gate validates read-only — and it is served only when the request
+/// targets a GitForge authority (see [`served_authorities`]) and the
+/// stored session is not already past its recorded expiry.
+fn credential_for(
+    config: &Config,
+    server_url: &str,
+    request: &CredentialRequest,
+) -> Option<(String, String)> {
+    let credential = config.refresh_token.as_ref()?;
+    // An expired session would just draw a 401 challenge; staying silent
+    // lets a prior helper or prompt produce a working answer instead.
+    if let Some(expires_at) = config.refresh_expires_at.as_deref() {
+        if chrono::DateTime::parse_from_rfc3339(expires_at)
+            .is_ok_and(|t| t.with_timezone(&chrono::Utc) <= chrono::Utc::now())
+        {
+            return None;
+        }
+    }
+    // Only answer for the GitForge deployment's own authorities; anything
+    // else belongs to the user's other credential helpers.
+    if let Some(host) = &request.host {
+        if !served_authorities(config, server_url)
+            .iter()
+            .any(|authority| host.eq_ignore_ascii_case(authority))
+        {
+            return None;
+        }
+    }
+    let username = config
+        .username
+        .clone()
+        .unwrap_or_else(|| "gitforge".to_string());
+    Some((username, credential.clone()))
+}
+
+/// Serve one git-credential helper operation
+/// (`gitforge auth git-credential <get|store|erase>`).
+///
+/// `get` answers from the stored session; `store`/`erase` consume their
+/// stdin and succeed silently because the CLI config remains the
+/// credential store — persisting git-side copies would go stale at the
+/// next server-side rotation, and erasing on a 401 would drop a session
+/// the CLI could have renewed.
+fn run_git_credential(
+    operation: GitCredentialOperation,
+    config: &Config,
+    server: &str,
+) -> Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    match operation {
+        GitCredentialOperation::Get => {
+            let request = parse_credential_request(&input);
+            if let Some((username, credential)) = credential_for(config, server, &request) {
+                println!("username={username}");
+                println!("password={credential}");
+                println!();
+            }
+            // No output = no answer: git moves on to the next helper or
+            // prompts, which is the correct behavior for a host we do not
+            // serve or an absent session.
+        }
+        GitCredentialOperation::Store | GitCredentialOperation::Erase => {}
+    }
+    Ok(())
 }
 
 /// Renew the stored session when the JWT is missing or about to lapse.
@@ -353,6 +522,18 @@ async fn renew_session(server: &str, config: &mut Config) -> Result<()> {
 pub async fn run_cli(cli: Cli) -> Result<()> {
     let mut config = Config::load().unwrap_or_default();
     let server = cli.server.unwrap_or_else(|| config.server_url.clone());
+    // The credential helper is machine-triggered on every git fetch and
+    // push. It must answer offline and fast: no session renewal (which
+    // rotates the stored credential and does network I/O), no prompts.
+    // Serving the stored refresh credential read-only is exactly what the
+    // git-server validates.
+    if let Commands::Auth {
+        command: Some(AuthCommand::GitCredential { operation }),
+        ..
+    } = &cli.command
+    {
+        return run_git_credential(*operation, &config, &server);
+    }
     if let Err(error) = renew_session(&server, &mut config).await {
         tracing::debug!("session renewal skipped: {error}");
     }
@@ -364,6 +545,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             logout,
             status,
             whoami,
+            ..
         } => {
             let api_client = GitForgeClient::new(&server, token.clone());
 
@@ -394,6 +576,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                                 .to_rfc3339(),
                         );
                         config.refresh_token = response.refresh_token;
+                        // Remembered so `auth git-credential get` can answer
+                        // `username=` offline (identity is advisory to the
+                        // server, but git asks for it).
+                        config.username = Some(username.clone());
                         if let Some(refresh_expires_in) = response.refresh_expires_in {
                             config.refresh_expires_at = Some(
                                 (chrono::Utc::now()
@@ -404,6 +590,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         if let Err(e) = config.save() {
                             tracing::warn!("Failed to save token: {}", e);
                         }
+                        println!(
+                            "   Git over HTTP: git config --global credential.helper \
+                             '!gitforge auth git-credential'"
+                        );
                     }
                     Err(e) => {
                         println!("❌ Login failed: {e}");
@@ -424,6 +614,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 config.token = None;
                 config.token_expires_at = None;
                 config.refresh_expires_at = None;
+                config.username = None;
                 if let Err(e) = config.save() {
                     println!("⚠️  Warning: Failed to clear credentials: {e}");
                 }
@@ -1112,6 +1303,7 @@ mod tests {
             logout: false,
             status: true,
             whoami: false,
+            command: None,
         });
         assert!(run_cli(cli).await.is_ok());
     }
@@ -1123,6 +1315,7 @@ mod tests {
             logout: false,
             status: false,
             whoami: false,
+            command: None,
         });
         assert!(run_cli(cli).await.is_ok());
     }
@@ -1149,8 +1342,164 @@ mod tests {
             logout: true,
             status: false,
             whoami: false,
+            command: None,
         });
         assert!(run_cli(cli).await.is_ok());
+    }
+
+    // ─── git-credential helper ───────────────────────────────────────────────
+
+    fn credential_config() -> Config {
+        Config {
+            server_url: "http://192.168.1.202:42780".to_string(),
+            username: Some("alice".to_string()),
+            refresh_token: Some("gfrt-live-credential".to_string()),
+            refresh_expires_at: Some((chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339()),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn test_parse_credential_request_reads_host_and_stops_at_blank_line() {
+        let request = parse_credential_request(
+            "protocol=http\nhost=192.168.1.202:42782\npath=alice/repo.git\n\nusername=ignored-after-blank\n",
+        );
+        assert_eq!(request.host.as_deref(), Some("192.168.1.202:42782"));
+    }
+
+    #[test]
+    fn test_parse_credential_request_without_host() {
+        assert!(parse_credential_request("protocol=http\n").host.is_none());
+        assert!(parse_credential_request("").host.is_none());
+    }
+
+    #[test]
+    fn test_server_host_of_strips_scheme_and_path() {
+        assert_eq!(
+            server_host_of("http://192.168.1.202:42780/api"),
+            "192.168.1.202:42780"
+        );
+        assert_eq!(
+            server_host_of("http://gitforge.example.com"),
+            "gitforge.example.com"
+        );
+        // No scheme: still just the authority portion.
+        assert_eq!(
+            server_host_of("192.168.1.202:42780/x"),
+            "192.168.1.202:42780"
+        );
+    }
+
+    #[test]
+    fn test_credential_for_matching_host_serves_stored_credential() {
+        let config = credential_config();
+        let request = CredentialRequest {
+            host: Some("192.168.1.202:42780".to_string()),
+        };
+        let served = credential_for(&config, &config.server_url, &request);
+        assert_eq!(
+            served,
+            Some(("alice".to_string(), "gfrt-live-credential".to_string()))
+        );
+    }
+
+    /// The standard deployment: `server_url` names the API (:42780) while
+    /// git traffic targets the git-server's default port (:42782). This is
+    /// the primary clone/push flow — it must be answered out of the box.
+    #[test]
+    fn test_credential_for_serves_default_git_port_on_server_hostname() {
+        let config = credential_config();
+        let request = CredentialRequest {
+            host: Some("192.168.1.202:42782".to_string()),
+        };
+        assert!(credential_for(&config, &config.server_url, &request).is_some());
+    }
+
+    /// Same hostname, but neither the API port nor the default git port:
+    /// a sibling service must not be able to harvest the credential by
+    /// sharing the host.
+    #[test]
+    fn test_credential_for_unknown_port_on_server_hostname_is_silent() {
+        let config = credential_config();
+        let request = CredentialRequest {
+            host: Some("192.168.1.202:9999".to_string()),
+        };
+        assert!(credential_for(&config, &config.server_url, &request).is_none());
+    }
+
+    /// Deployments that move the git HTTP server to a non-default port
+    /// configure it explicitly; that authority is served too.
+    #[test]
+    fn test_credential_for_explicit_git_server_url_is_served() {
+        let mut config = credential_config();
+        config.git_server_url = Some("http://192.168.1.202:42900".to_string());
+        let request = CredentialRequest {
+            host: Some("192.168.1.202:42900".to_string()),
+        };
+        assert!(credential_for(&config, &config.server_url, &request).is_some());
+    }
+
+    #[test]
+    fn test_credential_for_defaults_username_when_absent() {
+        let mut config = credential_config();
+        config.username = None;
+        let request = CredentialRequest { host: None };
+        let served = credential_for(&config, &config.server_url, &request);
+        assert_eq!(
+            served,
+            Some(("gitforge".to_string(), "gfrt-live-credential".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_credential_for_foreign_host_is_silent() {
+        let config = credential_config();
+        let request = CredentialRequest {
+            host: Some("github.com".to_string()),
+        };
+        assert!(credential_for(&config, &config.server_url, &request).is_none());
+    }
+
+    #[test]
+    fn test_credential_for_expired_session_is_silent() {
+        let mut config = credential_config();
+        config.refresh_expires_at =
+            Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
+        let request = CredentialRequest { host: None };
+        assert!(credential_for(&config, &config.server_url, &request).is_none());
+    }
+
+    #[test]
+    fn test_credential_for_without_stored_credential_is_silent() {
+        let mut config = credential_config();
+        config.refresh_token = None;
+        let request = CredentialRequest { host: None };
+        assert!(credential_for(&config, &config.server_url, &request).is_none());
+    }
+
+    #[test]
+    fn test_credential_for_unparseable_expiry_still_serves() {
+        // An unparseable stamp behaves like the absent stamp: reactive
+        // renewal (401 → refresh) is the CLI's posture for unknowns, and
+        // staying silent here would lock git out of a session the CLI
+        // could still renew.
+        let mut config = credential_config();
+        config.refresh_expires_at = Some("not-a-timestamp".to_string());
+        let request = CredentialRequest { host: None };
+        assert!(credential_for(&config, &config.server_url, &request).is_some());
+    }
+
+    #[test]
+    fn test_git_credential_get_parses_from_argv() {
+        let cli = Cli::try_parse_from(["gitforge", "auth", "git-credential", "get"])
+            .expect("credential-helper argv must parse");
+        match cli.command {
+            Commands::Auth {
+                command: Some(AuthCommand::GitCredential { operation }),
+                ..
+            } => assert!(matches!(operation, GitCredentialOperation::Get)),
+            other => panic!("expected git-credential subcommand, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1617,6 +1966,7 @@ mod tests {
             logout: false,
             status: false,
             whoami: true,
+            command: None,
         });
         assert!(run_cli(cli).await.is_ok());
     }
