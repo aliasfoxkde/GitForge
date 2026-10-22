@@ -1,6 +1,7 @@
 import subprocess
 import importlib.util
 import json
+import re
 import tempfile
 import threading
 import unittest
@@ -73,6 +74,21 @@ class GitForgeWorkflowContractTests(unittest.TestCase):
     def test_candidate_ref_rejects_invalid_event_identity(self):
         with self.assertRaises(ValueError):
             candidate_ref("pull_request", "../main", "1001", "1")
+
+    def test_candidate_checkout_fetches_full_history_for_gitforge_push(self):
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github"
+            / "workflows"
+            / "gitforge-ci.yml"
+        ).read_text(encoding="utf-8")
+        candidate_checkout = re.search(
+            r"(?ms)^      - name: Check out candidate commit\n(?P<step>.*?)(?=^      - name:|\Z)",
+            workflow,
+        )
+
+        self.assertIsNotNone(candidate_checkout)
+        self.assertRegex(candidate_checkout.group("step"), r"(?m)^          fetch-depth: 0$")
 
     def test_publish_candidate_transfers_commit_and_verifies_remote_ref(self):
         with tempfile.TemporaryDirectory() as temporary:

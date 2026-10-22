@@ -79,6 +79,8 @@ jobs:
       - name: Check out candidate commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # GitForge rejects shallow histories when the candidate ref is pushed.
+          fetch-depth: 0
           path: candidate
           persist-credentials: false
       - name: Test GitForge workflow contract
