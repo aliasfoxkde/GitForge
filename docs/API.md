@@ -202,6 +202,33 @@ definition document (the committed `.gitforge.yml` contents) as `config`.
 The document must parse with a single active version; the caller must own
 the repository (admin/maintainer override applies).
 
+`GET /api/pipelines` returns the active version of each definition the
+caller may see. Every entry carries `id`, `repo_id`, `name`,
+`trigger_type`, `active`, and `created_at`:
+
+```json
+{
+  "id": "6f1c0f9e-1c2b-4a3d-9f8e-0c2a5b7d9e11",
+  "repo_id": "3b5d9a2c-7e41-4f88-91a0-2d6c8e4f1b30",
+  "name": "amortyx-gates",
+  "trigger_type": "push",
+  "active": true,
+  "created_at": "2026-10-15T20:51:13Z"
+}
+```
+
+The `id` is the pipeline handle: `GET`, `DELETE`, and
+`POST /api/pipelines/{id}/runs` resolve it against the pipeline table, so
+a repository id answers `404` and a pipeline name answers `400` ("Invalid
+pipeline ID format"). Names are not unique — a name is unique only per
+repository, and retired versions share it — so the id is the only
+identifier the routes accept.
+
+`active` reports whether the row is the active version of its
+(repository, name) pair. Registering a definition retires the previous
+active version of the same name, which stays addressable by id and then
+reports `active: false`.
+
 `POST /api/pipelines/{id}/runs` triggers a run of the stored definition,
 resolving the optional `ref` (default: repository HEAD) to a commit and
 rejecting ambiguous or hostile refs.

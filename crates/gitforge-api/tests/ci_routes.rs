@@ -205,6 +205,84 @@ async fn get_pipeline_enforces_ownership_with_admin_override() {
 }
 
 #[tokio::test]
+async fn pipeline_responses_report_the_active_state() {
+    let f = seed().await;
+
+    // The listing carries the state of each pipeline: a client that prints
+    // "disabled" for an unreported state is asserting something the
+    // database never said.
+    let (status, listed) = request_json(
+        f.app.clone(),
+        "GET",
+        "/api/pipelines",
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["active"], json!(true));
+    assert_eq!(listed[0]["id"], f.pipeline_id.to_string());
+
+    // The identifier the listing prints is the one the id routes accept:
+    // the listing must not print a repository uuid in the pipeline id
+    // slot, because that answers "not found" when it is used.
+    let listed_id = listed[0]["id"].as_str().unwrap().to_string();
+    assert_ne!(listed_id, f.repo_id.to_string());
+    let (status, by_listed_id) = request_json(
+        f.app.clone(),
+        "GET",
+        &format!("/api/pipelines/{listed_id}"),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{by_listed_id}");
+    assert_eq!(by_listed_id["id"], json!(listed_id));
+
+    let (status, single) = request_json(
+        f.app.clone(),
+        "GET",
+        &format!("/api/pipelines/{}", f.pipeline_id),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(single["active"], json!(true));
+
+    // A retired version stays addressable by id; its state must be
+    // reported as retired, not silently dropped.
+    PipelineQueries::deactivate_active(&f.pool, f.repo_id, "ci-routes-pipeline")
+        .await
+        .unwrap();
+
+    let (status, retired) = request_json(
+        f.app.clone(),
+        "GET",
+        &format!("/api/pipelines/{}", f.pipeline_id),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(retired["active"], json!(false));
+
+    // ...and the listing, which carries the active definition only, no
+    // longer offers it.
+    let (status, listed) = request_json(
+        f.app.clone(),
+        "GET",
+        "/api/pipelines",
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(listed.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn pipeline_run_endpoints_scoped_and_expose_jobs_with_receipts() {
     let f = seed().await;
 
@@ -881,6 +959,9 @@ async fn pipeline_create_registers_active_definition_for_owner() {
     assert_eq!(body["name"], "registered-pipeline");
     assert_eq!(body["trigger_type"], "manual");
     assert_eq!(body["repo_id"], f.repo_id.to_string());
+    // The registered definition is the active version of its
+    // (repository, name) pair, and the response says so.
+    assert_eq!(body["active"], json!(true));
 
     let pipelines = PipelineQueries::list_by_repo(&f.pool, f.repo_id)
         .await

@@ -10,6 +10,7 @@ use gitforge_common::{
     Error, JobId, PipelineId, PipelineRunId, RepoId, Result, RunnerId, SshKeyId, UserId,
 };
 use sqlx::Row;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 fn parse_uuid_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<Uuid> {
@@ -839,6 +840,29 @@ impl PipelineQueries {
         }
     }
 
+    /// Get a pipeline by ID together with the active flag its row carries.
+    ///
+    /// The flag is read from the row that was fetched, so the definition
+    /// and its state cannot come from two different versions of the row.
+    pub async fn get_with_state(
+        pool: &Pool,
+        id: PipelineId,
+    ) -> Result<Option<(crate::models::Pipeline, bool)>> {
+        let row = sqlx::query("SELECT * FROM pipelines WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to get pipeline: {e}")))?;
+
+        match row {
+            Some(row) => {
+                let active = read_active_flag(&row)?;
+                Ok(Some((hydrate_pipeline(row)?, active)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// List pipelines by repository
     pub async fn list_by_repo(
         pool: &Pool,
@@ -877,6 +901,55 @@ impl PipelineQueries {
 
         Ok(pipelines)
     }
+
+    /// The active flag of the given pipeline rows, keyed by pipeline id.
+    ///
+    /// One read serves a whole listing, so the API can report the state of
+    /// each pipeline it returns without a query per row. The read is scoped
+    /// to the requested ids: a listing must not drag the version history
+    /// of every repository on the instance through the connection.
+    pub async fn active_flags(
+        pool: &Pool,
+        ids: &[PipelineId],
+    ) -> Result<HashMap<PipelineId, bool>> {
+        let mut flags = HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return Ok(flags);
+        }
+
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT id, active FROM pipelines WHERE id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id.to_string());
+        }
+        separated.push_unseparated(")");
+
+        let rows =
+            query.build().fetch_all(pool.pool()).await.map_err(|e| {
+                Error::database(format!("failed to read pipeline active flags: {e}"))
+            })?;
+
+        for row in rows {
+            let id = PipelineId::from(parse_uuid_column(&row, "id")?);
+            flags.insert(id, read_active_flag(&row)?);
+        }
+
+        Ok(flags)
+    }
+}
+
+/// Read the `active` column of a pipeline row.
+///
+/// The column is an INTEGER flag (`1` active, `0` retired); any non-zero
+/// value counts as active so a future flag value cannot silently read as
+/// retired.
+fn read_active_flag(row: &sqlx::sqlite::SqliteRow) -> Result<bool> {
+    let active: i64 = row
+        .try_get("active")
+        .map_err(|e| Error::database(format!("invalid pipeline active flag: {e}")))?;
+    Ok(active != 0)
 }
 
 // ============================================================================

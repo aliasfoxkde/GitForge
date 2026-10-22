@@ -217,6 +217,88 @@ async fn test_pipeline_versioning_active_uniqueness() {
     assert_eq!(retired.len(), 2);
 }
 
+/// Whether the pipeline row carries the active flag.
+///
+/// A pipeline that is not in the table has no active state, so it reads
+/// `false` instead of failing the assertion.
+async fn active_state(pool: &Pool, id: PipelineId) -> bool {
+    PipelineQueries::get_with_state(pool, id)
+        .await
+        .unwrap()
+        .is_some_and(|(_, active)| active)
+}
+
+#[tokio::test]
+async fn test_pipeline_active_flag_reports_retired_versions() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = User::new(
+        "active-flag-owner".to_string(),
+        "active-flag-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+
+    let repo = Repository::new(
+        "active-flag-repo".to_string(),
+        user.id,
+        "/git/active-flag-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+
+    let pipeline = |id: PipelineId| Pipeline {
+        id,
+        repo_id: repo.id,
+        name: "gates".to_string(),
+        trigger_type: "push".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+
+    let predecessor = PipelineId::new();
+    PipelineQueries::create(&pool, &pipeline(predecessor))
+        .await
+        .unwrap();
+    assert!(active_state(&pool, predecessor).await);
+
+    PipelineQueries::deactivate_active(&pool, repo.id, "gates")
+        .await
+        .unwrap();
+    let successor = PipelineId::new();
+    PipelineQueries::create(&pool, &pipeline(successor))
+        .await
+        .unwrap();
+
+    // A retired version stays addressable by id, so its state has to be
+    // reportable: the API cannot answer "active or not" from the listing
+    // alone.
+    assert!(!active_state(&pool, predecessor).await);
+    assert!(active_state(&pool, successor).await);
+
+    let flags = PipelineQueries::active_flags(&pool, &[predecessor, successor])
+        .await
+        .unwrap();
+    assert_eq!(flags.get(&predecessor), Some(&false));
+    assert_eq!(flags.get(&successor), Some(&true));
+
+    // The read is scoped to the requested ids: a listing must not answer
+    // for pipelines it did not ask about.
+    let scoped = PipelineQueries::active_flags(&pool, &[successor])
+        .await
+        .unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped.get(&successor), Some(&true));
+    assert!(!scoped.contains_key(&predecessor));
+
+    // An empty request is answered without touching the table.
+    let none = PipelineQueries::active_flags(&pool, &[]).await.unwrap();
+    assert!(none.is_empty());
+
+    // A pipeline that does not exist has no active state to report.
+    assert!(!active_state(&pool, PipelineId::new()).await);
+}
+
 #[tokio::test]
 async fn test_database_event_storage() {
     let pool = Pool::memory().await.unwrap();
