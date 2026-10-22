@@ -497,3 +497,7 @@ docker-compose up -d --scale runner=3
 - [ ] Set up TLS reverse proxy
 - [ ] Configure firewall rules
 - [ ] Front the API with a rate-limiting proxy (no rate limiter is built into the API)
+
+## Fast local gate
+
+Run `gitforge check --fast --changed` before pushing. It runs fmt, clippy, and tests only on crates affected by the current change (including reverse dependencies), plus an Aegis staged scan. Use `--full` for a complete workspace run. See docs/IMPACT_GRAPH.md.

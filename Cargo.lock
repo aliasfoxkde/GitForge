@@ -1445,6 +1445,7 @@ dependencies = [
  "gitforge-ai",
  "gitforge-common",
  "gitforge-db",
+ "gitforge-graph",
  "gitforge-review",
  "mockito",
  "reqwest",
@@ -1532,6 +1533,19 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "gitforge-graph"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

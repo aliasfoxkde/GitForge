@@ -1,0 +1,21 @@
+features:
+  - name: git-serving
+    crates: [gitforge-core, gitforge-storage]
+    tests: [git_http_protocol]
+    description: Smart HTTP + SSH git serving
+  - name: ci-engine
+    crates: [gitforge-ci, gitforge-scheduler]
+    tests: [pipeline]
+    description: Pipeline definitions and orchestration
+  - name: runner
+    crates: [gitforge-runner, gitforge-sandbox]
+    tests: [executor]
+    description: Container job execution
+  - name: api-gateway
+    crates: [gitforge-api]
+    tests: [routes]
+    description: HTTP API gateway
+  - name: auth
+    crates: [gitforge-common, gitforge-api]
+    tests: [auth]
+    description: Authentication and sessions

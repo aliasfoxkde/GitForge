@@ -32,11 +32,21 @@ if ! cargo fmt --all -- --check; then
     exit 1
 fi
 
-# ─── Strict clippy ───────────────────────────────────────────────────────────
-INFO "Running clippy (workspace, all targets, -D warnings)..."
-if ! cargo clippy --workspace --all-targets -- -D warnings; then
-    ERROR "clippy failed — fix the warnings before committing"
-    exit 1
+# ─── Fast local gate (preferred) ─────────────────────────────────────────────
+# When the gitforge CLI is available, run the change-scoped fast gate instead
+# of a full workspace clippy pass. Falls back to full clippy otherwise.
+if command -v gitforge >/dev/null 2>&1; then
+    INFO "Running gitforge check --fast --changed..."
+    if ! gitforge check --fast --changed; then
+        ERROR "gitforge check failed — fix before committing"
+        exit 1
+    fi
+else
+    INFO "Running clippy (workspace, all targets, -D warnings)..."
+    if ! cargo clippy --workspace --all-targets -- -D warnings; then
+        ERROR "clippy failed — fix the warnings before committing"
+        exit 1
+    fi
 fi
 
 INFO "Pre-commit checks passed."
