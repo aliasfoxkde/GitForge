@@ -31,6 +31,7 @@ fn make_pipeline(jobs: Vec<(&str, Vec<&str>)>) -> PipelineDefinition {
             steps: vec![],
             timeout: None,
             retry: None,
+            skip_if: None,
         })
         .collect();
 
@@ -207,6 +208,7 @@ async fn test_workspace_escape_attempt() {
         }],
         timeout: None,
         retry: None,
+        skip_if: None,
     }];
 
     let pipeline = PipelineDefinition {

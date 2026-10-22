@@ -7,13 +7,18 @@
 #
 # Evidence required, for one pipeline run of the source commit:
 #   - the run's status is succeeded
-#   - every durable job row of the run is succeeded
+#   - every durable job row of the run is succeeded or skipped
 #   - the durable job rows cover every job in the persisted pipeline
 #     definition, name for name (the lazy-enqueue false green left rows
 #     behind that graded green while the chain never advanced)
 #   - the persisted definition is readable — an unreadable definition
 #     cannot prove coverage, so the gate fails closed (unlike run
 #     reconciliation, which keeps row-only grading for legacy rows)
+#
+# A `skipped` row counts as satisfied: the job's `skip_if` condition
+# evaluated to false, so the pipeline definition itself decided the job had
+# nothing to do. The row still has to exist, so the coverage requirement
+# above still proves the definition was planned end to end.
 #
 # Usage: gitforge-release-gate <40-hex-source-commit>
 # Environment:
@@ -79,7 +84,7 @@ fi
 counts=$(db_query "SELECT
   (SELECT json_array_length(p.config, '\$.jobs') FROM pipelines p WHERE p.id = r.pipeline_id),
   (SELECT COUNT(*) FROM jobs j WHERE j.pipeline_run_id = r.id),
-  (SELECT COUNT(*) FROM jobs j WHERE j.pipeline_run_id = r.id AND j.status = 'succeeded')
+  (SELECT COUNT(*) FROM jobs j WHERE j.pipeline_run_id = r.id AND j.status IN ('succeeded', 'skipped'))
 FROM pipeline_runs r WHERE r.id = '$run_id';")
 if [[ -z "$counts" ]]; then
   refuse "run ${run_id:0:8} has no count evidence (query returned nothing)"
@@ -102,11 +107,31 @@ WHERE p.id = (SELECT pipeline_id FROM pipeline_runs WHERE id = '$run_id')
       NOT IN (SELECT commands FROM jobs WHERE pipeline_run_id = '$run_id');")
 missing_count=$(grep -c . <<< "$missing" || true)
 failing=$(db_query "SELECT '  ' || name || '=' || status FROM jobs
-WHERE pipeline_run_id = '$run_id' AND status <> 'succeeded';")
+WHERE pipeline_run_id = '$run_id' AND status NOT IN ('succeeded', 'skipped');")
+
+# A definition job that carries no `skip_if` can never legitimately be
+# skipped, so it must have produced a SUCCEEDED row. Without this check a
+# run whose conditions all evaluated false — a change detector that saw no
+# changed files, an expression environment that never received the
+# classification — would grade green having executed nothing at all.
+unskipped_missing=$(db_query "SELECT json_extract(d.value, '\$.name')
+FROM pipelines p, json_each(json_extract(p.config, '\$.jobs')) d
+WHERE p.id = (SELECT pipeline_id FROM pipeline_runs WHERE id = '$run_id')
+  AND json_extract(d.value, '\$.skip_if') IS NULL
+  AND (SELECT json_group_array(json_extract(s.value, '\$.run'))
+       FROM json_each(json_extract(d.value, '\$.steps')) s)
+      NOT IN (SELECT commands FROM jobs
+               WHERE pipeline_run_id = '$run_id' AND status = 'succeeded');")
+unskipped_missing_count=$(grep -c . <<< "$unskipped_missing" || true)
 
 if ((missing_count > 0)); then
   refuse "run ${run_id:0:8}: $missing_count definition job(s) never got a durable row (the lazy-enqueue false green):
 $missing
+$other_runs"
+fi
+if ((unskipped_missing_count > 0)); then
+  refuse "run ${run_id:0:8}: $unskipped_missing_count unconditional job(s) have no succeeded row (a green run that executed nothing):
+$unskipped_missing
 $other_runs"
 fi
 if ((durable != expected)); then
@@ -117,5 +142,5 @@ if ((succeeded != durable)); then
 $failing"
 fi
 
-printf 'release gate: PASSED — run %s green, %d/%d jobs covering the persisted definition\n' \
+printf 'release gate: PASSED — run %s green, %d/%d jobs satisfied (succeeded or skipped) covering the persisted definition\n' \
   "${run_id:0:8}" "$succeeded" "$expected"

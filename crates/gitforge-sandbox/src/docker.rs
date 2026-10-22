@@ -354,26 +354,57 @@ impl DockerSandbox {
                 }
             }
 
-            // Pull the image - Docker is idempotent, so this works even if image exists
-            let mut stream = docker.create_image(
-                Some(CreateImageOptions {
-                    from_image: Some(image.to_owned()),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            );
-
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(info) => {
-                        tracing::debug!("Pull progress: {:?}", info);
-                    }
-                    Err(e) => {
-                        return Err(Error::sandbox(format!("failed to pull image: {e}")));
+            // Retry-once for transient pull errors (e.g. Docker Hub rate-limit 403).
+            // The first attempt may fail because the daemon's unauthenticated quota is
+            // exhausted; waiting briefly lets the quota reset and the local inspect
+            // cache to be fresh on retry.
+            const PULL_RETRIES: u32 = 1;
+            const PULL_RETRY_DELAY_SECS: u64 = 60;
+            let mut last_err = None;
+            for attempt in 0..=PULL_RETRIES {
+                let mut stream = docker.create_image(
+                    Some(CreateImageOptions {
+                        from_image: Some(image.to_owned()),
+                        ..Default::default()
+                    }),
+                    None,
+                    None,
+                );
+                let mut pull_ok = true;
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok(info) => {
+                            tracing::debug!("Pull progress: {:?}", info);
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            pull_ok = false;
+                            break;
+                        }
                     }
                 }
+                if pull_ok {
+                    return Ok(());
+                }
+                if attempt < PULL_RETRIES {
+                    tracing::warn!(
+                        "image pull attempt {}/{} failed ({}): retrying in {}s",
+                        attempt + 1,
+                        PULL_RETRIES + 1,
+                        last_err
+                            .as_ref()
+                            .map(std::string::ToString::to_string)
+                            .unwrap_or_default(),
+                        PULL_RETRY_DELAY_SECS
+                    );
+                    sleep(Duration::from_secs(PULL_RETRY_DELAY_SECS)).await;
+                }
             }
+            return Err(Error::sandbox(format!(
+                "failed to pull image after {} attempt(s): {}",
+                PULL_RETRIES + 1,
+                last_err.map(|e| e.to_string()).unwrap_or_default()
+            )));
         }
         Ok(())
     }

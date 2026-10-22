@@ -301,6 +301,10 @@ pub enum JobStatus {
     /// daemon, unusable exec, exhausted host scratch (R6.3). Terminal and
     /// alertable; never a red X on the code.
     InfrastructureFailure,
+    /// Job was skipped because its `skip_if` condition evaluated to false.
+    /// Terminal — counted as succeeded for dependency purposes so downstream
+    /// jobs run normally.
+    Skipped,
 }
 
 impl JobStatus {
@@ -313,6 +317,7 @@ impl JobStatus {
                 | JobStatus::Cancelled
                 | JobStatus::TimedOut
                 | JobStatus::InfrastructureFailure
+                | JobStatus::Skipped
         )
     }
 }

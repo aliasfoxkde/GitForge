@@ -1908,7 +1908,11 @@ fn validate_reconciler_receipt_path(raw: &str) -> std::result::Result<PathBuf, S
     Ok(path)
 }
 
-const MAX_RECEIPT_STREAM_BYTES: usize = 64 * 1024;
+// 64KB cut off mid-line during a cargo build and hid the actual error text
+// (2026-10-11: three afternoon flakes were undiagnosable because the failing
+// message sat beyond the cap - EPERM/E0463 clues lived at line >64KB). 512KB
+// still bounds receipt size while keeping full compile-error context.
+const MAX_RECEIPT_STREAM_BYTES: usize = 512 * 1024;
 
 fn bounded_receipt_text(value: &str) -> String {
     if value.len() <= MAX_RECEIPT_STREAM_BYTES {

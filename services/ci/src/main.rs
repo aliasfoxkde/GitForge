@@ -1044,7 +1044,12 @@ async fn load_pipeline_from_commit(
         }
 
         let yaml = String::from_utf8(show.stdout).map_err(|error| {
-            anyhow::anyhow!("{config_path} at {commit_hash} is not valid UTF-8: {error}")
+            // Bytes that are not valid UTF-8 can never parse as a pipeline
+            // definition, so re-attempting only spends the retry budget.
+            // Classify with the unparseable-definition failures: terminal.
+            anyhow::Error::new(InvalidPipelineConfig(format!(
+                "{config_path} at {commit_hash} is not valid UTF-8: {error}"
+            )))
         })?;
         return PipelineDefinition::parse(&yaml).map(Some).map_err(|error| {
             anyhow::Error::new(InvalidPipelineConfig(format!(
@@ -2206,31 +2211,42 @@ async fn process_trigger_event(
                 "failed to handle push event"
             );
             if let (Some(pool), Some(request_id)) = (scheduler_db, request_id) {
-                // Retrying is only honest while the budget lasts and the
-                // failure could plausibly resolve: contention and lost
-                // config reads retry, a provably invalid committed config
-                // or an already-failed run is terminal and visible.
-                let attempts = gitforge_db::queries::TriggerRequestQueries::get(pool, request_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map_or(0, |request| request.attempts);
-                let settled = if !failure.retryable || attempts >= TRIGGER_MAX_ATTEMPTS {
-                    gitforge_db::queries::TriggerRequestQueries::mark_failed(
-                        pool,
-                        request_id,
-                        &failure.error.to_string(),
-                        failure.run_id,
-                    )
-                    .await
-                } else {
-                    gitforge_db::queries::TriggerRequestQueries::mark_retry(pool, request_id).await
-                };
-                if let Err(error) = settled {
-                    tracing::error!(%error, trigger = %request_id, "failed to settle trigger request after failure");
-                }
+                settle_trigger_failure(pool, request_id, &failure).await;
             }
         }
+    }
+}
+
+/// Settle a trigger request whose processing failed: terminal when a retry
+/// provably cannot help or the budget is spent, otherwise back to `pending`
+/// where the sweep republishes it after the backoff. Split out from the
+/// consumer so the decision is directly unit-testable — every retryable
+/// failure inducible through the full flow (DB busy, git spawn) is
+/// environment-dependent, and the durable queue's FK to `repositories`
+/// means the unregistered-repo branch can never hold a durable row.
+async fn settle_trigger_failure(
+    pool: &gitforge_db::Pool,
+    request_id: uuid::Uuid,
+    failure: &TriggerFailure,
+) {
+    let attempts = gitforge_db::queries::TriggerRequestQueries::get(pool, request_id)
+        .await
+        .ok()
+        .flatten()
+        .map_or(0, |request| request.attempts);
+    let settled = if !failure.retryable || attempts >= TRIGGER_MAX_ATTEMPTS {
+        gitforge_db::queries::TriggerRequestQueries::mark_failed(
+            pool,
+            request_id,
+            &failure.error.to_string(),
+            failure.run_id,
+        )
+        .await
+    } else {
+        gitforge_db::queries::TriggerRequestQueries::mark_retry(pool, request_id).await
+    };
+    if let Err(error) = settled {
+        tracing::error!(%error, trigger = %request_id, "failed to settle trigger request after failure");
     }
 }
 
@@ -2531,6 +2547,66 @@ async fn reconcile_fenced_engines(
     reconciled
 }
 
+/// Merge the `CI_CHANGE_*` variables a completed job published into the
+/// engine's run environment.
+///
+/// `skip_if` expressions are evaluated against exactly this environment, so a
+/// job whose variables are never merged prunes every gated downstream job:
+/// the expression sees an unset variable, evaluates false, and the gate that
+/// should have run is silently skipped. The receipt is read from the durable
+/// job row, which the scheduler writes before it publishes the completion.
+async fn merge_completed_job_env(
+    engine: &CiEngine,
+    pool: Option<&gitforge_db::Pool>,
+    job_id: gitforge_common::JobId,
+) {
+    let Some(pool) = pool else {
+        return;
+    };
+    let job = match gitforge_db::queries::JobQueries::get(pool, job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, %job_id, "failed to read completed job receipt");
+            return;
+        }
+    };
+    let Some(result_json) = job.result_json.as_deref() else {
+        return;
+    };
+    let env = gitforge_ci::engine::extract_change_env(result_json);
+    if env.is_empty() {
+        return;
+    }
+    engine.merge_job_result(job_id, &env).await;
+    tracing::info!(%job_id, variables = env.len(), "merged job output into pipeline env");
+}
+
+/// Persist a durable row for every job the engine skipped.
+///
+/// A skipped job never reaches a runner, so nothing else would move its
+/// planned row off `pending` — the run would never settle and the release
+/// gate would never see the row it requires. The receipt is deterministic, so
+/// a repeated write is idempotent.
+async fn persist_skipped_job_rows(pool: Option<&gitforge_db::Pool>, engine: &CiEngine) {
+    let Some(pool) = pool else {
+        return;
+    };
+    for job_id in engine.skipped_jobs().await {
+        let receipt = serde_json::json!({
+            "job_id": job_id.to_string(),
+            "skipped": true,
+            "status": "skipped",
+        })
+        .to_string();
+        if let Err(error) =
+            gitforge_db::queries::JobQueries::complete(pool, job_id, "skipped", &receipt).await
+        {
+            tracing::error!(%error, %job_id, "failed to persist skipped job row");
+        }
+    }
+}
+
 async fn run_scheduler_event_consumer(
     scheduler: Arc<Scheduler>,
     pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
@@ -2581,9 +2657,17 @@ async fn run_scheduler_event_consumer(
                 tracing::error!(%job_id, %error, "failed to mark job succeeded");
                 continue;
             }
+            // The job's receipt is the only source of the CI_CHANGE_* vars
+            // that `skip_if` conditions are evaluated against. Merging them
+            // has to happen before the downstream release: an unmerged
+            // receipt leaves the expression environment empty, every
+            // condition evaluates false, and the engine silently prunes
+            // every gated job.
+            merge_completed_job_env(&engine, scheduler_db.as_ref(), job_id).await;
             if let Err(error) = engine.queue_ready_jobs().await {
                 tracing::error!(%pipeline_run_id, %error, "failed to queue downstream jobs");
             }
+            persist_skipped_job_rows(scheduler_db.as_ref(), &engine).await;
         } else {
             if let Err(error) = engine
                 .fail_job(job_id, -1, "runner reported failure".to_string())
@@ -2945,11 +3029,14 @@ async fn rebuild_live_engines(
             .any(|job| matches!(job.status.as_str(), "running" | "assigned"));
         let mut durable_rows = Vec::with_capacity(rows.len());
         let mut graftable = true;
-        for job in rows {
+        for job in &rows {
             match gitforge_db::models::JobStatus::from_str(&job.status) {
-                Some(status) => {
-                    durable_rows.push((job.id, job.name, status.to_common(), job.started_at))
-                }
+                Some(status) => durable_rows.push((
+                    job.id,
+                    job.name.clone(),
+                    status.to_common(),
+                    job.started_at,
+                )),
                 None => {
                     tracing::warn!(
                         run = %run.id,
@@ -3032,9 +3119,26 @@ async fn rebuild_live_engines(
         // re-enqueued (the upsert refreshes the durable row; the scheduler
         // deduplicates its in-memory queue), and any stage whose
         // predecessors all succeeded is released now.
+        //
+        // The rebuilt engine starts with an empty run environment: the
+        // `CI_CHANGE_*` vars live in the detect-changes job's receipt, so
+        // they are re-merged from the durable rows before the release. A
+        // release evaluated against an empty environment would prune every
+        // gated job.
+        for job in &rows {
+            let Some(result_json) = job.result_json.as_deref() else {
+                continue;
+            };
+            let env = gitforge_ci::engine::extract_change_env(result_json);
+            if env.is_empty() {
+                continue;
+            }
+            engine.merge_job_result(job.id, &env).await;
+        }
         if let Err(error) = engine.queue_ready_jobs().await {
             tracing::warn!(run = %run.id, %error, "post-rebuild stage release failed");
         }
+        persist_skipped_job_rows(Some(pool), &engine).await;
         enqueue_ready_jobs(scheduler, &engine, run.id, run.repo_id, workspace_path).await;
         if held {
             tracing::info!(run = %run.id, "redrove stalled chain over live engine");
@@ -3092,6 +3196,7 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 ],
                 timeout: Some("30m".to_string()),
                 retry: Some(1),
+                skip_if: None,
             },
             JobDefinition {
                 name: "test".to_string(),
@@ -3107,6 +3212,7 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 }],
                 timeout: Some("30m".to_string()),
                 retry: Some(1),
+                skip_if: None,
             },
         ],
     }
@@ -4048,6 +4154,7 @@ mod tests {
             }],
             timeout: None,
             retry: None,
+            skip_if: None,
         };
         let definition = PipelineDefinition {
             name: "planning-test".to_string(),
@@ -4268,6 +4375,7 @@ mod tests {
             }],
             timeout: None,
             retry: None,
+            skip_if: None,
         };
         let definition = PipelineDefinition {
             name: "stall-test".to_string(),
@@ -5579,5 +5687,497 @@ jobs:
                 .is_empty(),
             "a ref-deletion push must not prepare a run workspace"
         );
+    }
+
+    // --- Trigger settlement classification ---
+    //
+    // A committed definition that can never parse must fail terminally and
+    // visibly instead of spending the retry budget on an unfixable input.
+    // Both malformed shapes are classified at `load_pipeline_from_commit`:
+    // unparseable YAML and bytes that are not valid UTF-8.
+
+    /// Bare repository with one commit per committed-config shape, returning
+    /// the repository's git path and the (valid, unparseable, non-UTF-8)
+    /// commit hashes.
+    async fn commit_config_variants() -> (String, String, String, String) {
+        let base =
+            std::env::temp_dir().join(format!("gitforge-ci-loadpipe-{}", uuid::Uuid::new_v4()));
+        let bare = base.join("variants.git");
+        std::fs::create_dir_all(&bare).expect("create bare dir");
+        run_git(
+            &[
+                "init",
+                "--bare",
+                "--initial-branch=main",
+                bare.to_str().expect("utf8 bare path"),
+            ],
+            None,
+        )
+        .await;
+        let work = base.join("seed");
+        std::fs::create_dir_all(&work).expect("create seed dir");
+        run_git(&["init", "--initial-branch=main"], Some(&work)).await;
+        run_git(&["config", "user.email", "dev@example.test"], Some(&work)).await;
+        run_git(
+            &["config", "user.name", "Classification Harness"],
+            Some(&work),
+        )
+        .await;
+        run_git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                bare.to_str().expect("utf8 bare path"),
+            ],
+            Some(&work),
+        )
+        .await;
+
+        let valid = "name: variant\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment: {}\njobs:\n  - name: v\n    image: alpine:latest\n    steps:\n      - name: s\n        run: echo v\n";
+        std::fs::write(work.join(".gitforge.yml"), valid).expect("write valid config");
+        run_git(&["add", "."], Some(&work)).await;
+        run_git(&["commit", "-m", "valid"], Some(&work)).await;
+        run_git(&["push", "origin", "main"], Some(&work)).await;
+        let valid_hash = run_git(&["rev-parse", "HEAD"], Some(&work)).await;
+
+        std::fs::write(work.join(".gitforge.yml"), "name: [unclosed").expect("write yaml config");
+        run_git(&["add", "."], Some(&work)).await;
+        run_git(&["commit", "-m", "unparseable"], Some(&work)).await;
+        run_git(&["push", "-f", "origin", "main"], Some(&work)).await;
+        let yaml_hash = run_git(&["rev-parse", "HEAD"], Some(&work)).await;
+
+        std::fs::write(work.join(".gitforge.yml"), [0xffu8, 0xfe, b'c', b'i', 0x00])
+            .expect("write binary config");
+        run_git(&["add", "."], Some(&work)).await;
+        run_git(&["commit", "-m", "non-utf8"], Some(&work)).await;
+        run_git(&["push", "-f", "origin", "main"], Some(&work)).await;
+        let binary_hash = run_git(&["rev-parse", "HEAD"], Some(&work)).await;
+
+        (
+            bare.display().to_string(),
+            valid_hash,
+            yaml_hash,
+            binary_hash,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_load_pipeline_from_commit_classifies_config_errors_terminal() {
+        let (git_path, valid_hash, yaml_hash, binary_hash) = commit_config_variants().await;
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let user = gitforge_db::models::User::new(
+            "classification-test".to_string(),
+            "classification@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .expect("create user");
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "classification-test".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: git_path.clone(),
+                required_checks: Vec::new(),
+                deny_non_fast_forward: false,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("create repository");
+
+        // Control: a well-formed committed definition loads.
+        let valid = load_pipeline_from_commit(&pool, repo_id, &valid_hash)
+            .await
+            .expect("valid config loads");
+        assert_eq!(
+            valid.expect("valid config present").name,
+            "variant",
+            "the committed definition is authoritative"
+        );
+
+        // Unparseable YAML is terminal: `InvalidPipelineConfig`.
+        let yaml_error = load_pipeline_from_commit(&pool, repo_id, &yaml_hash)
+            .await
+            .expect_err("unparseable config must fail");
+        assert!(
+            yaml_error.is::<InvalidPipelineConfig>(),
+            "unparseable YAML must be classified terminal, got: {yaml_error:#}"
+        );
+
+        // Non-UTF-8 bytes can never parse either — same terminal class,
+        // not a retryable environment failure.
+        let binary_error = load_pipeline_from_commit(&pool, repo_id, &binary_hash)
+            .await
+            .expect_err("non-UTF-8 config must fail");
+        assert!(
+            binary_error.is::<InvalidPipelineConfig>(),
+            "non-UTF-8 config must be classified terminal, got: {binary_error:#}"
+        );
+    }
+
+    /// The settle decision, exercised directly through `settle_trigger_failure`.
+    /// Every retryable failure inducible through the full flow is
+    /// environment-dependent, and the durable queue's FK to `repositories`
+    /// means a trigger row can never exist for an unregistered repo — so the
+    /// decision is pinned here with synthetic failures instead of through
+    /// `process_trigger_event`. The end-to-end terminal paths are pinned by
+    /// `tests/ci_trigger_settlement.rs`.
+    async fn seeded_trigger_request(
+        pool: &gitforge_db::Pool,
+    ) -> (uuid::Uuid, gitforge_common::RepoId) {
+        // The FK to `repositories` requires a real repo row behind the request.
+        let user = gitforge_db::models::User::new(
+            "settle-test".to_string(),
+            "settle-test@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(pool, &user)
+            .await
+            .expect("create user");
+        let repository = gitforge_db::models::Repository::new(
+            "settle-test".to_string(),
+            user.id,
+            "unused".to_string(),
+        );
+        let repo_id = repository.id;
+        gitforge_db::queries::RepoQueries::create(pool, &repository)
+            .await
+            .expect("create repository");
+
+        let request = gitforge_db::models::PipelineTriggerRequest::new(
+            repo_id,
+            "refs/heads/main".to_string(),
+            "0".repeat(40),
+            "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
+        );
+        let request_id = request.id;
+        let (_, was_new) =
+            gitforge_db::queries::TriggerRequestQueries::create_or_existing(pool, &request)
+                .await
+                .expect("create trigger request");
+        assert!(was_new, "the harness seeds a fresh request");
+        (request_id, repo_id)
+    }
+
+    #[tokio::test]
+    async fn test_settle_retryable_failure_keeps_budget() {
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let (request_id, _repo) = seeded_trigger_request(&pool).await;
+
+        // One consumed attempt (what mark_processing does on pickup).
+        gitforge_db::queries::TriggerRequestQueries::mark_processing(&pool, request_id)
+            .await
+            .expect("mark processing");
+
+        settle_trigger_failure(
+            &pool,
+            request_id,
+            &TriggerFailure::retryable(anyhow::anyhow!("database is busy")),
+        )
+        .await;
+
+        let settled = gitforge_db::queries::TriggerRequestQueries::get(&pool, request_id)
+            .await
+            .expect("read settled request")
+            .expect("trigger request row survives");
+        assert_eq!(
+            settled.status, "pending",
+            "a retryable failure keeps the retry budget"
+        );
+        assert_eq!(settled.attempts, 1, "the consumed attempt is counted");
+        assert!(
+            settled.error.is_none(),
+            "a retryable failure is not recorded as terminal: {:?}",
+            settled.error
+        );
+        assert!(settled.run_id.is_none(), "no run exists to attribute");
+    }
+
+    #[tokio::test]
+    async fn test_settle_terminal_failure_marks_failed() {
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let (request_id, _repo) = seeded_trigger_request(&pool).await;
+        let run_id = gitforge_common::PipelineRunId::new();
+
+        settle_trigger_failure(
+            &pool,
+            request_id,
+            &TriggerFailure::terminal_after_run(
+                anyhow::anyhow!("pipeline config is not valid"),
+                run_id,
+            ),
+        )
+        .await;
+
+        let settled = gitforge_db::queries::TriggerRequestQueries::get(&pool, request_id)
+            .await
+            .expect("read settled request")
+            .expect("trigger request row survives");
+        assert_eq!(
+            settled.status, "failed",
+            "a terminal failure is visible, not retried"
+        );
+        assert_eq!(
+            settled.run_id,
+            Some(run_id),
+            "the run produced before the failure is traceable"
+        );
+        assert!(
+            settled
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not valid")),
+            "the failure cause is recorded: {:?}",
+            settled.error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_settle_retryable_failure_at_exhausted_budget_fails_visible() {
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let (request_id, _repo) = seeded_trigger_request(&pool).await;
+
+        // Burn the whole budget with consumed attempts.
+        for _ in 0..TRIGGER_MAX_ATTEMPTS {
+            gitforge_db::queries::TriggerRequestQueries::mark_processing(&pool, request_id)
+                .await
+                .expect("mark processing");
+        }
+
+        settle_trigger_failure(
+            &pool,
+            request_id,
+            &TriggerFailure::retryable(anyhow::anyhow!("git spawn keeps failing")),
+        )
+        .await;
+
+        let settled = gitforge_db::queries::TriggerRequestQueries::get(&pool, request_id)
+            .await
+            .expect("read settled request")
+            .expect("trigger request row survives");
+        assert_eq!(
+            settled.status, "failed",
+            "a retryable failure at exhausted budget becomes visible"
+        );
+        assert!(
+            settled
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("git spawn")),
+            "the failure cause is recorded: {:?}",
+            settled.error
+        );
+    }
+
+    /// A gated pipeline: the classification job publishes `CI_CHANGE_*`, and
+    /// the gated job runs only when the environment says its class changed.
+    fn gated_definition(skip_if: Option<String>) -> PipelineDefinition {
+        let step = |name: &str| StepDefinition {
+            name: name.to_string(),
+            run: "true".to_string(),
+            env: None,
+            working_directory: None,
+            condition: None,
+        };
+        PipelineDefinition {
+            name: "gated-test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![
+                JobDefinition {
+                    name: "detect-changes".to_string(),
+                    image: "rust:latest".to_string(),
+                    needs: vec![],
+                    env: HashMap::new(),
+                    steps: vec![step("detect")],
+                    timeout: None,
+                    retry: None,
+                    skip_if: None,
+                },
+                JobDefinition {
+                    name: "clippy".to_string(),
+                    image: "rust:latest".to_string(),
+                    needs: vec!["detect-changes".to_string()],
+                    env: HashMap::new(),
+                    steps: vec![step("lint")],
+                    timeout: None,
+                    retry: None,
+                    skip_if,
+                },
+            ],
+        }
+    }
+
+    /// A durable pipeline and run for the gated fixtures — the planned job
+    /// rows reference the run.
+    async fn gated_run(
+        pool: &gitforge_db::Pool,
+        repo_id: gitforge_common::RepoId,
+        pipeline_id: gitforge_common::PipelineId,
+        definition: &PipelineDefinition,
+    ) -> gitforge_db::models::PipelineRun {
+        gitforge_db::queries::PipelineQueries::create(
+            pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: definition.name.clone(),
+                trigger_type: "push".to_string(),
+                config: serde_json::to_value(definition).unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline_id,
+            repo_id,
+            "push".to_string(),
+            "abc123".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(pool, &run)
+            .await
+            .unwrap();
+        run
+    }
+
+    /// The orchestration defect this guards: the completed job's receipt is
+    /// the only source of the classification, and an unmerged receipt leaves
+    /// the expression environment empty — every condition then evaluates
+    /// false and the engine prunes the gate that should have run.
+    #[tokio::test]
+    async fn test_completed_receipt_feeds_the_skip_environment() {
+        let (pool, repo_id) = test_pool_with_repository("/tmp/gated-repo".to_string()).await;
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let definition = gated_definition(Some(
+            r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string(),
+        ));
+        let run = gated_run(&pool, repo_id, pipeline_id, &definition).await;
+        let event = PipelineTriggerEvent::new(
+            pipeline_id,
+            repo_id,
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, definition).await.unwrap();
+        let planned: HashMap<String, gitforge_common::JobId> = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(id, name)| (name, id))
+            .collect();
+        persist_planned_jobs(&pool, &engine, run.id, None)
+            .await
+            .unwrap();
+
+        // The classification job's receipt, as the runner reported it.
+        let receipt = serde_json::json!({
+            "job_id": planned["detect-changes"].to_string(),
+            "success": true,
+            "exit_code": 0,
+            "step_results": [
+                {"exit_code": 0, "stdout": "CI_CHANGE_INCLUDE_CODE=1\n", "stderr": ""}
+            ],
+            "artifacts": []
+        })
+        .to_string();
+        gitforge_db::queries::JobQueries::complete(
+            &pool,
+            planned["detect-changes"],
+            "succeeded",
+            &receipt,
+        )
+        .await
+        .unwrap();
+
+        merge_completed_job_env(&engine, Some(&pool), planned["detect-changes"]).await;
+
+        let state = engine.state().await;
+        assert_eq!(
+            state
+                .pipeline_env
+                .get("CI_CHANGE_INCLUDE_CODE")
+                .map(String::as_str),
+            Some("1"),
+            "the receipt's classification reaches the expression environment"
+        );
+
+        // The gated job now runs instead of being pruned.
+        engine.start().await.unwrap();
+        engine
+            .assign_job(planned["detect-changes"], gitforge_common::RunnerId::new())
+            .await
+            .unwrap();
+        engine.start_job(planned["detect-changes"]).await.unwrap();
+        engine
+            .succeed_job(planned["detect-changes"], 0)
+            .await
+            .unwrap();
+        let queued = engine.queue_ready_jobs().await.unwrap();
+        assert_eq!(queued, vec![planned["clippy"]]);
+    }
+
+    /// A skipped job never reaches a runner, so nothing else moves its
+    /// planned row off `pending`: without a durable skip row the run never
+    /// settles and the release gate never sees the row it requires.
+    #[tokio::test]
+    async fn test_skipped_jobs_get_a_durable_row() {
+        let (pool, repo_id) = test_pool_with_repository("/tmp/gated-repo".to_string()).await;
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let definition = gated_definition(Some(
+            r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string(),
+        ));
+        let run = gated_run(&pool, repo_id, pipeline_id, &definition).await;
+        let event = PipelineTriggerEvent::new(
+            pipeline_id,
+            repo_id,
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, definition).await.unwrap();
+        let planned: HashMap<String, gitforge_common::JobId> = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(id, name)| (name, id))
+            .collect();
+        persist_planned_jobs(&pool, &engine, run.id, None)
+            .await
+            .unwrap();
+
+        // No classification was ever merged, so the condition is false and
+        // the gated job is skipped.
+        engine.start().await.unwrap();
+        engine
+            .assign_job(planned["detect-changes"], gitforge_common::RunnerId::new())
+            .await
+            .unwrap();
+        engine.start_job(planned["detect-changes"]).await.unwrap();
+        engine
+            .succeed_job(planned["detect-changes"], 0)
+            .await
+            .unwrap();
+        let queued = engine.queue_ready_jobs().await.unwrap();
+        assert!(queued.is_empty());
+        assert_eq!(engine.skipped_jobs().await, vec![planned["clippy"]]);
+
+        persist_skipped_job_rows(Some(&pool), &engine).await;
+
+        let row = gitforge_db::queries::JobQueries::get(&pool, planned["clippy"])
+            .await
+            .unwrap()
+            .expect("skipped job row");
+        assert_eq!(row.status, "skipped");
+        assert!(row.finished_at.is_some());
     }
 }

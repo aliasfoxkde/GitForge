@@ -679,6 +679,7 @@ fn entry_job_definition() -> Value {
             }],
             timeout: Some("30s".to_string()),
             retry: None,
+            skip_if: None,
         }],
     })
     .unwrap()

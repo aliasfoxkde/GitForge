@@ -249,6 +249,7 @@ mod tests {
             }],
             timeout: None,
             retry: None,
+            skip_if: None,
         }
     }
 
