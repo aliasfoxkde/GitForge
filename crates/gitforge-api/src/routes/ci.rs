@@ -13,7 +13,9 @@ use axum::{
 use gitforge_common::{JobId, PipelineId, PipelineRunId};
 use gitforge_db::{
     models::JobStatus,
-    queries::{JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries},
+    queries::{
+        JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries, TriggerRequestQueries,
+    },
     Pool,
 };
 use serde::{Deserialize, Serialize};
@@ -92,6 +94,10 @@ pub fn ci_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/pipelines/{id}/runs", post(trigger_pipeline_run))
         .route("/pipeline-runs", get(list_pipeline_runs))
         .route("/pipeline-runs/{id}", get(get_pipeline_run))
+        .route(
+            "/pipeline-trigger-requests/{id}",
+            get(get_pipeline_trigger_request),
+        )
         .route("/pipeline-runs/{id}/rerun", post(rerun_pipeline_run))
         .route("/pipeline-runs/{id}/jobs", get(get_pipeline_run_jobs))
         .route("/jobs/{id}", get(get_job))
@@ -890,6 +896,76 @@ async fn list_pipeline_runs(
                 Json(serde_json::json!({
                     "error": "database_error",
                     "message": "failed to list pipeline runs"
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Get the durable receipt for an asynchronously accepted pipeline trigger.
+async fn get_pipeline_trigger_request(
+    Extension(pool): Extension<Arc<Pool>>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let claims = user.claims;
+    let request_id = match Uuid::parse_str(&id) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_id",
+                    "message": "Invalid pipeline trigger request ID format"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match TriggerRequestQueries::get(&pool, request_id).await {
+        Ok(Some(request)) => match authorize_repo(&pool, &claims, request.repo_id).await {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "trigger_request_id": request.id.to_string(),
+                    "repo_id": request.repo_id.to_string(),
+                    "ref_name": request.ref_name,
+                    "new_hash": request.new_hash,
+                    "status": request.status,
+                    "pipeline_run_id": request.run_id.map(|run_id| run_id.to_string()),
+                    "attempts": request.attempts,
+                    "error": request.error,
+                    "created_at": request.created_at.to_rfc3339(),
+                    "updated_at": request.updated_at.to_rfc3339()
+                })),
+            )
+                .into_response(),
+            Err(status) => (
+                status,
+                Json(serde_json::json!({
+                    "error": "forbidden",
+                    "message": "Pipeline trigger request access is not permitted"
+                })),
+            )
+                .into_response(),
+        },
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "message": "Pipeline trigger request not found"
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, %request_id, "failed to get pipeline trigger request");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_error",
+                    "message": "Failed to get pipeline trigger request"
                 })),
             )
                 .into_response()

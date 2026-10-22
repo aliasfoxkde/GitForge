@@ -505,6 +505,23 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     }
                 }
             },
+            "/pipeline-trigger-requests/{id}": {
+                "get": {
+                    "tags": ["ci"],
+                    "summary": "Get durable pipeline trigger status",
+                    "description": "Returns the state of an asynchronously accepted trigger and its pipeline_run_id once materialized. Access is scoped to the trigger request's repository.",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+                    ],
+                    "responses": {
+                        "200": {"description": "Trigger request status and correlated pipeline run ID"},
+                        "400": {"description": "Invalid trigger request ID"},
+                        "403": {"description": "Repository access is not permitted"},
+                        "404": {"description": "Trigger request not found"},
+                        "500": {"description": "Failed to retrieve trigger request"}
+                    }
+                }
+            },
             "/pipeline-runs/{id}": {
                 "get": {
                     "tags": ["ci"],

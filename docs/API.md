@@ -231,7 +231,16 @@ GET /api/pipeline-runs
 GET /api/pipeline-runs/{id}
 GET /api/pipeline-runs/{id}/jobs
 POST /api/pipeline-runs/{id}/rerun
+GET /api/pipeline-trigger-requests/{id}
 ```
+
+The CI trigger service can return HTTP 202 before its durable queue consumer
+has materialized a pipeline run. The response includes a
+`trigger_request_id`; poll `GET /api/pipeline-trigger-requests/{id}` to observe
+`pending`, `processing`, `completed`, or `failed` and the eventual
+`pipeline_run_id`. The endpoint is repository-scoped to the authenticated
+owner/maintainer. A completed receipt always includes its run ID; failed
+failed receipts may include an `error` detail for authorized repository users.
 
 `POST /api/pipeline-runs/{id}/rerun` triggers a new run pinned to the
 original run's own commit hash — the reason to rerun is usually doubt

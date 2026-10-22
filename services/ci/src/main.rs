@@ -235,12 +235,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", axum::routing::get(health_check))
         .route(
             "/pipelines/trigger",
-            axum::routing::post(trigger_pipeline).layer(middleware::from_fn(require_trigger_auth)),
+            axum::routing::post(trigger_pipeline)
+                .layer(middleware::from_fn(require_trigger_auth_for_post)),
         )
         .route(
             "/pipeline-trigger-requests/{request_id}",
             axum::routing::get(get_trigger_request_status)
-                .layer(middleware::from_fn(require_trigger_auth)),
+                .layer(middleware::from_fn(require_receipt_auth_for_get)),
         )
         .merge(scheduler_routes(scheduler_state))
         .layer(Extension(trigger_state))
@@ -658,19 +659,43 @@ struct PipelineTriggerRequest {
     working_dir: Option<String>,
 }
 
-/// Trigger a pipeline through the same typed push-event path used by Git
-/// webhooks. This endpoint is internal control-plane automation and requires
-/// a dedicated trigger token, falling back to the scheduler operator/shared
-/// token during migration.
-fn configured_trigger_token(get_var: impl Fn(&str) -> Option<String>) -> Option<String> {
-    [
-        "GITFORGE_TRIGGER_TOKEN",
-        "GITFORGE_CI_TRIGGER_TOKEN",
-        "GITFORGE_SCHEDULER_OPERATOR_TOKEN",
-        "GITFORGE_SCHEDULER_TOKEN",
-    ]
-    .into_iter()
-    .find_map(|name| get_var(name).filter(|token| !token.is_empty()))
+/// Dedicated credentials used to enqueue CI triggers. Never include the
+/// scheduler operator credential here: POST can create work.
+fn configured_trigger_tokens(get_var: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    ["GITFORGE_TRIGGER_TOKEN", "GITFORGE_CI_TRIGGER_TOKEN"]
+        .into_iter()
+        .filter_map(get_var)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// Compatibility credentials accepted only for read-only receipt polling.
+fn configured_receipt_tokens(get_var: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut tokens = configured_trigger_tokens(&get_var);
+    tokens.extend(
+        [
+            "GITFORGE_SCHEDULER_OPERATOR_TOKEN",
+            "GITFORGE_SCHEDULER_TOKEN",
+        ]
+        .into_iter()
+        .filter_map(get_var)
+        .filter(|token| !token.is_empty()),
+    );
+    tokens
+}
+
+fn get_trigger_tokens() -> Vec<String> {
+    configured_trigger_tokens(|name| std::env::var(name).ok())
+}
+
+fn get_receipt_tokens() -> Vec<String> {
+    configured_receipt_tokens(|name| std::env::var(name).ok())
+}
+
+fn any_token_matches(expected_tokens: &[String], supplied: Option<&str>) -> bool {
+    expected_tokens.iter().fold(false, |matched, expected| {
+        trigger_token_matches(expected, supplied) | matched
+    })
 }
 
 /// Compare trigger credentials without leaking the first differing byte or
@@ -694,21 +719,46 @@ fn trigger_token_matches(expected: &str, supplied: Option<&str>) -> bool {
     difference == 0
 }
 
-async fn require_trigger_auth(request: Request, next: Next) -> Response {
-    let expected = configured_trigger_token(|name| std::env::var(name).ok());
-    let Some(expected) = expected else {
+async fn require_trigger_auth_for_post(request: Request, next: Next) -> Response {
+    let expected = get_trigger_tokens();
+    if expected.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "trigger_auth_not_configured"})),
         )
             .into_response();
-    };
+    }
     let supplied = request
         .headers()
         .get("x-gitforge-trigger-token")
         .or_else(|| request.headers().get(header::AUTHORIZATION))
         .and_then(|value| value.to_str().ok());
-    if trigger_token_matches(&expected, supplied) {
+    if any_token_matches(&expected, supplied) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "trigger_auth_required"})),
+        )
+            .into_response()
+    }
+}
+
+async fn require_receipt_auth_for_get(request: Request, next: Next) -> Response {
+    let expected = get_receipt_tokens();
+    if expected.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "trigger_auth_not_configured"})),
+        )
+            .into_response();
+    }
+    let supplied = request
+        .headers()
+        .get("x-gitforge-trigger-token")
+        .or_else(|| request.headers().get(header::AUTHORIZATION))
+        .and_then(|value| value.to_str().ok());
+    if any_token_matches(&expected, supplied) {
         next.run(request).await
     } else {
         (
@@ -862,6 +912,7 @@ async fn trigger_pipeline(
                         Json(serde_json::json!({
                             "status": if run_id.is_some() { "accepted" } else { "queued" },
                             "event_id": existing.id.to_string(),
+                            "trigger_request_id": existing.id.to_string(),
                             "pipeline_run_id": run_id,
                             "repo_id": repo_id.to_string(),
                             "new_hash": request.new_hash,
@@ -944,7 +995,8 @@ async fn trigger_pipeline(
                     "status": if pipeline_run_id.is_some() { "accepted" } else { "queued" },
                     "event_id": event.event_id.to_string(),
                     "pipeline_run_id": pipeline_run_id.map(|id| id.to_string()),
-                    "trigger_id": trigger_request.map(|request| request.id.to_string()),
+                    "trigger_id": trigger_request.as_ref().map(|request| request.id.to_string()),
+                    "trigger_request_id": trigger_request.as_ref().map(|request| request.id.to_string()),
                     "repo_id": repo_id.to_string(),
                     "new_hash": request.new_hash,
                 })),
@@ -3228,30 +3280,45 @@ mod tests {
 
     #[test]
     fn trigger_token_accepts_git_server_compatibility_name() {
-        let token = configured_trigger_token(|name| {
+        let tokens = configured_trigger_tokens(|name| {
             (name == "GITFORGE_CI_TRIGGER_TOKEN").then(|| "shared-secret".to_string())
         });
-        assert_eq!(token.as_deref(), Some("shared-secret"));
+        assert_eq!(tokens, vec!["shared-secret"]);
     }
 
     #[test]
-    fn trigger_token_prefers_dedicated_name_over_compatibility_alias() {
-        let token = configured_trigger_token(|name| match name {
+    fn trigger_tokens_include_both_dedicated_aliases() {
+        let tokens = configured_trigger_tokens(|name| match name {
             "GITFORGE_TRIGGER_TOKEN" => Some("dedicated".to_string()),
             "GITFORGE_CI_TRIGGER_TOKEN" => Some("compatibility".to_string()),
             _ => None,
         });
-        assert_eq!(token.as_deref(), Some("dedicated"));
+        assert_eq!(tokens, vec!["dedicated", "compatibility"]);
     }
 
     #[test]
-    fn trigger_token_ignores_empty_values_and_falls_back() {
-        let token = configured_trigger_token(|name| match name {
+    fn trigger_tokens_ignore_empty_values() {
+        let tokens = configured_trigger_tokens(|name| match name {
             "GITFORGE_TRIGGER_TOKEN" => Some(String::new()),
             "GITFORGE_CI_TRIGGER_TOKEN" => Some("compatibility".to_string()),
             _ => None,
         });
-        assert_eq!(token.as_deref(), Some("compatibility"));
+        assert_eq!(tokens, vec!["compatibility"]);
+    }
+
+    #[test]
+    fn receipt_tokens_include_operator_aliases_but_trigger_tokens_do_not() {
+        let get_var = |name: &str| match name {
+            "GITFORGE_TRIGGER_TOKEN" => Some("trigger".to_string()),
+            "GITFORGE_SCHEDULER_OPERATOR_TOKEN" => Some("operator".to_string()),
+            _ => None,
+        };
+
+        assert_eq!(configured_trigger_tokens(get_var), vec!["trigger"]);
+        assert_eq!(
+            configured_receipt_tokens(get_var),
+            vec!["trigger", "operator"]
+        );
     }
 
     #[test]
