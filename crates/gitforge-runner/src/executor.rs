@@ -1,6 +1,6 @@
 //! Job executor with container pooling
 
-use gitforge_common::{JobId, PipelineRunId, RepoId, Result};
+use gitforge_common::{JobId, PipelineRunId, RepoId, Result, VolumeSpec};
 use gitforge_sandbox::{
     DockerSandbox, OutputSink, Sandbox, SandboxInstance, SandboxLimits, StepResult,
 };
@@ -176,7 +176,7 @@ impl ContainerPool {
 
         while instances.len() < count {
             let id = JobId::new();
-            match self.sandbox.create(id, image, sandbox_limits()).await {
+            match self.sandbox.create(id, image, sandbox_limits(), &[]).await {
                 Ok(instance) => {
                     tracing::info!("pre-warmed container for image {}", image);
                     instances.push(instance);
@@ -190,17 +190,31 @@ impl ContainerPool {
         Ok(())
     }
 
-    /// Get a container from the pool, creating one if needed
+    /// Get a container from the pool, creating one if needed.
+    ///
+    /// `volumes` are the host mounts the job asked for (cache
+    /// directories, tmpfs scratch). They are honoured when the container
+    /// is created; a pooled container is only reused for jobs that need no
+    /// mounts, because a pooled container cannot gain a mount afterwards.
     pub async fn acquire(
         &self,
         job_id: &JobId,
         image: &str,
         workspace_path: Option<&str>,
+        volumes: &[VolumeSpec],
     ) -> Result<SandboxInstance> {
         if workspace_path.is_some() {
             return self
                 .sandbox
-                .create_with_workspace(*job_id, image, sandbox_limits(), workspace_path)
+                .create_with_workspace(*job_id, image, sandbox_limits(), workspace_path, volumes)
+                .await;
+        }
+        if !volumes.is_empty() {
+            // A mount is baked in at creation time, so a pooled container
+            // (created without one) cannot serve this job.
+            return self
+                .sandbox
+                .create(*job_id, image, sandbox_limits(), volumes)
                 .await;
         }
         let mut pools = self.pools.write().await;
@@ -215,7 +229,9 @@ impl ContainerPool {
 
         // Pool empty or no pool for this image, create new
         tracing::debug!("creating new container for job {} (pool empty)", job_id);
-        self.sandbox.create(*job_id, image, sandbox_limits()).await
+        self.sandbox
+            .create(*job_id, image, sandbox_limits(), &[])
+            .await
     }
 
     /// Return a container to the pool
@@ -241,7 +257,7 @@ impl ContainerPool {
             }
             // Create fresh instance for the pool
             let id = JobId::new();
-            match self.sandbox.create(id, image, sandbox_limits()).await {
+            match self.sandbox.create(id, image, sandbox_limits(), &[]).await {
                 Ok(new_instance) => {
                     instances.push(new_instance);
                     tracing::debug!("returned container to pool");
@@ -450,8 +466,12 @@ impl JobExecutor {
         let acquire_timeout = job_timeout.min(sandbox_acquire_timeout());
         let instance = match timeout(
             acquire_timeout,
-            self.pool
-                .acquire(&job_id, &job.image, job.working_dir.as_deref()),
+            self.pool.acquire(
+                &job_id,
+                &job.image,
+                job.working_dir.as_deref(),
+                &job.volumes,
+            ),
         )
         .await
         {
@@ -809,6 +829,9 @@ pub struct ExecutableJob {
     pub image: String,
     pub steps: Vec<JobStep>,
     pub env: HashMap<String, String>,
+    /// Host mounts the job's container needs (cache directories, tmpfs
+    /// scratch). Requested by the pipeline definition.
+    pub volumes: Vec<VolumeSpec>,
     pub working_dir: Option<String>,
     pub timeout_secs: u64,
 }
@@ -824,6 +847,7 @@ impl ExecutableJob {
             image,
             steps: Vec::new(),
             env: HashMap::new(),
+            volumes: Vec::new(),
             working_dir: None,
             timeout_secs: 300,
         }
@@ -836,6 +860,12 @@ impl ExecutableJob {
 
     pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Declare the host mounts the job's container needs.
+    pub fn with_volumes(mut self, volumes: Vec<VolumeSpec>) -> Self {
+        self.volumes = volumes;
         self
     }
 

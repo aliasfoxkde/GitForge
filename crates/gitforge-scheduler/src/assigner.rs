@@ -2,7 +2,7 @@
 
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
-use gitforge_common::{JobId, PipelineRunId, RepoId, RunnerId};
+use gitforge_common::{JobId, PipelineRunId, RepoId, RunnerId, VolumeSpec};
 use gitforge_db::models::{
     Job as DbJob, JobStatus, PipelineRun as DbPipelineRun, Runner,
     RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS,
@@ -183,6 +183,10 @@ pub struct JobExecutionDefinition {
     /// pipeline `environment` map and the job `env` map by the DAG builder;
     /// job-level keys win.
     pub env: HashMap<String, String>,
+    /// Host mounts the job's container needs (cache directories, tmpfs
+    /// scratch). Requested by the pipeline definition and honoured by the
+    /// sandbox when the container is created.
+    pub volumes: Vec<VolumeSpec>,
 }
 
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 300;
@@ -430,6 +434,7 @@ impl Scheduler {
                 working_dir,
                 timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
                 env: HashMap::new(),
+                volumes: Vec::new(),
             },
         )
         .await
@@ -505,6 +510,7 @@ impl Scheduler {
                 working_dir: definition.working_dir.clone(),
                 timeout_secs,
                 env: definition.env.clone(),
+                volumes: definition.volumes.clone(),
             },
         );
         tracing::debug!("job {} enqueued", job_id);
@@ -837,6 +843,9 @@ impl Scheduler {
                         // the job must be re-dispatched, and the CI engine's
                         // rebuild path restores pipeline environment.
                         env: HashMap::new(),
+                        // Likewise no volumes column: a re-adopted job runs
+                        // without the pipeline's cache mount.
+                        volumes: Vec::new(),
                     }
                 });
                 readopted += 1;
@@ -1420,6 +1429,9 @@ impl Scheduler {
                         // restores env; this row-level recovery is only the
                         // fallback when that engine rebuild did not happen.
                         env: HashMap::new(),
+                        // Likewise no volumes column: a row-recovered job
+                        // runs without the pipeline's cache mount.
+                        volumes: Vec::new(),
                     },
                 );
                 loaded += 1;
@@ -2127,6 +2139,7 @@ mod tests {
             working_dir: None,
             timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
             env: HashMap::new(),
+            volumes: Vec::new(),
         }
     }
 
@@ -2137,6 +2150,7 @@ mod tests {
             working_dir: None,
             timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
             env: HashMap::new(),
+            volumes: Vec::new(),
         }
     }
 
@@ -2282,6 +2296,7 @@ mod tests {
                     working_dir: Some("/workspace".to_string()),
                     timeout_secs: 900,
                     env: HashMap::new(),
+                    volumes: Vec::new(),
                 },
             )
             .await

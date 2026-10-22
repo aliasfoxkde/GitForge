@@ -1,7 +1,7 @@
 //! Runner agent
 
 use crate::executor::{ExecutableJob, JobExecutor, JobStep};
-use gitforge_common::{Error, JobId, PipelineRunId, Result, RunnerId};
+use gitforge_common::{Error, JobId, PipelineRunId, Result, RunnerId, VolumeSpec};
 use gitforge_db::models::Runner;
 use gitforge_sandbox::{
     ActiveJobRegistry, DockerContainerSource, DockerSandbox, OutputSink, OutputStream,
@@ -789,6 +789,10 @@ pub struct JobAssignment {
     /// empty so assignments from a pre-env scheduler still decode.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Host mounts the job's container needs. Defaults to empty so
+    /// assignments from a pre-mount scheduler still decode.
+    #[serde(default)]
+    pub volumes: Vec<VolumeSpec>,
 }
 
 fn default_job_timeout_secs() -> u64 {
@@ -1361,6 +1365,7 @@ impl RunnerAgent {
                 })
                 .collect(),
             env: assignment.env.clone(),
+            volumes: assignment.volumes.clone(),
             working_dir: assignment.working_dir.clone(),
             timeout_secs: assignment.timeout_secs.clamp(5, 24 * 60 * 60),
         };
@@ -2726,12 +2731,53 @@ mod tests {
             working_dir: Some("/workspace".to_string()),
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
         let deserialized: JobAssignment = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.job_id, "job-123");
         assert_eq!(deserialized.commands.len(), 2);
+    }
+
+    #[test]
+    fn test_job_assignment_carries_volumes() {
+        let assignment = JobAssignment {
+            job_id: "job-1".to_string(),
+            name: "build".to_string(),
+            pipeline_run_id: "run-1".to_string(),
+            commands: vec!["cargo build".to_string()],
+            image: "dsc-ci-rust:10".to_string(),
+            working_dir: None,
+            timeout_secs: 300,
+            env: HashMap::new(),
+            volumes: vec![gitforge_common::VolumeSpec {
+                volume_type: Some(gitforge_common::VolumeType::Bind),
+                source: Some("{cache_root}/cargo/{image}".to_string()),
+                destination: "/cargo-target".to_string(),
+                read_only: false,
+                size: None,
+            }],
+        };
+
+        let json = serde_json::to_string(&assignment).unwrap();
+        let decoded: JobAssignment = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.volumes.len(), 1);
+        assert_eq!(decoded.volumes[0].destination, "/cargo-target");
+    }
+
+    #[test]
+    fn test_legacy_job_assignment_without_volumes_decodes_empty() {
+        let assignment: JobAssignment = serde_json::from_str(
+            r#"{
+                "job_id": "job-1",
+                "name": "build",
+                "pipeline_run_id": "run-1",
+                "commands": ["cargo build"]
+            }"#,
+        )
+        .unwrap();
+        assert!(assignment.volumes.is_empty());
     }
 
     #[test]
@@ -2762,6 +2808,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert!(assignment.working_dir.is_none());
     }
@@ -2784,6 +2831,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         let debug_str = format!("{assignment:?}");
         assert!(debug_str.contains("job-123"));
@@ -2816,6 +2864,7 @@ mod tests {
             working_dir: Some("/workspace".to_string()),
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
 
         // Test JSON serialization
@@ -2842,6 +2891,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert!(assignment.commands.is_empty());
         assert!(assignment.working_dir.is_none());
@@ -2864,6 +2914,7 @@ mod tests {
             working_dir: Some("/project".to_string()),
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert_eq!(assignment.commands.len(), 4);
     }
@@ -2961,6 +3012,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         let assignment2 = JobAssignment {
             job_id: "job-1".to_string(),
@@ -2971,6 +3023,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         // JobAssignment should implement PartialEq if we add it
         // For now just verify individual field equality
@@ -2989,6 +3042,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
@@ -3068,6 +3122,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert_eq!(assignment.commands.len(), 100);
     }
@@ -3083,6 +3138,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         let cloned = assignment.clone();
         assert_eq!(cloned.job_id, assignment.job_id);
@@ -3100,6 +3156,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert_eq!(assignment.name, "测试任务");
     }
@@ -3119,6 +3176,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert_eq!(assignment.commands.len(), 3);
     }
@@ -3197,6 +3255,7 @@ mod tests {
             working_dir: Some("".to_string()),
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert!(assignment.working_dir.is_some());
     }
