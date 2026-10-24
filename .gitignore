@@ -2,7 +2,8 @@
 atheon
 atheon.exe
 atheon-*-*
-bin/
+# bin/ = compiled binaries output; but Cargo bin targets under src/ are source.
+/bin/
 dist/
 !template-parts/atheon-enhanced/
 
