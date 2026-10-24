@@ -279,6 +279,10 @@ pub struct Scheduler {
     db_pool: Option<Pool>,
     recovery_done: Arc<AtomicBool>,
     fence_grace_secs: i64,
+    /// Notified whenever a job is enqueued so the dispatch loop can assign
+    /// immediately instead of waiting out the next 5 s tick. The tick still
+    /// runs on its interval — the wake only collapses the idle latency.
+    dispatch_wake: Arc<tokio::sync::Notify>,
 }
 
 impl Scheduler {
@@ -292,6 +296,7 @@ impl Scheduler {
             db_pool: None,
             recovery_done: Arc::new(AtomicBool::new(true)),
             fence_grace_secs: DEFAULT_JOB_FENCE_GRACE_SECS,
+            dispatch_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -305,6 +310,7 @@ impl Scheduler {
             db_pool: Some(pool),
             recovery_done: Arc::new(AtomicBool::new(false)),
             fence_grace_secs: DEFAULT_JOB_FENCE_GRACE_SECS,
+            dispatch_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -325,6 +331,7 @@ impl Scheduler {
             db_pool: self.db_pool,
             recovery_done: self.recovery_done,
             fence_grace_secs: self.fence_grace_secs,
+            dispatch_wake: self.dispatch_wake,
         }
     }
 
@@ -508,7 +515,21 @@ impl Scheduler {
             },
         );
         tracing::debug!("job {} enqueued", job_id);
+        self.dispatch_wake.notify_one();
         Ok(())
+    }
+
+    /// Wake the dispatch loop so a freshly enqueued job is assigned without
+    /// waiting for the next periodic tick.
+    pub fn wake(&self) {
+        self.dispatch_wake.notify_one();
+    }
+
+    /// A cloneable wake handle for a dispatch loop running elsewhere (the
+    /// CI service drives `process_queue` on its own interval; selecting on
+    /// this lets an enqueue collapse the idle dispatch latency).
+    pub fn dispatch_wake_handle(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.dispatch_wake)
     }
 
     /// Submit an operator job exactly once across control-plane retries. This
@@ -577,7 +598,9 @@ impl Scheduler {
         let job = QueuedJob::new(job_id, pipeline_run_id, repo_id).with_priority(priority);
         let mut state = self.state.write().await;
         state.queue.enqueue(job);
+        drop(state);
         tracing::debug!("job {} enqueued with {:?} priority", job_id, priority);
+        self.dispatch_wake.notify_one();
     }
 
     /// Cancel a job
@@ -1157,19 +1180,25 @@ impl Scheduler {
                     .map(|job| job.job_id)
                     .collect::<Vec<_>>()
             };
+            // One batched read replaces a query per queued job: the tick
+            // used to serialize behind dozens of round trips under load.
+            let durable_jobs = match gitforge_db::queries::JobQueries::get_many(pool, &queued_ids)
+                .await
+            {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    // Durable state is authoritative. Fail closed for
+                    // this scheduler tick if cancellation is unreadable.
+                    tracing::error!(%error, "failed to reconcile queued jobs before assignment");
+                    return;
+                }
+            };
             for job_id in queued_ids {
-                let is_cancelled = match gitforge_db::queries::JobQueries::get(pool, job_id).await {
-                    Ok(Some(job)) => job.status == "cancelled",
-                    Ok(None) => false,
-                    Err(error) => {
-                        // Durable state is authoritative. Fail closed for
-                        // this scheduler tick if cancellation is unreadable.
-                        tracing::error!(%error, %job_id, "failed to reconcile cancellation before assignment");
-                        return;
-                    }
-                };
-                if is_cancelled {
-                    self.cancel(job_id).await;
+                match durable_jobs.get(&job_id) {
+                    Some(job) if job.status == "cancelled" => self.cancel(job_id).await,
+                    // A queued job missing from the durable read has not been
+                    // persisted yet; there is nothing to reconcile.
+                    _ => {}
                 }
             }
 
@@ -1180,7 +1209,6 @@ impl Scheduler {
             // with genuinely re-executed jobs, run 50b35e0b) and burned real
             // containers on a dead verdict. Run statuses are cached per tick:
             // a queue drains in run order, so distinct runs per tick is tiny.
-            let mut run_status_cache: HashMap<PipelineRunId, Option<String>> = HashMap::new();
             let queued_jobs = {
                 let state = self.state.read().await;
                 state
@@ -1190,19 +1218,22 @@ impl Scheduler {
                     .map(|job| (job.job_id, job.pipeline_run_id))
                     .collect::<Vec<_>>()
             };
+            // One batched read answers the run status behind every queued
+            // job; the per-run cache existed only to bound the old
+            // query-per-run cost, which the batch removes entirely.
+            let run_ids: Vec<PipelineRunId> =
+                queued_jobs.iter().map(|(_, run_id)| *run_id).collect();
+            let runs = match gitforge_db::queries::PipelineRunQueries::get_many(pool, &run_ids)
+                .await
+            {
+                Ok(runs) => runs,
+                Err(error) => {
+                    tracing::error!(%error, "failed to reconcile queued jobs against their runs");
+                    return;
+                }
+            };
             for (job_id, run_id) in queued_jobs {
-                let run_status = match run_status_cache.get(&run_id) {
-                    Some(cached) => cached.clone(),
-                    None => {
-                        let status = gitforge_db::queries::PipelineRunQueries::get(pool, run_id)
-                            .await
-                            .ok()
-                            .flatten()
-                            .map(|run| run.status);
-                        run_status_cache.insert(run_id, status.clone());
-                        status
-                    }
-                };
+                let run_status = runs.get(&run_id).map(|run| run.status.clone());
                 let run_terminal = matches!(
                     run_status.as_deref(),
                     Some("succeeded")
@@ -1231,16 +1262,19 @@ impl Scheduler {
                 let state = self.state.read().await;
                 state.assigned_jobs.keys().copied().collect::<Vec<_>>()
             };
-            for job_id in assigned_ids {
-                let is_cancelled = match gitforge_db::queries::JobQueries::get(pool, job_id).await {
-                    Ok(Some(job)) => job.status == "cancelled",
-                    Ok(None) => false,
+            let assigned_jobs =
+                match gitforge_db::queries::JobQueries::get_many(pool, &assigned_ids).await {
+                    Ok(jobs) => jobs,
                     Err(error) => {
-                        tracing::error!(%error, %job_id, "failed to reconcile assigned-job cancellation");
+                        tracing::error!(%error, "failed to reconcile assigned-job cancellation");
                         return;
                     }
                 };
-                if is_cancelled {
+            for job_id in assigned_ids {
+                if assigned_jobs
+                    .get(&job_id)
+                    .is_some_and(|job| job.status == "cancelled")
+                {
                     self.cancel(job_id).await;
                 }
             }

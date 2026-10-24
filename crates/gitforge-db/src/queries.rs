@@ -1029,6 +1029,39 @@ impl PipelineRunQueries {
         Ok(runs)
     }
 
+    /// Load several pipeline runs by id in one query.
+    ///
+    /// The F24 reconciliation sweep needs the status behind every queued
+    /// job's run each tick; a query per run serialized the tick behind
+    /// dozens of round trips under load.
+    pub async fn get_many(
+        pool: &Pool,
+        ids: &[PipelineRunId],
+    ) -> Result<std::collections::HashMap<PipelineRunId, crate::models::PipelineRun>> {
+        let mut loaded = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(loaded);
+        }
+
+        let encoded =
+            serde_json::to_string(&ids.iter().map(ToString::to_string).collect::<Vec<String>>())
+                .map_err(|e| Error::database(format!("failed to encode pipeline run ids: {e}")))?;
+
+        let rows =
+            sqlx::query("SELECT * FROM pipeline_runs WHERE id IN (SELECT value FROM json_each(?))")
+                .bind(encoded)
+                .fetch_all(pool.pool())
+                .await
+                .map_err(|e| Error::database(format!("failed to load pipeline runs: {e}")))?;
+
+        for row in rows {
+            let run = hydrate_pipeline_run(row)?;
+            loaded.insert(run.id, run);
+        }
+
+        Ok(loaded)
+    }
+
     /// List per-pipeline outcomes recorded for one commit, latest first (#240).
     ///
     /// The ref-update policy matches on the exact commit hash a push wants to
@@ -1521,6 +1554,40 @@ impl JobQueries {
             .map_err(|e| Error::database(format!("failed to get job: {e}")))?;
 
         row.map(hydrate_job).transpose()
+    }
+
+    /// Load several jobs by id in one query.
+    ///
+    /// The scheduler reconciles every queued and assigned job against the
+    /// durable rows each tick (cancellation, F24 terminal-run checks). One
+    /// query per job serialized the tick behind dozens of round trips under
+    /// load; a single `json_each` read answers them all, matching the
+    /// `PipelineRunQueries::get_many` pattern.
+    pub async fn get_many(
+        pool: &Pool,
+        ids: &[JobId],
+    ) -> Result<std::collections::HashMap<JobId, crate::models::Job>> {
+        let mut loaded = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(loaded);
+        }
+
+        let encoded =
+            serde_json::to_string(&ids.iter().map(ToString::to_string).collect::<Vec<String>>())
+                .map_err(|e| Error::database(format!("failed to encode job ids: {e}")))?;
+
+        let rows = sqlx::query("SELECT * FROM jobs WHERE id IN (SELECT value FROM json_each(?))")
+            .bind(encoded)
+            .fetch_all(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to load jobs: {e}")))?;
+
+        for row in rows {
+            let job = hydrate_job(row)?;
+            loaded.insert(job.id, job);
+        }
+
+        Ok(loaded)
     }
 
     /// Update job status
@@ -3588,6 +3655,87 @@ impl StatsQueries {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seed the FK chain (owner → repo → pipeline → run) so tests can
+    /// insert job rows under a valid parent.
+    async fn seed_run(pool: &Pool, run_id: PipelineRunId) {
+        let owner = crate::models::User::new(
+            "fk-owner".to_string(),
+            "fk-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "fk-repo".to_string(),
+            owner.id,
+            "/git/fk-repo".to_string(),
+        );
+        RepoQueries::create(pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({"jobs": []}),
+            created_at: Utc::now(),
+        };
+        PipelineQueries::create(pool, &pipeline).await.unwrap();
+        let mut run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "0".repeat(40),
+        );
+        run.id = run_id;
+        PipelineRunQueries::create(pool, &run).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_job_get_many_returns_only_requested_ids() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let run_id = PipelineRunId::new();
+        seed_run(&pool, run_id).await;
+
+        let id_a = JobId::new();
+        let id_b = JobId::new();
+        for (job_id, name) in [(id_a, "fmt"), (id_b, "test")] {
+            let mut job = crate::models::Job::new(run_id, name.to_string());
+            job.id = job_id;
+            JobQueries::create(&pool, &job).await.unwrap();
+        }
+        let missing = JobId::new();
+
+        let loaded = JobQueries::get_many(&pool, &[id_a, missing, id_b])
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get(&id_a).unwrap().id, id_a);
+        assert_eq!(loaded.get(&id_b).unwrap().id, id_b);
+        assert!(!loaded.contains_key(&missing));
+
+        assert!(JobQueries::get_many(&pool, &[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_run_get_many_returns_only_requested_ids() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let seeded = PipelineRunId::new();
+        seed_run(&pool, seeded).await;
+        let missing = PipelineRunId::new();
+
+        let loaded = PipelineRunQueries::get_many(&pool, &[seeded, missing])
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get(&seeded).unwrap().id, seeded);
+        assert!(!loaded.contains_key(&missing));
+    }
 
     #[tokio::test]
     async fn test_dashboard_stats_count_seeded_rows() {

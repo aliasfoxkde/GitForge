@@ -492,9 +492,12 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
-    // Start scheduler loop
+    // Start scheduler loop. The 5 s tick bounds reconciliation; a wake on
+    // enqueue collapses the idle dispatch latency so a fresh job is assigned
+    // in milliseconds instead of waiting out the tick.
     let scheduler_clone = scheduler_arc.clone();
     let shutdown_scheduler = shutdown.clone();
+    let dispatch_wake = scheduler_arc.dispatch_wake_handle();
     let _scheduler_handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         loop {
@@ -502,7 +505,10 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("scheduler loop shutting down");
                 break;
             }
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = dispatch_wake.notified() => {}
+            }
             scheduler_clone.process_queue().await;
         }
     });
