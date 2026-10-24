@@ -260,14 +260,18 @@ durations:**
 | Run | clippy | test | coverage |
 |-----|--------|------|----------|
 | cold (no cache) | 61s | 4m15s | 4m59s |
-| warm (cache mount, run `cab70f20`) | 1m43s | 4m53s | 4m07s |
+| warm (cache mount) | MEASURE AFTER DEPLOY | MEASURE AFTER DEPLOY | MEASURE AFTER DEPLOY |
 
-Caveat on the comparison: both rows are from the same host under low
-load, and the deltas are within run-to-run noise for a workspace this
-size. The structural saving is real but scales with dependency count:
-the warm clippy step rides a populated `/cargo-target` instead of
-recompiling every dependency, and the full chain succeeded end to end
-with the mount active (no correctness regressions).
+**Why the warm row is still empty (verified 2026-10-24):** run
+`cab70f20` for this branch executed end to end green, but the Fedora
+runner host still runs the `gitforge-06be8eae` binary — it predates
+this feature, ignores the unknown `volumes` field in the assignment
+(serde default), and mounts no `/cargo-target` (confirmed by
+`docker inspect` on every job container of the run: only the workspace
+bind). The numbers in that run are therefore ordinary cold runs, not
+cache evidence. Warm measurements become meaningful only after the
+branch deploys to the runner hosts; the old cold row stands as the
+baseline until then.
 
 **Known limits:** the durable `jobs` table has no env or volumes column,
 so a job recovered by the scheduler's row-level recovery path (after a
