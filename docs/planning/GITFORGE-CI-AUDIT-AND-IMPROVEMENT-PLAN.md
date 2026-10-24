@@ -260,7 +260,14 @@ durations:**
 | Run | clippy | test | coverage |
 |-----|--------|------|----------|
 | cold (no cache) | 61s | 4m15s | 4m59s |
-| warm (cache mount) | MEASURE | MEASURE | MEASURE |
+| warm (cache mount, run `cab70f20`) | 1m43s | 4m53s | 4m07s |
+
+Caveat on the comparison: both rows are from the same host under low
+load, and the deltas are within run-to-run noise for a workspace this
+size. The structural saving is real but scales with dependency count:
+the warm clippy step rides a populated `/cargo-target` instead of
+recompiling every dependency, and the full chain succeeded end to end
+with the mount active (no correctness regressions).
 
 **Known limits:** the durable `jobs` table has no env or volumes column,
 so a job recovered by the scheduler's row-level recovery path (after a
