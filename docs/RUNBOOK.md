@@ -165,6 +165,7 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 | `GITFORGE_SCHEDULER_TOKEN` | No | _(none)_ | Bearer token for scheduler API authentication |
 | `GITFORGE_REGISTER_ATTEMPTS` | No | `6` | Registration attempts before giving up when the scheduler is unreachable |
 | `GITFORGE_REGISTER_BACKOFF_SECS` | No | `1` | Initial registration retry delay; doubles per attempt up to 30s |
+| `GITFORGE_CACHE_ROOT` | No | `~/.cache/gitforge` | Host root for job cache mounts (compiled cargo artifacts). Used when a job declares a `cache:` block: the runner bind-mounts `<root>/cargo/<image>` at the job's `mount_path` inside the container. Falls back to `/var/cache/gitforge` when `$HOME` is unset. A cache that cannot be prepared is skipped with a warning — jobs still run cold. |
 
 > **Startup behavior**: If `GITFORGE_SCHEDULER_URL` is missing or empty, the runner exits immediately
 > with a clear error message. Invalid values for numeric variables (non-integer) also cause a fast

@@ -1,6 +1,6 @@
 //! Pipeline definition and parsing
 
-use gitforge_common::{PipelineId, RepoId};
+use gitforge_common::{JobCache, PipelineId, RepoId, VolumeSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -154,6 +154,16 @@ pub struct JobDefinition {
     /// transitions to Skipped (terminal, counted as succeeded for deps).
     #[serde(default)]
     pub skip_if: Option<String>,
+    /// Host mounts this job needs (cache directories, tmpfs scratch).
+    /// Absent in older pipelines; an empty list is the safe default.
+    #[serde(default)]
+    pub volumes: Vec<VolumeSpec>,
+    /// Compiled-artifact cache mounted into the job's container. The DAG
+    /// builder expands it into a bind mount plus the environment variable
+    /// that points the toolchain at it, so every downstream hop carries
+    /// plain volumes and env.
+    #[serde(default)]
+    pub cache: Option<JobCache>,
 }
 
 impl JobDefinition {
@@ -216,6 +226,65 @@ jobs:
     }
 
     #[test]
+    fn test_parse_job_with_cache_and_volumes() {
+        let yaml = r#"
+name: cached
+version: "1.0"
+trigger_on:
+  - push
+environment: {}
+jobs:
+  - name: test
+    image: dsc-ci-rust:10
+    cache:
+      source: "{cache_root}/cargo/{image}"
+      mount_path: /cargo-target
+    volumes:
+      - type: tmpfs
+        destination: /scratch
+        size: 4G
+    steps:
+      - name: run
+        run: cargo test
+"#;
+
+        let pipeline = PipelineDefinition::parse(yaml).unwrap();
+        let job = &pipeline.jobs[0];
+        let cache = job.cache.as_ref().expect("cache block");
+        assert_eq!(cache.source, "{cache_root}/cargo/{image}");
+        assert_eq!(cache.mount_path, "/cargo-target");
+        // The env var defaults to the one every cargo job wants.
+        assert_eq!(cache.env_var, "CARGO_TARGET_DIR");
+        assert_eq!(job.volumes.len(), 1);
+        assert_eq!(
+            job.volumes[0].resolved_type(),
+            gitforge_common::VolumeType::Tmpfs
+        );
+        assert_eq!(job.volumes[0].destination, "/scratch");
+    }
+
+    #[test]
+    fn test_parse_job_without_cache_has_no_volumes() {
+        let yaml = r#"
+name: plain
+version: "1.0"
+trigger_on:
+  - push
+environment: {}
+jobs:
+  - name: test
+    image: dsc-ci-rust:10
+    steps:
+      - name: run
+        run: cargo test
+"#;
+
+        let pipeline = PipelineDefinition::parse(yaml).unwrap();
+        assert!(pipeline.jobs[0].cache.is_none());
+        assert!(pipeline.jobs[0].volumes.is_empty());
+    }
+
+    #[test]
     fn test_parse_timeout_secs_bounds_and_units() {
         assert_eq!(parse_timeout_secs(None).unwrap(), DEFAULT_TIMEOUT_SECS);
         assert_eq!(parse_timeout_secs(Some("5s")).unwrap(), 5);
@@ -267,6 +336,8 @@ jobs:
             timeout: None,
             retry: None,
             skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         };
         assert!(job.has_dependencies());
 
@@ -279,6 +350,8 @@ jobs:
             timeout: None,
             retry: None,
             skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         };
         assert!(!job2.has_dependencies());
     }

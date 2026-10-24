@@ -46,9 +46,17 @@
 #   (The daemon moved from the vfs storage driver to overlay2 on
 #   2026-09-24 — container jobs got ~10x faster — but the pre-build rule
 #   stands.)
-# - Cargo state is cold in the container (no cache mount), so clippy and
-#   test each pay a full dependency compile; the generous timeouts absorb
-#   that rather than gating on a cache setup this repo doesn't own.
+# - CARGO CACHE: the clippy, test and coverage jobs declare a `cache:`
+#   block. The runner bind-mounts a host directory at /cargo-target inside
+#   the container and exports CARGO_TARGET_DIR pointing at it. The mount
+#   path inside the container is FIXED, so cargo can reuse the dependency
+#   artifacts an earlier run compiled instead of rebuilding the world
+#   every time; the host directory is keyed by image tag ({image}), so a
+#   rebuilt image starts from an empty cache rather than inheriting
+#   artifacts compiled by a different toolchain. The host location comes
+#   from the runner's GITFORGE_CACHE_ROOT. A cache mount that cannot be
+#   prepared degrades to a cold build with a warning — it is an
+#   optimisation, never a correctness requirement.
 name: gitforge-ci
 version: "1.0"
 trigger_on:
@@ -101,6 +109,12 @@ jobs:
   - name: clippy
     image: dsc-ci-rust:10
     needs: [fmt]
+    cache:
+      # Compiled-artifact cache: the runner bind-mounts a host directory
+      # (keyed by the image tag) at /cargo-target and exports
+      # CARGO_TARGET_DIR pointing at it.
+      source: "{cache_root}/cargo/{image}"
+      mount_path: /cargo-target
     skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" ]]'
     steps:
       - name: Strict lint (zero warnings)
@@ -120,6 +134,12 @@ jobs:
   - name: test
     image: dsc-ci-rust:10
     needs: [clippy]
+    cache:
+      # Compiled-artifact cache: the runner bind-mounts a host directory
+      # (keyed by the image tag) at /cargo-target and exports
+      # CARGO_TARGET_DIR pointing at it.
+      source: "{cache_root}/cargo/{image}"
+      mount_path: /cargo-target
     skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" || "$CI_CHANGE_INCLUDE_TESTS" == "1" ]]'
     steps:
       - name: Workspace test suite
@@ -148,6 +168,12 @@ jobs:
   - name: coverage
     image: dsc-ci-rust:10
     needs: [test]
+    cache:
+      # Compiled-artifact cache: the runner bind-mounts a host directory
+      # (keyed by the image tag) at /cargo-target and exports
+      # CARGO_TARGET_DIR pointing at it.
+      source: "{cache_root}/cargo/{image}"
+      mount_path: /cargo-target
     skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" || "$CI_CHANGE_INCLUDE_TESTS" == "1" ]]'
     steps:
       - name: Line coverage gate (fail 82, warn 84)

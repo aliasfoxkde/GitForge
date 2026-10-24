@@ -2852,6 +2852,10 @@ fn execution_plan(
         // The DAG builder has already merged pipeline `environment` into the
         // job `env` map, so the job definition alone carries everything.
         env: definition.env.clone(),
+        // Likewise the DAG builder expanded any `cache:` block into a bind
+        // mount, so the definition alone carries the mounts the container
+        // needs.
+        volumes: definition.volumes.clone(),
     }
 }
 
@@ -3197,6 +3201,8 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 timeout: Some("30m".to_string()),
                 retry: Some(1),
                 skip_if: None,
+                volumes: Vec::new(),
+                cache: None,
             },
             JobDefinition {
                 name: "test".to_string(),
@@ -3213,6 +3219,8 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 timeout: Some("30m".to_string()),
                 retry: Some(1),
                 skip_if: None,
+                volumes: Vec::new(),
+                cache: None,
             },
         ],
     }
@@ -3225,6 +3233,45 @@ mod tests {
     use std::sync::OnceLock;
 
     static WORKSPACE_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn execution_plan_carries_volumes_and_cache_env() {
+        let mut definition = JobDefinition {
+            name: "test".to_string(),
+            image: "dsc-ci-rust:10".to_string(),
+            needs: vec![],
+            env: HashMap::new(),
+            steps: vec![StepDefinition {
+                name: "run".to_string(),
+                run: "cargo test".to_string(),
+                env: None,
+                working_directory: None,
+                condition: None,
+            }],
+            timeout: None,
+            retry: None,
+            skip_if: None,
+            volumes: vec![gitforge_common::VolumeSpec {
+                volume_type: Some(gitforge_common::VolumeType::Bind),
+                source: Some("{cache_root}/cargo/{image}".to_string()),
+                destination: "/cargo-target".to_string(),
+                read_only: false,
+                size: None,
+            }],
+            cache: None,
+        };
+        definition
+            .env
+            .insert("CARGO_TARGET_DIR".to_string(), "/cargo-target".to_string());
+
+        let plan = execution_plan(&definition, None);
+        assert_eq!(plan.volumes.len(), 1);
+        assert_eq!(plan.volumes[0].destination, "/cargo-target");
+        assert_eq!(
+            plan.env.get("CARGO_TARGET_DIR"),
+            Some(&"/cargo-target".to_string())
+        );
+    }
 
     #[test]
     fn trigger_token_accepts_git_server_compatibility_name() {
@@ -4155,6 +4202,8 @@ mod tests {
             timeout: None,
             retry: None,
             skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         };
         let definition = PipelineDefinition {
             name: "planning-test".to_string(),
@@ -4376,6 +4425,8 @@ mod tests {
             timeout: None,
             retry: None,
             skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         };
         let definition = PipelineDefinition {
             name: "stall-test".to_string(),
@@ -6005,6 +6056,8 @@ jobs:
                     timeout: None,
                     retry: None,
                     skip_if: None,
+                    volumes: Vec::new(),
+                    cache: None,
                 },
                 JobDefinition {
                     name: "clippy".to_string(),
@@ -6015,6 +6068,8 @@ jobs:
                     timeout: None,
                     retry: None,
                     skip_if,
+                    volumes: Vec::new(),
+                    cache: None,
                 },
             ],
         }
