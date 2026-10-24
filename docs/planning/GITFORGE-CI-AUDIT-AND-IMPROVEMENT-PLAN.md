@@ -211,27 +211,75 @@ Changed files analysis:
 
 **Estimated impact:** Docs-only PRs go from ~140min → ~2min. Code-only PRs skip fuzz (~20min saved). Reduces CI queue time by ~40% average.
 
-### Phase 3: Cargo Cache Mount (High Effort, Medium Impact)
+### Phase 3: Cargo Cache Mount — IMPLEMENTED (2026-10-22, branch `feat/ci-cargo-cache-mount`)
+
 **Goal:** Clippy and test reuse compiled dependencies across runs.
 
-**Current state:** `.gitforge.yml` says "Cargo state is cold in the container (no cache mount)". This is a deliberate choice to avoid cache coherency issues, but it means every clippy job recompiles all dependencies.
+**Correction to the plan's premise (this is the load-bearing part).** The
+plan proposed mounting the cargo *registry* read-only and layering a tmpfs
+write path over it. The CI image already bakes a warm registry
+(`dsc-ci-rust:N` runs `cargo fetch --locked` and sets
+`CARGO_NET_OFFLINE=true`), so a registry mount buys nothing — and a
+read-only bind over `/usr/local/cargo/registry` would SHADOW the baked
+registry with an empty host directory, breaking every offline cargo
+invocation ("no matching package named ... found") in seconds. The cold
+cost is not the registry, it is the **compiled artifacts**: each run
+recompiles every dependency because the container's `target/` dies with
+the container.
 
-**Approach:** Mount the cargo registry cache as a read-only volume, with a write-through layer for incremental compilations:
-```yaml
-# In the job container spec
-volumes:
-  - type: bind
-    source: /var/cache/gitforge-cargo
-    destination: /usr/local/cargo/registry
-    options: [ro]
-  - type: tmpfs
-    destination: /usr/local/cargo/git
-    options: [size=4G]
-```
+**What was implemented:**
 
-**Risk:** Stale metadata across image bumps. Mitigate: invalidate cache on image tag change.
+- A job may declare host mounts (`volumes:` — bind, tmpfs, or named
+  volume) and, as a convenience, a compiled-artifact `cache:` block. The
+  schema lives in `gitforge-common::volume` and is plumbed end to end:
+  pipeline schema → DAG expansion → execution plan → scheduler payload →
+  runner assignment → sandbox container mounts. The `cache:` block is
+  expanded in the DAG builder into a bind mount plus `CARGO_TARGET_DIR`,
+  so every downstream hop speaks the same two channels (volumes and env)
+  and none of them needs to know what a "cache" is.
+- The mount path INSIDE the container is fixed (`/cargo-target`), while the
+  workspace is mounted at the fixed path `/workspace` — so cargo's
+  fingerprints (which key on absolute source paths) stay valid across
+  runs, and the dependency artifacts of an earlier run are reused.
+- Cache invalidation on image tag change is structural, not procedural:
+  the host directory is keyed by the image reference (`{image}` expands to
+  `dsc-ci-rust-10`), so a rebuilt image starts from an empty cache rather
+  than inheriting artifacts compiled by a different toolchain.
+- `{cache_root}` expands to the runner's `GITFORGE_CACHE_ROOT` (default
+  `~/.cache/gitforge`, else `/var/cache/gitforge`). The runner creates the
+  host directory itself, as its own user, because the daemon would create
+  a missing bind source as root — unwritable for the job's user.
+- A cache mount that cannot be prepared degrades to a cold build with a
+  runner-side warning. It is an optimisation, never a correctness
+  requirement, and a missing cache directory must not turn into a red
+  pipeline.
 
-**Estimated impact:** Clippy job: ~20min cold → ~3min warm. Test job: ~40min cold → ~5min warm. Total pipeline: ~140min → ~40min.
+**Measured on the Fedora instance (2026-10-22), clippy/test/coverage job
+durations:**
+
+| Run | clippy | test | coverage |
+|-----|--------|------|----------|
+| cold (no cache) | 61s | 4m15s | 4m59s |
+| warm (cache mount) | MEASURE AFTER DEPLOY | MEASURE AFTER DEPLOY | MEASURE AFTER DEPLOY |
+
+**Why the warm row is still empty (verified 2026-10-24):** run
+`cab70f20` for this branch executed end to end green, but the Fedora
+runner host still runs the `gitforge-06be8eae` binary — it predates
+this feature, ignores the unknown `volumes` field in the assignment
+(serde default), and mounts no `/cargo-target` (confirmed by
+`docker inspect` on every job container of the run: only the workspace
+bind). The numbers in that run are therefore ordinary cold runs, not
+cache evidence. Warm measurements become meaningful only after the
+branch deploys to the runner hosts; the old cold row stands as the
+baseline until then.
+
+**Known limits:** the durable `jobs` table has no env or volumes column,
+so a job recovered by the scheduler's row-level recovery path (after a
+crash mid-run) runs without the pipeline env or the cache mount. The CI
+service's own rebuild path re-plans from the stored pipeline definition
+and restores both. The fuzz job is deliberately left uncached: cargo-fuzz
+builds with `-Zbuild-std` on nightly and does not share the stable
+target directory.
 
 ### Phase 4: Runner Pool / Multi-Tenant Isolation (High Effort, High Impact)
 **Goal:** Each tenant (or each priority class) gets dedicated runner capacity.
@@ -322,7 +370,7 @@ SHORT-TERM (next 1-2 sprints):
   [ ] Phase 4: Add second runner to pool on fedora
 
 MEDIUM-TERM:
-  [ ] Phase 3: Cargo cache mount implementation
+  [x] Phase 3: Cargo cache mount implementation
   [x] Phase 5: gitforge-testing-common crate design + implementation
   [ ] Phase 4: Runner labels for repo isolation
 

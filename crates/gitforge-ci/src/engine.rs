@@ -722,6 +722,8 @@ mod tests {
                     timeout: None,
                     retry: None,
                     skip_if: None,
+                    volumes: Vec::new(),
+                    cache: None,
                 },
                 JobDefinition {
                     name: "test".to_string(),
@@ -738,6 +740,8 @@ mod tests {
                     timeout: None,
                     retry: None,
                     skip_if: None,
+                    volumes: Vec::new(),
+                    cache: None,
                 },
             ],
         }
@@ -761,6 +765,8 @@ mod tests {
             timeout: None,
             retry: None,
             skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         };
         PipelineDefinition {
             name: "test-parallel".to_string(),
@@ -887,6 +893,8 @@ mod tests {
             timeout: None,
             retry: None,
             skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         });
 
         let engine = CiEngine::new(event, chain).await.unwrap();
@@ -943,6 +951,8 @@ mod tests {
             timeout: None,
             retry: None,
             skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         });
 
         let engine = CiEngine::new(event, chain).await.unwrap();
@@ -1336,6 +1346,8 @@ mod tests {
                     timeout: None,
                     retry: None,
                     skip_if: None,
+                    volumes: Vec::new(),
+                    cache: None,
                 },
                 JobDefinition {
                     name: "clippy".to_string(),
@@ -1346,6 +1358,8 @@ mod tests {
                     timeout: None,
                     retry: None,
                     skip_if,
+                    volumes: Vec::new(),
+                    cache: None,
                 },
             ],
         }
