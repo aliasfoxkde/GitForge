@@ -1382,6 +1382,16 @@ impl Scheduler {
 
         let pending_jobs = gitforge_db::queries::JobQueries::list_dispatchable(pool).await?;
         let pending_rows = pending_jobs.len();
+        // The repository identity of every recovered job comes from its
+        // pipeline run. Loading those runs one at a time made each refresh
+        // pass issue one query per queued job, so a backlog of thousands
+        // cost thousands of round trips per pass; one batched read answers
+        // them all.
+        let run_ids = pending_jobs
+            .iter()
+            .map(|job| job.pipeline_run_id)
+            .collect::<Vec<_>>();
+        let runs = gitforge_db::queries::PipelineRunQueries::get_many(pool, &run_ids).await?;
         let mut state = self.state.write().await;
 
         let mut loaded = 0;
@@ -1390,10 +1400,7 @@ impl Scheduler {
                 // Jobs reference a pipeline run, which is the durable source
                 // of the repository identity. Refuse to enqueue if the run is
                 // missing instead of silently routing to a random repository.
-                let Some(run) =
-                    gitforge_db::queries::PipelineRunQueries::get(pool, db_job.pipeline_run_id)
-                        .await?
-                else {
+                let Some(run) = runs.get(&db_job.pipeline_run_id) else {
                     tracing::error!(
                         job_id = %db_job.id,
                         pipeline_run_id = %db_job.pipeline_run_id,
@@ -1509,10 +1516,18 @@ impl Scheduler {
         // Per-repo running load is NOT read from the database: the report
         // quotes the same in-memory map admission dispatches with, so the
         // "why next" answer can never disagree with what actually runs.
-        let (durable_queued, recent_dispatch) = match &self.db_pool {
+        let (durable_queued, recent_dispatch, durable_queued_count) = match &self.db_pool {
             Some(pool) => {
                 let durable_queued =
                     gitforge_db::queries::JobQueries::list_dispatchable(pool).await?;
+                // The queue listing is bounded, so the exact queue depth is
+                // counted separately: the status report must not quote a
+                // truncated number as the queue size.
+                let durable_queued_count = gitforge_db::queries::JobQueries::count_by_status(
+                    pool,
+                    JobStatus::Queued.as_str(),
+                )
+                .await?;
                 (
                     durable_queued,
                     gitforge_db::queries::JobQueries::recent_dispatch_latencies(
@@ -1520,14 +1535,18 @@ impl Scheduler {
                         LATENCY_SAMPLE_LIMIT,
                     )
                     .await?,
+                    durable_queued_count,
                 )
             }
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), 0),
         };
         // An in-memory scheduler has no durable state to count: `None`
         // serializes as null, honestly distinguishing "no durable store"
         // from "a durable store reports zero pending".
-        let durable_pending = self.db_pool.as_ref().map(|_| durable_queued.len());
+        let durable_pending = self
+            .db_pool
+            .as_ref()
+            .map(|_| durable_queued_count.max(0) as usize);
 
         // Names for the in-memory view come from the durable rows; a job
         // not yet persisted still reports with its scheduler-side fallback.

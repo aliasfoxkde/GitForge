@@ -9,6 +9,32 @@
 # cutover that missed its services looks exactly like this. No git command
 # here fetches from a remote; comparisons use local refs only.
 set -u -o pipefail
+# The live database lives wherever the services find it. The path is read
+# from the same environment the services run with, so a deployment that
+# moves the database does not leave this report reading a stale copy.
+gitforge_database_path() {
+    local root="$1"
+    if [[ -n "${GITFORGE_STATUS_DB:-}" ]]; then
+        printf '%s\n' "$GITFORGE_STATUS_DB"
+        return 0
+    fi
+    local url="${GITFORGE_DATABASE_URL:-}"
+    if [[ -z "$url" && -r /etc/gitforge/database.env ]]; then
+        url="$(sed -n 's/^GITFORGE_DATABASE_URL=//p' /etc/gitforge/database.env | tail -n 1)"
+        url="${url%\"}"
+        url="${url#\"}"
+    fi
+    if [[ "$url" == sqlite:* ]]; then
+        url="${url#sqlite://}"
+        url="${url#sqlite:}"
+        url="${url%%\?*}"
+        if [[ -n "$url" ]]; then
+            printf '%s\n' "$url"
+            return 0
+        fi
+    fi
+    printf '%s\n' "$root/data/gitforge.db"
+}
 
 JSON=false
 case "${1:-}" in
@@ -71,6 +97,7 @@ if [[ -z "$repo_dir" ]]; then
     script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
     repo_dir=$(git -C "$script_dir/.." rev-parse --show-toplevel 2>/dev/null || true)
 fi
+db_path="$(gitforge_database_path "$repo_dir")"
 release_vs_main="no release stamp"
 if [[ -n "$repo_dir" && "$release_source_commit" != "absent" ]]; then
     git_err=$(git -C "$repo_dir" rev-parse --git-dir 2>&1 >/dev/null)
@@ -330,8 +357,8 @@ else
     # so recurrence is visible without SQL; a stale row degrades the verdict.
     # Stored timestamps are RFC3339 TEXT, so normalize through datetime()
     # before comparing (raw comparison mis-sorts same-day rows).
-    if [[ -r "$repo_dir/data/gitforge.db" ]] && command -v sqlite3 >/dev/null 2>&1; then
-        registry_status=$(sqlite3 -readonly "$repo_dir/data/gitforge.db" ".timeout 15000" \
+    if [[ -r "$db_path" ]] && command -v sqlite3 >/dev/null 2>&1; then
+        registry_status=$(sqlite3 -readonly "$db_path" ".timeout 15000" \
             "SELECT count(*) FROM runners WHERE status='online';
              SELECT count(*) FROM runners WHERE status='online'
                AND datetime(COALESCE(last_heartbeat, created_at)) < datetime('now','-90 seconds');" \
