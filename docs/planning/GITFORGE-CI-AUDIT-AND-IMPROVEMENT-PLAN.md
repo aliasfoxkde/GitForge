@@ -323,7 +323,7 @@ SHORT-TERM (next 1-2 sprints):
 
 MEDIUM-TERM:
   [ ] Phase 3: Cargo cache mount implementation
-  [ ] Phase 5: gitforge-testing-common crate design + implementation
+  [x] Phase 5: gitforge-testing-common crate design + implementation
   [ ] Phase 4: Runner labels for repo isolation
 
 LONGER-TERM:
