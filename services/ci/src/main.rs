@@ -507,7 +507,7 @@ async fn main() -> anyhow::Result<()> {
             }
             tokio::select! {
                 _ = ticker.tick() => {}
-                _ = dispatch_wake.notified() => {}
+                () = dispatch_wake.notified() => {}
             }
             scheduler_clone.process_queue().await;
         }
