@@ -8,9 +8,7 @@ description = "Shared test fixtures, generators, and assertion helpers for GitFo
 
 [dependencies]
 tempfile = { workspace = true }
-# v5 adds the name-based (deterministic) uuids the seeded generators use;
-# the feature unions with the workspace's v4/serde set.
-uuid = { workspace = true, features = ["v5"] }
+uuid = { workspace = true }
 chrono = { workspace = true }
 
 [lints]

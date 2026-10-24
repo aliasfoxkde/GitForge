@@ -46,11 +46,22 @@ impl Seed {
         )
     }
 
-    /// A deterministic v4-shaped uuid derived from the seed's namespace
-    /// and counter (not random — the same seed replays the same uuids).
+    /// A deterministic uuid derived from the seed's namespace and
+    /// counter (not random — the same seed replays the same uuids).
+    /// Built with the no-feature `Builder` API rather than `new_v5`, so
+    /// the crate adds no uuid features and no new crates to the baked CI
+    /// registry.
     pub fn next_uuid(&self) -> uuid::Uuid {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&self.prefix.len().to_be_bytes());
         let name = self.next_name();
-        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, name.as_bytes())
+        let counter = self.counter.load(std::sync::atomic::Ordering::Relaxed);
+        bytes[8..].copy_from_slice(&counter.to_be_bytes());
+        // Mix the name in so distinct prefixes never collide.
+        for (slot, byte) in bytes.iter_mut().zip(name.bytes()) {
+            *slot ^= byte;
+        }
+        uuid::Builder::from_random_bytes(bytes).into_uuid()
     }
 
     /// A timestamp `offset_ms` after the Unix epoch — fixed base, so
