@@ -168,5 +168,24 @@ if ((succeeded != durable)); then
 $failing"
 fi
 
+# Quality-chain jobs are the evidence a cut rests on. A `skipped` row for one
+# of them means the run graded green WITHOUT compiling or testing the tree —
+# legitimate only when the change classification provably excluded their
+# inputs, which for a release source commit (a main tip) is exactly the
+# misclassification class fixed in detect-changes.sh (2026-10-24: a main push
+# reported an empty diff and skipped all four). The gate therefore demands
+# succeeded rows for these jobs; GITFORGE_RELEASE_ALLOW_SKIPPED=1 overrides
+# for the rare cut that genuinely is docs-only.
+if [[ "${GITFORGE_RELEASE_ALLOW_SKIPPED:-}" != "1" ]]; then
+  skipped_quality=$(db_query "SELECT name || '=' || status FROM jobs
+WHERE pipeline_run_id = '$run_id' AND status = 'skipped'
+  AND name IN ('clippy', 'test', 'coverage', 'fuzz');")
+  skipped_count=$(grep -c . <<< "$skipped_quality" || true)
+  if ((skipped_count > 0)); then
+    refuse "run ${run_id:0:8}: $skipped_count quality job(s) skipped, so this run did not compile/test the tree (set GITFORGE_RELEASE_ALLOW_SKIPPED=1 only for a genuinely docs-only cut):
+$skipped_quality"
+  fi
+fi
+
 printf 'release gate: PASSED — run %s green, %d/%d jobs satisfied (succeeded or skipped) covering the persisted definition\n' \
   "${run_id:0:8}" "$succeeded" "$expected"

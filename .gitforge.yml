@@ -86,6 +86,12 @@ jobs:
         # the binary is a locally-built tool, not distro-packaged, and is
         # not baked into this image.
         run: shellcheck scripts/*.sh scripts/gitforge-* scripts/qualityctl scripts/verify-user-systemd-policy systemd/*.sh
+      - name: Change-detection selftest (skip_if classification)
+        # detect-changes.sh is a single point of decision for the whole
+        # quality chain: a misclassification silently skips (or pointlessly
+        # runs) every gated job. These synthetic-repo cases pin the
+        # contract, including the main-push tip-diff fallback.
+        run: bash tests/detect-changes-selftest.sh
     timeout: 10m
 
   - name: fmt
