@@ -28,6 +28,16 @@ fi
 
 CHANGED_FILES=$(git diff --name-only "$BASE" HEAD 2>/dev/null || echo "")
 
+# A push to main itself (or any branch already merged into main) makes
+# merge-base == HEAD, so the diff above is empty even though the push
+# carries real changes. The observed change set is then the tip commit's
+# own diff (first parent for merges). Observed live 2026-10-24: the
+# d227f05a main push reported FILE_COUNT=0 and skipped every cargo job
+# while an earlier run of the same SHA ran them all.
+if [[ -z "$CHANGED_FILES" ]]; then
+    CHANGED_FILES=$(git diff --name-only HEAD^1 HEAD 2>/dev/null || echo "")
+fi
+
 # Empty push — no files changed
 if [[ -z "$CHANGED_FILES" ]]; then
     echo "CI_CHANGE_FILE_COUNT=0"
