@@ -216,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
     // root. The scheduler never accepts a runner filesystem path.
     let artifact_root = std::env::var("GITFORGE_ARTIFACT_ROOT")
         .unwrap_or_else(|_| "target/gitforge-artifacts".to_string());
-    let artifact_storage = Arc::new(FileStorage::new(artifact_root).await?);
+    let artifact_storage = Arc::new(FileStorage::new(&artifact_root).await?);
 
     // Create scheduler state for HTTP server (consumes scheduler)
     let scheduler_state = create_state_with_artifact_storage(scheduler, Some(artifact_storage));
@@ -380,6 +380,34 @@ async fn main() -> anyhow::Result<()> {
             let removed = sweep_terminal_workspaces(&sweep_pool).await;
             if removed > 0 {
                 tracing::info!(removed, "startup workspace sweep complete");
+            }
+            // Artifact retention (Phase 5.2): delete artifacts older than
+            // GITFORGE_ARTIFACT_RETENTION_DAYS (default 30). Read at the
+            // edge, once; the core sweep takes the duration as a value.
+            let retention_days: i64 = std::env::var("GITFORGE_ARTIFACT_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            let store = FileStorage::new(artifact_root_for_sweep()).await.map_err(|e| {
+                tracing::warn!(error = %e, "artifact retention sweep: storage unavailable");
+                e
+            });
+            if let Ok(store) = store {
+                match gitforge_storage::artifact::sweep_expired_artifacts(
+                    &store,
+                    chrono::Duration::days(retention_days),
+                )
+                .await
+                {
+                    Ok((removed, reclaimed)) if removed > 0 => tracing::info!(
+                        removed,
+                        reclaimed_bytes = reclaimed,
+                        retention_days,
+                        "artifact retention sweep complete"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "artifact retention sweep failed"),
+                }
             }
             run_reconciliation_loop(sweep_pool).await;
         });
@@ -1072,6 +1100,16 @@ fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(
         std::env::var("GITFORGE_WORKSPACE_ROOT")
             .unwrap_or_else(|_| "/var/lib/gitforge/workspaces".to_string()),
+    )
+}
+
+/// Same contract as the startup binding (`GITFORGE_ARTIFACT_ROOT`); the
+/// retention sweep re-derives it rather than threading the storage handle
+/// through main's ownership moves.
+fn artifact_root_for_sweep() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("GITFORGE_ARTIFACT_ROOT")
+            .unwrap_or_else(|_| "target/gitforge-artifacts".to_string()),
     )
 }
 

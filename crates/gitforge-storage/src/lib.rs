@@ -10,7 +10,7 @@ pub mod publication;
 pub mod receipt;
 pub mod receipt_store;
 
-pub use artifact::{Artifact, ArtifactId, ArtifactStore};
+pub use artifact::{sweep_expired_artifacts, Artifact, ArtifactId, ArtifactStore};
 pub use cache::{CacheKey, CacheStore, FileCacheStore};
 pub use filesystem::FileStorage;
 pub use job_logs::{FileJobLogStore, InMemoryJobLogStore, JobLogMeta, JobLogStore};

@@ -32,6 +32,12 @@ const PERSIST_ATTEMPTS: usize = 5;
 const PERSIST_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(250);
 const PERSIST_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(4);
 
+/// Inactive pipeline versions retained per (repo_id, name) by the
+/// retention sweep in `activate_pipeline_and_create_run` (F4). Run-bearing
+/// versions are never deleted regardless of age — run history references
+/// them.
+const PIPELINE_VERSION_RETENTION: u32 = 10;
+
 /// How many dispatchable jobs one queue poll may return.
 ///
 /// The queue is drained oldest-first, so a bounded window still dispatches
@@ -751,6 +757,15 @@ impl PipelineQueries {
     /// pipeline version. One BEGIN IMMEDIATE transaction makes the trio
     /// all-or-nothing so a durable trigger request can never point at a
     /// half-created run.
+    ///
+    /// Version retention (F4): after the insert, run-less versions of the
+    /// same (repo_id, name) beyond the newest
+    /// [`PIPELINE_VERSION_RETENTION`] are deleted in the same transaction.
+    /// Only run-less rows are eligible — pipeline_runs.pipeline_id
+    /// references the version row, so deleting a run-bearing version would
+    /// orphan run history. The 226-row dsc / 69-row VIVERE growth from the
+    /// 2026-09-20 audit came from exactly this insert path; the prune keeps
+    /// the table bounded without a separate sweeper.
     pub async fn activate_pipeline_and_create_run(
         pool: &Pool,
         pipeline: &crate::models::Pipeline,
@@ -798,6 +813,35 @@ impl PipelineQueries {
         .execute(&mut *transaction)
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline run: {e}")))?;
+
+        // Retention sweep, same transaction (F4): keep the newest
+        // PIPELINE_VERSION_RETENTION versions; delete run-less older ones.
+        sqlx::query(
+            r#"
+            DELETE FROM pipelines
+            WHERE repo_id = ? AND name = ? AND id NOT IN (?, ?)
+              AND NOT EXISTS (
+                  SELECT 1 FROM pipeline_runs pr WHERE pr.pipeline_id = pipelines.id
+              )
+              AND id NOT IN (
+                  SELECT id FROM pipelines
+                  WHERE repo_id = ? AND name = ?
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT ?
+              )
+            "#,
+        )
+        .bind(pipeline.repo_id.to_string())
+        .bind(&pipeline.name)
+        .bind(pipeline.id.to_string())
+        .bind(run.pipeline_id.to_string())
+        .bind(pipeline.repo_id.to_string())
+        .bind(&pipeline.name)
+        .bind(i64::from(PIPELINE_VERSION_RETENTION))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to prune pipeline versions: {e}")))?;
+
         transaction
             .commit()
             .await
@@ -4265,6 +4309,118 @@ mod tests {
             .expect("run persisted in the same transaction");
         assert_eq!(stored_run.status, "running");
         assert!(stored_run.started_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_version_retention_prunes_runless_keeps_run_bearing() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "retention-owner".to_string(),
+            "retention-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "retention-repo".to_string(),
+            owner.id,
+            "/git/retention-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let mk = |name: &str, created_at: DateTime<Utc>| crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: name.to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({"v": created_at.timestamp()}),
+            created_at,
+        };
+
+        // PIPELINE_VERSION_RETENTION run-less versions, oldest first, then
+        // one run-bearing version old enough to be pruned if retention
+        // ignored run references. Each seed retires its predecessor (the
+        // partial UNIQUE index admits one active version per (repo, name);
+        // a plain create inserts active = 1).
+        let mut runless_ids = Vec::new();
+        for i in 0..(PIPELINE_VERSION_RETENTION as i64) {
+            let pipeline = mk("ci", Utc::now() - chrono::Duration::hours(i + 2));
+            runless_ids.push(pipeline.id);
+            if i > 0 {
+                sqlx::query(
+                    "UPDATE pipelines SET active = 0 WHERE repo_id = ? AND name = ? AND active = 1",
+                )
+                .bind(repo.id.to_string())
+                .bind("ci")
+                .execute(pool.pool())
+                .await
+                .unwrap();
+            }
+            PipelineQueries::create(&pool, &pipeline).await.unwrap();
+        }
+        sqlx::query(
+            "UPDATE pipelines SET active = 0 WHERE repo_id = ? AND name = ? AND active = 1",
+        )
+        .bind(repo.id.to_string())
+        .bind("ci")
+        .execute(pool.pool())
+        .await
+        .unwrap();
+        let run_bearing = mk("ci", Utc::now() - chrono::Duration::hours(1));
+        PipelineQueries::create(&pool, &run_bearing).await.unwrap();
+        let historic_run =
+            crate::models::PipelineRun::new(run_bearing.id, repo.id, "push".to_string(), "2".repeat(40));
+        PipelineRunQueries::create(&pool, &historic_run).await.unwrap();
+
+        // New push: retires the active version, inserts the new one, and
+        // prunes run-less versions beyond retention — but never the
+        // run-bearing one, though it is older than half the survivors.
+        let latest = mk("ci", Utc::now());
+        let run =
+            crate::models::PipelineRun::new(latest.id, repo.id, "push".to_string(), "3".repeat(40));
+        PipelineQueries::activate_pipeline_and_create_run(&pool, &latest, &run)
+            .await
+            .unwrap();
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pipelines WHERE repo_id = ? AND name = 'ci'",
+        )
+        .bind(repo.id.to_string())
+        .fetch_one(pool.pool())
+        .await
+        .unwrap();
+        // 12 rows before the sweep (11 seeds + the new version): retention
+        // keeps the 10 newest by created_at — the new version, the
+        // run-bearing seed (1h old, newer than every run-less seed) and the
+        // 8 newest run-less seeds — and prunes the 2 oldest run-less ones.
+        // The run-bearing row survives regardless: even when it ages out of
+        // the retention window, its run reference protects it.
+        assert_eq!(total, i64::from(PIPELINE_VERSION_RETENTION));
+        // runless_ids[i] is (i+2) hours old: index 9 is the oldest.
+        for id in &runless_ids[8..] {
+            assert!(
+                PipelineQueries::get(&pool, *id).await.unwrap().is_none(),
+                "oldest run-less versions are pruned"
+            );
+        }
+        assert!(
+            PipelineQueries::get(&pool, runless_ids[7]).await.unwrap().is_some(),
+            "newest pruned boundary neighbor survives"
+        );
+        assert!(
+            PipelineQueries::get(&pool, run_bearing.id).await.unwrap().is_some(),
+            "run-bearing version is never deleted"
+        );
+        assert!(
+            PipelineRunQueries::get(&pool, historic_run.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "run history is untouched by the retention sweep"
+        );
     }
 
     #[tokio::test]
