@@ -812,6 +812,80 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to create idx_repositories_owner_id: {e}")))?;
 
+        // The queue dispatcher polls `WHERE status = 'queued' ORDER BY
+        // created_at ASC` on every dispatch cycle. With only the
+        // single-column status index, SQLite had to sort the whole queued
+        // set on every pass; under the 2026-10-21 backlog (3643 queued
+        // rows) that scan took 16-114 s per pass and starved the runner's
+        // 30 s client timeout. The composite index makes the poll an
+        // index-only range scan that is already in the required order.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create idx_jobs_status_created: {e}")))?;
+
+        // The reconciliation sweep and the engine rebuild read the
+        // non-terminal runs on every pass. Listing them through the
+        // full table and skipping the terminal ones in Rust meant a
+        // full scan of every run ever recorded on a loop that runs
+        // continuously. The partial index holds exactly the rows those
+        // sweeps can act on, already ordered oldest first.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pipeline_runs_nonterminal \
+             ON pipeline_runs(created_at ASC) \
+             WHERE status NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'timeout', 'timed-out')",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create idx_pipeline_runs_nonterminal: {e}")))?;
+
+        // The git server's outbox poll filters on event_type and orders by
+        // created_at; without an index on event_type it read every payload
+        // in the table on every 2 s pass (measured 190 s per pass).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(event_type, created_at)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create idx_events_type_created: {e}")))?;
+
+        // The delivery poll only ever looks at the two CI trigger event
+        // types; a partial index keeps that sweep proportional to the
+        // outbox rather than to the event history.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_events_delivery
+            ON events(created_at)
+            WHERE event_type IN ('ci.trigger.pending', 'ci.trigger.delivering')
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create idx_events_delivery: {e}")))?;
+
+        // The API's pipeline-run listing orders by created_at DESC over
+        // every run (measured 93-549 s for 7659 rows).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pipeline_runs_created ON pipeline_runs(created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create idx_pipeline_runs_created: {e}")))?;
+
+        // The per-repository listing filters on repo_id and orders by
+        // created_at DESC; without it every repository-scoped read scanned
+        // the whole run table.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pipeline_runs_repo_created ON pipeline_runs(repo_id, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!("failed to create idx_pipeline_runs_repo_created: {e}"))
+        })?;
+
         tracing::info!("database migrations completed successfully");
         Ok(())
     }

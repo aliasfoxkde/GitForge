@@ -1465,7 +1465,7 @@ async fn reconcile_orphaned_runs_filtered(
     pool: &gitforge_db::Pool,
     min_age: chrono::Duration,
 ) -> usize {
-    let runs = match gitforge_db::queries::PipelineRunQueries::list(pool).await {
+    let runs = match gitforge_db::queries::PipelineRunQueries::list_non_terminal(pool).await {
         Ok(runs) => runs,
         Err(error) => {
             tracing::warn!(%error, "run reconciliation skipped");
@@ -2977,7 +2977,7 @@ async fn rebuild_live_engines(
         std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
     >,
 ) -> usize {
-    let runs = match gitforge_db::queries::PipelineRunQueries::list(pool).await {
+    let runs = match gitforge_db::queries::PipelineRunQueries::list_non_terminal(pool).await {
         Ok(runs) => runs,
         Err(error) => {
             tracing::warn!(%error, "engine rebuild skipped: run list unreadable");

@@ -32,6 +32,32 @@ if [[ "${GITFORGE_RELEASE_SKIP_GATE:-}" == "1" ]]; then
   exit 0
 fi
 
+# The live database lives wherever the services find it. The path is read
+# from the same environment the services run with, so a deployment that
+# moves the database does not leave this script reading a stale copy.
+gitforge_database_path() {
+    local root="$1"
+    if [[ -n "${GITFORGE_RELEASE_DB:-}" ]]; then
+        printf '%s\n' "$GITFORGE_RELEASE_DB"
+        return 0
+    fi
+    local url="${GITFORGE_DATABASE_URL:-}"
+    if [[ -z "$url" && -r /etc/gitforge/database.env ]]; then
+        url="$(sed -n 's/^GITFORGE_DATABASE_URL=//p' /etc/gitforge/database.env | tail -n 1)"
+        url="${url%\"}"
+        url="${url#\"}"
+    fi
+    if [[ "$url" == sqlite:* ]]; then
+        url="${url#sqlite://}"
+        url="${url#sqlite:}"
+        url="${url%%\?*}"
+        if [[ -n "$url" ]]; then
+            printf '%s\n' "$url"
+            return 0
+        fi
+    fi
+    printf '%s\n' "$root/data/gitforge.db"
+}
 source_commit="${1:-}"
 if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'release gate: exact 40-hex source commit is required\n' >&2
@@ -39,7 +65,7 @@ if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-db_path="${GITFORGE_RELEASE_DB:-$repo_root/data/gitforge.db}"
+db_path="$(gitforge_database_path "$repo_root")"
 if [[ ! -f "$db_path" ]]; then
   printf 'release gate: live database not found: %s (set GITFORGE_RELEASE_DB)\n' "$db_path" >&2
   exit 1

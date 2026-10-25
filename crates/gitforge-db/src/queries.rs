@@ -32,6 +32,14 @@ const PERSIST_ATTEMPTS: usize = 5;
 const PERSIST_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(250);
 const PERSIST_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(4);
 
+/// How many dispatchable jobs one queue poll may return.
+///
+/// The queue is drained oldest-first, so a bounded window still dispatches
+/// every job in order: as the head of the window is claimed it leaves the
+/// `queued` set and the window advances. The bound exists so a backlog
+/// cannot make a single poll carry thousands of rows.
+const DISPATCHABLE_PAGE_SIZE: i64 = 500;
+
 /// Run a durable write until it commits or the retry budget is exhausted.
 ///
 /// This is the shared persistence discipline for one-shot writes that must
@@ -1029,11 +1037,93 @@ impl PipelineRunQueries {
         Ok(runs)
     }
 
+    /// List the runs that are not yet terminal, oldest first.
+    ///
+    /// The reconciliation sweep and the engine rebuild used to read every
+    /// run in the table and skip the terminal ones in Rust. With a table
+    /// holding years of history that is a full-table scan plus a
+    /// multi-thousand-row hydration on every pass — and the sweeps run on a
+    /// loop, not once at startup. This listing reads only the non-terminal
+    /// rows through a partial index and returns them oldest first, so a
+    /// backlog is worked through from the front instead of being re-read
+    /// in full on every tick.
+    pub async fn list_non_terminal(pool: &Pool) -> Result<Vec<crate::models::PipelineRun>> {
+        let rows = sqlx::query(
+            "SELECT * FROM pipeline_runs \
+             WHERE status NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'timeout', 'timed-out') \
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list non-terminal pipeline runs: {e}")))?;
+
+        let runs = rows
+            .into_iter()
+            .map(hydrate_pipeline_run)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(runs)
+    }
+
+    /// List pipeline runs for an API listing: bounded, ordered, and scoped.
+    ///
+    /// The listing used to read every run in the table and then filter it in
+    /// Rust, issuing one repository authorization query per row. With
+    /// thousands of historical runs that was thousands of round trips on a
+    /// listing that clients poll, and the `limit`, `repo_id` and `order`
+    /// query parameters were ignored. Joining the repository table
+    /// replaces the per-row authorization with one index lookup and lets
+    /// the database do the bounding.
+    ///
+    /// `owner_id` restricts the listing to the repositories the caller owns;
+    /// `None` means the caller may manage jobs in every repository.
+    pub async fn list_scoped(
+        pool: &Pool,
+        repo_id: Option<RepoId>,
+        owner_id: Option<UserId>,
+        newest_first: bool,
+        limit: i64,
+    ) -> Result<Vec<crate::models::PipelineRun>> {
+        let sql = if newest_first {
+            "SELECT r.* FROM pipeline_runs r \
+             JOIN repositories repo ON repo.id = r.repo_id \
+             WHERE (? IS NULL OR r.repo_id = ?) \
+               AND (? IS NULL OR repo.owner_id = ?) \
+             ORDER BY r.created_at DESC \
+             LIMIT ?"
+        } else {
+            "SELECT r.* FROM pipeline_runs r \
+             JOIN repositories repo ON repo.id = r.repo_id \
+             WHERE (? IS NULL OR r.repo_id = ?) \
+               AND (? IS NULL OR repo.owner_id = ?) \
+             ORDER BY r.created_at ASC \
+             LIMIT ?"
+        };
+
+        let rows = sqlx::query(sql)
+            .bind(repo_id.map(|id| id.to_string()))
+            .bind(repo_id.map(|id| id.to_string()))
+            .bind(owner_id.map(|id| id.to_string()))
+            .bind(owner_id.map(|id| id.to_string()))
+            .bind(limit)
+            .fetch_all(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to list pipeline runs: {e}")))?;
+
+        let runs = rows
+            .into_iter()
+            .map(hydrate_pipeline_run)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(runs)
+    }
+
     /// Load several pipeline runs by id in one query.
     ///
-    /// The F24 reconciliation sweep needs the status behind every queued
-    /// job's run each tick; a query per run serialized the tick behind
-    /// dozens of round trips under load.
+    /// Scheduler recovery (F24 reconciliation sweep, load_pending_jobs)
+    /// needs the run behind every queued job. Loading them one at a time
+    /// made each pass issue one query per job, so a large backlog cost
+    /// thousands of round trips on every tick.
     pub async fn get_many(
         pool: &Pool,
         ids: &[PipelineRunId],
@@ -1990,12 +2080,19 @@ impl JobQueries {
     /// releases their dependency stage, so they are deliberately excluded —
     /// scheduler recovery loads this list verbatim, and a planned row that
     /// leaked into it would be dispatched before its predecessors finished.
+    ///
+    /// The read is bounded: the queue is consumed oldest-first, so the
+    /// window advances as rows are claimed, and no poll has to carry the
+    /// whole backlog. An unbounded read of a large backlog was the reason a
+    /// dispatch poll could outlive the runner's own 30 s client timeout.
     pub async fn list_dispatchable(pool: &Pool) -> Result<Vec<crate::models::Job>> {
-        let rows =
-            sqlx::query("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC")
-                .fetch_all(pool.pool())
-                .await
-                .map_err(|e| Error::database(format!("failed to list dispatchable jobs: {e}")))?;
+        let rows = sqlx::query(
+            "SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT ?",
+        )
+        .bind(DISPATCHABLE_PAGE_SIZE)
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list dispatchable jobs: {e}")))?;
 
         let jobs = rows
             .into_iter()
@@ -2003,6 +2100,26 @@ impl JobQueries {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(jobs)
+    }
+
+    /// Count the jobs in one status.
+    ///
+    /// The queue listing is bounded so a poll cannot carry the whole
+    /// backlog, so the exact queue depth has to be counted separately: an
+    /// index-only count over the status column answers it without reading
+    /// the rows.
+    pub async fn count_by_status(pool: &Pool, status: &str) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM jobs WHERE status = ?")
+            .bind(status)
+            .fetch_one(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to count jobs by status: {e}")))?;
+
+        let count: i64 = row
+            .try_get("count")
+            .map_err(|e| Error::database(format!("failed to read job count: {e}")))?;
+
+        Ok(count)
     }
 
     /// List every job currently recorded as running, with its durable lease
@@ -5014,6 +5131,103 @@ mod tests {
             .await
             .unwrap();
         assert!(PipelineRunQueries::get(&pool, run.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_non_terminal_returns_only_open_runs_oldest_first() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let user = crate::models::User::new(
+            "alice".to_string(),
+            "alice@example.com".to_string(),
+            "hash".to_string(),
+        );
+        UserQueries::create(&pool, &user).await.unwrap();
+
+        let repo = crate::models::Repository::new(
+            "test-repo".to_string(),
+            user.id,
+            "/git/test-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "Test Pipeline".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+
+        let open = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "open-sha".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &open).await.unwrap();
+
+        let closed = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "closed-sha".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &closed).await.unwrap();
+        PipelineRunQueries::update_status(&pool, closed.id, "succeeded")
+            .await
+            .unwrap();
+
+        // The closed run is filtered out; the open one is returned.
+        let open_runs = PipelineRunQueries::list_non_terminal(&pool).await.unwrap();
+        assert_eq!(open_runs.len(), 1);
+        assert_eq!(open_runs[0].id, open.id);
+
+        // A run that reaches a terminal state leaves the listing.
+        PipelineRunQueries::update_status(&pool, open.id, "failed")
+            .await
+            .unwrap();
+        assert!(PipelineRunQueries::list_non_terminal(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The listing orders oldest first, so a backlog is drained from
+        // the front instead of being re-read in full on every pass.
+        let older = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "older-sha".to_string(),
+        );
+        let newer = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "alice".to_string(),
+            "newer-sha".to_string(),
+        );
+        PipelineRunQueries::create(&pool, &older).await.unwrap();
+        PipelineRunQueries::create(&pool, &newer).await.unwrap();
+        sqlx::query("UPDATE pipeline_runs SET created_at = ? WHERE id = ?")
+            .bind("2026-01-01T00:00:00+00:00")
+            .bind(older.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE pipeline_runs SET created_at = ? WHERE id = ?")
+            .bind("2026-06-01T00:00:00+00:00")
+            .bind(newer.id.to_string())
+            .execute(pool.pool())
+            .await
+            .unwrap();
+
+        let ordered = PipelineRunQueries::list_non_terminal(&pool).await.unwrap();
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].id, older.id);
+        assert_eq!(ordered[1].id, newer.id);
     }
 
     #[tokio::test]

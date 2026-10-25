@@ -5,6 +5,38 @@ use serde::{Deserialize, Serialize};
 /// Maximum message size in bytes
 pub const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB
 
+/// Per-stream cap for a captured job's output on the wire.
+///
+/// Two streams plus the JSON envelope have to fit inside
+/// [`MAX_MESSAGE_SIZE`], so each side gets a quarter of it. The cap is
+/// applied to the tail: a compile error or a failing test explains itself
+/// at the end of the stream, not at the beginning.
+pub const WIRE_STREAM_MAX: usize = 16 * 1024;
+
+/// Keep the tail of `text` within `max_bytes`, marking what was dropped.
+///
+/// A character boundary is respected so the result stays valid UTF-8.
+pub fn tail_for_wire(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let marker = "...[output truncated]...\n";
+    if max_bytes <= marker.len() {
+        // No room for the marker: the raw tail still has to fit.
+        let mut start = text.len() - max_bytes;
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        return text[start..].to_string();
+    }
+    let keep = max_bytes - marker.len();
+    let mut start = text.len() - keep;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{marker}{}", &text[start..])
+}
+
 impl Request {
     /// Get a string name for the request type (for logging)
     pub fn name(&self) -> &'static str {
@@ -12,6 +44,7 @@ impl Request {
             Request::Submit { .. } => "submit",
             Request::Status { .. } => "status",
             Request::Cancel { .. } => "cancel",
+            Request::Result { .. } => "result",
             Request::List => "list",
             Request::Stats => "stats",
             Request::Shutdown => "shutdown",
@@ -32,6 +65,8 @@ pub enum Request {
     Status { job_id: String },
     /// Cancel a running job
     Cancel { job_id: String },
+    /// Fetch a finished job's captured output
+    Result { job_id: String },
     /// List all jobs
     List,
     /// Get daemon stats
@@ -146,6 +181,35 @@ pub fn decode_response(bytes: &[u8]) -> anyhow::Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_for_wire_keeps_short_text_verbatim() {
+        assert_eq!(tail_for_wire("short", 64), "short");
+    }
+
+    #[test]
+    fn tail_for_wire_keeps_the_end_of_a_long_stream() {
+        let text = "a".repeat(100) + "THE-ERROR";
+        let capped = tail_for_wire(&text, 64);
+        assert!(capped.len() <= 64);
+        assert!(capped.contains("THE-ERROR"), "got {capped}");
+        assert!(capped.starts_with("...[output truncated]..."));
+    }
+
+    #[test]
+    fn tail_for_wire_respects_character_boundaries() {
+        // Each accented character is two bytes; a byte-wise cut would
+        // split one and produce invalid UTF-8.
+        let text = "\u{e9}".repeat(64);
+        let capped = tail_for_wire(&text, 17);
+        assert!(capped.len() <= 17);
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn request_names_cover_every_variant() {
+        assert_eq!(Request::Result { job_id: "x".into() }.name(), "result");
+    }
 
     #[test]
     fn test_encode_decode_request() {
