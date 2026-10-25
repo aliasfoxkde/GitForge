@@ -388,10 +388,12 @@ async fn main() -> anyhow::Result<()> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30);
-            let store = FileStorage::new(artifact_root_for_sweep()).await.map_err(|e| {
-                tracing::warn!(error = %e, "artifact retention sweep: storage unavailable");
-                e
-            });
+            let store = FileStorage::new(artifact_root_for_sweep())
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "artifact retention sweep: storage unavailable");
+                    e
+                });
             if let Ok(store) = store {
                 match gitforge_storage::artifact::sweep_expired_artifacts(
                     &store,

@@ -4371,9 +4371,15 @@ mod tests {
         .unwrap();
         let run_bearing = mk("ci", Utc::now() - chrono::Duration::hours(1));
         PipelineQueries::create(&pool, &run_bearing).await.unwrap();
-        let historic_run =
-            crate::models::PipelineRun::new(run_bearing.id, repo.id, "push".to_string(), "2".repeat(40));
-        PipelineRunQueries::create(&pool, &historic_run).await.unwrap();
+        let historic_run = crate::models::PipelineRun::new(
+            run_bearing.id,
+            repo.id,
+            "push".to_string(),
+            "2".repeat(40),
+        );
+        PipelineRunQueries::create(&pool, &historic_run)
+            .await
+            .unwrap();
 
         // New push: retires the active version, inserts the new one, and
         // prunes run-less versions beyond retention — but never the
@@ -4385,13 +4391,12 @@ mod tests {
             .await
             .unwrap();
 
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pipelines WHERE repo_id = ? AND name = 'ci'",
-        )
-        .bind(repo.id.to_string())
-        .fetch_one(pool.pool())
-        .await
-        .unwrap();
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pipelines WHERE repo_id = ? AND name = 'ci'")
+                .bind(repo.id.to_string())
+                .fetch_one(pool.pool())
+                .await
+                .unwrap();
         // 12 rows before the sweep (11 seeds + the new version): retention
         // keeps the 10 newest by created_at — the new version, the
         // run-bearing seed (1h old, newer than every run-less seed) and the
@@ -4407,11 +4412,17 @@ mod tests {
             );
         }
         assert!(
-            PipelineQueries::get(&pool, runless_ids[7]).await.unwrap().is_some(),
+            PipelineQueries::get(&pool, runless_ids[7])
+                .await
+                .unwrap()
+                .is_some(),
             "newest pruned boundary neighbor survives"
         );
         assert!(
-            PipelineQueries::get(&pool, run_bearing.id).await.unwrap().is_some(),
+            PipelineQueries::get(&pool, run_bearing.id)
+                .await
+                .unwrap()
+                .is_some(),
             "run-bearing version is never deleted"
         );
         assert!(

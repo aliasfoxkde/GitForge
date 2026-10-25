@@ -139,16 +139,19 @@ mod retention_tests {
         let old = artifact(JobId::new(), "old.log", 45, 100);
         let fresh = artifact(JobId::new(), "fresh.log", 1, 200);
         ArtifactStore::put(&storage, &old, b"old").await.unwrap();
-        ArtifactStore::put(&storage, &fresh, b"fresh").await.unwrap();
+        ArtifactStore::put(&storage, &fresh, b"fresh")
+            .await
+            .unwrap();
 
-        let (removed, reclaimed) =
-            sweep_expired_artifacts(&storage, chrono::Duration::days(30))
-                .await
-                .unwrap();
+        let (removed, reclaimed) = sweep_expired_artifacts(&storage, chrono::Duration::days(30))
+            .await
+            .unwrap();
 
         assert_eq!((removed, reclaimed), (1, 100));
         assert!(ArtifactStore::get_metadata(&storage, old.id).await.is_err());
-        assert!(ArtifactStore::get_metadata(&storage, fresh.id).await.is_ok());
+        assert!(ArtifactStore::get_metadata(&storage, fresh.id)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -158,12 +161,13 @@ mod retention_tests {
         let fresh = artifact(JobId::new(), "recent.log", 2, 50);
         ArtifactStore::put(&storage, &fresh, b"x").await.unwrap();
 
-        let (removed, reclaimed) =
-            sweep_expired_artifacts(&storage, chrono::Duration::days(30))
-                .await
-                .unwrap();
+        let (removed, reclaimed) = sweep_expired_artifacts(&storage, chrono::Duration::days(30))
+            .await
+            .unwrap();
         assert_eq!((removed, reclaimed), (0, 0));
-        assert!(ArtifactStore::get_metadata(&storage, fresh.id).await.is_ok());
+        assert!(ArtifactStore::get_metadata(&storage, fresh.id)
+            .await
+            .is_ok());
     }
 }
 
