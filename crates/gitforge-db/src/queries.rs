@@ -759,8 +759,8 @@ impl PipelineQueries {
     /// half-created run.
     ///
     /// Version retention (F4): after the insert, run-less versions of the
-    /// same (repo_id, name) beyond the newest
-    /// [`PIPELINE_VERSION_RETENTION`] are deleted in the same transaction.
+    /// same (repo_id, name) beyond the newest `PIPELINE_VERSION_RETENTION`
+    /// (10) are deleted in the same transaction.
     /// Only run-less rows are eligible — pipeline_runs.pipeline_id
     /// references the version row, so deleting a run-bearing version would
     /// orphan run history. The 226-row dsc / 69-row VIVERE growth from the
