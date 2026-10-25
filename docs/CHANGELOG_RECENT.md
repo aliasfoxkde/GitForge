@@ -4,6 +4,53 @@ All notable changes to GitForge will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-25
+
+Cut from main @ 3e41df86 (48 commits since 0.6.16). Release evidence:
+pipeline run 8d28d6f4 for 3e41df86 on the self-hosted GitForge chain
+(detect-changes, lint, fmt, clippy, test, coverage, fuzz — all green).
+
+### Added
+
+- **Wake-triggered dispatch** (scheduler): a `Notify`-based handle lets
+  the CI service assign a freshly enqueued job in milliseconds instead
+  of waiting out the 5 s tick.
+- **Cargo cache mounts** in the CI pipeline: jobs bind a
+  compiled-artifact cache (dsc-ci-rust, feat/ci-cargo-cache-mount),
+  cutting cold cargo time on repeat builds. Runners older than this
+  release silently ignore the `volumes` field — deploy the new runner
+  before trusting warm numbers.
+- **Change-classifier selftest**: synthetic-repo cases (branch push,
+  main push, docs-only) run in the lint job; a classifier regression
+  now fails CI instead of silently skipping the chain.
+- **gitforge-testing-common crate**: shared test scaffolding (seeded
+  fixtures, temp workspaces) for the workspace suites.
+- **Commit-boundary fault injection**: a sqlite3 commit-hook test proves
+  the job-log append surfaces an error and leaves zero durable rows
+  when COMMIT turns into ROLLBACK (no-ack-without-commit).
+
+### Changed
+
+- **Batched tick reconciliation** (scheduler): `JobQueries::get_many`
+  and `PipelineRunQueries::get_many` replace per-job sequential reads
+  in all three process_queue reconcile sweeps (cancellation, F24
+  terminal-run, assigned-job reconcile).
+- **Honest change detection**: `detect-changes.sh` falls back to the
+  tip diff when `merge-base(origin/main) == HEAD`. Before this fix,
+  every push to main reported an empty change set and skipped
+  clippy/test/coverage/fuzz (observed live: run 75cf505e vs dc1721cd
+  on the same SHA).
+- **Release gate hardening**: a cut whose run skipped
+  clippy/test/coverage/fuzz is refused
+  (`GITFORGE_RELEASE_ALLOW_SKIPPED=1` overrides for genuinely
+  docs-only cuts).
+- Route-docs gate recognises peer-service endpoints (06be8eae).
+- RUSTC pinned to the resolved toolchain for daemon-submitted cargo
+  jobs; a nested rust-toolchain.toml in a dependency crate no longer
+  hijacks the rustup shim (192ff602). DB index and query-limit fixes,
+  N+1 elimination in ci routes, CLI result printing on success.
+- Bundle staging tree directory modes pinned (894cf282).
+
 ## [0.6.16] - 2026-10-10
 
 ### Added
