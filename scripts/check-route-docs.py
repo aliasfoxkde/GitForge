@@ -39,11 +39,15 @@ disagree on names (`{id}` vs `{job_id}`).
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+# The repo root: GITFORGE_REPO_ROOT wins so the packaged binary can run
+# against any checkout; otherwise the script's own location decides
+# (scripts/.. in a source tree).
+REPO = Path(os.environ.get("GITFORGE_REPO_ROOT", Path(__file__).resolve().parent.parent))
 SRC_ROOT = REPO / "crates" / "gitforge-api" / "src"
 OPENAPI_RS = SRC_ROOT / "openapi.rs"
 API_MD = REPO / "docs" / "API.md"

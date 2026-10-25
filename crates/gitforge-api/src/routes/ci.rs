@@ -4,13 +4,13 @@ use crate::auth::Claims;
 use crate::middleware::AuthenticatedUser;
 use crate::routes::webhook::CiTriggerClient;
 use axum::{
-    extract::{Extension, Path},
+    extract::{Extension, Path, Query},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use gitforge_common::{JobId, PipelineId, PipelineRunId};
+use gitforge_common::{JobId, PipelineId, PipelineRunId, RepoId};
 use gitforge_db::{
     models::JobStatus,
     queries::{JobQueries, PipelineQueries, PipelineRunQueries, RepoQueries},
@@ -858,18 +858,76 @@ async fn delete_pipeline(
     }
 }
 
+/// Default number of pipeline runs one listing returns.
+const DEFAULT_PIPELINE_RUN_LIMIT: i64 = 100;
+
+/// Upper bound on the number of pipeline runs one listing returns.
+const MAX_PIPELINE_RUN_LIMIT: i64 = 500;
+
+/// Query parameters for the pipeline-run listing.
+///
+/// The listing is polled by clients — the release procedure reads it to
+/// find the run for a commit — so it has to be bounded and ordered. The
+/// parameters were accepted by clients and ignored by the server, which
+/// answered with the whole run history every time.
+#[derive(Debug, Default, Deserialize)]
+pub struct PipelineRunQuery {
+    /// Maximum number of runs to return.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Restrict the listing to one repository.
+    #[serde(default)]
+    pub repo_id: Option<String>,
+    /// `desc` (newest first, the default) or `asc` (oldest first).
+    #[serde(default)]
+    pub order: Option<String>,
+}
+
 /// List pipeline runs
 async fn list_pipeline_runs(
     Extension(pool): Extension<Arc<Pool>>,
     user: AuthenticatedUser,
+    Query(params): Query<PipelineRunQuery>,
 ) -> impl IntoResponse {
     let claims = user.claims;
-    match PipelineRunQueries::list(&pool).await {
+
+    let repo_id = match params.repo_id.as_deref() {
+        None => None,
+        Some(raw) => match Uuid::parse_str(raw) {
+            Ok(uuid) => Some(RepoId::from(uuid)),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_id",
+                        "message": "Invalid repository ID format"
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
+
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_PIPELINE_RUN_LIMIT)
+        .clamp(1, MAX_PIPELINE_RUN_LIMIT);
+    let newest_first = !matches!(params.order.as_deref(), Some("asc"));
+    // A caller that may manage jobs sees every repository; everyone else
+    // sees the repositories they own. The ownership filter is applied in
+    // the query rather than one authorization round trip per row.
+    let owner_id = if can_manage_jobs(&claims) {
+        None
+    } else {
+        Some(claims.user_id)
+    };
+
+    match PipelineRunQueries::list_scoped(&pool, repo_id, owner_id, newest_first, limit).await {
         Ok(runs) => {
-            let mut response = Vec::new();
-            for r in runs {
-                if authorize_repo(&pool, &claims, r.repo_id).await.is_ok() {
-                    response.push(serde_json::json!({
+            let response = runs
+                .into_iter()
+                .map(|r| {
+                    serde_json::json!({
                         "id": r.id.to_string(),
                         "pipeline_id": r.pipeline_id.to_string(),
                         "status": r.status,
@@ -878,9 +936,9 @@ async fn list_pipeline_runs(
                         "started_at": r.started_at.map(|dt| dt.to_rfc3339()),
                         "finished_at": r.finished_at.map(|dt| dt.to_rfc3339()),
                         "error": r.error
-                    }));
-                }
-            }
+                    })
+                })
+                .collect::<Vec<_>>();
             Json(response).into_response()
         }
         Err(e) => {

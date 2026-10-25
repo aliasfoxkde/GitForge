@@ -20,6 +20,7 @@ use gitforge_db::queries::{
     UserQueries,
 };
 use gitforge_db::Pool;
+use std::sync::atomic::Ordering;
 
 #[tokio::test]
 async fn test_database_in_memory_pool() {
@@ -1397,5 +1398,115 @@ async fn test_runner_mark_stale_offline() {
     assert_eq!(
         RunnerQueries::mark_stale_offline(&pool, 90).await.unwrap(),
         0
+    );
+}
+
+static FAULT_ARMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Fault-injection at the durability boundary (roadmap 2026-10-23 F-09 /
+/// G-4): a commit that the storage engine rejects mid-COMMIT must surface as
+/// an error to the caller AND leave nothing durably appended. The reference
+/// benchmark corpus' invariant — "uncertain commits are never retried" —
+/// is only safe to adopt if the failure mode is a loud error, never a
+/// success ack on a rolled-back row. The commit hook returning `true`
+/// aborts the COMMIT exactly as `sqlite3_commit_hook` fault injection did
+/// in the reference harness.
+#[tokio::test]
+async fn test_commit_fault_injection_never_acks_an_uncommitted_append() {
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+    let user = User::new(
+        "fault-owner".to_string(),
+        "fault-owner@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&pool, &user).await.unwrap();
+    let repo = Repository::new(
+        "fault-repo".to_string(),
+        user.id,
+        "/git/fault-repo".to_string(),
+    );
+    RepoQueries::create(&pool, &repo).await.unwrap();
+    let pipeline = Pipeline {
+        id: PipelineId::new(),
+        repo_id: repo.id,
+        name: "fault-ci".to_string(),
+        trigger_type: "manual".to_string(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    PipelineQueries::create(&pool, &pipeline).await.unwrap();
+    let run = PipelineRun::new(
+        pipeline.id,
+        repo.id,
+        "fault-owner".to_string(),
+        "fault-commit".to_string(),
+    );
+    PipelineRunQueries::create(&pool, &run).await.unwrap();
+    let job = Job::new(run.id, "fault-job".to_string());
+    JobQueries::create(&pool, &job).await.unwrap();
+    let runner = Runner::new("fault-runner".to_string(), RunnerType::Docker, 1);
+    RunnerQueries::create(&pool, &runner).await.unwrap();
+    JobQueries::assign_with_lease(&pool, job.id, runner.id, "fault-lease")
+        .await
+        .unwrap();
+
+    // Inject the fault on the pool's writer connection: every COMMIT aborts.
+    // The append path pulls its connection from the pool, so arming the
+    // hook on a freshly acquired-and-dropped connection poisons the pool's
+    // stored connection for the append below.
+    // A `Pool::memory()` can hold more than one underlying SQLite database
+    // (one per pooled connection, since `:memory:` is per-handle), so the
+    // fault must be armed on EVERY connection the pool owns — otherwise the
+    // append may land on an unarmed handle and the test passes by luck.
+    let mut armed = 0usize;
+    loop {
+        match pool.pool().acquire().await {
+            Ok(mut raw) => {
+                if let Ok(mut locked) = raw.lock_handle().await {
+                    locked.set_commit_hook(move || {
+                        FAULT_ARMED.fetch_add(1, Ordering::SeqCst);
+                        // sqlx's contract: `false` turns the COMMIT into a ROLLBACK.
+                        false
+                    });
+                    armed += 1;
+                }
+                // Drop `raw` back into the pool; the hook persists on the
+                // handle (only Drop of the whole connection clears it).
+            }
+            Err(_) => break,
+        }
+        // Pool connections are finite; an upper bound comfortably above the
+        // pool's configured max (5) stops the loop before it can block.
+        if armed >= 8 {
+            break;
+        }
+    }
+    assert!(armed > 0, "no pooled connection could be armed");
+
+    // The append must surface the aborted COMMIT as an error. The retry
+    // wrapper treats "failed to commit" as non-retryable by design: an
+    // uncertain commit is never silently retried (reference corpus law).
+    let outcome = JobQueries::append_log_with_lease(
+        &pool,
+        job.id,
+        runner.id,
+        "fault-lease",
+        "chunk that must not durably land",
+    )
+    .await;
+    let fired = FAULT_ARMED.load(Ordering::SeqCst);
+    assert!(fired > 0, "fault hook never fired — test would be vacuous");
+    assert!(
+        outcome.is_err(),
+        "aborted COMMIT must surface as an error, never Ok(Some(sequence))"
+    );
+
+    // And the durable read side must show zero chunks: no ack was possible,
+    // so no row may exist.
+    let logs = JobQueries::list_logs(&pool, job.id).await.unwrap();
+    assert!(
+        logs.is_empty(),
+        "a commit-aborted append must leave no durable rows, found {logs:?}"
     );
 }

@@ -1654,6 +1654,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitforge-testing-common"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "group"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

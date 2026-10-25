@@ -297,6 +297,7 @@ async fn renew_session(server: &str, config: &mut Config) -> Result<()> {
     let Some(stored_refresh) = config.refresh_token.clone() else {
         return Ok(());
     };
+    let stored_token = config.token.clone();
 
     let needs_renewal = match config
         .token_expires_at
@@ -330,18 +331,34 @@ async fn renew_session(server: &str, config: &mut Config) -> Result<()> {
             config.save()?;
         }
         Err(error) => {
-            // A definitive server rejection means the credential is dead
-            // (expired, revoked, or rotated by another login): drop the
-            // stale pair so the next command's hint is a plain re-login.
-            // Anything else (server down, network) is transient — keep
-            // the stored credentials rather than logging out spuriously.
+            // A definitive server rejection means the credential this
+            // command used is dead. It does NOT mean the session is dead:
+            // the refresh credential rotates on use, so two concurrent
+            // commands race — one rotates it and writes the new pair, the
+            // other is rejected. Wiping the stored pair in that case logged
+            // the user out even though a valid access token had just been
+            // written, and it also discarded the very credential the
+            // winning command had saved. The reset therefore happens only
+            // when the file still holds exactly the pair this command
+            // used; if it has changed, another command has already renewed
+            // the session and its credentials win.
             if error.to_string().contains("401") {
-                config.token = None;
-                config.token_expires_at = None;
-                config.refresh_token = None;
-                config.refresh_expires_at = None;
-                if let Err(save_error) = config.save() {
-                    tracing::warn!("failed to persist credential reset: {save_error}");
+                let current = Config::load().unwrap_or_default();
+                let unchanged = current.refresh_token.as_deref() == Some(stored_refresh.as_str())
+                    && current.token.as_deref() == stored_token.as_deref();
+                if unchanged {
+                    config.token = None;
+                    config.token_expires_at = None;
+                    config.refresh_token = None;
+                    config.refresh_expires_at = None;
+                    if let Err(save_error) = config.save() {
+                        tracing::warn!("failed to persist credential reset: {save_error}");
+                    }
+                } else {
+                    tracing::debug!(
+                        "refresh rejected, but the stored credentials changed underneath this command; keeping the renewed session"
+                    );
+                    *config = current;
                 }
             }
         }

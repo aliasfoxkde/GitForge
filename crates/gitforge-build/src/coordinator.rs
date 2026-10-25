@@ -115,11 +115,8 @@ impl BuildCoordinator {
             }
 
             // Store result for waiters
-            {
-                let mut results = coordinator.results.lock().await;
-                if let Ok(r) = &result {
-                    results.insert(job_id, r.clone());
-                }
+            if let Ok(r) = &result {
+                coordinator.store_result(r.clone()).await;
             }
 
             // Release permit (drop to signal completion)
@@ -207,6 +204,21 @@ impl BuildCoordinator {
             };
             (status, j.wait_time().as_millis() as u64)
         })
+    }
+
+    /// Store a finished job's result so waiters and the result endpoint
+    /// can read it back.
+    pub async fn store_result(&self, result: BuildResult) {
+        self.results.lock().await.insert(result.job_id, result);
+    }
+
+    /// Fetch a finished job's captured output.
+    ///
+    /// The daemon captures the child's stdout/stderr but nothing could read
+    /// it back: a failed gate reported only an exit code, never the reason.
+    /// This is the read side of that gap.
+    pub async fn get_result(&self, job_id: &uuid::Uuid) -> Option<BuildResult> {
+        self.results.lock().await.get(job_id).cloned()
     }
 
     /// List all jobs
@@ -400,6 +412,25 @@ fn resolve_cargo_from(cargo_real: Option<String>, rustup_path: Option<String>) -
     "rustup".to_string()
 }
 
+/// The absolute rustc sibling of a resolved cargo binary, if one exists.
+///
+/// `None` for the bare `rustup` fallback (which dispatches on its own) and
+/// when the sibling is absent, so the child environment is left untouched
+/// rather than pinned to a nonexistent path.
+fn resolve_rustc_sibling(cargo_executable: &str) -> Option<std::path::PathBuf> {
+    if cargo_executable == "rustup" {
+        return None;
+    }
+    let rustc = std::path::Path::new(cargo_executable)
+        .parent()?
+        .join("rustc");
+    if rustc.is_file() {
+        Some(rustc)
+    } else {
+        None
+    }
+}
+
 async fn execute_cargo_job(
     job: &BuildJob,
     active_pids: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
@@ -432,6 +463,16 @@ async fn execute_cargo_job(
 
     let mut cmd = tokio::process::Command::new(&cargo_executable);
     cmd.args(&cargo_args);
+
+    // Pin RUSTC to the rustc sibling of the resolved cargo. Cargo invokes
+    // rustc with the *dependency crate's* source directory as cwd, and any
+    // `rust-toolchain.toml` published inside that crate (atoi 2.0.0 pins
+    // 1.57.0) redirects the rustup shim to an ancient toolchain that rejects
+    // modern rustc flags. An absolute RUSTC bypasses per-directory overrides.
+    // A missing sibling rustc leaves the child env untouched.
+    if let Some(rustc) = resolve_rustc_sibling(&cargo_executable) {
+        cmd.env("RUSTC", rustc);
+    }
 
     // Builds are non-interactive. Detaching stdin prevents a child from
     // stopping on terminal input/job-control signals when the daemon runs in
@@ -590,6 +631,44 @@ mod tests {
             resolve_cargo_from(Some(String::new()), Some(String::new())),
             "rustup",
             "blank values on every tier keep the rustup-run fallback"
+        );
+    }
+
+    #[test]
+    fn test_resolve_rustc_sibling_pins_toolchain_rustc() {
+        // The atoi-2.0.0 regression: a crate-published rust-toolchain.toml
+        // must never redirect the rustup shim for daemon-driven builds, so
+        // the sibling of a real cargo binary is returned as the pin.
+        let dir = std::env::temp_dir().join("gf-rustc-sibling-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cargo = dir.join("cargo");
+        let rustc = dir.join("rustc");
+        std::fs::write(&cargo, b"").unwrap();
+        std::fs::write(&rustc, b"").unwrap();
+        let pinned = resolve_rustc_sibling(cargo.to_str().unwrap())
+            .expect("a cargo with a sibling rustc pins RUSTC");
+        assert_eq!(pinned, rustc);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_rustc_sibling_without_sibling_is_none() {
+        let dir = std::env::temp_dir().join("gf-rustc-lonely-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cargo = dir.join("cargo");
+        std::fs::write(&cargo, b"").unwrap();
+        assert!(
+            resolve_rustc_sibling(cargo.to_str().unwrap()).is_none(),
+            "a cargo without a sibling rustc leaves the env untouched"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_rustc_sibling_skips_rustup_fallback() {
+        assert!(
+            resolve_rustc_sibling("rustup").is_none(),
+            "the rustup fallback dispatches its own toolchain; no pin"
         );
     }
 

@@ -4,7 +4,7 @@ use crate::limits::SandboxLimits;
 use async_trait::async_trait;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
-use bollard::models::{ContainerCreateBody, HostConfig};
+use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountTmpfsOptions, MountType};
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, ListContainersOptions, RemoveContainerOptions,
     StopContainerOptions,
@@ -12,7 +12,7 @@ use bollard::query_parameters::{
 use bollard::Docker;
 use bollard::API_DEFAULT_VERSION;
 use futures_util::StreamExt;
-use gitforge_common::{Error, JobId, Result};
+use gitforge_common::{Error, JobId, Result, VolumeSpec, VolumeType};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -410,15 +410,146 @@ impl DockerSandbox {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Volume mounts
+// ---------------------------------------------------------------------------
+
+/// Where the runner keeps job caches when the pipeline does not name an
+/// absolute location. Overridable with `GITFORGE_CACHE_ROOT`; the default
+/// matches the usual system cache path.
+const DEFAULT_CACHE_ROOT: &str = "/var/cache/gitforge";
+
+/// The runner's cache root, read from the environment ONCE at the edge
+/// (where a container is created) and passed down as a value. A decision
+/// function that reads process-global state internally inherits whatever
+/// any other thread is doing to it at that instant.
+fn cache_root() -> String {
+    std::env::var("GITFORGE_CACHE_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_CACHE_ROOT.to_string())
+}
+
+/// Parse a human-readable size (`4G`, `512M`, `1024K`) into bytes.
+fn parse_size_bytes(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim();
+    let (digits, suffix) = trimmed.split_at(
+        trimmed
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(trimmed.len()),
+    );
+    let value: i64 = digits.parse().ok()?;
+    let multiplier = match suffix.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "K" | "KB" => 1024,
+        "M" | "MB" => 1024 * 1024,
+        "G" | "GB" => 1024 * 1024 * 1024,
+        "T" | "TB" => 1024_i64 * 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    value.checked_mul(multiplier)
+}
+
+/// Turn the requested volumes into docker mounts.
+///
+/// Binds become `HostConfig.binds` entries so they inherit the daemon's
+/// SELinux relabel behaviour (the workspace mount already relies on `:z`);
+/// tmpfs and named volumes become structured mounts.
+fn build_volume_mounts(
+    volumes: &[VolumeSpec],
+    image: &str,
+    cache_root: &str,
+) -> Result<(Vec<String>, Vec<Mount>)> {
+    let mut binds = Vec::new();
+    let mut mounts = Vec::new();
+
+    for volume in volumes {
+        volume
+            .validate()
+            .map_err(|reason| Error::sandbox(format!("invalid volume mount: {reason}")))?;
+        match volume.resolved_type() {
+            VolumeType::Bind => {
+                let source = volume.expanded_source(image, cache_root).ok_or_else(|| {
+                    Error::sandbox(format!(
+                        "volume mount {} requires a source",
+                        volume.destination
+                    ))
+                })?;
+                if !source.starts_with('/') {
+                    return Err(Error::sandbox(format!(
+                        "volume mount source must be an absolute path: {source}"
+                    )));
+                }
+                // The daemon creates a missing bind source as root, which
+                // the job's user could not write to. Create it here, as the
+                // runner's own user, so a cache mount is writable.
+                if let Err(error) = std::fs::create_dir_all(&source) {
+                    return Err(Error::sandbox(format!(
+                        "could not prepare volume mount source {source}: {error}"
+                    )));
+                }
+                let access = if volume.read_only { "ro" } else { "rw" };
+                binds.push(format!("{source}:{}:{access},z", volume.destination));
+            }
+            VolumeType::Tmpfs => {
+                let tmpfs_options =
+                    volume
+                        .size
+                        .as_deref()
+                        .and_then(parse_size_bytes)
+                        .map(|size_bytes| MountTmpfsOptions {
+                            size_bytes: Some(size_bytes),
+                            // World-writable: the job's user inside the image is
+                            // not the runner's user.
+                            mode: Some(0o1777),
+                            options: None,
+                        });
+                mounts.push(Mount {
+                    typ: Some(MountType::TMPFS),
+                    target: Some(volume.destination.clone()),
+                    source: None,
+                    read_only: Some(volume.read_only),
+                    consistency: None,
+                    bind_options: None,
+                    volume_options: None,
+                    image_options: None,
+                    tmpfs_options,
+                });
+            }
+            VolumeType::Volume => {
+                let source = volume.source.clone().unwrap_or_default();
+                mounts.push(Mount {
+                    typ: Some(MountType::VOLUME),
+                    target: Some(volume.destination.clone()),
+                    source: Some(source),
+                    read_only: Some(volume.read_only),
+                    consistency: None,
+                    bind_options: None,
+                    volume_options: None,
+                    image_options: None,
+                    tmpfs_options: None,
+                });
+            }
+        }
+    }
+
+    Ok((binds, mounts))
+}
+
 /// Sandbox trait
 #[async_trait]
 pub trait Sandbox: Send + Sync {
-    /// Create a new sandbox instance
+    /// Create a new sandbox instance.
+    ///
+    /// `volumes` are the host mounts the job asked for (cache directories,
+    /// tmpfs scratch). They are baked into the container at creation time.
     async fn create(
         &self,
         job_id: JobId,
         image: &str,
         limits: SandboxLimits,
+        volumes: &[VolumeSpec],
     ) -> Result<SandboxInstance>;
 
     /// Create a sandbox with an isolated host workspace mounted at
@@ -430,9 +561,10 @@ pub trait Sandbox: Send + Sync {
         image: &str,
         limits: SandboxLimits,
         workspace_path: Option<&str>,
+        volumes: &[VolumeSpec],
     ) -> Result<SandboxInstance> {
         let _ = workspace_path;
-        self.create(job_id, image, limits).await
+        self.create(job_id, image, limits, volumes).await
     }
 
     /// Execute a command in the sandbox.
@@ -508,6 +640,7 @@ impl Sandbox for DockerSandbox {
         job_id: JobId,
         image: &str,
         limits: SandboxLimits,
+        volumes: &[VolumeSpec],
     ) -> Result<SandboxInstance> {
         if let Some(ref docker) = self.docker {
             // Ensure image is available
@@ -521,6 +654,22 @@ impl Sandbox for DockerSandbox {
                 ("com.gitforce.job_id".to_owned(), job_label.clone()),
             ]);
 
+            let (binds, mounts) = match build_volume_mounts(volumes, image, &cache_root()) {
+                Ok(mounts) => mounts,
+                Err(error) => {
+                    // A cache mount that cannot be prepared degrades to a
+                    // cold build: the job still runs, it just does not
+                    // reuse the previous run's artifacts. Failing the job
+                    // here would turn a missing cache directory into a red
+                    // pipeline for a change that is only an optimisation.
+                    tracing::warn!(
+                        %error,
+                        "volume mounts unavailable; continuing without them"
+                    );
+                    (Vec::new(), Vec::new())
+                }
+            };
+
             // Build host config with resource limits
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
@@ -530,6 +679,12 @@ impl Sandbox for DockerSandbox {
                     None
                 } else {
                     Some("none".to_string())
+                },
+                binds: if binds.is_empty() { None } else { Some(binds) },
+                mounts: if mounts.is_empty() {
+                    None
+                } else {
+                    Some(mounts)
                 },
                 ..Default::default()
             };
@@ -582,9 +737,10 @@ impl Sandbox for DockerSandbox {
         image: &str,
         limits: SandboxLimits,
         workspace_path: Option<&str>,
+        volumes: &[VolumeSpec],
     ) -> Result<SandboxInstance> {
         let Some(workspace_path) = workspace_path else {
-            return self.create(job_id, image, limits).await;
+            return self.create(job_id, image, limits, volumes).await;
         };
         let workspace = Path::new(workspace_path);
         if !workspace.is_absolute() || !workspace.is_dir() {
@@ -602,6 +758,19 @@ impl Sandbox for DockerSandbox {
                 ("com.gitforce.managed".to_owned(), "true".to_owned()),
                 ("com.gitforce.job_id".to_owned(), job_label),
             ]);
+            let (volume_binds, volume_mounts) =
+                match build_volume_mounts(volumes, image, &cache_root()) {
+                    Ok(mounts) => mounts,
+                    Err(error) => {
+                        // See `create`: an unusable cache mount degrades to a
+                        // cold build instead of failing the job.
+                        tracing::warn!(
+                            %error,
+                            "volume mounts unavailable; continuing without them"
+                        );
+                        (Vec::new(), Vec::new())
+                    }
+                };
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
                 cpu_period: Some(100000),
@@ -616,7 +785,16 @@ impl Sandbox for DockerSandbox {
                 // one pipeline run, so use a shared relabel. Private `:Z`
                 // relabeling is racy when concurrent jobs mount the same
                 // checkout and can leave one container unable to see files.
-                binds: Some(vec![format!("{}:/workspace:z", workspace_path)]),
+                binds: Some({
+                    let mut binds = vec![format!("{}:/workspace:z", workspace_path)];
+                    binds.extend(volume_binds);
+                    binds
+                }),
+                mounts: if volume_mounts.is_empty() {
+                    None
+                } else {
+                    Some(volume_mounts)
+                },
                 ..Default::default()
             };
             let config = ContainerCreateBody {
@@ -1139,11 +1317,100 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_build_volume_mounts_bind_expands_placeholders() {
+        let root =
+            std::env::temp_dir().join(format!("gitforge-mount-test-{}", uuid::Uuid::new_v4()));
+        let volumes = vec![VolumeSpec {
+            volume_type: Some(VolumeType::Bind),
+            source: Some(format!("{}/cargo/{{image}}", root.display())),
+            destination: "/cargo-target".to_string(),
+            read_only: false,
+            size: None,
+        }];
+
+        let (binds, mounts) =
+            build_volume_mounts(&volumes, "dsc-ci-rust:10", &root.display().to_string()).unwrap();
+        assert!(mounts.is_empty());
+        assert_eq!(binds.len(), 1);
+        assert_eq!(
+            binds[0],
+            format!("{}/cargo/dsc-ci-rust-10:/cargo-target:rw,z", root.display())
+        );
+        // The mount source is created by the runner, as the runner's own
+        // user, so the job's user can write into it.
+        assert!(root.join("cargo/dsc-ci-rust-10").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_build_volume_mounts_read_only_bind() {
+        let root =
+            std::env::temp_dir().join(format!("gitforge-mount-test-{}", uuid::Uuid::new_v4()));
+        let volumes = vec![VolumeSpec {
+            volume_type: Some(VolumeType::Bind),
+            source: Some(root.display().to_string()),
+            destination: "/cache".to_string(),
+            read_only: true,
+            size: None,
+        }];
+
+        let (binds, _) =
+            build_volume_mounts(&volumes, "dsc-ci-rust:10", &root.display().to_string()).unwrap();
+        assert_eq!(binds[0], format!("{}:/cache:ro,z", root.display()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_build_volume_mounts_tmpfs_carries_size() {
+        let volumes = vec![VolumeSpec {
+            volume_type: Some(VolumeType::Tmpfs),
+            source: None,
+            destination: "/scratch".to_string(),
+            read_only: false,
+            size: Some("4G".to_string()),
+        }];
+
+        let (binds, mounts) =
+            build_volume_mounts(&volumes, "dsc-ci-rust:10", "/var/cache/gitforge").unwrap();
+        assert!(binds.is_empty());
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].target.as_deref(), Some("/scratch"));
+        assert_eq!(
+            mounts[0]
+                .tmpfs_options
+                .as_ref()
+                .and_then(|options| options.size_bytes),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_build_volume_mounts_rejects_relative_destination() {
+        let volumes = vec![VolumeSpec {
+            volume_type: Some(VolumeType::Bind),
+            source: Some("/var/cache".to_string()),
+            destination: "relative".to_string(),
+            read_only: false,
+            size: None,
+        }];
+
+        assert!(build_volume_mounts(&volumes, "dsc-ci-rust:10", "/var/cache/gitforge").is_err());
+    }
+
+    #[test]
+    fn test_parse_size_bytes() {
+        assert_eq!(parse_size_bytes("4G"), Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size_bytes("512M"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_size_bytes("1024"), Some(1024));
+        assert_eq!(parse_size_bytes("nonsense"), None);
+    }
+
     #[tokio::test]
     async fn test_stub_streams_output_to_sink() {
         let sandbox = DockerSandbox::stub_for_tests();
         let instance = sandbox
-            .create(JobId::new(), "test", SandboxLimits::default())
+            .create(JobId::new(), "test", SandboxLimits::default(), &[])
             .await
             .unwrap();
         let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
@@ -1187,7 +1454,7 @@ mod tests {
         // Test with real Docker
         let job_id = JobId::new();
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await;
 
         // If Docker has issues, we fall back to stub mode
@@ -1217,7 +1484,7 @@ mod tests {
 
         let job_id = JobId::new();
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await;
         if instance.is_err() {
             return;
@@ -1243,7 +1510,7 @@ mod tests {
 
         let job_id = JobId::new();
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await;
         if instance.is_err() {
             return;
@@ -1270,7 +1537,7 @@ mod tests {
 
         // Create container (will use stub)
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
         assert!(!instance.container_id.is_empty());
@@ -1322,7 +1589,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1342,7 +1609,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1373,7 +1640,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
         assert_eq!(instance.job_id, job_id);
@@ -1387,7 +1654,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1404,7 +1671,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "rust:latest", SandboxLimits::default())
+            .create(job_id, "rust:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1420,7 +1687,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1441,15 +1708,15 @@ mod tests {
         let job3 = JobId::new();
 
         let instance1 = sandbox
-            .create(job1, "alpine:latest", SandboxLimits::default())
+            .create(job1, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
         let instance2 = sandbox
-            .create(job2, "ubuntu:latest", SandboxLimits::default())
+            .create(job2, "ubuntu:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
         let instance3 = sandbox
-            .create(job3, "rust:latest", SandboxLimits::default())
+            .create(job3, "rust:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1468,7 +1735,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1488,6 +1755,7 @@ mod tests {
                 job_id,
                 "registry.example.com/verylongnamed repository/imagename:latest",
                 SandboxLimits::default(),
+                &[],
             )
             .await
             .unwrap();
@@ -1566,7 +1834,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1586,7 +1854,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1606,7 +1874,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1623,7 +1891,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1640,7 +1908,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
         assert!(!instance.container_id.is_empty());
@@ -1662,6 +1930,7 @@ mod tests {
                     network: false,
                     ..Default::default()
                 },
+                &[],
             )
             .await
             .unwrap();
@@ -1710,7 +1979,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1756,7 +2025,7 @@ mod tests {
         // Stub create_with_workspace requires Docker for workspace containers,
         // so we test via the non-workspace path and check Debug output.
         let instance = sandbox
-            .create(job_id, "alpine:latest", SandboxLimits::default())
+            .create(job_id, "alpine:latest", SandboxLimits::default(), &[])
             .await
             .unwrap();
 
@@ -1789,7 +2058,7 @@ mod tests {
         let job_id = JobId::new();
 
         let instance = sandbox
-            .create_with_workspace(job_id, "alpine:latest", SandboxLimits::default(), None)
+            .create_with_workspace(job_id, "alpine:latest", SandboxLimits::default(), None, &[])
             .await
             .unwrap();
 

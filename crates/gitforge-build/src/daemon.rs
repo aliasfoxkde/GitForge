@@ -11,8 +11,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 
 use gitforge_build::{
-    configured_socket_path, encode_response, BuildCoordinator, Request, Response,
-    MAX_CONCURRENT_JOBS, MAX_MESSAGE_SIZE,
+    configured_socket_path, encode_response, tail_for_wire, BuildCoordinator, Request, Response,
+    MAX_CONCURRENT_JOBS, MAX_MESSAGE_SIZE, WIRE_STREAM_MAX,
 };
 
 /// Create a shutdown flag
@@ -220,6 +220,24 @@ async fn handle_connection(
                 message: "invalid job id".to_string(),
             },
         },
+        Request::Result { job_id } => match uuid::Uuid::parse_str(&job_id) {
+            Ok(uuid) => match coordinator.get_result(&uuid).await {
+                Some(result) => Response::Completed {
+                    job_id,
+                    success: result.success,
+                    exit_code: result.exit_code,
+                    duration_ms: result.duration_ms,
+                    stdout: tail_for_wire(&result.output.stdout, WIRE_STREAM_MAX),
+                    stderr: tail_for_wire(&result.output.stderr, WIRE_STREAM_MAX),
+                },
+                None => Response::Error {
+                    message: "job result not found".to_string(),
+                },
+            },
+            Err(_) => Response::Error {
+                message: "invalid job id".to_string(),
+            },
+        },
         Request::List => {
             let jobs = coordinator.list_jobs().await;
             Response::JobList { jobs }
@@ -292,7 +310,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use gitforge_build::{decode_response, encode_request};
+    use gitforge_build::{decode_response, encode_request, BuildResult, JobOutput};
 
     /// Drive one request through `handle_connection` on a socket pair and
     /// return the decoded response, or `None` when the handler closed the
@@ -371,6 +389,69 @@ mod tests {
                 job_id: uuid::Uuid::new_v4().to_string(),
             },
             "job not found or already terminal",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_result_returns_the_captured_output_of_a_finished_job() {
+        let coordinator = Arc::new(BuildCoordinator::new());
+        let job_id = uuid::Uuid::new_v4();
+        coordinator
+            .store_result(BuildResult {
+                job_id,
+                success: false,
+                exit_code: 101,
+                duration_ms: 42,
+                output: JobOutput {
+                    stdout: "compiling...".to_string(),
+                    stderr: "error[E0308]: mismatched types".to_string(),
+                    exit_code: 101,
+                },
+                error: None,
+            })
+            .await;
+
+        match exchange_with(
+            &coordinator,
+            &Request::Result {
+                job_id: job_id.to_string(),
+            },
+        )
+        .await
+        {
+            Some(Response::Completed {
+                success,
+                exit_code,
+                duration_ms,
+                stdout,
+                stderr,
+                ..
+            }) => {
+                assert!(!success);
+                assert_eq!(exit_code, 101);
+                assert_eq!(duration_ms, 42);
+                assert_eq!(stdout, "compiling...");
+                assert!(stderr.contains("E0308"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_result_rejects_invalid_and_unknown_job_ids() {
+        expect_error_response(
+            &Request::Result {
+                job_id: "not-a-uuid".to_string(),
+            },
+            "invalid job id",
+        )
+        .await;
+        expect_error_response(
+            &Request::Result {
+                job_id: uuid::Uuid::new_v4().to_string(),
+            },
+            "job result not found",
         )
         .await;
     }
