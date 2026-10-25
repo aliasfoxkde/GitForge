@@ -1027,3 +1027,58 @@ gitforge-ci journal 2026-10-10 07:11:19–07:11:35 CDT (panic message,
 core-dump, scheduled restart); sqlx-sqlite-0.9.0 row.rs:31–52; timing
 correlation with F39's delayed trigger consumption (the crash is why
 the event waited for the fresh process).
+
+## 14. Findings verdicts (2026-10-25, v0.7.0 release-cycle audit)
+
+**F39 VERDICT (2026-10-25): fixed by architecture change — the duplicate-row
+mechanism no longer exists on the v0.7.0 line.** The F39 shape was: api
+creates run row client-side → ci consumes the trigger late → ci mints its
+own run row → the api-side row is a permanent zero-job `running` ghost no
+finalizer owns. Three structural changes since 2026-10-10 close it:
+
+1. **Dedup at the trigger boundary, not the run boundary.**
+   `TriggerRequestQueries::create_or_existing` (crates/gitforge-db/src/
+   queries.rs:3250) keys on (repo_id, new_hash, status IN pending/
+   processing): a racing or redelivered trigger for the same commit
+   dedups onto the in-flight request and returns its linked run id
+   (`deduplicated: true`) instead of minting a second execution. The
+   ci consumer links the minted run back via `mark_completed(pool,
+   request_id, run_id)` (services/ci/src/main.rs:2184), so the
+   202-null client response settles to a real run id late — the
+   documented durable-202-null contract — rather than orphaning.
+2. **The push path no longer creates run rows on the api side.** The
+   webhook handler delegates to ci first (`CiTriggerClient::trigger`,
+   crates/gitforge-api/src/routes/webhook.rs:253) and returns 202; the
+   inline `PipelineRunQueries::create` at webhook.rs:344 is the
+   fallback only when no CiTriggerClient extension is configured
+   (a deployment shape that no longer exists in production — the
+   client is always mounted), and it plans its OWN durable job under
+   a webhook idempotency key (`webhook:{pipeline}:{commit}`), so even
+   that path is not a zero-job ghost. The zero-job-`running` row class
+   now has no producer.
+3. **The checkout-spawn-failure grading and boot-order fixes** (consumer
+   before inline engine rebuild, 69e3c859) remove the delay window that
+   let the api's row outlive the crash in the first place.
+
+Residual, deliberately accepted: `run_event_consumer` does not look up an
+existing non-terminal run row for (repo, commit) before minting — if a
+future producer re-introduces api-side run creation for pushes, the ghost
+class reopens. The guard is the release gate's definition-coverage check,
+which mechanically refuses any run whose durable rows do not cover the
+persisted pipeline; gate the cut and the ghost cannot be release evidence.
+No further code change required for F39; closure recorded with the v0.7.0
+evidence run 8d28d6f4 (7/7 jobs, exact SHA 3e41df86) as the live
+demonstration that exact-SHA runs carry full durable coverage.
+
+**Phase-6 fuzz lane: DEFERRAL OVERTAKEN (verified 2026-10-25).** The
+2026-10-10 deferral verdict ("pkt-line fuzz target scheduled with the next
+image bump") is stale: the fuzz lane shipped since. `.gitforge.yml` runs a
+`fuzz` job as the chain's final stage (60 s libFuzzer smoke per target,
+cargo +nightly fuzz run, cargo-fuzz 0.13 `+channel` syntax, dsc-ci-rust:10)
+over `fuzz/fuzz_targets/pipeline_parse.rs` and `git_http_parsers.rs` — the
+two untrusted-input surfaces the plan named (pipeline config parser,
+smart-HTTP path/header parsers). Every v0.7.0 evidence run executed it
+green (runs 8d28d6f4, f61dc2df, beae775a). skip_if excludes the job only
+for non-code pushes, and the v0.7.0 release-gate hardening refuses a cut
+whose run skipped it for a main-tip source commit. Campaign-plan item
+closed; no further action.

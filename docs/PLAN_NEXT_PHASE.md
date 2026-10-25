@@ -1,5 +1,13 @@
 # GitForge Next Phase Plan
 
+> **Historical (July 2026).** Every critical gap in this document has
+> shipped: JWT auth is enforced on all routes, the rate limiter is mounted
+> on the auth surface, cargo-audit runs in CI (security.yml), the runner
+> leases and completion protocol are durable, and coverage is gated at
+> 82% in the pipeline. Current plans live in
+> [planning/MASTER_PLAN_2026-09-20.md](planning/MASTER_PLAN_2026-09-20.md)
+> and [planning/CAMPAIGN_PLAN_2026-10-03.md](planning/CAMPAIGN_PLAN_2026-10-03.md).
+
 ## Executive Summary
 
 Previous phases completed foundational work. This next phase addresses critical gaps: security, runner-scheduler communication, CI event integration, deployment, and test coverage.

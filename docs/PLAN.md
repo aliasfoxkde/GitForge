@@ -1,8 +1,13 @@
 # GitForge Project Plan
 
+> **Historical (2026-07-23).** Superseded by [planning/MASTER_PLAN_2026-09-20.md](planning/MASTER_PLAN_2026-09-20.md)
+> and [planning/CAMPAIGN_PLAN_2026-10-03.md](planning/CAMPAIGN_PLAN_2026-10-03.md).
+> Every "critical gap" listed here (JWT enforcement, CORS, cargo-audit in CI,
+> hardcoded secrets) has since shipped; the checklists below are closed.
+
 **Version**: 1.3.0
 **Last Updated**: 2026-07-23
-**Status**: IN PROGRESS
+**Status**: HISTORICAL — superseded, see banner above
 
 ---
 

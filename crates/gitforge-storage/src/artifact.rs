@@ -113,6 +113,65 @@ pub trait ArtifactStore: Send + Sync {
 }
 
 #[cfg(test)]
+mod retention_tests {
+    use super::super::filesystem::FileStorage;
+    use super::*;
+    use tempfile::tempdir;
+
+    fn artifact(job_id: JobId, name: &str, age_days: i64, size: u64) -> Artifact {
+        Artifact {
+            id: ArtifactId::new(),
+            job_id,
+            name: name.to_string(),
+            path: format!("/tmp/{name}"),
+            checksum: "0".repeat(64),
+            size_bytes: size,
+            content_type: None,
+            created_at: chrono::Utc::now() - chrono::Duration::days(age_days),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sweep_expired_artifacts_removes_only_old() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+
+        let old = artifact(JobId::new(), "old.log", 45, 100);
+        let fresh = artifact(JobId::new(), "fresh.log", 1, 200);
+        ArtifactStore::put(&storage, &old, b"old").await.unwrap();
+        ArtifactStore::put(&storage, &fresh, b"fresh")
+            .await
+            .unwrap();
+
+        let (removed, reclaimed) = sweep_expired_artifacts(&storage, chrono::Duration::days(30))
+            .await
+            .unwrap();
+
+        assert_eq!((removed, reclaimed), (1, 100));
+        assert!(ArtifactStore::get_metadata(&storage, old.id).await.is_err());
+        assert!(ArtifactStore::get_metadata(&storage, fresh.id)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sweep_with_nothing_expired_is_a_noop() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+        let fresh = artifact(JobId::new(), "recent.log", 2, 50);
+        ArtifactStore::put(&storage, &fresh, b"x").await.unwrap();
+
+        let (removed, reclaimed) = sweep_expired_artifacts(&storage, chrono::Duration::days(30))
+            .await
+            .unwrap();
+        assert_eq!((removed, reclaimed), (0, 0));
+        assert!(ArtifactStore::get_metadata(&storage, fresh.id)
+            .await
+            .is_ok());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -374,4 +433,31 @@ mod tests {
         .await;
         assert!(result.is_err());
     }
+}
+
+/// Artifact retention sweep (master-plan Phase 5.2): delete artifacts whose
+/// `created_at` is older than `max_age`, returning (removed_count,
+/// reclaimed_bytes). Unbounded growth is the failure mode — the live
+/// instance held 853 MB of artifacts before any sweep existed. Callers own
+/// the cadence (ci's startup sweep) and the age policy (default 30 days,
+/// `GITFORGE_ARTIFACT_RETENTION_DAYS` to override); errors on individual
+/// artifacts are skipped so one unreadable meta file cannot stall the pass.
+pub async fn sweep_expired_artifacts(
+    store: &dyn ArtifactStore,
+    max_age: chrono::Duration,
+) -> Result<(usize, u64)> {
+    let cutoff = chrono::Utc::now() - max_age;
+    let mut removed = 0usize;
+    let mut reclaimed = 0u64;
+    for artifact in store.list().await? {
+        if artifact.created_at >= cutoff {
+            continue;
+        }
+        let size = artifact.size_bytes;
+        if store.delete(artifact.id).await.is_ok() {
+            removed += 1;
+            reclaimed += size;
+        }
+    }
+    Ok((removed, reclaimed))
 }
