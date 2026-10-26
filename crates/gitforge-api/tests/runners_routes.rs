@@ -76,6 +76,7 @@ async fn seed() -> Fixture {
         trigger_type: "push".to_string(),
         config: json!({"name": "runner-routes-pipeline", "version": "1.0", "jobs": []}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     let pipeline_id = pipeline.id;
     PipelineQueries::create(&pool, &pipeline).await.unwrap();

@@ -166,6 +166,7 @@ async fn list_pipelines(
                         "repo_id": p.repo_id.to_string(),
                         "name": p.name,
                         "trigger_type": p.trigger_type,
+                        "enabled": p.active,
                         "created_at": p.created_at.to_rfc3339()
                     }));
                 }
@@ -207,6 +208,7 @@ async fn get_pipeline(
                                 "repo_id": pipeline.repo_id.to_string(),
                                 "name": pipeline.name,
                                 "trigger_type": pipeline.trigger_type,
+                                "enabled": pipeline.active,
                                 "created_at": pipeline.created_at.to_rfc3339()
                             })),
                         )
@@ -373,6 +375,7 @@ async fn create_pipeline(
         trigger_type: "manual".to_string(),
         config,
         created_at: chrono::Utc::now(),
+        active: true,
     };
 
     // idx_pipelines_active_repo_name admits one active version per

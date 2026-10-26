@@ -14,6 +14,9 @@ pub struct Pipeline {
     pub trigger_type: String,
     pub config: serde_json::Value,
     pub created_at: DateTime<Utc>,
+    /// Version-activation flag: exactly one version per (repo_id, name) is
+    /// active at a time; superseded versions stay as active = 0 history.
+    pub active: bool,
 }
 
 /// Trigger type

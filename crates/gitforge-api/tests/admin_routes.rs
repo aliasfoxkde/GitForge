@@ -98,6 +98,7 @@ async fn seed_job_on_runner(pool: &Pool, owner: &User, runner_id: RunnerId, stat
         trigger_type: "push".to_string(),
         config: json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(pool, &pipeline).await.unwrap();
     let run = PipelineRun::new(pipeline.id, repo.id, "webhook".to_string(), "a".repeat(40));

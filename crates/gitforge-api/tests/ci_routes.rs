@@ -92,6 +92,7 @@ async fn seed() -> Fixture {
         trigger_type: "push".to_string(),
         config: json!({"name": "ci-routes-pipeline", "version": "1.0", "jobs": []}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     let pipeline_id = pipeline.id;
     PipelineQueries::create(&pool, &pipeline).await.unwrap();
@@ -697,6 +698,7 @@ async fn webhook_replays_are_idempotent_and_map_to_one_durable_job() {
         trigger_type: "push".to_string(),
         config: entry_job_definition(),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(&f.pool, &pipeline).await.unwrap();
 
@@ -1102,6 +1104,7 @@ async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, RepoId, Pipe
         trigger_type: "manual".to_string(),
         config: json!({"name": "run-storage-pipeline", "version": "1.0", "jobs": []}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     let pipeline_id = pipeline.id;
     PipelineQueries::create(&f.pool, &pipeline).await.unwrap();
@@ -1497,6 +1500,7 @@ async fn seed_repo_with_pipeline(
             "jobs": [{"name": "build", "steps": [{"run": "true"}]}]
         }),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     let pipeline_id = pipeline.id;
     PipelineQueries::create(pool, &pipeline).await.unwrap();

@@ -1285,6 +1285,7 @@ mod tests {
             trigger_type: "manual".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
             .await
@@ -1527,6 +1528,7 @@ mod tests {
             trigger_type: "manual".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         gitforge_db::queries::PipelineQueries::create(pool, &pipeline)
             .await
@@ -1733,6 +1735,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
             .await

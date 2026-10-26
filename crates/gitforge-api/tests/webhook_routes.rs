@@ -102,6 +102,7 @@ async fn seed() -> Fixture {
             trigger_type: "push".to_string(),
             config,
             created_at: chrono::Utc::now(),
+            active: true,
         };
         let id = pipeline.id;
         PipelineQueries::create(pool, &pipeline).await.unwrap();
