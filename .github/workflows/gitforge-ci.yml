@@ -110,13 +110,21 @@ jobs:
               exit 0
             fi
           fi
-          if [ "$HTTP_CODE" = "202" ] && echo "$BODY" | jq -e '.status == "queued"' >/dev/null 2>&1; then
+          # 202 responses: status may be "queued" (durable trigger, run row
+          # lands late) or "accepted" (run row already created, id in
+          # pipeline_run_id). Both mean the pipeline is enqueued.
+          if [ "$HTTP_CODE" = "202" ] && echo "$BODY" | jq -e '.status == "queued" or (.status == "accepted" and .pipeline_run_id != null)' >/dev/null 2>&1; then
+            RUN_ID=$(echo "$BODY" | jq -r '.pipeline_run_id // empty')
             {
-              echo "run_id="
+              echo "run_id=$RUN_ID"
               echo "commit=$NEW_HASH"
               echo "status=enqueued"
             } >> "$GITHUB_OUTPUT"
-            echo "Durably queued (run row lands late); polling by commit $NEW_HASH"
+            if [ -n "$RUN_ID" ]; then
+              echo "Enqueued (accepted), pipeline run $RUN_ID"
+            else
+              echo "Durably queued (run row lands late); polling by commit $NEW_HASH"
+            fi
             exit 0
           fi
 
