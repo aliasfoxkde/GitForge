@@ -102,16 +102,20 @@ jobs:
           if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
             RUN_ID=$(echo "$BODY" | jq -r '.pipeline_run_id // empty')
             if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
-              echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-              echo "status=enqueued" >> "$GITHUB_OUTPUT"
+              {
+                echo "run_id=$RUN_ID"
+                echo "status=enqueued"
+              } >> "$GITHUB_OUTPUT"
               echo "Successfully enqueued pipeline run $RUN_ID"
               exit 0
             fi
           fi
           if [ "$HTTP_CODE" = "202" ] && echo "$BODY" | jq -e '.status == "queued"' >/dev/null 2>&1; then
-            echo "run_id=" >> "$GITHUB_OUTPUT"
-            echo "commit=$NEW_HASH" >> "$GITHUB_OUTPUT"
-            echo "status=enqueued" >> "$GITHUB_OUTPUT"
+            {
+              echo "run_id="
+              echo "commit=$NEW_HASH"
+              echo "status=enqueued"
+            } >> "$GITHUB_OUTPUT"
             echo "Durably queued (run row lands late); polling by commit $NEW_HASH"
             exit 0
           fi
