@@ -102,6 +102,16 @@ jobs:
           AEGIS_COMMIT: 04685c76c5488569b447fd8c1aefbedd01343459
         run: |
           set -euo pipefail
+          # The self-hosted runner's service environment does not source
+          # ~/.profile, so cargo may be absent from PATH (exit 127 observed
+          # 2026-10-29 on fedora-gitforge-01).
+          if ! command -v cargo >/dev/null 2>&1; then
+            # shellcheck source=/dev/null
+            for candidate in "$HOME/.cargo/env" /usr/local/cargo/env; do
+              [ -f "$candidate" ] && . "$candidate" && break
+            done
+          fi
+          command -v cargo >/dev/null 2>&1 || { echo "cargo not found on runner PATH" >&2; exit 127; }
           git clone --filter=blob:none --no-checkout https://github.com/aliasfoxkde/aegis.git "$RUNNER_TEMP/aegis"
           git -C "$RUNNER_TEMP/aegis" checkout --detach "$AEGIS_COMMIT"
           cargo build --locked --release --manifest-path "$RUNNER_TEMP/aegis/Cargo.toml" --package aegis-cli --bin aegis

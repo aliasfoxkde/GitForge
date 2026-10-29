@@ -41,6 +41,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, gitforge-github]
     outputs:
       run_id: ${{ steps.enqueue.outputs.run_id }}
+      commit: ${{ steps.enqueue.outputs.commit }}
       build_status: ${{ steps.enqueue.outputs.status }}
     steps:
       - name: Validate GitForge configuration
@@ -69,11 +70,17 @@ jobs:
           # Trigger the GitForge CI service. The service returns the durable
           # pipeline-run ID; polling the API by pipeline ID was a protocol
           # mismatch and could never observe the created run.
+          #
+          # github.sha on pull_request events is the synthetic merge commit,
+          # which exists only on GitHub — the 202 instance cannot check out
+          # an object its mirror never received (run 0fc5ac86 failed exactly
+          # this way). Trigger on the real branch head instead.
+          NEW_HASH="${{ github.event.pull_request.head.sha || github.sha }}"
           PAYLOAD=$(jq -n \
             --arg repo "$GITFORGE_REPO_ID" \
             --arg ref "${{ github.ref_name }}" \
             --arg old "${{ github.event.before }}" \
-            --arg new "${{ github.sha }}" \
+            --arg new "$NEW_HASH" \
             '{repo_id:$repo,ref_name:$ref,old_hash:$old,new_hash:$new,working_dir:null}')
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "$GITFORGE_SCHEDULER_URL/pipelines/trigger" \
@@ -87,7 +94,12 @@ jobs:
           echo "HTTP Code: $HTTP_CODE"
           echo "Response: $BODY"
 
-          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
+          # A 202 with pipeline_run_id null is the durable-trigger contract:
+          # the event is durably queued and the run row lands late (observed
+          # up to 5 min under load), never lost. Treat enqueued-202 as
+          # success even without a run id; the poll step re-queries by
+          # commit hash.
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
             RUN_ID=$(echo "$BODY" | jq -r '.pipeline_run_id // empty')
             if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
               echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
@@ -95,6 +107,13 @@ jobs:
               echo "Successfully enqueued pipeline run $RUN_ID"
               exit 0
             fi
+          fi
+          if [ "$HTTP_CODE" = "202" ] && echo "$BODY" | jq -e '.status == "queued"' >/dev/null 2>&1; then
+            echo "run_id=" >> "$GITHUB_OUTPUT"
+            echo "commit=$NEW_HASH" >> "$GITHUB_OUTPUT"
+            echo "status=enqueued" >> "$GITHUB_OUTPUT"
+            echo "Durably queued (run row lands late); polling by commit $NEW_HASH"
+            exit 0
           fi
 
           echo "GitForge enqueue failed (HTTP $HTTP_CODE); refusing to bypass GitForge" >&2
@@ -115,10 +134,39 @@ jobs:
           set -euo pipefail
           echo "Build enqueued, polling GitForge for status..."
           RUN_ID='${{ needs.enqueue-build.outputs.run_id }}'
+          COMMIT='${{ needs.enqueue-build.outputs.commit }}'
           STATUS_URL="$GITFORGE_API_URL/api/pipeline-runs/$RUN_ID"
+
+          # Durable-trigger path: no run id yet. Re-query by commit hash
+          # until the run row lands (observed latency: up to 5 min).
+          # The runs listing has no commit filter; fetch the repo's newest
+          # runs and match client-side (the trigger's run is at the head
+          # of the list within seconds of enqueueing).
+          resolve_run_id() {
+            RUN_ID=$(curl --fail-with-body --silent --show-error \
+              --max-time 30 \
+              -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
+              -H "Accept: application/json" \
+              "$GITFORGE_API_URL/api/pipeline-runs?repo_id=$GITFORGE_REPO_ID&order=desc&limit=10" \
+              | jq -r --arg commit "$COMMIT" \
+                '[.[]? | select(.commit_hash == $commit)][0].id // empty' 2>/dev/null || true)
+          }
 
           deadline=$(( $(date +%s) + GITFORGE_POLL_TIMEOUT_SECONDS ))
           while :; do
+            if [ -z "$RUN_ID" ] && [ -n "$COMMIT" ]; then
+              resolve_run_id
+            fi
+            if [ -z "$RUN_ID" ]; then
+              echo "run row for $COMMIT not landed yet"
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "GitForge pipeline run row never appeared for commit $COMMIT within ${GITFORGE_POLL_TIMEOUT_SECONDS}s" >&2
+                echo "terminal_status=timeout" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+              sleep "$GITFORGE_POLL_INTERVAL_SECONDS"
+              continue
+            fi
             RESPONSE=$(curl --fail-with-body --silent --show-error \
               --max-time 30 \
               -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
