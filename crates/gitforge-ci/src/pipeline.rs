@@ -120,7 +120,12 @@ pub struct PipelineDefinition {
 impl PipelineDefinition {
     /// Parse pipeline definition from YAML
     pub fn parse(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+        reject_unknown_keys(&value).map_err(|message| {
+            use serde::de::Error as _;
+            serde_yaml::Error::custom(message)
+        })?;
+        serde_yaml::from_value(value)
     }
 
     /// Convert to YAML
@@ -198,6 +203,62 @@ lazy_static::lazy_static! {
     static ref EMPTY_ENV: HashMap<String, String> = HashMap::new();
 }
 
+const PIPELINE_KEYS: &[&str] = &["name", "version", "trigger_on", "environment", "jobs"];
+const JOB_KEYS: &[&str] = &[
+    "name", "image", "needs", "env", "steps", "timeout", "retry", "skip_if", "volumes", "cache",
+];
+
+/// Reject YAML keys the parser would otherwise silently drop. A stale binary
+/// (deployed before a field existed) degrades the committed pipeline — a
+/// dropped `cache:` cold-builds every job, a dropped `skip_if:` runs jobs
+/// that should have been skipped — so failing loudly is the safe behavior.
+/// The error names the offending key and points at deploy skew.
+fn reject_unknown_keys(value: &serde_yaml::Value) -> Result<(), String> {
+    fn check(
+        mapping: &serde_yaml::Mapping,
+        allowed: &[&str],
+        what: &str,
+        job_name: Option<&str>,
+    ) -> Result<(), String> {
+        for key in mapping.keys() {
+            if let serde_yaml::Value::String(k) = key {
+                if !allowed.contains(&k.as_str()) {
+                    let label = match job_name {
+                        Some(name) => format!("job '{name}'"),
+                        None => what.to_string(),
+                    };
+                    return Err(format!(
+                        "unknown {what} key '{k}' in {label}: the deployed binary predates \
+                         this pipeline field, or the key is misspelled — refusing to \
+                         silently ignore it"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    let Some(mapping) = value.as_mapping() else {
+        return Ok(());
+    };
+    check(mapping, PIPELINE_KEYS, "pipeline", None)?;
+    let Some(jobs) = mapping.get(serde_yaml::Value::from("jobs")) else {
+        return Ok(());
+    };
+    if let Some(jobs) = jobs.as_sequence() {
+        for (idx, job) in jobs.iter().enumerate() {
+            let Some(job) = job.as_mapping() else {
+                continue;
+            };
+            let name = job
+                .get(serde_yaml::Value::from("name"))
+                .and_then(|v| v.as_str())
+                .map_or_else(|| format!("#{idx}"), str::to_owned);
+            check(job, JOB_KEYS, "job", Some(&name))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +284,72 @@ jobs:
         assert_eq!(pipeline.name, "test-pipeline");
         assert_eq!(pipeline.jobs.len(), 1);
         assert_eq!(pipeline.jobs[0].name, "build");
+    }
+
+    #[test]
+    fn test_parse_rejects_unknown_job_key() {
+        // A binary from before `cache` existed must fail loudly, not
+        // silently run the degraded pipeline.
+        let yaml = r#"
+name: stale-binary
+version: "1.0"
+trigger_on: [push]
+jobs:
+  - name: clippy
+    image: dsc-ci-rust:10
+    steps:
+      - name: clippy
+        run: cargo clippy
+    caches:
+      source: "{cache_root}/cargo/{image}"
+"#;
+        let error = PipelineDefinition::parse(yaml).unwrap_err().to_string();
+        assert!(
+            error.contains("unknown"),
+            "error mentions unknown key: {error}"
+        );
+        assert!(error.contains("caches"), "error names the key: {error}");
+        assert!(error.contains("clippy"), "error names the job: {error}");
+    }
+
+    #[test]
+    fn test_parse_rejects_unknown_pipeline_key() {
+        let yaml = r#"
+name: typo
+version: "1.0"
+trigger_on: [push]
+enviroment: {}
+jobs: []
+"#;
+        let error = PipelineDefinition::parse(yaml).unwrap_err().to_string();
+        assert!(error.contains("enviroment"), "error names the key: {error}");
+    }
+
+    #[test]
+    fn test_parse_accepts_all_documented_keys() {
+        let yaml = r#"
+name: full
+version: "1.0"
+trigger_on: [push, pull_request]
+environment: {}
+jobs:
+  - name: job
+    image: img:1
+    needs: []
+    env: {}
+    steps:
+      - name: step
+        run: echo hi
+    timeout: 45m
+    retry: 1
+    skip_if: 'false'
+    volumes: []
+    cache:
+      source: "{cache_root}/x"
+"#;
+        let pipeline = PipelineDefinition::parse(yaml).unwrap();
+        assert_eq!(pipeline.jobs.len(), 1);
+        assert!(pipeline.jobs[0].cache.is_some());
     }
 
     #[test]

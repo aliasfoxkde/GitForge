@@ -2442,6 +2442,7 @@ async fn handle_push_event(
             config: serde_json::to_value(&pipeline)
                 .map_err(|e| TriggerFailure::terminal(e.into()))?,
             created_at: Utc::now(),
+            active: true,
         };
         let mut db_run = DbPipelineRun::new(
             pipeline_id,
@@ -3739,6 +3740,7 @@ mod tests {
                 trigger_type: "push".to_string(),
                 config: serde_json::json!({}),
                 created_at: chrono::Utc::now(),
+                active: true,
             },
         )
         .await
@@ -3835,6 +3837,7 @@ mod tests {
                 trigger_type: "push".to_string(),
                 config: serde_json::json!({}),
                 created_at: chrono::Utc::now(),
+                active: true,
             },
         )
         .await
@@ -3975,6 +3978,7 @@ mod tests {
                 trigger_type: "push".to_string(),
                 config: serde_json::json!({}),
                 created_at: chrono::Utc::now(),
+                active: true,
             },
         )
         .await
@@ -4271,6 +4275,7 @@ mod tests {
                 trigger_type: "push".to_string(),
                 config: serde_json::to_value(&definition).unwrap(),
                 created_at: chrono::Utc::now(),
+                active: true,
             },
         )
         .await
@@ -4495,6 +4500,7 @@ mod tests {
                 trigger_type: "push".to_string(),
                 config: serde_json::to_value(&definition).unwrap(),
                 created_at: chrono::Utc::now(),
+                active: true,
             },
         )
         .await
@@ -4751,6 +4757,7 @@ jobs:
                 trigger_type: "push".to_string(),
                 config: serde_json::to_value(&definition).unwrap(),
                 created_at: chrono::Utc::now(),
+                active: true,
             },
         )
         .await
@@ -4894,6 +4901,7 @@ jobs:
                 trigger_type: "push".to_string(),
                 config: definition,
                 created_at: chrono::Utc::now(),
+                active: true,
             },
         )
         .await
@@ -6138,6 +6146,7 @@ jobs:
                 trigger_type: "push".to_string(),
                 config: serde_json::to_value(definition).unwrap(),
                 created_at: chrono::Utc::now(),
+                active: true,
             },
         )
         .await

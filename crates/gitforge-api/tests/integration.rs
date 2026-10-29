@@ -60,6 +60,7 @@ async fn webhook_fixture(
         trigger_type: "push".to_string(),
         config,
         created_at: chrono::Utc::now(),
+        active: true,
     };
     gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
         .await
@@ -868,6 +869,7 @@ async fn test_scheduler_upload_is_downloadable_through_authenticated_api() {
         trigger_type: "manual".to_string(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
         .await
@@ -1042,6 +1044,7 @@ async fn test_api_artifacts_are_scoped_to_job_repository_owner() {
             trigger_type: "manual".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         },
     )
     .await
@@ -1964,6 +1967,7 @@ async fn test_api_webhook_trigger_success() {
         trigger_type: "push".to_string(),
         config: serde_json::to_value(pipeline_definition).unwrap(),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
         .await
@@ -2204,6 +2208,7 @@ async fn test_api_job_control_enforces_repository_ownership_and_persists_cancel(
             trigger_type: "manual".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         },
     )
     .await
@@ -2350,6 +2355,7 @@ async fn test_api_pipeline_runs_with_jobs() {
         trigger_type: "push".to_string(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
         .await

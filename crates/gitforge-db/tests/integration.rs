@@ -122,6 +122,7 @@ async fn test_database_pipeline_with_dependencies() {
         trigger_type: "push".to_string(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(&pool, &pipeline).await.unwrap();
 
@@ -174,6 +175,7 @@ async fn test_pipeline_versioning_active_uniqueness() {
         trigger_type: "push".to_string(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
 
     // The partial UNIQUE index admits only one active version per
@@ -288,6 +290,7 @@ async fn test_database_job_state_transitions() {
         trigger_type: "push".to_string(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(&pool, &pipeline).await.unwrap();
 
@@ -342,6 +345,7 @@ async fn test_database_durable_job_lease_fences_replay() {
         trigger_type: "manual".to_string(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(&pool, &pipeline).await.unwrap();
     let run = PipelineRun::new(
@@ -472,6 +476,7 @@ async fn test_database_pipeline_run_status_updates() {
         trigger_type: "push".to_string(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(&pool, &pipeline).await.unwrap();
 
@@ -1251,6 +1256,7 @@ async fn test_pipeline_run_terminal_verdict_guard() {
         trigger_type: "push".to_string(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(&pool, &pipeline).await.unwrap();
     let run = PipelineRun::new(
@@ -1434,6 +1440,7 @@ async fn test_commit_fault_injection_never_acks_an_uncommitted_append() {
         trigger_type: "manual".to_string(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(&pool, &pipeline).await.unwrap();
     let run = PipelineRun::new(

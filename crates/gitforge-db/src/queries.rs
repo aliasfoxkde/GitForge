@@ -126,6 +126,10 @@ fn hydrate_pipeline(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Pipel
         )
         .map_err(|error| Error::database(format!("invalid pipeline config JSON: {error}")))?,
         created_at: parse_timestamp_column(&row, "created_at")?,
+        active: row
+            .try_get::<i64, _>("active")
+            .map(|value| value != 0)
+            .map_err(|error| Error::database(format!("invalid pipeline active flag: {error}")))?,
     })
 }
 
@@ -3841,6 +3845,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({"jobs": []}),
             created_at: Utc::now(),
+            active: true,
         };
         PipelineQueries::create(pool, &pipeline).await.unwrap();
         let mut run = crate::models::PipelineRun::new(
@@ -4208,6 +4213,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({"jobs": []}),
             created_at: Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
         let run = crate::models::PipelineRun::new(
@@ -4276,6 +4282,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({"version": 1}),
             created_at: Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &first).await.unwrap();
 
@@ -4287,6 +4294,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({"version": 2}),
             created_at: Utc::now(),
+            active: true,
         };
         let run =
             crate::models::PipelineRun::new(second.id, repo.id, "push".to_string(), "1".repeat(40));
@@ -4338,6 +4346,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({"v": created_at.timestamp()}),
             created_at,
+            active: true,
         };
 
         // PIPELINE_VERSION_RETENTION run-less versions, oldest first, then
@@ -4706,6 +4715,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &ci).await.unwrap();
         let release = crate::models::Pipeline {
@@ -4931,6 +4941,7 @@ mod tests {
             trigger_type: "manual".to_string(),
             config: serde_json::json!({}),
             created_at: Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
         let run = crate::models::PipelineRun::new(
@@ -5168,6 +5179,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
 
         // Create
@@ -5246,6 +5258,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
 
@@ -5326,6 +5339,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
 
@@ -5421,6 +5435,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
         let run = crate::models::PipelineRun::new(
@@ -5497,6 +5512,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
         let run = crate::models::PipelineRun::new(
@@ -5572,6 +5588,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
 
@@ -5685,6 +5702,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
         let run = crate::models::PipelineRun::new(
@@ -5803,6 +5821,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
 
@@ -5859,6 +5878,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
 
@@ -5922,6 +5942,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
         let run = crate::models::PipelineRun::new(
@@ -6037,6 +6058,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
         let run = crate::models::PipelineRun::new(
@@ -6132,6 +6154,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
         let run = crate::models::PipelineRun::new(
@@ -6243,6 +6266,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
         let run = crate::models::PipelineRun::new(
@@ -6401,6 +6425,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: Utc::now(),
+            active: true,
         };
         PipelineQueries::create(&pool, &pipeline).await.unwrap();
         let run = crate::models::PipelineRun::new(

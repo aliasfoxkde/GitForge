@@ -148,14 +148,19 @@ if ((dry_run == 1)); then
 fi
 
 # --- 1. Drain ---------------------------------------------------------------
+command -v sqlite3 >/dev/null 2>&1 \
+    || die "sqlite3 CLI not found; the drain gate cannot read the DB. Install sqlite3 (drain can be hand-verified: SELECT count(*) FROM jobs WHERE status IN ('assigned','running'))"
 while true; do
     inflight=$(sqlite3 -readonly "$db_path" ".timeout 15000" \
         "SELECT count(*) FROM jobs WHERE status IN ('assigned','running');" 2>/dev/null)
     if [[ "$inflight" == "0" ]]; then
         say "$(date +%H:%M:%S) drained; cutting over"
         break
+    elif [[ -z "$inflight" ]]; then
+        # An unreadable DB must not spin forever — fail loudly instead.
+        die "drain query failed (empty output): cannot verify in-flight jobs on $db_path"
     fi
-    say "$(date +%H:%M:%S) in-flight=${inflight:-unknown}; waiting"
+    say "$(date +%H:%M:%S) in-flight=${inflight}; waiting"
     sleep 5
 done
 

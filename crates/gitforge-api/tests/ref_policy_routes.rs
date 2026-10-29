@@ -365,6 +365,7 @@ async fn commit_status_aggregates_required_checks() {
         trigger_type: "push".to_string(),
         config: json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(&fixture.pool, &pipeline)
         .await

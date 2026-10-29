@@ -84,6 +84,7 @@ async fn seed() -> Fixture {
         trigger_type: "push".to_string(),
         config: json!({"name": "artifact-routes-pipeline", "version": "1.0", "jobs": []}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(&pool, &pipeline).await.unwrap();
 
@@ -111,6 +112,7 @@ async fn seed() -> Fixture {
         trigger_type: "push".to_string(),
         config: json!({"name": "artifact-other-pipeline", "version": "1.0", "jobs": []}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(&pool, &other_pipeline)
         .await
