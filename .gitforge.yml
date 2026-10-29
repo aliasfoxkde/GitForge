@@ -27,13 +27,14 @@
 #   directory and corrupt each other's build locks.
 # - `environment: {}` is required by the parser (PipelineDefinition has no
 #   serde default) even though it is never forwarded.
-# - The image is pre-built on the host (dsc-ci-rust:10 — cargo, clippy,
+# - The image is pre-built on the host (dsc-ci-rust:11 — cargo, clippy,
 #   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, python3
 #   for the route-docs drift gate, and the GitForge workspace cargo
 #   registry cache baked in for offline builds).
 #   Rebuild and bump the tag whenever Cargo.lock changes or the baked
 #   tooling changes — a stale cache fails every cargo job in seconds with
-#   "candidate versions found which didn't match" (v10 added shellcheck
+#   "candidate versions found which didn't match" (v11 baked the
+#   cargo-audit dependency-bump lockfile; v10 added shellcheck
 #   for the new head-of-chain lint job; v9 added python3 for
 #   the drift checker; v8 documents the
 #   current tag; v7 added the coverage toolchain; v6 existed because v5
@@ -64,7 +65,7 @@ trigger_on:
 environment: {}
 jobs:
   - name: detect-changes
-    image: dsc-ci-rust:10
+    image: dsc-ci-rust:11
     steps:
       - name: Enumerate changed files and classify
         # Populates CI_CHANGE_* vars used by downstream skip_if conditions.
@@ -73,7 +74,7 @@ jobs:
     timeout: 5m
 
   - name: lint
-    image: dsc-ci-rust:10
+    image: dsc-ci-rust:11
     needs: [detect-changes]
     steps:
       - name: Shellcheck (including extensionless ops scripts)
@@ -95,7 +96,7 @@ jobs:
     timeout: 10m
 
   - name: fmt
-    image: dsc-ci-rust:10
+    image: dsc-ci-rust:11
     needs: [lint]
 
     steps:
@@ -113,7 +114,7 @@ jobs:
     timeout: 15m
 
   - name: clippy
-    image: dsc-ci-rust:10
+    image: dsc-ci-rust:11
     needs: [fmt]
     cache:
       # Compiled-artifact cache: the runner bind-mounts a host directory
@@ -138,7 +139,7 @@ jobs:
     timeout: 60m
 
   - name: test
-    image: dsc-ci-rust:10
+    image: dsc-ci-rust:11
     needs: [clippy]
     cache:
       # Compiled-artifact cache: the runner bind-mounts a host directory
@@ -172,7 +173,7 @@ jobs:
     timeout: 90m
 
   - name: coverage
-    image: dsc-ci-rust:10
+    image: dsc-ci-rust:11
     needs: [test]
     cache:
       # Compiled-artifact cache: the runner bind-mounts a host directory
@@ -233,7 +234,7 @@ jobs:
     timeout: 90m
 
   - name: fuzz
-    image: dsc-ci-rust:10
+    image: dsc-ci-rust:11
     needs: [coverage]
     skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" ]]'
     steps:
