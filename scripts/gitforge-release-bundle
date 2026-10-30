@@ -103,18 +103,24 @@ source_commit=$source_commit
 build_timestamp_utc=$build_timestamp
 toolchain=$toolchain
 EOF
-  sha256sum RELEASE_METADATA.txt bin/* scripts/* systemd/user/* | sort > MANIFEST.sha256
   cat > READY <<EOF
 release_id=$release_id
 source_commit=$source_commit
 manifest=MANIFEST.sha256
 EOF
+  # READY is written before the manifest so the completion marker itself is
+  # checksummed: a bundle whose READY was edited after the cut fails verify.
+  sha256sum READY RELEASE_METADATA.txt bin/* scripts/* systemd/user/* | sort > MANIFEST.sha256
 )
 
 # Atomic publish. -T fails when the target appeared meanwhile (a co-tenant
 # cutting the same release id won the race) instead of nesting the staging
 # tree inside the existing directory the way plain mv would.
 mv -T "$staging_dir" "$release_dir"
+
+# Verify the assembled bundle with the same verifier a consumer would run:
+# a cut that cannot pass its own contract must not be publishable.
+"$(dirname "$0")/gitforge-release-verify" "$release_dir"
 
 printf 'release bundle: assembled %s\n' "$release_dir"
 printf 'release bundle: files=%s\n' "$(wc -l < "$release_dir/MANIFEST.sha256")"

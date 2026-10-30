@@ -47,7 +47,7 @@ TOOLCHAIN = "test-rustc 1.0.0 (canary)"
 RELEASE_ID = "20260909-canary"
 
 MANIFEST_FILES = frozenset(
-    ("RELEASE_METADATA.txt",)
+    ("RELEASE_METADATA.txt", "READY")
     + tuple(f"bin/{name}" for name in REQUIRED_BINARIES)
     + ("scripts/gitforge-status",)
     + tuple(f"systemd/user/{name}" for name in UNIT_EXAMPLES)
@@ -208,6 +208,46 @@ class ReleaseBundleContractTests(unittest.TestCase):
         # not the metadata consistency check.
         self.assertNotIn("valid bundle=", result.stdout)
 
+    def test_tampered_ready_marker_fails_verification(self):
+        ready = self.release_dir / "READY"
+        ready.write_text(ready.read_text() + "tampered=yes\n")
+
+        result = self.verify()
+        self.assertNotEqual(result.returncode, 0, "verify accepted a tampered READY marker")
+        self.assertIn("FAILED", result.stdout + result.stderr)
+        self.assertNotIn("valid bundle=", result.stdout)
+
+    def test_manifest_missing_ready_entry_fails_verification(self):
+        manifest = self.release_dir / "MANIFEST.sha256"
+        manifest.write_text(
+            "".join(
+                line
+                for line in manifest.read_text().splitlines(keepends=True)
+                if not line.endswith("  READY\n")
+            )
+        )
+
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "checksum manifest must contain exactly one READY entry", result.stderr
+        )
+
+    def test_manifest_duplicate_ready_entry_fails_verification(self):
+        manifest = self.release_dir / "MANIFEST.sha256"
+        ready_entry = next(
+            line
+            for line in manifest.read_text().splitlines(keepends=True)
+            if line.endswith("  READY\n")
+        )
+        manifest.write_text(manifest.read_text() + ready_entry)
+
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "checksum manifest must contain exactly one READY entry", result.stderr
+        )
+
     # ─── 4. malformed or incomplete bundles fail closed ─────────────────────
 
     def test_missing_ready_marker_fails_closed(self):
@@ -255,8 +295,14 @@ class ReleaseBundleContractTests(unittest.TestCase):
         )
         result = self.verify()
         self.assertEqual(result.returncode, 1)
-        self.assertIn(
-            "metadata and READY source commits are missing or inconsistent", result.stderr
+        # READY is manifest-covered, so the tamper trips the checksum gate
+        # before the consistency gate; either diagnostic is a fail-closed
+        # catch of the same tamper.
+        combined = result.stdout + result.stderr
+        self.assertTrue(
+            "metadata and READY source commits are missing or inconsistent" in combined
+            or "computed checksum did NOT match" in combined,
+            combined,
         )
 
     def test_verify_rejects_missing_directory(self):

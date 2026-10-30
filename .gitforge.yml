@@ -265,3 +265,14 @@ jobs:
           cargo +nightly fuzz run git_http_parsers \
               -- -max_total_time=60 -rss_limit_mb=2560
     timeout: 60m
+
+  - name: release-contract
+    # The CI image already ships python3; reusing it avoids a second
+    # image pull per run.
+    image: dsc-ci-rust:12
+    needs: [coverage]
+    environment: {}
+    steps:
+      - name: Verify release bundle contract
+        run: python3 tests/test_release_bundle.py -v
+    timeout: 10m
