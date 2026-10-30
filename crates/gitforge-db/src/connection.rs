@@ -158,6 +158,16 @@ impl Pool {
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
+            // A starved waiter must fail fast, not hang its caller: with
+            // no acquire timeout, a scheduler refresh that cannot get a
+            // connection blocks its whole loop, jobs sit `queued` with no
+            // executor, and the wedge is silent until an operator restarts
+            // the unit (measured 2026-10-25: ~1 h of `pool timed out`
+            // warnings with zero job containers). 10 s bounds one wait to
+            // well under the callers' own retry periods, so a starved
+            // cycle degrades to visible errors that the retry paths
+            // absorb instead of a dead scheduler.
+            .acquire_timeout(Duration::from_secs(10))
             .before_acquire(|conn, _meta| heal_poisoned_connection(conn))
             .connect_with(options)
             .await

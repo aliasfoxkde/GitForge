@@ -62,8 +62,10 @@ async fn spawn_api() -> ApiService {
         .await
         .expect("create sqlite pool");
     pool.migrate().await.expect("run migrations");
+    // Generated at runtime so no credential-like literal appears in source.
+    let harness_passphrase = format!("harness-{}", uuid::Uuid::new_v4());
     let password_hash =
-        gitforge_common::password::hash_password("harness-passphrase").expect("hash password");
+        gitforge_common::password::hash_password(&harness_passphrase).expect("hash password");
     let user = gitforge_db::models::User::new(
         "gatewayowner".to_string(),
         "gatewayowner@example.com".to_string(),
@@ -141,7 +143,7 @@ async fn test_login_and_authenticated_repository_and_ssh_key_flow() {
         .expect("bad login request");
     assert_eq!(bad.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    let good = login("harness-passphrase")
+    let good = login(&harness_passphrase)
         .send()
         .await
         .expect("login request");

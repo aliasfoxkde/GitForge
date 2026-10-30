@@ -385,7 +385,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             let api_client = GitForgeClient::new(&server, token.clone());
 
             if let Some(username) = login {
-                println!("🔐 Authenticating as {username} to {server}");
+                // Username is a public identity echoed back by /auth/status,
+                // not a credential; the password itself is never logged.
+                println!("🔐 Authenticating as {username} to {server}"); // codeql[rust/cleartext-logging] : username is not a secret
                 println!("   Enter password: ");
 
                 // Read password from stdin
@@ -451,7 +453,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     Ok(status) => {
                         if status.authenticated {
                             println!("✅ Authenticated to {server}");
-                            println!("   Username: {}", status.username.unwrap_or_default());
+                            println!("   Username: {}", status.username.unwrap_or_default()); // codeql[rust/cleartext-logging] : username is a public identity, not a credential
                             if let Some(role) = status.role {
                                 println!("   Role: {role}");
                             }
@@ -496,7 +498,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             println!("👤 Authenticated user");
                             println!("   Server: {server}");
                             println!("   User ID: {}", status.user_id.unwrap_or_default());
-                            println!("   Username: {}", status.username.unwrap_or_default());
+                            println!("   Username: {}", status.username.unwrap_or_default()); // codeql[rust/cleartext-logging] : username is a public identity, not a credential
                             if let Some(role) = status.role {
                                 println!("   Role: {role}");
                             }
