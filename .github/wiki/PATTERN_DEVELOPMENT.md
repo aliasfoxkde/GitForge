@@ -1,31 +1,36 @@
-# Pattern Development
+# Aegis Pattern Development
 
-This project uses a pattern-based approach for detection and quality enforcement.
+[Aegis](https://github.com/aliasfoxkde) is the repository's security/quality
+pattern scanner. The committed baseline (`.github/aegis-baseline.json`) pins
+known findings so `make aegis` reports only *new* ones.
 
-## Pattern Format
+## Running
 
-Patterns are defined in YAML:
-
-```yaml
-name: pattern-name
-description: What this pattern detects
-category: security|quality|best-practice
-match:
-  type: regex|exact|contains
-  pattern: "the pattern to match"
-enabled: true
+```bash
+make aegis          # human findings vs the committed baseline
+make aegis-report   # full scan, no baseline
+make aegis-baseline # regenerate AFTER triaging findings
 ```
 
-## Adding a New Pattern
+Scan a `git archive HEAD` tree rather than the live checkout — the baseline is
+line-sensitive and the checkout may carry uncommitted drift.
 
-1. Create a YAML file in `community/patterns/`
-2. Add `name`, `match`, and `category`
-3. Run `go run ./bundler` to rebuild the bundle
-4. Add tests for true positives and false positives
-5. Update documentation
+```bash
+aegis --format json scan .
+```
 
-## Pattern Categories
+(`--format json`, not `-f json`.)
 
-- `security` — Security vulnerabilities
-- `quality` — Code quality issues
-- `best-practice` — Recommended patterns
+## Baseline Discipline
+
+- The baseline drifts: if `make aegis` fails on a clean checkout, regenerate it
+  after triage rather than suppressing findings ad hoc
+- Findings must be triaged before a baseline refresh — a silent refresh that
+  absorbs new defects defeats the gate
+- Changed-line scan: CI runs the aegis changed-line scan on every PR; new lines
+  must not introduce unbaselined findings
+
+## Adding Patterns
+
+Aegis patterns are defined in its own project, not this repo. To propose one,
+open an issue describing the defect class with true/false positive examples.

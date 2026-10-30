@@ -24,7 +24,8 @@ main (production)
 ## The Gate Is GitForge, Not GitHub
 
 The authoritative CI chain is this repo's self-hosted pipeline
-(`.gitforge.yml`: `fmt → clippy → test → coverage` on `dsc-ci-rust:7`,
+(`.gitforge.yml`:
+`fmt → clippy (+ rustdoc gate) → test → coverage` on `dsc-ci-rust:8`,
 linear chain, one shared workspace per run). A push to the GitForge
 remote triggers it automatically.
 

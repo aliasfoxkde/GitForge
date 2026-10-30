@@ -1,6 +1,6 @@
 //! Pipeline definition and parsing
 
-use gitforge_common::{PipelineId, RepoId};
+use gitforge_common::{JobCache, PipelineId, RepoId, VolumeSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -120,7 +120,12 @@ pub struct PipelineDefinition {
 impl PipelineDefinition {
     /// Parse pipeline definition from YAML
     pub fn parse(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+        reject_unknown_keys(&value).map_err(|message| {
+            use serde::de::Error as _;
+            serde_yaml::Error::custom(message)
+        })?;
+        serde_yaml::from_value(value)
     }
 
     /// Convert to YAML
@@ -141,6 +146,29 @@ pub struct JobDefinition {
     pub steps: Vec<StepDefinition>,
     pub timeout: Option<String>,
     pub retry: Option<u32>,
+    /// Skip this job entirely when the shell expression evaluates to false.
+    /// The expression is evaluated in a bash subshell with access to CI-change
+    /// variables written by the `detect-changes` job:
+    ///   CHANGES_INCLUDE_CODE      — non-doc Rust/source files changed
+    ///   CHANGES_INCLUDE_DOCS      — documentation files changed
+    ///   CHANGES_INCLUDE_CRATES     — specific gitforge-* crates changed
+    ///   CHANGES_INCLUDE_TESTS      — test files changed
+    ///   CHANGES_INCLUDE_INFRA      — infrastructure/docker/scripts changed
+    ///   CHANGES_FILE_COUNT        — total number of changed files
+    /// When absent the job always runs. When the expression is false the job
+    /// transitions to Skipped (terminal, counted as succeeded for deps).
+    #[serde(default)]
+    pub skip_if: Option<String>,
+    /// Host mounts this job needs (cache directories, tmpfs scratch).
+    /// Absent in older pipelines; an empty list is the safe default.
+    #[serde(default)]
+    pub volumes: Vec<VolumeSpec>,
+    /// Compiled-artifact cache mounted into the job's container. The DAG
+    /// builder expands it into a bind mount plus the environment variable
+    /// that points the toolchain at it, so every downstream hop carries
+    /// plain volumes and env.
+    #[serde(default)]
+    pub cache: Option<JobCache>,
 }
 
 impl JobDefinition {
@@ -175,6 +203,62 @@ lazy_static::lazy_static! {
     static ref EMPTY_ENV: HashMap<String, String> = HashMap::new();
 }
 
+const PIPELINE_KEYS: &[&str] = &["name", "version", "trigger_on", "environment", "jobs"];
+const JOB_KEYS: &[&str] = &[
+    "name", "image", "needs", "env", "steps", "timeout", "retry", "skip_if", "volumes", "cache",
+];
+
+/// Reject YAML keys the parser would otherwise silently drop. A stale binary
+/// (deployed before a field existed) degrades the committed pipeline — a
+/// dropped `cache:` cold-builds every job, a dropped `skip_if:` runs jobs
+/// that should have been skipped — so failing loudly is the safe behavior.
+/// The error names the offending key and points at deploy skew.
+fn reject_unknown_keys(value: &serde_yaml::Value) -> Result<(), String> {
+    fn check(
+        mapping: &serde_yaml::Mapping,
+        allowed: &[&str],
+        what: &str,
+        job_name: Option<&str>,
+    ) -> Result<(), String> {
+        for key in mapping.keys() {
+            if let serde_yaml::Value::String(k) = key {
+                if !allowed.contains(&k.as_str()) {
+                    let label = match job_name {
+                        Some(name) => format!("job '{name}'"),
+                        None => what.to_string(),
+                    };
+                    return Err(format!(
+                        "unknown {what} key '{k}' in {label}: the deployed binary predates \
+                         this pipeline field, or the key is misspelled — refusing to \
+                         silently ignore it"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    let Some(mapping) = value.as_mapping() else {
+        return Ok(());
+    };
+    check(mapping, PIPELINE_KEYS, "pipeline", None)?;
+    let Some(jobs) = mapping.get(serde_yaml::Value::from("jobs")) else {
+        return Ok(());
+    };
+    if let Some(jobs) = jobs.as_sequence() {
+        for (idx, job) in jobs.iter().enumerate() {
+            let Some(job) = job.as_mapping() else {
+                continue;
+            };
+            let name = job
+                .get(serde_yaml::Value::from("name"))
+                .and_then(|v| v.as_str())
+                .map_or_else(|| format!("#{idx}"), str::to_owned);
+            check(job, JOB_KEYS, "job", Some(&name))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +284,131 @@ jobs:
         assert_eq!(pipeline.name, "test-pipeline");
         assert_eq!(pipeline.jobs.len(), 1);
         assert_eq!(pipeline.jobs[0].name, "build");
+    }
+
+    #[test]
+    fn test_parse_rejects_unknown_job_key() {
+        // A binary from before `cache` existed must fail loudly, not
+        // silently run the degraded pipeline.
+        let yaml = r#"
+name: stale-binary
+version: "1.0"
+trigger_on: [push]
+jobs:
+  - name: clippy
+    image: dsc-ci-rust:10
+    steps:
+      - name: clippy
+        run: cargo clippy
+    caches:
+      source: "{cache_root}/cargo/{image}"
+"#;
+        let error = PipelineDefinition::parse(yaml).unwrap_err().to_string();
+        assert!(
+            error.contains("unknown"),
+            "error mentions unknown key: {error}"
+        );
+        assert!(error.contains("caches"), "error names the key: {error}");
+        assert!(error.contains("clippy"), "error names the job: {error}");
+    }
+
+    #[test]
+    fn test_parse_rejects_unknown_pipeline_key() {
+        let yaml = r#"
+name: typo
+version: "1.0"
+trigger_on: [push]
+enviroment: {}
+jobs: []
+"#;
+        let error = PipelineDefinition::parse(yaml).unwrap_err().to_string();
+        assert!(error.contains("enviroment"), "error names the key: {error}");
+    }
+
+    #[test]
+    fn test_parse_accepts_all_documented_keys() {
+        let yaml = r#"
+name: full
+version: "1.0"
+trigger_on: [push, pull_request]
+environment: {}
+jobs:
+  - name: job
+    image: img:1
+    needs: []
+    env: {}
+    steps:
+      - name: step
+        run: echo hi
+    timeout: 45m
+    retry: 1
+    skip_if: 'false'
+    volumes: []
+    cache:
+      source: "{cache_root}/x"
+"#;
+        let pipeline = PipelineDefinition::parse(yaml).unwrap();
+        assert_eq!(pipeline.jobs.len(), 1);
+        assert!(pipeline.jobs[0].cache.is_some());
+    }
+
+    #[test]
+    fn test_parse_job_with_cache_and_volumes() {
+        let yaml = r#"
+name: cached
+version: "1.0"
+trigger_on:
+  - push
+environment: {}
+jobs:
+  - name: test
+    image: dsc-ci-rust:10
+    cache:
+      source: "{cache_root}/cargo/{image}"
+      mount_path: /cargo-target
+    volumes:
+      - type: tmpfs
+        destination: /scratch
+        size: 4G
+    steps:
+      - name: run
+        run: cargo test
+"#;
+
+        let pipeline = PipelineDefinition::parse(yaml).unwrap();
+        let job = &pipeline.jobs[0];
+        let cache = job.cache.as_ref().expect("cache block");
+        assert_eq!(cache.source, "{cache_root}/cargo/{image}");
+        assert_eq!(cache.mount_path, "/cargo-target");
+        // The env var defaults to the one every cargo job wants.
+        assert_eq!(cache.env_var, "CARGO_TARGET_DIR");
+        assert_eq!(job.volumes.len(), 1);
+        assert_eq!(
+            job.volumes[0].resolved_type(),
+            gitforge_common::VolumeType::Tmpfs
+        );
+        assert_eq!(job.volumes[0].destination, "/scratch");
+    }
+
+    #[test]
+    fn test_parse_job_without_cache_has_no_volumes() {
+        let yaml = r#"
+name: plain
+version: "1.0"
+trigger_on:
+  - push
+environment: {}
+jobs:
+  - name: test
+    image: dsc-ci-rust:10
+    steps:
+      - name: run
+        run: cargo test
+"#;
+
+        let pipeline = PipelineDefinition::parse(yaml).unwrap();
+        assert!(pipeline.jobs[0].cache.is_none());
+        assert!(pipeline.jobs[0].volumes.is_empty());
     }
 
     #[test]
@@ -253,6 +462,9 @@ jobs:
             steps: vec![],
             timeout: None,
             retry: None,
+            skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         };
         assert!(job.has_dependencies());
 
@@ -264,6 +476,9 @@ jobs:
             steps: vec![],
             timeout: None,
             retry: None,
+            skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         };
         assert!(!job2.has_dependencies());
     }

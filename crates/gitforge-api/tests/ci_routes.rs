@@ -5,6 +5,14 @@
 //! durable job-submission contract: payload validation, idempotent replay,
 //! and the cancel lifecycle.
 
+// Test-harness exemption, same discipline as the sibling suites:
+// `allow-unwrap-in-tests` covers `#[test]` bodies, but boot/seed/fixture
+// helper functions in a test target are neither `#[test]` fns nor
+// `#[cfg(test)]`, a class the clippy.toml config cannot address. Setup
+// failing IS the assertion -- a panic aborts the run loudly. Production
+// code keeps the denies.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
@@ -23,6 +31,10 @@ use gitforge_db::{
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
+
+mod common;
+
+use common::serve_stub_ci;
 
 /// Seed users, a repository with one pipeline and one pending run, and the
 /// matching auth tokens for each role.
@@ -80,6 +92,7 @@ async fn seed() -> Fixture {
         trigger_type: "push".to_string(),
         config: json!({"name": "ci-routes-pipeline", "version": "1.0", "jobs": []}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     let pipeline_id = pipeline.id;
     PipelineQueries::create(&pool, &pipeline).await.unwrap();
@@ -667,6 +680,9 @@ fn entry_job_definition() -> Value {
             }],
             timeout: Some("30s".to_string()),
             retry: None,
+            skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         }],
     })
     .unwrap()
@@ -682,6 +698,7 @@ async fn webhook_replays_are_idempotent_and_map_to_one_durable_job() {
         trigger_type: "push".to_string(),
         config: entry_job_definition(),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(&f.pool, &pipeline).await.unwrap();
 
@@ -1019,7 +1036,7 @@ async fn pipeline_create_enforces_authorization_and_shape() {
 
 /// Seed a second repository whose storage is a real bare repository with
 /// one commit, plus an active pipeline for it. Returns (bare path, commit).
-async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, PipelineId, String) {
+async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, RepoId, PipelineId, String) {
     let bare = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         std::process::Command::new("git")
@@ -1087,10 +1104,11 @@ async fn seed_real_storage_repo(f: &Fixture) -> (tempfile::TempDir, PipelineId, 
         trigger_type: "manual".to_string(),
         config: json!({"name": "run-storage-pipeline", "version": "1.0", "jobs": []}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     let pipeline_id = pipeline.id;
     PipelineQueries::create(&f.pool, &pipeline).await.unwrap();
-    (bare, pipeline_id, commit)
+    (bare, repo_id, pipeline_id, commit)
 }
 
 #[tokio::test]
@@ -1125,7 +1143,7 @@ async fn pipeline_run_trigger_rejects_hostile_refs_before_any_git_call() {
 #[tokio::test]
 async fn pipeline_run_trigger_resolves_revisions_in_repository_storage() {
     let f = seed().await;
-    let (_bare, pipeline_id, commit) = seed_real_storage_repo(&f).await;
+    let (_bare, _repo_id, pipeline_id, commit) = seed_real_storage_repo(&f).await;
 
     // The fixture repository's storage path does not exist, so its runs
     // must report the storage problem instead of running git.
@@ -1203,6 +1221,128 @@ async fn pipeline_run_trigger_validates_pipeline_and_id() {
 }
 
 // ---------------------------------------------------------------------------
+// Pipeline run rerun (POST /api/pipeline-runs/{id}/rerun)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pipeline_run_rerun_validates_run_and_id() {
+    let f = seed().await;
+
+    // Malformed run id.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/pipeline-runs/not-a-uuid/rerun",
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_id");
+
+    // Unknown run id.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!(
+            "/api/pipeline-runs/{}/rerun",
+            gitforge_common::PipelineRunId::new()
+        ),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // Authorization applies before anything else runs.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipeline-runs/{}/rerun", f.run_id),
+        Some(&f.intruder_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn pipeline_run_rerun_reproduces_stored_commit() {
+    let f = seed().await;
+
+    // The fixture repository's storage does not exist: the rerun must
+    // report the storage problem instead of running git or minting a run
+    // doomed at clone time.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipeline-runs/{}/rerun", f.run_id),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "storage_unavailable");
+
+    let (_bare, repo_id, _pipeline_id, commit) = seed_real_storage_repo(&f).await;
+
+    // A stored commit that no longer resolves (rewritten history, pruned
+    // storage) is a request error, not a server fault or a doomed run.
+    let ghost = PipelineRun::new(
+        f.pipeline_id,
+        repo_id,
+        "webhook".to_string(),
+        "e".repeat(40),
+    );
+    PipelineRunQueries::create(&f.pool, &ghost).await.unwrap();
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipeline-runs/{}/rerun", ghost.id),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "unknown_revision");
+
+    // A stored hash failing the revision guard never reaches git.
+    let hostile = PipelineRun::new(
+        f.pipeline_id,
+        repo_id,
+        "webhook".to_string(),
+        "--upload-pack=/tmp/x".to_string(),
+    );
+    PipelineRunQueries::create(&f.pool, &hostile).await.unwrap();
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipeline-runs/{}/rerun", hostile.id),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_commit_hash");
+
+    // A resolvable stored commit walks the full pre-CI ladder; with CI
+    // unconfigured in the fixture it surfaces the missing orchestrator
+    // instead of pretending a run was created.
+    let real = PipelineRun::new(f.pipeline_id, repo_id, "webhook".to_string(), commit);
+    PipelineRunQueries::create(&f.pool, &real).await.unwrap();
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipeline-runs/{}/rerun", real.id),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "ci_unavailable");
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline deletion (DELETE /api/pipelines/{id})
 // ---------------------------------------------------------------------------
 
@@ -1273,4 +1413,295 @@ async fn pipeline_delete_deactivates_definitions_with_run_history() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+// ---------------------------------------------------------------------------
+// Run-trigger validation and delegation
+// ---------------------------------------------------------------------------
+
+/// Create a bare repository with one commit; returns the temp dir (which
+/// must outlive the assertions) and the resolved commit hash.
+fn seed_bare_repo() -> (tempfile::TempDir, String) {
+    use std::process::Command;
+
+    let git_env = [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "-c",
+        "commit.gpgsign=false",
+    ];
+    let run = |args: &[&str], cwd: &std::path::Path| {
+        let output = Command::new("git")
+            .args(git_env)
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git is available");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    let work = tempfile::tempdir().unwrap();
+    run(&["init", "-q"], work.path());
+    std::fs::write(work.path().join("README.md"), "run-trigger test\n").unwrap();
+    run(&["add", "."], work.path());
+    run(&["commit", "-q", "-m", "init"], work.path());
+
+    let bare = tempfile::tempdir().unwrap();
+    let bare_path = bare.path().join("repo.git");
+    run(
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            work.path().to_str().unwrap(),
+            bare_path.to_str().unwrap(),
+        ],
+        bare.path(),
+    );
+    let head = run(
+        &[
+            "--git-dir",
+            bare_path.to_str().unwrap(),
+            "rev-parse",
+            "HEAD",
+        ],
+        bare.path(),
+    );
+    let commit = String::from_utf8(head.stdout).unwrap().trim().to_string();
+    (bare, commit)
+}
+
+/// Register a repository (owned by the fixture owner) whose storage is
+/// the given path, plus one manual pipeline for it.
+async fn seed_repo_with_pipeline(
+    pool: &Pool,
+    owner_id: gitforge_common::UserId,
+    git_path: String,
+) -> (gitforge_common::RepoId, PipelineId) {
+    let repo = Repository::new("trigger-bare-repo".to_string(), owner_id, git_path);
+    let repo_id = repo.id;
+    RepoQueries::create(pool, &repo).await.unwrap();
+
+    let pipeline = Pipeline {
+        id: PipelineId::new(),
+        repo_id,
+        name: "trigger-bare-pipeline".to_string(),
+        trigger_type: "manual".to_string(),
+        config: json!({
+            "name": "trigger-bare-pipeline",
+            "version": "1.0",
+            "jobs": [{"name": "build", "steps": [{"run": "true"}]}]
+        }),
+        created_at: chrono::Utc::now(),
+        active: true,
+    };
+    let pipeline_id = pipeline.id;
+    PipelineQueries::create(pool, &pipeline).await.unwrap();
+    (repo_id, pipeline_id)
+}
+
+#[tokio::test]
+async fn run_trigger_validates_revision_and_storage_before_delegating() {
+    let f = seed().await;
+
+    // Option-smuggling revisions are rejected before any filesystem or
+    // orchestrator contact.
+    for bad in ["-oCore.dump", "HEAD extra", "main~0;reset"] {
+        let (status, body) = request_json(
+            f.app.clone(),
+            "POST",
+            &format!("/api/pipelines/{}/runs", f.pipeline_id),
+            Some(&f.owner_token),
+            Some(json!({"ref": bad})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        assert_eq!(body["error"], "invalid_ref");
+    }
+
+    // The fixture repository's storage path does not exist: the trigger
+    // refuses to resolve revisions against missing storage.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipelines/{}/runs", f.pipeline_id),
+        Some(&f.owner_token),
+        Some(json!({"ref": "HEAD"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "storage_unavailable");
+
+    // A real bare repository: an unresolvable revision is a client
+    // error reported before any orchestrator round-trip.
+    let (bare, commit) = seed_bare_repo();
+    let owner_id = RepoQueries::get(&f.pool, f.repo_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .owner_id;
+    let (_, pipeline_id) = seed_repo_with_pipeline(
+        &f.pool,
+        owner_id,
+        bare.path().join("repo.git").to_string_lossy().into_owned(),
+    )
+    .await;
+
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/pipelines/{pipeline_id}/runs"),
+        Some(&f.owner_token),
+        Some(json!({"ref": "no-such-ref"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "unknown_revision");
+
+    // No CI trigger client is configured in this fixture: a fully valid
+    // request reports the orchestrator as unavailable.
+    let (status, body) = request_json(
+        f.app,
+        "POST",
+        &format!("/api/pipelines/{pipeline_id}/runs"),
+        Some(&f.owner_token),
+        Some(json!({"ref": commit})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "ci_unavailable");
+}
+
+#[tokio::test]
+async fn pipeline_delete_rejects_malformed_and_unknown_ids() {
+    let f = seed().await;
+
+    let (status, body) = request_json(
+        f.app.clone(),
+        "DELETE",
+        "/api/pipelines/not-a-uuid",
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_id");
+
+    let (status, body) = request_json(
+        f.app,
+        "DELETE",
+        &format!("/api/pipelines/{}", uuid::Uuid::new_v4()),
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "not_found");
+}
+
+/// The pipeline-run trigger delegation ladder against the pinned
+/// orchestrator endpoint: a healthy answer relays its run id, the honest
+/// `queued` answer relays "no run yet", and an orchestrator failure
+/// surfaces as a bad gateway — with nothing persisted locally.
+#[tokio::test]
+async fn run_trigger_delegation_ladder_relays_the_orchestrator_answers() {
+    let f = seed().await;
+    let (bare, commit) = seed_bare_repo();
+    let owner_id = RepoQueries::get(&f.pool, f.repo_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .owner_id;
+    let (repo_id, pipeline_id) = seed_repo_with_pipeline(
+        &f.pool,
+        owner_id,
+        bare.path().join("repo.git").to_string_lossy().into_owned(),
+    )
+    .await;
+
+    let client =
+        CiTriggerClient::new("http://127.0.0.1:42781/pipelines/trigger", "stub-token").unwrap();
+    let app = ApiServer::new("test-secret", f.pool.clone())
+        .with_ci_trigger_client(Arc::new(client))
+        .into_router();
+
+    let Some(received) = serve_stub_ci(vec![
+        (200, json!({"pipeline_run_id": "orchestrated-run-1"})),
+        (200, json!({"queued": true, "pipeline_run_id": null})),
+        (500, json!({"error": "orchestrator exploded"})),
+    ])
+    .await
+    else {
+        eprintln!(
+            "skipping run_trigger_delegation_ladder: port 42781 is already owned on this host"
+        );
+        return;
+    };
+
+    // 1. A healthy answer with a run id is relayed verbatim.
+    let (status, body) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/api/pipelines/{pipeline_id}/runs"),
+        Some(&f.owner_token),
+        Some(json!({"ref": commit})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["pipeline_id"], pipeline_id.to_string());
+    assert_eq!(body["pipeline_run_id"], "orchestrated-run-1");
+
+    // 2. The honest queued answer relays a null run id.
+    let (status, body) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/api/pipelines/{pipeline_id}/runs"),
+        Some(&f.owner_token),
+        Some(json!({"ref": commit})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["pipeline_id"], pipeline_id.to_string());
+    assert!(body["pipeline_run_id"].is_null());
+
+    // 3. An orchestrator rejection is a bad gateway.
+    let (status, body) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/api/pipelines/{pipeline_id}/runs"),
+        Some(&f.owner_token),
+        Some(json!({"ref": commit})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], "ci_trigger_failed");
+
+    // Delegation is CI's custody: nothing is persisted locally beyond the
+    // run the fixture itself seeds (list() is an unfiltered SELECT, so the
+    // contract is "no run added by the three trigger calls", not emptiness).
+    let runs = PipelineRunQueries::list(&f.pool).await.unwrap();
+    assert_eq!(
+        runs.len(),
+        1,
+        "delegation must not persist local runs beyond the fixture seed"
+    );
+    assert_eq!(runs[0].id, f.run_id, "the only run is the fixture seed");
+
+    // The stub saw the production trigger contract: the configured
+    // token header, the repository, and the requested revision carried
+    // as both the ref name and the resolved commit.
+    let seen = received.lock().unwrap();
+    assert_eq!(seen.len(), 3, "every trigger hit the pinned endpoint");
+    assert_eq!(seen[0].token, "stub-token");
+    assert_eq!(seen[0].body["repo_id"], repo_id.to_string());
+    assert_eq!(seen[0].body["ref_name"], commit);
+    assert_eq!(seen[0].body["new_hash"], commit);
+    assert_eq!(seen[0].body["old_hash"], "0".repeat(40));
 }

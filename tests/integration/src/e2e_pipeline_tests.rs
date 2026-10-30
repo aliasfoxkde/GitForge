@@ -257,6 +257,7 @@ async fn test_ci_engine_pipeline_to_yaml() {
             }],
             timeout: Some("30m".to_string()),
             retry: Some(2),
+            skip_if: None,
         }],
     };
 
@@ -319,6 +320,7 @@ fn test_job_definition_has_dependencies() {
         steps: vec![],
         timeout: None,
         retry: None,
+        skip_if: None,
     };
     assert!(!job_no_deps.has_dependencies());
 
@@ -330,6 +332,7 @@ fn test_job_definition_has_dependencies() {
         steps: vec![],
         timeout: None,
         retry: None,
+        skip_if: None,
     };
     assert!(job_with_deps.has_dependencies());
 }
@@ -382,6 +385,7 @@ async fn test_end_to_end_pipeline_execution() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
             JobDefinition {
                 name: "test".to_string(),
@@ -397,6 +401,7 @@ async fn test_end_to_end_pipeline_execution() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
         ],
     };
@@ -462,6 +467,7 @@ async fn test_concurrent_jobs_in_pipeline() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
             JobDefinition {
                 name: "format".to_string(),
@@ -477,6 +483,7 @@ async fn test_concurrent_jobs_in_pipeline() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
             JobDefinition {
                 name: "build".to_string(),
@@ -492,6 +499,7 @@ async fn test_concurrent_jobs_in_pipeline() {
                 }],
                 timeout: None,
                 retry: None,
+                skip_if: None,
             },
         ],
     };

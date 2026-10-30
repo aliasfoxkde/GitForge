@@ -1,7 +1,7 @@
 //! Pipeline models
 
 use chrono::{DateTime, Utc};
-use gitforge_common::{PipelineId, PipelineRunId, RepoId};
+use gitforge_common::{JobCache, PipelineId, PipelineRunId, RepoId, VolumeSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -14,6 +14,9 @@ pub struct Pipeline {
     pub trigger_type: String,
     pub config: serde_json::Value,
     pub created_at: DateTime<Utc>,
+    /// Version-activation flag: exactly one version per (repo_id, name) is
+    /// active at a time; superseded versions stay as active = 0 history.
+    pub active: bool,
 }
 
 /// Trigger type
@@ -70,6 +73,10 @@ pub struct PipelineRun {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Durable cause for a non-success verdict, written by whichever layer
+    /// finalized the run. `None` for successes and for runs that predate
+    /// the column.
+    pub error: Option<String>,
 }
 
 impl PipelineRun {
@@ -90,6 +97,7 @@ impl PipelineRun {
             started_at: None,
             finished_at: None,
             created_at: Utc::now(),
+            error: None,
         }
     }
 
@@ -127,6 +135,13 @@ pub struct JobDefinition {
     pub steps: Vec<StepDefinition>,
     pub needs: Vec<String>,
     pub env: HashMap<String, String>,
+    /// Host mounts the job's container needs. Mirrors the CI pipeline
+    /// schema so a stored definition round-trips unchanged.
+    #[serde(default)]
+    pub volumes: Vec<VolumeSpec>,
+    /// Compiled-artifact cache requested by the job.
+    #[serde(default)]
+    pub cache: Option<JobCache>,
 }
 
 /// Step definition within a job
@@ -233,6 +248,8 @@ mod tests {
             steps: vec![],
             needs: vec![],
             env: HashMap::new(),
+            volumes: Vec::new(),
+            cache: None,
         };
         let json = serde_json::to_string(&job).unwrap();
         assert!(json.contains("build"));

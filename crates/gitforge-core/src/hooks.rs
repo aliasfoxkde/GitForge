@@ -44,30 +44,14 @@ impl HookPayload {
 
     /// Get the branch name from the ref
     pub fn branch_name(&self) -> Option<String> {
-        if self.ref_name.starts_with("refs/heads/") {
-            Some(
-                self.ref_name
-                    .strip_prefix("refs/heads/")
-                    .unwrap()
-                    .to_string(),
-            )
-        } else {
-            None
-        }
+        self.ref_name
+            .strip_prefix("refs/heads/")
+            .map(str::to_string)
     }
 
     /// Get the tag name from the ref
     pub fn tag_name(&self) -> Option<String> {
-        if self.ref_name.starts_with("refs/tags/") {
-            Some(
-                self.ref_name
-                    .strip_prefix("refs/tags/")
-                    .unwrap()
-                    .to_string(),
-            )
-        } else {
-            None
-        }
+        self.ref_name.strip_prefix("refs/tags/").map(str::to_string)
     }
 
     /// Check if this is a push to a branch

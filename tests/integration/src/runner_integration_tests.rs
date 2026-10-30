@@ -113,6 +113,8 @@ fn test_job_result_success() {
         completed_at: chrono::Utc::now(),
         error: None,
         workspace_path: None,
+        infrastructure_failure: false,
+        timed_out: false,
     };
     assert!(result.success);
     assert_eq!(result.exit_code, 0);
@@ -133,6 +135,8 @@ fn test_job_result_failure() {
         completed_at: chrono::Utc::now(),
         error: Some("build failed".to_string()),
         workspace_path: None,
+        infrastructure_failure: false,
+        timed_out: false,
     };
     assert!(!result.success);
     assert_eq!(result.exit_code, 1);

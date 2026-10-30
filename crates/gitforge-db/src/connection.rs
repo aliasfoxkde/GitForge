@@ -8,6 +8,114 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// How many poisoned-connection recovery passes `begin_immediate` attempts
+/// before giving up. Each pass takes a fresh connection, so the cap bounds
+/// the added latency without masking a genuinely dead database.
+const BEGIN_RECOVERY_PASSES: usize = 3;
+
+/// Begin a `BEGIN IMMEDIATE` transaction, recovering a poisoned connection.
+///
+/// sqlx tracks transaction depth per connection, but a write that loses a
+/// race against task cancellation or a write freeze can leave the SQLite
+/// handle inside a transaction while the depth counter says zero (the
+/// rollback paths that would resync the pair only run when the original
+/// command both succeeded and was acknowledged). The poisoned connection
+/// returns to the pool, and because the pool hands out the most recently
+/// used connection first, every subsequent `begin_with` fails with
+/// `(code: 1) cannot start a transaction within a transaction`. That is
+/// not a transient lock: `persist_with_retry` alone cannot clear it,
+/// because every retry is handed the same poisoned connection.
+///
+/// Recovery is a bare `ROLLBACK` on a fresh pooled connection — a no-op
+/// error on a healthy one — then the begin is retried. Observed live
+/// 2026-10-08: five `persist_with_retry` attempts at job completion all
+/// failed against the same poisoned connection while the runner's work had
+/// succeeded; the lease-dead fence then graded the run failed.
+pub(crate) async fn begin_immediate(
+    pool: &SqlitePool,
+    context: &str,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    match pool.begin_with("BEGIN IMMEDIATE").await {
+        Ok(tx) => Ok(tx),
+        Err(begin_error) => {
+            let mut last = begin_error;
+            for _ in 0..BEGIN_RECOVERY_PASSES {
+                let Ok(mut conn) = pool.acquire().await else {
+                    break;
+                };
+                // A bare ROLLBACK clears the desynced SQLite-side
+                // transaction. On a healthy connection it fails with
+                // "no transaction is active", which carries no signal.
+                let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+                // Return the healed connection BEFORE re-beginning:
+                // begin_with acquires its own connection, and holding this
+                // one across that wait deadlocks any pool already at its
+                // connection cap (a single-connection pool burns a full
+                // acquire timeout per recovery pass). The pool hands out
+                // the most recently used connection first, so the re-begin
+                // gets the connection just healed.
+                drop(conn);
+                match pool.begin_with("BEGIN IMMEDIATE").await {
+                    Ok(tx) => {
+                        tracing::warn!(
+                            context = %context,
+                            "recovered a desynced pooled connection with ROLLBACK"
+                        );
+                        return Ok(tx);
+                    }
+                    Err(error) => last = error,
+                }
+            }
+            Err(Error::database(format!(
+                "failed to begin {context}: {last}"
+            )))
+        }
+    }
+}
+
+/// Heal a pooled connection that still holds a SQLite-side transaction.
+///
+/// This is the `before_acquire` hook every GitForge pool installs. A
+/// connection whose SQLite handle is inside a transaction that sqlx's
+/// depth counter does not know about does not just fail the next
+/// `begin_with` — any *single-statement* write routed to it in
+/// autocommit silently joins the orphaned transaction and evaporates
+/// when that transaction is rolled back (observed live 2026-10-08: run
+/// `99c463db` logged `persisted planned job rows planned=4` yet zero
+/// rows existed afterwards). Healing at the idle->borrowed boundary
+/// closes the whole class for every caller, including plain queries
+/// that never open a transaction themselves.
+///
+/// A bare ROLLBACK is the probe and the cure in one statement: it
+/// succeeds exactly when an orphaned transaction existed (now cleared),
+/// fails with "no transaction is active" on a healthy connection, and
+/// any other failure retires the connection by reporting `false` (the
+/// pool closes it instead of handing it out).
+pub(crate) fn heal_poisoned_connection<'c>(
+    conn: &'c mut sqlx::SqliteConnection,
+) -> futures::future::BoxFuture<'c, sqlx::Result<bool>> {
+    Box::pin(async move {
+        match sqlx::raw_sql("ROLLBACK").execute(conn).await {
+            Ok(_) => {
+                tracing::warn!("healed an orphaned SQLite transaction on a pooled connection");
+                Ok(true)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no transaction is active") {
+                    Ok(true)
+                } else {
+                    tracing::warn!(
+                        %error,
+                        "retiring unusable pooled SQLite connection"
+                    );
+                    Ok(false)
+                }
+            }
+        }
+    })
+}
+
 /// SQLite connection pool wrapper
 #[derive(Clone)]
 pub struct Pool {
@@ -50,6 +158,17 @@ impl Pool {
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
+            // A starved waiter must fail fast, not hang its caller: with
+            // no acquire timeout, a scheduler refresh that cannot get a
+            // connection blocks its whole loop, jobs sit `queued` with no
+            // executor, and the wedge is silent until an operator restarts
+            // the unit (measured 2026-10-25: ~1 h of `pool timed out`
+            // warnings with zero job containers). 10 s bounds one wait to
+            // well under the callers' own retry periods, so a starved
+            // cycle degrades to visible errors that the retry paths
+            // absorb instead of a dead scheduler.
+            .acquire_timeout(Duration::from_secs(10))
+            .before_acquire(|conn, _meta| heal_poisoned_connection(conn))
             .connect_with(options)
             .await
             .map_err(|e| Error::database(format!("failed to connect to database: {e}")))?;
@@ -202,6 +321,7 @@ impl Pool {
                 started_at TEXT,
                 finished_at TEXT,
                 created_at TEXT NOT NULL,
+                error TEXT,
                 FOREIGN KEY (pipeline_id) REFERENCES pipelines(id),
                 FOREIGN KEY (repo_id) REFERENCES repositories(id)
             )
@@ -210,6 +330,121 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline_runs table: {e}")))?;
+
+        // Durable cause for a non-success run verdict. A planning-stage
+        // failure (workspace prep, job planning) produces a run with zero
+        // job rows, and a job-backed failure leaves the reason only in the
+        // process log, which is unreadable after the fact. SQLite has no
+        // portable IF NOT EXISTS form for ADD COLUMN, so tolerate only the
+        // known duplicate-column case.
+        for statement in ["ALTER TABLE pipeline_runs ADD COLUMN error TEXT"] {
+            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
+                if !error.to_string().contains("duplicate column name") {
+                    return Err(Error::database(format!(
+                        "failed to migrate pipeline_runs table: {error}"
+                    )));
+                }
+            }
+        }
+
+        // Create pipeline_trigger_requests table: the durable hand-off
+        // between the CI trigger endpoint and the event consumer. The
+        // endpoint inserts here before publishing to the in-memory bus, so
+        // a restart or a dropped bus event can no longer lose a trigger
+        // after the git-server has already marked the webhook delivered.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pipeline_trigger_requests (
+                id TEXT PRIMARY KEY,
+                repo_id TEXT NOT NULL,
+                ref_name TEXT NOT NULL,
+                old_hash TEXT NOT NULL,
+                new_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                run_id TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (repo_id) REFERENCES repositories(id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!(
+                "failed to create pipeline_trigger_requests table: {e}"
+            ))
+        })?;
+
+        // At most one in-flight trigger per (repository, commit): the API
+        // and the webhook both fire on the same push, and the correlation
+        // window can answer `queued` to one of them while the other is still
+        // cloning — without this index every retry minted another duplicate
+        // run for the same commit. Completed and failed rows are excluded so
+        // an explicit re-trigger (manual re-run of an old commit) stays
+        // possible.
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_trigger_requests_active
+            ON pipeline_trigger_requests(repo_id, new_hash)
+            WHERE status IN ('pending', 'processing')
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create trigger request index: {e}")))?;
+
+        // The trigger-request sweep claims stale rows by status and age.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_trigger_requests_status
+            ON pipeline_trigger_requests(status, updated_at)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!(
+                "failed to create trigger request status index: {e}"
+            ))
+        })?;
+
+        // Refresh tokens: long-lived, revocable session credentials. Only
+        // the SHA-256 digest is stored (unsalted: the token is 244-bit
+        // random, so a leak cannot be reversed and equality lookup needs a
+        // deterministic digest) — a database leak must not yield usable
+        // credentials. Old databases gain
+        // the table on first boot after upgrade; tokens issued before the
+        // upgrade simply don't exist, which is the correct state.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create refresh_tokens table: {e}")))?;
+
+        // The login/refresh paths look tokens up by exact hash.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash
+            ON refresh_tokens(token_hash)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create refresh token index: {e}")))?;
 
         // Create runners table
         sqlx::query(
@@ -255,11 +490,7 @@ impl Pool {
         .await
         .map_err(|e| Error::database(format!("failed to check duplicate runner names: {e}")))?;
         if duplicate_names > 0 {
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(|e| Error::database(format!("failed to begin runner rename: {e}")))?;
+            let mut tx = begin_immediate(&self.pool, "runner rename").await?;
             sqlx::query(
                 r#"
                 UPDATE runners SET name = name || '-legacy-' || id
@@ -542,6 +773,36 @@ impl Pool {
             .await
             .map_err(|e| Error::database(format!("failed to create idx_jobs_status: {e}")))?;
 
+        // The 60 s timeout watchdog scans exactly this shape every pass
+        // (`WHERE status = 'running' AND started_at IS NOT NULL`), and under
+        // load each unindexed pass added minutes of drift to timeout
+        // enforcement on top of the interval itself. The partial index keeps
+        // the scan proportional to the number of live jobs, not the table.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_running_started ON jobs(started_at) WHERE status = 'running'",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!("failed to create idx_jobs_running_started: {e}"))
+        })?;
+
+        // Same story for the evidence-strand sweep (F31 residual): it selects
+        // non-terminal rows carrying terminal evidence on every watchdog pass.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_jobs_stranded_evidence
+            ON jobs(finished_at)
+            WHERE finished_at IS NOT NULL
+              AND status IN ('pending', 'queued', 'assigned', 'running')
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!("failed to create idx_jobs_stranded_evidence: {e}"))
+        })?;
+
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_pipeline_run_id ON jobs(pipeline_run_id)")
             .execute(&self.pool)
             .await
@@ -560,6 +821,80 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create idx_repositories_owner_id: {e}")))?;
+
+        // The queue dispatcher polls `WHERE status = 'queued' ORDER BY
+        // created_at ASC` on every dispatch cycle. With only the
+        // single-column status index, SQLite had to sort the whole queued
+        // set on every pass; under the 2026-10-21 backlog (3643 queued
+        // rows) that scan took 16-114 s per pass and starved the runner's
+        // 30 s client timeout. The composite index makes the poll an
+        // index-only range scan that is already in the required order.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create idx_jobs_status_created: {e}")))?;
+
+        // The reconciliation sweep and the engine rebuild read the
+        // non-terminal runs on every pass. Listing them through the
+        // full table and skipping the terminal ones in Rust meant a
+        // full scan of every run ever recorded on a loop that runs
+        // continuously. The partial index holds exactly the rows those
+        // sweeps can act on, already ordered oldest first.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pipeline_runs_nonterminal \
+             ON pipeline_runs(created_at ASC) \
+             WHERE status NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'timeout', 'timed-out')",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create idx_pipeline_runs_nonterminal: {e}")))?;
+
+        // The git server's outbox poll filters on event_type and orders by
+        // created_at; without an index on event_type it read every payload
+        // in the table on every 2 s pass (measured 190 s per pass).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(event_type, created_at)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create idx_events_type_created: {e}")))?;
+
+        // The delivery poll only ever looks at the two CI trigger event
+        // types; a partial index keeps that sweep proportional to the
+        // outbox rather than to the event history.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_events_delivery
+            ON events(created_at)
+            WHERE event_type IN ('ci.trigger.pending', 'ci.trigger.delivering')
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create idx_events_delivery: {e}")))?;
+
+        // The API's pipeline-run listing orders by created_at DESC over
+        // every run (measured 93-549 s for 7659 rows).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pipeline_runs_created ON pipeline_runs(created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::database(format!("failed to create idx_pipeline_runs_created: {e}")))?;
+
+        // The per-repository listing filters on repo_id and orders by
+        // created_at DESC; without it every repository-scoped read scanned
+        // the whole run table.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pipeline_runs_repo_created ON pipeline_runs(repo_id, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!("failed to create idx_pipeline_runs_repo_created: {e}"))
+        })?;
 
         tracing::info!("database migrations completed successfully");
         Ok(())

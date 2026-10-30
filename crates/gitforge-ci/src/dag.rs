@@ -148,6 +148,19 @@ impl DagBuilder {
                     .or_insert_with(|| value.clone());
             }
 
+            // A job's `cache:` block is expanded HERE — into a bind mount
+            // plus the environment variable that points the toolchain at
+            // it — so the execution plan, the scheduler payload, the
+            // runner exec and the sandbox mount all speak the same two
+            // channels (volumes and env) and none of them has to know
+            // what a cache is.
+            if let Some(cache) = &job.cache {
+                definition
+                    .env
+                    .insert(cache.env_var.clone(), cache.mount_path.clone());
+                definition.volumes.push(cache.to_volume());
+            }
+
             nodes.push(JobNode {
                 id: job_id,
                 name: job.name.clone(),
@@ -249,7 +262,37 @@ mod tests {
             }],
             timeout: None,
             retry: None,
+            skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         }
+    }
+
+    #[test]
+    fn test_cache_block_expands_into_mount_and_env() {
+        let mut job = make_job("test", vec![]);
+        job.cache = Some(gitforge_common::JobCache::default());
+
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![job],
+        };
+
+        let graph = DagBuilder::build(&pipeline, PipelineRunId::new()).unwrap();
+        let definition = &graph.nodes[0].definition;
+        assert_eq!(
+            definition.env.get("CARGO_TARGET_DIR"),
+            Some(&"/cargo-target".to_string())
+        );
+        assert_eq!(definition.volumes.len(), 1);
+        assert_eq!(definition.volumes[0].destination, "/cargo-target");
+        assert_eq!(
+            definition.volumes[0].resolved_type(),
+            gitforge_common::VolumeType::Bind
+        );
     }
 
     #[test]

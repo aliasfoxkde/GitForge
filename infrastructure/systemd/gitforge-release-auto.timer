@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the GitForge release auto-update pass every 6 hours
+
+[Timer]
+# Off-schedule minute avoids the top-of-hour thundering herd.
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

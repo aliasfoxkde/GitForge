@@ -1,0 +1,278 @@
+# GitForge local CI pipeline (self-hosted GitForge at /nas/Temp/repos/GitForge).
+#
+# The project's own gates, run by the project itself: a shellcheck pass over
+# the release-channel ops scripts, rustfmt --check plus the route-docs drift
+# gate, the strict clippy pass, the workspace test suite, the line-coverage
+# gate, and a bounded fuzz smoke over the untrusted-input parsers. Pushes to
+# any branch run the full chain, so a PR branch is validated here before it
+# merges.
+#
+# CHANGE-DETECTION PRUNING: the detect-changes job enumerates files changed
+# vs the merge-base with origin/main and classifies them. Downstream jobs
+# use skip_if to skip themselves when their class of file hasn't changed:
+#   - clippy: skips when no Rust source or crates/ changed
+#   - test: skips when no source, crates/, or tests changed
+#   - coverage: skips when no source, crates/, or tests changed
+#   - fuzz: skips when no source or crates/ changed
+# A doc-only push (e.g. updating a README) runs detect-changes → lint → fmt
+# and stops. A infra-only push (e.g. Dockerfile tweak) runs the same three
+# jobs and stops.
+#
+# Documented constraints (same list proven in gods-eye-view's and dsc's
+# .gitforce.yml):
+# - The job graph is a LINEAR CHAIN (detect-changes → lint → fmt → clippy →
+#   test → coverage → fuzz), not a fan-out,
+#   because all jobs of one run share the SAME workspace directory on this
+#   runner. Concurrent jobs would run cargo against the same target/
+#   directory and corrupt each other's build locks.
+# - `environment: {}` is required by the parser (PipelineDefinition has no
+#   serde default) even though it is never forwarded.
+# - The image is pre-built on the host (dsc-ci-rust:12 — cargo, clippy,
+#   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, python3
+#   for the route-docs drift gate, and the GitForge workspace cargo
+#   registry cache baked in for offline builds).
+#   Rebuild and bump the tag whenever Cargo.lock changes or the baked
+#   tooling changes — a stale cache fails every cargo job in seconds with
+#   "candidate versions found which didn't match" (v11 baked the
+#   cargo-audit dependency-bump lockfile; v10 added shellcheck
+#   for the new head-of-chain lint job; v9 added python3 for
+#   the drift checker; v8 documents the
+#   current tag; v7 added the coverage toolchain; v6 existed because v5
+#   dropped openssh-client, which the hermetic ssh-protocol tests spawn
+#   via ssh-keygen; v5 itself existed because the audited-deps bump
+#   moved jsonwebtoken to 11.1.0 ahead of v4's cache). The recipe lives at
+#   infrastructure/docker/ci-rust.Dockerfile. The image must exist on the
+#   host before the first run: the runner's hard 60-second
+#   sandbox-acquisition cap rules out building or pulling at run time.
+#   (The daemon moved from the vfs storage driver to overlay2 on
+#   2026-09-24 — container jobs got ~10x faster — but the pre-build rule
+#   stands.)
+# - CARGO CACHE: the clippy, test and coverage jobs declare a `cache:`
+#   block. The runner bind-mounts a host directory at /cargo-target inside
+#   the container and exports CARGO_TARGET_DIR pointing at it. The mount
+#   path inside the container is FIXED, so cargo can reuse the dependency
+#   artifacts an earlier run compiled instead of rebuilding the world
+#   every time; the host directory is keyed by image tag ({image}), so a
+#   rebuilt image starts from an empty cache rather than inheriting
+#   artifacts compiled by a different toolchain. The host location comes
+#   from the runner's GITFORGE_CACHE_ROOT. A cache mount that cannot be
+#   prepared degrades to a cold build with a warning — it is an
+#   optimisation, never a correctness requirement.
+name: gitforge-ci
+version: "1.0"
+trigger_on:
+  - push
+environment: {}
+jobs:
+  - name: detect-changes
+    image: dsc-ci-rust:12
+    steps:
+      - name: Enumerate changed files and classify
+        # Populates CI_CHANGE_* vars used by downstream skip_if conditions.
+        # Always runs — it is the source of pipeline_env for the whole DAG.
+        run: bash scripts/detect-changes.sh
+    timeout: 5m
+
+  - name: lint
+    image: dsc-ci-rust:12
+    needs: [detect-changes]
+    steps:
+      - name: Shellcheck (including extensionless ops scripts)
+        # The release-channel ops scripts (scripts/gitforge-*) are bash and
+        # ship in every release bundle; a bug in them breaks the update
+        # channel itself (2026-10-10: a hardcoded unit list made every
+        # promote roll back forever). Parse-only, no cargo, no network —
+        # so it heads the chain and fails fast before the expensive jobs.
+        # The aegis pattern scan stays host-side (make lint / make aegis):
+        # the binary is a locally-built tool, not distro-packaged, and is
+        # not baked into this image.
+        run: shellcheck scripts/*.sh scripts/gitforge-* scripts/qualityctl scripts/verify-user-systemd-policy systemd/*.sh
+      - name: Change-detection selftest (skip_if classification)
+        # detect-changes.sh is a single point of decision for the whole
+        # quality chain: a misclassification silently skips (or pointlessly
+        # runs) every gated job. These synthetic-repo cases pin the
+        # contract, including the main-push tip-diff fallback.
+        run: bash tests/detect-changes-selftest.sh
+    timeout: 10m
+
+  - name: fmt
+    image: dsc-ci-rust:12
+    needs: [lint]
+
+    steps:
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Route-vs-docs drift gate
+        # Parse-only cross-check (no cargo, no network, <1s): every axum
+        # route under crates/gitforge-api must have an OpenAPI path entry
+        # and a docs/API.md endpoint, and neither doc surface may carry an
+        # entry with no backing route. Hand-maintained docs drift; this is
+        # the gate that catches it at push time instead of at review time.
+        # Exits 1 on drift; --report (always exit 0) exists for baseline
+        # sweeps, not for this gate.
+        run: python3 scripts/check-route-docs.py
+    timeout: 15m
+
+  - name: clippy
+    image: dsc-ci-rust:12
+    needs: [fmt]
+    cache:
+      # Compiled-artifact cache: the runner bind-mounts a host directory
+      # (keyed by the image tag) at /cargo-target and exports
+      # CARGO_TARGET_DIR pointing at it.
+      source: "{cache_root}/cargo/{image}"
+      mount_path: /cargo-target
+    skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" ]]'
+    steps:
+      - name: Strict lint (zero warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rustdoc gate (zero warnings, no broken links)
+        # Rides the clippy job instead of taking its own position in the
+        # chain: every job here pays a cold-cache dependency compile (no
+        # cache mount), while this step runs in the container whose
+        # target/ clippy just populated, so rustdoc reuses the dependency
+        # metadata instead of rebuilding it. RUSTDOCFLAGS="-D warnings"
+        # makes broken_intra_doc_links and every other rustdoc lint
+        # fatal; --no-deps scopes the gate to this workspace's docs
+        # rather than several hundred dependency crates.
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+    timeout: 60m
+
+  - name: test
+    image: dsc-ci-rust:12
+    needs: [clippy]
+    cache:
+      # Compiled-artifact cache: the runner bind-mounts a host directory
+      # (keyed by the image tag) at /cargo-target and exports
+      # CARGO_TARGET_DIR pointing at it.
+      source: "{cache_root}/cargo/{image}"
+      mount_path: /cargo-target
+    skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" || "$CI_CHANGE_INCLUDE_TESTS" == "1" ]]'
+    steps:
+      - name: Workspace test suite
+        # Bounded test parallelism. Under the daemon's old vfs storage
+        # driver, in-container fork/exec of the real `git` children spawned
+        # by the gitforge-core http tests was slow enough that at default
+        # parallelism (= host core count) the parent's request write raced
+        # the child's readiness and failed with EPIPE (3 of 4 runs lost
+        # that race while the same suite passed on the host). The daemon
+        # has since moved to overlay2 and jobs run ~10x faster, but the
+        # two-thread bound stays: it keeps the suite well inside the
+        # timeout and the gate deterministic without re-litigating default
+        # parallelism on every image refresh.
+        #
+        # The budget matches the coverage job's 90m (run b18b863f): with
+        # sibling CI runs saturating the host the cold-cache compile of
+        # the workspace test binaries alone can eat the hour the old 60m
+        # budget granted, and the job died to the watchdog mid-compile —
+        # an infrastructure kill, not a test verdict. 90m measured: the
+        # 2026-10-06 22:28 run finished test in ~36m under load ~40; the
+        # 23:29 run needed more than 60m under load ~45 with three
+        # concurrent runs.
+        run: cargo test --workspace -- --test-threads=2
+    timeout: 90m
+
+  - name: coverage
+    image: dsc-ci-rust:12
+    needs: [test]
+    cache:
+      # Compiled-artifact cache: the runner bind-mounts a host directory
+      # (keyed by the image tag) at /cargo-target and exports
+      # CARGO_TARGET_DIR pointing at it.
+      source: "{cache_root}/cargo/{image}"
+      mount_path: /cargo-target
+    skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" || "$CI_CHANGE_INCLUDE_TESTS" == "1" ]]'
+    steps:
+      - name: Line coverage gate (fail 82, warn 84)
+        # Thresholds are calibrated AGAINST THE SANDBOX the job runs in:
+        # two identical in-sandbox sweeps of the campaign branch measured
+        # 82.80% (bridge network) and 82.82% (--network none) — stable to
+        # within noise. The original 87% came from a HOST sweep and was a
+        # calibration mistake: on the host, ambient services (a live
+        # GitForge API on localhost, the docker socket, host git config)
+        # let integration tests exercise real paths and inflate the
+        # number by ~4.8pp. A gate must be measured where it runs.
+        # Hard gate 82 (0.8pp below the measured floor), advisory target
+        # 84 to grow into. llvm-cov re-runs the test suite instrumented,
+        # so it inherits the bounded test parallelism the test job
+        # documents. Steps run under sh (dash): no pipefail, and a `tee`
+        # pipeline would hide the gate's exit code, so the run is
+        # captured through an if-redirect and printed afterwards.
+        #
+        # The runner caps the captured step log at 64 KB (the OLDEST
+        # bytes are dropped and a truncation marker is prepended — F30),
+        # and llvm-cov's compile+test chatter alone exceeds that. This
+        # step never relies on the cap: all llvm-cov output is
+        # redirected into a temp file inside the container, so the
+        # captured step output is only the few verdict lines echoed
+        # here, and they always survive intact.
+        run: |
+          summary=$(mktemp)
+          if cargo llvm-cov --workspace --all-targets --summary-only \
+               --fail-under-lines 82 -- --test-threads=2 >"$summary" 2>&1
+          then gate=ok
+          else gate=fail
+          fi
+          pct=$(awk '$1=="TOTAL" {gsub(/%/,"",$10); print $10; exit}' "$summary")
+          if [ -n "$pct" ]; then
+            echo "line coverage: ${pct}%"
+          else
+            echo "FAIL: coverage summary unparsable (no TOTAL row); capture tail follows"
+            tail -40 "$summary"
+            exit 1
+          fi
+          if [ "$gate" = fail ]; then
+            echo "FAIL: line coverage ${pct}% is below the 82% hard gate; capture tail follows"
+            tail -40 "$summary"
+            exit 1
+          fi
+          if awk "BEGIN{exit !($pct < 84.0)}"; then
+            echo "WARN: line coverage ${pct}% is below the 84% advisory target"
+          else
+            echo "line coverage ${pct}% meets the 84% target"
+          fi
+    timeout: 90m
+
+  - name: fuzz
+    image: dsc-ci-rust:12
+    needs: [coverage]
+    skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" ]]'
+    steps:
+      - name: Fuzz smoke (60s per target)
+        # Bounded libFuzzer smoke over the two untrusted-input surfaces:
+        # the .gitforge.yml pipeline parser (bytes controlled by anyone
+        # who can push to any repo) and the smart-HTTP path/header
+        # parsers (raw client strings ahead of auth). A crash here is a
+        # found vulnerability, not an infra failure: fix or bound it
+        # before the branch merges. 60s per target is a smoke, not a
+        # campaign — sustained fuzzing runs locally/off-schedule.
+        #
+        # Cold-cache note: the first fuzz job of a run compiles std from
+        # source (cargo-fuzz builds with -Zbuild-std by default) plus
+        # libfuzzer-sys plus the workspace deps for the nightly target —
+        # the 60m budget absorbs that, same rationale as the test job's.
+        # set -e is explicit: dash without it would run the second target
+        # even if the first crashed.
+        #
+        # Nightly is selected with the +channel syntax: cargo-fuzz 0.13
+        # (dsc-ci-rust:10) dropped `run --toolchain`, and the image's
+        # default toolchain is stable, which cannot build -Zbuild-std.
+        run: |
+          set -e
+          cd fuzz
+          cargo +nightly fuzz run pipeline_parse \
+              -- -max_total_time=60 -rss_limit_mb=2560
+          cargo +nightly fuzz run git_http_parsers \
+              -- -max_total_time=60 -rss_limit_mb=2560
+    timeout: 60m
+
+  - name: release-contract
+    # The CI image already ships python3; reusing it avoids a second
+    # image pull per run.
+    image: dsc-ci-rust:12
+    needs: [coverage]
+    environment: {}
+    steps:
+      - name: Verify release bundle contract
+        run: python3 tests/test_release_bundle.py -v
+    timeout: 10m

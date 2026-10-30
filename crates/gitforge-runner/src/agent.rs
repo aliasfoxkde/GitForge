@@ -1,7 +1,7 @@
 //! Runner agent
 
 use crate::executor::{ExecutableJob, JobExecutor, JobStep};
-use gitforge_common::{Error, JobId, PipelineRunId, Result, RunnerId};
+use gitforge_common::{Error, JobId, PipelineRunId, Result, RunnerId, VolumeSpec};
 use gitforge_db::models::Runner;
 use gitforge_sandbox::{
     ActiveJobRegistry, DockerContainerSource, DockerSandbox, OutputSink, OutputStream,
@@ -48,7 +48,8 @@ pub struct RunnerConfig {
     /// scheduler's listener is up.
     pub register_attempts: u32,
     /// Initial delay in seconds between registration attempts. Doubles after
-    /// every failed attempt up to [`REGISTER_BACKOFF_CAP_SECS`].
+    /// every failed attempt up to the `REGISTER_BACKOFF_CAP_SECS` bound
+    /// (30 s; the constant stays private to the backoff math).
     pub register_backoff_secs: u64,
     /// Whether registration failure may fall back to standalone execution.
     /// Defaults to `false`: a runner that cannot register exits instead of
@@ -788,6 +789,10 @@ pub struct JobAssignment {
     /// empty so assignments from a pre-env scheduler still decode.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Host mounts the job's container needs. Defaults to empty so
+    /// assignments from a pre-mount scheduler still decode.
+    #[serde(default)]
+    pub volumes: Vec<VolumeSpec>,
 }
 
 fn default_job_timeout_secs() -> u64 {
@@ -978,7 +983,7 @@ impl RunnerAgent {
         let scheduler_lost = self.scheduler_lost.clone();
         let heartbeat_handle = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(heartbeat_interval));
-            let mut consecutive_failures = 0_u32;
+            let mut guard = HeartbeatGuard::default();
             loop {
                 ticker.tick().await;
                 if !*is_running.read().await {
@@ -991,25 +996,39 @@ impl RunnerAgent {
                 if let Some(token) = &heartbeat_token {
                     heartbeat_request = heartbeat_request.bearer_auth(token);
                 }
-                let delivered = heartbeat_request
-                    .send()
-                    .await
-                    .is_ok_and(|response| response.status().is_success());
-                if delivered {
-                    consecutive_failures = 0;
-                    continue;
+                let outcome = match heartbeat_request.send().await {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status.is_success() {
+                            HeartbeatOutcome::Delivered
+                        } else if matches!(status.as_u16(), 401 | 403 | 404) {
+                            HeartbeatOutcome::IdentityRejected(status.as_u16())
+                        } else {
+                            HeartbeatOutcome::Unreachable(Some(status.as_u16()))
+                        }
+                    }
+                    Err(_) => HeartbeatOutcome::Unreachable(None),
+                };
+                let failed = !matches!(outcome, HeartbeatOutcome::Delivered);
+                match guard.observe(outcome) {
+                    HeartbeatAction::Continue => {
+                        if failed {
+                            tracing::trace!(
+                                "heartbeat failed; runner stays up ({})",
+                                guard.describe()
+                            );
+                        }
+                    }
+                    HeartbeatAction::StopForReRegistration => {
+                        tracing::error!(
+                            rejections = guard.identity_rejections,
+                            "scheduler rejected runner identity; stopping for re-registration"
+                        );
+                        scheduler_lost.store(true, Ordering::SeqCst);
+                        *is_running.write().await = false;
+                        break;
+                    }
                 }
-                consecutive_failures += 1;
-                if consecutive_failures >= 10 {
-                    tracing::error!(
-                        "lost contact with scheduler after {} consecutive failed heartbeats; stopping for re-registration",
-                        consecutive_failures
-                    );
-                    scheduler_lost.store(true, Ordering::SeqCst);
-                    *is_running.write().await = false;
-                    break;
-                }
-                tracing::trace!("heartbeat failed ({}/10 consecutive)", consecutive_failures);
             }
         });
         self.control_task_abort_handles
@@ -1346,6 +1365,7 @@ impl RunnerAgent {
                 })
                 .collect(),
             env: assignment.env.clone(),
+            volumes: assignment.volumes.clone(),
             working_dir: assignment.working_dir.clone(),
             timeout_secs: assignment.timeout_secs.clamp(5, 24 * 60 * 60),
         };
@@ -1531,10 +1551,15 @@ impl RunnerAgent {
         });
         // The backend, not the commit, failed this job: say so explicitly
         // so the durable row lands as infrastructure_failure (R6.3), not as
-        // a code failure. Omitted for ordinary outcomes; the scheduler's
-        // default mapping keeps the wire contract backward compatible.
+        // a code failure. The scheduler already accepts `timed_out`; the
+        // runner used to grade its own deadline kill as `failed`, which the
+        // durable watchdog then could not distinguish from a real red X.
+        // Omitted for ordinary outcomes; the scheduler's default mapping
+        // keeps the wire contract backward compatible.
         if result.infrastructure_failure {
             complete_request["outcome"] = serde_json::json!("infrastructure_failure");
+        } else if result.timed_out {
+            complete_request["outcome"] = serde_json::json!("timed_out");
         }
 
         let mut complete_request_builder = client.post(&complete_url).json(&complete_request);
@@ -1888,7 +1913,11 @@ fn validate_reconciler_receipt_path(raw: &str) -> std::result::Result<PathBuf, S
     Ok(path)
 }
 
-const MAX_RECEIPT_STREAM_BYTES: usize = 64 * 1024;
+// 64KB cut off mid-line during a cargo build and hid the actual error text
+// (2026-10-11: three afternoon flakes were undiagnosable because the failing
+// message sat beyond the cap - EPERM/E0463 clues lived at line >64KB). 512KB
+// still bounds receipt size while keeping full compile-error context.
+const MAX_RECEIPT_STREAM_BYTES: usize = 512 * 1024;
 
 fn bounded_receipt_text(value: &str) -> String {
     if value.len() <= MAX_RECEIPT_STREAM_BYTES {
@@ -2276,6 +2305,112 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// How a single runner-heartbeat attempt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatOutcome {
+    /// The scheduler acknowledged the runner.
+    Delivered,
+    /// The scheduler answered and rejected this runner's identity
+    /// (401/403/404): the registration row is gone or the token was
+    /// revoked. Only re-registration fixes this; retrying cannot.
+    IdentityRejected(u16),
+    /// The scheduler could not be reached (transport error) or answered
+    /// with a transient failure (5xx, 429). The outage may end on any
+    /// later tick, so the runner must survive it.
+    Unreachable(Option<u16>),
+}
+
+/// What the heartbeat loop should do after an attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatAction {
+    /// Keep the agent running.
+    Continue,
+    /// Stop the agent so the supervisor restarts it into registration.
+    StopForReRegistration,
+}
+
+/// Consecutive identity rejections that stop the agent. A rejected
+/// registration cannot heal in place — re-registration is the only fix,
+/// and the supervisor provides it on restart.
+const MAX_CONSECUTIVE_IDENTITY_REJECTIONS: u32 = 10;
+
+/// How often an ongoing unreachable streak is re-logged at warn level.
+/// Per-tick tracing stays at trace so a long outage does not flood the
+/// journal, but a multi-hour silence must stay visible somewhere.
+const UNREACHABLE_WARN_EVERY: u32 = 10;
+
+/// Failure bookkeeping for the runner heartbeat loop.
+///
+/// The two failure classes get opposite treatments, mirroring the law the
+/// job-lease heartbeat already follows ("transport failures and 5xx are
+/// not decisions"). Identity rejections count toward stopping the agent
+/// for re-registration. Unreachable streaks NEVER stop the agent: the
+/// scheduler already marks a heartbeats-lost runner offline and
+/// re-enqueues its jobs (`Scheduler::process_queue`), so a
+/// disconnected-but-alive runner is safe to leave running — when contact
+/// returns, the next heartbeat succeeds and the runner resumes without a
+/// restart. Killing the agent on transport loss turned every scheduler
+/// outage into a crash-loop that needed a human to end (the .202 runner
+/// sat dead for hours after a firewall change on 2026-10-08 while its
+/// supervisor kept restarting it).
+#[derive(Default)]
+struct HeartbeatGuard {
+    identity_rejections: u32,
+    unreachable_streak: u32,
+}
+
+impl HeartbeatGuard {
+    /// Record one attempt and decide what the loop does next. Only a
+    /// delivered heartbeat resets the identity count: an unreachable
+    /// attempt between two rejections is not evidence the identity
+    /// became valid again.
+    fn observe(&mut self, outcome: HeartbeatOutcome) -> HeartbeatAction {
+        match outcome {
+            HeartbeatOutcome::Delivered => {
+                self.identity_rejections = 0;
+                self.unreachable_streak = 0;
+                HeartbeatAction::Continue
+            }
+            HeartbeatOutcome::IdentityRejected(status) => {
+                self.identity_rejections += 1;
+                self.unreachable_streak = 0;
+                if self.identity_rejections >= MAX_CONSECUTIVE_IDENTITY_REJECTIONS {
+                    HeartbeatAction::StopForReRegistration
+                } else {
+                    tracing::trace!("heartbeat rejected with HTTP {status}");
+                    HeartbeatAction::Continue
+                }
+            }
+            HeartbeatOutcome::Unreachable(status) => {
+                self.unreachable_streak += 1;
+                if self
+                    .unreachable_streak
+                    .is_multiple_of(UNREACHABLE_WARN_EVERY)
+                {
+                    match status {
+                        Some(status) => tracing::warn!(
+                            streak = self.unreachable_streak,
+                            "scheduler unreachable (HTTP {status}); runner stays up for recovery"
+                        ),
+                        None => tracing::warn!(
+                            streak = self.unreachable_streak,
+                            "scheduler unreachable (transport error); runner stays up for recovery"
+                        ),
+                    }
+                }
+                HeartbeatAction::Continue
+            }
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "identity rejections: {}, unreachable streak: {}",
+            self.identity_rejections, self.unreachable_streak
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2596,12 +2731,53 @@ mod tests {
             working_dir: Some("/workspace".to_string()),
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
         let deserialized: JobAssignment = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.job_id, "job-123");
         assert_eq!(deserialized.commands.len(), 2);
+    }
+
+    #[test]
+    fn test_job_assignment_carries_volumes() {
+        let assignment = JobAssignment {
+            job_id: "job-1".to_string(),
+            name: "build".to_string(),
+            pipeline_run_id: "run-1".to_string(),
+            commands: vec!["cargo build".to_string()],
+            image: "dsc-ci-rust:10".to_string(),
+            working_dir: None,
+            timeout_secs: 300,
+            env: HashMap::new(),
+            volumes: vec![gitforge_common::VolumeSpec {
+                volume_type: Some(gitforge_common::VolumeType::Bind),
+                source: Some("{cache_root}/cargo/{image}".to_string()),
+                destination: "/cargo-target".to_string(),
+                read_only: false,
+                size: None,
+            }],
+        };
+
+        let json = serde_json::to_string(&assignment).unwrap();
+        let decoded: JobAssignment = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.volumes.len(), 1);
+        assert_eq!(decoded.volumes[0].destination, "/cargo-target");
+    }
+
+    #[test]
+    fn test_legacy_job_assignment_without_volumes_decodes_empty() {
+        let assignment: JobAssignment = serde_json::from_str(
+            r#"{
+                "job_id": "job-1",
+                "name": "build",
+                "pipeline_run_id": "run-1",
+                "commands": ["cargo build"]
+            }"#,
+        )
+        .unwrap();
+        assert!(assignment.volumes.is_empty());
     }
 
     #[test]
@@ -2632,6 +2808,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert!(assignment.working_dir.is_none());
     }
@@ -2654,6 +2831,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         let debug_str = format!("{assignment:?}");
         assert!(debug_str.contains("job-123"));
@@ -2686,6 +2864,7 @@ mod tests {
             working_dir: Some("/workspace".to_string()),
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
 
         // Test JSON serialization
@@ -2712,6 +2891,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert!(assignment.commands.is_empty());
         assert!(assignment.working_dir.is_none());
@@ -2734,6 +2914,7 @@ mod tests {
             working_dir: Some("/project".to_string()),
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert_eq!(assignment.commands.len(), 4);
     }
@@ -2831,6 +3012,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         let assignment2 = JobAssignment {
             job_id: "job-1".to_string(),
@@ -2841,6 +3023,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         // JobAssignment should implement PartialEq if we add it
         // For now just verify individual field equality
@@ -2859,6 +3042,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
@@ -2938,6 +3122,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert_eq!(assignment.commands.len(), 100);
     }
@@ -2953,6 +3138,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         let cloned = assignment.clone();
         assert_eq!(cloned.job_id, assignment.job_id);
@@ -2970,6 +3156,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert_eq!(assignment.name, "测试任务");
     }
@@ -2989,6 +3176,7 @@ mod tests {
             working_dir: None,
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert_eq!(assignment.commands.len(), 3);
     }
@@ -3067,6 +3255,7 @@ mod tests {
             working_dir: Some("".to_string()),
             timeout_secs: 300,
             env: HashMap::new(),
+            volumes: Vec::new(),
         };
         assert!(assignment.working_dir.is_some());
     }
@@ -3776,5 +3965,83 @@ mod tests {
             result.is_ok(),
             "transient failures must not end the loop before the lease verdict"
         );
+    }
+
+    #[test]
+    fn test_heartbeat_guard_stops_only_after_identity_rejection_budget() {
+        let mut guard = HeartbeatGuard::default();
+        for _ in 0..MAX_CONSECUTIVE_IDENTITY_REJECTIONS - 1 {
+            assert_eq!(
+                guard.observe(HeartbeatOutcome::IdentityRejected(404)),
+                HeartbeatAction::Continue
+            );
+        }
+        assert_eq!(
+            guard.observe(HeartbeatOutcome::IdentityRejected(404)),
+            HeartbeatAction::StopForReRegistration
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_guard_never_stops_on_unreachable() {
+        let mut guard = HeartbeatGuard::default();
+        for i in 0..(MAX_CONSECUTIVE_IDENTITY_REJECTIONS * 10) as u16 {
+            // Alternate transport errors and 5xx: neither is a decision.
+            let outcome = if i % 2 == 0 {
+                HeartbeatOutcome::Unreachable(None)
+            } else {
+                HeartbeatOutcome::Unreachable(Some(503))
+            };
+            assert_eq!(guard.observe(outcome), HeartbeatAction::Continue);
+        }
+        assert_eq!(
+            guard.unreachable_streak,
+            MAX_CONSECUTIVE_IDENTITY_REJECTIONS * 10
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_guard_success_resets_both_counts() {
+        let mut guard = HeartbeatGuard::default();
+        for _ in 0..MAX_CONSECUTIVE_IDENTITY_REJECTIONS - 1 {
+            guard.observe(HeartbeatOutcome::IdentityRejected(401));
+        }
+        guard.observe(HeartbeatOutcome::Unreachable(Some(500)));
+        assert_eq!(
+            guard.observe(HeartbeatOutcome::Delivered),
+            HeartbeatAction::Continue
+        );
+        assert_eq!(guard.identity_rejections, 0);
+        assert_eq!(guard.unreachable_streak, 0);
+    }
+
+    #[test]
+    fn test_heartbeat_guard_unreachable_does_not_rescue_identity() {
+        // "Consecutive" means no delivered heartbeat in between: an outage
+        // bridging two rejections must not let a bad identity live forever.
+        let mut guard = HeartbeatGuard::default();
+        for _ in 0..MAX_CONSECUTIVE_IDENTITY_REJECTIONS - 1 {
+            guard.observe(HeartbeatOutcome::IdentityRejected(403));
+        }
+        for _ in 0..50 {
+            guard.observe(HeartbeatOutcome::Unreachable(None));
+        }
+        assert_eq!(
+            guard.observe(HeartbeatOutcome::IdentityRejected(403)),
+            HeartbeatAction::StopForReRegistration
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_guard_identity_rejection_ends_unreachable_streak() {
+        // Contact was re-established (and refused us): the unreachable
+        // streak is over even though the runner is not healthy.
+        let mut guard = HeartbeatGuard::default();
+        for _ in 0..2 * UNREACHABLE_WARN_EVERY {
+            guard.observe(HeartbeatOutcome::Unreachable(None));
+        }
+        guard.observe(HeartbeatOutcome::IdentityRejected(401));
+        assert_eq!(guard.unreachable_streak, 0);
+        assert_eq!(guard.identity_rejections, 1);
     }
 }

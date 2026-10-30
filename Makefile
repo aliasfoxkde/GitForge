@@ -3,7 +3,7 @@
 # Self-hosted Git platform with CI/CD
 # ─────────────────────────────────────────────────────────────────────────────
 
-.PHONY: build build-release build-cross test test-race lint clean setup coverage fmt vet
+.PHONY: build build-release build-cross test test-race lint clean setup coverage fmt vet vuln
 
 # ─── Build ────────────────────────────────────────────────────────────────────
 build:
@@ -53,11 +53,17 @@ fmt:
 vet:
 	cargo vet
 
+# cargo audit against the shared ignore list (.cargo/audit.toml — each
+# recorded exception states why the advisory is accepted and what would
+# lift it). CONTRIBUTING's pre-merge checklist references this target.
+vuln:
+	cargo audit -c .cargo/audit.toml
+
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
 
 shellcheck:
-	shellcheck scripts/*.sh systemd/*.sh
+	shellcheck scripts/*.sh systemd/*.sh scripts/gitforge-* scripts/qualityctl scripts/verify-user-systemd-policy
 
 # Security pattern scan (Aegis). The baseline records every finding triaged
 # as intentional or a false positive at audit time (see
@@ -144,6 +150,7 @@ help:
 	@echo ""
 	@echo "  make lint              - Run linters"
 	@echo "  make fmt               - Check formatting"
+	@echo "  make vuln              - cargo audit vs .cargo/audit.toml ignore list"
 	@echo ""
 	@echo "  make aegis             - Security pattern scan (new findings fail)"
 	@echo "  make aegis-report      - Security pattern scan (full report)"

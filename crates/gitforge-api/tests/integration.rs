@@ -2,6 +2,14 @@
 //!
 //! These tests verify API functionality with database integration.
 
+// Test-harness exemption, same discipline as the sibling suites:
+// `allow-unwrap-in-tests` covers `#[test]` bodies, but boot/seed/fixture
+// helper functions in a test target are neither `#[test]` fns nor
+// `#[cfg(test)]`, a class the clippy.toml config cannot address. Setup
+// failing IS the assertion -- a panic aborts the run loudly. Production
+// code keeps the denies.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
@@ -52,6 +60,7 @@ async fn webhook_fixture(
         trigger_type: "push".to_string(),
         config,
         created_at: chrono::Utc::now(),
+        active: true,
     };
     gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
         .await
@@ -93,6 +102,9 @@ fn webhook_job(needs: Vec<String>, timeout: Option<&str>) -> JobDefinition {
         }],
         timeout: timeout.map(str::to_string),
         retry: None,
+        skip_if: None,
+        volumes: Vec::new(),
+        cache: None,
     }
 }
 
@@ -857,6 +869,7 @@ async fn test_scheduler_upload_is_downloadable_through_authenticated_api() {
         trigger_type: "manual".to_string(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
         .await
@@ -1031,6 +1044,7 @@ async fn test_api_artifacts_are_scoped_to_job_repository_owner() {
             trigger_type: "manual".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         },
     )
     .await
@@ -1048,6 +1062,7 @@ async fn test_api_artifacts_are_scoped_to_job_repository_owner() {
             started_at: Some(chrono::Utc::now()),
             finished_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
+            error: None,
         },
     )
     .await
@@ -1940,6 +1955,9 @@ async fn test_api_webhook_trigger_success() {
             }],
             timeout: Some("30s".to_string()),
             retry: None,
+            skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         }],
     };
     let pipeline = gitforge_db::models::Pipeline {
@@ -1949,6 +1967,7 @@ async fn test_api_webhook_trigger_success() {
         trigger_type: "push".to_string(),
         config: serde_json::to_value(pipeline_definition).unwrap(),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
         .await
@@ -2189,6 +2208,7 @@ async fn test_api_job_control_enforces_repository_ownership_and_persists_cancel(
             trigger_type: "manual".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         },
     )
     .await
@@ -2206,6 +2226,7 @@ async fn test_api_job_control_enforces_repository_ownership_and_persists_cancel(
             started_at: Some(chrono::Utc::now()),
             finished_at: None,
             created_at: chrono::Utc::now(),
+            error: None,
         },
     )
     .await
@@ -2334,6 +2355,7 @@ async fn test_api_pipeline_runs_with_jobs() {
         trigger_type: "push".to_string(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
         .await
@@ -2351,6 +2373,7 @@ async fn test_api_pipeline_runs_with_jobs() {
         started_at: Some(chrono::Utc::now()),
         finished_at: None,
         created_at: chrono::Utc::now(),
+        error: None,
     };
     gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
         .await

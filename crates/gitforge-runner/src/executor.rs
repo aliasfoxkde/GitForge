@@ -1,6 +1,6 @@
 //! Job executor with container pooling
 
-use gitforge_common::{JobId, PipelineRunId, RepoId, Result};
+use gitforge_common::{JobId, PipelineRunId, RepoId, Result, VolumeSpec};
 use gitforge_sandbox::{
     DockerSandbox, OutputSink, Sandbox, SandboxInstance, SandboxLimits, StepResult,
 };
@@ -25,15 +25,48 @@ const POOL_SIZE: usize = 2;
 /// instead of watching jobs fail before the daemon ever answered. Storage
 /// has since moved to overlay2 and creation is fast, but the escape hatch
 /// stays for loaded hosts.
+///
+/// The ceiling is also load-aware: when the 1-minute load average already
+/// exceeds the CPU count, the daemon is saturated and container creation
+/// queues behind everything else — failing the job there wastes a whole
+/// pipeline cycle for an acquisition that would have landed (the
+/// 2026-10-03 incident ledger: acquisition timeout at load 66, clean
+/// re-fire on the next window). The cap scales linearly with load up to
+/// three times the default. An explicit GITFORGE_SANDBOX_ACQUIRE_SECS
+/// still wins over any load scaling.
 fn sandbox_acquire_timeout() -> Duration {
     const DEFAULT_SECS: u64 = 60;
-    Duration::from_secs(
-        std::env::var("GITFORGE_SANDBOX_ACQUIRE_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|secs| *secs > 0)
-            .unwrap_or(DEFAULT_SECS),
-    )
+    if let Some(pinned) = std::env::var("GITFORGE_SANDBOX_ACQUIRE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+    {
+        return Duration::from_secs(pinned);
+    }
+    let load1 = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| {
+            text.split_whitespace()
+                .next()
+                .and_then(|field| field.parse::<f64>().ok())
+        });
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    Duration::from_secs(acquire_timeout_secs(DEFAULT_SECS, load1, cores))
+}
+
+/// Pure scaling rule for the acquisition ceiling: `default_secs` while the
+/// load per core is under 1.0, then linear growth to `3 × default_secs`
+/// at (or past) 3 loads per core. Unreadable load or a zero core count
+/// degrades to the plain default.
+fn acquire_timeout_secs(default_secs: u64, load1: Option<f64>, cores: usize) -> u64 {
+    const MAX_FACTOR: f64 = 3.0;
+    let Some(load) = load1 else {
+        return default_secs;
+    };
+    let cores = cores.max(1) as f64;
+    let loads_per_core = (load / cores).max(1.0);
+    let factor = loads_per_core.min(MAX_FACTOR);
+    ((default_secs as f64) * factor).round() as u64
 }
 
 /// Sandbox memory ceiling in megabytes. Debug codegen and linking of
@@ -143,7 +176,7 @@ impl ContainerPool {
 
         while instances.len() < count {
             let id = JobId::new();
-            match self.sandbox.create(id, image, sandbox_limits()).await {
+            match self.sandbox.create(id, image, sandbox_limits(), &[]).await {
                 Ok(instance) => {
                     tracing::info!("pre-warmed container for image {}", image);
                     instances.push(instance);
@@ -157,17 +190,31 @@ impl ContainerPool {
         Ok(())
     }
 
-    /// Get a container from the pool, creating one if needed
+    /// Get a container from the pool, creating one if needed.
+    ///
+    /// `volumes` are the host mounts the job asked for (cache
+    /// directories, tmpfs scratch). They are honoured when the container
+    /// is created; a pooled container is only reused for jobs that need no
+    /// mounts, because a pooled container cannot gain a mount afterwards.
     pub async fn acquire(
         &self,
         job_id: &JobId,
         image: &str,
         workspace_path: Option<&str>,
+        volumes: &[VolumeSpec],
     ) -> Result<SandboxInstance> {
         if workspace_path.is_some() {
             return self
                 .sandbox
-                .create_with_workspace(*job_id, image, sandbox_limits(), workspace_path)
+                .create_with_workspace(*job_id, image, sandbox_limits(), workspace_path, volumes)
+                .await;
+        }
+        if !volumes.is_empty() {
+            // A mount is baked in at creation time, so a pooled container
+            // (created without one) cannot serve this job.
+            return self
+                .sandbox
+                .create(*job_id, image, sandbox_limits(), volumes)
                 .await;
         }
         let mut pools = self.pools.write().await;
@@ -182,7 +229,9 @@ impl ContainerPool {
 
         // Pool empty or no pool for this image, create new
         tracing::debug!("creating new container for job {} (pool empty)", job_id);
-        self.sandbox.create(*job_id, image, sandbox_limits()).await
+        self.sandbox
+            .create(*job_id, image, sandbox_limits(), &[])
+            .await
     }
 
     /// Return a container to the pool
@@ -208,7 +257,7 @@ impl ContainerPool {
             }
             // Create fresh instance for the pool
             let id = JobId::new();
-            match self.sandbox.create(id, image, sandbox_limits()).await {
+            match self.sandbox.create(id, image, sandbox_limits(), &[]).await {
                 Ok(new_instance) => {
                     instances.push(new_instance);
                     tracing::debug!("returned container to pool");
@@ -398,6 +447,7 @@ impl JobExecutor {
                 started_at,
                 completed_at,
                 infrastructure_failure: false,
+                timed_out: false,
                 error: Some(format!(
                     "toolchain preflight failed: {violation}. The job image is \
                      offline by contract (CARGO_NET_OFFLINE=true, no egress); \
@@ -416,8 +466,12 @@ impl JobExecutor {
         let acquire_timeout = job_timeout.min(sandbox_acquire_timeout());
         let instance = match timeout(
             acquire_timeout,
-            self.pool
-                .acquire(&job_id, &job.image, job.working_dir.as_deref()),
+            self.pool.acquire(
+                &job_id,
+                &job.image,
+                job.working_dir.as_deref(),
+                &job.volumes,
+            ),
         )
         .await
         {
@@ -433,6 +487,7 @@ impl JobExecutor {
                     logs: None,
                     started_at,
                     completed_at,
+                    timed_out: false,
                     error: Some(format!(
                         "failed to create sandbox: acquisition timed out after {} seconds; \
                          backend probe: {}",
@@ -455,6 +510,7 @@ impl JobExecutor {
                     logs: None,
                     started_at,
                     completed_at,
+                    timed_out: false,
                     error: Some(format!(
                         "failed to create sandbox: {e}; backend probe: {}",
                         self.pool.sandbox.backend_health().await.detail
@@ -492,6 +548,7 @@ impl JobExecutor {
                 logs: None,
                 started_at,
                 completed_at,
+                timed_out: false,
                 error: Some(format!(
                     "container backend preflight failed: {probe_error}; \
                      backend probe: {}",
@@ -677,6 +734,7 @@ impl JobExecutor {
             },
             workspace_path: job.working_dir.clone(),
             infrastructure_failure,
+            timed_out,
         }
     }
 
@@ -771,6 +829,9 @@ pub struct ExecutableJob {
     pub image: String,
     pub steps: Vec<JobStep>,
     pub env: HashMap<String, String>,
+    /// Host mounts the job's container needs (cache directories, tmpfs
+    /// scratch). Requested by the pipeline definition.
+    pub volumes: Vec<VolumeSpec>,
     pub working_dir: Option<String>,
     pub timeout_secs: u64,
 }
@@ -786,6 +847,7 @@ impl ExecutableJob {
             image,
             steps: Vec::new(),
             env: HashMap::new(),
+            volumes: Vec::new(),
             working_dir: None,
             timeout_secs: 300,
         }
@@ -798,6 +860,12 @@ impl ExecutableJob {
 
     pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Declare the host mounts the job's container needs.
+    pub fn with_volumes(mut self, volumes: Vec<VolumeSpec>) -> Self {
+        self.volumes = volumes;
         self
     }
 
@@ -845,6 +913,11 @@ pub struct JobResult {
     /// acquisition failure, a failed preflight exec, an OCI-layer exec
     /// error, or a step that died on the host's exhausted scratch fs.
     pub infrastructure_failure: bool,
+    /// The job deadline elapsed while work was in flight. Reported on the
+    /// wire instead of inferred from error text — string-matching "timeout"
+    /// in the message mis-graded jobs whose error merely mentioned it, and
+    /// never fired for the runner's own kill path.
+    pub timed_out: bool,
 }
 
 impl JobResult {
@@ -852,7 +925,7 @@ impl JobResult {
     fn status(&self) -> ReceiptStatus {
         if self.success {
             ReceiptStatus::Succeeded
-        } else if self.error.as_ref().is_some_and(|e| e.contains("timeout")) {
+        } else if self.timed_out {
             ReceiptStatus::TimedOut
         } else if self.infrastructure_failure {
             ReceiptStatus::InfrastructureFailure
@@ -934,20 +1007,42 @@ mod tests {
     use gitforge_sandbox::StepResult;
 
     #[test]
+    fn test_acquire_timeout_scales_with_host_load() {
+        // No readable load (non-Linux, odd sandbox): plain default.
+        assert_eq!(acquire_timeout_secs(60, None, 8), 60);
+
+        // Idle and lightly loaded: the historical 60-second ceiling.
+        assert_eq!(acquire_timeout_secs(60, Some(0.5), 8), 60);
+        assert_eq!(acquire_timeout_secs(60, Some(8.0), 8), 60);
+
+        // Saturated daemon (the load-66 incident shape): linear growth,
+        // capped at 3× default.
+        assert_eq!(acquire_timeout_secs(60, Some(16.0), 8), 120);
+        assert_eq!(acquire_timeout_secs(60, Some(66.0), 8), 180);
+        assert_eq!(acquire_timeout_secs(60, Some(500.0), 8), 180);
+
+        // Degenerate inputs degrade to the default, never panic.
+        assert_eq!(acquire_timeout_secs(60, Some(4.0), 0), 180);
+        assert_eq!(acquire_timeout_secs(60, Some(f64::NAN), 8), 60);
+    }
+
+    #[test]
     fn test_sandbox_acquire_timeout_default_and_env_override() {
-        // Default: the historical 60-second ceiling.
+        // Unset: 60s or the load-scaled value above it (the host may be
+        // busy), never below the historical default.
         std::env::remove_var("GITFORGE_SANDBOX_ACQUIRE_SECS");
-        assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(60));
+        assert!(sandbox_acquire_timeout() >= Duration::from_secs(60));
 
         // Operators on slow storage can raise it.
         std::env::set_var("GITFORGE_SANDBOX_ACQUIRE_SECS", "300");
         assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(300));
 
-        // Garbage and non-positive values fall back to the default.
+        // Garbage and non-positive values ignore the pin (60s floor, load
+        // scaling may still raise it on a busy host).
         std::env::set_var("GITFORGE_SANDBOX_ACQUIRE_SECS", "not-a-number");
-        assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(60));
+        assert!(sandbox_acquire_timeout() >= Duration::from_secs(60));
         std::env::set_var("GITFORGE_SANDBOX_ACQUIRE_SECS", "0");
-        assert_eq!(sandbox_acquire_timeout(), Duration::from_secs(60));
+        assert!(sandbox_acquire_timeout() >= Duration::from_secs(60));
         std::env::remove_var("GITFORGE_SANDBOX_ACQUIRE_SECS");
     }
 
@@ -1063,6 +1158,7 @@ mod tests {
             error: None,
             workspace_path: None,
             infrastructure_failure: false,
+            timed_out: false,
         };
         assert_eq!(success_result.status(), ReceiptStatus::Succeeded);
 
@@ -1079,10 +1175,12 @@ mod tests {
             error: Some("build failed".to_string()),
             workspace_path: None,
             infrastructure_failure: false,
+            timed_out: false,
         };
         assert_eq!(failure_result.status(), ReceiptStatus::Failed);
 
-        // Test timeout status
+        // Test timeout status: grading is driven by the explicit flag, not
+        // by substring-matching the error text.
         let timeout_result = JobResult {
             job_id: JobId::new(),
             success: false,
@@ -1095,8 +1193,27 @@ mod tests {
             error: Some("operation timeout exceeded".to_string()),
             workspace_path: None,
             infrastructure_failure: false,
+            timed_out: true,
         };
         assert_eq!(timeout_result.status(), ReceiptStatus::TimedOut);
+
+        // An error message that merely mentions a timeout must not grade
+        // the job as timed out — the flag is the only authority.
+        let mentions_timeout_result = JobResult {
+            job_id: JobId::new(),
+            success: false,
+            exit_code: -1,
+            step_results: vec![],
+            artifacts: vec![],
+            logs: None,
+            started_at: started,
+            completed_at: completed,
+            error: Some("operation timeout exceeded".to_string()),
+            workspace_path: None,
+            infrastructure_failure: false,
+            timed_out: false,
+        };
+        assert_eq!(mentions_timeout_result.status(), ReceiptStatus::Failed);
 
         // Test infrastructure status (R6.3): the backend, not the commit,
         // failed the job.
@@ -1116,6 +1233,7 @@ mod tests {
             ),
             workspace_path: None,
             infrastructure_failure: true,
+            timed_out: false,
         };
         assert_eq!(infra_result.status(), ReceiptStatus::InfrastructureFailure);
     }

@@ -1,146 +1,102 @@
 # Setup Guide
 
-Initial configuration steps after creating a repository from the Dark Factory template.
+Deploying and configuring a GitForge instance.
 
 ## Prerequisites
 
-- [ ] Git installed (2.40+)
-- [ ] Go installed (1.21+) — if using Go templates
-- [ ] `gh` CLI authenticated (`gh auth login`)
-- [ ] Repository created from template
+- Rust (stable) toolchain for building the release binaries
+- Linux host with systemd (user units are the supported layout)
+- SQLite database reachable by all services
+- A container runtime (docker or podman) for CI job execution
 
-## Initial Setup
-
-### 1. Clone Your Repository
+## Build
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_PROJECT.git
-cd YOUR_PROJECT
+make build-release
+# Binaries: target/release/{api,ci,git-server,runner}
 ```
 
-### 2. Install Git Hooks
+Note the package names are `api`, `ci`, `git-server`, `runner` (not
+`gitforge-*`).
+
+For a shared build cache across worktrees/experiments:
 
 ```bash
-make setup
+CARGO_TARGET_DIR=/path/to/shared/target make build-release
 ```
 
-This installs pre-commit and pre-push hooks.
+## Service Units (user layout)
 
-### 3. Replace Placeholders
+The standalone-instance layout runs plain user services:
 
-Replace `aliasfoxkde` with your GitHub username in:
+| Unit | Executes |
+|---|---|
+| `gitforge-api.service` | the api gateway |
+| `gitforge-ci.service` | the CI scheduler |
+| `gitforge-git-server.service` | git HTTP + SSH serving |
+| `gitforge-runner.service` | the container runner |
 
-```bash
-# Automatic replacement
-find . -type f \( -name "*.yml" -o -name "*.yaml" -o -name "*.md" -o -name "*.json" \) \
-    -exec sed -i 's/aliasfoxkde/YOUR_USERNAME/g' {} \;
+Releases are staged as bundles under a `releases/` directory and a
+`gitforge-current` symlink selects the live one. Cutover is:
+drain in-flight jobs → stop schedulers (`ci`, `runner`) first → stop stateless
+(`api`, `git-server`) → flip the symlink atomically → start stateless → start
+schedulers. `scripts/gitforge-remote-cutover` automates this (it requires the
+`sqlite3` CLI for its drain gate; hand-verify the drain and run the steps
+manually where the CLI is absent).
+
+## Environment
+
+Key variables (set per-unit via drop-ins):
+
+| Variable | Purpose |
+|---|---|
+| `GITFORGE_DATABASE_URL` | `sqlite:` URL of the audit database |
+| `GITFORGE_CI_TRIGGER_TOKEN` | credential for `/pipelines/trigger` (401s without it) |
+| `PORT` | api listen port (default 42780) |
+
+## CI Pipeline Configuration
+
+Pipelines are defined per-repository in `.gitforge.yml`:
+
+```yaml
+jobs:
+  - name: clippy
+    image: dsc-ci-rust:12
+    steps:
+      - name: lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Files to check manually:
-- `.github/CODEOWNERS`
-- `.github/FUNDING.yml`
-- `README.md`
+- The parser **rejects unknown top-level keys** (`cache:`, `skip_if:` on an
+  old binary were silently dropped — check the executing binary's commit
+  before trusting a run)
+- Push triggers authenticate with `GITFORGE_CI_TRIGGER_TOKEN`
+- A `202` with `pipeline_run_id: null` is the durable-queued contract: the run
+  row lands late (observed up to 5 min under load), never lost
 
-### 4. Set Up Environment
+## GitHub Mirror Bridge
 
-```bash
-# Copy environment template
-cp .env.example .env
+The repository mirrors to GitHub; CI is authoritative on the GitForge side
+(`.github/workflows/gitforge-ci.yml` enqueues builds via the scheduler API).
+Repository variables/secrets:
 
-# Edit with your values
-vim .env
-```
+| Name | Kind | Purpose |
+|---|---|---|
+| `GITFORGE_ENABLED` | var | gate for the bridge workflows |
+| `GITFORGE_SCHEDULER_URL` | var | scheduler endpoint |
+| `GITFORGE_REPO_ID` | var | GitForge repo **UUID** (not the GitHub repo id) |
+| `GITFORGE_CI_TRIGGER_TOKEN` | secret | enqueue credential |
+| `GITFORGE_API_TOKEN` | secret | status-polling credential |
 
-### 5. Verify Installation
-
-```bash
-make lint   # Should pass
-make test   # Should pass
-make build  # Should pass
-```
-
-## GitHub Configuration
-
-### Required GitHub Apps
-
-Install these apps from GitHub Marketplace:
-
-| App | Purpose |
-|-----|---------|
-| Codecov | Coverage tracking |
-| Dependabot | Dependency updates |
-
-### Required Permissions
-
-Ensure repository has:
-- **Wiki**: Enabled (for documentation)
-- **Issues**: Enabled (for issue tracking)
-- **Projects**: Enabled (for project boards)
-
-### Secrets Configuration
-
-Add these repository secrets:
-
-| Secret | Description |
-|--------|-------------|
-| `CODECOV_TOKEN` | For coverage uploads |
-| `GITHUB_TOKEN` | Automatically provided |
-
-### Branch Protection
-
-After first push, verify branch protection:
+## Verification
 
 ```bash
-# Check rulesets
-gh api repos/OWNER/REPO/rulesets --jq '.[] | "\(.name): \(.enforcement)"'
-```
-
-## CI/CD Verification
-
-### Trigger First CI Run
-
-```bash
-git add -A
-git commit -m "feat: initial commit"
-git push -u origin main
-```
-
-### Verify Checks Pass
-
-1. Go to your repository on GitHub
-2. Click on the commit
-3. Verify all checks pass:
-   - `go-test`
-   - `lint`
-   - `build`
-
-### Common CI Issues
-
-| Issue | Solution |
-|-------|----------|
-| Coverage below threshold | Add more tests |
-| `golangci-lint` failures | Fix lint errors |
-| Build fails | Check Go version matches |
-
-## Updating from Template
-
-To pull in latest template changes:
-
-```bash
-# Add template as remote
-git remote add template https://github.com/aliasfoxkde/dark-factory.git
-
-# Fetch template changes
-git fetch template
-
-# Review template changes
-git log --oneline template/main..HEAD
-
-# Merge template changes
-git merge template/main --allow-unrelated-histories
+make lint
+make test
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:42780/api/health
 ```
 
 ## Getting Help
 
-- [GitHub Discussions](https://github.com/aliasfoxkde/dark-factory/discussions)
-- [Troubleshooting Guide](./TROUBLESHOOTING.md)
+- [Troubleshooting Guide](TROUBLESHOOTING)
+- `docs/RUNBOOK.md` in the repository for live-instance operations

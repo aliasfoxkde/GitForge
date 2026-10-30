@@ -1,12 +1,11 @@
 # Conventions
 
-Coding and collaboration conventions for Dark Factory projects.
+Coding and collaboration conventions for the GitForge repository.
 
 ## Conventional Commits
 
-Format: `<type>(<scope>): <description>`
-
-### Types
+Format: `<type>(<scope>): <subject>` — subject max 50 chars, imperative; body
+wrapped at 72 chars.
 
 | Type | Description |
 |------|-------------|
@@ -18,112 +17,45 @@ Format: `<type>(<scope>): <description>`
 | `ci` | CI/CD changes |
 | `chore` | Maintenance tasks |
 | `perf` | Performance improvements |
+| `style` | Formatting (no code change) |
 
-### Examples
+## Rust Standards
 
-```
-feat(api): add user authentication endpoint
-fix(auth): resolve null pointer in token validation
-docs: update README with new installation steps
-test(handler): add tests for user creation
-refactor(db): extract connection pooling logic
-ci: add golangci-lint to pre-commit
-chore: update dependencies
-perf(query): optimize database index lookup
-```
+- No `unwrap()`/`expect()` in library code — return `Result`; `?` over panics
+- Structured logging via `tracing`, never `println!`/`eprintln!`
+- No global mutable state — pass pools/registries explicitly
+- No placeholder code: `TODO`/`FIXME`/stubs left in place
+- `cargo clippy --workspace --all-targets -- -D warnings` must pass
+- `cargo fmt --all` must pass
 
-## Go Coding Standards
+## Database Discipline
 
-### Sentinel Errors
+- Write paths use `BEGIN IMMEDIATE` transactions (`begin_with`)
+- One-shot DB writes under contention are the F21/F23 failure class: new write
+  paths go through `persist_with_retry` or a conditional/idempotent UPDATE
+- Never migrate the schema while a peer binary is running against the same DB
 
-Define package-level error variables:
+## Testing
 
-```go
-var (
-    ErrNotFound     = errors.New("not found")
-    ErrInvalidInput = errors.New("invalid input")
-    ErrUnauthorized = errors.New("unauthorized")
-)
-```
+- Unit tests in `#[cfg(test)]` modules; integration tests in `crates/*/tests/`
+  and `services/*/tests/`
+- Regression-test every defect with a pinned test
+- The pre-push hook runs the full suite; the CI test job runs with
+  `--test-threads=2` deliberately
 
-### Context Propagation
+## CI Notes
 
-All public APIs must accept `context.Context`:
+- The authoritative CI chain is this repo's own GitForge pipeline
+  (`.gitforge.yml`, self-hosted): fmt → clippy (+ rustdoc gate) → test →
+  coverage on `dsc-ci-rust`
+- GitHub Actions is a mirror, not the gate — validate through GitForge
+- A `skipped` quality job (clippy/test/coverage/fuzz) counts as **not
+  validated** for release purposes; the release gate refuses such runs
 
-```go
-func (s *Service) DoSomething(ctx context.Context, req *Request) (*Response, error)
-```
+## Decision Cores Take Their Environment as Data
 
-### Structured Logging
-
-Use `log/slog` instead of `fmt.Fprintf`:
-
-```go
-slog.Info("request processed",
-    "request_id", req.ID,
-    "duration_ms", elapsed.Milliseconds(),
-)
-```
-
-### Dependency Injection
-
-Pass dependencies via struct fields, not globals:
-
-```go
-type Service struct {
-    db     *DB
-    logger *slog.Logger
-    cache  *Cache
-}
-```
-
-## Test Requirements
-
-### Coverage by Layer
-
-| Layer | Minimum Coverage |
-|-------|-----------------|
-| Core business logic | 95% |
-| API handlers | 90% |
-| Configuration | 85% |
-| Utilities | 85% |
-
-### Test Patterns
-
-**Table-driven tests:**
-
-```go
-func TestAdd(t *testing.T) {
-    tests := []struct {
-        name string
-        a, b int
-        want int
-    }{
-        {"positive", 1, 2, 3},
-        {"negative", -1, -2, -3},
-        {"zero", 0, 0, 0},
-    }
-    for _, tt := range tests {
-        t.Run(tt.name, func(t *testing.T) {
-            got := Add(tt.a, tt.b)
-            if got != tt.want {
-                t.Errorf("Add() = %v, want %v", got, tt.want)
-            }
-        })
-    }
-}
-```
-
-**Use `-p 1`** — mandatory for `go test` due to package-level init state.
-
-## Code Review Checklist
-
-- [ ] Conventional commit format in title
-- [ ] Tests written before implementation
-- [ ] Coverage maintained or improved
-- [ ] No `//golint:disable` without justification
-- [ ] No hardcoded credentials or secrets
-- [ ] No debug/temporary code
-- [ ] `go vet ./...` passes
-- [ ] `golangci-lint run --timeout=5m` passes
-- [ ] Documentation updated (if needed)
+A decision function must not read process-global state (env vars, cwd, the
+clock) *inside* the decision. Read it at the edge, once, and pass it in as a
+value — concurrent writers make environment-reading cores nondeterministic.
+`fn decide(input)` is the edge; `fn decide_with(input, env_value)` is the core
+tests exercise.

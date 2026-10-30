@@ -111,15 +111,15 @@ impl JobStateMachine {
     /// Transition to failed state
     pub fn fail(&mut self, exit_code: i32, error: String) -> Result<()> {
         self.ensure_valid_transition(JobStatus::Failed)?;
-        self.status = JobStatus::Failed;
-        self.exit_code = Some(exit_code);
-        self.error_message = Some(error);
         tracing::error!(
             "job {} failed with exit code {}: {}",
             self.job_id,
             exit_code,
-            self.error_message.as_ref().unwrap()
+            error
         );
+        self.status = JobStatus::Failed;
+        self.exit_code = Some(exit_code);
+        self.error_message = Some(error);
         Ok(())
     }
 
@@ -136,6 +136,16 @@ impl JobStateMachine {
         self.ensure_valid_transition(JobStatus::TimedOut)?;
         self.status = JobStatus::TimedOut;
         tracing::error!("job {} timed out", self.job_id);
+        Ok(())
+    }
+
+    /// Transition to skipped state (condition evaluated to false).
+    /// Terminal — counted as succeeded for dependency purposes so downstream
+    /// jobs run normally.
+    pub fn skip(&mut self) -> Result<()> {
+        self.ensure_valid_transition(JobStatus::Skipped)?;
+        self.status = JobStatus::Skipped;
+        tracing::info!("job {} skipped", self.job_id);
         Ok(())
     }
 
@@ -161,11 +171,13 @@ impl JobStateMachine {
             // From pending
             (JobStatus::Pending, JobStatus::Queued) => true,
             (JobStatus::Pending, JobStatus::Cancelled) => true,
+            (JobStatus::Pending, JobStatus::Skipped) => true,
 
             // From queued
             (JobStatus::Queued, JobStatus::Assigned) => true,
             (JobStatus::Queued, JobStatus::Cancelled) => true,
             (JobStatus::Queued, JobStatus::Failed) => true,
+            (JobStatus::Queued, JobStatus::Skipped) => true,
             // The timeout watchdog times jobs out from the durable rows, which
             // may be ahead of this engine's mirror: a job dispatched to a
             // runner that hung before reporting assignment/progress still sits

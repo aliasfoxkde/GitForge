@@ -6,6 +6,14 @@
 //! sits behind the protected router with the admin-or-maintainer retire
 //! policy. These tests drive the real router with an in-memory database.
 
+// Test-harness exemption, same discipline as the sibling suites:
+// `allow-unwrap-in-tests` covers `#[test]` bodies, but boot/seed/fixture
+// helper functions in a test target are neither `#[test]` fns nor
+// `#[cfg(test)]`, a class the clippy.toml config cannot address. Setup
+// failing IS the assertion -- a panic aborts the run loudly. Production
+// code keeps the denies.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
@@ -68,6 +76,7 @@ async fn seed() -> Fixture {
         trigger_type: "push".to_string(),
         config: json!({"name": "runner-routes-pipeline", "version": "1.0", "jobs": []}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     let pipeline_id = pipeline.id;
     PipelineQueries::create(&pool, &pipeline).await.unwrap();

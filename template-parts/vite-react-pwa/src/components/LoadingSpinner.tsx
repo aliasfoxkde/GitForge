@@ -3,9 +3,11 @@ import { cn } from '@/lib/cn';
 interface LoadingSpinnerProps {
   className?: string;
   size?: 'sm' | 'md' | 'lg';
+  /** Announced to assistive technology instead of the bare graphic. */
+  label?: string;
 }
 
-export function LoadingSpinner({ className, size = 'md' }: LoadingSpinnerProps) {
+export function LoadingSpinner({ className, size = 'md', label = 'Loading' }: LoadingSpinnerProps) {
   const sizes = {
     sm: 'w-4 h-4',
     md: 'w-8 h-8',
@@ -13,9 +15,11 @@ export function LoadingSpinner({ className, size = 'md' }: LoadingSpinnerProps) 
   };
 
   return (
-    <div className={cn('flex items-center justify-center', className)}>
+    <div role="status" aria-live="polite" className={cn('flex items-center justify-center', className)}>
+      <span className="sr-only">{label}</span>
       <svg
-        className={cn('animate-spin text-foreground', sizes[size])}
+        aria-hidden="true"
+        className={cn('animate-spin motion-reduce:animate-none text-foreground', sizes[size])}
         xmlns="http://www.w3.org/2000/svg"
         fill="none"
         viewBox="0 0 24 24"

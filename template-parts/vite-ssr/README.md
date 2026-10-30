@@ -2,6 +2,12 @@
 
 A server-side rendering (SSR) React application template using Vite, optimized for Vercel deployments.
 
+> **This is a template part, not a standalone scaffold.** Layer it over a
+> fresh `npm create vite@latest my-app -- --template react-ts` skeleton:
+> the part supplies `src/`, configs, and tests, while the scaffold
+> supplies the entry `index.html` (keep its `lang="en"` root element —
+> accessibility starts there) and the vite binary itself.
+
 ## Quick Start
 
 ```bash

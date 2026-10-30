@@ -1,29 +1,34 @@
 # Getting Started
 
-Welcome to the project! This guide will help you get up and running.
+GitForge is a self-hosted Git platform: repositories, smart HTTP + SSH Git
+serving, a built-in CI/CD engine with a container runner, and AI-powered code
+review. Rust workspace, 15 crates under `crates/`, 4 service binaries under
+`services/`.
 
 ## Prerequisites
 
-- Go 1.21 or later
+- Rust (stable) via [rustup](https://rustup.rs)
 - Git
-- A GitHub account
+- SQLite (the sqlx CLI is used for query checks during development)
+- Docker/podman only if you want to exercise the container runner locally
 
 ## Quick Start
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/aliasfoxkde/dark-factory.git
-   cd dark-factory
+   git clone https://github.com/aliasfoxkde/GitForge.git
+   cd GitForge
    ```
 
-2. **Install dependencies**
-   ```bash
-   go mod download
-   ```
-
-3. **Set up git hooks**
+2. **Install git hooks**
    ```bash
    make setup
+   ```
+
+3. **Build**
+   ```bash
+   make build          # debug
+   make build-release  # release
    ```
 
 4. **Run tests**
@@ -31,23 +36,22 @@ Welcome to the project! This guide will help you get up and running.
    make test
    ```
 
-5. **Build**
+5. **Lint**
    ```bash
-   make build
+   make lint   # fmt, cargo vet, strict clippy, shellcheck, aegis scan
    ```
 
-## Configuration
+## Services
 
-All configuration is via environment variables:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `APP_ENV` | Environment | `development` |
-| `HTTP_PORT` | HTTP port | `8080` |
-| `LOG_LEVEL` | Log level | `info` |
+| Binary | Port | Role |
+|---|---|---|
+| `api` | 42780 | Gateway routes + OpenAPI |
+| `ci` | 42781 | CI orchestrator / scheduler |
+| `git-server` | 42782 (HTTP) / 42022 (SSH) | Git serving |
+| `runner` | — | Container job execution |
 
 ## Next Steps
 
-- Read the [Architecture documentation](../ARCHITECTURE.md)
-- Check the [Contributing guide](../CONTRIBUTING.md)
-- Browse the [Pattern Library](../PATTERN_FORMAT.md)
+- Read the [Setup Guide](SETUP_GUIDE) for deployment configuration
+- Check [Troubleshooting](TROUBLESHOOTING) when something misbehaves
+- See `docs/RUNBOOK.md` in the repo for live-instance operations

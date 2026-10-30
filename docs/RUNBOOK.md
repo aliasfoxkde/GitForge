@@ -122,6 +122,20 @@ cargo run -p ci
 - Hosts scheduler HTTP API on port 42781
 - Assigns jobs to runners
 
+Each workspace-prep git command (adopt checkout, clean, clone, checkout)
+runs under a wall-clock budget; a hung child is killed and the run is
+graded `failed` with the cause recorded on the run row (visible as
+`error` in the run's API/CLI output).
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `GITFORGE_WORKSPACE_PREP_TIMEOUT_SECS` | No | `300` | Per-command budget for workspace prep. Raise it on hosts that legitimately clone multi-gigabyte repositories; `0`/invalid values fall back to the default. |
+
+Failed runs carry their cause in the `error` field of
+`GET /api/v1/ci/pipeline-runs/{id}`, and a run that ends `failed` or
+`cancelled` sweeps its never-dispatched (`pending`/`queued`) job rows to
+`cancelled`, so no zombie rows outlive a terminal run.
+
 ### 4. Runner Agent
 
 The runner agent executes jobs in Docker containers.
@@ -151,6 +165,7 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 | `GITFORGE_SCHEDULER_TOKEN` | No | _(none)_ | Bearer token for scheduler API authentication |
 | `GITFORGE_REGISTER_ATTEMPTS` | No | `6` | Registration attempts before giving up when the scheduler is unreachable |
 | `GITFORGE_REGISTER_BACKOFF_SECS` | No | `1` | Initial registration retry delay; doubles per attempt up to 30s |
+| `GITFORGE_CACHE_ROOT` | No | `~/.cache/gitforge` | Host root for job cache mounts (compiled cargo artifacts). Used when a job declares a `cache:` block: the runner bind-mounts `<root>/cargo/<image>` at the job's `mount_path` inside the container. Falls back to `/var/cache/gitforge` when `$HOME` is unset. A cache that cannot be prepared is skipped with a warning — jobs still run cold. |
 
 > **Startup behavior**: If `GITFORGE_SCHEDULER_URL` is missing or empty, the runner exits immediately
 > with a clear error message. Invalid values for numeric variables (non-integer) also cause a fast
@@ -165,6 +180,116 @@ running runner (for example, `remote-podman-runner-01`); leaving the default
 Historical stale rows are retained for audit and can be retired through the
 authenticated runner-retirement operation after confirming that they own no
 active jobs.
+
+## Release Cycling
+
+Releases are bundle-cut, not tag-cut: a release is a directory under
+`releases/` plus the `releases/gitforge-current` symlink the systemd drop-in
+pins. The full cycle is mechanical:
+
+```bash
+# 1. Gate: refuse to cut unless the live instance graded the exact
+#    source commit with a full, honest pipeline run (job rows must cover
+#    the persisted definition, name for name).
+scripts/gitforge-release-gate <40-hex-source-commit>
+
+# 2. Bundle: preflight + build release binaries + MANIFEST.sha256 + READY.
+GITFORGE_SOURCE_COMMIT=<sha> \
+  scripts/gitforge-release-bundle /nas/Temp/repos/GitForge \
+  /nas/Temp/repos/GitForge/releases gitforge-<shortsha>-<YYYYMMDD>
+
+# 3. Promote + restart, drain-gated and rollback-ready:
+./scripts/gitforge-release-auto            # dry-run: prints the plan
+./scripts/gitforge-release-auto --apply    # or AUTO_UPDATE=1
+```
+
+`gitforge-release-auto` refuses to run twice concurrently (flock on
+`releases/.auto-update.lock`), defers while any `gitforge-job-*` container is
+still running (drain gate — pending-only runs are just queued and do not
+block), flips `gitforge-current` atomically, restarts the `gitforge@*` units,
+and leaves the previous bundle in place for instant rollback (re-point the
+symlink and restart). Verify after cutover: `systemctl` unit states, `/health`
+on :42780/:42781/:42782, and `scripts/gitforge-status` with
+`GITFORGE_RELEASE_ROOT=/nas/Temp/repos/GitForge/releases/gitforge-current`
+(the default path reports false drift on this instance).
+
+Known boot behavior: the ci unit runs migrations, then the startup workspace
+sweep, then spawns the event consumer. Triggers published while the consumer
+is down or busy are durable and land once it drains — a `202` with a null
+`pipeline_run_id` means queued, not lost; re-query before re-triggering.
+
+Bundle cuts are atomic as of 2026-10-10: `gitforge-release-bundle` assembles
+under `releases/.incomplete-<release-id>/` and renames into place only once
+`READY` exists, so a half-cut bundle can never sit at the final name (and a
+failed attempt's staging tree is cleared by the next run of the same
+release id). The `.incomplete-` prefix is dot-hidden and never matches the
+release-auto candidate glob.
+
+### Cutover on the fedora instance (user units)
+
+The fedora host runs a second, standalone GitForge instance under
+**user-level** systemd (`gitforge-{api,ci,git-server,runner}.service`),
+pinned to the promoted bundle through the `~/work/gitforge-current` symlink.
+It is the validation/audit instance: release cutoffs and coverage probes run
+there, isolated from the NAS control plane. Cut overs are drain-gated the
+same way the NAS promote is, via the parametrized script:
+
+```bash
+# Run ON the fedora host ("remote" refers to the instance, not the login site).
+scripts/gitforge-remote-cutover --units user \
+    --db    ~/work/gitforge-audit-20260822/audit.db \
+    --bundle ~/work/validation/releases/gitforge-<shortsha>-<YYYYMMDD> \
+    --link  ~/work/gitforge-current          # add --dry-run to inspect first
+```
+
+The script polls the job table until nothing is `assigned`/`running` (a
+pending-only backlog does not block), stops the scheduler units first
+(`ci`, then `runner`, then `api`/`git-server`), flips the symlink with
+`mv -T`, restarts stateless before schedulers, and prints the boot-adoption
+journal lines. Units that are not installed — or masked (retired) — on the
+host are reported and skipped. For system-level template-unit hosts
+(the NAS), pass `--units system`; the script then drives
+`gitforge@{api,ci,git-server,runner}.service` through `sudo -n systemctl`.
+
+Fedora operational notes:
+
+- Non-interactive ssh has no session bus: `systemctl --user` fails silently
+  unless `XDG_RUNTIME_DIR` is set (the cutover script exports
+  `/run/user/$(id -u)` itself when missing).
+- `systemctl --user list-unit-files` needs the `.service` suffix or a glob —
+  a bare unit name matches nothing.
+- Ad-hoc docker probes that bind-mount host directories must pass
+  `--security-opt label=disable`: SELinux labels `user_tmp_t` dirs as
+  unwritable from confined containers, which presents as `Permission
+  denied` on writes the modes clearly allow. The runner's own job
+  workspaces already handle their labeling.
+- **Cut over the full service set together — never migrate the shared DB
+  under a running peer.** sqlx caches per-statement column metadata at
+  prepare time; when one service `ALTER TABLE`s the shared SQLite DB while
+  another still holds prepared `SELECT *` statements, SQLite's
+  auto-reprepare pairs a new column count with the stale metadata and the
+  peer panics (`SqliteRow::current`: `index out of bounds: the len is 16
+  but the index is 16`; ledger F40, 2026-10-10). `Restart=on-failure`
+  bounds the damage to one aborted process, but the drain-gated
+  stop-everything-then-start-together sequence avoids the window entirely.
+
+### Two-instance topology (as of 2026-10-10)
+
+- **NAS (control plane).** System-level template units
+  `gitforge@{api,ci,git-server}.service` + the repo-of-record, the API
+  gateway (:42780), the scheduler (:42781), and git serving (:42782). The
+  NAS `gitforge@runner.service` unit is **masked — retired, not failed**:
+  local execution moved off the NAS, and `gitforge-release-auto` /
+  `gitforge-status` skip masked units instead of failing the promote (the
+  pre-fix behavior made every release roll back forever).
+- **Execution fleet.** Remote docker runners register into the NAS
+  scheduler: `fedora-docker` on 192.168.1.202 and `t5500-docker`, so jobs
+  dispatch off-host while pushes, runs, and logs stay on the NAS instance.
+  A fresh `online` runner row with a stale heartbeat is the stale-registry
+  defect class F26 — `gitforge-status` reports stale-online counts and
+  degrades the verdict.
+- **Fedora standalone instance.** The user-unit instance above for release
+  validation; cut over with `scripts/gitforge-remote-cutover --units user`.
 
 ## Docker Compose
 

@@ -4,20 +4,20 @@
 
 use axum::Router;
 use axum::{
-    extract::{Extension, Request},
+    extract::{Extension, Path, Request},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     Json,
 };
 use chrono::Utc;
-use futures::StreamExt;
 use gitforge_ci::{
     engine::{fence_actions, FenceAction},
     CiEngine, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
 };
 use gitforge_common::PipelineStatus;
 use gitforge_db::models::{Pipeline as DbPipeline, PipelineRun as DbPipelineRun};
+use gitforge_db::queries::persist_with_retry;
 use gitforge_events::{
     EventBus, EventEnvelope, EventFilter, EventPayload, EventType, InMemoryEventBus,
     PushReceivedPayload,
@@ -31,7 +31,7 @@ use gitforge_storage::FileStorage;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tokio::time::timeout;
 use tower_http::trace::TraceLayer;
@@ -52,14 +52,113 @@ const PIPELINE_CONFIG_PATHS: [&str; 2] = [".gitforge.yml", ".gitforce.yml"];
 /// live engines to the same terminal state.
 const JOB_TIMEOUT_SWEEP_SECS: u64 = 60;
 
+/// How often the durable trigger-request sweep recovers interrupted work.
+const TRIGGER_SWEEP_SECS: u64 = 30;
+
+/// A `pending` trigger request older than this is republished: its bus event
+/// was lost (ring lag, restart) or a retry's backoff has elapsed. The gap
+/// doubles as the retry backoff.
+const TRIGGER_PENDING_REPUBLISH_AFTER_SECS: i64 = 60;
+
+/// A `processing` trigger request older than this is assumed dead. Run
+/// creation includes a full clone of the repository (observed up to ~10 min
+/// under load), so the threshold must comfortably exceed that; demoting a
+/// live request would double-run the commit.
+const TRIGGER_PROCESSING_STALE_AFTER_SECS: i64 = 30 * 60;
+
+/// How often a control-plane pass redrives stalled chains: every
+/// non-terminal run with live rows gets a fresh engine grafted from the
+/// durable rows, its ready stages released, and its dispatchable rows
+/// re-enqueued. This retries startup rebuilds that failed (otherwise never
+/// retried within the process lifetime), re-seeds queued rows lost from the
+/// scheduler's in-memory queue while no runner was available, and re-releases
+/// tails whose completion event never reached the live engine — the ~21h
+/// stalled chains observed across a control-plane restart. Runs with rows
+/// actively executing are left to the timeout watchdog, and healthy runs
+/// re-drive as a no-op (graft of identical truth, deduplicated enqueue).
+const ENGINE_REDRIVE_INTERVAL_SECS: u64 = 300;
+
+/// How many consumer attempts a trigger request gets before its failure is
+/// terminal and visible (`failed`) instead of retried.
+const TRIGGER_MAX_ATTEMPTS: i64 = 5;
+
 struct TriggerState {
     event_bus: Arc<dyn EventBus>,
+    /// Durable store for trigger requests. `None` keeps the development
+    /// in-memory mode: triggers work exactly as before, with no durable
+    /// bookkeeping (and no hollow-delivery guarantee).
+    db: Option<gitforge_db::Pool>,
     workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
     run_waiters: Arc<
         std::sync::Mutex<
             HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
         >,
     >,
+}
+
+/// A committed pipeline definition that exists but cannot be parsed. Distinct
+/// from transient failures (DB busy, git spawn failure) because retrying can
+/// never fix it: the trigger request must fail terminally and visibly instead
+/// of being re-attempted forever.
+#[derive(Debug)]
+struct InvalidPipelineConfig(String);
+
+impl std::fmt::Display for InvalidPipelineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidPipelineConfig {}
+
+/// How a trigger request's processing ended. `Ignored` covers payloads that
+/// legitimately produce no run (non-push envelopes, ref-deletion sentinels);
+/// it is reported without a run id rather than with a fabricated one.
+#[derive(Debug)]
+enum TriggerOutcome {
+    Started(gitforge_common::PipelineRunId),
+    Ignored,
+}
+
+/// Why processing a trigger request failed, and whether running it again
+/// could plausibly succeed.
+#[derive(Debug)]
+struct TriggerFailure {
+    /// `true` for contention/environment failures (DB busy, git spawn) —
+    /// the request keeps its retry budget. `false` for failures where a
+    /// retry provably cannot help (invalid committed config, an already
+    /// failed run).
+    retryable: bool,
+    /// The run row created before the failure, when one exists. The request
+    /// records it so the failure is traceable to its run.
+    run_id: Option<gitforge_common::PipelineRunId>,
+    error: anyhow::Error,
+}
+
+impl TriggerFailure {
+    fn retryable(error: anyhow::Error) -> Self {
+        Self {
+            retryable: true,
+            run_id: None,
+            error,
+        }
+    }
+
+    fn terminal(error: anyhow::Error) -> Self {
+        Self {
+            retryable: false,
+            run_id: None,
+            error,
+        }
+    }
+
+    fn terminal_after_run(error: anyhow::Error, run_id: gitforge_common::PipelineRunId) -> Self {
+        Self {
+            retryable: false,
+            run_id: Some(run_id),
+            error,
+        }
+    }
 }
 
 #[tokio::main]
@@ -117,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
     // root. The scheduler never accepts a runner filesystem path.
     let artifact_root = std::env::var("GITFORGE_ARTIFACT_ROOT")
         .unwrap_or_else(|_| "target/gitforge-artifacts".to_string());
-    let artifact_storage = Arc::new(FileStorage::new(artifact_root).await?);
+    let artifact_storage = Arc::new(FileStorage::new(&artifact_root).await?);
 
     // Create scheduler state for HTTP server (consumes scheduler)
     let scheduler_state = create_state_with_artifact_storage(scheduler, Some(artifact_storage));
@@ -127,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
     let run_waiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let trigger_state = Arc::new(TriggerState {
         event_bus: event_bus.clone(),
+        db: scheduler_db.clone(),
         workspace_paths: workspace_paths.clone(),
         run_waiters: run_waiters.clone(),
     });
@@ -136,6 +236,11 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/pipelines/trigger",
             axum::routing::post(trigger_pipeline).layer(middleware::from_fn(require_trigger_auth)),
+        )
+        .route(
+            "/pipeline-trigger-requests/{request_id}",
+            axum::routing::get(get_trigger_request_status)
+                .layer(middleware::from_fn(require_trigger_auth)),
         )
         .merge(scheduler_routes(scheduler_state))
         .layer(Extension(trigger_state))
@@ -148,7 +253,12 @@ async fn main() -> anyhow::Result<()> {
     let scheduler_handle = tokio::spawn(async move {
         axum::serve(scheduler_listener, scheduler_app)
             .await
-            .unwrap();
+            .unwrap_or_else(|error| {
+                // The scheduler API dying is fatal to dispatch; surface it
+                // loudly rather than panicking inside a detached task where
+                // the panic would only surface as a silent JoinHandle error.
+                tracing::error!("scheduler HTTP API failed: {error}");
+            });
     });
 
     tracing::info!("Scheduler HTTP API listening on {}", scheduler_addr);
@@ -168,6 +278,39 @@ async fn main() -> anyhow::Result<()> {
     let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let pipeline_registry_clone = pipeline_registry.clone();
+
+    // Shared shutdown flag (created before the consumer so it can hold a
+    // handle; the handler itself spawns below, before the recovery passes).
+    let shutdown = create_shutdown_flag();
+    let shutdown_flag = shutdown.clone();
+    spawn_shutdown_handler(shutdown_flag);
+
+    // Start event consumer loop BEFORE the recovery passes below: the
+    // startup engine rebuild re-clones run workspaces and can take many
+    // minutes under load, and inlining it ahead of the consumer left
+    // post-restart triggers unpublished-to-nobody for that whole window
+    // (observed 2026-10-08: triggers 503ing 40+ minutes after a restart).
+    // The consumer is independent of recovery — reconciliation grades from
+    // durable rows, and a rebuild racing a fresh trigger only contends on
+    // the registry lock.
+    let shutdown_consumer = shutdown.clone();
+    let _consumer_handle = tokio::spawn(async move {
+        if let Err(e) = run_event_consumer(
+            event_bus_clone,
+            scheduler_clone,
+            pipeline_cache_clone,
+            scheduler_db_clone,
+            workspace_paths_clone,
+            run_workspace_paths_clone,
+            pipeline_registry_clone,
+            run_waiters_clone,
+            shutdown_consumer,
+        )
+        .await
+        {
+            tracing::error!("event consumer error: {}", e);
+        }
+    });
 
     // Recover runs stranded non-terminal by a previous process lifetime,
     // reclaim workspaces of already-terminal runs, then keep reconciling
@@ -195,46 +338,173 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(rebuilt, "startup engine rebuild complete");
         }
 
+        // The startup rebuild is one-shot: a rebuild that failed (transient
+        // clone outage, unreadable row) would otherwise leave the run's
+        // pending rows parked until the NEXT restart. Redrive periodically;
+        // the custody skip keeps passes idempotent, so healthy runs are
+        // untouched and only registry-absent runs are re-attempted.
+        {
+            let redrive_pool = pool.clone();
+            let redrive_scheduler = scheduler_arc.clone();
+            let redrive_registry = pipeline_registry.clone();
+            let redrive_workspaces = run_workspace_paths.clone();
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(Duration::from_secs(ENGINE_REDRIVE_INTERVAL_SECS));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Consume the immediate first tick: startup just rebuilt.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let rebuilt = rebuild_live_engines(
+                        &redrive_pool,
+                        &redrive_scheduler,
+                        &redrive_registry,
+                        &redrive_workspaces,
+                    )
+                    .await;
+                    if rebuilt > 0 {
+                        tracing::warn!(rebuilt, "periodic engine redrive recovered stalled runs");
+                    }
+                }
+            });
+        }
+
         let sweep_pool = pool.clone();
         tokio::spawn(async move {
             let finalized = reconcile_orphaned_runs(&sweep_pool).await;
             if finalized > 0 {
                 tracing::info!(finalized, "startup run reconciliation complete");
             }
+            sweep_ghost_jobs(&sweep_pool).await;
             let removed = sweep_terminal_workspaces(&sweep_pool).await;
             if removed > 0 {
                 tracing::info!(removed, "startup workspace sweep complete");
+            }
+            // Artifact retention (Phase 5.2): delete artifacts older than
+            // GITFORGE_ARTIFACT_RETENTION_DAYS (default 30). Read at the
+            // edge, once; the core sweep takes the duration as a value.
+            let retention_days: i64 = std::env::var("GITFORGE_ARTIFACT_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            let store = FileStorage::new(artifact_root_for_sweep())
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "artifact retention sweep: storage unavailable");
+                    e
+                });
+            if let Ok(store) = store {
+                match gitforge_storage::artifact::sweep_expired_artifacts(
+                    &store,
+                    chrono::Duration::days(retention_days),
+                )
+                .await
+                {
+                    Ok((removed, reclaimed)) if removed > 0 => tracing::info!(
+                        removed,
+                        reclaimed_bytes = reclaimed,
+                        retention_days,
+                        "artifact retention sweep complete"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "artifact retention sweep failed"),
+                }
             }
             run_reconciliation_loop(sweep_pool).await;
         });
     }
 
-    // Shared shutdown flag
-    let shutdown = create_shutdown_flag();
-    let shutdown_flag = shutdown.clone();
-
-    // Spawn graceful shutdown handler
-    spawn_shutdown_handler(shutdown_flag);
-
-    // Start event consumer loop
-    let shutdown_consumer = shutdown.clone();
-    let _consumer_handle = tokio::spawn(async move {
-        if let Err(e) = run_event_consumer(
-            event_bus_clone,
-            scheduler_clone,
-            pipeline_cache_clone,
-            scheduler_db_clone,
-            workspace_paths_clone,
-            run_workspace_paths_clone,
-            pipeline_registry_clone,
-            run_waiters_clone,
-            shutdown_consumer,
-        )
-        .await
-        {
-            tracing::error!("event consumer error: {}", e);
-        }
-    });
+    // Durable trigger-request sweep. A request recorded but never consumed
+    // (bus ring lag, consumer death, a restart between the durable insert
+    // and the publish) is republished here; a `processing` request whose
+    // process died mid-run is demoted and retried on the same cadence. This
+    // is the recovery half of the durable trigger queue: without it the
+    // pending rows the trigger endpoint now writes would become the new
+    // silent-loss class.
+    {
+        let sweep_db = scheduler_db.clone();
+        let sweep_bus = event_bus.clone();
+        let sweep_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(TRIGGER_SWEEP_SECS));
+            // Skip, not Delay: a slow sweep must not push every later sweep
+            // later; the next tick re-examines the same rows anyway.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The interval's first tick fires immediately; consume it so the
+            // sweep does not contend with startup recovery.
+            ticker.tick().await;
+            loop {
+                if sweep_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                ticker.tick().await;
+                let Some(pool) = sweep_db.as_ref() else {
+                    // Development in-memory mode records no durable requests.
+                    break;
+                };
+                let stale = match gitforge_db::queries::TriggerRequestQueries::requeue_stale(
+                    pool,
+                    chrono::Duration::seconds(TRIGGER_PENDING_REPUBLISH_AFTER_SECS),
+                    chrono::Duration::seconds(TRIGGER_PROCESSING_STALE_AFTER_SECS),
+                )
+                .await
+                {
+                    Ok(stale) => stale,
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "trigger sweep failed to requeue stale requests"
+                        );
+                        continue;
+                    }
+                };
+                for request in stale {
+                    if request.attempts > TRIGGER_MAX_ATTEMPTS {
+                        // Every retry already failed or hung past the budget;
+                        // retrying forever would hide a permanently broken
+                        // repository behind an ever-growing queue.
+                        let _ = gitforge_db::queries::TriggerRequestQueries::mark_failed(
+                            pool,
+                            request.id,
+                            "trigger processing budget exhausted",
+                            request.run_id,
+                        )
+                        .await;
+                        continue;
+                    }
+                    tracing::warn!(
+                        trigger = %request.id,
+                        repo = %request.repo_id,
+                        attempts = request.attempts,
+                        "republishing recovered trigger request"
+                    );
+                    let event = EventEnvelope::new(
+                        EventType::PushReceived,
+                        EventPayload::PushReceived(PushReceivedPayload {
+                            repo_id: request.repo_id,
+                            ref_name: request.ref_name.clone(),
+                            old_hash: request.old_hash.clone(),
+                            new_hash: request.new_hash.clone(),
+                            pusher_id: None,
+                        }),
+                        Some(request.repo_id),
+                        None,
+                    )
+                    .with_correlation(request.id);
+                    if let Err(error) = sweep_bus.publish(event).await {
+                        // The row stays pending/processing; the next sweep
+                        // picks it up again.
+                        tracing::error!(
+                            %error,
+                            trigger = %request.id,
+                            "trigger sweep republish failed"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     let completion_scheduler = scheduler_arc.clone();
     let completion_registry = pipeline_registry.clone();
@@ -252,9 +522,12 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
-    // Start scheduler loop
+    // Start scheduler loop. The 5 s tick bounds reconciliation; a wake on
+    // enqueue collapses the idle dispatch latency so a fresh job is assigned
+    // in milliseconds instead of waiting out the tick.
     let scheduler_clone = scheduler_arc.clone();
     let shutdown_scheduler = shutdown.clone();
+    let dispatch_wake = scheduler_arc.dispatch_wake_handle();
     let _scheduler_handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         loop {
@@ -262,7 +535,10 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("scheduler loop shutting down");
                 break;
             }
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                () = dispatch_wake.notified() => {}
+            }
             scheduler_clone.process_queue().await;
         }
     });
@@ -288,7 +564,12 @@ async fn main() -> anyhow::Result<()> {
     let watchdog_shutdown = shutdown.clone();
     let _timeout_handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(JOB_TIMEOUT_SWEEP_SECS));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip, not Delay: Delay accumulates drift when a sweep is slow (a
+        // 60s interval observed slipping to 43-minute effective enforcement
+        // under DB contention), and a late timeout decision is strictly
+        // worse than a skipped sweep interval because the next tick still
+        // catches everything the skipped one would have.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -476,6 +757,75 @@ async fn require_trigger_auth(request: Request, next: Next) -> Response {
     }
 }
 
+/// Read the durable trigger receipt and its pipeline state for CI clients.
+/// This exposes status only and uses the same narrow trigger credential as the
+/// enqueue endpoint; it does not require a user JWT or grant general API reads.
+async fn get_trigger_request_status(
+    Extension(trigger_state): Extension<Arc<TriggerState>>,
+    Path(request_id): Path<uuid::Uuid>,
+) -> Response {
+    let Some(pool) = trigger_state.db.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "trigger_status_unavailable"})),
+        )
+            .into_response();
+    };
+
+    let trigger_request =
+        match gitforge_db::queries::TriggerRequestQueries::get(pool, request_id).await {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "trigger_request_not_found"})),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                tracing::error!(%error, %request_id, "failed to read trigger request status");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "trigger_status_read_failed"})),
+                )
+                    .into_response();
+            }
+        };
+
+    let pipeline_status = if let Some(run_id) = trigger_request.run_id {
+        match gitforge_db::queries::PipelineRunQueries::get(pool, run_id).await {
+            Ok(Some(run)) => Some(run.status),
+            Ok(None) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": "trigger_pipeline_run_not_found"})),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                tracing::error!(%error, %request_id, %run_id, "failed to read triggered pipeline status");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "trigger_pipeline_status_read_failed"})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": trigger_request.status,
+            "pipeline_run_id": trigger_request.run_id.map(|id| id.to_string()),
+            "pipeline_status": pipeline_status,
+        })),
+    )
+        .into_response()
+}
+
 async fn trigger_pipeline(
     Extension(trigger_state): Extension<Arc<TriggerState>>,
     Json(request): Json<PipelineTriggerRequest>,
@@ -523,10 +873,62 @@ async fn trigger_pipeline(
     trigger_state
         .workspace_paths
         .lock()
-        .expect("workspace cache lock poisoned")
+        .unwrap_or_else(PoisonError::into_inner)
         .insert(repo_id, working_dir);
 
-    let event = EventEnvelope::new(
+    // Record the trigger durably BEFORE publishing: the in-memory bus loses
+    // everything on restart and drops events on ring lag, while the
+    // git-server has already marked its outbox row `delivered` on this very
+    // response. Without this row a restart between "delivered" and "run
+    // created" loses the trigger permanently — 11% of all deliveries on the
+    // live instance. A racing trigger for the same commit dedups onto the
+    // in-flight row instead of minting a duplicate run.
+    let trigger_request = if let Some(pool) = trigger_state.db.as_ref() {
+        let request = gitforge_db::models::PipelineTriggerRequest::new(
+            repo_id,
+            request.ref_name.clone(),
+            request.old_hash.clone(),
+            request.new_hash.clone(),
+        );
+        match gitforge_db::queries::TriggerRequestQueries::create_or_existing(pool, &request).await
+        {
+            Ok((existing, was_new)) => {
+                if !was_new {
+                    let run_id = existing.run_id.map(|id| id.to_string());
+                    return (
+                        StatusCode::ACCEPTED,
+                        Json(serde_json::json!({
+                            "status": if run_id.is_some() { "accepted" } else { "queued" },
+                            "event_id": existing.id.to_string(),
+                            "pipeline_run_id": run_id,
+                            "repo_id": repo_id.to_string(),
+                            "new_hash": request.new_hash,
+                            "deduplicated": true,
+                        })),
+                    );
+                }
+                Some(existing)
+            }
+            // A trigger the control plane cannot record is a trigger that
+            // can be lost: refuse it (503) so the git-server outbox keeps
+            // the event pending and redelivers, instead of answering 2xx
+            // for work that only exists in a volatile ring.
+            Err(error) => {
+                tracing::error!(%error, "failed to persist durable trigger request");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "trigger_not_durable",
+                        "message": error.to_string(),
+                    })),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut event = EventEnvelope::new(
         EventType::PushReceived,
         EventPayload::PushReceived(PushReceivedPayload {
             repo_id,
@@ -538,12 +940,15 @@ async fn trigger_pipeline(
         Some(repo_id),
         None,
     );
+    if let Some(recorded) = &trigger_request {
+        event = event.with_correlation(recorded.id);
+    }
 
     let (run_tx, run_rx) = tokio::sync::oneshot::channel();
     trigger_state
         .run_waiters
         .lock()
-        .expect("run waiter lock poisoned")
+        .unwrap_or_else(PoisonError::into_inner)
         .insert(event.event_id, run_tx);
 
     match trigger_state.event_bus.publish(event.clone()).await {
@@ -557,7 +962,8 @@ async fn trigger_pipeline(
             // (`gitforge_common::CI_TRIGGER_CORRELATION_WINDOW`) so their
             // request budgets are derived from this one; a window that
             // elapses under write contention still answers `queued` — the
-            // run is created by the consumer either way.
+            // durable trigger request guarantees the consumer creates the
+            // run either way (the sweep republishes lost events).
             let pipeline_run_id =
                 tokio::time::timeout(gitforge_common::CI_TRIGGER_CORRELATION_WINDOW, run_rx)
                     .await
@@ -567,7 +973,7 @@ async fn trigger_pipeline(
                 trigger_state
                     .run_waiters
                     .lock()
-                    .expect("run waiter lock poisoned")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .remove(&event.event_id);
             }
             (
@@ -576,18 +982,32 @@ async fn trigger_pipeline(
                     "status": if pipeline_run_id.is_some() { "accepted" } else { "queued" },
                     "event_id": event.event_id.to_string(),
                     "pipeline_run_id": pipeline_run_id.map(|id| id.to_string()),
+                    "trigger_id": trigger_request.map(|request| request.id.to_string()),
                     "repo_id": repo_id.to_string(),
                     "new_hash": request.new_hash,
                 })),
             )
         }
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "event_publish_failed",
-                "message": error.to_string(),
-            })),
-        ),
+        // The request row stays `pending`: the trigger sweep republishes it
+        // within a minute, so the trigger survives even though this bus
+        // delivery failed.
+        Err(error) => {
+            // No event is in flight, so the correlation waiter must not
+            // linger: a leaked sender makes the sweep-recovered event's
+            // response path answer a waiter nobody holds.
+            trigger_state
+                .run_waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&event.event_id);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "event_publish_failed",
+                    "message": error.to_string(),
+                })),
+            )
+        }
     }
 }
 
@@ -662,11 +1082,18 @@ async fn load_pipeline_from_commit(
         }
 
         let yaml = String::from_utf8(show.stdout).map_err(|error| {
-            anyhow::anyhow!("{config_path} at {commit_hash} is not valid UTF-8: {error}")
+            // Bytes that are not valid UTF-8 can never parse as a pipeline
+            // definition, so re-attempting only spends the retry budget.
+            // Classify with the unparseable-definition failures: terminal.
+            anyhow::Error::new(InvalidPipelineConfig(format!(
+                "{config_path} at {commit_hash} is not valid UTF-8: {error}"
+            )))
         })?;
-        return PipelineDefinition::parse(&yaml)
-            .map(Some)
-            .map_err(|error| anyhow::anyhow!("invalid {config_path} at {commit_hash}: {error}"));
+        return PipelineDefinition::parse(&yaml).map(Some).map_err(|error| {
+            anyhow::Error::new(InvalidPipelineConfig(format!(
+                "invalid {config_path} at {commit_hash}: {error}"
+            )))
+        });
     }
     Ok(None)
 }
@@ -677,6 +1104,16 @@ fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(
         std::env::var("GITFORGE_WORKSPACE_ROOT")
             .unwrap_or_else(|_| "/var/lib/gitforge/workspaces".to_string()),
+    )
+}
+
+/// Same contract as the startup binding (`GITFORGE_ARTIFACT_ROOT`); the
+/// retention sweep re-derives it rather than threading the storage handle
+/// through main's ownership moves.
+fn artifact_root_for_sweep() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("GITFORGE_ARTIFACT_ROOT")
+            .unwrap_or_else(|_| "target/gitforge-artifacts".to_string()),
     )
 }
 
@@ -732,27 +1169,31 @@ struct CleanupCommand {
     args: Vec<OsString>,
 }
 
-fn cleanup_command(backend: ContainerBackend, workspace: &std::path::Path) -> CleanupCommand {
+/// Build the container-assisted removal command for a validated run
+/// workspace. Returns `None` when the backend+path combination admits no
+/// safe command (only possible for a path with no parent or no final
+/// component — never true of GitForge-created `<root>/<run id>` paths);
+/// callers treat that as any other best-effort cleanup miss.
+fn cleanup_command(
+    backend: ContainerBackend,
+    workspace: &std::path::Path,
+) -> Option<CleanupCommand> {
     match backend {
-        ContainerBackend::Podman => CleanupCommand {
+        ContainerBackend::Podman => Some(CleanupCommand {
             program: "podman",
             args: ["unshare", "rm", "-rf", "--"]
                 .into_iter()
                 .map(OsString::from)
                 .chain(std::iter::once(workspace.as_os_str().to_os_string()))
                 .collect(),
-        },
+        }),
         ContainerBackend::Docker => {
             // Mount the trusted parent and remove only the validated run
             // directory from inside the container. No shell is involved, and
             // the container cannot follow a path outside this bind mount.
-            let parent = workspace
-                .parent()
-                .expect("validated run workspace always has a parent");
-            let name = workspace
-                .file_name()
-                .expect("validated run workspace always has a name");
-            CleanupCommand {
+            let parent = workspace.parent()?;
+            let name = workspace.file_name()?;
+            Some(CleanupCommand {
                 program: "docker",
                 args: [
                     "run",
@@ -777,12 +1218,13 @@ fn cleanup_command(backend: ContainerBackend, workspace: &std::path::Path) -> Cl
                         .into_os_string(),
                 ))
                 .collect(),
-            }
+            })
         }
     }
 }
 
-async fn run_cleanup_command(command: CleanupCommand) -> Option<std::process::Output> {
+async fn run_cleanup_command(command: Option<CleanupCommand>) -> Option<std::process::Output> {
+    let command = command?;
     timeout(
         Duration::from_secs(120),
         tokio::process::Command::new(command.program)
@@ -1065,7 +1507,7 @@ async fn reconcile_orphaned_runs_filtered(
     pool: &gitforge_db::Pool,
     min_age: chrono::Duration,
 ) -> usize {
-    let runs = match gitforge_db::queries::PipelineRunQueries::list(pool).await {
+    let runs = match gitforge_db::queries::PipelineRunQueries::list_non_terminal(pool).await {
         Ok(runs) => runs,
         Err(error) => {
             tracing::warn!(%error, "run reconciliation skipped");
@@ -1307,6 +1749,37 @@ async fn run_reconciliation_loop(pool: gitforge_db::Pool) {
                 tracing::info!(removed, "periodic workspace sweep complete");
             }
         }
+        // Every tick, not only when something finalized: the sweep is a
+        // single indexed UPDATE and is the safety net for any path that
+        // strands a never-dispatched row under a terminal run without
+        // passing through a per-run sweep.
+        sweep_ghost_jobs(&pool).await;
+    }
+}
+
+/// Cancel every never-dispatched job row sitting under an already-terminal
+/// run, across all runs. This is the backlog cleaner for rows stranded by
+/// finalization paths that predate the per-run sweeps — on first boot after
+/// upgrade it reclaims the whole historical accumulation in one pass.
+/// Returns the number of rows cancelled (0 on error; failures log and move
+/// on rather than stall the reconciliation loop).
+async fn sweep_ghost_jobs(pool: &gitforge_db::Pool) -> u64 {
+    match gitforge_db::queries::JobQueries::cancel_unclaimed_in_terminal_runs(pool).await {
+        Ok(0) => 0,
+        Ok(count) => {
+            tracing::info!(
+                count,
+                "cancelled never-dispatched job rows under terminal runs"
+            );
+            count
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "failed to sweep never-dispatched job rows under terminal runs"
+            );
+            0
+        }
     }
 }
 
@@ -1422,24 +1895,21 @@ async fn prepare_run_workspace(
         // run this way). Adopt the directory instead: force the tracked tree
         // back to the run's commit and clear job leftovers so a resumed
         // stage sees fresh-checkout state.
-        let repair = tokio::process::Command::new("git")
+        let mut repair = tokio::process::Command::new("git");
+        repair
             .arg("-C")
             .arg(&workspace)
-            .args(["checkout", "--force", "--detach", commit_hash])
-            .output()
-            .await?;
+            .args(["checkout", "--force", "--detach", commit_hash]);
+        let repair = run_git_output(repair, "adopt checkout", workspace_prep_timeout()).await?;
         if !repair.status.success() {
             return Err(anyhow::anyhow!(
                 "workspace for run {run_id} exists but could not be adopted at commit {commit_hash}: {}",
                 String::from_utf8_lossy(&repair.stderr).trim()
             ));
         }
-        let clean = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&workspace)
-            .args(["clean", "-fdx"])
-            .output()
-            .await?;
+        let mut clean = tokio::process::Command::new("git");
+        clean.arg("-C").arg(&workspace).args(["clean", "-fdx"]);
+        let clean = run_git_output(clean, "adopt clean", workspace_prep_timeout()).await?;
         if !clean.status.success() {
             return Err(anyhow::anyhow!(
                 "workspace for run {run_id} adopted but could not be cleaned: {}",
@@ -1453,14 +1923,14 @@ async fn prepare_run_workspace(
     // Do not request Git's hard-link-based local clone optimization here.
     // Workspace and repository storage may be mounted with policies that
     // reject hard links; a regular clone is portable across those filesystems.
-    let clone = tokio::process::Command::new("git")
-        // --no-local: avoid hard links and local-object alternates for
-        // portability across protected or differently-owned storage.
+    let mut clone = tokio::process::Command::new("git");
+    // --no-local: avoid hard links and local-object alternates for
+    // portability across protected or differently-owned storage.
+    clone
         .args(["clone", "--no-local", "--no-checkout"])
         .arg(&source)
-        .arg(&workspace)
-        .output()
-        .await?;
+        .arg(&workspace);
+    let clone = run_git_output(clone, "clone", workspace_prep_timeout()).await?;
     if !clone.status.success() {
         return Err(anyhow::anyhow!(
             "checkout clone failed for run {}: {}",
@@ -1469,12 +1939,12 @@ async fn prepare_run_workspace(
         ));
     }
 
-    let checkout = tokio::process::Command::new("git")
+    let mut checkout = tokio::process::Command::new("git");
+    checkout
         .arg("-C")
         .arg(&workspace)
-        .args(["checkout", "--detach", commit_hash])
-        .output()
-        .await?;
+        .args(["checkout", "--detach", commit_hash]);
+    let checkout = run_git_output(checkout, "checkout", workspace_prep_timeout()).await?;
     if !checkout.status.success() {
         return Err(anyhow::anyhow!(
             "checkout commit {} failed for run {}: {}",
@@ -1485,6 +1955,53 @@ async fn prepare_run_workspace(
     }
 
     Ok(workspace.to_string_lossy().into_owned())
+}
+
+/// Wall-clock budget for one workspace-prep git command.
+///
+/// Workspace prep runs inside the push handler, so one hung child wedged the
+/// whole corridor: a `git clone --no-local` that never returned left the run
+/// row `running` with zero jobs forever (observed 2026-10-06, run 7a612e78:
+/// clone at 12m36s etime, empty workspace, nothing reaped it). The default
+/// sits far above the slowest observed legitimate clone — the reconciler's
+/// own grace window documents multi-gigabyte clones at minutes — and the
+/// override exists for hosts that legitimately need longer.
+fn workspace_prep_timeout() -> Duration {
+    parse_workspace_prep_timeout(std::env::var("GITFORGE_WORKSPACE_PREP_TIMEOUT_SECS").ok())
+}
+
+/// Parse the workspace-prep budget override; any unusable value (unset,
+/// non-numeric, zero) falls back to the default. Split from
+/// [`workspace_prep_timeout`] so the parsing contract is testable without
+/// racing other tests over the process environment.
+fn parse_workspace_prep_timeout(value: Option<String>) -> Duration {
+    let seconds = value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&seconds| seconds > 0);
+    Duration::from_secs(seconds.unwrap_or(300))
+}
+
+/// Run one workspace-prep git command under the prep budget.
+///
+/// `kill_on_drop` is the part that actually bounds the damage: on timeout the
+/// `output()` future is dropped, and without the kill flag the child would
+/// outlive its future and keep cloning — the exact unbounded state this
+/// helper exists to prevent.
+async fn run_git_output(
+    mut command: tokio::process::Command,
+    step: &str,
+    budget: Duration,
+) -> anyhow::Result<std::process::Output> {
+    command.kill_on_drop(true);
+    match timeout(budget, command.output()).await {
+        Ok(output) => output.map_err(|error| {
+            anyhow::anyhow!("workspace prep step '{step}' failed to spawn: {error}")
+        }),
+        Err(_) => Err(anyhow::anyhow!(
+            "workspace prep step '{step}' exceeded its {}s budget and was killed",
+            budget.as_secs()
+        )),
+    }
 }
 
 /// Create the shutdown future that waits for shutdown signal
@@ -1501,7 +2018,75 @@ pub async fn graceful_shutdown_delay() {
     .ok();
 }
 
-/// Run the event consumer loop
+/// How many trigger requests may run concurrently across all repositories.
+/// A repository's own events stay strictly ordered; the cap bounds how many
+/// repositories' clones and checkouts can proceed at once.
+const DEFAULT_TRIGGER_CONCURRENCY: usize = 4;
+
+/// The repository a trigger event belongs to, for lane assignment.
+fn event_repo_id(event: &EventEnvelope) -> gitforge_common::RepoId {
+    match &event.payload {
+        EventPayload::PushReceived(payload) => payload.repo_id,
+        _ => gitforge_common::RepoId::from(uuid::Uuid::nil()),
+    }
+}
+
+/// Spawn a per-repository lane: its events are processed FIFO, so a push and
+/// its follow-up land in order. The sender lives in the lane map for the
+/// process lifetime.
+#[allow(clippy::too_many_arguments)]
+fn spawn_trigger_lane(
+    scheduler: Arc<Scheduler>,
+    pipeline_cache: Arc<std::sync::Mutex<PipelineCache>>,
+    scheduler_db: Option<gitforge_db::Pool>,
+    workspace_paths: Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    run_workspace_paths: Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
+    pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
+    run_waiters: Arc<
+        std::sync::Mutex<
+            HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
+        >,
+    >,
+    permits: Arc<tokio::sync::Semaphore>,
+) -> tokio::sync::mpsc::UnboundedSender<EventEnvelope> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<EventEnvelope>();
+    tokio::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            // The semaphore bounds total concurrency across repositories;
+            // because the lane is FIFO, a repository's own ordering holds
+            // even while its second event waits for a permit.
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                break;
+            };
+            process_trigger_event(
+                &event,
+                &scheduler,
+                &pipeline_cache,
+                scheduler_db.as_ref(),
+                &workspace_paths,
+                &run_workspace_paths,
+                &pipeline_registry,
+                &run_waiters,
+            )
+            .await;
+            drop(permit);
+        }
+    });
+    sender
+}
+
+/// Run the event consumer loop.
+///
+/// Events are dispatched to one lane per repository: a repository's events
+/// are processed FIFO while different repositories proceed concurrently up
+/// to `GITFORGE_TRIGGER_CONCURRENCY`. The single global consumer this
+/// replaces serialized every push behind every other push's clone — measured
+/// backlogs ran 15-44 minutes under load. The loop also re-subscribes when
+/// the bus stream closes: the consumer used to exit permanently while the
+/// HTTP trigger endpoint kept answering 2xx for events nobody would ever
+/// process.
 #[allow(clippy::too_many_arguments)]
 async fn run_event_consumer(
     event_bus: Arc<dyn EventBus>,
@@ -1522,9 +2107,17 @@ async fn run_event_consumer(
 ) -> anyhow::Result<()> {
     tracing::info!("starting event consumer loop");
 
-    // Subscribe to push events
-    let filter = EventFilter::for_types(vec![EventType::PushReceived]);
-    let mut stream = event_bus.subscribe(filter).await?;
+    let concurrency = std::env::var("GITFORGE_TRIGGER_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_TRIGGER_CONCURRENCY);
+    let permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let lanes: Arc<
+        std::sync::Mutex<
+            HashMap<gitforge_common::RepoId, tokio::sync::mpsc::UnboundedSender<EventEnvelope>>,
+        >,
+    > = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -1532,38 +2125,177 @@ async fn run_event_consumer(
             break;
         }
 
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_millis(100)) => {
-                if shutdown.load(Ordering::SeqCst) {
-                    break;
+        // Subscribe to push events
+        let filter = EventFilter::for_types(vec![EventType::PushReceived]);
+        let mut stream = event_bus.subscribe(filter).await?;
+
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if shutdown.load(Ordering::SeqCst) {
+                        tracing::info!("event consumer loop shutting down");
+                        return Ok(());
+                    }
                 }
-            }
-            event = stream.next() => {
-                match event {
-                    Some(event) => {
-                        tracing::debug!("received event: {:?}", event.event_type);
-                        match handle_push_event(&event, &scheduler, &pipeline_cache, scheduler_db.as_ref(), &workspace_paths, &run_workspace_paths, &pipeline_registry).await {
-                            Ok(run_id) => {
-                                if let Some(waiter) = run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id) {
-                                    let _ = waiter.send(run_id);
-                                }
-                            }
-                            Err(e) => {
-                                run_waiters.lock().expect("run waiter lock poisoned").remove(&event.event_id);
-                                tracing::error!("failed to handle push event: {}", e);
+                event = futures::StreamExt::next(&mut stream) => {
+                    match event {
+                        Some(event) => {
+                            tracing::debug!("received event: {:?}", event.event_type);
+                            let lane_sender = {
+                                let mut lanes = lanes
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                lanes
+                                    .entry(event_repo_id(&event))
+                                    .or_insert_with(|| {
+                                        spawn_trigger_lane(
+                                            scheduler.clone(),
+                                            pipeline_cache.clone(),
+                                            scheduler_db.clone(),
+                                            workspace_paths.clone(),
+                                            run_workspace_paths.clone(),
+                                            pipeline_registry.clone(),
+                                            run_waiters.clone(),
+                                            permits.clone(),
+                                        )
+                                    })
+                                    .clone()
+                            };
+                            if let Err(error) = lane_sender.send(event) {
+                                tracing::error!(%error, "trigger lane rejected its event");
                             }
                         }
-                    }
-                    None => {
-                        tracing::info!("event stream closed");
-                        break;
+                        None => {
+                            tracing::warn!("event stream closed; resubscribing");
+                            break;
+                        }
                     }
                 }
             }
         }
+
+        // Brief pause so a dead bus cannot turn into a resubscribe spin.
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
     Ok(())
+}
+
+/// Process one trigger event end to end: mark the durable request in flight,
+/// drive the pipeline, then settle the request and the correlation waiter
+/// from the real outcome.
+#[allow(clippy::too_many_arguments)]
+async fn process_trigger_event(
+    event: &EventEnvelope,
+    scheduler: &Arc<Scheduler>,
+    pipeline_cache: &Arc<std::sync::Mutex<PipelineCache>>,
+    scheduler_db: Option<&gitforge_db::Pool>,
+    workspace_paths: &Arc<std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>>,
+    run_workspace_paths: &Arc<
+        std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+    >,
+    pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
+    run_waiters: &Arc<
+        std::sync::Mutex<
+            HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<gitforge_common::PipelineRunId>>,
+        >,
+    >,
+) {
+    let request_id = event.correlation_id;
+    if let (Some(pool), Some(request_id)) = (scheduler_db, request_id) {
+        if let Err(error) =
+            gitforge_db::queries::TriggerRequestQueries::mark_processing(pool, request_id).await
+        {
+            tracing::error!(%error, trigger = %request_id, "failed to mark trigger request processing");
+        }
+    }
+
+    match handle_push_event(
+        event,
+        scheduler,
+        pipeline_cache,
+        scheduler_db,
+        workspace_paths,
+        run_workspace_paths,
+        pipeline_registry,
+    )
+    .await
+    {
+        Ok(TriggerOutcome::Started(run_id)) => {
+            if let (Some(pool), Some(request_id)) = (scheduler_db, request_id) {
+                if let Err(error) = gitforge_db::queries::TriggerRequestQueries::mark_completed(
+                    pool, request_id, run_id,
+                )
+                .await
+                {
+                    tracing::error!(%error, trigger = %request_id, "failed to mark trigger request completed");
+                }
+            }
+            if let Some(waiter) = run_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&event.event_id)
+            {
+                let _ = waiter.send(run_id);
+            }
+        }
+        Ok(TriggerOutcome::Ignored) => {
+            // No run corresponds to this event. Dropping the waiter makes
+            // the correlating caller answer `queued` instead of receiving a
+            // fabricated run id that names no row.
+            run_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&event.event_id);
+        }
+        Err(failure) => {
+            run_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&event.event_id);
+            tracing::error!(
+                error = %failure.error,
+                retryable = failure.retryable,
+                "failed to handle push event"
+            );
+            if let (Some(pool), Some(request_id)) = (scheduler_db, request_id) {
+                settle_trigger_failure(pool, request_id, &failure).await;
+            }
+        }
+    }
+}
+
+/// Settle a trigger request whose processing failed: terminal when a retry
+/// provably cannot help or the budget is spent, otherwise back to `pending`
+/// where the sweep republishes it after the backoff. Split out from the
+/// consumer so the decision is directly unit-testable — every retryable
+/// failure inducible through the full flow (DB busy, git spawn) is
+/// environment-dependent, and the durable queue's FK to `repositories`
+/// means the unregistered-repo branch can never hold a durable row.
+async fn settle_trigger_failure(
+    pool: &gitforge_db::Pool,
+    request_id: uuid::Uuid,
+    failure: &TriggerFailure,
+) {
+    let attempts = gitforge_db::queries::TriggerRequestQueries::get(pool, request_id)
+        .await
+        .ok()
+        .flatten()
+        .map_or(0, |request| request.attempts);
+    let settled = if !failure.retryable || attempts >= TRIGGER_MAX_ATTEMPTS {
+        gitforge_db::queries::TriggerRequestQueries::mark_failed(
+            pool,
+            request_id,
+            &failure.error.to_string(),
+            failure.run_id,
+        )
+        .await
+    } else {
+        gitforge_db::queries::TriggerRequestQueries::mark_retry(pool, request_id).await
+    };
+    if let Err(error) = settled {
+        tracing::error!(%error, trigger = %request_id, "failed to settle trigger request after failure");
+    }
 }
 
 /// Handle a push received event - trigger pipeline if configured
@@ -1577,10 +2309,10 @@ async fn handle_push_event(
         std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
     >,
     pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
-) -> anyhow::Result<gitforge_common::PipelineRunId> {
+) -> Result<TriggerOutcome, TriggerFailure> {
     // Only handle PushReceived events
     let EventPayload::PushReceived(payload) = &event.payload else {
-        return Ok(gitforge_common::PipelineRunId::new());
+        return Ok(TriggerOutcome::Ignored);
     };
 
     // Belt-and-suspenders for the git-server's deletion filter (F37): an
@@ -1594,7 +2326,7 @@ async fn handle_push_event(
             ref_name = %payload.ref_name,
             "ignoring ref-deletion push: nothing to build"
         );
-        return Ok(gitforge_common::PipelineRunId::new());
+        return Ok(TriggerOutcome::Ignored);
     }
 
     let repo_id = payload.repo_id;
@@ -1616,7 +2348,15 @@ async fn handle_push_event(
     let committed_pipeline = match scheduler_db {
         Some(pool) => match load_pipeline_from_commit(pool, repo_id, &payload.new_hash).await {
             Ok(pipeline) => pipeline,
-            Err(error) => return Err(error),
+            Err(error) => {
+                // A committed definition that cannot be parsed will fail on
+                // every retry; everything else (DB busy, git spawn) may
+                // resolve and keeps its retry budget.
+                if error.is::<InvalidPipelineConfig>() {
+                    return Err(TriggerFailure::terminal(error));
+                }
+                return Err(TriggerFailure::retryable(error));
+            }
         },
         None => None,
     };
@@ -1628,13 +2368,20 @@ async fn handle_push_event(
         );
         committed
     } else {
-        let cached_pipeline = { pipeline_cache.lock().unwrap().get(&repo_id).cloned() };
+        let cached_pipeline = {
+            pipeline_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&repo_id)
+                .cloned()
+        };
         if let Some(cached) = cached_pipeline {
             cached
         } else {
             let persisted = if let Some(pool) = scheduler_db {
                 gitforge_db::queries::PipelineQueries::list_by_repo(pool, repo_id)
-                    .await?
+                    .await
+                    .map_err(|e| TriggerFailure::retryable(e.into()))?
                     .into_iter()
                     .find_map(|pipeline| {
                         serde_json::from_value::<PipelineDefinition>(pipeline.config).ok()
@@ -1647,11 +2394,11 @@ async fn handle_push_event(
     };
     pipeline_cache
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(repo_id, pipeline.clone());
     let requested_workspace = workspace_paths
         .lock()
-        .expect("workspace cache lock poisoned")
+        .unwrap_or_else(PoisonError::into_inner)
         .get(&repo_id)
         .cloned()
         .flatten();
@@ -1661,8 +2408,15 @@ async fn handle_push_event(
     let pipeline_id = trigger_event.pipeline_id;
 
     // Create and start the CI engine
-    let engine = Arc::new(CiEngine::new(trigger_event, pipeline.clone()).await?);
-    engine.start().await?;
+    let engine = Arc::new(
+        CiEngine::new(trigger_event, pipeline.clone())
+            .await
+            .map_err(|e| TriggerFailure::terminal(e.into()))?,
+    );
+    engine
+        .start()
+        .await
+        .map_err(|e| TriggerFailure::terminal(e.into()))?;
 
     tracing::info!(
         "pipeline triggered for repo {} on ref {}",
@@ -1676,22 +2430,22 @@ async fn handle_push_event(
 
     let state = engine.state().await;
     if let Some(pool) = scheduler_db {
+        // Pipeline version + run row land in one BEGIN IMMEDIATE
+        // transaction (activate_pipeline_and_create_run). The previous
+        // three-write sequence could be interrupted between writes, leaving
+        // a retired pipeline version with no run row — a hollow run the
+        // reconciler could never see, and the shape of every
+        // restart-correlated loss in the 2026-10-03 evidence.
         let db_pipeline = DbPipeline {
             id: pipeline_id,
             repo_id,
             name: pipeline.name.clone(),
             trigger_type: "push".to_string(),
-            config: serde_json::to_value(&pipeline)?,
+            config: serde_json::to_value(&pipeline)
+                .map_err(|e| TriggerFailure::terminal(e.into()))?,
             created_at: Utc::now(),
+            active: true,
         };
-        // Only one active pipeline version per (repo, name) is allowed by
-        // idx_pipelines_active_repo_name — retire the predecessor before
-        // recording this push's version, or every push after the first
-        // fails run creation with a constraint violation.
-        gitforge_db::queries::PipelineQueries::deactivate_active(pool, repo_id, &pipeline.name)
-            .await?;
-        gitforge_db::queries::PipelineQueries::create(pool, &db_pipeline).await?;
-
         let mut db_run = DbPipelineRun::new(
             pipeline_id,
             repo_id,
@@ -1700,35 +2454,42 @@ async fn handle_push_event(
         );
         db_run.id = state.run_id;
         db_run.start();
-        gitforge_db::queries::PipelineRunQueries::create(pool, &db_run).await?;
+        gitforge_db::queries::PipelineQueries::activate_pipeline_and_create_run(
+            pool,
+            &db_pipeline,
+            &db_run,
+        )
+        .await
+        .map_err(|e| TriggerFailure::retryable(e.into()))?;
     }
 
     let workspace_path = match requested_workspace {
         Some(path) => Some(path),
         None => {
             let pool = scheduler_db.ok_or_else(|| {
-                anyhow::anyhow!(
+                TriggerFailure::terminal(anyhow::anyhow!(
                     "push run {} has no workspace and durable repository storage is unavailable",
                     state.run_id
-                )
+                ))
             })?;
             match prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await {
                 Ok(path) => Some(path),
                 Err(error) => {
-                    let _ = gitforge_db::queries::PipelineRunQueries::update_status(
-                        pool,
-                        state.run_id,
-                        "failed",
-                    )
-                    .await;
-                    return Err(error);
+                    // The cause must survive the process: a failed run with
+                    // zero job rows is otherwise indistinguishable from a
+                    // silent planning crash once the log has rotated.
+                    fail_run(pool, state.run_id, &error).await;
+                    // The run row exists and is graded failed; re-running the
+                    // trigger would only duplicate it. The request records the
+                    // failed run so the outcome stays traceable.
+                    return Err(TriggerFailure::terminal_after_run(error, state.run_id));
                 }
             }
         }
     };
     run_workspace_paths
         .lock()
-        .expect("workspace cache lock poisoned")
+        .unwrap_or_else(PoisonError::into_inner)
         .insert(state.run_id, workspace_path.clone());
     pipeline_registry
         .write()
@@ -1749,16 +2510,11 @@ async fn handle_push_event(
             // Without the planned rows a restart cannot resume this run; a
             // half-planned run must not be left non-terminal.
             tracing::error!(run = %state.run_id, %error, "failed to persist planned jobs");
-            let _ = gitforge_db::queries::PipelineRunQueries::update_status(
-                pool,
-                state.run_id,
-                "failed",
-            )
-            .await;
+            fail_run(pool, state.run_id, &error).await;
             pipeline_registry.write().await.remove(&state.run_id);
             if let Some(path) = run_workspace_paths
                 .lock()
-                .expect("workspace cache lock poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .remove(&state.run_id)
                 .flatten()
             {
@@ -1766,7 +2522,7 @@ async fn handle_push_event(
                     let _ = tokio::fs::remove_dir_all(path).await;
                 });
             }
-            return Err(error);
+            return Err(TriggerFailure::terminal_after_run(error, state.run_id));
         }
     }
 
@@ -1779,7 +2535,7 @@ async fn handle_push_event(
     )
     .await;
 
-    Ok(state.run_id)
+    Ok(TriggerOutcome::Started(state.run_id))
 }
 
 /// Converge engine job state with scheduler rows that went terminal
@@ -1840,6 +2596,66 @@ async fn reconcile_fenced_engines(
     reconciled
 }
 
+/// Merge the `CI_CHANGE_*` variables a completed job published into the
+/// engine's run environment.
+///
+/// `skip_if` expressions are evaluated against exactly this environment, so a
+/// job whose variables are never merged prunes every gated downstream job:
+/// the expression sees an unset variable, evaluates false, and the gate that
+/// should have run is silently skipped. The receipt is read from the durable
+/// job row, which the scheduler writes before it publishes the completion.
+async fn merge_completed_job_env(
+    engine: &CiEngine,
+    pool: Option<&gitforge_db::Pool>,
+    job_id: gitforge_common::JobId,
+) {
+    let Some(pool) = pool else {
+        return;
+    };
+    let job = match gitforge_db::queries::JobQueries::get(pool, job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, %job_id, "failed to read completed job receipt");
+            return;
+        }
+    };
+    let Some(result_json) = job.result_json.as_deref() else {
+        return;
+    };
+    let env = gitforge_ci::engine::extract_change_env(result_json);
+    if env.is_empty() {
+        return;
+    }
+    engine.merge_job_result(job_id, &env).await;
+    tracing::info!(%job_id, variables = env.len(), "merged job output into pipeline env");
+}
+
+/// Persist a durable row for every job the engine skipped.
+///
+/// A skipped job never reaches a runner, so nothing else would move its
+/// planned row off `pending` — the run would never settle and the release
+/// gate would never see the row it requires. The receipt is deterministic, so
+/// a repeated write is idempotent.
+async fn persist_skipped_job_rows(pool: Option<&gitforge_db::Pool>, engine: &CiEngine) {
+    let Some(pool) = pool else {
+        return;
+    };
+    for job_id in engine.skipped_jobs().await {
+        let receipt = serde_json::json!({
+            "job_id": job_id.to_string(),
+            "skipped": true,
+            "status": "skipped",
+        })
+        .to_string();
+        if let Err(error) =
+            gitforge_db::queries::JobQueries::complete(pool, job_id, "skipped", &receipt).await
+        {
+            tracing::error!(%error, %job_id, "failed to persist skipped job row");
+        }
+    }
+}
+
 async fn run_scheduler_event_consumer(
     scheduler: Arc<Scheduler>,
     pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>>,
@@ -1890,9 +2706,17 @@ async fn run_scheduler_event_consumer(
                 tracing::error!(%job_id, %error, "failed to mark job succeeded");
                 continue;
             }
+            // The job's receipt is the only source of the CI_CHANGE_* vars
+            // that `skip_if` conditions are evaluated against. Merging them
+            // has to happen before the downstream release: an unmerged
+            // receipt leaves the expression environment empty, every
+            // condition evaluates false, and the engine silently prunes
+            // every gated job.
+            merge_completed_job_env(&engine, scheduler_db.as_ref(), job_id).await;
             if let Err(error) = engine.queue_ready_jobs().await {
                 tracing::error!(%pipeline_run_id, %error, "failed to queue downstream jobs");
             }
+            persist_skipped_job_rows(scheduler_db.as_ref(), &engine).await;
         } else {
             if let Err(error) = engine
                 .fail_job(job_id, -1, "runner reported failure".to_string())
@@ -1905,7 +2729,7 @@ async fn run_scheduler_event_consumer(
         let state = engine.state().await;
         let workspace_path = run_workspace_paths
             .lock()
-            .expect("workspace cache lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&state.run_id)
             .cloned()
             .flatten();
@@ -1931,7 +2755,8 @@ async fn run_scheduler_event_consumer(
 }
 
 /// Finalize `engine`'s run once it has reached a terminal status: persist the
-/// status, free the run's workspace, and evict the engine from the registry.
+/// status, sweep any never-dispatched job rows left behind by a non-success
+/// verdict, free the run's workspace, and evict the engine from the registry.
 /// Shared by the completion consumer and the timeout watchdog so a job reaped
 /// by the watchdog finalizes exactly like one reported by a runner. Runs that
 /// are not terminal yet are left untouched.
@@ -1971,10 +2796,13 @@ async fn finalize_run_if_terminal(
             );
             return;
         }
+        if terminal_status != "succeeded" {
+            sweep_unclaimed_jobs(pool, state.run_id).await;
+        }
     }
     let workspace_path = run_workspace_paths
         .lock()
-        .expect("workspace cache lock poisoned")
+        .unwrap_or_else(PoisonError::into_inner)
         .remove(&state.run_id)
         .flatten();
     // Free the checkout once nothing references it. Spawned so a large delete
@@ -1986,6 +2814,59 @@ async fn finalize_run_if_terminal(
         remove_run_workspace_dir(&root, run_id, workspace_path.as_deref()).await;
     });
     pipeline_registry.write().await.remove(&state.run_id);
+}
+
+/// Record a run's failure cause durably, then sweep any job rows the run
+/// left unclaimed.
+///
+/// Both halves answer the same defect from opposite sides: the reason makes
+/// the run explain itself in the API (a zero-job failed run's cause
+/// otherwise lives only in the process log), and the sweep keeps the run's
+/// `pending`/`queued` rows from outliving it — once the run row is terminal
+/// the orphan reconciler skips it forever, so an unswept row can never reach
+/// a terminal state on its own (observed 2026-10-06, run 84e2ab37: `fmt`
+/// succeeded, `clippy` failed, `test` and `coverage` pending for hours after
+/// the run was graded `failed`).
+async fn fail_run(
+    pool: &gitforge_db::Pool,
+    run_id: gitforge_common::PipelineRunId,
+    error: &anyhow::Error,
+) {
+    let reason = format!("{error:#}");
+    if let Err(status_error) = gitforge_db::queries::PipelineRunQueries::update_status_with_error(
+        pool,
+        run_id,
+        "failed",
+        Some(&reason),
+    )
+    .await
+    {
+        tracing::error!(%status_error, run = %run_id, "failed to persist run failure reason");
+    }
+    sweep_unclaimed_jobs(pool, run_id).await;
+}
+
+/// Cancel the run's never-dispatched (`pending`/`queued`) job rows. Best
+/// effort: a failed sweep logs and moves on, leaving the rows legible to a
+/// future operator pass rather than hiding behind a swallowed error.
+async fn sweep_unclaimed_jobs(pool: &gitforge_db::Pool, run_id: gitforge_common::PipelineRunId) {
+    match gitforge_db::queries::JobQueries::cancel_unclaimed_for_run(pool, run_id).await {
+        Ok(0) => {}
+        Ok(count) => {
+            tracing::info!(
+                run = %run_id,
+                count,
+                "cancelled never-dispatched job rows on a terminal run"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                run = %run_id,
+                "failed to sweep never-dispatched job rows"
+            );
+        }
+    }
 }
 
 /// Resolve a job definition into the scheduler's flat execution plan: the
@@ -2020,6 +2901,10 @@ fn execution_plan(
         // The DAG builder has already merged pipeline `environment` into the
         // job `env` map, so the job definition alone carries everything.
         env: definition.env.clone(),
+        // Likewise the DAG builder expanded any `cache:` block into a bind
+        // mount, so the definition alone carries the mounts the container
+        // needs.
+        volumes: definition.volumes.clone(),
     }
 }
 
@@ -2098,7 +2983,10 @@ async fn persist_planned_jobs(
         db_job.image = plan.image;
         db_job.working_dir = plan.working_dir;
         db_job.timeout_secs = plan.timeout_secs;
-        gitforge_db::queries::JobQueries::create(pool, &db_job).await?;
+        // Durable-write discipline (F21/F23): losing one row to a transient
+        // busy aborts the whole loop and strands a half-planned run (the
+        // caller fails it), so each row fights contention instead.
+        persist_with_retry(|| gitforge_db::queries::JobQueries::create(pool, &db_job)).await?;
     }
     tracing::info!(run = %run_id, planned = planned.len(), "persisted planned job rows");
     Ok(planned.len())
@@ -2132,7 +3020,7 @@ async fn rebuild_live_engines(
         std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
     >,
 ) -> usize {
-    let runs = match gitforge_db::queries::PipelineRunQueries::list(pool).await {
+    let runs = match gitforge_db::queries::PipelineRunQueries::list_non_terminal(pool).await {
         Ok(runs) => runs,
         Err(error) => {
             tracing::warn!(%error, "engine rebuild skipped: run list unreadable");
@@ -2187,13 +3075,21 @@ async fn rebuild_live_engines(
         if !has_live_row {
             continue;
         }
+        // Computed before the graftable loop consumes `rows`: only rows
+        // actively executing on a runner block the re-drive.
+        let in_flight = rows
+            .iter()
+            .any(|job| matches!(job.status.as_str(), "running" | "assigned"));
         let mut durable_rows = Vec::with_capacity(rows.len());
         let mut graftable = true;
-        for job in rows {
+        for job in &rows {
             match gitforge_db::models::JobStatus::from_str(&job.status) {
-                Some(status) => {
-                    durable_rows.push((job.id, job.name, status.to_common(), job.started_at))
-                }
+                Some(status) => durable_rows.push((
+                    job.id,
+                    job.name.clone(),
+                    status.to_common(),
+                    job.started_at,
+                )),
                 None => {
                     tracing::warn!(
                         run = %run.id,
@@ -2209,6 +3105,22 @@ async fn rebuild_live_engines(
         if !graftable {
             continue;
         }
+        let held = pipeline_registry.read().await.contains_key(&run.id);
+        if held && in_flight {
+            // A live engine with rows actively executing: replacing it would
+            // orphan the in-flight leases (#243 re-adoption covers scheduler
+            // restarts, not live-process swaps). The timeout watchdog owns
+            // this class.
+            continue;
+        }
+        // Custody is not protection here: rebuilding over a held engine is
+        // loss-free exactly when nothing is executing, because the fresh
+        // engine grafts the same durable truth. The stall classes this pass
+        // exists for — a startup rebuild that failed, queued rows lost from
+        // the scheduler's in-memory queue, a completion event dropped before
+        // the engine absorbed it — all leave no running row behind, and the
+        // stalled chains observed live (tail rows pending for ~21h across a
+        // control-plane restart) are exactly of that shape.
         let engine = match CiEngine::rebuild(
             run.id,
             run.pipeline_id,
@@ -2224,21 +3136,33 @@ async fn rebuild_live_engines(
                 continue;
             }
         };
-        let workspace_path =
-            match prepare_run_workspace(pool, run.repo_id, run.id, &run.commit_hash).await {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    tracing::error!(
-                        run = %run.id,
-                        %error,
-                        "engine rebuild skipped: workspace could not be restored"
-                    );
-                    continue;
+        // Bound the guard to its own statement so it never spans the
+        // `prepare_run_workspace` await (the future must stay Send).
+        let cached_workspace = run_workspace_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&run.id)
+            .cloned()
+            .flatten();
+        let workspace_path = match cached_workspace {
+            Some(path) => Some(path),
+            None => {
+                match prepare_run_workspace(pool, run.repo_id, run.id, &run.commit_hash).await {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        tracing::error!(
+                            run = %run.id,
+                            %error,
+                            "engine rebuild skipped: workspace could not be restored"
+                        );
+                        continue;
+                    }
                 }
-            };
+            }
+        };
         run_workspace_paths
             .lock()
-            .expect("workspace cache lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(run.id, workspace_path.clone());
         pipeline_registry
             .write()
@@ -2248,11 +3172,32 @@ async fn rebuild_live_engines(
         // re-enqueued (the upsert refreshes the durable row; the scheduler
         // deduplicates its in-memory queue), and any stage whose
         // predecessors all succeeded is released now.
+        //
+        // The rebuilt engine starts with an empty run environment: the
+        // `CI_CHANGE_*` vars live in the detect-changes job's receipt, so
+        // they are re-merged from the durable rows before the release. A
+        // release evaluated against an empty environment would prune every
+        // gated job.
+        for job in &rows {
+            let Some(result_json) = job.result_json.as_deref() else {
+                continue;
+            };
+            let env = gitforge_ci::engine::extract_change_env(result_json);
+            if env.is_empty() {
+                continue;
+            }
+            engine.merge_job_result(job.id, &env).await;
+        }
         if let Err(error) = engine.queue_ready_jobs().await {
             tracing::warn!(run = %run.id, %error, "post-rebuild stage release failed");
         }
+        persist_skipped_job_rows(Some(pool), &engine).await;
         enqueue_ready_jobs(scheduler, &engine, run.id, run.repo_id, workspace_path).await;
-        tracing::info!(run = %run.id, "rebuilt live engine for interrupted run");
+        if held {
+            tracing::info!(run = %run.id, "redrove stalled chain over live engine");
+        } else {
+            tracing::info!(run = %run.id, "rebuilt live engine for interrupted run");
+        }
         rebuilt += 1;
     }
     rebuilt
@@ -2304,6 +3249,9 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 ],
                 timeout: Some("30m".to_string()),
                 retry: Some(1),
+                skip_if: None,
+                volumes: Vec::new(),
+                cache: None,
             },
             JobDefinition {
                 name: "test".to_string(),
@@ -2319,6 +3267,9 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 }],
                 timeout: Some("30m".to_string()),
                 retry: Some(1),
+                skip_if: None,
+                volumes: Vec::new(),
+                cache: None,
             },
         ],
     }
@@ -2331,6 +3282,45 @@ mod tests {
     use std::sync::OnceLock;
 
     static WORKSPACE_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn execution_plan_carries_volumes_and_cache_env() {
+        let mut definition = JobDefinition {
+            name: "test".to_string(),
+            image: "dsc-ci-rust:10".to_string(),
+            needs: vec![],
+            env: HashMap::new(),
+            steps: vec![StepDefinition {
+                name: "run".to_string(),
+                run: "cargo test".to_string(),
+                env: None,
+                working_directory: None,
+                condition: None,
+            }],
+            timeout: None,
+            retry: None,
+            skip_if: None,
+            volumes: vec![gitforge_common::VolumeSpec {
+                volume_type: Some(gitforge_common::VolumeType::Bind),
+                source: Some("{cache_root}/cargo/{image}".to_string()),
+                destination: "/cargo-target".to_string(),
+                read_only: false,
+                size: None,
+            }],
+            cache: None,
+        };
+        definition
+            .env
+            .insert("CARGO_TARGET_DIR".to_string(), "/cargo-target".to_string());
+
+        let plan = execution_plan(&definition, None);
+        assert_eq!(plan.volumes.len(), 1);
+        assert_eq!(plan.volumes[0].destination, "/cargo-target");
+        assert_eq!(
+            plan.env.get("CARGO_TARGET_DIR"),
+            Some(&"/cargo-target".to_string())
+        );
+    }
 
     #[test]
     fn trigger_token_accepts_git_server_compatibility_name() {
@@ -2639,6 +3629,275 @@ mod tests {
         assert!(error.to_string().contains("git path is unavailable"));
     }
 
+    #[test]
+    fn workspace_prep_timeout_parses_override_and_falls_back() {
+        let default = parse_workspace_prep_timeout(None);
+        assert_eq!(default, Duration::from_secs(300));
+
+        let override_secs = parse_workspace_prep_timeout(Some("45".to_string()));
+        assert_eq!(override_secs, Duration::from_secs(45));
+
+        let padded = parse_workspace_prep_timeout(Some("  120  ".to_string()));
+        assert_eq!(padded, Duration::from_secs(120));
+
+        // Any unusable override falls back to the default rather than
+        // producing a zero budget that would kill every clone instantly.
+        for unusable in [
+            Some("0".to_string()),
+            Some("abc".to_string()),
+            Some("-5".to_string()),
+            Some(String::new()),
+        ] {
+            assert_eq!(
+                parse_workspace_prep_timeout(unusable),
+                Duration::from_secs(300)
+            );
+        }
+    }
+
+    /// A prep command that hangs must return the timeout error promptly AND
+    /// stop producing output: the kill_on_drop contract, observed through
+    /// the child's own heartbeat. A dead shell can never append another
+    /// line, so growth after the kill is the one thing this test cannot
+    /// tolerate.
+    #[tokio::test]
+    async fn run_git_output_times_out_and_kills_the_child() {
+        let marker_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-prep-timeout-tests")
+            .join(gitforge_common::PipelineRunId::new().to_string());
+        tokio::fs::create_dir_all(&marker_dir).await.unwrap();
+        let heartbeat = marker_dir.join("heartbeat.log");
+        let heartbeat_path = heartbeat.to_string_lossy().into_owned();
+
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(format!(
+            "while :; do date +%s%N >> {heartbeat_path}; sleep 0.1; done"
+        ));
+
+        let started = std::time::Instant::now();
+        let error = run_git_output(command, "clone", Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "timeout returned only after {:?}",
+            started.elapsed()
+        );
+        assert!(error.to_string().contains("exceeded its"));
+
+        // Let any in-flight final write land, then verify the heartbeat
+        // stopped for a full second's worth of the old 10 Hz cadence.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let size_after_kill = tokio::fs::metadata(&heartbeat).await.unwrap().len();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let size_settled = tokio::fs::metadata(&heartbeat).await.unwrap().len();
+        assert_eq!(
+            size_settled, size_after_kill,
+            "child kept writing after the prep budget killed it"
+        );
+
+        tokio::fs::remove_dir_all(&marker_dir).await.unwrap();
+    }
+
+    /// `fail_run` is the planning-stage finalizer: the run row must carry
+    /// the human-readable cause and its never-dispatched job rows must not
+    /// outlive it, while rows a runner already took stay with the runner
+    /// lifecycle.
+    #[tokio::test]
+    async fn fail_run_records_reason_and_sweeps_unclaimed_jobs() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "fail-run-test".to_string(),
+            "fail-run@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "fail-run-test".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: "/git/fail-run-test".to_string(),
+                required_checks: Vec::new(),
+                deny_non_fast_forward: false,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: "fail-run-pipeline".to_string(),
+                trigger_type: "push".to_string(),
+                config: serde_json::json!({}),
+                created_at: chrono::Utc::now(),
+                active: true,
+            },
+        )
+        .await
+        .unwrap();
+        let run_id = seed_run(&pool, repo_id, pipeline_id, "running").await;
+
+        let pending = gitforge_db::models::Job::new(run_id, "pending-job".to_string());
+        let mut queued = gitforge_db::models::Job::new(run_id, "queued-job".to_string());
+        queued.status = gitforge_db::models::JobStatus::Queued.as_str().to_string();
+        let running = gitforge_db::models::Job::new(run_id, "running-job".to_string());
+        for job in [&pending, &queued, &running] {
+            gitforge_db::queries::JobQueries::create(&pool, job)
+                .await
+                .unwrap();
+        }
+        gitforge_db::queries::JobQueries::update_status(&pool, running.id, "running")
+            .await
+            .unwrap();
+
+        fail_run(
+            &pool,
+            run_id,
+            &anyhow::anyhow!("clone blew its time budget"),
+        )
+        .await;
+
+        let run = gitforge_db::queries::PipelineRunQueries::get(&pool, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(run
+            .error
+            .is_some_and(|reason| reason.contains("clone blew its time budget")));
+
+        let swept = gitforge_db::queries::JobQueries::get(&pool, pending.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(swept.status, "cancelled");
+        assert!(swept.finished_at.is_some());
+        let swept = gitforge_db::queries::JobQueries::get(&pool, queued.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(swept.status, "cancelled");
+        let untouched = gitforge_db::queries::JobQueries::get(&pool, running.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.status, "running");
+    }
+
+    /// The bulk ghost sweep reclaims never-dispatched rows under terminal
+    /// runs — including the historical accumulation left by finalization
+    /// paths that predated the per-run sweeps — while leaving live runs and
+    /// runner-owned rows untouched.
+    #[tokio::test]
+    async fn sweep_ghost_jobs_cancels_only_unclaimed_rows_of_terminal_runs() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let user = gitforge_db::models::User::new(
+            "ghost-sweep-test".to_string(),
+            "ghost-sweep@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .unwrap();
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "ghost-sweep-test".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: "/git/ghost-sweep-test".to_string(),
+                required_checks: Vec::new(),
+                deny_non_fast_forward: false,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: "ghost-sweep-pipeline".to_string(),
+                trigger_type: "push".to_string(),
+                config: serde_json::json!({}),
+                created_at: chrono::Utc::now(),
+                active: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        // A failed run with the classic ghost set, a live run holding a
+        // legitimately queued row, and a terminal run whose row a runner
+        // already claimed.
+        let failed_run = seed_run(&pool, repo_id, pipeline_id, "failed").await;
+        let ghost_pending = gitforge_db::models::Job::new(failed_run, "fmt".to_string());
+        let mut ghost_queued = gitforge_db::models::Job::new(failed_run, "test".to_string());
+        ghost_queued.status = gitforge_db::models::JobStatus::Queued.as_str().to_string();
+        let live_run = seed_run(&pool, repo_id, pipeline_id, "running").await;
+        let mut live_queued = gitforge_db::models::Job::new(live_run, "clippy".to_string());
+        live_queued.status = gitforge_db::models::JobStatus::Queued.as_str().to_string();
+        let terminal_run = seed_run(&pool, repo_id, pipeline_id, "succeeded").await;
+        let claimed = gitforge_db::models::Job::new(terminal_run, "coverage".to_string());
+        for job in [&ghost_pending, &ghost_queued, &live_queued, &claimed] {
+            gitforge_db::queries::JobQueries::create(&pool, job)
+                .await
+                .unwrap();
+        }
+        gitforge_db::queries::JobQueries::update_status(&pool, claimed.id, "assigned")
+            .await
+            .unwrap();
+
+        let swept = sweep_ghost_jobs(&pool).await;
+        assert_eq!(swept, 2, "exactly the two unclaimed rows of the failed run");
+
+        for job in [&ghost_pending, &ghost_queued] {
+            let row = gitforge_db::queries::JobQueries::get(&pool, job.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status, "cancelled", "ghost must be swept: {}", job.name);
+            assert!(row.finished_at.is_some());
+        }
+        let live = gitforge_db::queries::JobQueries::get(&pool, live_queued.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live.status, "queued",
+            "a live run's queued row must survive"
+        );
+        let assigned = gitforge_db::queries::JobQueries::get(&pool, claimed.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            assigned.status, "assigned",
+            "runner-owned rows stay with the runner lifecycle"
+        );
+
+        // Idempotent: a second pass reclaims nothing.
+        assert_eq!(sweep_ghost_jobs(&pool).await, 0);
+    }
+
     /// Seed a bare repository with two commits: the first without a pipeline
     /// definition, the second carrying one. Returns (bare repo path, first
     /// commit, second commit).
@@ -2721,6 +3980,7 @@ mod tests {
                 trigger_type: "push".to_string(),
                 config: serde_json::json!({}),
                 created_at: chrono::Utc::now(),
+                active: true,
             },
         )
         .await
@@ -2822,7 +4082,7 @@ mod tests {
     fn test_cleanup_command_selects_backend_without_fallback() {
         let workspace = std::path::Path::new("/var/lib/gitforge/workspaces/run-123");
 
-        let podman = cleanup_command(ContainerBackend::Podman, workspace);
+        let podman = cleanup_command(ContainerBackend::Podman, workspace).unwrap();
         assert_eq!(podman.program, "podman");
         assert_eq!(
             podman.args,
@@ -2838,7 +4098,7 @@ mod tests {
             .collect::<Vec<_>>()
         );
 
-        let docker = cleanup_command(ContainerBackend::Docker, workspace);
+        let docker = cleanup_command(ContainerBackend::Docker, workspace).unwrap();
         assert_eq!(docker.program, "docker");
         assert_eq!(
             docker.args[0..10],
@@ -2993,6 +4253,9 @@ mod tests {
             }],
             timeout: None,
             retry: None,
+            skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
         };
         let definition = PipelineDefinition {
             name: "planning-test".to_string(),
@@ -3014,6 +4277,7 @@ mod tests {
                 trigger_type: "push".to_string(),
                 config: serde_json::to_value(&definition).unwrap(),
                 created_at: chrono::Utc::now(),
+                active: true,
             },
         )
         .await
@@ -3130,6 +4394,188 @@ mod tests {
         let queue = scheduler.queue_status().await.unwrap();
         assert_eq!(queue.in_memory_queued, 2);
         assert_eq!(queue.durable_pending, Some(2));
+
+        // A later pass re-drives the same run: nothing is executing, so the
+        // fresh engine grafts identical durable truth and the chain is
+        // re-seeded without disturbing live state.
+        let redriven = rebuild_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        assert_eq!(
+            redriven, 1,
+            "an idle custody-held run is re-driven, not skipped"
+        );
+        let engine = registry.read().await.get(&run.id).cloned().expect("engine");
+        let state = engine.state().await;
+        assert_eq!(
+            state.jobs[&planned["a"]].status(),
+            gitforge_common::JobStatus::Succeeded
+        );
+        // These two mirror the durable rows (this test bypasses the
+        // completion consumer, so the engine-side successes above were never
+        // persisted); a released stage is not re-parked by the re-drive.
+        assert_eq!(
+            state.jobs[&planned["b"]].status(),
+            gitforge_common::JobStatus::Queued
+        );
+        assert_eq!(
+            state.jobs[&planned["c"]].status(),
+            gitforge_common::JobStatus::Queued
+        );
+
+        tokio::fs::remove_dir_all(&test_root).await.unwrap();
+    }
+
+    // The stalled-chain class observed live: a runner completes stage a and
+    // the durable row flips to `succeeded`, but the completion never reaches
+    // the live engine (event dropped, control-plane swap) — so the tail
+    // stays `pending` for hours while the registry still holds the stale
+    // engine. A redrive pass grafts the durable truth over the stale engine
+    // and releases the tail.
+    #[tokio::test]
+    async fn test_periodic_redrive_releases_chain_stalled_on_lost_completion() {
+        let _guard = WORKSPACE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-planning-tests")
+            .join(gitforge_common::PipelineRunId::new().to_string());
+        let source = test_root.join("source.git");
+        let seed = test_root.join("seed");
+        tokio::fs::create_dir_all(&test_root).await.unwrap();
+        run_git(["init", "--bare", source.to_str().unwrap()], None).await;
+        tokio::fs::create_dir_all(&seed).await.unwrap();
+        run_git(["init", seed.to_str().unwrap()], None).await;
+        run_git(["config", "user.email", "ci@example.test"], Some(&seed)).await;
+        run_git(["config", "user.name", "GitForge CI"], Some(&seed)).await;
+        tokio::fs::write(seed.join("marker.txt"), "stalled\n")
+            .await
+            .unwrap();
+        run_git(["add", "marker.txt"], Some(&seed)).await;
+        run_git(["commit", "-m", "stall fixture"], Some(&seed)).await;
+        let commit = run_git(["rev-parse", "HEAD"], Some(&seed)).await;
+        run_git(
+            ["push", source.to_str().unwrap(), "HEAD:refs/heads/main"],
+            Some(&seed),
+        )
+        .await;
+
+        std::env::set_var("GITFORGE_WORKSPACE_ROOT", test_root.join("workspaces"));
+        let (pool, repo_id) =
+            test_pool_with_repository(source.to_string_lossy().into_owned()).await;
+
+        let chained = |name: &str, needs: &[&str]| JobDefinition {
+            name: name.to_string(),
+            image: "rust:latest".to_string(),
+            needs: needs.iter().map(ToString::to_string).collect(),
+            env: HashMap::new(),
+            steps: vec![StepDefinition {
+                name: format!("{name}-step"),
+                run: "true".to_string(),
+                env: None,
+                working_directory: None,
+                condition: None,
+            }],
+            timeout: None,
+            retry: None,
+            skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
+        };
+        let definition = PipelineDefinition {
+            name: "stall-test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![
+                chained("a", &[]),
+                chained("b", &["a"]),
+                chained("c", &["b"]),
+            ],
+        };
+        let pipeline_id = gitforge_common::PipelineId::new();
+        gitforge_db::queries::PipelineQueries::create(
+            &pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: definition.name.clone(),
+                trigger_type: "push".to_string(),
+                config: serde_json::to_value(&definition).unwrap(),
+                created_at: chrono::Utc::now(),
+                active: true,
+            },
+        )
+        .await
+        .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline_id,
+            repo_id,
+            "push".to_string(),
+            commit.clone(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
+            .await
+            .unwrap();
+        gitforge_db::queries::PipelineRunQueries::update_status(&pool, run.id, "running")
+            .await
+            .unwrap();
+
+        let event =
+            PipelineTriggerEvent::new(pipeline_id, repo_id, commit.clone(), TriggerType::Push);
+        let engine = CiEngine::new_with_run_id(event, definition, run.id)
+            .await
+            .unwrap();
+        let planned: HashMap<String, gitforge_common::JobId> = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(id, name)| (name, id))
+            .collect();
+        persist_planned_jobs(&pool, &engine, run.id, None)
+            .await
+            .unwrap();
+
+        // The live process: the registry holds this engine, and stage a is
+        // executing on a runner (released, assigned, started).
+        engine.queue_ready_jobs().await.unwrap();
+        let runner_id = gitforge_common::RunnerId::new();
+        engine.assign_job(planned["a"], runner_id).await.unwrap();
+        engine.start_job(planned["a"]).await.unwrap();
+
+        // The runner completes stage a; the durable row records it, but the
+        // completion never reaches the engine.
+        gitforge_db::queries::JobQueries::update_status(&pool, planned["a"], "succeeded")
+            .await
+            .unwrap();
+
+        let registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        registry.write().await.insert(run.id, Arc::new(engine));
+        let run_workspaces: Arc<
+            std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let scheduler = Arc::new(Scheduler::with_db(pool.clone()));
+
+        let redriven = rebuild_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        assert_eq!(redriven, 1, "the stalled chain is re-driven");
+
+        // The fresh engine grafted the durable completion...
+        let engine = registry.read().await.get(&run.id).cloned().expect("engine");
+        let state = engine.state().await;
+        assert_eq!(
+            state.jobs[&planned["a"]].status(),
+            gitforge_common::JobStatus::Succeeded
+        );
+
+        // ...released the tail durably...
+        let row = gitforge_db::queries::JobQueries::get(&pool, planned["b"])
+            .await
+            .unwrap()
+            .expect("row b");
+        assert_eq!(row.status, "queued", "released stage becomes dispatchable");
+
+        // ...and the scheduler can dispatch it.
+        let queue = scheduler.queue_status().await.unwrap();
+        assert_eq!(queue.in_memory_queued, 1);
 
         tokio::fs::remove_dir_all(&test_root).await.unwrap();
     }
@@ -3313,6 +4759,7 @@ jobs:
                 trigger_type: "push".to_string(),
                 config: serde_json::to_value(&definition).unwrap(),
                 created_at: chrono::Utc::now(),
+                active: true,
             },
         )
         .await
@@ -3456,6 +4903,7 @@ jobs:
                 trigger_type: "push".to_string(),
                 config: definition,
                 created_at: chrono::Utc::now(),
+                active: true,
             },
         )
         .await
@@ -4077,7 +5525,7 @@ jobs:
     ) {
         cache
             .lock()
-            .expect("workspace cache lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(run_id, workspace_path);
     }
 
@@ -4089,7 +5537,7 @@ jobs:
     ) -> Option<String> {
         cache
             .lock()
-            .expect("workspace cache lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&run_id)
             .cloned()
             .flatten()
@@ -4103,7 +5551,7 @@ jobs:
     ) {
         cache
             .lock()
-            .expect("workspace cache lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .remove(&run_id);
     }
 
@@ -4342,9 +5790,506 @@ jobs:
         assert!(
             run_workspace_paths
                 .lock()
-                .expect("workspace cache lock poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .is_empty(),
             "a ref-deletion push must not prepare a run workspace"
         );
+    }
+
+    // --- Trigger settlement classification ---
+    //
+    // A committed definition that can never parse must fail terminally and
+    // visibly instead of spending the retry budget on an unfixable input.
+    // Both malformed shapes are classified at `load_pipeline_from_commit`:
+    // unparseable YAML and bytes that are not valid UTF-8.
+
+    /// Bare repository with one commit per committed-config shape, returning
+    /// the repository's git path and the (valid, unparseable, non-UTF-8)
+    /// commit hashes.
+    async fn commit_config_variants() -> (String, String, String, String) {
+        let base =
+            std::env::temp_dir().join(format!("gitforge-ci-loadpipe-{}", uuid::Uuid::new_v4()));
+        let bare = base.join("variants.git");
+        std::fs::create_dir_all(&bare).expect("create bare dir");
+        run_git(
+            &[
+                "init",
+                "--bare",
+                "--initial-branch=main",
+                bare.to_str().expect("utf8 bare path"),
+            ],
+            None,
+        )
+        .await;
+        let work = base.join("seed");
+        std::fs::create_dir_all(&work).expect("create seed dir");
+        run_git(&["init", "--initial-branch=main"], Some(&work)).await;
+        run_git(&["config", "user.email", "dev@example.test"], Some(&work)).await;
+        run_git(
+            &["config", "user.name", "Classification Harness"],
+            Some(&work),
+        )
+        .await;
+        run_git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                bare.to_str().expect("utf8 bare path"),
+            ],
+            Some(&work),
+        )
+        .await;
+
+        let valid = "name: variant\nversion: \"1.0\"\ntrigger_on:\n  - push\nenvironment: {}\njobs:\n  - name: v\n    image: alpine:latest\n    steps:\n      - name: s\n        run: echo v\n";
+        std::fs::write(work.join(".gitforge.yml"), valid).expect("write valid config");
+        run_git(&["add", "."], Some(&work)).await;
+        run_git(&["commit", "-m", "valid"], Some(&work)).await;
+        run_git(&["push", "origin", "main"], Some(&work)).await;
+        let valid_hash = run_git(&["rev-parse", "HEAD"], Some(&work)).await;
+
+        std::fs::write(work.join(".gitforge.yml"), "name: [unclosed").expect("write yaml config");
+        run_git(&["add", "."], Some(&work)).await;
+        run_git(&["commit", "-m", "unparseable"], Some(&work)).await;
+        run_git(&["push", "-f", "origin", "main"], Some(&work)).await;
+        let yaml_hash = run_git(&["rev-parse", "HEAD"], Some(&work)).await;
+
+        std::fs::write(work.join(".gitforge.yml"), [0xffu8, 0xfe, b'c', b'i', 0x00])
+            .expect("write binary config");
+        run_git(&["add", "."], Some(&work)).await;
+        run_git(&["commit", "-m", "non-utf8"], Some(&work)).await;
+        run_git(&["push", "-f", "origin", "main"], Some(&work)).await;
+        let binary_hash = run_git(&["rev-parse", "HEAD"], Some(&work)).await;
+
+        (
+            bare.display().to_string(),
+            valid_hash,
+            yaml_hash,
+            binary_hash,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_load_pipeline_from_commit_classifies_config_errors_terminal() {
+        let (git_path, valid_hash, yaml_hash, binary_hash) = commit_config_variants().await;
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let user = gitforge_db::models::User::new(
+            "classification-test".to_string(),
+            "classification@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .expect("create user");
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository {
+                id: repo_id,
+                name: "classification-test".to_string(),
+                owner_id: user.id,
+                visibility: "private".to_string(),
+                git_path: git_path.clone(),
+                required_checks: Vec::new(),
+                deny_non_fast_forward: false,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("create repository");
+
+        // Control: a well-formed committed definition loads.
+        let valid = load_pipeline_from_commit(&pool, repo_id, &valid_hash)
+            .await
+            .expect("valid config loads");
+        assert_eq!(
+            valid.expect("valid config present").name,
+            "variant",
+            "the committed definition is authoritative"
+        );
+
+        // Unparseable YAML is terminal: `InvalidPipelineConfig`.
+        let yaml_error = load_pipeline_from_commit(&pool, repo_id, &yaml_hash)
+            .await
+            .expect_err("unparseable config must fail");
+        assert!(
+            yaml_error.is::<InvalidPipelineConfig>(),
+            "unparseable YAML must be classified terminal, got: {yaml_error:#}"
+        );
+
+        // Non-UTF-8 bytes can never parse either — same terminal class,
+        // not a retryable environment failure.
+        let binary_error = load_pipeline_from_commit(&pool, repo_id, &binary_hash)
+            .await
+            .expect_err("non-UTF-8 config must fail");
+        assert!(
+            binary_error.is::<InvalidPipelineConfig>(),
+            "non-UTF-8 config must be classified terminal, got: {binary_error:#}"
+        );
+    }
+
+    /// The settle decision, exercised directly through `settle_trigger_failure`.
+    /// Every retryable failure inducible through the full flow is
+    /// environment-dependent, and the durable queue's FK to `repositories`
+    /// means a trigger row can never exist for an unregistered repo — so the
+    /// decision is pinned here with synthetic failures instead of through
+    /// `process_trigger_event`. The end-to-end terminal paths are pinned by
+    /// `tests/ci_trigger_settlement.rs`.
+    async fn seeded_trigger_request(
+        pool: &gitforge_db::Pool,
+    ) -> (uuid::Uuid, gitforge_common::RepoId) {
+        // The FK to `repositories` requires a real repo row behind the request.
+        let user = gitforge_db::models::User::new(
+            "settle-test".to_string(),
+            "settle-test@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(pool, &user)
+            .await
+            .expect("create user");
+        let repository = gitforge_db::models::Repository::new(
+            "settle-test".to_string(),
+            user.id,
+            "unused".to_string(),
+        );
+        let repo_id = repository.id;
+        gitforge_db::queries::RepoQueries::create(pool, &repository)
+            .await
+            .expect("create repository");
+
+        let request = gitforge_db::models::PipelineTriggerRequest::new(
+            repo_id,
+            "refs/heads/main".to_string(),
+            "0".repeat(40),
+            "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
+        );
+        let request_id = request.id;
+        let (_, was_new) =
+            gitforge_db::queries::TriggerRequestQueries::create_or_existing(pool, &request)
+                .await
+                .expect("create trigger request");
+        assert!(was_new, "the harness seeds a fresh request");
+        (request_id, repo_id)
+    }
+
+    #[tokio::test]
+    async fn test_settle_retryable_failure_keeps_budget() {
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let (request_id, _repo) = seeded_trigger_request(&pool).await;
+
+        // One consumed attempt (what mark_processing does on pickup).
+        gitforge_db::queries::TriggerRequestQueries::mark_processing(&pool, request_id)
+            .await
+            .expect("mark processing");
+
+        settle_trigger_failure(
+            &pool,
+            request_id,
+            &TriggerFailure::retryable(anyhow::anyhow!("database is busy")),
+        )
+        .await;
+
+        let settled = gitforge_db::queries::TriggerRequestQueries::get(&pool, request_id)
+            .await
+            .expect("read settled request")
+            .expect("trigger request row survives");
+        assert_eq!(
+            settled.status, "pending",
+            "a retryable failure keeps the retry budget"
+        );
+        assert_eq!(settled.attempts, 1, "the consumed attempt is counted");
+        assert!(
+            settled.error.is_none(),
+            "a retryable failure is not recorded as terminal: {:?}",
+            settled.error
+        );
+        assert!(settled.run_id.is_none(), "no run exists to attribute");
+    }
+
+    #[tokio::test]
+    async fn test_settle_terminal_failure_marks_failed() {
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let (request_id, _repo) = seeded_trigger_request(&pool).await;
+        let run_id = gitforge_common::PipelineRunId::new();
+
+        settle_trigger_failure(
+            &pool,
+            request_id,
+            &TriggerFailure::terminal_after_run(
+                anyhow::anyhow!("pipeline config is not valid"),
+                run_id,
+            ),
+        )
+        .await;
+
+        let settled = gitforge_db::queries::TriggerRequestQueries::get(&pool, request_id)
+            .await
+            .expect("read settled request")
+            .expect("trigger request row survives");
+        assert_eq!(
+            settled.status, "failed",
+            "a terminal failure is visible, not retried"
+        );
+        assert_eq!(
+            settled.run_id,
+            Some(run_id),
+            "the run produced before the failure is traceable"
+        );
+        assert!(
+            settled
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not valid")),
+            "the failure cause is recorded: {:?}",
+            settled.error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_settle_retryable_failure_at_exhausted_budget_fails_visible() {
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let (request_id, _repo) = seeded_trigger_request(&pool).await;
+
+        // Burn the whole budget with consumed attempts.
+        for _ in 0..TRIGGER_MAX_ATTEMPTS {
+            gitforge_db::queries::TriggerRequestQueries::mark_processing(&pool, request_id)
+                .await
+                .expect("mark processing");
+        }
+
+        settle_trigger_failure(
+            &pool,
+            request_id,
+            &TriggerFailure::retryable(anyhow::anyhow!("git spawn keeps failing")),
+        )
+        .await;
+
+        let settled = gitforge_db::queries::TriggerRequestQueries::get(&pool, request_id)
+            .await
+            .expect("read settled request")
+            .expect("trigger request row survives");
+        assert_eq!(
+            settled.status, "failed",
+            "a retryable failure at exhausted budget becomes visible"
+        );
+        assert!(
+            settled
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("git spawn")),
+            "the failure cause is recorded: {:?}",
+            settled.error
+        );
+    }
+
+    /// A gated pipeline: the classification job publishes `CI_CHANGE_*`, and
+    /// the gated job runs only when the environment says its class changed.
+    fn gated_definition(skip_if: Option<String>) -> PipelineDefinition {
+        let step = |name: &str| StepDefinition {
+            name: name.to_string(),
+            run: "true".to_string(),
+            env: None,
+            working_directory: None,
+            condition: None,
+        };
+        PipelineDefinition {
+            name: "gated-test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![
+                JobDefinition {
+                    name: "detect-changes".to_string(),
+                    image: "rust:latest".to_string(),
+                    needs: vec![],
+                    env: HashMap::new(),
+                    steps: vec![step("detect")],
+                    timeout: None,
+                    retry: None,
+                    skip_if: None,
+                    volumes: Vec::new(),
+                    cache: None,
+                },
+                JobDefinition {
+                    name: "clippy".to_string(),
+                    image: "rust:latest".to_string(),
+                    needs: vec!["detect-changes".to_string()],
+                    env: HashMap::new(),
+                    steps: vec![step("lint")],
+                    timeout: None,
+                    retry: None,
+                    skip_if,
+                    volumes: Vec::new(),
+                    cache: None,
+                },
+            ],
+        }
+    }
+
+    /// A durable pipeline and run for the gated fixtures — the planned job
+    /// rows reference the run.
+    async fn gated_run(
+        pool: &gitforge_db::Pool,
+        repo_id: gitforge_common::RepoId,
+        pipeline_id: gitforge_common::PipelineId,
+        definition: &PipelineDefinition,
+    ) -> gitforge_db::models::PipelineRun {
+        gitforge_db::queries::PipelineQueries::create(
+            pool,
+            &gitforge_db::models::Pipeline {
+                id: pipeline_id,
+                repo_id,
+                name: definition.name.clone(),
+                trigger_type: "push".to_string(),
+                config: serde_json::to_value(definition).unwrap(),
+                created_at: chrono::Utc::now(),
+                active: true,
+            },
+        )
+        .await
+        .unwrap();
+        let run = gitforge_db::models::PipelineRun::new(
+            pipeline_id,
+            repo_id,
+            "push".to_string(),
+            "abc123".to_string(),
+        );
+        gitforge_db::queries::PipelineRunQueries::create(pool, &run)
+            .await
+            .unwrap();
+        run
+    }
+
+    /// The orchestration defect this guards: the completed job's receipt is
+    /// the only source of the classification, and an unmerged receipt leaves
+    /// the expression environment empty — every condition then evaluates
+    /// false and the engine prunes the gate that should have run.
+    #[tokio::test]
+    async fn test_completed_receipt_feeds_the_skip_environment() {
+        let (pool, repo_id) = test_pool_with_repository("/tmp/gated-repo".to_string()).await;
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let definition = gated_definition(Some(
+            r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string(),
+        ));
+        let run = gated_run(&pool, repo_id, pipeline_id, &definition).await;
+        let event = PipelineTriggerEvent::new(
+            pipeline_id,
+            repo_id,
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, definition).await.unwrap();
+        let planned: HashMap<String, gitforge_common::JobId> = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(id, name)| (name, id))
+            .collect();
+        persist_planned_jobs(&pool, &engine, run.id, None)
+            .await
+            .unwrap();
+
+        // The classification job's receipt, as the runner reported it.
+        let receipt = serde_json::json!({
+            "job_id": planned["detect-changes"].to_string(),
+            "success": true,
+            "exit_code": 0,
+            "step_results": [
+                {"exit_code": 0, "stdout": "CI_CHANGE_INCLUDE_CODE=1\n", "stderr": ""}
+            ],
+            "artifacts": []
+        })
+        .to_string();
+        gitforge_db::queries::JobQueries::complete(
+            &pool,
+            planned["detect-changes"],
+            "succeeded",
+            &receipt,
+        )
+        .await
+        .unwrap();
+
+        merge_completed_job_env(&engine, Some(&pool), planned["detect-changes"]).await;
+
+        let state = engine.state().await;
+        assert_eq!(
+            state
+                .pipeline_env
+                .get("CI_CHANGE_INCLUDE_CODE")
+                .map(String::as_str),
+            Some("1"),
+            "the receipt's classification reaches the expression environment"
+        );
+
+        // The gated job now runs instead of being pruned.
+        engine.start().await.unwrap();
+        engine
+            .assign_job(planned["detect-changes"], gitforge_common::RunnerId::new())
+            .await
+            .unwrap();
+        engine.start_job(planned["detect-changes"]).await.unwrap();
+        engine
+            .succeed_job(planned["detect-changes"], 0)
+            .await
+            .unwrap();
+        let queued = engine.queue_ready_jobs().await.unwrap();
+        assert_eq!(queued, vec![planned["clippy"]]);
+    }
+
+    /// A skipped job never reaches a runner, so nothing else moves its
+    /// planned row off `pending`: without a durable skip row the run never
+    /// settles and the release gate never sees the row it requires.
+    #[tokio::test]
+    async fn test_skipped_jobs_get_a_durable_row() {
+        let (pool, repo_id) = test_pool_with_repository("/tmp/gated-repo".to_string()).await;
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let definition = gated_definition(Some(
+            r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string(),
+        ));
+        let run = gated_run(&pool, repo_id, pipeline_id, &definition).await;
+        let event = PipelineTriggerEvent::new(
+            pipeline_id,
+            repo_id,
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, definition).await.unwrap();
+        let planned: HashMap<String, gitforge_common::JobId> = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(id, name)| (name, id))
+            .collect();
+        persist_planned_jobs(&pool, &engine, run.id, None)
+            .await
+            .unwrap();
+
+        // No classification was ever merged, so the condition is false and
+        // the gated job is skipped.
+        engine.start().await.unwrap();
+        engine
+            .assign_job(planned["detect-changes"], gitforge_common::RunnerId::new())
+            .await
+            .unwrap();
+        engine.start_job(planned["detect-changes"]).await.unwrap();
+        engine
+            .succeed_job(planned["detect-changes"], 0)
+            .await
+            .unwrap();
+        let queued = engine.queue_ready_jobs().await.unwrap();
+        assert!(queued.is_empty());
+        assert_eq!(engine.skipped_jobs().await, vec![planned["clippy"]]);
+
+        persist_skipped_job_rows(Some(&pool), &engine).await;
+
+        let row = gitforge_db::queries::JobQueries::get(&pool, planned["clippy"])
+            .await
+            .unwrap()
+            .expect("skipped job row");
+        assert_eq!(row.status, "skipped");
+        assert!(row.finished_at.is_some());
     }
 }

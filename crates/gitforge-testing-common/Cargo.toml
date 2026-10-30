@@ -1,0 +1,15 @@
+[package]
+name = "gitforge-testing-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared test fixtures, generators, and assertion helpers for GitForge crates"
+
+[dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[lints]
+workspace = true

@@ -9,6 +9,7 @@ use gitforge_common::{Error, JobId, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::PoisonError;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -112,18 +113,21 @@ impl ReceiptStore for InMemoryReceiptStore {
         // Compute SHA-256 of receipt for integrity
         let receipt_sha = Self::compute_receipt_sha256(receipt);
 
-        let mut receipts = self.receipts.lock().unwrap();
+        let mut receipts = self.receipts.lock().unwrap_or_else(PoisonError::into_inner);
         receipts.insert(job_id, receipt.clone());
 
         // Index by workspace
         if let Some(ws_id) = Self::extract_workspace_id(receipt) {
-            let mut by_ws = self.by_workspace.lock().unwrap();
+            let mut by_ws = self
+                .by_workspace
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             by_ws.entry(ws_id).or_default().push(job_id);
         }
 
         // Index by run_id
         if let Some(run_id) = &receipt.run_id {
-            let mut by_run = self.by_run.lock().unwrap();
+            let mut by_run = self.by_run.lock().unwrap_or_else(PoisonError::into_inner);
             by_run.entry(run_id.clone()).or_default().push(job_id);
         }
 
@@ -136,14 +140,17 @@ impl ReceiptStore for InMemoryReceiptStore {
     }
 
     async fn get(&self, job_id: &JobId) -> Result<Option<JobReceipt>> {
-        let receipts = self.receipts.lock().unwrap();
+        let receipts = self.receipts.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(receipts.get(job_id).cloned())
     }
 
     async fn list_by_workspace(&self, workspace_id: &str) -> Result<Vec<JobReceipt>> {
-        let by_ws = self.by_workspace.lock().unwrap();
+        let by_ws = self
+            .by_workspace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let job_ids: Vec<JobId> = by_ws.get(workspace_id).cloned().unwrap_or_default();
-        let receipts = self.receipts.lock().unwrap();
+        let receipts = self.receipts.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(job_ids
             .into_iter()
             .filter_map(|id| receipts.get(&id).cloned())
@@ -152,14 +159,14 @@ impl ReceiptStore for InMemoryReceiptStore {
 
     async fn list_by_owner(&self, _owner_id: &str) -> Result<Vec<JobReceipt>> {
         // In-memory store doesn't track owner_id separately
-        let receipts = self.receipts.lock().unwrap();
+        let receipts = self.receipts.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(receipts.values().cloned().collect())
     }
 
     async fn list_by_run(&self, run_id: &str) -> Result<Vec<JobReceipt>> {
-        let by_run = self.by_run.lock().unwrap();
+        let by_run = self.by_run.lock().unwrap_or_else(PoisonError::into_inner);
         let job_ids: Vec<JobId> = by_run.get(run_id).cloned().unwrap_or_default();
-        let receipts = self.receipts.lock().unwrap();
+        let receipts = self.receipts.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(job_ids
             .into_iter()
             .filter_map(|id| receipts.get(&id).cloned())
@@ -167,7 +174,7 @@ impl ReceiptStore for InMemoryReceiptStore {
     }
 
     async fn verify(&self, job_id: &JobId) -> Result<ReceiptVerification> {
-        let receipts = self.receipts.lock().unwrap();
+        let receipts = self.receipts.lock().unwrap_or_else(PoisonError::into_inner);
 
         let Some(receipt) = receipts.get(job_id) else {
             return Ok(ReceiptVerification {

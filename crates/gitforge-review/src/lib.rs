@@ -124,6 +124,19 @@ fn detect_language(path: &str) -> Option<String> {
     }
 }
 
+/// Compile a static scanner/diff pattern.
+///
+/// Every pattern passed here is a compile-time literal exercised by the
+/// unit tests against live match cases; a syntax error in one is a defect
+/// in the table itself, surfacing at first use — never a runtime input
+/// condition. Panicking with the pattern text is therefore the correct
+/// failure mode, and `Regex::new`'s fallibility is not propagated into an
+/// input-validation path it can never occupy.
+#[allow(clippy::expect_used)] // static pattern tables — see doc comment
+pub(crate) fn static_regex(pattern: &str) -> Regex {
+    Regex::new(pattern).expect("static scanner pattern must compile")
+}
+
 /// Parse a unified diff format string
 pub fn parse_unified_diff(diff: &str) -> Result<Vec<ParsedDiff>, ReviewError> {
     let mut diffs = Vec::new();
@@ -131,12 +144,12 @@ pub fn parse_unified_diff(diff: &str) -> Result<Vec<ParsedDiff>, ReviewError> {
     let mut current_hunk: Option<DiffHunk> = None;
 
     // Regex patterns for unified diff format
-    let diff_header_re = Regex::new(r"^diff --git a/(.*) b/(.*)$").unwrap();
-    let new_file_re = Regex::new(r"^new file mode \d+$").unwrap();
-    let deleted_file_re = Regex::new(r"^deleted file mode \d+$").unwrap();
-    let index_re = Regex::new(r"^index [a-f0-9]+\.\.[a-f0-9]+").unwrap();
-    let hunk_header_re = Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").unwrap();
-    let binary_re = Regex::new(r"^Binary files").unwrap();
+    let diff_header_re = crate::static_regex(r"^diff --git a/(.*) b/(.*)$");
+    let new_file_re = crate::static_regex(r"^new file mode \d+$");
+    let deleted_file_re = crate::static_regex(r"^deleted file mode \d+$");
+    let index_re = crate::static_regex(r"^index [a-f0-9]+\.\.[a-f0-9]+");
+    let hunk_header_re = crate::static_regex(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@");
+    let binary_re = crate::static_regex(r"^Binary files");
 
     for line in diff.lines() {
         // Check for diff header

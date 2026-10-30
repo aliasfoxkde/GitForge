@@ -50,38 +50,77 @@ if [[ -e "$release_dir" ]]; then
   exit 1
 fi
 
-mkdir -p "$release_dir/bin" "$release_dir/scripts" "$release_dir/systemd/user"
+# Assemble under a staging directory and rename into place only once the
+# bundle is complete. A half-cut bundle at the final name would look like a
+# deployable release to anything listing releases/ and, worse, block every
+# retry behind the overwrite refusal above (2026-10-10: three orphaned
+# .incomplete-* dirs from a hand-run cut sat in releases/ exactly because
+# nothing owned this convention). The staging name is derived from the
+# release id, so a concurrent cut of a different release cannot collide,
+# and this run owns it: a prior failed attempt's partial tree is cleared
+# before assembly. Dot-prefixed, so the release-auto candidate glob
+# (gitforge-*-*) never sees a staging tree.
+staging_dir="$bundle_root/.incomplete-$release_id"
+if [[ -e "$staging_dir" ]]; then
+  find "$staging_dir" -depth -delete
+fi
+
+mkdir -p "$staging_dir/bin" "$staging_dir/scripts" "$staging_dir/systemd/user"
+
+# The services run as the unprivileged `gitforge` user, which reaches the
+# bundle through the www-data group. mkdir honours the caller's umask, and
+# an umask of 077 produced group-unsearchable release directories: the
+# cutover flipped the symlink, every unit died with 203/EXEC ("Permission
+# denied"), and the rollback restored the previous bundle. Pin the modes
+# explicitly so a cut is correct under any umask.
+#
+# The modes are pinned on the STAGING tree, which is renamed into place at
+# the end of the assembly: the final release directory does not exist yet
+# at this point, and chmod'ing it aborted every cut (2026-10-22).
+chmod 2755 "$staging_dir" "$staging_dir/bin" "$staging_dir/scripts" \
+  "$staging_dir/systemd" "$staging_dir/systemd/user"
 
 for binary in api ci git-server runner; do
-  install -m 0755 "$source_root/$binary" "$release_dir/bin/$binary"
+  install -m 0755 "$source_root/$binary" "$staging_dir/bin/$binary"
 done
 
-install -m 0755 "$source_root/scripts/gitforge-status" "$release_dir/scripts/gitforge-status"
+install -m 0755 "$source_root/scripts/gitforge-status" "$staging_dir/scripts/gitforge-status"
 
 for unit in gitforge-ci.service.example gitforge-runner.service.example; do
-  install -m 0644 "$(dirname "$0")/../systemd/user/$unit" "$release_dir/systemd/user/$unit"
+  install -m 0644 "$(dirname "$0")/../systemd/user/$unit" "$staging_dir/systemd/user/$unit"
 done
 
 for policy in gitforge-resource-limits.conf gitforge-ci-resource-limits.conf gitforge-runner-resource-limits.conf; do
-  install -m 0644 "$(dirname "$0")/../systemd/user/$policy" "$release_dir/systemd/user/$policy"
+  install -m 0644 "$(dirname "$0")/../systemd/user/$policy" "$staging_dir/systemd/user/$policy"
 done
 
 build_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 (
-  cd "$release_dir"
+  cd "$staging_dir"
   cat > RELEASE_METADATA.txt <<EOF
 release_id=$release_id
 source_commit=$source_commit
 build_timestamp_utc=$build_timestamp
 toolchain=$toolchain
 EOF
-  sha256sum RELEASE_METADATA.txt bin/* scripts/* systemd/user/* | sort > MANIFEST.sha256
   cat > READY <<EOF
 release_id=$release_id
 source_commit=$source_commit
 manifest=MANIFEST.sha256
 EOF
+  # READY is written before the manifest so the completion marker itself is
+  # checksummed: a bundle whose READY was edited after the cut fails verify.
+  sha256sum READY RELEASE_METADATA.txt bin/* scripts/* systemd/user/* | sort > MANIFEST.sha256
 )
+
+# Atomic publish. -T fails when the target appeared meanwhile (a co-tenant
+# cutting the same release id won the race) instead of nesting the staging
+# tree inside the existing directory the way plain mv would.
+mv -T "$staging_dir" "$release_dir"
+
+# Verify the assembled bundle with the same verifier a consumer would run:
+# a cut that cannot pass its own contract must not be publishable.
+"$(dirname "$0")/gitforge-release-verify" "$release_dir"
 
 printf 'release bundle: assembled %s\n' "$release_dir"
 printf 'release bundle: files=%s\n' "$(wc -l < "$release_dir/MANIFEST.sha256")"

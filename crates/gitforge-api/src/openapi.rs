@@ -43,7 +43,7 @@ pub fn get_openapi_spec() -> serde_json::Value {
                 "post": {
                     "tags": ["auth"],
                     "summary": "Authenticate a user",
-                    "description": "Authenticates a persisted user and returns a 24-hour bearer token. This public route is mounted at /auth/login, not under /api.",
+                    "description": "Authenticates a persisted user and returns a 24-hour bearer token plus a 30-day refresh credential for silent renewal. This public route is mounted at /auth/login, not under /api.",
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -70,13 +70,81 @@ pub fn get_openapi_spec() -> serde_json::Value {
                                         "properties": {
                                             "token": {"type": "string"},
                                             "token_type": {"type": "string", "example": "Bearer"},
-                                            "expires_in": {"type": "integer", "format": "int64", "example": 86400}
+                                            "expires_in": {"type": "integer", "format": "int64", "example": 86400},
+                                            "refresh_token": {"type": "string", "description": "Long-lived credential; rotate via /auth/refresh. Omitted when its row could not be persisted."},
+                                            "refresh_expires_in": {"type": "integer", "format": "int64", "example": 2592000}
                                         }
                                     }
                                 }
                             }
                         },
                         "401": {"description": "Invalid username or password"}
+                    }
+                }
+            },
+            "/auth/refresh": {
+                "post": {
+                    "tags": ["auth"],
+                    "summary": "Exchange a refresh credential for a fresh token pair",
+                    "description": "Rotates on use: the presented credential is revoked and a new credential accompanies the fresh 24-hour bearer token. Replaying a rotated credential fails closed with 401. This public route is mounted at /auth/refresh, not under /api.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["refresh_token"],
+                                    "properties": {
+                                        "refresh_token": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Fresh token pair",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["token", "token_type", "expires_in"],
+                                        "properties": {
+                                            "token": {"type": "string"},
+                                            "token_type": {"type": "string", "example": "Bearer"},
+                                            "expires_in": {"type": "integer", "format": "int64", "example": 86400},
+                                            "refresh_token": {"type": "string", "description": "The rotated replacement credential."},
+                                            "refresh_expires_in": {"type": "integer", "format": "int64", "example": 2592000}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "401": {"description": "Invalid, expired, or rotated credential"}
+                    }
+                }
+            },
+            "/auth/logout": {
+                "post": {
+                    "tags": ["auth"],
+                    "summary": "Revoke a refresh credential",
+                    "description": "Revokes the presented credential server-side. Idempotent: unknown or already-revoked credentials still answer 200 so logout never leaks whether a credential existed. This public route is mounted at /auth/logout, not under /api.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["refresh_token"],
+                                    "properties": {
+                                        "refresh_token": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {"description": "Credential revoked (or already dead)"}
                     }
                 }
             },
@@ -103,6 +171,59 @@ pub fn get_openapi_spec() -> serde_json::Value {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            },
+            "/auth/refresh": {
+                "post": {
+                    "tags": ["auth"],
+                    "summary": "Rotate the refresh credential",
+                    "description": "Exchanges a valid refresh credential for a new bearer token and a rotated refresh credential. Fails closed on replay of an already-rotated credential.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["refresh_token"],
+                                    "properties": {
+                                        "refresh_token": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "New bearer token and rotated refresh credential"
+                        },
+                        "401": {"description": "Missing, invalid, or replayed credential"}
+                    }
+                }
+            },
+            "/auth/logout": {
+                "post": {
+                    "tags": ["auth"],
+                    "summary": "Revoke the refresh credential",
+                    "description": "Revokes the presented refresh credential server-side. Idempotent: revoking an already-revoked credential still returns 200.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["refresh_token"],
+                                    "properties": {
+                                        "refresh_token": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Revocation recorded (always 200, even for an absent credential)"
                         }
                     }
                 }
@@ -416,6 +537,25 @@ pub fn get_openapi_spec() -> serde_json::Value {
                     }
                 }
             },
+            "/pipeline-runs/{id}/rerun": {
+                "post": {
+                    "tags": ["ci"],
+                    "summary": "Rerun a pipeline run at its stored commit",
+                    "description": "Triggers a new run pinned to the original run's commit hash — the reason to rerun is usually doubt about the original verdict, and refs move. A commit that no longer resolves is refused up front instead of minting a run doomed at clone time. Delegates to the CI orchestrator like a push trigger and rides its durable duplicate protection.",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "202": {
+                            "description": "Rerun accepted (pipeline_run_id may be null when the orchestrator queues asynchronously)"
+                        },
+                        "400": {"description": "Invalid run ID or unresolvable stored commit"},
+                        "404": {"description": "Pipeline run not found"},
+                        "502": {"description": "CI orchestrator rejected the trigger"},
+                        "503": {"description": "CI orchestrator trigger not configured"}
+                    }
+                }
+            },
             "/jobs/{id}": {
                 "get": {
                     "tags": ["ci"],
@@ -711,6 +851,90 @@ pub fn get_openapi_spec() -> serde_json::Value {
                         "404": {"description": "Run not found or not visible to the caller"}
                     }
                 }
+            },
+            "/ssh-keys": {
+                "get": {
+                    "tags": ["users"],
+                    "summary": "List the caller's SSH public keys",
+                    "description": "The per-user public key registry backing Git-over-SSH authentication. Fingerprints are computed server-side and globally unique; registering a duplicate key returns 409 duplicate_key.",
+                    "responses": {
+                        "200": {"description": "List of SSH keys"},
+                        "401": {"description": "Missing or invalid bearer token"}
+                    }
+                },
+                "post": {
+                    "tags": ["users"],
+                    "summary": "Register an SSH public key",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["name", "public_key"],
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "public_key": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {"description": "Key registered"},
+                        "409": {"description": "duplicate_key — the key material is already registered"}
+                    }
+                }
+            },
+            "/ssh-keys/{id}": {
+                "delete": {
+                    "tags": ["users"],
+                    "summary": "Delete an SSH public key",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "204": {"description": "Key deleted"},
+                        "404": {"description": "Key not found or not owned by the caller"}
+                    }
+                }
+            },
+            "/webhook/trigger/{pipeline_id}": {
+                "post": {
+                    "tags": ["ci"],
+                    "summary": "Webhook-triggered pipeline execution",
+                    "description": "Authenticated webhook entry point. With a CI trigger client configured it delegates to the orchestrator and returns 202; otherwise it queues the pipeline's first runnable job directly (200). Redeliveries for the same commit are idempotent — one webhook key maps to exactly one job and a replay's run row is recorded as cancelled.",
+                    "parameters": [
+                        {"name": "pipeline_id", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "200": {"description": "Job queued directly into the durable queue"},
+                        "202": {"description": "Delegated to the CI orchestrator"},
+                        "404": {"description": "Pipeline not found"},
+                        "409": {"description": "Webhook idempotency key reused with a different job"},
+                        "422": {"description": "Stored pipeline definition unusable"},
+                        "502": {"description": "CI delegation failed"}
+                    }
+                }
+            },
+            "/dashboard": {
+                "get": {
+                    "tags": ["health"],
+                    "summary": "Public aggregate dashboard data",
+                    "description": "Aggregate dashboard counters; requires no authentication.",
+                    "responses": {
+                        "200": {"description": "Dashboard HTML"}
+                    }
+                }
+            },
+            "/metrics": {
+                "get": {
+                    "tags": ["health"],
+                    "summary": "Prometheus metrics scrape endpoint",
+                    "responses": {
+                        "200": {"description": "Metrics in Prometheus text exposition format"}
+                    }
+                }
             }
         },
         "components": {
@@ -808,7 +1032,8 @@ pub fn get_openapi_spec() -> serde_json::Value {
                         "commit_hash": {"type": "string"},
                         "triggered_by": {"type": "string"},
                         "started_at": {"type": "string", "nullable": true},
-                        "finished_at": {"type": "string", "nullable": true}
+                        "finished_at": {"type": "string", "nullable": true},
+                        "error": {"type": "string", "nullable": true}
                     }
                 },
                 "JobResponse": {
@@ -997,6 +1222,8 @@ mod tests {
         let spec = get_openapi_spec();
         let paths = spec.get("paths").unwrap().as_object().unwrap();
         assert!(paths.contains_key("/auth/login"));
+        assert!(paths.contains_key("/auth/refresh"));
+        assert!(paths.contains_key("/auth/logout"));
         assert!(paths.contains_key("/auth/status"));
         assert!(paths.contains_key("/health"));
         assert!(paths.contains_key("/repos"));

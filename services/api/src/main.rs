@@ -146,6 +146,7 @@ pub struct ServerConfig {
 /// Fails fast (panic at startup) when the variable is missing, the file is
 /// unreadable, or the result is empty: a server with no signing key must
 /// not come up at all.
+#[allow(clippy::panic)] // deliberate fail-fast startup aborts — see doc comment
 pub fn resolve_jwt_secret() -> String {
     if let Ok(path) = std::env::var("JWT_SECRET_FILE") {
         if !path.is_empty() {

@@ -13,7 +13,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use gitforge_common::{JobId, RunnerId};
+use gitforge_common::{JobId, RunnerId, VolumeSpec};
 use gitforge_db::models::{Runner, RunnerType};
 use gitforge_storage::{Artifact, ArtifactId, ArtifactStore, FileStorage, MAX_ARTIFACT_BYTES};
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,10 @@ pub struct PendingJobInfo {
     /// older contract never read this key, and this side always sends it,
     /// so no version negotiation is needed.
     pub env: HashMap<String, String>,
+    /// Host mounts the job's container needs. Runners on an older contract
+    /// never read this key; this side always sends it, so no version
+    /// negotiation is needed.
+    pub volumes: Vec<VolumeSpec>,
     pub runner_id: String,
     pub lease_token: String,
 }
@@ -527,6 +531,7 @@ async fn get_pending_jobs(
                     working_dir: definition.working_dir,
                     timeout_secs: definition.timeout_secs,
                     env: definition.env,
+                    volumes: definition.volumes,
                     runner_id: runner_id.to_string(),
                     lease_token,
                 });
@@ -1280,6 +1285,7 @@ mod tests {
             trigger_type: "manual".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
             .await
@@ -1522,6 +1528,7 @@ mod tests {
             trigger_type: "manual".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         gitforge_db::queries::PipelineQueries::create(pool, &pipeline)
             .await
@@ -1728,6 +1735,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
             .await
@@ -1824,6 +1832,7 @@ mod tests {
             working_dir: Some("/workspace".to_string()),
             timeout_secs: 300,
             env: HashMap::from([("RUST_BACKTRACE".to_string(), "1".to_string())]),
+            volumes: Vec::new(),
             runner_id: "runner-123".to_string(),
             lease_token: "lease-123".to_string(),
         };

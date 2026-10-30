@@ -11,6 +11,7 @@ pub mod ids;
 pub mod password;
 pub mod result;
 pub mod time;
+pub mod volume;
 
 pub use error::{Error, ErrorKind, Result};
 pub use ids::{
@@ -18,6 +19,7 @@ pub use ids::{
     StepId, UserId,
 };
 pub use time::DateTime;
+pub use volume::{image_cache_key, JobCache, VolumeSpec, VolumeType};
 
 /// True when `hash` is git's "ref does not exist" sentinel: empty or all
 /// zero digits. `git receive-pack` sends an all-zero new hash on branch

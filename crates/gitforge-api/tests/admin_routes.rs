@@ -5,6 +5,14 @@
 //! requires an administrator or maintainer. These tests drive all of that
 //! through the real router with an in-memory database.
 
+// Test-harness exemption, same discipline as the sibling suites:
+// `allow-unwrap-in-tests` covers `#[test]` bodies, but boot/seed/fixture
+// helper functions in a test target are neither `#[test]` fns nor
+// `#[cfg(test)]`, a class the clippy.toml config cannot address. Setup
+// failing IS the assertion -- a panic aborts the run loudly. Production
+// code keeps the denies.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
@@ -90,6 +98,7 @@ async fn seed_job_on_runner(pool: &Pool, owner: &User, runner_id: RunnerId, stat
         trigger_type: "push".to_string(),
         config: json!({}),
         created_at: chrono::Utc::now(),
+        active: true,
     };
     PipelineQueries::create(pool, &pipeline).await.unwrap();
     let run = PipelineRun::new(pipeline.id, repo.id, "webhook".to_string(), "a".repeat(40));

@@ -9,6 +9,14 @@
 //! service, and the run and job rows are asserted in the database the
 //! service itself wrote.
 
+// Test-harness exemption, same discipline as the sibling suites:
+// `allow-unwrap-in-tests` covers `#[test]` bodies, but boot/seed/fixture
+// helper functions in a test target are neither `#[test]` fns nor
+// `#[cfg(test)]`, a class the clippy.toml config cannot address. Setup
+// failing IS the assertion -- a panic aborts the run loudly. Production
+// code keeps the denies.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -202,6 +210,22 @@ async fn post_trigger(port: u16, token: Option<&str>, body: &str) -> (reqwest::S
     (status, text)
 }
 
+async fn get_trigger_status(
+    port: u16,
+    token: Option<&str>,
+    trigger_id: &str,
+) -> (reqwest::StatusCode, String) {
+    let url = format!("http://127.0.0.1:{port}/pipeline-trigger-requests/{trigger_id}");
+    let mut request = reqwest::Client::new().get(url);
+    if let Some(token) = token {
+        request = request.header("x-gitforge-trigger-token", token);
+    }
+    let response = request.send().await.expect("read trigger status");
+    let status = response.status();
+    let text = response.text().await.expect("read status body");
+    (status, text)
+}
+
 #[tokio::test]
 async fn test_trigger_requires_token_and_runs_committed_pipeline() {
     let mut service = spawn_ci().await;
@@ -237,6 +261,31 @@ async fn test_trigger_requires_token_and_runs_committed_pipeline() {
         .as_str()
         .expect("pipeline_run_id in response")
         .to_string();
+    let trigger_id = payload["trigger_id"]
+        .as_str()
+        .expect("trigger_id in response")
+        .to_string();
+
+    let (status, body) = get_trigger_status(service.scheduler_port, None, &trigger_id).await;
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "body: {body}");
+
+    let (status, body) = get_trigger_status(
+        service.scheduler_port,
+        Some("harness-trigger-token"),
+        &trigger_id,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    let receipt: serde_json::Value = serde_json::from_str(&body).expect("parse trigger receipt");
+    assert_eq!(receipt["status"], "completed", "body: {body}");
+    assert_eq!(receipt["pipeline_run_id"], run_id, "body: {body}");
+    assert!(
+        matches!(
+            receipt["pipeline_status"].as_str(),
+            Some("pending" | "running")
+        ),
+        "receipt must expose a valid nonterminal pipeline state: {body}"
+    );
 
     // The service's durable rows: one run for the pushed commit with the
     // job from the committed definition enqueued for runners.

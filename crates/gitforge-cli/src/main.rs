@@ -17,6 +17,8 @@ mod sync;
 pub use client::GitForgeClient;
 pub use config::Config;
 
+const AUTH_LOGIN_USAGE: &str = "gitforge auth --login <username>";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "gitforge",
@@ -261,6 +263,9 @@ async fn watch_pipeline_run(client: &GitForgeClient, run_id: &str) -> Result<Str
         let run = client.get_pipeline_run(run_id).await?;
         println!("   run {} — {}", run.id, run.status);
         if terminal.contains(&run.status.as_str()) {
+            if let Some(error) = &run.error {
+                println!("   reason: {error}");
+            }
             return Ok(run.status);
         }
         tokio::time::sleep(std::time::Duration::from_secs(WATCH_POLL_SECS)).await;
@@ -278,10 +283,98 @@ fn bare_repo_name(arg: &str) -> &str {
     arg.trim_matches('/').rsplit('/').next().unwrap_or(arg)
 }
 
+/// Renew the stored session when the JWT is missing or about to lapse.
+///
+/// The durable secret is the 30-day refresh credential persisted at
+/// login; the JWT it mints is a 24-hour bearer. Renewing here — before
+/// any command runs — is what keeps credentials valid across reboots
+/// and idle periods without re-running `gitforge auth --login`.
+/// Renewal rotates the credential server-side, so the new pair is
+/// persisted before the command proceeds.
+async fn renew_session(server: &str, config: &mut Config) -> Result<()> {
+    use chrono::{DateTime, Utc};
+
+    // Legacy credentials (pre-refresh servers) carry no renew path; the
+    // normal 401 hint still directs a re-login at expiry.
+    let Some(stored_refresh) = config.refresh_token.clone() else {
+        return Ok(());
+    };
+    let stored_token = config.token.clone();
+
+    let needs_renewal = match config
+        .token_expires_at
+        .as_deref()
+        .and_then(|stamp| DateTime::parse_from_rfc3339(stamp).ok())
+    {
+        Some(expires_at) => {
+            expires_at.with_timezone(&Utc) < Utc::now() + chrono::Duration::minutes(10)
+        }
+        // No recorded expiry means the stored JWT's lifetime is unknown;
+        // attempting one renewal is cheaper than a doomed request.
+        None => true,
+    };
+    if !needs_renewal {
+        return Ok(());
+    }
+
+    let client = GitForgeClient::new(server, None);
+    match client.refresh(&stored_refresh).await {
+        Ok(response) => {
+            config.token = Some(response.token);
+            config.token_expires_at =
+                Some((Utc::now() + chrono::Duration::seconds(response.expires_in)).to_rfc3339());
+            if let Some(rotated) = response.refresh_token {
+                config.refresh_token = Some(rotated);
+            }
+            if let Some(refresh_expires_in) = response.refresh_expires_in {
+                config.refresh_expires_at =
+                    Some((Utc::now() + chrono::Duration::seconds(refresh_expires_in)).to_rfc3339());
+            }
+            config.save()?;
+        }
+        Err(error) => {
+            // A definitive server rejection means the credential this
+            // command used is dead. It does NOT mean the session is dead:
+            // the refresh credential rotates on use, so two concurrent
+            // commands race — one rotates it and writes the new pair, the
+            // other is rejected. Wiping the stored pair in that case logged
+            // the user out even though a valid access token had just been
+            // written, and it also discarded the very credential the
+            // winning command had saved. The reset therefore happens only
+            // when the file still holds exactly the pair this command
+            // used; if it has changed, another command has already renewed
+            // the session and its credentials win.
+            if error.to_string().contains("401") {
+                let current = Config::load().unwrap_or_default();
+                let unchanged = current.refresh_token.as_deref() == Some(stored_refresh.as_str())
+                    && current.token.as_deref() == stored_token.as_deref();
+                if unchanged {
+                    config.token = None;
+                    config.token_expires_at = None;
+                    config.refresh_token = None;
+                    config.refresh_expires_at = None;
+                    if let Err(save_error) = config.save() {
+                        tracing::warn!("failed to persist credential reset: {save_error}");
+                    }
+                } else {
+                    tracing::debug!(
+                        "refresh rejected, but the stored credentials changed underneath this command; keeping the renewed session"
+                    );
+                    *config = current;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run the CLI command handler (extracted for testing)
 pub async fn run_cli(cli: Cli) -> Result<()> {
-    let config = Config::load().unwrap_or_default();
+    let mut config = Config::load().unwrap_or_default();
     let server = cli.server.unwrap_or_else(|| config.server_url.clone());
+    if let Err(error) = renew_session(&server, &mut config).await {
+        tracing::debug!("session renewal skipped: {error}");
+    }
     let token = cli.token.or_else(|| config.token.clone());
 
     match &cli.command {
@@ -294,7 +387,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             let api_client = GitForgeClient::new(&server, token.clone());
 
             if let Some(username) = login {
-                println!("🔐 Authenticating as {username} to {server}");
+                // Username is a public identity echoed back by /auth/status,
+                // not a credential; the password itself is never logged.
+                println!("🔐 Authenticating as {username} to {server}"); // codeql[rust/cleartext-logging] : username is not a secret
                 println!("   Enter password: ");
 
                 // Read password from stdin
@@ -304,15 +399,29 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     Ok(response) => {
                         println!("✅ Login successful!");
                         println!("   Token expires in {} seconds", response.expires_in);
+                        if let Some(refresh_expires_in) = response.refresh_expires_in {
+                            println!(
+                                "   Session renewable for {} days",
+                                refresh_expires_in / 86_400
+                            );
+                        }
                         println!();
-                        println!(
-                            "   Token: {}...",
-                            &response.token[..response.token.len().min(20)]
-                        );
 
                         // Save token to config
                         let mut config = config.clone();
                         config.token = Some(response.token);
+                        config.token_expires_at = Some(
+                            (chrono::Utc::now() + chrono::Duration::seconds(response.expires_in))
+                                .to_rfc3339(),
+                        );
+                        config.refresh_token = response.refresh_token;
+                        if let Some(refresh_expires_in) = response.refresh_expires_in {
+                            config.refresh_expires_at = Some(
+                                (chrono::Utc::now()
+                                    + chrono::Duration::seconds(refresh_expires_in))
+                                .to_rfc3339(),
+                            );
+                        }
                         if let Err(e) = config.save() {
                             tracing::warn!("Failed to save token: {}", e);
                         }
@@ -323,28 +432,58 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     }
                 }
             } else if *logout {
+                // Revoke the refresh credential server-side first so the
+                // dead credential can't be replayed; a server outage must
+                // not block a local logout, so that call is best-effort.
                 let mut config = config.clone();
+                if let Some(refresh_token) = config.refresh_token.take() {
+                    let revoker = GitForgeClient::new(&server, None);
+                    if let Err(e) = revoker.logout(&refresh_token).await {
+                        println!("⚠️  Server-side revocation skipped: {e}");
+                    }
+                }
                 config.token = None;
+                config.token_expires_at = None;
+                config.refresh_expires_at = None;
                 if let Err(e) = config.save() {
                     println!("⚠️  Warning: Failed to clear credentials: {e}");
                 }
                 println!("👋 Logged out. Credentials cleared.");
-                println!("   Run `gitforge auth login <username>` to authenticate again.");
+                println!("   Run `{AUTH_LOGIN_USAGE}` to authenticate again.");
             } else if *status {
                 match api_client.auth_status().await {
                     Ok(status) => {
                         if status.authenticated {
                             println!("✅ Authenticated to {server}");
-                            println!("   Username: {}", status.username.unwrap_or_default());
+                            println!("   Username: {}", status.username.unwrap_or_default()); // codeql[rust/cleartext-logging] : username is a public identity, not a credential
                             if let Some(role) = status.role {
                                 println!("   Role: {role}");
+                            }
+                            match (config.token_expires_at.as_deref(), &config.refresh_token) {
+                                (Some(expires_at), Some(_)) => {
+                                    println!("   JWT expires: {expires_at}");
+                                    if let Some(stamp) = &config.refresh_expires_at {
+                                        println!("   Refresh credential expires: {stamp}");
+                                    }
+                                }
+                                (Some(expires_at), None) => {
+                                    println!("   JWT expires: {expires_at}");
+                                    println!(
+                                        "   No refresh credential stored — re-login to enable \
+                                         automatic renewal."
+                                    );
+                                }
+                                (None, Some(_)) => {
+                                    println!("   Renewal credential stored (expiry unknown).");
+                                }
+                                (None, None) => {}
                             }
                         } else {
                             println!("❌ Not authenticated.");
                             if let Some(msg) = status.message {
                                 println!("   Reason: {msg}");
                             }
-                            println!("   Run `gitforge auth login <username>` to authenticate.");
+                            println!("   Run `{AUTH_LOGIN_USAGE}` to authenticate.");
                         }
                     }
                     Err(e) => {
@@ -361,7 +500,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             println!("👤 Authenticated user");
                             println!("   Server: {server}");
                             println!("   User ID: {}", status.user_id.unwrap_or_default());
-                            println!("   Username: {}", status.username.unwrap_or_default());
+                            println!("   Username: {}", status.username.unwrap_or_default()); // codeql[rust/cleartext-logging] : username is a public identity, not a credential
                             if let Some(role) = status.role {
                                 println!("   Role: {role}");
                             }
@@ -400,7 +539,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 admin::bootstrap_first_admin(&database_url, username, email, &password, *confirm)
                     .await?;
             println!("✅ First administrator created successfully.");
-            println!("   Run `gitforge auth login --login <username>` to obtain a session token.");
+            println!("   Run `{AUTH_LOGIN_USAGE}` to obtain a session token.");
         }
 
         Commands::Repo {
@@ -689,11 +828,16 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 match api_client.run_pipeline(id, cli_ref.as_deref()).await {
                     Ok(triggered) => {
                         println!("🚀 Triggered pipeline: {id}");
-                        println!("   Run: {}", triggered.pipeline_run_id);
-                        println!(
-                            "   Watch it: gitforge pipeline --watch {}",
-                            triggered.pipeline_run_id
-                        );
+                        match triggered.pipeline_run_id {
+                            Some(run_id) => {
+                                println!("   Run: {run_id}");
+                                println!("   Watch it: gitforge pipeline --watch {run_id}");
+                            }
+                            None => println!(
+                                "   Accepted, but the orchestrator did not schedule a run \
+                                 (pipeline may not be registered with the scheduler)"
+                            ),
+                        }
                     }
                     Err(e) => println!("❌ {e}"),
                 }
@@ -846,7 +990,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         }
                     }
                 } else {
-                    println!("❌ Not authenticated. Run `gitforge auth login <username>` first.");
+                    println!("❌ Not authenticated. Run `{AUTH_LOGIN_USAGE}` first.");
                 }
             } else if *pull {
                 if let Some(ref t) = token {
@@ -865,7 +1009,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         }
                     }
                 } else {
-                    println!("❌ Not authenticated. Run `gitforge auth login <username>` first.");
+                    println!("❌ Not authenticated. Run `{AUTH_LOGIN_USAGE}` first.");
                 }
             }
         }
@@ -972,6 +1116,16 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_login_usage_is_parseable_by_the_cli() {
+        let cli = Cli::try_parse_from(AUTH_LOGIN_USAGE.split_whitespace())
+            .expect("the displayed login command must parse");
+        let Commands::Auth { login, .. } = cli.command else {
+            panic!("the displayed login command must select auth");
+        };
+        assert_eq!(login.as_deref(), Some("<username>"));
+    }
 
     fn test_cli(command: Commands) -> Cli {
         Cli {

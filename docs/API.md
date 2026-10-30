@@ -47,12 +47,24 @@ the protected `/api` prefix:
 ```
 POST /auth/login
 GET /auth/status
+POST /auth/refresh
+POST /auth/logout
 ```
 
 `POST /auth/login` accepts `username` and `password` and returns `token`,
 `token_type`, and `expires_in`. `GET /auth/status` returns an
 `authenticated` boolean and, for a valid bearer token, the user identity and
-role. User registration is not exposed by the GitForge API; users must be
+role.
+
+Login also returns a long-lived refresh credential (stored server-side as a
+SHA-256 digest only, never the plaintext). `POST /auth/refresh` accepts
+`{"refresh_token": "..."}` and returns a new bearer token plus a rotated
+refresh credential; presenting an already-rotated credential is rejected
+(401), so a captured response cannot be replayed. `POST /auth/logout` takes
+the same body and revokes the credential server-side, idempotently —
+revoking an already-revoked credential still returns 200.
+
+User registration is not exposed by the GitForge API; users must be
 provisioned through the supported local CLI bootstrap path on a fresh
 database. Run `gitforge admin --bootstrap --username <name> --email <email>
 --confirm`; the password is read from the terminal and the command refuses to
@@ -218,7 +230,40 @@ deactivates one with run history (the history stays queryable).
 GET /api/pipeline-runs
 GET /api/pipeline-runs/{id}
 GET /api/pipeline-runs/{id}/jobs
+POST /api/pipeline-runs/{id}/rerun
 ```
+
+`POST /api/pipeline-runs/{id}/rerun` triggers a new run pinned to the
+original run's own commit hash — the reason to rerun is usually doubt
+about the original verdict, and refs move. A commit that no longer
+resolves is refused up front (400 `unknown_revision`) instead of minting
+a run doomed at clone time. Delegates to the CI orchestrator the same way
+a push trigger does (202 with the new run id, riding its durable
+duplicate protection); 404 if the run does not exist, 503 when the CI
+trigger is not configured, 502 when the orchestrator rejects the trigger.
+
+#### CI trigger receipt (scheduler service)
+
+The scheduler service on port `42781` exposes a narrow read-only receipt for
+the durable request created by `POST /pipelines/trigger`:
+
+```text
+GET /pipeline-trigger-requests/{request_id}
+```
+
+Send the same `Authorization: Bearer <GITFORGE_TRIGGER_TOKEN>` credential
+(or `x-gitforge-trigger-token`) used for enqueue. This route returns only the
+trigger lifecycle, correlated pipeline run ID, and pipeline status; it does
+not expose the stored error text or general pipeline listings. A missing
+request returns `404`, a missing database returns `503`, and a database read
+failure returns `500`.
+
+`status` is `pending`, `processing`, `completed`, or `failed`. Until a run is
+materialized, `pipeline_run_id` and `pipeline_status` are `null`. Once present,
+`pipeline_status` is `pending`, `running`, `succeeded`, `failed`, or
+`cancelled`. CI clients should continue polling while the trigger is
+`pending`/`processing` or the pipeline is `pending`/`running`, and stop only at
+a terminal pipeline status.
 
 **Pipeline Run Response:**
 ```json

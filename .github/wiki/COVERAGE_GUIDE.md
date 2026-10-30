@@ -1,119 +1,46 @@
 # Coverage Guide
 
-How to measure and maintain test coverage in Dark Factory projects.
+Measuring and maintaining line coverage for the GitForge workspace.
 
-## Coverage Targets
+## The Gate
 
-| Layer | Minimum | Examples |
-|-------|--------|----------|
-| Core business logic | 95% | `internal/services/*.go` |
-| API handlers | 90% | `internal/api/handlers*.go` |
-| Configuration | 85% | `internal/config/*.go` |
-| Utilities | 85% | `internal/utils/*.go` |
+The line-coverage gate lives in `.gitforge.yml` (coverage job):
 
-## Measuring Coverage
+- **fail < 82%**
+- **warn < 84%**
 
-### Full Coverage Report
+Thresholds are calibrated against the CI sandbox (`dsc-ci-rust`), not a
+developer host, where ambient services inflate integration coverage. Raise
+them only with an in-sandbox measurement.
 
-```bash
-go test -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out -o coverage.html
-```
-
-### Per-Package Coverage
+## Measuring Locally
 
 ```bash
-go test -coverprofile=coverage.out ./internal/api/...
-go tool cover -func=coverage.out
+cargo llvm-cov --workspace --all-targets --summary-only \
+    --fail-under-lines 82 -- --test-threads=2
 ```
 
-### Coverage Summary
+The `--test-threads=2` bound mirrors the CI suite (some suites flake at higher
+parallelism under co-tenant load).
+
+For an HTML report:
 
 ```bash
-go test -cover ./... -covermode=count
+cargo llvm-cov --workspace --all-targets --html -- --test-threads=2
+# open target/llvm-cov/html/index.html
 ```
 
-## Coverage Enforcement
+## Conventions
 
-### Pre-commit Hook
+- Unit tests live in `#[cfg(test)]` modules; integration tests in
+  `crates/*/tests/` and `services/*/tests/`
+- Regression-test every defect with a pinned test
+- Tests that need temp files should honor `TMPDIR` and keep payloads small —
+  SQLite test stalls under NAS-backed temp dirs are a known failure mode
+- Prefer generated inputs over credential-like literals in tests; secrets
+  scanners and CodeQL flag hard-coded passphrases even in test code
 
-The pre-commit hook runs a coverage gate:
+## Historical Baseline
 
-```bash
-COVER_THRESHOLD=70  # Default
-go test -coverprofile=.coverage.out ./...
-COVER=$(go tool cover -func=.coverage.out | grep total | awk '{print $3}' | tr -d '%')
-if (( $(echo "$COVER < $COVER_THRESHOLD" | bc -l) )); then
-    echo "Coverage $COVER% is below threshold $COVER_THRESHOLD%"
-    exit 1
-fi
-```
-
-### CI/CD Gate
-
-In `.github/workflows/ci.yml`:
-
-```yaml
-- name: Check coverage
-  run: |
-    go test -coverprofile=coverage.out ./...
-    go tool cover -func=coverage.out | grep total
-```
-
-## What Counts as Covered
-
-- **Line coverage**: Each line executed at least once
-- **Branch coverage**: Each branch (if/else, switch cases) exercised
-- **Function coverage**: Each function called
-
-## Exemption Process
-
-To request a coverage exemption:
-
-1. Create an issue with `coverage-exemption` label
-2. Explain why the code is difficult to test
-3. Propose an alternative testing strategy
-4. Get approval from CODEOWNERS
-
-Example exemption comment:
-
-```go
-// Exempt from coverage: requires integration with external system
-// Tracking: #123
-func connectToExternalService() {
-    // ...
-}
-```
-
-## Improving Coverage
-
-### Hard-to-Test Code
-
-- **External dependencies**: Use interfaces for mocking
-- **Database operations**: Use repository pattern with mocks
-- **Network calls**: Use HTTP handler interfaces
-- **Time-dependent logic**: Inject clock interface
-
-```go
-// Instead of: time.Now()
-// Use:
-type Clock interface {
-    Now() time.Time
-}
-
-// Then mock in tests:
-type mockClock struct{}
-func (m *mockClock) Now() time.Time {
-    return time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-}
-```
-
-### Test Fixtures
-
-Use `_fixtures/` directory for test data:
-
-```
-_fixtures/
-├── testdata.json
-└── sample_input.csv
-```
+- 83.04% at `c4e3816b` (2026-10-10, in-sandbox measurement,
+  `docs/audits/COVERAGE_BASELINE_2026-10-10.md`)

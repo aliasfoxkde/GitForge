@@ -6,7 +6,7 @@
 //! command list as a self-delimiting pkt-line block terminated by a flush
 //! packet. That lets the repository's ref-update policy be evaluated BEFORE
 //! spawning the child and declined with a standard receive-pack status
-//! report ("ng <ref> <reason>"), which git clients render as
+//! report (`ng <ref> <reason>`), which git clients render as
 //! `! [remote rejected] <ref> (reason)`.
 //!
 //! Two mechanisms cooperate:
@@ -247,18 +247,76 @@ fn pkt_line(payload: &str) -> Vec<u8> {
     format!("{:04x}{}", payload.len() + 4, payload).into_bytes()
 }
 
+/// Frame one sideband payload under `band` (1 = data, 2 = progress).
+fn sideband_chunk(band: u8, data: &[u8]) -> Vec<u8> {
+    let len = 4 + 1 + data.len();
+    let mut frame = format!("{len:04x}").into_bytes();
+    frame.push(band);
+    frame.extend_from_slice(data);
+    frame
+}
+
+/// Whether the client's push command list requested `side-band-64k`.
+///
+/// The requested capabilities ride after the NUL on the first command
+/// pkt-line. A malformed or capability-less command list reads as plain
+/// framing, which is the safe fallback: a real client always requests the
+/// capability when the server advertises it, and a degenerate one that did
+/// not negotiate sideband expects the unframed report.
+pub fn requests_sideband(body: &[u8]) -> bool {
+    if body.len() < 4 {
+        return false;
+    }
+    let Ok(header) = std::str::from_utf8(&body[..4]) else {
+        return false;
+    };
+    let Ok(pkt_len) = usize::from_str_radix(header, 16) else {
+        return false;
+    };
+    if pkt_len < 4 || pkt_len > body.len() {
+        return false;
+    }
+    let payload = &body[4..pkt_len];
+    let Some(nul) = payload.iter().position(|&byte| byte == 0) else {
+        return false;
+    };
+    let Ok(caps) = std::str::from_utf8(&payload[nul + 1..]) else {
+        return false;
+    };
+    caps.split_whitespace().any(|cap| cap == "side-band-64k")
+}
+
 /// Build the receive-pack status report declining `reasons`.
 ///
 /// The report claims a clean unpack because nothing was unpacked and every
 /// refusal is carried per ref — exactly what a client sees when a real
-/// pre-receive hook declines every update.
-pub fn synthesize_rejection_report(reasons: &[(String, String)]) -> Vec<u8> {
+/// pre-receive hook declines every update. When the client negotiated
+/// `side-band-64k` the pkt-line report is multiplexed through band 1 and
+/// terminated by a bare flush: sending the raw report to a sideband client
+/// makes git read the first byte of `unpack ok` as a band number and die
+/// with "protocol error: bad band #117" instead of rendering the refusal.
+pub fn synthesize_rejection_report(reasons: &[(String, String)], sideband: bool) -> Vec<u8> {
     let mut report = pkt_line("unpack ok\n");
     for (ref_name, reason) in reasons {
         report.extend(pkt_line(&format!("ng {ref_name} {reason}\n")));
     }
+    // The status stream always terminates with its own flush; under
+    // sideband that flush must ride through band 1 (the client's status
+    // parser reads the demultiplexed stream and stops at it), and a bare
+    // outer flush then ends the response body.
     report.extend_from_slice(b"0000");
-    report
+    if !sideband {
+        return report;
+    }
+    // 65535 is the pkt-line ceiling; the band byte and the length header
+    // bound each chunk's payload.
+    const BAND_DATA_MAX: usize = 65535 - 4 - 1;
+    let mut framed = Vec::with_capacity(report.len() + 5);
+    for chunk in report.chunks(BAND_DATA_MAX) {
+        framed.extend(sideband_chunk(1, chunk));
+    }
+    framed.extend_from_slice(b"0000");
+    framed
 }
 
 #[cfg(test)]
@@ -326,13 +384,59 @@ mod tests {
 
     #[test]
     fn test_rejection_report_is_valid_pkt_line_stream() {
-        let report = synthesize_rejection_report(&[(
-            "refs/heads/main".to_string(),
-            "required checks not green: ci is failed".to_string(),
-        )]);
+        let report = synthesize_rejection_report(
+            &[(
+                "refs/heads/main".to_string(),
+                "required checks not green: ci is failed".to_string(),
+            )],
+            false,
+        );
         let expected =
             "000eunpack ok\n003fng refs/heads/main required checks not green: ci is failed\n0000";
         assert_eq!(String::from_utf8(report).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_rejection_report_is_sideband_framed_when_negotiated() {
+        let report = synthesize_rejection_report(
+            &[(
+                "refs/heads/main".to_string(),
+                "required checks not green: ci is failed".to_string(),
+            )],
+            true,
+        );
+        // The status stream's own terminating flush rides through band 1;
+        // the bare outer flush ends the response body.
+        let raw =
+            "000eunpack ok\n003fng refs/heads/main required checks not green: ci is failed\n0000";
+        let mut expected = format!("{:04x}{}", 4 + 1 + raw.len(), char::from_u32(1).unwrap());
+        expected.push_str(raw);
+        expected.push_str("0000");
+        assert_eq!(String::from_utf8(report).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_requests_sideband_reads_the_first_command_caps() {
+        let frame = |caps: &str| {
+            let payload = format!("{ZERO} {COMMIT_A} refs/heads/main\0{caps}\n");
+            let mut framed = format!("{:04x}", payload.len() + 4).into_bytes();
+            framed.extend_from_slice(payload.as_bytes());
+            framed
+        };
+        assert!(requests_sideband(&frame(
+            "report-status side-band-64k agent=git/2.47"
+        )));
+        assert!(!requests_sideband(&frame("report-status agent=git/2.47")));
+        // A command list without a capability suffix reads as plain framing.
+        let payload = format!("{ZERO} {COMMIT_A} refs/heads/main\n");
+        let mut bare = format!("{:04x}", payload.len() + 4).into_bytes();
+        bare.extend_from_slice(payload.as_bytes());
+        assert!(!requests_sideband(&bare));
+        // Malformed inputs degrade to plain framing, never panic.
+        assert!(!requests_sideband(b""));
+        assert!(!requests_sideband(b"zzzz"));
+        assert!(!requests_sideband(b"0040truncated"));
+        assert!(!requests_sideband(b"000bfoo bar\n"));
     }
 
     #[tokio::test]
@@ -418,6 +522,7 @@ mod tests {
             trigger_type: "push".to_string(),
             config: serde_json::json!({}),
             created_at: chrono::Utc::now(),
+            active: true,
         };
         gitforge_db::queries::PipelineQueries::create(&pool, &pipeline)
             .await

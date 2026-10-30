@@ -9,6 +9,14 @@
 //! service is stopped with SIGTERM so `cargo llvm-cov` counts the
 //! startup and shutdown path.
 
+// Test-harness exemption, same discipline as the sibling suites:
+// `allow-unwrap-in-tests` covers `#[test]` bodies, but boot/seed/fixture
+// helper functions in a test target are neither `#[test]` fns nor
+// `#[cfg(test)]`, a class the clippy.toml config cannot address. Setup
+// failing IS the assertion -- a panic aborts the run loudly. Production
+// code keeps the denies.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -54,8 +62,10 @@ async fn spawn_api() -> ApiService {
         .await
         .expect("create sqlite pool");
     pool.migrate().await.expect("run migrations");
+    // Generated at runtime so no credential-like literal appears in source.
+    let harness_passphrase = format!("harness-{}", uuid::Uuid::new_v4());
     let password_hash =
-        gitforge_common::password::hash_password("harness-passphrase").expect("hash password");
+        gitforge_common::password::hash_password(&harness_passphrase).expect("hash password");
     let user = gitforge_db::models::User::new(
         "gatewayowner".to_string(),
         "gatewayowner@example.com".to_string(),
@@ -133,7 +143,7 @@ async fn test_login_and_authenticated_repository_and_ssh_key_flow() {
         .expect("bad login request");
     assert_eq!(bad.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    let good = login("harness-passphrase")
+    let good = login(&harness_passphrase)
         .send()
         .await
         .expect("login request");

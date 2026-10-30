@@ -851,3 +851,234 @@ the same day, plus the r6-platform-durability line deployed.
   `test_reconcile_never_invents_doom_without_a_definition`, and the
   rewritten custody assertion in
   `test_periodic_reconciliation_skips_live_and_fresh_runs`.
+
+## 12. Platform durability blocker sweep (2026-10-03, branch fix/platform-durability-20261003)
+
+Root-cause pass over the four blocker classes from the 2026-10-03
+live-DB evidence (177/1614 trigger rows permanently hollow; cancel
+500s under contention; 43-minute timeout enforcement lag; container
+loss invisible), plus the throughput problems underneath them.
+All fixes on `fix/platform-durability-20261003` (based on 5f0f7654,
+absorbing co-tenant PR #253's heartbeat work rather than
+duplicating it).
+
+**Hollow delivery (durable trigger queue).** The bus is in-memory;
+git-server marked `ci.trigger.delivered` on any 2xx including "202
+queued", and a consumer death dropped events on the floor while the
+HTTP trigger kept answering 2xx — 11% of observed trigger rows
+never produced runs, restart-correlated (ci restarted 09:03:18Z).
+Fix: `pipeline_trigger_requests` table (gitforge-db
+`TriggerRequestQueries`) written BEFORE publish, with a partial
+unique index on `(repo_id, new_hash) WHERE status IN
+('pending','processing')` so concurrent triggers dedup to one run
+while manual re-trigger after a terminal outcome still works. The
+consumer settles every request: completed (with run id), failed
+(with error), or retry-pending — failures are now visible rows, not
+silence. A 30 s sweep republishes stale pending (>60 s) and demotes
+stale processing (>30 min, above max observed clone time); attempts
+cap at 5 with retryable-vs-terminal classification
+(`InvalidPipelineConfig` is terminal — a bad committed config
+retried forever would just hide). Run creation
+(pipeline version + run row) moved into one BEGIN IMMEDIATE
+transaction (`activate_pipeline_and_create_run`) — the old
+three-autocommit sequence was interruptible between writes, which
+is exactly the hollow-run shape. The consumer is also no longer one
+globally sequential task: per-repo FIFO lanes, global concurrency
+semaphore (`GITFORGE_TRIGGER_CONCURRENCY`, default 4) — the old
+single consumer serialized every push behind every other push's
+clone (observed 15-44 min backlogs) and exited permanently when the
+bus stream closed (now resubscribes). The bus stream itself was
+rewritten off its thread-spawn-per-10ms busy poll and survives
+broadcast lag (resync + warn) instead of wedging.
+
+**Cancel 500s.** `JobQueries::cancel` was the only durable
+job-status write with no BEGIN IMMEDIATE, no retry, and an
+unfenced `WHERE id = ?` (TOCTOU could clobber a completed job into
+cancelled). Now a single conditional UPDATE inside
+`persist_with_retry` (shared gitforge-db helper: 5 attempts, 250 ms
+doubling backoff capped at 4 s, retries only Database-kind
+errors); 0 rows affected is disambiguated by re-read — an
+already-terminal job is idempotent success, a missing id is
+not_found. Shared by any future one-shot write path (F21/F23
+class).
+
+**Timeout lag.** Durable authority stays with the 60 s watchdog,
+but: tick behavior Delay→Skip (Delay accumulated drift under DB
+contention — observed 43-minute effective enforcement); partial
+indexes back the two full scans (`idx_jobs_running_started` on
+jobs(started_at) WHERE status='running' for `reconcile_expired`;
+`idx_jobs_stranded_evidence` on finished_at for
+`reconcile_evidence_rows`).
+
+**Container loss.** docker.rs logged-and-continued exec stream
+errors and defaulted any unreadable exit to 0 — a container that
+vanished mid-step graded its step as passed (false-green
+possible). Now: mid-stream error → daemon-confirm container; gone
+→ Err (executor already grades Err as infrastructure_failure);
+final inspect polls up to 5×250 ms for a definitive answer and
+fails loudly when none arrives (unknown outcome ≠ pass;
+`container_present` treats only 404 as authoritative loss, other
+inspect errors are inconclusive).
+
+**Honest timeout grading.** The runner graded its own deadline
+kill as `failed` on the wire; the scheduler already accepted
+`timed_out`. `JobResult` now carries an explicit `timed_out`
+flag (replacing `error.contains("timeout")` string-matching,
+which the new pinned test shows mis-grades messages that merely
+mention a timeout), and agent reports `outcome: "timed_out"`.
+The durable watchdog and the runner now agree on what a timeout
+is.
+
+**git-server dispatcher.** `reqwest::Client::new()` had no
+timeout (one hung CI pinned the delivery loop), and a
+`bail!` on any failed row abandoned the rest of the claimed
+50-row batch for a 120 s lease. Now 60 s request bound
+(`ci_http_client`) and per-row continue; unparseable payloads
+park instead of poisoning the batch via `?`.
+
+Regression pins added this branch: bus lag survival
+(`test_subscriber_survives_lag_without_hanging`), trigger-request
+dedup lifecycle + stale requeue
+(`test_trigger_request_dedup_lifecycle`,
+`test_trigger_request_requeue_stale_and_terminal_failure`),
+atomic activation
+(`test_activate_pipeline_and_create_run_is_atomic`), cancel
+idempotence/fencing
+(`test_cancel_is_idempotent_and_never_clobbers_a_terminal_job`),
+persist_with_retry semantics (2 tests), flag-driven timeout
+grading (rewritten `test_job_result_status`).
+
+## 13. Fedora false-green incident (2026-10-10, fedora CI instance)
+
+Found while gating the v0.6.16 release: the release gate requires a
+green exact-SHA pipeline run with full definition coverage, and the
+candidate run f5676f9f (6a1e1f3b, RC) graded `succeeded` with **one
+of four** definition jobs — fmt only, 11 seconds, no clippy/test/
+coverage ever enqueued. Two findings, both evidenced on the live
+fedora instance (audit.db, unit journals).
+
+**F38 (stale-deployment orphan finalizer grades truncated chains
+succeeded — found 2026-10-10 gating v0.6.16).** The deployed fedora
+release is `gitforge-63427df-20260923` (17 days old at discovery);
+every chain-integrity fix since — #212 interrupted-chain grading, F37
+doom cascade deployment, the boot consumer-ordering fix 69e3c859 — is
+undeployed. When the ci process restarts, runs created under the dead
+process are not adopted by the new one (no `rebuilt live engine`
+lines in the 06:42:28 boot window), so their lazy chains never
+resume: at first-job completion the engine logs `WARN ci: completion
+received for unknown pipeline run f5676f9f…` (07:01:29), and the
+periodic orphan reconciler then grades the run from its observed jobs
+— `finalized orphaned run f5676f9f status="succeeded"` (07:02:00,
+three runs in one sweep, including co-tenant 3b1be60c). A chain with
+one observed succeeded job cannot grade anything but succeeded. The
+run count check (definition coverage: 4 planned rows for gitforge-ci,
+observed 1) is the only thing that catches it — run status alone is
+not evidence on this deployment. Disposition: deploy-is-the-fix (the
+RC being gated carries the adoption logging, honest interrupted-chain
+grading, and doom cascade); interim operational rule recorded in
+memory — never trust a terminal grade without counting job rows
+against the committed definition. Evidence: fedora ci journal
+2026-10-10 07:01:14–07:02:00 CDT; audit.db runs f5676f9f (4-shape:
+fmt succeeded, 3 absent), 3b1be60c, 80755be1.
+
+**F39 (delayed trigger consumption mints a second run row — found
+2026-10-10 re-triggering the RC).** A push whose RPC response failed
+client-side (curl 7 mid-sideband) had landed server-side: the ref
+existed and the api had created run row e370bd23 (12:11:19Z). The
+trigger event was consumed by ci 2m later (12:13:20Z) and the engine
+minted its own run row db0397db instead of adopting the api's — two
+rows for one push, one of them (`e370bd23`) a permanent zero-job
+`running` ghost no finalizer owns (zero rows → `has_live_row` false
+→ rebuild skips; nothing grades it). The real run db0397db planned
+all four rows correctly (persisted planned=4) and is the release
+gate's subject. Disposition: open defect — the api-side row and the
+engine-side row must share identity or the loser must be finalized;
+until fixed, gate checks select the run row that owns the job rows,
+never the first row matching the commit. Evidence: audit.db rows
+e370bd23 (0 jobs, running) and db0397db (4 jobs) both at commit
+6a1e1f3b; ci journal 07:13:20 push-received line.
+
+**F40 (sqlx stale prepared-statement metadata aborts ci across a live
+schema migration — found 2026-10-10 auditing fedora service journals;
+same incident window as F39 and its likely proximate cause).** At
+12:11:19Z, mid-trigger (`pipeline triggered … ci/rc-v0616-retry` →
+`enqueueing 1 ready jobs`), a `sqlx-sqlite` worker panicked in
+`SqliteRow::current` (`row.rs:43`: `index out of bounds: the len is
+16 but the index is 16`) and the release-profile abort turned it into
+a core dump. Mechanism: sqlx caches per-statement column metadata at
+prepare time; when another process migrates the shared SQLite DB
+(`ALTER TABLE … ADD COLUMN`), SQLite auto-reprepares the cached
+statement to the new schema (17 columns) while sqlx still holds the
+old metadata vec (16) — `columns[i]` runs off the end. The old ci
+binary had prepared `SELECT *` statements against the pre-migration
+jobs table; a co-booting service applied the migration underneath it.
+Disposition: upstream sqlx behavior, self-healed — systemd
+`Restart=on-failure` restarted ci in 13s (journal: restart counter 1,
+07:11:35 CDT) and the fresh process prepares statements post-migration;
+the standard drain-gated cutover restarts the full service set
+together, which is the operational mitigation. No in-repo code change:
+the alternative (sweeping every `SELECT *` into explicit column lists)
+converts an upstream panic into a clean error only at the cost of
+schema-drift errors in dozens of query paths; rejected as
+disproportionate. Residual: a service that boots before a pending
+migration while a peer holds cached statements can still lose one
+request to the panic — bounded by the restart policy. Evidence: fedora
+gitforge-ci journal 2026-10-10 07:11:19–07:11:35 CDT (panic message,
+core-dump, scheduled restart); sqlx-sqlite-0.9.0 row.rs:31–52; timing
+correlation with F39's delayed trigger consumption (the crash is why
+the event waited for the fresh process).
+
+## 14. Findings verdicts (2026-10-25, v0.7.0 release-cycle audit)
+
+**F39 VERDICT (2026-10-25): fixed by architecture change — the duplicate-row
+mechanism no longer exists on the v0.7.0 line.** The F39 shape was: api
+creates run row client-side → ci consumes the trigger late → ci mints its
+own run row → the api-side row is a permanent zero-job `running` ghost no
+finalizer owns. Three structural changes since 2026-10-10 close it:
+
+1. **Dedup at the trigger boundary, not the run boundary.**
+   `TriggerRequestQueries::create_or_existing` (crates/gitforge-db/src/
+   queries.rs:3250) keys on (repo_id, new_hash, status IN pending/
+   processing): a racing or redelivered trigger for the same commit
+   dedups onto the in-flight request and returns its linked run id
+   (`deduplicated: true`) instead of minting a second execution. The
+   ci consumer links the minted run back via `mark_completed(pool,
+   request_id, run_id)` (services/ci/src/main.rs:2184), so the
+   202-null client response settles to a real run id late — the
+   documented durable-202-null contract — rather than orphaning.
+2. **The push path no longer creates run rows on the api side.** The
+   webhook handler delegates to ci first (`CiTriggerClient::trigger`,
+   crates/gitforge-api/src/routes/webhook.rs:253) and returns 202; the
+   inline `PipelineRunQueries::create` at webhook.rs:344 is the
+   fallback only when no CiTriggerClient extension is configured
+   (a deployment shape that no longer exists in production — the
+   client is always mounted), and it plans its OWN durable job under
+   a webhook idempotency key (`webhook:{pipeline}:{commit}`), so even
+   that path is not a zero-job ghost. The zero-job-`running` row class
+   now has no producer.
+3. **The checkout-spawn-failure grading and boot-order fixes** (consumer
+   before inline engine rebuild, 69e3c859) remove the delay window that
+   let the api's row outlive the crash in the first place.
+
+Residual, deliberately accepted: `run_event_consumer` does not look up an
+existing non-terminal run row for (repo, commit) before minting — if a
+future producer re-introduces api-side run creation for pushes, the ghost
+class reopens. The guard is the release gate's definition-coverage check,
+which mechanically refuses any run whose durable rows do not cover the
+persisted pipeline; gate the cut and the ghost cannot be release evidence.
+No further code change required for F39; closure recorded with the v0.7.0
+evidence run 8d28d6f4 (7/7 jobs, exact SHA 3e41df86) as the live
+demonstration that exact-SHA runs carry full durable coverage.
+
+**Phase-6 fuzz lane: DEFERRAL OVERTAKEN (verified 2026-10-25).** The
+2026-10-10 deferral verdict ("pkt-line fuzz target scheduled with the next
+image bump") is stale: the fuzz lane shipped since. `.gitforge.yml` runs a
+`fuzz` job as the chain's final stage (60 s libFuzzer smoke per target,
+cargo +nightly fuzz run, cargo-fuzz 0.13 `+channel` syntax, dsc-ci-rust:10)
+over `fuzz/fuzz_targets/pipeline_parse.rs` and `git_http_parsers.rs` — the
+two untrusted-input surfaces the plan named (pipeline config parser,
+smart-HTTP path/header parsers). Every v0.7.0 evidence run executed it
+green (runs 8d28d6f4, f61dc2df, beae775a). skip_if excludes the job only
+for non-code pushes, and the v0.7.0 release-gate hardening refuses a cut
+whose run skipped it for a main-tip source commit. Campaign-plan item
+closed; no further action.

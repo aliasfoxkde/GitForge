@@ -123,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
         db_pool: saved_db_pool.clone(),
         ci_trigger_url: std::env::var("GITFORGE_CI_TRIGGER_URL").ok(),
         ci_trigger_token: std::env::var("GITFORGE_CI_TRIGGER_TOKEN").ok(),
-        http_client: reqwest::Client::new(),
+        http_client: ci_http_client(),
     };
 
     if state.ci_trigger_url.is_none() || state.ci_trigger_token.is_none() {
@@ -175,7 +175,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn HTTP server
     let http_handle = tokio::spawn(async move {
-        axum::serve(http_listener, app).await.unwrap();
+        axum::serve(http_listener, app)
+            .await
+            .unwrap_or_else(|error| {
+                // The Git HTTP endpoint dying is fatal to the service; surface
+                // it loudly rather than panicking inside a detached task where
+                // the panic would only surface as a silent JoinHandle error.
+                tracing::error!("Git HTTP server failed: {error}");
+            });
     });
 
     // Start SSH server for Git operations. The host key is generated on
@@ -560,11 +567,15 @@ async fn git_receive_pack(
                     "push declined by ref-update policy"
                 );
             }
+            // The report must speak the framing the client negotiated:
+            // raw pkt-lines for a plain client, band-1 multiplexing for the
+            // sideband client every modern git is.
+            let sideband = ref_policy::requests_sideband(&body);
             return finish_response(
                 Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", "application/x-git-receive-pack-result"),
-                Body::from(ref_policy::synthesize_rejection_report(&reasons)),
+                Body::from(ref_policy::synthesize_rejection_report(&reasons, sideband)),
             );
         }
     }
@@ -778,6 +789,17 @@ async fn persist_ci_trigger(
     }
 }
 
+/// HTTP client for CI trigger delivery. A default `Client::new()` has no
+/// request timeout, so one hung CI service pinned the delivery loop (and
+/// with it the outbox cadence) indefinitely; the 60 s bound clears the CI
+/// trigger's own 15 s correlation window with headroom.
+fn ci_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 async fn deliver_pending_ci_events(state: &AppState) -> anyhow::Result<()> {
     let (Some(pool), Some(url), Some(token)) = (
         &state.db_pool,
@@ -817,11 +839,26 @@ async fn deliver_pending_ci_events(state: &AppState) -> anyhow::Result<()> {
         if claimed != 1 {
             continue;
         }
+        let payload_json = match serde_json::from_str::<serde_json::Value>(&payload) {
+            Ok(payload_json) => payload_json,
+            Err(error) => {
+                // A payload that cannot be parsed can never deliver; park it
+                // back to pending with a warn rather than poisoning the batch
+                // through the `?` and skipping every later row.
+                tracing::error!(event = %id, %error, "CI trigger payload is not valid JSON");
+                sqlx::query("UPDATE events SET event_type = 'ci.trigger.pending', delivery_token = NULL, delivery_until = NULL WHERE id = ? AND event_type = 'ci.trigger.delivering' AND delivery_token = ?")
+                    .bind(&id)
+                    .bind(&delivery_token)
+                    .execute(pool.pool())
+                    .await?;
+                continue;
+            }
+        };
         let response = state
             .http_client
             .post(url)
             .bearer_auth(token)
-            .json(&serde_json::from_str::<serde_json::Value>(&payload)?)
+            .json(&payload_json)
             .send()
             .await;
         match response {
@@ -838,7 +875,11 @@ async fn deliver_pending_ci_events(state: &AppState) -> anyhow::Result<()> {
                     .bind(&delivery_token)
                     .execute(pool.pool())
                     .await?;
-                anyhow::bail!("CI trigger returned HTTP {}", response.status());
+                tracing::warn!(
+                    event = %id,
+                    status = %response.status(),
+                    "CI trigger rejected delivery; event returns to pending"
+                );
             }
             Err(error) => {
                 sqlx::query("UPDATE events SET event_type = 'ci.trigger.pending', delivery_token = NULL, delivery_until = NULL WHERE id = ? AND event_type = 'ci.trigger.delivering' AND delivery_token = ?")
@@ -846,7 +887,16 @@ async fn deliver_pending_ci_events(state: &AppState) -> anyhow::Result<()> {
                     .bind(&delivery_token)
                     .execute(pool.pool())
                     .await?;
-                anyhow::bail!("CI trigger request failed: {error}");
+                // Continue, not bail: the old early-return abandoned the rest
+                // of the claimed 50-row batch for up to a full lease (120 s)
+                // whenever one event hit a transient failure — precisely the
+                // conditions delivery exists to ride out. Each row answers
+                // for itself; the lease still bounds concurrent redelivery.
+                tracing::warn!(
+                    event = %id,
+                    error = %error,
+                    "CI trigger request failed; event returns to pending"
+                );
             }
         }
     }

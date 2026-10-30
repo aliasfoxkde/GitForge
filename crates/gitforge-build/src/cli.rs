@@ -115,7 +115,8 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
                             || status.starts_with("failed")
                             || status == "cancelled"
                         {
-                            if status.starts_with("failed") || status == "cancelled" {
+                            if job_failed(&status) {
+                                print_job_output(client, &socket_path, &job_id).await;
                                 anyhow::bail!("job {status}");
                             }
                             return Ok(());
@@ -132,6 +133,41 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
         _ => {
             anyhow::bail!("unexpected response: {response:?}");
         }
+    }
+}
+
+/// Decide whether a terminal job status represents a failure.
+///
+/// The coordinator reports a finished job as `completed(<exit code>)`; a
+/// non-zero exit code is a failure even though the status string starts
+/// with `completed`.
+fn job_failed(status: &str) -> bool {
+    if let Some(rest) = status.strip_prefix("completed(") {
+        let code = rest.trim_end_matches(')');
+        return code.parse::<i32>().is_ok_and(|c| c != 0);
+    }
+    status.starts_with("failed") || status == "cancelled"
+}
+
+/// Print the captured stdout/stderr of a finished job.
+///
+/// Without this the CLI reports only the status string, so a failing build
+/// gives no clue about what went wrong.
+async fn print_job_output<C: JobSubmitter>(client: &C, socket_path: &str, job_id: &str) {
+    match client.get_result(socket_path, job_id.to_string()).await {
+        Ok(Response::Completed {
+            stdout,
+            stderr,
+            exit_code,
+            ..
+        }) => {
+            eprintln!("--- job stdout (exit code {exit_code}) ---");
+            eprintln!("{stdout}");
+            eprintln!("--- job stderr ---");
+            eprintln!("{stderr}");
+        }
+        Ok(other) => eprintln!("--- job output unavailable: {other:?} ---"),
+        Err(e) => eprintln!("--- job output unavailable: {e} ---"),
     }
 }
 
@@ -408,6 +444,19 @@ mod tests {
             assert!(success);
             assert_eq!(exit_code, 0);
         }
+    }
+
+    #[test]
+    fn job_failed_reads_the_exit_code_out_of_a_completed_status() {
+        assert!(!job_failed("completed(0)"));
+        assert!(job_failed("completed(101)"));
+        assert!(job_failed("failed"));
+        assert!(job_failed("cancelled"));
+    }
+
+    #[test]
+    fn job_failed_treats_an_unparsable_completed_status_as_success() {
+        assert!(!job_failed("completed(unknown)"));
     }
 
     #[test]

@@ -14,6 +14,19 @@ pub struct Config {
     /// Auth token
     pub token: Option<String>,
 
+    /// Refresh credential minted with the token. Stored 0600 alongside it:
+    /// whoever can read this file can act as the user regardless, so the
+    /// file mode — not a second secret store — is the security boundary.
+    /// The server holds only its bcrypt hash and revokes it on use.
+    pub refresh_token: Option<String>,
+
+    /// RFC3339 instant the access token expires (absent for tokens written
+    /// by older CLIs; renewal then happens reactively on 401).
+    pub token_expires_at: Option<String>,
+
+    /// RFC3339 instant the refresh credential expires.
+    pub refresh_expires_at: Option<String>,
+
     /// Local data directory
     pub local_data_dir: PathBuf,
 
@@ -91,6 +104,9 @@ impl Default for Config {
         Self {
             server_url: "http://localhost:42780".to_string(),
             token: None,
+            refresh_token: None,
+            token_expires_at: None,
+            refresh_expires_at: None,
             local_data_dir: dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("gitforge"),

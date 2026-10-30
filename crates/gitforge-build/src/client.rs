@@ -40,6 +40,9 @@ pub trait JobSubmitter: Send + Sync {
     /// Cancel a queued or running job.
     async fn cancel_job(&self, socket_path: &str, job_id: String) -> DaemonResult;
 
+    /// Fetch a finished job's captured output.
+    async fn get_result(&self, socket_path: &str, job_id: String) -> DaemonResult;
+
     /// Ask the daemon to shut down gracefully.
     async fn shutdown(&self, socket_path: &str) -> DaemonResult;
 }
@@ -123,6 +126,15 @@ impl JobSubmitter for UnixSocketClient {
         stream.write_all(&encode_request(&request)?).await?;
         stream.shutdown().await?;
         Ok(read_response(&mut stream).await?)
+    }
+
+    async fn get_result(&self, socket_path: &str, job_id: String) -> DaemonResult {
+        let mut stream = UnixStream::connect(socket_path).await?;
+        stream
+            .write_all(&encode_request(&Request::Result { job_id })?)
+            .await?;
+        stream.flush().await?;
+        read_response(&mut stream).await
     }
 
     async fn shutdown(&self, socket_path: &str) -> DaemonResult {
@@ -210,6 +222,17 @@ impl JobSubmitter for MockClient {
     async fn cancel_job(&self, _socket_path: &str, _job_id: String) -> DaemonResult {
         Ok(Response::Error {
             message: "cancel unavailable in mock client".to_string(),
+        })
+    }
+
+    async fn get_result(&self, _socket_path: &str, job_id: String) -> DaemonResult {
+        Ok(Response::Completed {
+            job_id,
+            success: false,
+            exit_code: 1,
+            duration_ms: 0,
+            stdout: String::new(),
+            stderr: String::new(),
         })
     }
 
