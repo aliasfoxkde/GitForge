@@ -271,7 +271,6 @@ jobs:
     # image pull per run.
     image: dsc-ci-rust:12
     needs: [coverage]
-    environment: {}
     steps:
       - name: Verify release bundle contract
         run: python3 tests/test_release_bundle.py -v
