@@ -597,17 +597,14 @@ async fn git_receive_pack(
                     );
                     continue;
                 }
-                if let Err(error) = enqueue_ci_event(
-                    state
-                        .db_pool
-                        .as_deref()
-                        .expect("repo lookup requires database"),
-                    repo_id,
-                    &update,
-                    None,
-                )
-                .await
-                {
+                let Some(pool) = state.db_pool.as_deref() else {
+                    tracing::error!(
+                        repo_id = %repo_id,
+                        "cannot enqueue CI event: database is unavailable"
+                    );
+                    continue;
+                };
+                if let Err(error) = enqueue_ci_event(pool, repo_id, &update, None).await {
                     // No longer a drop: the inline retry outlives measured
                     // storms (F42) and anything beyond that hands off to a
                     // background continuation that keeps inserting until the

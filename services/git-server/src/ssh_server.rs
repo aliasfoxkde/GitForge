@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use gitforge_core::{FileStorageBackend, StorageBackend};
 use gitforge_db::{queries::SshKeyQueries, Pool};
-use russh::keys::{ssh_key::LineEnding, Algorithm, HashAlg, PrivateKey, PublicKey};
+use russh::keys::{ssh_key::LineEnding, Algorithm, HashAlg, PrivateKey};
 use russh::server::{Auth, Handler, Msg, Server, Session};
 use russh::{Channel, MethodKind, MethodSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -175,8 +175,15 @@ impl Handler for GitSshSession {
         })
     }
 
-    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: russh::server::VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
+        let fingerprint = key
+            .public_key
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
         let reject = || Auth::Reject {
             proceed_with_methods: Some(MethodSet::from(&[MethodKind::PublicKey][..])),
             partial_success: false,
@@ -662,6 +669,7 @@ fn parse_git_command(command: &str) -> Result<(&str, String), String> {
 
 /// Forward the git child's stdout to the channel, its stderr as extended
 /// (stderr) data, and report the exit status once both pipes are drained.
+#[allow(clippy::too_many_arguments)]
 async fn pump_until_exit(
     handle: russh::server::Handle,
     channel: russh::ChannelId,
