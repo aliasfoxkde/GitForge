@@ -98,10 +98,10 @@ impl Drop for TemporaryFileGuard {
 /// Write and sync a sibling temporary file, then publish it with one rename.
 ///
 /// GitForge's supported storage hosts are Linux: a same-directory rename
-/// atomically replaces an existing destination there. Do not remove the old
-/// destination first, since that would expose a missing-file window. If this
-/// storage is extended to platforms where rename cannot replace an existing
-/// file, use that platform's atomic replace primitive instead.
+/// atomically publishes over an existing destination there. Do not delete the
+/// old destination first, since that would expose a missing-file window. If
+/// this storage is extended to platforms where rename cannot publish over an
+/// existing file, use that platform's atomic publication primitive instead.
 ///
 /// This provides atomic visibility for one file. It syncs the file contents
 /// before rename, but does not sync the containing directory, so it does not
