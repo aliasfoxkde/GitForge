@@ -227,6 +227,15 @@ async fn spawn_server() -> TestServer {
         None,
     );
 
+    // HEAD points at main; the branch-delete test pushes :main, so allow
+    // deleting the current branch in this fixture.
+    run_git(
+        &["config", "receive.denyDeleteCurrent", "ignore"],
+        &bare_repo,
+        &[],
+        None,
+    );
+
     let host_key_path = ssh_dir.join("host_ed25519");
     let ssh_port = free_port();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_git-server"))
@@ -235,9 +244,13 @@ async fn spawn_server() -> TestServer {
         .env("GIT_ROOT", &git_root)
         .env("DATABASE_URL", format!("sqlite:{}", db_path.display()))
         .env("GITFORGE_SSH_HOST_KEY", &host_key_path)
-        .env("RUST_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .env("RUST_LOG", "debug")
+        .stdout(Stdio::from(
+            std::fs::File::create("/var/tmp/ssh-server.log").unwrap(),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create("/var/tmp/ssh-server.log").unwrap(),
+        ))
         .spawn()
         .expect("spawn git-server binary");
 
@@ -283,6 +296,10 @@ fn ssh_url(port: u16, path: &str) -> String {
 
 #[tokio::test]
 async fn test_git_push_and_clone_over_ssh() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let mut server = spawn_server().await;
     let base = server.git_root.parent().unwrap().to_path_buf();
     let origin_url = ssh_url(server.ssh_port, "testowner/proto.git");

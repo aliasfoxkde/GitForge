@@ -180,10 +180,7 @@ impl Handler for GitSshSession {
         user: &str,
         key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        let fingerprint = key
-            .public_key
-            .fingerprint(HashAlg::Sha256)
-            .to_string();
+        let fingerprint = key.public_key.fingerprint(HashAlg::Sha256).to_string();
         let reject = || Auth::Reject {
             proceed_with_methods: Some(MethodSet::from(&[MethodKind::PublicKey][..])),
             partial_success: false,
@@ -714,26 +711,49 @@ async fn pump_until_exit(
             return;
         }
     };
+    tracing::debug!(?channel, status, "pump finished; evaluating CI enqueue");
     if status == 0 {
-        if let (Ok(push_event), Some(pool)) = (push_event.await, db_pool) {
-            let pusher_id = push_event.pusher_id;
-            if let Some(repo_id) = push_event.repo_id {
-                let accepted_refs = receive_status
-                    .as_deref()
-                    .and_then(parse_receive_status_ok_refs)
-                    .unwrap_or_default();
-                for update in push_event.updates {
-                    if !accepted_refs.contains(&update.ref_name) {
-                        continue;
+        match push_event.await {
+            Ok(push_event) => {
+                let pusher_id = push_event.pusher_id;
+                match (push_event.repo_id, db_pool.clone()) {
+                    (Some(repo_id), Some(pool)) => {
+                        let accepted_refs = receive_status
+                            .as_deref()
+                            .and_then(parse_receive_status_ok_refs)
+                            .unwrap_or_default();
+                        if accepted_refs.is_empty() {
+                            tracing::warn!(?channel,
+                                status = ?receive_status.as_deref().map(|s| String::from_utf8_lossy(s)),
+                                "no accepted refs parsed from receive-pack status; skipping CI enqueue");
+                        }
+                        for update in push_event.updates {
+                            if !accepted_refs.contains(&update.ref_name) {
+                                tracing::debug!(?channel, ref_name = %update.ref_name,
+                                    "ref not in accepted set; skipping CI enqueue");
+                                continue;
+                            }
+                            if let Err(error) =
+                                crate::enqueue_ci_event(&pool, repo_id, &update, pusher_id).await
+                            {
+                                tracing::error!(?channel, ref_name = %update.ref_name, %error,
+                                    "SSH CI trigger insert deferred to background redelivery");
+                            }
+                        }
                     }
-                    if let Err(error) =
-                        crate::enqueue_ci_event(&pool, repo_id, &update, pusher_id).await
-                    {
-                        tracing::error!(?channel, ref_name = %update.ref_name, %error,
-                            "SSH CI trigger insert deferred to background redelivery");
+                    (None, _) => tracing::warn!(
+                        ?channel,
+                        "push event carried no repo_id; skipping CI enqueue"
+                    ),
+                    (_, None) => {
+                        tracing::warn!(?channel, "no db pool available; skipping CI enqueue")
                     }
                 }
             }
+            Err(_) => tracing::warn!(
+                ?channel,
+                "push event sender dropped before completion; skipping CI enqueue"
+            ),
         }
     }
     let _ = handle.exit_status_request(channel, status as u32).await;
@@ -779,21 +799,41 @@ async fn pipe_receive_status_to_channel(
 
 fn parse_receive_status_ok_refs(status: &[u8]) -> Option<std::collections::HashSet<String>> {
     let mut accepted = std::collections::HashSet::new();
-    let mut offset = 0;
+    parse_status_packets(status, &mut accepted)?;
+    Some(accepted)
+}
+
+/// Walk pkt-lines collecting `unpack ok` confirmations and `ok <ref>` rows.
+/// With `sideband` set, each packet's payload carries a side-band channel
+/// byte and the status report as *inner* pkt-lines, which are unwrapped
+/// recursively (receive-pack negotiates side-band-64k whenever the client
+/// advertises it).
+fn parse_status_packets(
+    mut data: &[u8],
+    accepted: &mut std::collections::HashSet<String>,
+) -> Option<bool> {
     let mut saw_unpack_ok = false;
-    while offset + 4 <= status.len() {
-        let length =
-            usize::from_str_radix(std::str::from_utf8(&status[offset..offset + 4]).ok()?, 16)
-                .ok()?;
+    while data.len() >= 4 {
+        let length = usize::from_str_radix(std::str::from_utf8(&data[..4]).ok()?, 16).ok()?;
         if length == 0 {
-            return saw_unpack_ok.then_some(accepted);
+            // Flush packets separate sections (capabilities, then the
+            // status report); keep scanning rather than stopping at the
+            // first one.
+            data = &data[4..];
+            continue;
         }
-        if length < 4 || offset + length > status.len() {
+        if length < 4 || length > data.len() {
             return None;
         }
-        let mut payload = &status[offset + 4..offset + length];
+        let payload = &data[4..length];
+        data = &data[length..];
         if payload.first() == Some(&1) {
-            payload = &payload[1..];
+            // Side-band channel 1: the payload is the status report itself,
+            // pkt-line encoded. A nested flush packet ends it.
+            if parse_status_packets(&payload[1..], accepted)? {
+                saw_unpack_ok = true;
+            }
+            continue;
         }
         for line in payload.split(|byte| *byte == b'\n') {
             if line == b"unpack ok" {
@@ -802,9 +842,8 @@ fn parse_receive_status_ok_refs(status: &[u8]) -> Option<std::collections::HashS
                 accepted.insert(std::str::from_utf8(ref_name).ok()?.to_string());
             }
         }
-        offset += length;
     }
-    None
+    Some(saw_unpack_ok)
 }
 
 /// Kill a disconnected git child and await it so it cannot remain a zombie.
@@ -934,7 +973,12 @@ mod tests {
         let accepted = parse_receive_status_ok_refs(status).expect("valid status report");
         assert!(accepted.contains("refs/heads/main"));
         assert!(!accepted.contains("refs/heads/bad"));
-        assert!(parse_receive_status_ok_refs(b"0000").is_none());
+        // A bare flush packet is a valid (empty) report; malformed hex is not.
+        assert_eq!(
+            parse_receive_status_ok_refs(b"0000"),
+            Some(std::collections::HashSet::new())
+        );
+        assert!(parse_receive_status_ok_refs(b"zzzz").is_none());
     }
 
     #[tokio::test]
