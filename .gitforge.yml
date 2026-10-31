@@ -25,8 +25,6 @@
 #   because all jobs of one run share the SAME workspace directory on this
 #   runner. Concurrent jobs would run cargo against the same target/
 #   directory and corrupt each other's build locks.
-# - `environment: {}` is required by the parser (PipelineDefinition has no
-#   serde default) even though it is never forwarded.
 # - The image is pre-built on the host (dsc-ci-rust:12 — cargo, clippy,
 #   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, python3
 #   for the route-docs drift gate, and the GitForge workspace cargo
@@ -271,7 +269,6 @@ jobs:
     # image pull per run.
     image: dsc-ci-rust:12
     needs: [coverage]
-    environment: {}
     steps:
       - name: Verify release bundle contract
         run: python3 tests/test_release_bundle.py -v
