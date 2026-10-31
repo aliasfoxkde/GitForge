@@ -25,6 +25,18 @@ criteria = "safe-to-deploy"
 delta = "11.0.0 -> 11.1.0"
 notes = "Dependabot lockfile-only update; reviewed as a minor upstream release and all GitForge CI, security, Aegis, and E2E gates pass."
 
+[[audits.lazy_static]]
+who = "Michael Kinney (Claude Code audit session)"
+criteria = "safe-to-deploy"
+delta = "1.5.0 -> 1.5.1"
+notes = "Delta 1.5.0->1.5.1 reviewed line-by-line: docs-only (deprecation notice, doc typos, html_root_url, Cargo.toml metadata reordering). No code or unsafe changes."
+
+[[audits.libc]]
+who = "Michael Kinney (Claude Code audit session)"
+criteria = "safe-to-deploy"
+delta = "0.2.190 -> 0.2.191"
+notes = "Delta 0.2.190->0.2.191 reviewed: 168 added lines are FFI declarations (extern types, fn bindings), platform additions (Android, Apple xnu, FreeBSD, OpenBSD, QURT, Hurd), and a cfg-gate removal on an existing deprecated unsafe fn (mach_task_self). No new unsafe logic or ambient capabilities - libc is declaration-only by design. Upstream PRs referenced in changelog."
+
 [[audits.libz-sys]]
 who = "Michael Kinney"
 criteria = "safe-to-deploy"
@@ -36,6 +48,18 @@ who = "Michael Kinney"
 criteria = "safe-to-deploy"
 delta = "0.63.2 -> 0.63.3"
 notes = "Dependabot lockfile-only update; reviewed as a patch upstream release and all GitForge CI, security, Aegis, and E2E gates pass."
+
+[[audits.sha2]]
+who = "Michael Kinney (Claude Code audit session)"
+criteria = "safe-to-deploy"
+delta = "0.11.0 -> 0.11.1"
+notes = "Delta 0.11.0->0.11.1 reviewed line-by-line: refactor of hw-accel backends (aarch64_sha2, riscv_zknh, wasm32_simd128, x86_sha/x86_avx2). unsafe fn compress made safe with target_feature gating (stricter), compile_error feature assertions added, intrinsics wrapped in unsafe blocks at use sites. No algorithm changes, no constant changes (K32/K64 untouched), no input-handling changes. Soft backend refactor only."
+
+[[audits.uuid]]
+who = "Michael Kinney (Claude Code audit session)"
+criteria = "safe-to-deploy"
+delta = "1.26.1 -> 1.29.0"
+notes = "Delta 1.26.1->1.29.0 reviewed (1086-line diff, 47 hunks): adds NonNilUuid constructors (new_v1..v7 with per-call SAFETY comments - version bits guarantee non-nil), Option<Uuid> serde support, const-fn parser extended for braced/URN forms (parse-only, length-gated, no unsafe), feature-gating fixes. No new unsafe blocks beyond documented new_unchecked wrappers, no RNG changes, no dependency additions. Purely additive API over existing generation logic."
 
 [[trusted.aho-corasick]]
 criteria = "safe-to-deploy"
@@ -206,6 +230,30 @@ user-id = 3618 # David Tolnay (dtolnay)
 start = "2025-09-13"
 end = "2027-09-09"
 
+[[trusted.serde_json]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-02-28"
+end = "2027-10-31"
+
+[[trusted.serde_spanned]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-01-20"
+end = "2027-10-31"
+
+[[trusted.thiserror]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-09"
+end = "2027-10-31"
+
+[[trusted.thiserror-impl]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-09"
+end = "2027-10-31"
+
 [[trusted.thread_local]]
 criteria = "safe-to-deploy"
 user-id = 2915 # Amanieu d'Antras (Amanieu)
@@ -213,11 +261,41 @@ start = "2019-09-07"
 end = "2027-10-02"
 notes = "peer-attested publisher trust: delegated to peer registries (isrg/mozilla/bytecode-alliance/zcash) per cargo-vet suggest NOTE, 2026-10-02"
 
+[[trusted.tokio]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2020-12-25"
+end = "2027-10-31"
+
 [[trusted.tokio-test]]
 criteria = "safe-to-deploy"
 user-id = 6741 # Alice Ryhl (Darksonn)
 start = "2021-05-14"
 end = "2027-09-20"
+
+[[trusted.tokio-util]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2021-01-12"
+end = "2027-10-31"
+
+[[trusted.toml]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2022-12-14"
+end = "2027-10-31"
+
+[[trusted.toml_datetime]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2022-10-21"
+end = "2027-10-31"
+
+[[trusted.toml_parser]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2025-07-08"
+end = "2027-10-31"
 
 [[trusted.toml_writer]]
 criteria = "safe-to-deploy"
@@ -237,6 +315,12 @@ user-id = 189 # Andrew Gallant (BurntSushi)
 start = "2019-06-09"
 end = "2027-10-02"
 notes = "peer-attested publisher trust: delegated to peer registries (isrg/mozilla/bytecode-alliance/zcash) per cargo-vet suggest NOTE, 2026-10-02"
+
+[[trusted.want]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2019-03-19"
+end = "2027-10-31"
 
 [[trusted.winapi-util]]
 criteria = "safe-to-deploy"
