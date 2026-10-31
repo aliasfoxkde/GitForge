@@ -46,7 +46,7 @@ These are valuable primitives. The proposed work should extend them rather than 
 | CI cache mount | Cargo target path keyed by a sanitized image string | Different image names can normalize to the same path; cache correctness should use canonical digests |
 | Workspaces | Native Git worktrees/manual lifecycle and runner workspaces | Ownership/cleanup and per-job I/O costs remain operator burdens |
 | Concurrent builds | Current self-pipeline is intentionally a linear chain because the jobs share a mutable workspace/target | Parallelism is currently limited; simply fanning out jobs would be unsafe |
-| Test selection | Changed-file / affected-crate filtering exists in prior work, but test-level change-impact and trusted result reuse are not on main | Full test/coverage work can still be repeated unnecessarily |
+| Test selection | Main has changed-file classification and job-level skip_if filtering. A prior, unmerged #322 branch adds affected-crate graph selection; it is not integrated into main. Per-test change-impact and trusted result reuse are not on main | Full test/coverage work can still be repeated unnecessarily |
 | Observability | Queue/job status, receipts, logs and metrics exist | Missing unified queue wait, host pressure, physical I/O, cache effectiveness and workspace-cost signals |
 
 The October 10 worktree census documented 44 live Git worktrees: 25 clean, 17 with small dirty WIP, one additional dirty main worktree, and one 3,962-file build-artifact spill. The important finding is not the exact historical count; it is that Git cleanup must be owner/lease aware and distinguish build output from source changes.
