@@ -4,7 +4,7 @@ use crate::artifact::{Artifact, ArtifactId, ArtifactStore};
 use crate::cache::{CacheEntry, CacheKey, CacheStore};
 use async_trait::async_trait;
 use gitforge_common::{Error, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -60,44 +60,108 @@ impl FileStorage {
     }
 }
 
+/// Remove a temporary sibling on ordinary error or future cancellation.
+///
+/// The guard is activated only after `create_new` succeeds, so it never removes
+/// a path owned by another writer. Drop cleanup uses a small synchronous unlink
+/// because async cleanup cannot be awaited when a future is cancelled.
+struct TemporaryFileGuard {
+    path: PathBuf,
+    active: bool,
+}
+
+impl TemporaryFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            active: false,
+        }
+    }
+
+    fn activate(&mut self) {
+        self.active = true;
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for TemporaryFileGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Write and sync a sibling temporary file, then publish it with one rename.
+///
+/// GitForge's supported storage hosts are Linux: a same-directory rename
+/// atomically publishes over an existing destination there. Do not delete the
+/// old destination first, since that would expose a missing-file window. If
+/// this storage is extended to platforms where rename cannot publish over an
+/// existing file, use that platform's atomic publication primitive instead.
+///
+/// This provides atomic visibility for one file. It syncs the file contents
+/// before rename, but does not sync the containing directory, so it does not
+/// promise that the rename itself survives sudden power loss.
+pub(crate) async fn write_atomic(path: &Path, contents: &[u8], description: &str) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("storage");
+    let temporary_path = path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+
+    let mut cleanup = TemporaryFileGuard::new(temporary_path.clone());
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary_path)
+        .await
+        .map_err(|e| Error::storage(format!("failed to create temporary {description}: {e}")))?;
+    cleanup.activate();
+
+    file.write_all(contents)
+        .await
+        .map_err(|e| Error::storage(format!("failed to write temporary {description}: {e}")))?;
+    file.sync_all()
+        .await
+        .map_err(|e| Error::storage(format!("failed to sync temporary {description}: {e}")))?;
+    drop(file);
+
+    fs::rename(&temporary_path, path)
+        .await
+        .map_err(|e| Error::storage(format!("failed to publish {description}: {e}")))?;
+    cleanup.disarm();
+    Ok(())
+}
+
 #[async_trait]
 impl ArtifactStore for FileStorage {
     async fn put(&self, artifact: &Artifact, data: &[u8]) -> Result<()> {
         let artifact_path = self.artifact_path(artifact.id);
         let meta_path = self.artifact_meta_path(artifact.id);
 
-        // Write data
-        let mut file = fs::File::create(&artifact_path)
-            .await
-            .map_err(|e| Error::storage(format!("failed to create artifact file: {e}")))?;
-
-        file.write_all(data)
-            .await
-            .map_err(|e| Error::storage(format!("failed to write artifact data: {e}")))?;
-
-        // Ensure data is flushed to disk before returning
-        file.sync_all()
-            .await
-            .map_err(|e| Error::storage(format!("failed to sync artifact data: {e}")))?;
-
-        // Write metadata
         let meta_json = serde_json::to_string_pretty(artifact)
             .map_err(|e| Error::storage(format!("failed to serialize artifact metadata: {e}")))?;
 
-        let mut meta_file = fs::File::create(&meta_path)
+        // Publish bytes before metadata so list operations never index bytes
+        // that have not been written. These are separate atomic renames, not
+        // a two-file transaction; a metadata publish error is returned with
+        // an explicit note that the data file may already contain this write.
+        write_atomic(&artifact_path, data, "artifact data").await?;
+        write_atomic(&meta_path, meta_json.as_bytes(), "artifact metadata")
             .await
-            .map_err(|e| Error::storage(format!("failed to create artifact metadata file: {e}")))?;
-
-        meta_file
-            .write_all(meta_json.as_bytes())
-            .await
-            .map_err(|e| Error::storage(format!("failed to write artifact metadata: {e}")))?;
-
-        // Ensure metadata is flushed to disk before returning
-        meta_file
-            .sync_all()
-            .await
-            .map_err(|e| Error::storage(format!("failed to sync artifact metadata: {e}")))?;
+            .map_err(|error| {
+                Error::storage(format!(
+                    "artifact data was published but metadata publication failed: {error}"
+                ))
+            })?;
 
         tracing::info!(
             "stored artifact {} ({} bytes)",
@@ -206,20 +270,6 @@ impl CacheStore for FileStorage {
         let path = self.cache_path(&key);
         let meta_path = self.cache_meta_path(&key);
 
-        let mut file = fs::File::create(&path)
-            .await
-            .map_err(|e| Error::storage(format!("failed to create cache file: {e}")))?;
-
-        file.write_all(&data)
-            .await
-            .map_err(|e| Error::storage(format!("failed to write cache data: {e}")))?;
-
-        // Ensure data is flushed to disk before returning
-        file.sync_all()
-            .await
-            .map_err(|e| Error::storage(format!("failed to sync cache data: {e}")))?;
-
-        // Write metadata
         let now = chrono::Utc::now();
         let entry = crate::cache::CacheEntry {
             key: key.clone(),
@@ -231,20 +281,16 @@ impl CacheStore for FileStorage {
         let meta_json = serde_json::to_string(&entry)
             .map_err(|e| Error::storage(format!("failed to serialize cache metadata: {e}")))?;
 
-        let mut meta_file = fs::File::create(&meta_path)
+        // As with artifacts, the metadata rename follows the data rename but
+        // cannot make the two files a single transaction.
+        write_atomic(&path, &data, "cache data").await?;
+        write_atomic(&meta_path, meta_json.as_bytes(), "cache metadata")
             .await
-            .map_err(|e| Error::storage(format!("failed to create cache metadata file: {e}")))?;
-
-        meta_file
-            .write_all(meta_json.as_bytes())
-            .await
-            .map_err(|e| Error::storage(format!("failed to write cache metadata: {e}")))?;
-
-        // Ensure metadata is flushed to disk before returning
-        meta_file
-            .sync_all()
-            .await
-            .map_err(|e| Error::storage(format!("failed to sync cache metadata: {e}")))?;
+            .map_err(|error| {
+                Error::storage(format!(
+                    "cache data was published but metadata publication failed: {error}"
+                ))
+            })?;
 
         tracing::debug!("cached {} bytes at {:?}", data.len(), path);
         Ok(())
@@ -325,6 +371,89 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn test_temporary_file_guard_removes_owned_file_on_drop() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".data.tmp-owned");
+        std::fs::write(&path, b"temporary").unwrap();
+
+        let mut guard = TemporaryFileGuard::new(path.clone());
+        guard.activate();
+        drop(guard);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_inactive_temporary_file_guard_does_not_remove_unowned_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".data.tmp-collision");
+        std::fs::write(&path, b"another writer's file").unwrap();
+
+        drop(TemporaryFileGuard::new(path.clone()));
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"another writer's file");
+    }
+
+    #[tokio::test]
+    async fn test_atomic_write_replaces_without_exposing_partial_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache.data");
+        let old = vec![b'o'; 256 * 1024];
+        let new = vec![b'n'; 256 * 1024];
+        fs::write(&path, &old).await.unwrap();
+
+        let writer_path = path.clone();
+        let writer_new = new.clone();
+        let writer_old = old.clone();
+        let writer = tokio::spawn(async move {
+            for _ in 0..8 {
+                write_atomic(&writer_path, &writer_new, "test data")
+                    .await
+                    .unwrap();
+                write_atomic(&writer_path, &writer_old, "test data")
+                    .await
+                    .unwrap();
+            }
+        });
+
+        loop {
+            let observed = fs::read(&path).await.unwrap();
+            assert!(
+                observed == old || observed == new,
+                "reader observed a partial or mixed publication"
+            );
+            if writer.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_atomic_write_cleans_temporary_file_when_publish_fails() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("occupied.data");
+        fs::create_dir(&target).await.unwrap();
+
+        assert!(write_atomic(&target, b"new data", "test data")
+            .await
+            .is_err());
+
+        assert!(fs::metadata(&target).await.unwrap().is_dir());
+        let mut entries = fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".occupied.data.tmp-"),
+                "failed publication left a temporary file behind"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_file_storage_artifact() {
         let dir = tempdir().unwrap();
@@ -363,6 +492,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_artifact_replacement_publishes_data_and_valid_metadata() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+        let id = ArtifactId::new();
+        let job_id = gitforge_common::JobId::new();
+        let old_data = b"previous artifact";
+        let mut artifact = Artifact {
+            id,
+            job_id,
+            name: "previous.txt".to_string(),
+            path: "/fake/previous.txt".to_string(),
+            checksum: "old".to_string(),
+            size_bytes: old_data.len() as u64,
+            content_type: Some("text/plain".to_string()),
+            created_at: chrono::Utc::now(),
+        };
+        ArtifactStore::put(&storage, &artifact, old_data)
+            .await
+            .unwrap();
+
+        let new_data = b"replacement artifact contents";
+        artifact.name = "replacement.txt".to_string();
+        artifact.path = "/fake/replacement.txt".to_string();
+        artifact.checksum = "new".to_string();
+        artifact.size_bytes = new_data.len() as u64;
+        ArtifactStore::put(&storage, &artifact, new_data)
+            .await
+            .unwrap();
+
+        assert_eq!(ArtifactStore::get(&storage, id).await.unwrap(), new_data);
+        let metadata = ArtifactStore::get_metadata(&storage, id).await.unwrap();
+        assert_eq!(metadata.name, "replacement.txt");
+        assert_eq!(metadata.size_bytes, new_data.len() as u64);
+        let listed = ArtifactStore::list(&storage).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, metadata.name);
+        assert_eq!(listed[0].size_bytes, metadata.size_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_artifact_metadata_publish_failure_reports_data_was_published() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            job_id: gitforge_common::JobId::new(),
+            name: "partial-pair.txt".to_string(),
+            path: "/fake/partial-pair.txt".to_string(),
+            checksum: "new".to_string(),
+            size_bytes: 4,
+            content_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        fs::create_dir(storage.artifact_meta_path(artifact.id))
+            .await
+            .unwrap();
+
+        let error = ArtifactStore::put(&storage, &artifact, b"data")
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("artifact data was published but metadata publication failed"));
+        assert_eq!(
+            ArtifactStore::get(&storage, artifact.id).await.unwrap(),
+            b"data"
+        );
+        let mut entries = fs::read_dir(&storage.artifacts_dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(
+                !entry.file_name().to_string_lossy().contains(".tmp-"),
+                "failed metadata publication left a temporary file behind"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_metadata_publish_failure_reports_data_was_published() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).await.unwrap();
+        let key = CacheKey::new(gitforge_common::RepoId::new(), "partial-pair", "main");
+        fs::create_dir(storage.cache_meta_path(&key)).await.unwrap();
+
+        let error = CacheStore::put(&storage, key.clone(), b"cache bytes".to_vec())
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cache data was published but metadata publication failed"));
+        assert_eq!(
+            CacheStore::get(&storage, &key).await.unwrap().unwrap(),
+            b"cache bytes"
+        );
+        let mut entries = fs::read_dir(&storage.cache_dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(
+                !entry.file_name().to_string_lossy().contains(".tmp-"),
+                "failed cache metadata publication left a temporary file behind"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_cache_put_and_get() {
         let dir = tempdir().unwrap();
         let storage = FileStorage::new(dir.path()).await.unwrap();
@@ -378,6 +612,19 @@ mod tests {
         let retrieved = CacheStore::get(&storage, &key).await.unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap(), data);
+
+        let replacement = b"replacement cache data";
+        CacheStore::put(&storage, key.clone(), replacement.to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            CacheStore::get(&storage, &key).await.unwrap().unwrap(),
+            replacement
+        );
+        let entries = CacheStore::list(&storage).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, key);
+        assert_eq!(entries[0].size_bytes, replacement.len() as u64);
     }
 
     #[tokio::test]
