@@ -245,3 +245,75 @@ async fn test_login_and_authenticated_repository_and_ssh_key_flow() {
 
     common::shutdown_gracefully(&mut service.child).await;
 }
+
+/// Status-poll authentication contract (#344): the pipeline-runs endpoints
+/// must reject a bad credential with an immediate, unambiguous 401. A poller
+/// that misreads auth failure as "run not visible yet" turns a bad token
+/// into a multi-hour missing-run timeout — this test pins the rejection so
+/// the client can distinguish the two cases.
+#[tokio::test]
+async fn test_pipeline_run_status_rejects_invalid_credentials() {
+    let mut service = spawn_api().await;
+    let base = format!("http://127.0.0.1:{}", service.port);
+    let client = reqwest::Client::new();
+
+    // A syntactically valid but wrongly-signed JWT must yield 401 with the
+    // explicit invalid_token error — not 404, which would read as
+    // "run does not exist" to a status poller.
+    let forged = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDAiLCJ1c2VyX2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAiLCJ1c2VybmFtZSI6InBvbGxlciIsInJvbGUiOiJkZXZlbG9wZXIiLCJleHAiOjk0NjY4NDQwMCwiaWF0IjoxMDAwMDAwMDAwfQ.not-a-real-signature";
+    for path in [
+        "/api/pipeline-runs?limit=1",
+        "/api/pipeline-runs/00000000-0000-0000-0000-000000000000",
+    ] {
+        let response = client
+            .get(format!("{base}{path}"))
+            .header("authorization", format!("Bearer {forged}"))
+            .send()
+            .await
+            .expect("forged token request");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "forged token against {path} must be an auth rejection"
+        );
+        let body: serde_json::Value = response.json().await.expect("parse error body");
+        assert_eq!(body["error"], "invalid_token");
+    }
+
+    // A well-formed, freshly-signed token sees the same endpoints as an
+    // empty collection (200), proving 401 above is credential-specific.
+    let login = client
+        .post(format!("{base}/auth/login"))
+        .json(&serde_json::json!({
+            "username": "gatewayowner",
+            "password": &service.harness_passphrase,
+        }))
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let login_body: serde_json::Value = login.json().await.expect("parse login");
+    let token = login_body["token"].as_str().expect("token");
+
+    let listed = client
+        .get(format!("{base}/api/pipeline-runs?limit=1"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("authenticated list");
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+
+    let missing = client
+        .get(format!(
+            "{base}/api/pipeline-runs/00000000-0000-0000-0000-000000000000"
+        ))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("authenticated get");
+    // A valid credential that asks for a nonexistent run gets 404 — the
+    // distinct "missing run" signal a poller must handle separately.
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    common::shutdown_gracefully(&mut service.child).await;
+}

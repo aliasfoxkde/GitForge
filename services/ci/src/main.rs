@@ -2023,11 +2023,22 @@ pub async fn graceful_shutdown_delay() {
 /// repositories' clones and checkouts can proceed at once.
 const DEFAULT_TRIGGER_CONCURRENCY: usize = 4;
 
-/// The repository a trigger event belongs to, for lane assignment.
-fn event_repo_id(event: &EventEnvelope) -> gitforge_common::RepoId {
+/// The repository and ref a trigger event belongs to, for lane assignment.
+/// Lanes are keyed per (repo, ref): FIFO ordering holds within a ref, while
+/// a long-running branch cannot starve pushes to other refs of the same
+/// repository (observed: a codex branch's ~10-minute pipelines left five
+/// main-branch trigger requests pending for hours).
+type EventLaneKey = (gitforge_common::RepoId, String);
+type LaneMap = HashMap<EventLaneKey, tokio::sync::mpsc::UnboundedSender<EventEnvelope>>;
+
+fn event_lane_key(event: &EventEnvelope) -> EventLaneKey {
     match &event.payload {
-        EventPayload::PushReceived(payload) => payload.repo_id,
-        _ => gitforge_common::RepoId::from(uuid::Uuid::nil()),
+        EventPayload::PushReceived(payload) => (payload.repo_id, payload.ref_name.clone()),
+        EventPayload::RefUpdated(payload) => (payload.repo_id, payload.ref_name.clone()),
+        _ => (
+            gitforge_common::RepoId::from(uuid::Uuid::nil()),
+            String::new(),
+        ),
     }
 }
 
@@ -2113,11 +2124,7 @@ async fn run_event_consumer(
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_TRIGGER_CONCURRENCY);
     let permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let lanes: Arc<
-        std::sync::Mutex<
-            HashMap<gitforge_common::RepoId, tokio::sync::mpsc::UnboundedSender<EventEnvelope>>,
-        >,
-    > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let lanes: Arc<std::sync::Mutex<LaneMap>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -2146,7 +2153,7 @@ async fn run_event_consumer(
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 lanes
-                                    .entry(event_repo_id(&event))
+                                    .entry(event_lane_key(&event))
                                     .or_insert_with(|| {
                                         spawn_trigger_lane(
                                             scheduler.clone(),
@@ -3282,6 +3289,33 @@ mod tests {
     use std::sync::OnceLock;
 
     static WORKSPACE_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn lane_key_separates_refs_within_a_repo() {
+        let repo = gitforge_common::RepoId::from(uuid::Uuid::new_v4());
+        let push = |ref_name: &str| {
+            EventEnvelope::new(
+                EventType::PushReceived,
+                EventPayload::PushReceived(PushReceivedPayload {
+                    repo_id: repo,
+                    ref_name: ref_name.to_string(),
+                    old_hash: "a".repeat(40),
+                    new_hash: "b".repeat(40),
+                    pusher_id: None,
+                }),
+                Some(repo),
+                None,
+            )
+        };
+        assert_eq!(
+            event_lane_key(&push("refs/heads/main")),
+            event_lane_key(&push("refs/heads/main"))
+        );
+        assert_ne!(
+            event_lane_key(&push("refs/heads/main")),
+            event_lane_key(&push("refs/heads/codex/x"))
+        );
+    }
 
     #[test]
     fn execution_plan_carries_volumes_and_cache_env() {
