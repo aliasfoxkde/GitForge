@@ -49,6 +49,12 @@ criteria = "safe-to-deploy"
 delta = "0.63.2 -> 0.63.3"
 notes = "Dependabot lockfile-only update; reviewed as a patch upstream release and all GitForge CI, security, Aegis, and E2E gates pass."
 
+[[audits.russh]]
+who = "Michael Kinney (Claude Code audit session)"
+criteria = "safe-to-deploy"
+delta = "0.63.3 -> 0.65.0"
+notes = "Focused security audit of the 6567-line delta (auth, kex, cipher, cert, agent). Verdict SAFE-TO-DEPLOY. Changes are largely hardening: pre-auth cert-nesting depth cap (check_cert_nesting, marker-count cap 8) closes a stack-overflow DoS; auth state machine binds request algorithm to signature algorithm (RFC 8332 anti-downgrade, closes ssh-rsa/SHA-1 downgrade); rejection_count no longer increments on partial_success; zero maximum_packet_size in CHANNEL_OPEN rejected (prevents write stall); cipher byte counters zeroed per key epoch with rekey timer (fixes rekey accounting); agent add_key bounds constraint flood and honors RSA-SHA2 flags. No new unsafe, no algorithm removals, added unwraps are test-only. Handler trait changed: auth_publickey now receives VerifiedPublicKey (post-verify) and auth_publickey_offered receives PublicKeyOffer; git-server adapted accordingly. Full report in session audit of /var/tmp/russh-delta.diff, 2026-10-31."
+
 [[audits.sha2]]
 who = "Michael Kinney (Claude Code audit session)"
 criteria = "safe-to-deploy"
