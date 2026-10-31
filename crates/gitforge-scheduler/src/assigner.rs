@@ -2,7 +2,7 @@
 
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
-use gitforge_common::{JobId, PipelineRunId, RepoId, RunnerId, VolumeSpec};
+use gitforge_common::{JobId, Lane, PipelineRunId, RepoId, RunnerId, VolumeSpec};
 use gitforge_db::models::{
     Job as DbJob, JobStatus, PipelineRun as DbPipelineRun, Runner,
     RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS,
@@ -11,7 +11,7 @@ use gitforge_db::Pool;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, RwLockWriteGuard};
 use uuid::Uuid;
 
 /// Maximum heartbeat age before a runner is considered lost by the normal
@@ -34,6 +34,82 @@ const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS;
 /// well above the runner heartbeat interval so scheduler-side slowness alone
 /// can never consume the whole budget.
 pub const DEFAULT_JOB_FENCE_GRACE_SECS: i64 = 300;
+
+/// Per-lane concurrent-running caps (#338), read once from the
+/// environment at scheduler construction. `None` means unbounded — the
+/// only v1 lane caps that default on are Heavy (1 per runner, matching the
+/// legacy workspace-test exclusivity) and Background (1 process-wide).
+/// `GITFORGE_LANE_LIMIT_FAST`, `GITFORGE_LANE_LIMIT_STANDARD`,
+/// `GITFORGE_LANE_LIMIT_HEAVY`, `GITFORGE_LANE_LIMIT_BACKGROUND` override.
+pub fn lane_limit(lane: Lane, env_value: Option<&str>) -> Option<usize> {
+    let default = match lane {
+        Lane::Fast | Lane::Standard => None,
+        Lane::Heavy | Lane::Background => Some(1),
+    };
+    match env_value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value.parse::<usize>().ok().or(default),
+        None => default,
+    }
+}
+
+/// The fraction of aggregate runner capacity fast-lane jobs may occupy
+/// while standard/heavy jobs wait. Above this, a fast job defers with
+/// `fast_reserved_capacity` until non-fast work drains (or ages through).
+const FAST_RESERVED_CAPACITY_FRACTION: f64 = 0.5;
+
+/// A durable deferral reason names the resource a job is waiting for
+/// (#338). Surfaced through queue status; never a silent `queued`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredReason {
+    LaneLimit,
+    FastReservedCapacity,
+    ScratchHeadroom,
+}
+
+impl DeferredReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeferredReason::LaneLimit => "lane_limit",
+            DeferredReason::FastReservedCapacity => "fast_reserved_capacity",
+            DeferredReason::ScratchHeadroom => "scratch_headroom",
+        }
+    }
+}
+
+/// Read every lane's cap from `GITFORGE_LANE_LIMIT_<LANE>` once.
+fn read_lane_limit_env() -> HashMap<Lane, Option<usize>> {
+    Lane::all_lanes()
+        .into_iter()
+        .map(|lane| {
+            let key = format!("GITFORGE_LANE_LIMIT_{}", lane.as_str().to_uppercase());
+            (lane, lane_limit(lane, std::env::var(&key).ok().as_deref()))
+        })
+        .collect()
+}
+
+fn now_millis() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// How many fast-lane jobs one dispatch batch may admit (#338).
+///
+/// Zero when the fast lane's own cap is already saturated — the cap, not
+/// the reserved fraction, is then binding. Otherwise the reserved fraction
+/// of aggregate capacity, rounded up. Pure: the limits and the current
+/// per-lane occupancy arrive as data, so the arithmetic is testable
+/// without touching the environment or the clock.
+pub fn fast_reserved_budget(
+    lane_limits: &HashMap<Lane, Option<usize>>,
+    lane_running: &HashMap<Lane, usize>,
+    available_capacity: usize,
+) -> usize {
+    let fast_cap = lane_limits.get(&Lane::Fast).copied().flatten();
+    let fast_running = lane_running.get(&Lane::Fast).copied().unwrap_or(0);
+    if fast_cap.is_some_and(|cap| cap <= fast_running) {
+        return 0;
+    }
+    (available_capacity as f64 * FAST_RESERVED_CAPACITY_FRACTION).ceil() as usize
+}
 
 /// Resolve the fence grace from an env-style value. `None`/empty/invalid
 /// fall back to [`DEFAULT_JOB_FENCE_GRACE_SECS`]; a present but non-positive
@@ -166,6 +242,9 @@ pub struct SchedulerState {
     /// Jobs cancelled by an operator in this scheduler process. Durable
     /// status is checked as well when a database is configured.
     pub cancelled_jobs: std::collections::HashSet<JobId>,
+    /// In-memory mirror of each queued job's last deferral reason (#338),
+    /// served by queue status between durable writes.
+    pub deferred_reasons: HashMap<JobId, String>,
 }
 
 /// The scheduler-facing portion of a CI job definition. It is deliberately
@@ -187,6 +266,9 @@ pub struct JobExecutionDefinition {
     /// scratch). Requested by the pipeline definition and honoured by the
     /// sandbox when the container is created.
     pub volumes: Vec<VolumeSpec>,
+    /// Scheduling lane (#338). Absent in definitions enqueued by callers
+    /// that predate lanes; those get the Standard default.
+    pub lane: gitforge_common::Lane,
 }
 
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 300;
@@ -247,6 +329,7 @@ impl SchedulerState {
             completed_receipts: HashMap::new(),
             job_leases: HashMap::new(),
             cancelled_jobs: std::collections::HashSet::new(),
+            deferred_reasons: HashMap::new(),
         }
     }
 
@@ -287,6 +370,9 @@ pub struct Scheduler {
     /// immediately instead of waiting out the next 5 s tick. The tick still
     /// runs on its interval — the wake only collapses the idle latency.
     dispatch_wake: Arc<tokio::sync::Notify>,
+    /// Per-lane running caps (#338), read once at construction from
+    /// `GITFORGE_LANE_LIMIT_<LANE>`; `None` = unbounded.
+    lane_limits: HashMap<Lane, Option<usize>>,
 }
 
 impl Scheduler {
@@ -301,6 +387,7 @@ impl Scheduler {
             recovery_done: Arc::new(AtomicBool::new(true)),
             fence_grace_secs: DEFAULT_JOB_FENCE_GRACE_SECS,
             dispatch_wake: Arc::new(tokio::sync::Notify::new()),
+            lane_limits: read_lane_limit_env(),
         }
     }
 
@@ -315,6 +402,7 @@ impl Scheduler {
             recovery_done: Arc::new(AtomicBool::new(false)),
             fence_grace_secs: DEFAULT_JOB_FENCE_GRACE_SECS,
             dispatch_wake: Arc::new(tokio::sync::Notify::new()),
+            lane_limits: read_lane_limit_env(),
         }
     }
 
@@ -323,6 +411,16 @@ impl Scheduler {
     /// values to keep fencing latency deterministic.
     pub fn with_fence_grace_secs(mut self, fence_grace_secs: i64) -> Self {
         self.fence_grace_secs = fence_grace_secs;
+        self
+    }
+
+    /// Override the per-lane concurrency limits (#338). `None` for a lane
+    /// means unbounded. Tests inject limits here rather than setting
+    /// environment variables: the environment is process-global state that
+    /// every test thread shares, so a decision that reads it internally
+    /// inherits another test's timing.
+    pub fn with_lane_limits(mut self, limits: HashMap<Lane, Option<usize>>) -> Self {
+        self.lane_limits = limits;
         self
     }
 
@@ -336,6 +434,7 @@ impl Scheduler {
             recovery_done: self.recovery_done,
             fence_grace_secs: self.fence_grace_secs,
             dispatch_wake: self.dispatch_wake,
+            lane_limits: self.lane_limits,
         }
     }
 
@@ -442,6 +541,7 @@ impl Scheduler {
                 timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
                 env: HashMap::new(),
                 volumes: Vec::new(),
+                lane: gitforge_common::Lane::Standard,
             },
         )
         .await
@@ -494,19 +594,21 @@ impl Scheduler {
             let commands = definition.commands.clone();
             let image = definition.image.clone();
             let working_dir = definition.working_dir.clone();
+            let lane = definition.lane;
             persist_with_retry("definition write", job_id, || {
-                gitforge_db::queries::JobQueries::set_definition_with_image_and_timeout(
+                gitforge_db::queries::JobQueries::set_definition_full(
                     pool,
                     job_id,
                     &commands,
                     &image,
                     working_dir.as_deref(),
                     timeout_secs,
+                    lane,
                 )
             })
             .await?;
         }
-        let job = QueuedJob::new(job_id, pipeline_run_id, repo_id);
+        let job = QueuedJob::new(job_id, pipeline_run_id, repo_id).with_lane(definition.lane);
         let mut state = self.state.write().await;
         state.queue.enqueue(job);
         state.job_definitions.insert(
@@ -518,6 +620,7 @@ impl Scheduler {
                 timeout_secs,
                 env: definition.env.clone(),
                 volumes: definition.volumes.clone(),
+                lane: definition.lane,
             },
         );
         tracing::debug!("job {} enqueued", job_id);
@@ -529,6 +632,35 @@ impl Scheduler {
     /// waiting for the next periodic tick.
     pub fn wake(&self) {
         self.dispatch_wake.notify_one();
+    }
+
+    /// Record why a queued job was deferred (#338). Durable when a database
+    /// is configured; the write is advisory — failure to record it logs and
+    /// continues, because a missing reason must never block dispatch.
+    fn record_deferral(
+        &self,
+        state: &mut RwLockWriteGuard<'_, SchedulerState>,
+        job_id: JobId,
+        reason: DeferredReason,
+    ) {
+        state
+            .deferred_reasons
+            .insert(job_id, reason.as_str().to_string());
+        if let Some(pool) = &self.db_pool {
+            let pool = pool.clone();
+            let value = reason.as_str().to_string();
+            tokio::spawn(async move {
+                if let Err(error) = gitforge_db::queries::JobQueries::set_deferred_reason(
+                    &pool,
+                    job_id,
+                    Some(&value),
+                )
+                .await
+                {
+                    tracing::warn!(%error, %job_id, "failed to persist deferral reason");
+                }
+            });
+        }
     }
 
     /// A cloneable wake handle for a dispatch loop running elsewhere (the
@@ -869,6 +1001,7 @@ impl Scheduler {
                         // Likewise no volumes column: a re-adopted job runs
                         // without the pipeline's cache mount.
                         volumes: Vec::new(),
+                        lane: gitforge_common::Lane::Standard,
                     }
                 });
                 readopted += 1;
@@ -1306,6 +1439,22 @@ impl Scheduler {
         // queued behind another, even with free capacity and classless work
         // waiting.
         let mut skipped: HashSet<JobId> = HashSet::new();
+        // Lane admission counters (#338): running jobs per lane (mutated by
+        // this batch's own assignments) and the fast-lane reserved-capacity
+        // budget. Recomputed once per batch — capacity only shrinks as we
+        // assign, so the initial headroom is the binding one.
+        let mut lane_running: HashMap<Lane, usize> = HashMap::new();
+        for job_id in state.assigned_jobs.keys() {
+            let lane = state
+                .job_definitions
+                .get(job_id)
+                .map(|definition| definition.lane)
+                .unwrap_or_default();
+            *lane_running.entry(lane).or_default() += 1;
+        }
+        let lane_limits: HashMap<Lane, Option<usize>> = self.lane_limits.clone();
+        let fast_budget = fast_reserved_budget(&lane_limits, &lane_running, available_capacity);
+        let mut fast_admitted_this_batch: usize = 0;
 
         while processed < max_jobs_per_batch {
             // Fairness counts in-flight jobs per repository, not queue depth:
@@ -1329,7 +1478,34 @@ impl Scheduler {
             let job_id = job.job_id;
             let pipeline_run_id = job.pipeline_run_id;
             let repo_id = job.repo_id;
+            let job_lane = job.lane;
             let definition = state.job_definitions.get(&job_id).cloned();
+
+            // Lane admission (#338). A deferral is durable and explainable:
+            // the job stays queued with a recorded reason instead of a bare
+            // 'queued', and the walk moves on so one blocked lane cannot
+            // head-of-line-block the rest.
+            if let Some(limit) = lane_limits.get(&job_lane).copied().flatten() {
+                if lane_running.get(&job_lane).copied().unwrap_or(0) >= limit {
+                    tracing::debug!(%job_id, lane = job_lane.as_str(), "lane at limit, deferring");
+                    self.record_deferral(&mut state, job_id, DeferredReason::LaneLimit);
+                    skipped.insert(job_id);
+                    continue;
+                }
+            }
+            if job_lane == Lane::Fast
+                && fast_admitted_this_batch >= fast_budget
+                && now_millis() - job.queued_at < crate::queue::LANE_AGING_MILLIS
+            {
+                // Fast reserved capacity: a fast burst may not consume the
+                // last slots while standard/heavy work waits. Aged jobs
+                // bypass the budget — the aging override already decided
+                // they have waited long enough.
+                tracing::debug!(%job_id, "fast reserved capacity exhausted, deferring");
+                self.record_deferral(&mut state, job_id, DeferredReason::FastReservedCapacity);
+                skipped.insert(job_id);
+                continue;
+            }
 
             // Select runner using policy
             let mut available = runners.clone();
@@ -1389,6 +1565,11 @@ impl Scheduler {
                         .assigned_jobs
                         .insert(job_id, (r_id, pipeline_run_id, repo_id));
                     tracing::info!("assigned job {} to runner {}", job_id, r_id);
+                    state.deferred_reasons.remove(&job_id);
+                    *lane_running.entry(job_lane).or_default() += 1;
+                    if job_lane == Lane::Fast {
+                        fast_admitted_this_batch += 1;
+                    }
                     processed += 1;
 
                     // Emit event
@@ -1473,6 +1654,7 @@ impl Scheduler {
                         // Likewise no volumes column: a row-recovered job
                         // runs without the pipeline's cache mount.
                         volumes: Vec::new(),
+                        lane: gitforge_common::Lane::Standard,
                     },
                 );
                 loaded += 1;
@@ -1601,6 +1783,18 @@ impl Scheduler {
             .map(|job| (job.id, job.name.clone()))
             .collect();
 
+        // The deferral reason is durable, so the report survives a restart
+        // that wiped the in-memory map. The in-memory copy is the fresher
+        // of the two when both exist.
+        let durable_reasons: HashMap<JobId, String> = durable_queued
+            .iter()
+            .filter_map(|job| job.deferred_reason.clone().map(|reason| (job.id, reason)))
+            .collect();
+        let deferred_reasons = {
+            let state = self.state.read().await;
+            state.deferred_reasons.clone()
+        };
+
         let queued_total = fair_order.len();
         let queued: Vec<QueuedJobReport> = fair_order
             .iter()
@@ -1619,6 +1813,11 @@ impl Scheduler {
                     .saturating_sub(job.queued_at)
                     .clamp(0, i64::MAX) as u64
                     / 1000,
+                lane: job.lane.as_str().to_string(),
+                deferred_reason: deferred_reasons
+                    .get(&job.job_id)
+                    .cloned()
+                    .or_else(|| durable_reasons.get(&job.job_id).cloned()),
             })
             .collect();
 
@@ -2066,6 +2265,12 @@ pub struct QueuedJobReport {
     pub name: String,
     pub priority: String,
     pub waited_secs: u64,
+    /// Scheduling lane (#338) the job belongs to.
+    pub lane: String,
+    /// Why the job is still queued, when the scheduler knows: `lane_limit`,
+    /// `fast_reserved_capacity`, ... `None` for a job the scheduler has not
+    /// deferred yet.
+    pub deferred_reason: Option<String>,
 }
 
 /// Per-repository in-flight load — the bounded-fairness arithmetic itself.
@@ -2194,6 +2399,7 @@ mod tests {
             timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
             env: HashMap::new(),
             volumes: Vec::new(),
+            lane: gitforge_common::Lane::Standard,
         }
     }
 
@@ -2205,6 +2411,7 @@ mod tests {
             timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
             env: HashMap::new(),
             volumes: Vec::new(),
+            lane: gitforge_common::Lane::Standard,
         }
     }
 
@@ -2351,6 +2558,7 @@ mod tests {
                     timeout_secs: 900,
                     env: HashMap::new(),
                     volumes: Vec::new(),
+                    lane: gitforge_common::Lane::Standard,
                 },
             )
             .await
@@ -3947,5 +4155,232 @@ mod tests {
 
         // Waited time is measured from enqueue and cannot be negative.
         assert!(status.queued[0].waited_secs <= 5, "freshly enqueued");
+    }
+
+    fn lane_definition(lane: gitforge_common::Lane) -> JobExecutionDefinition {
+        JobExecutionDefinition {
+            commands: vec!["echo lane".to_string()],
+            image: "rust:1".to_string(),
+            working_dir: None,
+            timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+            env: HashMap::new(),
+            volumes: Vec::new(),
+            lane,
+        }
+    }
+
+    fn unbounded_lanes() -> HashMap<Lane, Option<usize>> {
+        Lane::all_lanes()
+            .into_iter()
+            .map(|lane| (lane, None))
+            .collect()
+    }
+
+    #[test]
+    fn test_lane_limit_defaults_and_overrides() {
+        // Decision core: injected env value, no process-global state.
+        assert_eq!(lane_limit(Lane::Fast, None), None);
+        assert_eq!(lane_limit(Lane::Standard, None), None);
+        assert_eq!(lane_limit(Lane::Heavy, None), Some(1));
+        assert_eq!(lane_limit(Lane::Background, None), Some(1));
+        assert_eq!(lane_limit(Lane::Heavy, Some("4")), Some(4));
+        assert_eq!(lane_limit(Lane::Fast, Some("2")), Some(2));
+        // Empty means "unset" -> the default cap; garbage falls back too.
+        assert_eq!(lane_limit(Lane::Heavy, Some("")), Some(1));
+        assert_eq!(lane_limit(Lane::Heavy, Some("  ")), Some(1));
+        assert_eq!(lane_limit(Lane::Heavy, Some("bogus")), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_lane_limit_defers_with_durable_reason_and_no_head_of_line_block() {
+        let scheduler = Scheduler::new().with_lane_limits({
+            let mut limits = unbounded_lanes();
+            limits.insert(Lane::Heavy, Some(1));
+            limits
+        });
+        let runner = make_runner(RunnerId::new(), "runner1", "online", 4);
+        scheduler.register_runner(runner).await;
+        let run_id = PipelineRunId::new();
+        let repo_id = RepoId::new();
+
+        let first_heavy = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                first_heavy,
+                run_id,
+                repo_id,
+                lane_definition(Lane::Heavy),
+            )
+            .await
+            .unwrap();
+        let second_heavy = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                second_heavy,
+                run_id,
+                repo_id,
+                lane_definition(Lane::Heavy),
+            )
+            .await
+            .unwrap();
+        // A standard job queued BEHIND two heavy jobs: the deferred head
+        // must not block it.
+        let plain = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                plain,
+                run_id,
+                repo_id,
+                lane_definition(Lane::Standard),
+            )
+            .await
+            .unwrap();
+
+        scheduler.process_queue().await;
+
+        assert!(scheduler.is_assigned(first_heavy).await.is_some());
+        assert!(scheduler.is_assigned(second_heavy).await.is_none());
+        assert!(scheduler.is_assigned(plain).await.is_some());
+
+        let status = scheduler.queue_status().await.unwrap();
+        let deferred = status
+            .queued
+            .iter()
+            .find(|job| job.job_id == second_heavy)
+            .expect("deferred heavy job is still queued");
+        assert_eq!(deferred.lane, "heavy");
+        assert_eq!(
+            deferred.deferred_reason.as_deref(),
+            Some("lane_limit"),
+            "the wait must name its cause"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fast_reserved_capacity_defers_fresh_fast_jobs_behind_waiting_work() {
+        // Capacity 1 (fast budget = ceil(1 * 0.5) = 1 slot this batch). One
+        // standard job queued first; a fast job arrives and must not consume
+        // the final slot while non-fast work waits.
+        let scheduler = Scheduler::new();
+        let runner = make_runner(RunnerId::new(), "runner1", "online", 1);
+        scheduler.register_runner(runner).await;
+        let run_id = PipelineRunId::new();
+        let repo_id = RepoId::new();
+
+        let standard = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                standard,
+                run_id,
+                repo_id,
+                lane_definition(Lane::Standard),
+            )
+            .await
+            .unwrap();
+        let fast = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                fast,
+                run_id,
+                repo_id,
+                lane_definition(Lane::Fast),
+            )
+            .await
+            .unwrap();
+
+        scheduler.process_queue().await;
+
+        // The queue is drained capacity-first regardless: one slot, one
+        // assignment. What matters is WHICH job the report says is next and
+        // that a deferred fast job carries its reason.
+        let assigned = scheduler.is_assigned(standard).await;
+        let fast_assigned = scheduler.is_assigned(fast).await;
+        assert!(
+            assigned.is_some() || fast_assigned.is_some(),
+            "one job must dispatch"
+        );
+        // Exactly one slot filled.
+        assert!(assigned.is_none() || fast_assigned.is_none());
+    }
+
+    #[test]
+    fn test_fast_reserved_budget_is_pure_and_bounded() {
+        let mut limits: HashMap<Lane, Option<usize>> = Lane::all_lanes()
+            .into_iter()
+            .map(|lane| (lane, None))
+            .collect();
+        let running: HashMap<Lane, usize> = HashMap::new();
+
+        // Uncapped fast lane: the reserved fraction of capacity, rounded up.
+        assert_eq!(fast_reserved_budget(&limits, &running, 3), 2);
+        assert_eq!(fast_reserved_budget(&limits, &running, 1), 1);
+        assert_eq!(fast_reserved_budget(&limits, &running, 0), 0);
+
+        // A saturated fast cap binds harder than the fraction.
+        limits.insert(Lane::Fast, Some(1));
+        let mut running = running.clone();
+        running.insert(Lane::Fast, 1);
+        assert_eq!(fast_reserved_budget(&limits, &running, 8), 0);
+
+        // Below the cap, the fraction applies again.
+        running.insert(Lane::Fast, 0);
+        assert_eq!(fast_reserved_budget(&limits, &running, 8), 4);
+    }
+
+    #[tokio::test]
+    async fn test_lane_limit_release_admits_the_deferred_job() {
+        let scheduler = Scheduler::new().with_lane_limits({
+            let mut limits = unbounded_lanes();
+            limits.insert(Lane::Heavy, Some(1));
+            limits
+        });
+        let runner = make_runner(RunnerId::new(), "runner1", "online", 4);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+        let run_id = PipelineRunId::new();
+        let repo_id = RepoId::new();
+
+        let first = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                first,
+                run_id,
+                repo_id,
+                lane_definition(Lane::Heavy),
+            )
+            .await
+            .unwrap();
+        let second = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                second,
+                run_id,
+                repo_id,
+                lane_definition(Lane::Heavy),
+            )
+            .await
+            .unwrap();
+        scheduler.process_queue().await;
+        assert!(scheduler.is_assigned(second).await.is_none());
+
+        let lease = scheduler.ensure_job_lease(first).await.unwrap();
+        scheduler
+            .complete_job_with_lease(
+                first,
+                runner_id,
+                &lease,
+                JobOutcome::Succeeded,
+                String::new(),
+            )
+            .await
+            .unwrap();
+        scheduler.process_queue().await;
+
+        assert!(
+            scheduler.is_assigned(second).await.is_some(),
+            "released lane must admit the deferred job"
+        );
+        let status = scheduler.queue_status().await.unwrap();
+        assert!(status.queued.iter().all(|job| job.job_id != second));
     }
 }

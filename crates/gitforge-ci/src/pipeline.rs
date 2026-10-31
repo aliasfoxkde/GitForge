@@ -169,6 +169,12 @@ pub struct JobDefinition {
     /// plain volumes and env.
     #[serde(default)]
     pub cache: Option<JobCache>,
+    /// Scheduling lane (#338): fast / standard / heavy / background. The
+    /// assigner uses it for per-lane admission and reserved fast-lane
+    /// capacity. Absent means Standard — pre-lane pipelines keep their
+    /// legacy scheduling behavior exactly.
+    #[serde(default)]
+    pub lane: gitforge_common::Lane,
 }
 
 impl JobDefinition {
@@ -206,6 +212,7 @@ lazy_static::lazy_static! {
 const PIPELINE_KEYS: &[&str] = &["name", "version", "trigger_on", "environment", "jobs"];
 const JOB_KEYS: &[&str] = &[
     "name", "image", "needs", "env", "steps", "timeout", "retry", "skip_if", "volumes", "cache",
+    "lane",
 ];
 
 /// Reject YAML keys the parser would otherwise silently drop. A stale binary
@@ -465,6 +472,7 @@ jobs:
             skip_if: None,
             volumes: Vec::new(),
             cache: None,
+            lane: Default::default(),
         };
         assert!(job.has_dependencies());
 
@@ -479,6 +487,7 @@ jobs:
             skip_if: None,
             volumes: Vec::new(),
             cache: None,
+            lane: Default::default(),
         };
         assert!(!job2.has_dependencies());
     }

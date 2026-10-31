@@ -556,6 +556,15 @@ impl Pool {
             // quiet instead of judging from the runner's global heartbeat,
             // which starves under host load while the build is healthy.
             "ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT",
+            // Execution lane (#338): fast/standard/heavy/background. The
+            // assigner consults this for per-lane admission and reserved
+            // capacity; 'standard' keeps pre-lane rows dispatchable.
+            "ALTER TABLE jobs ADD COLUMN lane TEXT NOT NULL DEFAULT 'standard'",
+            // Durable queue-reason (#338): why the assigner last deferred
+            // this job (lane_limit, scratch_headroom, ...). NULL once the
+            // job is assigned; surfaced in queue status so a queued job
+            // explains its wait instead of just reading 'queued'.
+            "ALTER TABLE jobs ADD COLUMN deferred_reason TEXT",
         ] {
             if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
                 let message = error.to_string();

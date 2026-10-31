@@ -120,6 +120,13 @@ pub struct Job {
     /// jobs after a scheduler restart; validation always goes through the
     /// lease-gated queries rather than this field.
     pub lease_token: Option<String>,
+    /// Scheduling lane (#338). Defaults to `standard` for rows written
+    /// before the column existed.
+    pub lane: gitforge_common::Lane,
+    /// Why the assigner last deferred this job (lane_limit,
+    /// scratch_headroom, ...). `None` once assigned; surfaced in queue
+    /// status so a queued job explains its wait.
+    pub deferred_reason: Option<String>,
 }
 
 impl Job {
@@ -142,6 +149,8 @@ impl Job {
             result_json: None,
             heartbeat_at: None,
             lease_token: None,
+            lane: gitforge_common::Lane::default(),
+            deferred_reason: None,
         }
     }
 

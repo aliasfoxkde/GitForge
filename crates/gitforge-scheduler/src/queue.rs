@@ -4,6 +4,12 @@ use gitforge_common::{JobId, PipelineRunId, RepoId};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+/// A job queued at least this long outranks lane ordering entirely — the
+/// anti-starvation floor (#338). 15 minutes: longer than any fast job
+/// should hold the queue, short enough that a heavy job never waits out a
+/// full pipeline because fresher fast work keeps arriving.
+pub const LANE_AGING_MILLIS: i64 = 15 * 60 * 1000;
+
 /// Job priority
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Priority {
@@ -33,6 +39,10 @@ pub struct QueuedJob {
     pub repo_id: RepoId,
     pub priority: Priority,
     pub queued_at: i64,
+    /// Scheduling lane (#338). Scheduling policy input only — the fair
+    /// ordering and admission walk consult it; default keeps pre-lane
+    /// callers on Standard.
+    pub lane: gitforge_common::Lane,
 }
 
 impl QueuedJob {
@@ -43,11 +53,17 @@ impl QueuedJob {
             repo_id,
             priority: Priority::default(),
             queued_at: chrono::Utc::now().timestamp_millis(),
+            lane: gitforge_common::Lane::default(),
         }
     }
 
     pub fn with_priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
+        self
+    }
+
+    pub fn with_lane(mut self, lane: gitforge_common::Lane) -> Self {
+        self.lane = lane;
         self
     }
 }
@@ -159,13 +175,36 @@ impl JobQueue {
 
     /// The fair-dispatch ordering shared by `peek_fair` and `fair_order`:
     /// priority first, then the repository with fewer running jobs, then
-    /// FIFO, then insertion order.
+    /// FIFO, then insertion order. A job that has waited longer than
+    /// `LANE_AGING_MILLIS` outranks everything except priority — the
+    /// anti-starvation guarantee for heavy/background lanes behind a
+    /// continuous fast-lane backlog (#338).
     fn fair_cmp(
         &self,
         left: &QueuedJob,
         right: &QueuedJob,
         load_by_repo: &HashMap<RepoId, usize>,
     ) -> Ordering {
+        // Aging override: both candidates beyond the age horizon fall back
+        // to strict FIFO among themselves (older first), so an aged backlog
+        // drains oldest-first rather than by lane.
+        let now = chrono::Utc::now().timestamp_millis();
+        let left_aged = now - left.queued_at >= LANE_AGING_MILLIS;
+        let right_aged = now - right.queued_at >= LANE_AGING_MILLIS;
+        if left_aged || right_aged {
+            if left_aged && right_aged {
+                return right.queued_at.cmp(&left.queued_at).then_with(|| {
+                    self.insertion_order
+                        .get(&right.job_id)
+                        .cmp(&self.insertion_order.get(&left.job_id))
+                });
+            }
+            return if left_aged {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
         left.priority
             .cmp(&right.priority)
             .then_with(|| {
@@ -573,6 +612,7 @@ mod tests {
             repo_id,
             priority: Priority::High,
             queued_at: 1234567890,
+            lane: gitforge_common::Lane::default(),
         };
 
         assert_eq!(job.job_id, job_id);
@@ -580,6 +620,7 @@ mod tests {
         assert_eq!(job.repo_id, repo_id);
         assert_eq!(job.priority, Priority::High);
         assert_eq!(job.queued_at, 1234567890);
+        assert_eq!(job.lane, gitforge_common::Lane::Standard);
     }
 
     #[test]
