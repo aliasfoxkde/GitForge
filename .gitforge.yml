@@ -29,6 +29,8 @@
 #   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, python3
 #   for the route-docs drift gate, and the GitForge workspace cargo
 #   registry cache baked in for offline builds).
+#   Tag 15 was built on Fedora from this branch's Cargo.lock after the
+#   prior tag failed offline on the newly locked libc 0.2.191 crate.
 #   Rebuild and bump the tag whenever Cargo.lock changes or the baked
 #   tooling changes — a stale cache fails every cargo job in seconds with
 #   "candidate versions found which didn't match" (v11 baked the
