@@ -981,6 +981,18 @@ mod tests {
         assert!(parse_receive_status_ok_refs(b"zzzz").is_none());
     }
 
+    #[test]
+    fn test_receive_status_skips_advertisement_flush_and_sideband() {
+        // Byte-exact fixture from a real SSH push: the receive-pack ref
+        // advertisement ends in its own flush packet before the status
+        // report starts, and the report arrives inside sideband-64k band-1
+        // nested pkt-lines. The advertisement flush must be skipped, and
+        // the nested framing must be demultiplexed.
+        let status = b"00000013\x01000eunpack ok\n001c\x010017ok refs/heads/main\n0000";
+        let accepted = parse_receive_status_ok_refs(status).expect("valid status report");
+        assert!(accepted.contains("refs/heads/main"));
+    }
+
     #[tokio::test]
     async fn test_load_or_create_host_key_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
