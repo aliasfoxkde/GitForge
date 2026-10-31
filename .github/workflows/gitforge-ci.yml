@@ -156,14 +156,31 @@ jobs:
           # The runs listing has no commit filter; fetch the repo's newest
           # runs and match client-side (the trigger's run is at the head
           # of the list within seconds of enqueueing).
+          #
+          # Auth failures (401/403) must fail immediately: folding them into
+          # the empty-RUN_ID retry loop converted a bad token into a
+          # multi-hour "run row never appeared" timeout (#344).
           resolve_run_id() {
-            RUN_ID=$(curl --fail-with-body --silent --show-error \
-              --max-time 30 \
+            local HTTP_CODE
+            HTTP_CODE=$(curl --silent --show-error --output /tmp/gitforge-runs.json \
+              --write-out '%{http_code}' --max-time 30 \
               -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
               -H "Accept: application/json" \
-              "$GITFORGE_API_URL/api/pipeline-runs?repo_id=$GITFORGE_REPO_ID&order=desc&limit=10" \
-              | jq -r --arg commit "$COMMIT" \
-                '[.[]? | select(.commit_hash == $commit)][0].id // empty' 2>/dev/null || true)
+              "$GITFORGE_API_URL/api/pipeline-runs?repo_id=$GITFORGE_REPO_ID&order=desc&limit=10" || true)
+            case "$HTTP_CODE" in
+              200) ;;
+              401|403)
+                echo "GitForge rejected the status credential (HTTP $HTTP_CODE) while resolving the run; fix GITFORGE_API_TOKEN — this is not a missing run" >&2
+                exit 2
+                ;;
+              *)
+                # Transient API failure: retry until the deadline.
+                return 0
+                ;;
+            esac
+            RUN_ID=$(jq -r --arg commit "$COMMIT" \
+              '[.[]? | select(.commit_hash == $commit)][0].id // empty' \
+              /tmp/gitforge-runs.json 2>/dev/null || true)
           }
 
           deadline=$(( $(date +%s) + GITFORGE_POLL_TIMEOUT_SECONDS ))
@@ -181,12 +198,30 @@ jobs:
               sleep "$GITFORGE_POLL_INTERVAL_SECONDS"
               continue
             fi
-            RESPONSE=$(curl --fail-with-body --silent --show-error \
-              --max-time 30 \
+            POLL_HTTP=$(curl --silent --show-error --output /tmp/gitforge-run.json \
+              --write-out '%{http_code}' --max-time 30 \
               -H "Authorization: Bearer $GITFORGE_API_TOKEN" \
               -H "Accept: application/json" \
-              "$STATUS_URL")
-            STATUS=$(echo "$RESPONSE" | jq -r '.status // .state // empty' | tr '[:upper:]' '[:lower:]')
+              "$STATUS_URL" || true)
+            case "$POLL_HTTP" in
+              200) ;;
+              401|403)
+                echo "GitForge rejected the status credential (HTTP $POLL_HTTP) for run $RUN_ID; fix GITFORGE_API_TOKEN — this is not a missing run" >&2
+                echo "terminal_status=auth_error" >> "$GITHUB_OUTPUT"
+                exit 2
+                ;;
+              *)
+                # Transient API failure (5xx, network): retry until deadline.
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                  echo "GitForge API unreachable (HTTP ${POLL_HTTP:-none}); last status unknown within ${GITFORGE_POLL_TIMEOUT_SECONDS}s" >&2
+                  echo "terminal_status=timeout" >> "$GITHUB_OUTPUT"
+                  exit 1
+                fi
+                sleep "$GITFORGE_POLL_INTERVAL_SECONDS"
+                continue
+                ;;
+            esac
+            STATUS=$(jq -r '.status // .state // empty' /tmp/gitforge-run.json | tr '[:upper:]' '[:lower:]')
             echo "GitForge pipeline run $RUN_ID status: ${STATUS:-unknown}"
 
             case "$STATUS" in
