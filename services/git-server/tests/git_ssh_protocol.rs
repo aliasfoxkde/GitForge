@@ -394,6 +394,20 @@ async fn test_git_push_and_clone_over_ssh() {
     // still exit normally after reporting per-ref rejection, so only an
     // explicit `ok <ref>` status may enqueue another build.
     let stale_clone = clone_parent.join("cloned");
+    // A clone inherits no local identity, and the CI sandbox has no global
+    // one, so the commit below would fail with "Author identity unknown".
+    run_git(
+        &["config", "user.email", "dev@example.com"],
+        &stale_clone,
+        &[],
+        None,
+    );
+    run_git(
+        &["config", "user.name", "SSH Protocol Test"],
+        &stale_clone,
+        &[],
+        None,
+    );
     std::fs::write(stale_clone.join("divergent.txt"), "divergent\n").expect("write divergent file");
     run_git(&["add", "."], &stale_clone, &[], None);
     run_git(
