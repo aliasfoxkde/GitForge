@@ -180,10 +180,7 @@ impl Handler for GitSshSession {
         user: &str,
         key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        let fingerprint = key
-            .public_key
-            .fingerprint(HashAlg::Sha256)
-            .to_string();
+        let fingerprint = key.public_key.fingerprint(HashAlg::Sha256).to_string();
         let reject = || Auth::Reject {
             proceed_with_methods: Some(MethodSet::from(&[MethodKind::PublicKey][..])),
             partial_success: false,
