@@ -91,6 +91,10 @@ class ReleaseBundleContractTests(unittest.TestCase):
         env = os.environ.copy()
         env["GITFORGE_SOURCE_COMMIT"] = SOURCE_COMMIT
         env["GITFORGE_TOOLCHAIN"] = TOOLCHAIN
+        # The bundler consults the live-instance release gate, which no
+        # test fixture can satisfy; the gate itself is covered by
+        # tests/test_release_gate.py against a purpose-built database.
+        env["GITFORGE_RELEASE_SKIP_GATE"] = "1"
         return env
 
     def _run(self, script, *args):
