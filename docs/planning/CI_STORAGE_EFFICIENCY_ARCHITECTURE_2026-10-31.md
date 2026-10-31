@@ -308,9 +308,9 @@ Run cold and warm cases, repeated trials and realistic mixed workloads. Save raw
 
 ### Gate 0 — correctness and trust (must precede optimization rollout)
 
-- Fix the current russh callback signature compile error and API test fixture compile error on main.
-- Complete cargo-vet review of all 15 unattested dependency versions using evidence; do not add blanket exemptions.
-- Fix and test GitForge API-token vs trigger-token contracts for both enqueue and status/poll operations; distinguish 401 auth failures from missing run rows/timeouts.
+- Fix the current russh callback signature compile error and API test fixture compile error on main (the open #336 branch contains fixes for both; still require exact-head validation).
+- Complete cargo-vet review of all 15 unattested dependency versions using evidence; do not add blanket exemptions (#345).
+- Fix and test GitForge API-token vs trigger-token contracts for both enqueue and status/poll operations; distinguish 401 auth failures from missing run rows/timeouts (#344).
 - Close #318's public-fork isolation and required-check semantics before running untrusted code against persistent caches/runners.
 - Validate PR #336 atomic publication semantics at exact head; resolve the Supply Chain and GitForge poll failures; do not call it fully green until both GitHub and GitForge evidence succeeds.
 - Close or coordinate #337 and #258 independently; avoid overlapping stale branches on Git server files.
@@ -377,7 +377,7 @@ This initiative is complete only when:
 ## References
 
 ### GitForge
-- #342 umbrella epic; #338 resource scheduling; #339 CAS/workspaces/GC; #340 incremental tests; #341 toolchain benchmarks.
+- #342 umbrella epic; #338 resource scheduling; #339 CAS/workspaces/GC; #340 incremental tests; #341 toolchain benchmarks; #344 CI status-poll authentication; #345 cargo-vet attestations.
 - #277 resource/storage headroom; #284 duplicate lanes; #318 runner trust; #322 smart CI; #288 push/outbox behavior; #335 Amortyx-Stack registration/evidence; #336 atomic publication; #337 release bundle tests; #258 SSH push trigger.
 
 ### Storage/workspace
