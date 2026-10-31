@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod ids;
+pub mod lane;
 pub mod password;
 pub mod result;
 pub mod time;
@@ -18,6 +19,7 @@ pub use ids::{
     JobId, JobStatus, PipelineId, PipelineRunId, PipelineStatus, RepoId, RunnerId, SshKeyId,
     StepId, UserId,
 };
+pub use lane::Lane;
 pub use time::DateTime;
 pub use volume::{image_cache_key, JobCache, VolumeSpec, VolumeType};
 

@@ -2912,6 +2912,7 @@ fn execution_plan(
         // mount, so the definition alone carries the mounts the container
         // needs.
         volumes: definition.volumes.clone(),
+        lane: definition.lane,
     }
 }
 
@@ -3259,6 +3260,7 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 skip_if: None,
                 volumes: Vec::new(),
                 cache: None,
+                lane: Default::default(),
             },
             JobDefinition {
                 name: "test".to_string(),
@@ -3277,6 +3279,7 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 skip_if: None,
                 volumes: Vec::new(),
                 cache: None,
+                lane: Default::default(),
             },
         ],
     }
@@ -3342,6 +3345,7 @@ mod tests {
                 size: None,
             }],
             cache: None,
+            lane: Default::default(),
         };
         definition
             .env
@@ -4290,6 +4294,7 @@ mod tests {
             skip_if: None,
             volumes: Vec::new(),
             cache: None,
+            lane: Default::default(),
         };
         let definition = PipelineDefinition {
             name: "planning-test".to_string(),
@@ -4514,6 +4519,7 @@ mod tests {
             skip_if: None,
             volumes: Vec::new(),
             cache: None,
+            lane: Default::default(),
         };
         let definition = PipelineDefinition {
             name: "stall-test".to_string(),
@@ -6148,6 +6154,7 @@ jobs:
                     skip_if: None,
                     volumes: Vec::new(),
                     cache: None,
+                    lane: Default::default(),
                 },
                 JobDefinition {
                     name: "clippy".to_string(),
@@ -6160,6 +6167,7 @@ jobs:
                     skip_if,
                     volumes: Vec::new(),
                     cache: None,
+                    lane: Default::default(),
                 },
             ],
         }

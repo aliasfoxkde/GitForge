@@ -683,6 +683,7 @@ fn entry_job_definition() -> Value {
             skip_if: None,
             volumes: Vec::new(),
             cache: None,
+            lane: Default::default(),
         }],
     })
     .unwrap()
