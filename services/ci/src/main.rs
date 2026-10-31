@@ -691,6 +691,8 @@ struct PipelineTriggerRequest {
     ref_name: String,
     old_hash: String,
     new_hash: String,
+    #[serde(default)]
+    pusher_id: Option<gitforge_common::UserId>,
     working_dir: Option<String>,
 }
 
@@ -933,7 +935,7 @@ async fn trigger_pipeline(
             ref_name: request.ref_name,
             old_hash: request.old_hash,
             new_hash: request.new_hash.clone(),
-            pusher_id: None,
+            pusher_id: request.pusher_id,
         }),
         Some(repo_id),
         None,
