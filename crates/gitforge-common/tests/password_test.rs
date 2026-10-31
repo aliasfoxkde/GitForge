@@ -42,7 +42,7 @@ fn test_empty_password() {
 
 #[test]
 fn test_long_password() {
-    let password: String = core::iter::repeat('a').take(100).collect();
+    let password = ['a'; 100].iter().collect::<String>();
     let hash = hash_password(&password).unwrap();
     assert!(verify_password(&password, &hash).unwrap());
 }
