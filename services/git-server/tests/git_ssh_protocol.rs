@@ -30,6 +30,8 @@ struct TestServer {
     ssh_port: u16,
     git_root: PathBuf,
     repo_id: RepoId,
+    user_id: UserId,
+    db_path: PathBuf,
     /// `GIT_SSH_COMMAND` that authenticates with the generated client key.
     git_ssh_command: String,
     ssh_key_dir: PathBuf,
@@ -225,6 +227,15 @@ async fn spawn_server() -> TestServer {
         None,
     );
 
+    // HEAD points at main; the branch-delete test pushes :main, so allow
+    // deleting the current branch in this fixture.
+    run_git(
+        &["config", "receive.denyDeleteCurrent", "ignore"],
+        &bare_repo,
+        &[],
+        None,
+    );
+
     let host_key_path = ssh_dir.join("host_ed25519");
     let ssh_port = free_port();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_git-server"))
@@ -233,9 +244,13 @@ async fn spawn_server() -> TestServer {
         .env("GIT_ROOT", &git_root)
         .env("DATABASE_URL", format!("sqlite:{}", db_path.display()))
         .env("GITFORGE_SSH_HOST_KEY", &host_key_path)
-        .env("RUST_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .env("RUST_LOG", "debug")
+        .stdout(Stdio::from(
+            std::fs::File::create("/var/tmp/ssh-server.log").unwrap(),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create("/var/tmp/ssh-server.log").unwrap(),
+        ))
         .spawn()
         .expect("spawn git-server binary");
 
@@ -267,6 +282,8 @@ async fn spawn_server() -> TestServer {
         ssh_port,
         git_root,
         repo_id,
+        user_id,
+        db_path,
         git_ssh_command,
         ssh_key_dir,
         _ssh_key_tempdir: ssh_key_tempdir,
@@ -279,6 +296,10 @@ fn ssh_url(port: u16, path: &str) -> String {
 
 #[tokio::test]
 async fn test_git_push_and_clone_over_ssh() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let mut server = spawn_server().await;
     let base = server.git_root.parent().unwrap().to_path_buf();
     let origin_url = ssh_url(server.ssh_port, "testowner/proto.git");
@@ -325,6 +346,25 @@ async fn test_git_push_and_clone_over_ssh() {
         "pushed ref must match local commit"
     );
 
+    // The SSH receive-pack path must use the same durable outbox contract as
+    // Smart HTTP, including the account authenticated by the presented key.
+    let pool = gitforge_db::Pool::new(&server.db_path.display().to_string())
+        .await
+        .expect("open push event database");
+    let (event_type, payload): (String, String) = sqlx::query_as(
+        "SELECT event_type, payload FROM events WHERE event_type = 'ci.trigger.pending'",
+    )
+    .fetch_one(pool.pool())
+    .await
+    .expect("SSH push must leave a durable CI event");
+    assert_eq!(event_type, "ci.trigger.pending");
+    let payload: serde_json::Value = serde_json::from_str(&payload).expect("parse push event");
+    assert_eq!(payload["repo_id"], server.repo_id.to_string());
+    assert_eq!(payload["ref_name"], "refs/heads/main");
+    assert_eq!(payload["old_hash"], "0".repeat(40));
+    assert_eq!(payload["new_hash"], pushed_sha);
+    assert_eq!(payload["pusher_id"], server.user_id.to_string());
+
     // ─── Clone: real upload-pack negotiation over SSH ───────────────────
     let clone_parent = base.join("clones");
     std::fs::create_dir_all(&clone_parent).expect("create clone parent");
@@ -344,6 +384,67 @@ async fn test_git_push_and_clone_over_ssh() {
     );
     run_git(&["push", "origin", "main"], &work, &[], ssh);
     run_git(&["fetch", "origin"], &clone_parent.join("cloned"), &[], ssh);
+    let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(pool.pool())
+        .await
+        .expect("count push events after upload-pack");
+    assert_eq!(event_count, 2, "upload-pack must not create a build event");
+
+    // A divergent update is rejected by receive-pack. Git's process can
+    // still exit normally after reporting per-ref rejection, so only an
+    // explicit `ok <ref>` status may enqueue another build.
+    let stale_clone = clone_parent.join("cloned");
+    // A clone inherits no local identity, and the CI sandbox has no global
+    // one, so the commit below would fail with "Author identity unknown".
+    run_git(
+        &["config", "user.email", "dev@example.com"],
+        &stale_clone,
+        &[],
+        None,
+    );
+    run_git(
+        &["config", "user.name", "SSH Protocol Test"],
+        &stale_clone,
+        &[],
+        None,
+    );
+    std::fs::write(stale_clone.join("divergent.txt"), "divergent\n").expect("write divergent file");
+    run_git(&["add", "."], &stale_clone, &[], None);
+    run_git(
+        &["commit", "-m", "divergent stale commit"],
+        &stale_clone,
+        &[],
+        None,
+    );
+    let rejected = Command::new("git")
+        .args(["push", "origin", "main"])
+        .current_dir(&stale_clone)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_SSH_COMMAND", server.git_ssh_command.clone())
+        .output()
+        .expect("spawn rejected non-fast-forward push");
+    assert!(
+        !rejected.status.success(),
+        "divergent push must be rejected"
+    );
+    let count_after_rejection: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(pool.pool())
+        .await
+        .expect("count events after rejected push");
+    assert_eq!(
+        count_after_rejection, 2,
+        "rejected refs must not trigger CI"
+    );
+
+    // Ref deletion has a successful receive-pack status but no commit to
+    // build, so it must not add an outbox event either.
+    run_git(&["push", "origin", ":main"], &work, &[], ssh);
+    let count_after_deletion: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(pool.pool())
+        .await
+        .expect("count events after ref deletion");
+    assert_eq!(count_after_deletion, 2, "ref deletion must not trigger CI");
 
     common::shutdown_gracefully(&mut server.child).await;
 }
