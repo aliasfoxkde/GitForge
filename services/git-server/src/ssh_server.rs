@@ -783,20 +783,54 @@ fn parse_receive_status_ok_refs(status: &[u8]) -> Option<std::collections::HashS
             usize::from_str_radix(std::str::from_utf8(&status[offset..offset + 4]).ok()?, 16)
                 .ok()?;
         if length == 0 {
-            return saw_unpack_ok.then_some(accepted);
+            // The captured stream also contains the receive-pack ref
+            // advertisement, which ends in its own flush packet before the
+            // status report starts. A flush before any status lines is that
+            // advertisement boundary, not the end of the report; keep
+            // scanning until a flush that terminates actual status lines.
+            if saw_unpack_ok {
+                return Some(accepted);
+            }
+            offset += 4;
+            continue;
         }
         if length < 4 || offset + length > status.len() {
             return None;
         }
         let mut payload = &status[offset + 4..offset + length];
         if payload.first() == Some(&1) {
+            // Sideband-64k: the payload is band-1 data carrying *nested*
+            // pkt-lines (e.g. "000eunpack ok\n"). Strip the band byte and
+            // demultiplex the inner framing; treating the nested lengths as
+            // text made every status line unmatchable.
             payload = &payload[1..];
-        }
-        for line in payload.split(|byte| *byte == b'\n') {
-            if line == b"unpack ok" {
-                saw_unpack_ok = true;
-            } else if let Some(ref_name) = line.strip_prefix(b"ok ") {
-                accepted.insert(std::str::from_utf8(ref_name).ok()?.to_string());
+            while payload.len() >= 4 {
+                let inner_len =
+                    usize::from_str_radix(std::str::from_utf8(&payload[..4]).ok()?, 16).ok()?;
+                if inner_len < 4 || inner_len > payload.len() {
+                    // Not pkt-line framed; fall back to raw lines.
+                    break;
+                }
+                if inner_len == 4 {
+                    payload = &payload[4..];
+                    continue;
+                }
+                for line in payload[4..inner_len].split(|byte| *byte == b'\n') {
+                    if line == b"unpack ok" {
+                        saw_unpack_ok = true;
+                    } else if let Some(ref_name) = line.strip_prefix(b"ok ") {
+                        accepted.insert(std::str::from_utf8(ref_name).ok()?.to_string());
+                    }
+                }
+                payload = &payload[inner_len..];
+            }
+        } else {
+            for line in payload.split(|byte| *byte == b'\n') {
+                if line == b"unpack ok" {
+                    saw_unpack_ok = true;
+                } else if let Some(ref_name) = line.strip_prefix(b"ok ") {
+                    accepted.insert(std::str::from_utf8(ref_name).ok()?.to_string());
+                }
             }
         }
         offset += length;
@@ -932,6 +966,20 @@ mod tests {
         assert!(accepted.contains("refs/heads/main"));
         assert!(!accepted.contains("refs/heads/bad"));
         assert!(parse_receive_status_ok_refs(b"0000").is_none());
+    }
+
+    #[test]
+    fn test_receive_status_skips_advertisement_flush() {
+        // The captured stream contains the receive-pack ref advertisement,
+        // which ends in its own flush packet before the status report starts.
+        // A flush before any status lines must not terminate the parse.
+        // Real stream order: the advertisement flush comes first (no status
+        // lines seen yet, so it is skipped, not treated as end-of-report),
+        // then sideband pkt-lines carrying the report, then the terminating
+        // flush that ends the parse.
+        let status = b"00000013\x01000eunpack ok\n001c\x010017ok refs/heads/main\n0000";
+        let accepted = parse_receive_status_ok_refs(status).expect("valid status report");
+        assert!(accepted.contains("refs/heads/main"));
     }
 
     #[tokio::test]
