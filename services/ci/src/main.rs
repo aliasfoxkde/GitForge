@@ -3385,6 +3385,7 @@ mod tests {
             }],
             cache: None,
             lane: Default::default(),
+            fault: None,
         };
         definition
             .env
@@ -4334,6 +4335,7 @@ mod tests {
             volumes: Vec::new(),
             cache: None,
             lane: Default::default(),
+            fault: None,
         };
         let definition = PipelineDefinition {
             name: "planning-test".to_string(),
@@ -4559,6 +4561,7 @@ mod tests {
             volumes: Vec::new(),
             cache: None,
             lane: Default::default(),
+            fault: None,
         };
         let definition = PipelineDefinition {
             name: "stall-test".to_string(),
