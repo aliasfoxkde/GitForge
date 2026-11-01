@@ -1,0 +1,1732 @@
+# GitForge — Comprehensive Production Readiness & Optimization Handoff
+
+**Repository:** `aliasfoxkde/GitForge`  
+**Primary branch:** `main`  
+**Initiative:** Production hardening, execution efficiency, storage optimization, incremental CI and operational reliability  
+**Umbrella:** [GitForge #342](https://github.com/aliasfoxkde/GitForge/issues/342)  
+**Architecture PR:** [#343](https://github.com/aliasfoxkde/GitForge/pull/343)
+
+---
+
+# 1. Mission and execution requirements
+
+Take ownership of bringing GitForge to a production-ready state, resolving outstanding implementation, reliability, security, performance and operational issues.
+
+This is an end-to-end engineering initiative. Do not stop after writing plans, creating issues, or documenting recommendations. Implement the work, test it, resolve regressions, consolidate branches, submit reviewable PRs, and verify the resulting production behavior.
+
+The overarching objectives are:
+
+1. Make GitForge reliable under high concurrency and multiple simultaneous projects.
+2. Eliminate unnecessary queued work, duplicate CI execution, redundant builds and repeated dependency downloads.
+3. Reduce CPU, RAM, disk I/O, storage consumption, network transfers and latency.
+4. Implement intelligent incremental testing and build-result reuse without compromising correctness.
+5. Introduce safe content-addressed storage and managed workspaces.
+6. Separate lightweight, latency-sensitive work from resource-intensive workloads.
+7. Improve scheduler fairness, resource governance, recovery and observability.
+8. Optimize API, database and service execution for small VPS deployments.
+9. Improve the architecture so new languages, test runners, compilers and execution backends can be integrated without rewriting GitForge.
+10. Consolidate outstanding PRs, resolve merge conflicts, close duplicate work, and eliminate stale branches safely.
+11. Establish reliable CI/CD, security, release and rollback procedures.
+12. Deliver a system that can onboard real repositories and handle concurrent customer workloads.
+
+## Non-negotiable engineering rules
+
+- Preserve working functionality and existing architecture unless a measured improvement justifies changing it.
+- Prefer small, independently reviewable implementation PRs.
+- Do not create competing implementations of functionality that already exists.
+- Do not introduce arbitrary concurrency restrictions without measuring the workload.
+- Do not disable, weaken or bypass required security, testing or quality gates to obtain green CI.
+- Do not claim a feature is implemented merely because the code compiles.
+- Do not merge or deploy based on stale validation results.
+- Do not delete dirty worktrees, unmerged changes, user data or artifacts without verified ownership and recovery procedures.
+- Do not globally share writable state between unrelated jobs or trust domains.
+- Do not let AI-generated summaries replace authoritative source records.
+- Preserve backward compatibility where practical and use explicit versioning where contracts must change.
+- Every optimization must have before/after measurements.
+- Every new capability must have automated tests, failure handling, documentation and an operational rollback procedure.
+
+**Work continuously through the phases below. Do not stop at the first milestone.** If an implementation depends on unavailable infrastructure, implement the parts that can be validated, document the exact blocker, and continue with independent work.
+
+# 2. Repository and existing work inventory
+
+First, refresh the actual GitHub state. The following represents the October 31, 2026 audit and must not be assumed to remain unchanged.
+
+## 2.1 Main implementation tickets
+
+| Issue | Scope |
+|---|---|
+| [#342](https://github.com/aliasfoxkde/GitForge/issues/342) | Overall initiative |
+| [#338](https://github.com/aliasfoxkde/GitForge/issues/338) | Resource-aware scheduling and CI lanes |
+| [#339](https://github.com/aliasfoxkde/GitForge/issues/339) | CAS, workspaces, deduplication and GC |
+| [#340](https://github.com/aliasfoxkde/GitForge/issues/340) | Incremental testing and reusable test results |
+| [#341](https://github.com/aliasfoxkde/GitForge/issues/341) | Compiler, tooling, test-runner and database benchmarks |
+| [#344](https://github.com/aliasfoxkde/GitForge/issues/344) | GitForge status-poll authentication |
+| [#345](https://github.com/aliasfoxkde/GitForge/issues/345) | cargo-vet dependency audits |
+
+## 2.2 Existing issues that must be incorporated
+
+| Issue | Required work |
+|---|---|
+| #277 | CPU, memory, storage, disk I/O and resource governance |
+| #284 | Deduplicate CI validation and control runner concurrency |
+| #288 | Decouple Git push responses from CI delivery |
+| #318 | Secure execution of public fork PRs and fix required-check behavior |
+| #322 | Smart CI, dependency graph and change-impact optimization |
+| #335 | Amortyx-Stack repository registration and release-gate evidence |
+| #258 | Trigger CI following successful SSH pushes |
+
+Do not consider these issues resolved simply because a related PR has been created. Verify their acceptance criteria against the resulting code and test evidence.
+
+## 2.3 Outstanding PRs requiring triage
+
+The audit found these four open PRs:
+
+| PR | Branch | Purpose |
+|---|---|---|
+| [#258](https://github.com/aliasfoxkde/GitForge/pull/258) | `codex/ssh-push-durable-ci-20261005` | SSH push CI trigger |
+| [#336](https://github.com/aliasfoxkde/GitForge/pull/336) | `codex/atomic-storage-publish-mirror-20261031` | Atomic filesystem publication |
+| [#337](https://github.com/aliasfoxkde/GitForge/pull/337) | `chore/release-contract-test-fix` | Release-bundle contract tests |
+| [#343](https://github.com/aliasfoxkde/GitForge/pull/343) | `docs/ci-storage-efficiency-architecture-20261031` | Architecture documentation |
+
+These PRs were all based on the same main commit during the audit. They contain overlapping files and should not be treated as entirely independent.
+
+### Critical overlap
+
+PR #258 and PR #336 both modify:
+
+- `services/git-server/src/ssh_server.rs`
+- `services/api/tests/api_gateway_flow.rs`
+- `crates/gitforge-common/tests/password_test.rs`
+- `.gitforge.yml`
+
+PR #337 also modifies:
+
+- `.gitforge.yml`
+- `crates/gitforge-common/tests/password_test.rs`
+- `services/ci/src/main.rs`
+
+PR #336 contains both storage functionality and fixes for the SSH callback/API test fixture problems. PR #258 contains the broader SSH push-trigger functionality.
+
+**Do not merge these branches blindly or independently.**
+
+Create an ownership matrix, examine every commit and patch, identify duplicated changes, and consolidate them systematically.
+
+# 3. Phase 0 — Repository, branch and PR cleanup
+
+This must be the first engineering phase.
+
+## 3.1 Establish a reliable baseline
+
+Before modifying anything:
+
+1. Fetch all remote branches and tags.
+2. Record the exact current main SHA.
+3. Inspect all local modifications and untracked files.
+4. Inventory all local and remote branches.
+5. Inventory worktrees and their owners.
+6. Inventory all open, closed and merged PRs relevant to these changes.
+7. Retrieve PR reviews, comments, CI failures and commit histories.
+8. Inspect outstanding Dependabot/security alerts.
+9. Record the latest deployment and release status.
+10. Capture current workspace and test baselines.
+
+Example:
+
+```bash
+git fetch --all --tags
+git status --short
+git branch -avv
+git worktree list --porcelain
+
+gh pr list --state open
+gh issue list --state open
+gh run list --branch main
+```
+
+Do not reset or clean existing working directories simply to obtain a clean Git state. Determine which changes belong to the user, an agent, or a stale execution session.
+
+Create recovery references before any destructive branch operations.
+
+## 3.2 Consolidate existing PRs
+
+Perform a full review of #258, #336 and #337.
+
+For each PR:
+
+- Review the entire commit history.
+- Review the complete diff against the actual latest main.
+- Identify duplicate commits and overlapping modifications.
+- Identify changes already applied elsewhere.
+- Identify modifications that were superseded by later main commits.
+- Check whether the implementation is still architecturally appropriate.
+- Run focused tests.
+- Determine missing integration and operational validation.
+
+### Suggested integration strategy
+
+Use a controlled integration branch based on the latest main.
+
+The intended logical ownership should be:
+
+**SSH and CI triggering**
+
+Consolidate the successful-push trigger behavior from #258, including:
+
+- SSH `receive-pack` handling.
+- Accepted ref updates.
+- Durable CI outbox insertion.
+- Pusher identity.
+- Non-fast-forward rejection handling.
+- Ref deletion handling.
+- Correct trigger payloads.
+- Idempotency and duplicate-trigger prevention.
+
+Coordinate this with #288.
+
+The client-facing Git push should not wait for downstream CI execution or an extended sequence of delivery attempts. Once the ref update and durable outbox event are safely committed, return the push result and allow background delivery to retry.
+
+Verify real Git protocol behavior, not just handler-level tests.
+
+**Storage publication**
+
+Extract and retain the unique storage implementation from #336:
+
+- Unique temporary files.
+- File synchronization.
+- Same-directory atomic rename.
+- Preservation of previous files until replacements are ready.
+- Explicit handling of partial data/metadata publication.
+- Recovery and reconciliation.
+
+Retain the documented limitations. Individual files being atomically published does not establish a transaction across data and metadata.
+
+**Release bundle tests**
+
+Retain the valid changes from #337, including:
+
+- Avoiding inappropriate live-release checks during offline contract tests.
+- Correct release-bundle behavior.
+- Trigger correlation and configuration compatibility.
+- Test determinism.
+
+### Merge strategy
+
+Prefer a sequence of independently validated changes:
+
+1. Consolidate SSH push triggering and delivery behavior.
+2. Rebase and incorporate atomic storage publication.
+3. Rebase and incorporate release-bundle contract fixes.
+4. Resolve shared configuration/test changes once.
+5. Validate the integrated result.
+6. Update or close superseded PRs with explicit explanations.
+
+If the work is better represented by one combined implementation PR, create that PR and link the originals.
+
+Do not close an original PR until its functionality has demonstrably landed in the replacement branch or has been intentionally superseded.
+
+Do not merge an implementation PR merely because GitHub reports `mergeable: true`.
+
+## 3.3 Review the older smart-CI branch
+
+The following branch contains substantial useful work:
+
+`docs/gitforge-smart-ci-dependency-graph-20261019`
+
+The audit found it six commits ahead and 70 commits behind main.
+
+It contains:
+
+- `crates/gitforge-graph`
+- Cargo metadata graph ingestion.
+- Reverse dependency analysis.
+- Feature and known-issue mappings.
+- `gitforge check --fast --changed`.
+- Affected-crate selection.
+- CLI integration.
+- `impact_runs` migration.
+- Documentation and task tracking.
+
+Do not merge its stale history wholesale.
+
+Instead:
+
+1. Preserve the original branch.
+2. Create a fresh branch from current main.
+3. Compare the old branch's six unique commits.
+4. Review the code and contracts individually.
+5. Port only valid changes.
+6. Update dependencies and schema compatibility.
+7. Re-run tests against the current workspace.
+8. Produce a clean implementation PR for #322/#340.
+
+Use `git range-diff` and normal patch comparisons to ensure no intended functionality is lost.
+
+## 3.4 Branch cleanup policy
+
+After successful merges:
+
+- Remove redundant remote branches.
+- Remove corresponding local branches only after confirming they are merged or safely superseded.
+- Prune stale worktree registrations only after inspecting actual directories.
+- Preserve unmerged work.
+- Record deleted/superseded branch mappings in the PR or issue.
+- Ensure the final main branch has no accidental experimental code or temporary files.
+
+**Deliverable:** a clean PR inventory, consolidated source changes, no unresolved merge conflicts, and an explicit report of branches safely removed or retained.
+
+# 4. Phase 1 — Restore correctness, security and operational reliability
+
+This phase is a prerequisite for production use.
+
+## 4.1 Fix compilation and integration failures
+
+The October 30 main-branch run exposed:
+
+- An incompatible `russh` `auth_publickey` callback signature.
+- An undefined `harness_passphrase` in `services/api/tests/api_gateway_flow.rs`.
+- Related failures in Rust Build, Test, Security and CodeQL.
+
+PR #336 contains changes addressing the callback and fixture failures.
+
+Verify their correctness, consolidate them, and run the complete workspace gates on the resulting exact commit.
+
+Do not assume the fixes are effective because they exist in a branch.
+
+## 4.2 Fix authentication and CI status polling
+
+Resolve #344.
+
+The observed GitForge Actions workflow successfully enqueued a build but received HTTP 401 while attempting to retrieve its status.
+
+Trace:
+
+- API token configuration.
+- Trigger token configuration.
+- Scheduler authentication.
+- Authentication middleware.
+- Pipeline-run listing.
+- Individual run retrieval.
+- Token scope and permission handling.
+- Service environment configuration.
+- Fedora deployment configuration.
+
+Establish distinct, documented permissions for:
+
+- Triggering builds.
+- Reading execution status.
+- Runner heartbeats and job operations.
+- Administrative scheduler operations.
+
+Add an integration test:
+
+```text
+enqueue pipeline
+    → persist execution
+    → obtain exact run ID
+    → authenticate status request
+    → read pending status
+    → read terminal status
+    → report result to GitHub
+```
+
+Test:
+
+- Invalid token.
+- Unauthorized token.
+- Missing run.
+- Delayed run persistence.
+- API transient failure.
+- Scheduler restart.
+- Completed success.
+- Completed failure.
+
+Do not convert an authentication failure into a fake missing-run response or a two-hour polling timeout.
+
+Never print credentials into logs or diagnostic artifacts.
+
+## 4.3 Complete supply-chain audits
+
+Resolve #345.
+
+The inspected Supply Chain job reported 15 missing `safe-to-deploy` attestations:
+
+- `lazy_static 1.5.1`
+- `libc 0.2.191`
+- `russh 0.65.0`
+- `serde_json 1.0.154`
+- `serde_spanned 1.1.2`
+- `sha2 0.11.1`
+- `thiserror 2.0.21`
+- `thiserror-impl 2.0.21`
+- `tokio 1.54.1`
+- `tokio-util 0.7.20`
+- `toml 1.1.8+spec-1.1.0`
+- `toml_datetime 1.1.2+spec-1.1.0`
+- `toml_parser 1.1.5+spec-1.1.0`
+- `uuid 1.29.0`
+- `want 0.3.2`
+
+These are audit gaps, not automatically confirmed vulnerabilities.
+
+For each dependency:
+
+1. Inspect the exact version change.
+2. Review upstream security and code changes.
+3. Review build scripts, unsafe code and dependency changes.
+4. Import an appropriate trusted upstream audit or create a documented local audit.
+5. Use publisher trust only when justified.
+6. Avoid blanket exemptions.
+7. Re-run cargo-vet and all security checks.
+
+Keep cargo-audit, cargo-vet, CodeQL, secret scanning and other independent security checks meaningful.
+
+## 4.4 Public runner trust and isolation
+
+Resolve #318 before expanding shared caching.
+
+GitForge is public, and untrusted fork PRs have historically executed on persistent self-hosted runners.
+
+Implement a secure trust boundary.
+
+Requirements:
+
+- Fork PRs cannot access persistent host credentials.
+- Untrusted workloads cannot access trusted cache-writing permissions.
+- No shared writable build state across trust domains.
+- No unrestricted host filesystem mounts.
+- Ephemeral or demonstrably isolated execution for untrusted workloads.
+- Explicit network and egress policies.
+- Secrets are only available in appropriately trusted execution contexts.
+- Artifact publication validates ownership and provenance.
+
+Review GitHub Actions workflow triggers and ruleset behavior.
+
+Required status checks must not remain pending because their parent workflow was excluded by path filtering.
+
+## 4.5 Push delivery reliability
+
+Coordinate #258 and #288.
+
+Ensure:
+
+- Successful Git ref updates and durable trigger events are recorded reliably.
+- CI delivery happens asynchronously through the durable worker.
+- Failed delivery is retried.
+- Duplicate delivery does not create duplicate executions.
+- An accepted Git push does not wait on an unavailable CI service.
+- Worker restart does not lose pending events.
+- The original event can be correlated with its resulting pipeline run.
+
+Test actual pushes over both SSH and smart HTTP.
+
+**Exit criteria:** a successful push, reliable outbox event, eventual pipeline execution, correct GitHub status reporting and authenticated status retrieval.
+
+# 5. Phase 2 — Resource-aware queueing and execution
+
+Implement #338, coordinating #277 and #284.
+
+This is one of the highest-priority architectural changes because it addresses the overload problem directly.
+
+## 5.1 Separate control and execution capacity
+
+GitForge should distinguish control-plane operations from execution jobs.
+
+Control-plane operations include:
+
+- Authentication.
+- Git requests and ref updates.
+- Trigger persistence.
+- Webhooks.
+- Runner heartbeats.
+- Cancellation.
+- Queue inspection.
+- Job status retrieval.
+- Artifact metadata and receipt access.
+
+These should remain responsive even during heavy build activity.
+
+No expensive compilation, dependency installation, archive extraction or large filesystem traversal should run synchronously on API request paths.
+
+## 5.2 Implement workload classes
+
+Introduce the following logical lanes:
+
+| Lane | Examples |
+|---|---|
+| Control | API, auth, Git, webhooks, heartbeat, cancellation |
+| Fast | Formatting, metadata, changed-file lint, targeted unit tests |
+| Standard | Ordinary builds and affected test suites |
+| Heavy | Full workspace tests, coverage, fuzzing, releases |
+| Background | Cache warming, graph refresh, GC, compaction |
+
+Use a unified durable execution and job-lease model. These should be scheduling policies, not separate disconnected job-management implementations.
+
+## 5.3 Scheduling algorithms
+
+Extend the existing priority and repository-aware scheduler.
+
+Implement:
+
+- Weighted fair scheduling between repositories and tenants.
+- Per-repository concurrency limits.
+- Bounded fast-lane reserved capacity.
+- Priority aging.
+- Anti-starvation guarantees.
+- Per-lane resource budgets.
+- Bounded pending queues.
+- Backpressure under overload.
+- Resource-aware runner selection.
+- Cancellation and retry preservation.
+- Durable queue-reason reporting.
+
+Avoid an approach where a permanent fast-lane workload starves heavy jobs indefinitely.
+
+Likewise, a backlog of large projects must not block short validation or control-plane activity.
+
+## 5.4 Resource-aware admission
+
+Each execution should have an explicit resource request and enforced limit.
+
+Cover:
+
+- CPU quota.
+- Memory reservation and maximum.
+- Process count.
+- Scratch/workspace capacity.
+- Disk/inode headroom.
+- I/O pressure.
+- Network policy.
+- Timeout.
+- Runner and toolchain requirements.
+
+Collect host and per-container metrics, including cgroup resource usage and Linux PSI where available.
+
+Admission decisions must account for:
+
+1. Existing running workloads.
+2. Available runner slots.
+3. CPU and memory headroom.
+4. Available scratch space.
+5. Storage pressure.
+6. Current I/O contention.
+7. Repository and tenant concurrency.
+8. The requested job's resource class.
+
+If capacity is insufficient, defer work with a meaningful reason:
+
+```text
+runner_unavailable
+cpu_budget
+memory_headroom
+scratch_headroom
+io_pressure
+per_repository_limit
+lane_limit
+dependency_wait
+```
+
+Do not kill otherwise healthy jobs just because pressure increases. Prevent additional work from entering an unsafe environment.
+
+## 5.5 Actions and GitForge integration
+
+Resolve #284.
+
+Map every GitHub Actions workflow to:
+
+- Its real commands.
+- Runner requirements.
+- Resource costs.
+- Equivalent GitForge pipeline jobs.
+- Required status checks.
+- Security responsibilities.
+
+Avoid running the same expensive tests once through Actions and again through GitForge when both executions validate the same commit and contract.
+
+Keep Actions as an integration/status adapter where possible and GitForge as the execution source of truth where appropriate.
+
+Do not remove independent checks simply because they look similar.
+
+Use one canonical execution identity to correlate:
+
+```text
+repository
+commit
+ref
+pipeline-definition digest
+trust class
+trigger
+execution ID
+required gate
+```
+
+GitHub must report the actual result of the associated GitForge execution.
+
+## 5.6 Queue observability
+
+Expose:
+
+- Queue depth by lane.
+- Queue age.
+- Queue wait time.
+- Deferral reason.
+- Running jobs.
+- Per-repository utilization.
+- Per-runner utilization.
+- CPU-seconds.
+- Peak RAM.
+- Disk usage.
+- I/O bytes.
+- Cache efficiency.
+- Execution latency.
+- Failed and recovered leases.
+
+The queue must explain why a job is waiting instead of merely displaying `queued`.
+
+**Exit criteria:** mixed workloads make fair progress, fast checks remain responsive, heavy work is bounded, and every deferral is explainable.
+
+# 6. Phase 3 — Shared storage, CAS and managed workspaces
+
+Implement #339.
+
+The goal is to eliminate repeated storage and filesystem work throughout GitForge, not merely introduce more symlinks.
+
+## 6.1 Content-addressed storage
+
+Implement an immutable CAS for non-Git content.
+
+Do not replace Git's native object database. Keep Git responsible for its own commits, trees and blobs.
+
+Use CAS for:
+
+- Shared dependency snapshots.
+- Build outputs.
+- Immutable workspace bases.
+- Compiler artifacts.
+- Test result artifacts.
+- Execution manifests.
+- Container/build metadata.
+- Logs and debug chunks.
+- Impact graph artifacts.
+- Knowledge summaries.
+
+Each object should have:
+
+- A complete cryptographic digest.
+- Size.
+- Type and schema version.
+- Trust namespace.
+- Integrity status.
+- Creation metadata.
+- Reference information.
+- Retention/lease information.
+
+Use canonical, unambiguous cache-key serialization. Avoid concatenating arbitrary strings without delimiters or using truncated digests as unique identities.
+
+Use the existing SHA-256 dependency unless a benchmark and compatibility assessment justify a different algorithm.
+
+## 6.2 Deduplication
+
+Deduplicate at ingest.
+
+Byte-identical objects within an authorized namespace should reference the same stored object.
+
+Evaluate:
+
+- Whole-file hashing.
+- Content-defined chunking for large archives/logs.
+- Compression.
+- Existing Git object reuse.
+- Package-manager content stores.
+- Compiler output reuse.
+
+Do not enable chunking everywhere automatically. Hashing and indexing overhead can exceed the savings for small files.
+
+Track logical versus physical storage and real deduplication ratios.
+
+## 6.3 Cache identity and correctness
+
+Include relevant execution inputs:
+
+- Source tree.
+- Lockfiles.
+- Dependency graph.
+- Compiler/toolchain.
+- Target triple.
+- OS/architecture.
+- Runtime ABI.
+- Runner image digest.
+- Build flags/features.
+- Pipeline configuration.
+- Test arguments.
+- Relevant environment contract.
+
+Different toolchain images must not accidentally share incompatible compiled outputs.
+
+Replace the current sanitized image-string cache naming with a canonical image identity digest.
+
+Use explicit manifests and durable references instead of relying on directory naming conventions alone.
+
+## 6.4 Worktree/workspace manager
+
+Build a reusable workspace manager.
+
+Suggested backend priority:
+
+1. Native Git worktrees.
+2. Reflink-based copy-on-write.
+3. OverlayFS.
+4. Btrfs subvolume snapshots.
+5. Safe full-copy fallback.
+
+Provide a common provider interface so the underlying filesystem can change without changing job execution logic.
+
+Track:
+
+- Workspace ID.
+- Repository.
+- Commit.
+- Branch/ref.
+- Owner.
+- Agent/session.
+- Job association.
+- Lease.
+- State.
+- Filesystem provider.
+- Base digest.
+- Creation and last-used times.
+- Cleanup policy.
+
+Lifecycle states:
+
+```text
+creating
+active
+idle
+pinned
+collecting
+deleted
+```
+
+Workspace creation, ownership and cleanup must be durable and lease-aware.
+
+### Critical storage rules
+
+- Do not hard-link mutable build output.
+- Do not symlink writable target directories into a shared store.
+- Shared immutable content must be protected from modification.
+- Unrelated jobs must not concurrently mutate the same Cargo target directory.
+- Keep per-job writable build state isolated.
+- Validate filesystem capabilities before using specialized providers.
+
+Btrfs snapshots should be optional and only used when the filesystem layout supports them. They do not replace backups.
+
+## 6.5 Garbage collection
+
+Implement a proper storage GC.
+
+Use:
+
+1. Mark live references.
+2. Include active job/workspace leases.
+3. Include pinned releases and recovery artifacts.
+4. Generate dry-run results.
+5. Quarantine eligible objects.
+6. Wait through a grace period.
+7. Recheck references and leases.
+8. Delete only verified unreferenced objects.
+
+Protect against the publish-to-reference race. An object must not become eligible for deletion between writing its contents and registering its durable reference.
+
+Add:
+
+- Per-tenant quotas.
+- Cache budgets.
+- Retention policies.
+- Pressure thresholds.
+- Manual pin/unpin.
+- Orphan reconciliation.
+- Corruption checks.
+- Recovery procedures.
+
+Never automatically remove a dirty or owned workspace.
+
+## 6.6 Storage observability
+
+Provide metrics:
+
+```text
+logical_bytes
+physical_bytes
+deduplicated_bytes
+dedup_ratio
+cache_hits
+cache_misses
+cache_download_bytes
+cache_write_bytes
+workspace_bytes
+snapshot_bytes
+gc_candidates
+gc_reclaimed_bytes
+active_leased_bytes
+corrupt_objects
+```
+
+Add a storage inspection and dry-run GC CLI.
+
+**Exit criteria:** shared objects are immutable and integrity-checked, workspace creation is safe, and GC cannot delete live work.
+
+# 7. Phase 4 — Incremental test and build intelligence
+
+Implement #340 and rebase #322.
+
+This is a major opportunity to eliminate repeated work.
+
+## 7.1 Reuse the existing graph
+
+Review the prior `gitforge-graph` implementation and port valid work to current main.
+
+Build a persistent, versioned graph containing:
+
+- Repositories.
+- Commits and source trees.
+- Packages/crates.
+- Modules/files.
+- Functions/symbols where practical.
+- Dependencies.
+- Features.
+- Tests and test binaries.
+- Pipeline jobs.
+- Runner images.
+- Toolchain identities.
+- Known issues.
+
+Add relationship types for:
+
+```text
+DEPENDS_ON
+IMPORTS
+USES
+CALLS
+TESTS
+IMPLEMENTS
+AFFECTS
+EXECUTED_IN
+BUILT_WITH
+VALIDATED_BY
+```
+
+Do not create an elaborate graph database merely for the sake of abstraction. Start with the existing graph crate and a storage format appropriate to the scale of GitForge.
+
+## 7.2 Build a test-impact index
+
+Combine:
+
+- Static dependency information.
+- Cargo metadata.
+- Project manifests.
+- Build configuration.
+- Coverage data.
+- Execution traces.
+- Test fixtures.
+- Known integration dependencies.
+
+Track which tests exercise which code.
+
+Initially, file-level coverage mappings are acceptable where function-level mappings are unavailable. Improve precision incrementally.
+
+## 7.3 Incremental execution
+
+When a commit changes files:
+
+1. Identify modified files.
+2. Resolve their packages/modules.
+3. Find dependent packages.
+4. Determine affected tests.
+5. Add new or modified tests.
+6. Include affected integration/global tests.
+7. Include previously failing and flaky tests.
+8. Validate graph confidence.
+9. Execute the selected tests.
+10. Record the impact and execution evidence.
+
+Use a conservative fallback whenever graph information is missing or uncertain.
+
+## 7.4 Reusable test results
+
+Implement a result cache keyed by the complete test fingerprint.
+
+Include:
+
+- Test identity.
+- Source and dependency digests.
+- Test binary and arguments.
+- Fixtures.
+- Environment.
+- Compiler/runtime.
+- Platform.
+- Runner image.
+- Configuration.
+- Graph/index schema.
+
+Only reuse deterministic, eligible test results.
+
+Never assume that tests involving time, randomness, external services, mutable files or network calls are deterministic without capturing those inputs.
+
+Never reuse:
+
+- Newly added tests.
+- Previously failing tests.
+- Flaky tests.
+- Tests with unknown inputs.
+- Results from incompatible toolchains/environments.
+- Results whose source dependencies changed.
+
+Store result provenance and distinguish:
+
+```text
+executed_pass
+executed_fail
+cache_reused
+flaky
+timeout
+skipped_by_selection
+not_eligible
+```
+
+A cached result must never be reported as though the test executed in the current run.
+
+## 7.5 Differential validation
+
+This is mandatory.
+
+During rollout, execute:
+
+- The optimized selected test set.
+- The full authoritative test set.
+
+On the same commit.
+
+Compare the results.
+
+Any failure missed by the optimized selection blocks enabling that selection as an authoritative gate.
+
+Measure the false-negative rate and target zero.
+
+Keep scheduled full tests, coverage, fuzzing and full release validation.
+
+## 7.6 OpenTestSuite integration
+
+Use the existing OpenTestSuite prototype as the foundation for a versioned test-runner adapter.
+
+The interface should support:
+
+- Test discovery.
+- Test selection.
+- Execution.
+- Retries.
+- Test grouping.
+- Resource requirements.
+- Structured results.
+- Logs.
+- Coverage.
+- Traces.
+- Artifact publication.
+- Test-result caching.
+- Environment identity.
+
+Integrate language-specific tools through adapters instead of building one monolithic GitForge test framework.
+
+## 7.7 Rust-specific testing
+
+Pilot `cargo-nextest`.
+
+Requirements:
+
+- Process isolation.
+- Bounded test parallelism.
+- Test groups.
+- Serial-test support.
+- Retry handling.
+- Structured reports.
+- Integration with durable receipts.
+
+Retain Cargo and `cargo test` as compatible fallback paths.
+
+**Exit criteria:** meaningful reduction in executed tests and CPU time without missed failures.
+
+# 8. Phase 5 — Toolchain and compiler optimization
+
+Implement #341.
+
+The objective is to make GitForge select efficient tools per project, not force every project onto a single new compiler or test framework.
+
+## 8.1 Rust
+
+Evaluate:
+
+| Tool | Purpose |
+|---|---|
+| cargo-nextest | Test execution |
+| sccache | Compiler invocation cache |
+| cargo-chef | Dependency/image layer caching |
+| mold / LLD | Faster linking |
+| cargo-hakari | Workspace feature unification |
+| Lust | Experimental agent-oriented Rust subset checking |
+
+Start with nextest, sccache and linker/dependency-cache measurements.
+
+Account for sccache's Rust limitations, including incremental compilation incompatibility with cache hits and certain linker-dependent crate types.
+
+Do not share writable Cargo targets across concurrent jobs.
+
+## 8.2 TypeScript and JavaScript
+
+Evaluate:
+
+- `ts-rust` / `tsc-rs`.
+- Native TypeScript Go compiler where compatible.
+- Biome.
+- Oxlint.
+- Existing ESLint/Prettier configurations.
+
+Require diagnostic and behavior compatibility against actual project configurations.
+
+Keep experimental compilers advisory until they pass the required compatibility corpus.
+
+## 8.3 Python
+
+Evaluate:
+
+- uv.
+- Ruff.
+- pytest-xdist.
+- pytest-testmon.
+
+Preserve pytest behavior and project-specific plugin requirements.
+
+Use dynamic dependency information to avoid unnecessary tests only after differential validation.
+
+## 8.4 Lust
+
+Lust is particularly interesting for fast coding-agent edit loops.
+
+However, its currently documented subset lacks important general Rust features, including generics, traits and closures.
+
+Investigate:
+
+- Supported-language coverage.
+- Diagnostic quality.
+- False negatives.
+- Cold versus warm performance.
+- Agent edit-loop performance.
+- Compatibility with actual GitForge projects.
+
+Treat it as an optional experimental fast-check adapter, not a replacement for rustc, Clippy or release validation.
+
+## 8.5 Tool selection architecture
+
+Build a common project tooling adapter contract.
+
+GitForge should identify:
+
+```text
+language
+project type
+manifest
+toolchain
+compiler
+linter
+formatter
+test runner
+build system
+dependency manager
+cache policy
+resource profile
+```
+
+Allow project-specific overrides.
+
+Tool versions must be pinned, reproducible and recorded in execution receipts.
+
+**Exit criteria:** measured tooling improvements with demonstrated compatibility.
+
+# 9. Phase 6 — Optimize GitForge API and database performance
+
+Use the linked server challenges as benchmark references.
+
+Repositories:
+
+- https://github.com/arjaythedev/twelve-dollar-server-challenge
+- https://github.com/arjaythedev/multicore-server-challenge
+- https://github.com/arjaythedev/million-users-challenge
+- https://github.com/arjaythedev/database-benchmark-configs
+- https://github.com/arjaythedev/software-engineering-resources
+
+Apply their benchmarking discipline to GitForge itself.
+
+Do not directly equate the challenge's concurrent-user counts with GitForge job capacity.
+
+## 9.1 Benchmark environments
+
+Test:
+
+| Profile | Objective |
+|---|---|
+| 2-core / 2-GB | Small VPS efficiency |
+| 4-core | Moderate concurrency |
+| 8-core / 16-GB | Main execution throughput |
+| 16-core / 32-GB | Scaling behavior |
+
+Test realistic combinations of:
+
+- API requests.
+- Git pushes.
+- Webhooks.
+- Queue submissions.
+- Job polling.
+- Runner heartbeats.
+- Artifact uploads.
+- Log streaming.
+- Database reads/writes.
+
+## 9.2 API optimizations
+
+Profile:
+
+- Async request handling.
+- Connection pooling.
+- Prepared statements.
+- Allocation overhead.
+- Serialization/deserialization.
+- Request-body limits.
+- Streaming.
+- Backpressure.
+- Database wait times.
+- Lock contention.
+- Excessive polling.
+- Unnecessary JSON cloning.
+
+Avoid unnecessary allocations and repeated database queries.
+
+Use bounded concurrency and efficient connection pooling.
+
+Ensure large artifacts and logs do not block small control-plane requests.
+
+## 9.3 Database optimizations
+
+Evaluate:
+
+- Query plans.
+- Index effectiveness.
+- Connection-pool settings.
+- Transaction boundaries.
+- WAL behavior.
+- Lock contention.
+- Vacuum/maintenance.
+- Batch operations.
+- Read/write contention.
+
+Benchmark SQLite and Postgres under comparable workloads.
+
+Do not copy configuration values from another server without checking hardware, database versions, durability requirements and workload characteristics.
+
+## 9.4 Performance targets
+
+First establish real baselines.
+
+Then create targets for:
+
+- API p50/p95/p99.
+- Queue wait time.
+- Job throughput.
+- Trigger-to-run latency.
+- Database wait time.
+- CPU consumption.
+- Peak memory.
+- Disk reads/writes.
+- Cache hit ratio.
+
+Prioritize reductions in tail latency and resource contention, not merely maximum throughput.
+
+**Exit criteria:** GitForge remains responsive under mixed control-plane and execution workloads.
+
+# 10. Phase 7 — Session, conversation, log and debug consolidation
+
+Build on the CAS infrastructure from #339.
+
+The goal is to significantly reduce storage consumed by repeated operational information while preserving recoverability.
+
+## 10.1 Data representation
+
+Keep original logs, conversations and execution records immutable.
+
+Produce separate derived artifacts:
+
+- Structured event streams.
+- Command histories.
+- Tool invocation records.
+- Test outcomes.
+- Error summaries.
+- Debug traces.
+- Decisions and constraints.
+- Reusable knowledge.
+- References to generated artifacts.
+
+Use exact duplicate chunk elimination and compression before applying lossy summarization.
+
+## 10.2 Knowledge extraction
+
+Build a pipeline:
+
+```text
+raw source
+    → normalization
+    → exact deduplication
+    → structured extraction
+    → knowledge consolidation
+    → retrieval indexing
+    → provenance references
+```
+
+Summaries must retain source digests and exact offsets.
+
+The original content must remain retrievable.
+
+## 10.3 Compression target
+
+Use 2% or less of original size as an aggressive experimental target, not a guaranteed production property.
+
+Build a validation corpus measuring:
+
+- Important fact recall.
+- Decision preservation.
+- Technical constraint preservation.
+- Command/error preservation.
+- Test-result preservation.
+- Source traceability.
+- Retrieval accuracy.
+
+Never discard authoritative source data merely because an AI summary claims it is redundant.
+
+Allow separate retention policies for raw logs, verbose debug traces, compressed event records and extracted knowledge.
+
+**Exit criteria:** measured storage savings, validated retrieval, and preserved raw evidence.
+
+# 11. Phase 8 — Comprehensive reliability and failure testing
+
+Implement failure injection throughout the new architecture.
+
+Required scenarios:
+
+### Scheduler
+
+- Multiple repositories flood the queue.
+- Fast lane is saturated.
+- Heavy jobs cannot obtain memory.
+- A runner goes offline.
+- Scheduler restarts with pending jobs.
+- Lease expires during execution.
+- Duplicate triggers arrive.
+- Cancellation occurs during a retry.
+- Database is temporarily unavailable.
+
+### Storage
+
+- Two processes publish the same object simultaneously.
+- Crash during object publication.
+- Crash before reference registration.
+- Corrupt object.
+- Missing metadata.
+- Concurrent garbage collection.
+- Dirty workspace with a live owner.
+- Expired workspace with a stale lock.
+- Disk reaches critical capacity.
+- Cross-tenant cache access attempt.
+
+### Testing
+
+- Changed source invalidates old results.
+- New test is always executed.
+- Failed/flaky test is never reused.
+- Test dependency graph is incomplete.
+- Toolchain changes.
+- Environment changes.
+- Cache checksum fails.
+- Optimized selection disagrees with full execution.
+
+### Git and CI
+
+- SSH push.
+- HTTP push.
+- Rejected push.
+- Branch deletion.
+- Duplicate webhook.
+- Delayed outbox delivery.
+- GitForge API 401.
+- Worker restart.
+- CI run recovery.
+- Failed pipeline status reporting.
+- Public fork PR isolation.
+
+Every failure should produce a useful diagnostic, preserve durable state where required, and recover safely.
+
+# 12. Phase 9 — Documentation, deployment and production readiness
+
+Update the relevant documentation as functionality lands.
+
+At minimum:
+
+- ARCHITECTURE.md
+- RUNBOOK.md
+- SECURITY.md
+- API.md
+- CI/CD documentation
+- Scheduler and resource admission documentation
+- CAS and workspace storage documentation
+- Cache policy documentation
+- GC procedures
+- Test runner and impact graph documentation
+- Toolchain compatibility matrix
+- Deployment and rollback documentation
+
+Update configuration examples and schemas.
+
+Do not allow undocumented environment variables or hidden runtime assumptions to become production dependencies.
+
+## Production observability
+
+Expose useful operational information through the API, CLI and dashboards.
+
+Include:
+
+- Queue state.
+- Lane utilization.
+- Job resource consumption.
+- Resource deferral reasons.
+- Runner health.
+- Storage statistics.
+- Cache statistics.
+- Deduplication ratio.
+- Workspace ownership.
+- GC status.
+- Test selection and reuse.
+- Job receipts.
+- Error classification.
+- Recovery status.
+
+Provide alerts for:
+
+- Repeated job failures.
+- Stuck queues.
+- Dead runners.
+- Failed delivery outbox events.
+- Disk pressure.
+- Memory pressure.
+- Storage corruption.
+- Authentication failures.
+- Excessive API latency.
+- Abnormal retry rates.
+
+## Release and rollback
+
+Implement safe feature rollout.
+
+Use independently controllable flags for:
+
+- Multi-lane scheduling.
+- Resource admission.
+- CAS reads.
+- CAS writes.
+- Workspace snapshots.
+- GC.
+- Test impact selection.
+- Test result reuse.
+- Alternative tooling.
+
+Support rollback to the existing conservative execution path.
+
+A broken cache should degrade to rebuilding, not fail the project. A missing graph should execute a broader test suite, not silently skip validation.
+
+# 13. Required engineering workflow
+
+Follow this workflow for every implementation task.
+
+## Step 1 — Inspect
+
+Review:
+
+- Existing implementation.
+- Related issues.
+- Open PRs.
+- Existing tests.
+- Public APIs.
+- Storage contracts.
+- Database migrations.
+- Configuration formats.
+- Deployment assumptions.
+- Backward compatibility.
+
+Identify reusable code before writing anything new.
+
+## Step 2 — Plan
+
+Create a small implementation plan with:
+
+- Files affected.
+- Existing components reused.
+- New components.
+- API/schema changes.
+- Risks.
+- Migration strategy.
+- Test strategy.
+- Rollback plan.
+
+Update the relevant GitHub issue.
+
+## Step 3 — Implement
+
+Use minimal, deliberate changes.
+
+Avoid unnecessary dependencies and architectural rewrites.
+
+Prefer shared libraries and adapters over duplicated implementations.
+
+## Step 4 — Test locally
+
+At minimum, run the relevant focused tests, then:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Run applicable Python, shell, workflow, security, fuzz and integration checks.
+
+Use the repository's existing authoritative commands and scripts rather than assuming these commands fully represent its CI configuration.
+
+Check migrations, configuration parsing, release bundles and API compatibility.
+
+## Step 5 — Integrate
+
+Before opening or updating a PR:
+
+```bash
+git fetch origin
+git rebase origin/main
+```
+
+Resolve conflicts semantically, not mechanically.
+
+Inspect the resulting diff for:
+
+- Lost functionality.
+- Duplicate tests.
+- Accidental configuration removal.
+- Missing migration updates.
+- Inconsistent API contracts.
+- Changed defaults.
+- Regressions in unrelated systems.
+
+Run the tests again after the final conflict resolution.
+
+## Step 6 — Submit PR
+
+Every PR should include:
+
+```text
+Summary
+Problem addressed
+Implementation details
+Files/components changed
+Compatibility considerations
+Tests performed
+CI evidence
+Performance measurements
+Security implications
+Migration instructions
+Rollback instructions
+Related issues
+```
+
+Keep PR scope focused.
+
+## Step 7 — Validate exact commit
+
+All required checks must pass against the exact final PR head.
+
+Check both:
+
+1. GitHub Actions.
+2. GitForge's own pipeline.
+
+A successful enqueue is not a successful execution.
+
+A successful build is not a successful security audit.
+
+A successful subset of tests is not a full release validation.
+
+## Step 8 — Merge and clean up
+
+Once all requirements are met:
+
+- Merge using the repository's configured strategy.
+- Verify the commit is on main.
+- Confirm the main branch checks.
+- Update the issue.
+- Close superseded PRs.
+- Remove safe-to-delete branches.
+- Preserve unrelated WIP.
+- Verify the next dependent PR is based on the updated main.
+
+Do not deploy a change solely because its PR was merged.
+
+## Step 9 — Verify operational behavior
+
+For infrastructure changes, test on the actual Fedora runner environment.
+
+Capture relevant service logs, queue metrics, resource measurements and recovery evidence.
+
+Do not claim production validation from local unit tests alone.
+
+# 14. PR and merge-conflict resolution policy
+
+Treat PR cleanup as a continuous workstream, not a final administrative task.
+
+For every open PR, classify it:
+
+| Classification | Action |
+|---|---|
+| Valid and independent | Rebase, validate and merge |
+| Valid but overlapping another PR | Consolidate or sequence |
+| Partially superseded | Port unique changes and close after verification |
+| Fully superseded | Close with replacement reference |
+| Stale but valuable | Preserve and port selected work |
+| Incorrect or unsafe | Document and replace |
+| Blocked by infrastructure | Keep explicit blocker and evidence |
+
+When resolving merge conflicts:
+
+1. Identify which branch introduced the original behavior.
+2. Determine whether main has already changed that behavior.
+3. Read the entire surrounding implementation.
+4. Preserve all valid functionality.
+5. Avoid duplicate declarations and duplicate tests.
+6. Check configuration contract compatibility.
+7. Check migrations and API schema compatibility.
+8. Run tests for both sides of the conflict.
+9. Review the final diff manually.
+10. Record the resolution in the PR.
+
+Do not automatically choose `ours` or `theirs` for important files.
+
+Never force-push over another agent's branch without understanding its ownership and current work.
+
+If another agent is actively modifying the same subsystem, coordinate the branch boundary rather than competing with it.
+
+# 15. Acceptance criteria by milestone
+
+| Milestone | Completion requirement |
+|---|---|
+| M0 — Repository cleanup | PR inventory, merged/superseded work resolved, branch conflicts cleared |
+| M1 — Correctness | Workspace builds/tests, API authentication and status polling work |
+| M2 — Security | cargo-vet, Cargo Audit, CodeQL, public runner trust and required checks validated |
+| M3 — Reliable CI delivery | SSH/HTTP pushes, outbox, retries and run correlation proven |
+| M4 — Scheduler | Fair lanes, bounded admission, resource limits and queue reasons implemented |
+| M5 — Storage | CAS, immutable reuse, managed workspaces and safe GC implemented |
+| M6 — Incremental validation | Graph-based selection and result reuse pass differential testing |
+| M7 — Tooling | Language adapters and faster tools benchmarked and verified |
+| M8 — Service performance | API/database performance characterized and optimized |
+| M9 — Knowledge consolidation | Provenance-preserving extraction and measured compression |
+| M10 — Production release | Monitoring, documentation, recovery, rollback and release evidence complete |
+
+Each milestone requires actual code and validation evidence.
+
+# 16. Final production-readiness checklist
+
+Do not declare GitForge production-ready until all applicable items are satisfied.
+
+### Code quality
+
+- [ ] No unresolved compilation errors.
+- [ ] Strict Clippy passes.
+- [ ] Formatting passes.
+- [ ] Required tests pass.
+- [ ] Coverage meets the repository's actual enforced threshold.
+- [ ] Migrations are tested.
+- [ ] No accidental placeholders or unimplemented production paths.
+- [ ] No unexplained warnings or suppressed findings.
+
+### CI/CD
+
+- [ ] GitHub workflows and GitForge agree on execution identity.
+- [ ] No unintended duplicate heavy validation.
+- [ ] Required checks work for all relevant PR types.
+- [ ] CI status polling authenticates correctly.
+- [ ] Failed jobs report the true failure reason.
+- [ ] Queued jobs recover across restart.
+- [ ] Trigger events are durable and idempotent.
+- [ ] Release bundles pass contract tests.
+
+### Security
+
+- [ ] cargo-vet attestations completed or narrowly documented exceptions reviewed.
+- [ ] Cargo Audit clean or reviewed advisories documented.
+- [ ] CodeQL passes.
+- [ ] Secrets scanning passes.
+- [ ] Public fork execution is isolated.
+- [ ] Shared caches enforce trust boundaries.
+- [ ] Artifact and workspace ownership is enforced.
+- [ ] Credential rotation procedures documented.
+
+### Scheduling and execution
+
+- [ ] Fast/standard/heavy/background lanes implemented.
+- [ ] Fair scheduling and aging work.
+- [ ] Per-repository limits enforced.
+- [ ] CPU/memory/process limits enforced.
+- [ ] Storage and I/O pressure admission works.
+- [ ] Control-plane requests remain responsive under heavy workloads.
+- [ ] No unbounded queue or task spawning.
+- [ ] Queue wait and deferral reasons visible.
+- [ ] Retry, cancellation and recovery tested.
+
+### Storage
+
+- [ ] Content-addressed objects have verified identities.
+- [ ] Immutable object publication is race-safe.
+- [ ] CAS reference registration is durable.
+- [ ] Concurrent cache access is safe.
+- [ ] Workspace creation/cleanup is ownership-aware.
+- [ ] Snapshot/reflink fallbacks work.
+- [ ] GC dry-run is accurate.
+- [ ] GC cannot delete live/leased objects.
+- [ ] Backup and restore are tested.
+- [ ] Storage metrics are exposed.
+
+### Incremental validation
+
+- [ ] Change-impact graph is current.
+- [ ] Affected-test selection works.
+- [ ] New and failing/flaky tests are included.
+- [ ] Complete test fingerprints invalidate correctly.
+- [ ] Differential validation demonstrates no missed failures.
+- [ ] Full scheduled/release tests remain active.
+
+### Operations
+
+- [ ] Deployment procedures documented.
+- [ ] Rollback tested.
+- [ ] Health/readiness probes work.
+- [ ] Resource and queue metrics available.
+- [ ] Error alerts configured.
+- [ ] Disk-pressure handling tested.
+- [ ] Runner recovery tested.
+- [ ] Production backup/restore tested.
+- [ ] No unresolved critical operational blockers.
+
+### Performance
+
+- [ ] Baseline and post-change measurements recorded.
+- [ ] 2-core/2-GB profile evaluated.
+- [ ] Larger runner profiles evaluated.
+- [ ] Queue saturation tested.
+- [ ] Multiple simultaneous repositories tested.
+- [ ] API p95/p99 recorded under execution load.
+- [ ] CPU/RAM/I/O and storage savings quantified.
+- [ ] Cold/warm cache behavior verified.
+- [ ] Performance improvements do not compromise correctness.
+
+# 17. Reporting and project management expectations
+
+Maintain a machine-readable and human-readable implementation ledger.
+
+For every task record:
+
+```text
+issue
+description
+owner
+status
+branch
+PR
+base_sha
+head_sha
+files_changed
+dependencies
+tests
+CI_results
+benchmark_results
+blockers
+rollback
+```
+
+Use clear statuses:
+
+```text
+NOT_STARTED
+IN_PROGRESS
+BLOCKED
+IMPLEMENTED
+VALIDATING
+READY_FOR_REVIEW
+MERGED
+VERIFIED_IN_DEPLOYMENT
+```
+
+Never use `COMPLETE` when something is only implemented or waiting for validation.
+
+Provide a concise progress report after each implementation batch:
+
+1. What was implemented.
+2. What changed architecturally.
+3. Which existing issues were resolved.
+4. Which PRs were merged, superseded or updated.
+5. Which tests passed and failed.
+6. Performance differences.
+7. Remaining blockers.
+8. Next implementation phase.
+
+Maintain an updated master plan and a prioritized task ledger. Update GitHub issues instead of allowing documentation and issue status to diverge.
+
+# 18. Final deliverables
+
+At the end of this initiative, deliver:
+
+1. Clean, consolidated GitHub PR history.
+2. Updated main branch with all validated production fixes.
+3. Completed resource-aware scheduler.
+4. Shared CAS and managed workspace subsystem.
+5. Safe storage GC and retention policies.
+6. Dependency and test-impact graph.
+7. Incremental test selection and verified test-result reuse.
+8. Shared language/test-runner adapter framework.
+9. Benchmark results and toolchain compatibility matrix.
+10. Improved API, database and small-VPS execution performance.
+11. Observability and operational management improvements.
+12. Session/log/debug knowledge consolidation.
+13. Updated architecture, API, security and operations documentation.
+14. Deployment/rollback procedures.
+15. Final production-readiness report with exact commits and CI evidence.
+
+---
+
+# 19. Final instruction to the implementation agent
+
+Treat this as a coordinated engineering programme with an emphasis on execution, not documentation.
+
+Start by auditing and cleaning the current PR situation. Fix the correctness and security blockers before introducing risky optimizations. Preserve the useful smart-CI work, consolidate shared fixes, and establish reliable exact-commit validation.
+
+Then implement the resource-aware scheduler, shared storage/workspace manager, incremental test intelligence, and benchmark-driven tooling improvements in that order.
+
+Do not attempt to implement everything in one massive branch. Use focused PRs, dependencies, feature flags, controlled integration and measurable milestones.
+
+Do not stop after making the first PR or resolving the obvious compile errors. Continue through the acceptance criteria and production validation.
+
+**Most importantly: optimize GitForge as one coordinated system.**
+
+The scheduler, runners, test framework, cache, filesystem, database and API should work together. A job should know what it needs; the scheduler should know whether it can safely run; the workspace manager should provision it efficiently; shared immutable storage should eliminate redundant data; the test graph should eliminate unnecessary execution; and observability should make every decision explainable.
+
+The finished product must be demonstrably faster, more reliable, more efficient and safer under real multi-project workloads—not merely more sophisticated on paper.
+
+Do not report production readiness until the final checklist is satisfied and the exact release candidate has passed its required validation.

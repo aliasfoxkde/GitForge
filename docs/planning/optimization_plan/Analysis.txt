@@ -1,0 +1,376 @@
+GitForge audit and proposed storage architecture
+The repository is aliasfoxkde/GitForge, and I’m treating the current main branch as the production baseline while separately checking active development branches.
+
+One important distinction: I would not approach this as merely a better Git worktree manager. The opportunity is to build a shared, content-addressed development and execution substrate that GitForge can use for repositories, build artifacts, dependencies, CI environments, agent sessions, and retained operational knowledge.
+
+That could deliver substantially more value than adding symlink optimization to the existing checkout process.
+1. Existing GitForge capabilities and gaps
+What is already implemented
+Area	Current implementation	Assessment
+Git worktrees	Native Git worktree usage in development	No integrated lifecycle manager established by the inspected code
+Persistent cache	FileCacheStore and CacheStore abstraction	Basic persistence, not content-addressed deduplication
+Artifact storage	Filesystem-backed artifact store	Separate data and metadata files
+Build cache	Host-mounted Cargo target cache	Useful reuse, but limited cache identity and isolation
+Job logs	Filesystem and in-memory stores	Basic retention and retrieval
+Execution isolation	Docker sandbox and host mounts	Good foundation
+Build coordination	Semaphore-limited build daemon	Controls concurrent Cargo builds
+CI scheduling	DAG, durable jobs, leases, retry/recovery	Substantial existing functionality
+Observability	Metrics, job receipts, logs, status APIs	Foundation exists; storage-level accounting can improve
+
+The most important discovery is that GitForge already supports a Cargo cache mount in its own CI configuration.
+
+The .gitforge.yml configuration mounts a host directory into containers at /cargo-target, with the host cache keyed by the CI image tag. It also explicitly treats a failed cache mount as an optimization failure rather than a correctness failure.
+
+This is the right general principle, but it is not yet a unified cache architecture.
+Existing implementation limitations
+A. Cache storage is not a true content-addressed store.
+
+crates/gitforge-storage/src/cache.rs currently identifies entries by a cache key and stores separate data and JSON metadata files.
+
+It does not:
+- Deduplicate identical content across different keys.
+- Deduplicate content across repositories.
+- Maintain reference counts for shared objects.
+- Provide immutable objects with independently addressable references.
+- Implement eviction based on global storage pressure.
+- Provide a comprehensive integrity/reconciliation mechanism.
+There is also a cache-key construction issue worth fixing: the key components are concatenated without explicit length or delimiter encoding, and the filesystem name uses only the first 16 hexadecimal characters of the resulting SHA-256.
+
+B. The worktree problem is real, not hypothetical.
+
+The October 10 worktree audit documented:
+Condition	Count
+Live worktrees	44
+Clean	25
+Dirty, 1–9 files	17
+Additional dirty worktree	1
+Build-artifact spill, 3,962 files	1
+
+There was also an ownership problem: removing a dirty worktree could destroy another agent's active changes.
+
+This is precisely the kind of lifecycle problem a proper manager should solve. It needs explicit ownership, leases, expiration, recoverability, and safe cleanup—not just git worktree prune.
+
+Source: GitForge worktree audit.
+
+C. There is already a storage reliability improvement in progress.
+
+As of October 31, PR #336 proposes atomic file publication for artifacts, caches, receipts, and metadata.
+
+That is important groundwork, but its stated semantics are deliberately narrower than a transactional storage engine: individual files are atomically published, while separate data and metadata renames are not a single transaction. Its full GitForge pipeline was still being validated in the PR description.
+
+Source: PR #336 — Atomic storage publication.
+
+I would build on that work rather than introduce another competing filesystem implementation.
+2. Current quality and release status
+Not release-clean at the inspected main commit
+The codebase has a strong engineering foundation, but I would not equate its lint and architecture maturity with production readiness.
+Positive indicators
+The workspace currently enforces:
+- Rust Clippy with warnings treated as errors.
+- unwrap_used, expect_used, and panic denied at workspace level.
+- Formatting, security scanning, dependency auditing, and route/documentation consistency checks.
+- Integration tests and a separate coverage gate.
+- Durable job scheduling, lease fencing, recovery, cancellation, and sandbox cleanup mechanisms.
+The October 25 quality roadmap reported a measured 83.04% workspace line-coverage baseline against an 82% failure threshold. The storage crate itself was at 92.61%; the largest deficits were in Git server, runner, and CI service execution paths.
+
+Source: Quality roadmap · Coverage baseline.
+What is failing
+I checked the October 30 main-branch run for commit 5ceb106d.
+Validation	Result
+Integration Tests	Passed
+General CI	Passed
+CodeQL	Failed
+Rust CI	Failed
+Security	Failed
+GitForge's own CI pipeline	Failed
+
+The failed Rust CI included Build, Test, Clippy, Coverage, Supply Chain, and Rust Security checks. Cargo Audit and the secrets scan did pass.
+
+This is significant: the source has extensive quality controls, but the actual current main-branch validation evidence is not clean.
+
+Relevant runs: Rust CI, Security, GitForge CI.
+Highest-priority outstanding items
+Priority	Item	Why it matters
+Critical	#318 — Public PR runner trust	Public fork code executing on persistent self-hosted runners is a host compromise risk.
+High	#277 — Resource and storage governance	Historical severe disk, CPU, memory, and I/O contention.
+High	#284 — Duplicate CI lanes	Multiple validation workflows can compete for the same runner resources.
+High	#322 — Smart CI dependency graph	Change-impact-based execution remains an important missing optimization.
+High	#335 — Amortyx-Stack gate evidence	Repository registration and canonical execution evidence are not yet reliable for that integration.
+
+The storage-related work should be coordinated with these issues, rather than implemented independently.
+
+In particular, the security issue should be resolved before treating the public repository's persistent runners as a safe execution environment for untrusted contributors.
+
+I’ve created the GitHub tracking structure and submitted the architecture PR. The work is now divided into independently implementable projects rather than one enormous rewrite.
+GitForge initiative
+Submitted
+
+7 issues + 1 PR
+One umbrella issue, four implementation workstreams, two immediate blocker tickets, and one architecture PR.
+
+Issue #342 — Main implementation epic
+
+Make GitForge resource-efficient, incremental and storage-deduplicated.
+
+PR #343 — Architecture and execution plan
+Draft PR · CI pending
+Branch: docs/ci-storage-efficiency-architecture-20261031
+
+1. Issues submitted
+These are the individual implementation tickets.
+Issue	Workstream
+#338	Resource-aware fast, standard and heavy CI lanes
+#339	Content-addressed storage, worktrees, snapshots and GC
+#340	Incremental test graph and reusable test results
+#341	Faster compilers, linters, test runners and database benchmarks
+
+Two additional blockers:
+Issue	Work
+#344	Fix GitForge Actions API authentication and status polling (HTTP 401).
+#345	Complete the 15 missing cargo-vet safe-to-deploy audits.
+
+The umbrella issue links the existing #277, #284, #318, #322, #335, #336, #337 and #258 work.
+2. The architecture I recommend
+There are four major systems to build.
+
+
+
+
+
+
+
+
+
+A. Resource-aware execution scheduler
+
+Protect fast work and API responsiveness while controlling expensive jobs.
+
+Issue #338
+
+
+
+
+
+
+
+
+
+
+
+
+B. Shared CAS and workspace manager
+
+Reuse immutable data, create cheap isolated workspaces and safely reclaim storage.
+
+Issue #339
+
+
+
+
+
+
+
+
+
+
+
+
+C. Incremental test and build intelligence
+
+Determine what actually needs to execute and reuse proven results.
+
+Issue #340
+
+
+
+
+
+
+
+
+
+
+
+
+D. Optimized toolchain and execution adapters
+
+Select the fastest compatible compiler, linter and test runner for each language.
+
+Issue #341
+
+
+
+A. Separate fast and heavy workloads
+The key distinction is that GitForge shouldn't treat all jobs as equivalent.
+Reserved capacity
+Fast lane
+
+Formatting, manifest checks, changed-file lint, targeted tests, small smoke tests and route validation.
+
+Normal capacity
+Standard lane
+
+Ordinary compilation, builds and affected test suites.
+
+Admission controlled
+Heavy lane
+
+Full-workspace builds, full tests, coverage, fuzzing, mutation testing and release builds.
+
+Background lane
+
+Cache warming, graph rebuilding, GC, log compaction and scheduled audits.
+
+
+The scheduler will need more than priority labels. It should consider CPU, memory, disk space, I/O pressure, active jobs, repository concurrency and the cost of each job.
+
+I specifically included:
+- Weighted fairness between repositories and tenants.
+- Reserved fast-lane capacity without starving heavy work.
+- Per-repository concurrency limits.
+- Durable queue reasons explaining why work is waiting.
+- Cgroup-enforced resource reservations.
+- Bounded pending work rather than unlimited waiting tasks.
+- Separate control-plane responsiveness from compute workload.
+This is especially important on a 2-core VPS. A machine that can technically start eight jobs does not necessarily have the resources to execute them efficiently.
+B. The shared storage system
+I recommend building a GitForge storage subsystem with three layers.
+Immutable content-addressed store
+
+Verified blobs · dependencies · build artifacts · logs · snapshots
+
+
+Manifests and references
+Ownership, versions, hashes and leases
+
+Workspace providers
+Git worktrees, reflinks, OverlayFS, Btrfs
+
+
+
+Isolated execution environments
+
+Independent agent sessions · CI jobs · builds · test runs
+
+
+This borrows from pnpm's content-addressed package storage, but extends the concept.
+
+pnpm's implementation illustrates several important constraints: hard links require the same filesystem, the shared store is a trust boundary, and integrity checks protect cached content. 
+
+GitHub
+
+For GitForge:
+- Git retains ownership of Git objects.
+- The CAS stores reusable non-Git data.
+- Manifests connect logical workspaces and artifacts to immutable objects.
+- Workspaces get independent writable state.
+- Garbage collection follows references, leases and ownership.
+- Reflink/OverlayFS/Btrfs are optional workspace backends.
+Btrfs is particularly interesting because snapshots initially share copy-on-write extents, but snapshots are not backups. 
+
+BTRFS documentation
+
+An important distinction: do not hard-link mutable build outputs or concurrently share Cargo target directories. Use isolated writable outputs and compiler-level caching.
+C. Incremental testing
+I consider this one of the highest-value opportunities.
+
+For example:
+
+Suppose a project has 1,000 tests and you change a function used by 12 tests.
+
+Instead of immediately executing all 1,000, GitForge should know which tests exercise that function and which dependent components might be affected.
+
+The graph should track:
+- Source files, functions, modules and packages.
+- Static dependencies and reverse dependencies.
+- Test-to-code execution relationships.
+- Test inputs and fixtures.
+- Compiler, runtime, image and environment identity.
+- Previous results, failures and flaky behavior.
+A test result should be reusable only if its entire relevant execution fingerprint matches.
+
+New tests, failed tests, flaky tests, integration tests with unknown dependencies, and tests affected by global configuration changes must not be silently skipped.
+
+I also specified differential validation: execute both the optimized test selection and the full suite on the same commit during rollout. Any missed failure blocks enabling test-result reuse.
+
+There is already useful work to preserve here: the older #322 branch contains a graph implementation and changed-crate selection, but it is 70 commits behind main. We should rebase and review that work rather than recreate it.
+D. Faster tooling
+The supplied projects are worthwhile research inputs.
+Tool	Potential role	My recommendation
+lust-lang	Extremely fast incremental Rust-like checks	Prototype/advisory only
+ts-rust	Faster TypeScript checking	Conformance pilot
+cargo-nextest	Faster, controlled test execution	High-priority pilot
+sccache	Compiler invocation caching	High-priority pilot
+cargo-chef	Docker dependency layers	Evaluate
+Biome / Oxlint	Faster JS/TS linting	Evaluate rule compatibility
+uv / Ruff	Faster Python tooling	High-priority pilot
+
+A few important qualifications:
+- Lust's current prototype does not support generics, traits or closures. Its reported agent edit-loop speedups are interesting, but it cannot replace rustc and Clippy for general production Rust projects.
+- ts-rust reports substantial TypeScript checking improvements, including a 4.35x result against its TypeScript 7 baseline in one benchmark. However, it is an early release pinned to a particular TypeScript revision. Keep it advisory until exact diagnostics and compatibility are demonstrated on our projects.
+- Nextest controls test concurrency, process isolation, retries and test groups. It complements Cargo rather than replacing Cargo. 
+  
+  cargo-nextest+1
+- sccache has important Rust-specific limitations: incremental compilation is not cached, and some linker-dependent crate types are not cacheable. 
+  
+  GitHub
+- pytest-testmon is especially interesting because it tracks test-to-code dependencies using coverage data and selects tests affected by changed code. It also requires an initial full collection. 
+  
+  Testmon
+I would build an extensible test-runner interface and integrate your OpenTestSuite prototype through adapters rather than build a separate testing framework into GitForge itself. 
+3. What should happen first?
+I established this execution order in the epic.
+1. Gate 0 — Correctness and security
+   
+   Resolve the SSH callback and API fixture compile errors, fix the GitForge polling authentication contract, complete cargo-vet audits, and resolve public PR runner isolation.
+2. Gate 1 — Queue and resource observability
+   
+   Measure queue waiting time, host pressure, per-job resource consumption, storage usage and cache effectiveness. Implement bounded admission before increasing concurrency.
+3. Gate 2 — Shared storage and workspaces
+   
+   Build the immutable object store and workspace provider, then benchmark native worktrees, reflinks, OverlayFS and Btrfs.
+4. Gate 3 — Incremental validation
+   
+   Rebase #322, integrate per-test mappings, and compare optimized test selection against full tests.
+5. Gate 4 — Toolchain optimization
+   
+   Benchmark alternative tools under identical workloads and roll out only those that improve performance without compromising correctness.
+4. What has actually been fixed?
+There is an important distinction between submitted work and implemented runtime changes.
+Tracking and architecture submitted
+The following has been completed in this pass:
+- Four implementation tickets and an umbrella epic created.
+- Two additional Gate 0 blocker tickets created.
+- A new branch and architecture document submitted as PR #343.
+- The architecture document covers storage, GC, queue admission, incremental tests, benchmarking, toolchain alternatives, safety and rollout.
+- The prior graph implementation and the open atomic-storage PR have been incorporated into the plan rather than duplicated.
+No runtime scheduler, storage or test-selection code has been changed by PR #343. It is explicitly a design/documentation PR, and its latest GitHub checks were still queued or pending when I checked.
+
+There is also existing work worth distinguishing:
+
+PR #336 — Atomic file-backed storage publication already contains fixes for the SSH callback signature and missing API test-fixture variable, in addition to its atomic storage work.
+
+On its inspected head, Build, Test, Clippy and Coverage passed, as did the ordinary security and integration checks. However, Supply Chain still failed on the 15 missing attestations, and GitForge status polling still returned 401. It remains open and unmerged.
+
+I have not represented those fixes as deployed or validated on main.
+
+5. My overall recommendation
+I would prioritize the work as follows:
+Rank	Investment	Expected importance
+1	Queue admission, host-pressure governance and fast/heavy lanes	Very high
+2	Eliminate duplicate CI execution and redundant validation	Very high
+3	Shared immutable dependency/build cache	Very high
+4	Incremental test impact and verified result reuse	Very high
+5	Managed copy-on-write workspaces and GC	High
+6	Alternative compiler/linter/test tooling	Medium–high
+7	Conversation/log knowledge compaction	High for long-term storage efficiency
+
+The most important architectural decision is to avoid treating storage, scheduling and testing as separate optimizations.
+
+They should cooperate:
+
+A job should know what it needs, the scheduler should know whether it can safely run, the workspace manager should provision it efficiently, the CAS should reuse immutable inputs, and the test graph should avoid executing work that is demonstrably unnecessary.
+
+That is a much more significant advantage than simply making Docker builds or individual compilers faster.
+
+The immediate next implementation milestone should be Gate 0 and #338. Once the CI execution contract and resource observability are reliable, the storage and incremental-testing work can be introduced without creating another source of queue instability.
