@@ -1,0 +1,1 @@
+{"cell_id":"build-common-cold","command":"cargo build -p gitforge-common ","wall_seconds":1.29,"exit_code":0,"host":"SWARMONE","timestamp_utc":"2026-11-01T07:34:20Z","git_sha":"d476baf7","target_dir":"/var/tmp/gitforge-target","load_avg":"49.32 46.27 57.30"}
