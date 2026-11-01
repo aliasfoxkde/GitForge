@@ -2945,6 +2945,11 @@ fn execution_plan(
         // needs.
         volumes: definition.volumes.clone(),
         lane: definition.lane,
+        // The fault surface is rollout-gated at parse time (the pipeline
+        // parser rejected the `fault:` key unless the deployment enabled
+        // it), so carrying it verbatim here is safe: `None` for every job
+        // of a flag-off deployment.
+        fault: definition.fault,
     }
 }
 
@@ -3293,6 +3298,7 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 volumes: Vec::new(),
                 cache: None,
                 lane: Default::default(),
+                fault: None,
             },
             JobDefinition {
                 name: "test".to_string(),
@@ -3312,6 +3318,7 @@ fn create_default_pipeline(repo_id: &str) -> PipelineDefinition {
                 volumes: Vec::new(),
                 cache: None,
                 lane: Default::default(),
+                fault: None,
             },
         ],
     }
@@ -6187,6 +6194,7 @@ jobs:
                     volumes: Vec::new(),
                     cache: None,
                     lane: Default::default(),
+                    fault: None,
                 },
                 JobDefinition {
                     name: "clippy".to_string(),
@@ -6200,6 +6208,7 @@ jobs:
                     volumes: Vec::new(),
                     cache: None,
                     lane: Default::default(),
+                    fault: None,
                 },
             ],
         }

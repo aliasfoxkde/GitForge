@@ -270,6 +270,12 @@ pub struct JobExecutionDefinition {
     /// Scheduling lane (#338). Absent in definitions enqueued by callers
     /// that predate lanes; those get the Standard default.
     pub lane: gitforge_common::Lane,
+    /// Failure-injection request (M10). Propagated verbatim to the runner,
+    /// which simulates the outcome instead of executing. Only ever `Some`
+    /// when the deployment enabled the fault-injection rollout flag (the
+    /// CI parser rejects the key otherwise). Absent callers default to
+    /// `None` — real execution.
+    pub fault: Option<gitforge_common::Fault>,
 }
 
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 300;
@@ -556,6 +562,7 @@ impl Scheduler {
                 env: HashMap::new(),
                 volumes: Vec::new(),
                 lane: gitforge_common::Lane::Standard,
+                fault: None,
             },
         )
         .await
@@ -638,6 +645,7 @@ impl Scheduler {
                 env: definition.env.clone(),
                 volumes: definition.volumes.clone(),
                 lane: definition.lane,
+                fault: None,
             },
         );
         tracing::debug!("job {} enqueued", job_id);
@@ -1027,6 +1035,7 @@ impl Scheduler {
                         // without the pipeline's cache mount.
                         volumes: Vec::new(),
                         lane: gitforge_common::Lane::Standard,
+                        fault: None,
                     }
                 });
                 readopted += 1;
@@ -1689,6 +1698,7 @@ impl Scheduler {
                         // runs without the pipeline's cache mount.
                         volumes: Vec::new(),
                         lane: gitforge_common::Lane::Standard,
+                        fault: None,
                     },
                 );
                 loaded += 1;
@@ -2434,6 +2444,7 @@ mod tests {
             env: HashMap::new(),
             volumes: Vec::new(),
             lane: gitforge_common::Lane::Standard,
+            fault: None,
         }
     }
 
@@ -2446,6 +2457,7 @@ mod tests {
             env: HashMap::new(),
             volumes: Vec::new(),
             lane: gitforge_common::Lane::Standard,
+            fault: None,
         }
     }
 
@@ -2593,6 +2605,7 @@ mod tests {
                     env: HashMap::new(),
                     volumes: Vec::new(),
                     lane: gitforge_common::Lane::Standard,
+                    fault: None,
                 },
             )
             .await
@@ -4200,6 +4213,7 @@ mod tests {
             env: HashMap::new(),
             volumes: Vec::new(),
             lane,
+            fault: None,
         }
     }
 

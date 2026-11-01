@@ -266,6 +266,7 @@ mod tests {
             volumes: Vec::new(),
             cache: None,
             lane: Default::default(),
+            fault: None,
         }
     }
 
