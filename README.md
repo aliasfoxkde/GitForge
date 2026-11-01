@@ -2,7 +2,7 @@
 
 > **Self-hosted Git platform with event-driven CI/CD capabilities.**
 
-GitForge is a production-ready, self-hosted Git service that provides Git hosting, CI/CD pipeline orchestration, and job execution — similar to GitHub Actions but fully self-hosted.
+GitForge is a self-hosted Git service that provides Git hosting, CI/CD pipeline orchestration, and job execution — similar in scope to GitHub Actions, but operated on your own infrastructure.
 
 ## Quick Links
 
@@ -80,7 +80,7 @@ docker-compose up -d
 | **User Guides** | [Deployment](docs/DEPLOYMENT.md) · [Runbook](docs/RUNBOOK.md) · [API Reference](docs/API.md) |
 | **Architecture** | [Architecture Overview](docs/ARCHITECTURE.md) · [Hooks](docs/HOOKS.md) · [Testing Strategy](docs/TESTING_STRATEGY.md) |
 | **Development** | [Contributing](docs/CONTRIBUTING.md) · [Branch Strategy](docs/BRANCH_STRATEGY.md) |
-| **Project** | [Changelog](docs/CHANGELOG_RECENT.md) · [Security](docs/SECURITY.md) |
+| **Project** | [Changelog](docs/CHANGELOG_RECENT.md) · [Security](docs/SECURITY.md) · [Release readiness](docs/RELEASE_READINESS.md) |
 
 ## Project Structure
 
