@@ -34,6 +34,7 @@ struct ApiService {
     child: tokio::process::Child,
     port: u16,
     db_path: PathBuf,
+    passphrase: String,
 }
 
 impl Drop for ApiService {
@@ -110,6 +111,7 @@ async fn spawn_api() -> ApiService {
         child,
         port,
         db_path,
+        passphrase: harness_passphrase,
     }
 }
 
@@ -143,7 +145,7 @@ async fn test_login_and_authenticated_repository_and_ssh_key_flow() {
         .expect("bad login request");
     assert_eq!(bad.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    let good = login(&harness_passphrase)
+    let good = login(&service.passphrase)
         .send()
         .await
         .expect("login request");
