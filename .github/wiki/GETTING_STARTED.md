@@ -2,7 +2,7 @@
 
 GitForge is a self-hosted Git platform: repositories, smart HTTP + SSH Git
 serving, a built-in CI/CD engine with a container runner, and AI-powered code
-review. Rust workspace, 15 crates under `crates/`, 4 service binaries under
+review. Rust workspace, 16 crates under `crates/`, 4 service binaries under
 `services/`.
 
 ## Prerequisites

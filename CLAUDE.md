@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Type
 
-**GitForge** is a self-hosted Git platform (repos, smart HTTP + SSH Git serving) with a built-in CI/CD engine, container runner, and AI-powered code review. Rust workspace: 15 libraries under `crates/`, 4 binaries under `services/` (api, ci, git-server, runner).
+**GitForge** is a self-hosted Git platform (repos, smart HTTP + SSH Git serving) with a built-in CI/CD engine, container runner, and AI-powered code review. Rust workspace: 16 libraries under `crates/`, 4 binaries under
+`services/` (api, ci, git-server, runner).
 
 ## Build, Test, and Lint Commands
 
@@ -56,8 +57,10 @@ crates/gitforge-runner    # Container job execution
 crates/gitforge-ci        # Pipeline definitions, engine
 crates/gitforge-api       # Gateway routes + openapi
 crates/gitforge-cli       # `gitforge` CLI
-crates/gitforge-ai/-review # AI code review
-...                       # events, process, build, sandbox, storage
+crates/gitforge-ai        # AI provider abstraction (Anthropic, OpenAI, Ollama)
+crates/gitforge-review    # AI code review engine
+...                       # events, process, build, sandbox, storage,
+                          # testing-common
 services/api              # Gateway binary (:42780)
 services/ci               # CI orchestrator binary (:42781)
 services/git-server       # Git HTTP (:42782) + SSH (:42022)
