@@ -19,6 +19,7 @@ members = [
     "crates/gitforge-ai",
     "crates/gitforge-review",
     "crates/gitforge-testing-common",
+    "crates/gitforge-graph",
     "services/git-server",
     "services/ci",
     "services/runner",

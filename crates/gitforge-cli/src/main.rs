@@ -19,6 +19,45 @@ pub use config::Config;
 
 const AUTH_LOGIN_USAGE: &str = "gitforge auth --login <username>";
 
+/// Scope selected for the local quality gate. A missing graph or an
+/// unrecognized/empty change set always selects the full workspace so the
+/// gate cannot accidentally skip checks (#340 fail-closed policy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckScope {
+    Workspace,
+    Packages(Vec<String>),
+}
+
+fn select_check_scope(
+    graph: Option<&gitforge_graph::DependencyGraph>,
+    changed_files: &[String],
+    full: bool,
+) -> CheckScope {
+    let Some(graph) = graph else {
+        return CheckScope::Workspace;
+    };
+    if full || changed_files.is_empty() {
+        return CheckScope::Workspace;
+    }
+    let affected = graph.affected_crates(changed_files);
+    if affected.is_empty() {
+        CheckScope::Workspace
+    } else {
+        CheckScope::Packages(affected)
+    }
+}
+
+fn check_failure(name: &str, status: std::io::Result<std::process::ExitStatus>) -> Option<String> {
+    match status {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(format!(
+            "{name} failed (exit {})",
+            status.code().unwrap_or(-1)
+        )),
+        Err(error) => Some(format!("{name} could not run: {error}")),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "gitforge",
@@ -205,6 +244,21 @@ enum Commands {
         /// Initialize local storage
         #[arg(long)]
         init: Option<String>,
+    },
+    /// Dependency-graph-scoped quality gate and incremental test selection
+    Check {
+        /// Run the fast local gate (default)
+        #[arg(long)]
+        fast: bool,
+        /// Scope checks to changed files only
+        #[arg(long)]
+        changed: bool,
+        /// Run full workspace checks regardless of the graph
+        #[arg(long)]
+        full: bool,
+        /// Reuse prior test results whose inputs are fingerprint-identical
+        #[arg(long)]
+        reuse: bool,
     },
     /// AI code review
     Review {
@@ -1014,6 +1068,281 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
 
+        Commands::Check {
+            fast,
+            changed,
+            full,
+            reuse,
+        } => {
+            use gitforge_graph::{find_workspace_root, git_changed_files_local, DependencyGraph};
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let root = find_workspace_root(&cwd).unwrap_or(cwd.clone());
+            println!("GitForge check");
+            println!("   workspace: {}", root.display());
+
+            let changed_files = if *full {
+                Vec::new()
+            } else {
+                git_changed_files_local(&root).unwrap_or_default()
+            };
+
+            let graph = match DependencyGraph::load_from_workspace(&root) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    eprintln!(
+                        "could not build dependency graph: {e}; falling back to full workspace"
+                    );
+                    None
+                }
+            };
+
+            // --fast/--changed imply scoping even without an explicit --changed.
+            let scoped = *changed || *fast;
+            let scope = select_check_scope(graph.as_ref(), &changed_files, *full || !scoped);
+            let affected = match &scope {
+                CheckScope::Workspace => graph
+                    .as_ref()
+                    .map(gitforge_graph::DependencyGraph::crates)
+                    .unwrap_or_default(),
+                CheckScope::Packages(packages) => packages.clone(),
+            };
+
+            println!("   changed files: {}", changed_files.len());
+            match &scope {
+                CheckScope::Workspace if graph.is_none() => {
+                    println!("   affected crates: full workspace (dependency graph unavailable)");
+                }
+                CheckScope::Workspace => println!("   affected crates: full workspace"),
+                CheckScope::Packages(packages) => {
+                    println!("   affected crates: {}", packages.join(", "));
+                }
+            }
+
+            // Optional overlays: feature and known-issue registries.
+            let features_path = root.join("docs/planning/FEATURES.yml");
+            if features_path.exists() {
+                if let Ok(yaml) = std::fs::read_to_string(&features_path) {
+                    if let Some(graph) = graph.as_ref() {
+                        let mut graph = graph.clone();
+                        if graph.load_features_yaml(&yaml).is_ok() {
+                            let feats = graph.affected_features(&affected);
+                            if !feats.is_empty() {
+                                println!("   affected features: {}", feats.join(", "));
+                                let tests = graph.feature_tests(&feats);
+                                if !tests.is_empty() {
+                                    println!("   feature tests: {}", tests.join(", "));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let issues_path = root.join("docs/planning/KNOWN_ISSUES.yml");
+            if issues_path.exists() {
+                if let Ok(yaml) = std::fs::read_to_string(&issues_path) {
+                    if let Some(graph) = graph.as_ref() {
+                        let mut graph = graph.clone();
+                        if graph.load_issues_yaml(&yaml).is_ok() {
+                            let issues = graph.issues_for_crates(&affected);
+                            if !issues.is_empty() {
+                                println!(
+                                    "   known issues touching affected crates: {}",
+                                    issues.len()
+                                );
+                                for i in &issues {
+                                    println!("     - [{}] {} ({})", i.id, i.title, i.severity);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Result reuse: consult the JSONL store when --reuse is set.
+            let reuse_store =
+                gitforge_graph::reuse::ResultStore::at_path(root.join("target-ref/reuse.jsonl"));
+            if *reuse {
+                println!("   result reuse: enabled (target-ref/reuse.jsonl)");
+            }
+
+            let mut failures = Vec::new();
+
+            println!("cargo fmt --all -- --check");
+            let status = std::process::Command::new("cargo")
+                .arg("fmt")
+                .arg("--all")
+                .arg("--")
+                .arg("--check")
+                .current_dir(&root)
+                .status();
+            match check_failure("cargo fmt", status) {
+                None => println!("   fmt ok"),
+                Some(error) => {
+                    println!("   {error}");
+                    failures.push(error);
+                }
+            }
+
+            match &scope {
+                CheckScope::Workspace => {
+                    println!("cargo clippy (full workspace)");
+                    let status = std::process::Command::new("cargo")
+                        .arg("clippy")
+                        .arg("--workspace")
+                        .arg("--all-targets")
+                        .arg("--")
+                        .arg("-D")
+                        .arg("warnings")
+                        .current_dir(&root)
+                        .status();
+                    if let Some(error) = check_failure("cargo clippy --workspace", status) {
+                        println!("   {error}");
+                        failures.push(error);
+                    } else {
+                        println!("   clippy ok");
+                    }
+                }
+                CheckScope::Packages(packages) => {
+                    println!("cargo clippy (affected crates)");
+                    for c in packages {
+                        print!("   clippy -p {c} ... ");
+                        let st = std::process::Command::new("cargo")
+                            .arg("clippy")
+                            .arg("-p")
+                            .arg(c)
+                            .arg("--all-targets")
+                            .arg("--")
+                            .arg("-D")
+                            .arg("warnings")
+                            .current_dir(&root)
+                            .status();
+                        if let Some(error) = check_failure(&format!("cargo clippy -p {c}"), st) {
+                            println!("{error}");
+                            failures.push(error);
+                        } else {
+                            println!("ok");
+                        }
+                    }
+                }
+            }
+
+            // Tests follow the same fail-closed scope as clippy. With --reuse,
+            // a job whose inputs are fingerprint-identical to a prior passing
+            // run is reported as reused and skipped.
+            let run_test = |c: &str| -> Option<String> {
+                if *reuse {
+                    if let Ok(Some(stored)) = reuse_store.latest(c) {
+                        let decision = gitforge_graph::reuse::decide_reuse(
+                            c,
+                            &gitforge_graph::reuse::JobInputs {
+                                files: affected.clone(),
+                                command: format!("cargo test -p {c}"),
+                                env: Default::default(),
+                                image: String::new(),
+                            },
+                            &root,
+                            Some(&stored),
+                            chrono::Utc::now().timestamp_millis(),
+                            30 * 24 * 60 * 60 * 1000,
+                        );
+                        if decision == gitforge_graph::reuse::ReuseDecision::Reuse {
+                            println!(
+                                "   test -p {c}: reused (fingerprint match at {})",
+                                stored.commit_sha
+                            );
+                            return None;
+                        }
+                    }
+                }
+                print!("   test -p {c} ... ");
+                let st = std::process::Command::new("cargo")
+                    .arg("test")
+                    .arg("-p")
+                    .arg(c)
+                    .current_dir(&root)
+                    .status();
+                match check_failure(&format!("cargo test -p {c}"), st) {
+                    None => {
+                        println!("ok");
+                        if *reuse {
+                            let _ = reuse_store.record(&gitforge_graph::reuse::ReusableResult {
+                                job_name: c.to_string(),
+                                fingerprint: gitforge_graph::reuse::JobInputs {
+                                    files: affected.clone(),
+                                    command: format!("cargo test -p {c}"),
+                                    env: Default::default(),
+                                    image: String::new(),
+                                }
+                                .content_fingerprint(&root),
+                                commit_sha: git_changed_files_local(&root)
+                                    .ok()
+                                    .and_then(|_| {
+                                        std::process::Command::new("git")
+                                            .arg("rev-parse")
+                                            .arg("HEAD")
+                                            .current_dir(&root)
+                                            .output()
+                                            .ok()
+                                            .filter(|o| o.status.success())
+                                            .map(|o| {
+                                                String::from_utf8_lossy(&o.stdout)
+                                                    .trim()
+                                                    .to_string()
+                                            })
+                                    })
+                                    .unwrap_or_default(),
+                                recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+                                passed: true,
+                            });
+                        }
+                        None
+                    }
+                    Some(error) => {
+                        println!("{error}");
+                        Some(error)
+                    }
+                }
+            };
+
+            match &scope {
+                CheckScope::Workspace => {
+                    println!("cargo test (full workspace)");
+                    let st = std::process::Command::new("cargo")
+                        .arg("test")
+                        .arg("--workspace")
+                        .current_dir(&root)
+                        .status();
+                    if let Some(error) = check_failure("cargo test --workspace", st) {
+                        println!("   {error}");
+                        failures.push(error);
+                    } else {
+                        println!("   tests ok");
+                    }
+                }
+                CheckScope::Packages(packages) => {
+                    println!("cargo test (affected crates)");
+                    for c in packages {
+                        if let Some(error) = run_test(c) {
+                            failures.push(error);
+                        }
+                    }
+                }
+            }
+
+            if failures.is_empty() {
+                println!(
+                    "
+check passed"
+                );
+            } else {
+                eprintln!(
+                    "
+check failed: {}",
+                    failures.join("; ")
+                );
+                anyhow::bail!("quality gate failed: {}", failures.join("; "));
+            }
+        }
         Commands::Review {
             staged,
             diff,
