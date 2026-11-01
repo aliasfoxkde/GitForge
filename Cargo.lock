@@ -511,9 +511,11 @@ dependencies = [
  "gitforge-common",
  "gitforge-db",
  "gitforge-events",
+ "gitforge-metrics",
  "gitforge-process",
  "gitforge-scheduler",
  "gitforge-storage",
+ "prometheus",
  "reqwest",
  "serde",
  "serde_json",
@@ -1371,6 +1373,7 @@ dependencies = [
  "gitforge-core",
  "gitforge-db",
  "gitforge-events",
+ "gitforge-metrics",
  "gitforge-review",
  "gitforge-scheduler",
  "gitforge-storage",
@@ -1505,6 +1508,7 @@ dependencies = [
  "chrono",
  "futures",
  "gitforge-common",
+ "gitforge-metrics",
  "gitforge-review",
  "serde",
  "serde_json",
@@ -1533,6 +1537,30 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "gitforge-metrics"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "prometheus",
+ "tower",
+]
+
+[[package]]
+name = "gitforge-perfprobe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1618,6 +1646,7 @@ dependencies = [
  "futures",
  "gitforge-common",
  "gitforge-db",
+ "gitforge-metrics",
  "gitforge-storage",
  "hex",
  "serde",

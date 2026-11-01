@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/gitforge-common",
+    "crates/gitforge-metrics",
+    "crates/gitforge-perfprobe",
     "crates/gitforge-db",
     "crates/gitforge-events",
     "crates/gitforge-core",

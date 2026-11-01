@@ -7,5 +7,5 @@ pub mod models;
 pub mod publication_outbox;
 pub mod queries;
 
-pub use connection::Pool;
+pub use connection::{set_metrics, Pool};
 pub use models::*;

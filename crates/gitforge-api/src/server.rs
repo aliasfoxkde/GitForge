@@ -1,8 +1,6 @@
 //! API server
 
 use crate::auth::ApiAuth;
-use crate::metrics::Metrics;
-use crate::metrics_middleware::MetricsLayer;
 use crate::routes::{
     artifact_routes, ci_routes, public_runner_routes, repo_routes, review_routes, runner_routes,
     ssh_key_routes, user_routes, webhook_routes,
@@ -16,6 +14,7 @@ use axum::{
     Json, Router,
 };
 use gitforge_db::Pool;
+use gitforge_metrics::{Metrics, MetricsLayer};
 use gitforge_scheduler::Scheduler;
 use gitforge_storage::FileStorage;
 use serde::Serialize;
@@ -48,6 +47,7 @@ impl ApiServer {
     ) -> Self {
         let auth = ApiAuth::new(jwt_secret);
         let metrics = Metrics::new();
+        gitforge_db::set_metrics(metrics.clone());
         let metrics_arc = Arc::new(metrics);
 
         // Configure CORS - restrictive by default

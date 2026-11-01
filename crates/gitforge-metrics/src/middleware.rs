@@ -2,7 +2,7 @@
 //!
 //! Intercepts all HTTP requests and records metrics for Prometheus export.
 
-use crate::metrics::Metrics;
+use crate::Metrics;
 use axum::{extract::Request, response::Response};
 use std::{
     convert::Infallible,
@@ -52,13 +52,10 @@ where
         let start = std::time::Instant::now();
         let method = request.method().as_str().to_string();
 
-        // We need to use a separate future that captures method and path
         Box::pin(async move {
             let response = inner.call(request).await;
 
-            // Record metrics
             let duration = start.elapsed().as_secs_f64();
-            // Handle case where inner service returns error (shouldn't happen with Infallible)
             let status = response
                 .as_ref()
                 .map(axum::http::Response::status)
@@ -97,8 +94,7 @@ impl<S> Layer<S> for MetricsLayer {
 ///
 /// This prevents high-cardinality labels in metrics.
 /// Example: `/api/repos/550e8400-e29b-41d4-a716-446655440000` -> `/api/repos/{id}`
-/// Example: `/api/repos/123` -> `/api/repos/{id}`
-fn normalize_path(path: &str) -> String {
+pub fn normalize_path(path: &str) -> String {
     let segments: Vec<&str> = path.split('/').collect();
     let normalized: Vec<String> = segments
         .iter()
@@ -116,17 +112,11 @@ fn normalize_path(path: &str) -> String {
 
 /// Check if a path segment looks like an ID (UUID or numeric)
 fn is_id_segment(segment: &str) -> bool {
-    // Check for UUID pattern
     if is_uuid(segment) {
         return true;
     }
 
-    // Check for pure numeric ID
-    if segment.chars().all(|c| c.is_ascii_digit()) {
-        return true;
-    }
-
-    false
+    segment.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Check if a string is a UUID

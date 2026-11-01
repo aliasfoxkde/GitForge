@@ -1,0 +1,14 @@
+[package]
+name = "gitforge-metrics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+prometheus = "0.14"
+tower = { workspace = true }
+
+[lints]
+workspace = true
