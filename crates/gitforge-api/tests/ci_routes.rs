@@ -684,6 +684,7 @@ fn entry_job_definition() -> Value {
             volumes: Vec::new(),
             cache: None,
             lane: Default::default(),
+            fault: None,
         }],
     })
     .unwrap()
