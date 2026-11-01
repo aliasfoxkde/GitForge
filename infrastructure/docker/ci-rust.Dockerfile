@@ -37,12 +37,17 @@ FROM rust:1-slim-bookworm
 # openssl-sys needs pkg-config + libssl headers; git is a test dependency
 # (ssh/https protocol suites drive a real git client) and openssh-client
 # supplies ssh-keygen, which the hermetic git_ssh_protocol suite spawns.
-# python3 runs the route-docs drift gate; g++ compiles libFuzzer's vendored
-# C++ runtime when the fuzz job builds its targets; shellcheck is the lint
-# job's gate over the shell surfaces (scripts + systemd units).
+# python3 runs the route-docs drift gate; python3-yaml backs the strict
+# config/ledger validators (Amortyx-Stack's scripts-check.sh hard-fails
+# without it even in non-strict mode) and python3-pyflakes gives the
+# Python lint name-level checks instead of compile-only; g++ compiles
+# libFuzzer's vendored C++ runtime when the fuzz job builds its targets;
+# shellcheck is the lint job's gate over the shell surfaces (scripts +
+# systemd units).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev curl ca-certificates git openssh-client python3 g++ shellcheck \
+        pkg-config libssl-dev curl ca-certificates git openssh-client \
+        python3 python3-yaml python3-pyflakes g++ shellcheck \
     && rm -rf /var/lib/apt/lists/*
 
 # Slim images ship the minimal rustup profile; the pipeline needs both linters.
