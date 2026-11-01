@@ -1,0 +1,24 @@
+Recommended execution approach
+I would give the agent this document as its master objective, then let it operate in the following order:
+Execution priority
+1. Clean up PRs #258, #336 and #337. Consolidate overlapping changes and restore a reliable baseline.
+2. Finish Gate 0. Resolve compile failures, cargo-vet, authentication, public runner security and push delivery.
+3. Implement #338. Resource-aware queues, fast/heavy lanes and backpressure.
+4. Implement #339. CAS, workspace manager and garbage collection.
+5. Implement #340. Dependency graph, incremental testing and verified result reuse.
+6. Implement #341. Toolchain and service performance experiments.
+7. Complete production validation. Stress testing, failure recovery, deployment and rollback.
+
+One additional instruction I'd strongly emphasize to your agent: don't let it create a large number of parallel implementation agents immediately. Start with a single integration owner, establish shared interfaces and file ownership, and then delegate isolated workstreams. GitForge's existing queue and shared-runner contention problems would make uncontrolled parallel coding particularly counterproductive.
+
+The end goal is a GitForge that can manage its own development workload efficiently while becoming a better platform for everybody else's CI/CD workloads.
+
+
+Notes:
+The implementation should be treated as a GitForge production-hardening and performance initiative, not just a collection of optimization patches.
+
+I would give your AI one overarching objective: take GitForge from its current state to a verified, production-ready platform, systematically resolving existing issues, consolidating outstanding PRs, improving the execution architecture, and validating every change against real workloads.
+
+The important instruction is that it must not simply make CI green by skipping tests, lowering coverage, suppressing security findings, or weakening resource constraints. It must improve the underlying system while preserving correctness.
+
+Below is a handoff specification you can give your coding agent. It includes repository-specific instructions, the current PR situation, implementation order, engineering requirements, and final acceptance criteria.

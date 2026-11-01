@@ -1,12 +1,30 @@
 //! Database connection pool management with SQLite for MVP
 
 use gitforge_common::{Error, Result};
+use gitforge_metrics::Metrics;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
 use std::path::Path;
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+/// Optional process-wide metrics collector. Instrumentation is a no-op
+/// until a service installs one via [`set_metrics`]; library code never
+/// requires a collector to function.
+static METRICS: OnceLock<Metrics> = OnceLock::new();
+
+/// Install the process-wide metrics collector. Only the first call wins;
+/// later calls are ignored so a service and its embedded libraries can
+/// both attempt installation safely.
+pub fn set_metrics(metrics: Metrics) {
+    let _ = METRICS.set(metrics);
+}
+
+pub(crate) fn metrics() -> Option<&'static Metrics> {
+    METRICS.get()
+}
 
 /// How many poisoned-connection recovery passes `begin_immediate` attempts
 /// before giving up. Each pass takes a fresh connection, so the cap bounds
@@ -35,8 +53,14 @@ pub(crate) async fn begin_immediate(
     pool: &SqlitePool,
     context: &str,
 ) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    let write_start = Instant::now();
     match pool.begin_with("BEGIN IMMEDIATE").await {
-        Ok(tx) => Ok(tx),
+        Ok(tx) => {
+            if let Some(m) = metrics() {
+                m.record_db_write(context, write_start.elapsed().as_secs_f64());
+            }
+            Ok(tx)
+        }
         Err(begin_error) => {
             let mut last = begin_error;
             for _ in 0..BEGIN_RECOVERY_PASSES {
@@ -61,6 +85,9 @@ pub(crate) async fn begin_immediate(
                             context = %context,
                             "recovered a desynced pooled connection with ROLLBACK"
                         );
+                        if let Some(m) = metrics() {
+                            m.record_db_write(context, write_start.elapsed().as_secs_f64());
+                        }
                         return Ok(tx);
                     }
                     Err(error) => last = error,
@@ -71,6 +98,25 @@ pub(crate) async fn begin_immediate(
             )))
         }
     }
+}
+
+/// Acquire a pooled connection, recording the queue wait.
+///
+/// `begin_with` performs its own internal acquire, which cannot be hooked;
+/// call sites that take a connection directly go through here so pool
+/// starvation is observable.
+pub(crate) async fn acquire_timed(
+    pool: &SqlitePool,
+) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>> {
+    let start = Instant::now();
+    let conn = pool
+        .acquire()
+        .await
+        .map_err(|e| Error::database(format!("failed to acquire pooled connection: {e}")))?;
+    if let Some(m) = metrics() {
+        m.record_db_pool_acquire(start.elapsed().as_secs_f64());
+    }
+    Ok(conn)
 }
 
 /// Heal a pooled connection that still holds a SQLite-side transaction.
@@ -556,6 +602,15 @@ impl Pool {
             // quiet instead of judging from the runner's global heartbeat,
             // which starves under host load while the build is healthy.
             "ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT",
+            // Execution lane (#338): fast/standard/heavy/background. The
+            // assigner consults this for per-lane admission and reserved
+            // capacity; 'standard' keeps pre-lane rows dispatchable.
+            "ALTER TABLE jobs ADD COLUMN lane TEXT NOT NULL DEFAULT 'standard'",
+            // Durable queue-reason (#338): why the assigner last deferred
+            // this job (lane_limit, scratch_headroom, ...). NULL once the
+            // job is assigned; surfaced in queue status so a queued job
+            // explains its wait instead of just reading 'queued'.
+            "ALTER TABLE jobs ADD COLUMN deferred_reason TEXT",
         ] {
             if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
                 let message = error.to_string();

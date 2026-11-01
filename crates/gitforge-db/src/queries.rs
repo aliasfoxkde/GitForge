@@ -2,7 +2,7 @@
 //!
 //! This module provides real SQLite query implementations for all database operations.
 
-use crate::connection::begin_immediate;
+use crate::connection::{acquire_timed, begin_immediate};
 use crate::models::JobStatus;
 use crate::Pool;
 use chrono::{DateTime, Utc};
@@ -54,7 +54,10 @@ const DISPATCHABLE_PAGE_SIZE: i64 = 500;
 /// feature of a busy failure is that a retry succeeds — while validation
 /// and not-found errors propagate immediately: retrying them cannot change
 /// the outcome.
-pub async fn persist_with_retry<T, F, Fut>(mut operation: F) -> Result<T>
+///
+/// The `context` tag attributes retry passes to one durable-write site in
+/// the `gitforge_db_write_retries_total` metric.
+pub async fn persist_with_retry_ctx<T, F, Fut>(context: &str, mut operation: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
@@ -66,6 +69,9 @@ where
                 .saturating_mul(1 << (attempt - 1).min(4))
                 .min(PERSIST_BACKOFF_CAP);
             tokio::time::sleep(backoff).await;
+            if let Some(m) = crate::connection::metrics() {
+                m.record_db_write_retry(context);
+            }
         }
         match operation().await {
             Ok(value) => return Ok(value),
@@ -83,6 +89,16 @@ where
         }
     }
     Err(last_error.unwrap_or_else(|| Error::database("durable write made no attempts")))
+}
+
+/// Run a durable write until it commits or the retry budget is exhausted,
+/// without metrics attribution.
+pub async fn persist_with_retry<T, F, Fut>(operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    persist_with_retry_ctx("unattributed", operation).await
 }
 
 fn parse_timestamp_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<DateTime<Utc>> {
@@ -278,6 +294,14 @@ fn hydrate_job(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Job> {
         lease_token: row
             .try_get::<Option<String>, _>("lease_token")
             .map_err(|error| Error::database(format!("invalid job lease token: {error}")))?,
+        lane: row
+            .try_get::<Option<String>, _>("lane")
+            .map_err(|error| Error::database(format!("invalid job lane: {error}")))?
+            .and_then(|value| gitforge_common::Lane::from_str(&value))
+            .unwrap_or_default(),
+        deferred_reason: row
+            .try_get("deferred_reason")
+            .map_err(|error| Error::database(format!("invalid job deferred reason: {error}")))?,
     })
 }
 
@@ -1382,7 +1406,7 @@ impl JobQueries {
         // with a busy timeout. BEGIN IMMEDIATE serializes only this short
         // append transaction and keeps the lease check plus sequence
         // allocation atomic.
-        let mut conn = pool.pool().acquire().await.map_err(|e| {
+        let mut conn = acquire_timed(pool.pool()).await.map_err(|e| {
             Error::database(format!("failed to acquire log append connection: {e}"))
         })?;
         sqlx::query("BEGIN IMMEDIATE")
@@ -1617,8 +1641,8 @@ impl JobQueries {
     pub async fn create(pool: &Pool, job: &crate::models::Job) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, timeout_secs, result_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, timeout_secs, result_json, lane, deferred_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(job.id.to_string())
@@ -1635,6 +1659,8 @@ impl JobQueries {
         .bind(&job.working_dir)
         .bind(i64::try_from(job.timeout_secs).unwrap_or(i64::MAX))
         .bind(&job.result_json)
+        .bind(job.lane.as_str())
+        .bind(&job.deferred_reason)
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to create job: {e}")))?;
@@ -1660,7 +1686,9 @@ impl JobQueries {
                 commands = excluded.commands,
                 image = excluded.image,
                 working_dir = excluded.working_dir,
-                timeout_secs = excluded.timeout_secs
+                timeout_secs = excluded.timeout_secs,
+                lane = excluded.lane,
+                deferred_reason = NULL
             "#,
         )
         .bind(job.id.to_string())
@@ -1677,6 +1705,8 @@ impl JobQueries {
         .bind(&job.working_dir)
         .bind(i64::try_from(job.timeout_secs).unwrap_or(i64::MAX))
         .bind(&job.result_json)
+        .bind(job.lane.as_str())
+        .bind(&job.deferred_reason)
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to enqueue job: {e}")))?;
@@ -1858,17 +1888,43 @@ impl JobQueries {
         working_dir: Option<&str>,
         timeout_secs: u64,
     ) -> Result<()> {
+        Self::set_definition_full(
+            pool,
+            id,
+            commands,
+            image,
+            working_dir,
+            timeout_secs,
+            gitforge_common::Lane::default(),
+        )
+        .await
+    }
+
+    /// Persist the execution definition plus the job's scheduling lane
+    /// (#338). The lane rides the same update as the definition so the
+    /// enqueue path writes it once, atomically with the commands it
+    /// governs.
+    pub async fn set_definition_full(
+        pool: &Pool,
+        id: JobId,
+        commands: &[String],
+        image: &str,
+        working_dir: Option<&str>,
+        timeout_secs: u64,
+        lane: gitforge_common::Lane,
+    ) -> Result<()> {
         let commands_json = serde_json::to_string(commands)
             .map_err(|e| Error::database(format!("failed to encode job commands: {e}")))?;
         let timeout_secs = i64::try_from(timeout_secs)
             .map_err(|_| Error::invalid_input("job timeout exceeds database range"))?;
         sqlx::query(
-            "UPDATE jobs SET commands = ?, image = ?, working_dir = ?, timeout_secs = ? WHERE id = ?",
+            "UPDATE jobs SET commands = ?, image = ?, working_dir = ?, timeout_secs = ?, lane = ? WHERE id = ?",
         )
             .bind(commands_json)
             .bind(image)
             .bind(working_dir)
             .bind(timeout_secs)
+            .bind(lane.as_str())
             .bind(id.to_string())
             .execute(pool.pool())
             .await
@@ -1926,7 +1982,7 @@ impl JobQueries {
         lease_token: &str,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE jobs SET runner_id = ?, status = 'assigned', lease_token = ?, lease_generation = lease_generation + 1 WHERE id = ? AND status IN ('pending', 'queued') AND runner_id IS NULL",
+            "UPDATE jobs SET runner_id = ?, status = 'assigned', lease_token = ?, lease_generation = lease_generation + 1, deferred_reason = NULL WHERE id = ? AND status IN ('pending', 'queued') AND runner_id IS NULL",
         )
         .bind(runner_id.to_string())
         .bind(lease_token)
@@ -1935,6 +1991,19 @@ impl JobQueries {
         .await
         .map_err(|e| Error::database(format!("failed to assign job lease: {e}")))?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Record why the assigner deferred a queued job (#338). The value is
+    /// advisory — read back through queue status so a queued job explains
+    /// its wait — and is cleared to NULL by the assignment update.
+    pub async fn set_deferred_reason(pool: &Pool, id: JobId, reason: Option<&str>) -> Result<()> {
+        sqlx::query("UPDATE jobs SET deferred_reason = ? WHERE id = ? AND status = 'queued'")
+            .bind(reason)
+            .bind(id.to_string())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("failed to set job deferred reason: {e}")))?;
+        Ok(())
     }
 
     /// Persist the assigned-to-running lifecycle transition.

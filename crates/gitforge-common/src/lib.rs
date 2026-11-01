@@ -7,17 +7,23 @@
 //! - Time utilities
 
 pub mod error;
+pub mod fault;
 pub mod ids;
+pub mod lane;
 pub mod password;
 pub mod result;
+pub mod rollout;
 pub mod time;
 pub mod volume;
 
 pub use error::{Error, ErrorKind, Result};
+pub use fault::Fault;
 pub use ids::{
     JobId, JobStatus, PipelineId, PipelineRunId, PipelineStatus, RepoId, RunnerId, SshKeyId,
     StepId, UserId,
 };
+pub use lane::Lane;
+pub use rollout::RolloutFlags;
 pub use time::DateTime;
 pub use volume::{image_cache_key, JobCache, VolumeSpec, VolumeType};
 

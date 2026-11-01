@@ -105,6 +105,8 @@ fn webhook_job(needs: Vec<String>, timeout: Option<&str>) -> JobDefinition {
         skip_if: None,
         volumes: Vec::new(),
         cache: None,
+        lane: Default::default(),
+        fault: None,
     }
 }
 
@@ -1958,6 +1960,8 @@ async fn test_api_webhook_trigger_success() {
             skip_if: None,
             volumes: Vec::new(),
             cache: None,
+            lane: Default::default(),
+            fault: None,
         }],
     };
     let pipeline = gitforge_db::models::Pipeline {

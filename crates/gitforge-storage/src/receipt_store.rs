@@ -3,6 +3,7 @@
 //! Provides durable storage for job receipts with cryptographic integrity
 //! and retrieval by multiple identifiers.
 
+use crate::filesystem::write_atomic;
 use crate::receipt::JobReceipt;
 use async_trait::async_trait;
 use gitforge_common::{Error, JobId, Result};
@@ -11,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::PoisonError;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 /// Receipt metadata for indexing and retrieval
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,39 +243,6 @@ impl FileReceiptStore {
             .filter(|s| !s.is_empty())
             .map(std::string::ToString::to_string)
     }
-
-    async fn write_atomic(path: &PathBuf, contents: &[u8]) -> Result<()> {
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("receipt");
-        let temporary_path = path.with_file_name(format!(
-            ".{file_name}.tmp-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-
-        let result = async {
-            let mut file = fs::File::create(&temporary_path).await.map_err(|e| {
-                Error::storage(format!("failed to create temporary receipt file: {e}"))
-            })?;
-            file.write_all(contents).await.map_err(|e| {
-                Error::storage(format!("failed to write temporary receipt file: {e}"))
-            })?;
-            file.sync_all().await.map_err(|e| {
-                Error::storage(format!("failed to flush temporary receipt file: {e}"))
-            })?;
-            fs::rename(&temporary_path, path)
-                .await
-                .map_err(|e| Error::storage(format!("failed to publish receipt file: {e}")))
-        }
-        .await;
-
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary_path).await;
-        }
-        result
-    }
 }
 
 #[async_trait]
@@ -290,7 +258,7 @@ impl ReceiptStore for FileReceiptStore {
         let receipt_path = self.receipt_path(&job_id);
         let receipt_json = serde_json::to_string_pretty(receipt)
             .map_err(|e| Error::storage(format!("failed to serialize receipt: {e}")))?;
-        Self::write_atomic(&receipt_path, receipt_json.as_bytes()).await?;
+        write_atomic(&receipt_path, receipt_json.as_bytes(), "receipt file").await?;
 
         // Write metadata for indexing
         let workspace_id = Self::extract_workspace_id(receipt);
@@ -308,7 +276,13 @@ impl ReceiptStore for FileReceiptStore {
         let meta_path = self.meta_path(&job_id);
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| Error::storage(format!("failed to serialize meta: {e}")))?;
-        Self::write_atomic(&meta_path, meta_json.as_bytes()).await?;
+        write_atomic(&meta_path, meta_json.as_bytes(), "receipt metadata file")
+            .await
+            .map_err(|error| {
+                Error::storage(format!(
+                    "receipt was published but metadata publication failed: {error}"
+                ))
+            })?;
 
         tracing::debug!("persisted receipt for job {}", job_id);
         Ok(())
@@ -598,6 +572,33 @@ mod tests {
         let retrieved = store.get(&job_id).await.unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().job_id, job_id);
+    }
+
+    #[tokio::test]
+    async fn test_file_receipt_store_metadata_publish_failure_reports_receipt_was_published() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FileReceiptStore::new(temp_dir.path()).await.unwrap();
+        let job_id = JobId::new();
+        let receipt = make_test_receipt(job_id);
+        fs::create_dir(store.meta_path(&job_id)).await.unwrap();
+
+        let error = store.put(&receipt).await.unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("receipt was published but metadata publication failed"));
+        let retrieved = store.get(&job_id).await.unwrap();
+        assert_eq!(retrieved.unwrap().job_id, job_id);
+
+        let mut entries = fs::read_dir(temp_dir.path().join("receipts"))
+            .await
+            .unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(
+                !entry.file_name().to_string_lossy().contains(".tmp-"),
+                "failed receipt metadata publication left a temporary file behind"
+            );
+        }
     }
 
     #[tokio::test]

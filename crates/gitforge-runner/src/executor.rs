@@ -1,6 +1,7 @@
 //! Job executor with container pooling
 
-use gitforge_common::{JobId, PipelineRunId, RepoId, Result, VolumeSpec};
+use crate::fault::{fault_error, fault_outcome};
+use gitforge_common::{Fault, JobId, PipelineRunId, RepoId, Result, VolumeSpec};
 use gitforge_sandbox::{
     DockerSandbox, OutputSink, Sandbox, SandboxInstance, SandboxLimits, StepResult,
 };
@@ -424,6 +425,30 @@ impl JobExecutor {
     ) -> JobResult {
         let job_id = job.job_id; // Copy type
         let started_at = chrono::Utc::now();
+
+        // Fault injection (M10): when the job carries a fault request, the
+        // runner simulates the outcome and never acquires a sandbox or runs
+        // a step. The outcome mapping is the pure core in crate::fault;
+        // this is the only place that turns it into a JobResult.
+        if let Some(fault) = job.fault {
+            let outcome = fault_outcome(fault);
+            let completed_at = chrono::Utc::now();
+            tracing::warn!(%job_id, fault = fault.as_str(), "simulating injected fault");
+            return JobResult {
+                job_id,
+                success: outcome.success,
+                exit_code: outcome.exit_code,
+                step_results: Vec::new(),
+                artifacts: Vec::new(),
+                logs: None,
+                started_at,
+                completed_at,
+                infrastructure_failure: false,
+                timed_out: outcome.timed_out,
+                error: Some(fault_error(fault)),
+                workspace_path: job.working_dir.clone(),
+            };
+        }
         let job_timeout = Duration::from_secs(job.timeout_secs.clamp(5, 24 * 60 * 60));
         let deadline = Instant::now() + job_timeout;
         tracing::info!("executing job {}", job_id);
@@ -834,6 +859,11 @@ pub struct ExecutableJob {
     pub volumes: Vec<VolumeSpec>,
     pub working_dir: Option<String>,
     pub timeout_secs: u64,
+    /// Failure-injection request (M10). `Some` means the runner grades the
+    /// job from the fault without executing any step; only possible when
+    /// the deployment's fault-injection rollout flag is enabled (the
+    /// parser rejects the key otherwise).
+    pub fault: Option<Fault>,
 }
 
 impl ExecutableJob {
@@ -850,6 +880,7 @@ impl ExecutableJob {
             volumes: Vec::new(),
             working_dir: None,
             timeout_secs: 300,
+            fault: None,
         }
     }
 

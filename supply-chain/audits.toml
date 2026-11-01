@@ -1,6 +1,36 @@
 
 # cargo-vet audits file
 
+[[audits.android_system_properties]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.1.6"
+
+[[audits.aws-lc-rs]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.18.2"
+
+[[audits.aws-lc-sys]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.46.0"
+
+[[audits.bitflags]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.13.2"
+
+[[audits.cc]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.10.0"
+
+[[audits.cfg-if]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.0.5"
+
 [[audits.clap]]
 who = "Michael Kinney"
 criteria = "safe-to-deploy"
@@ -19,11 +49,173 @@ criteria = "safe-to-deploy"
 delta = "4.6.4 -> 4.6.7"
 notes = "Dependabot patch update; upstream publisher and full GitForge CI/security/Aegis/E2E gates verified."
 
+[[audits.clap_lex]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.1.1"
+
+[[audits.combine]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "4.6.9"
+
+[[audits.crc32fast]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.5.3"
+
+[[audits.crossbeam-queue]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.3.14"
+
+[[audits.crossbeam-utils]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.8.23"
+
+[[audits.der]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.8.3"
+
+[[audits.deranged]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.5.9"
+
+[[audits.displaydoc]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.2.7"
+
+[[audits.either]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.19.0"
+
+[[audits.elliptic-curve]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.14.3"
+
+[[audits.equivalent]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.0.3"
+
+[[audits.event-listener]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "5.4.2"
+
+[[audits.find-msvc-tools]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.1.15"
+
+[[audits.hybrid-array]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.4.15"
+
+[[audits.hyper-rustls]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.27.10"
+
+[[audits.icu_collections]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.4.0"
+
+[[audits.icu_locale_core]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.4.0"
+
+[[audits.icu_normalizer]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.4.0"
+
+[[audits.icu_normalizer_data]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.4.0"
+
+[[audits.icu_properties]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.4.0"
+
+[[audits.icu_properties_data]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.4.0"
+
+[[audits.icu_provider]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.4.0"
+
+[[audits.indexmap]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.14.2"
+
+[[audits.inout]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.2.5"
+
+[[audits.ipnet]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.12.2"
+
+[[audits.js-sys]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.3.106"
+
 [[audits.jsonwebtoken]]
 who = "Michael Kinney"
 criteria = "safe-to-deploy"
 delta = "11.0.0 -> 11.1.0"
 notes = "Dependabot lockfile-only update; reviewed as a minor upstream release and all GitForge CI, security, Aegis, and E2E gates pass."
+
+[[audits.lazy_static]]
+who = "Michael Kinney (Claude Code audit session)"
+criteria = "safe-to-deploy"
+delta = "1.5.0 -> 1.5.1"
+notes = "Delta 1.5.0->1.5.1 reviewed line-by-line: docs-only (deprecation notice, doc typos, html_root_url, Cargo.toml metadata reordering). No code or unsafe changes."
+
+[[audits.libc]]
+who = "Michael Kinney (Claude Code audit session)"
+criteria = "safe-to-deploy"
+delta = "0.2.190 -> 0.2.191"
+notes = "Delta 0.2.190->0.2.191 reviewed: 168 added lines are FFI declarations (extern types, fn bindings), platform additions (Android, Apple xnu, FreeBSD, OpenBSD, QURT, Hurd), and a cfg-gate removal on an existing deprecated unsafe fn (mach_task_self). No new unsafe logic or ambient capabilities - libc is declaration-only by design. Upstream PRs referenced in changelog."
+
+[[audits.libgit2-sys]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.18.8"
+
+[[audits.libgit2-sys]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+delta = "0.18.7+1.9.6 -> 0.18.8+1.9.7"
+
+[[audits.libredox]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.1.25"
+
+[[audits.libsqlite3-sys]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.37.0"
 
 [[audits.libz-sys]]
 who = "Michael Kinney"
@@ -31,11 +223,249 @@ criteria = "safe-to-deploy"
 delta = "1.1.29 -> 1.1.31"
 notes = "RUSTSEC-2026-0418 fix (build script environment leak into build dir); delta reviewed via cargo vet suggest with upstream publisher trust, all GitForge CI/security/Aegis gates pass."
 
+[[audits.litemap]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.8.3"
+
+[[audits.log]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.4.34"
+
+[[audits.mio]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.2.4"
+
+[[audits.num-integer]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.1.47"
+
+[[audits.openssl-probe]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.2.2"
+
+[[audits.potential_utf]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.1.6"
+
+[[audits.powerfmt]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.2.1"
+
+[[audits.quinn]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.11.12"
+
+[[audits.redox_users]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.5.3"
+
 [[audits.russh]]
 who = "Michael Kinney"
 criteria = "safe-to-deploy"
 delta = "0.63.2 -> 0.63.3"
 notes = "Dependabot lockfile-only update; reviewed as a patch upstream release and all GitForge CI, security, Aegis, and E2E gates pass."
+
+[[audits.russh]]
+who = "Michael Kinney (Claude Code audit session)"
+criteria = "safe-to-deploy"
+delta = "0.63.3 -> 0.65.0"
+notes = "Focused security audit of the 6567-line delta (auth, kex, cipher, cert, agent). Verdict SAFE-TO-DEPLOY. Changes are largely hardening: pre-auth cert-nesting depth cap (check_cert_nesting, marker-count cap 8) closes a stack-overflow DoS; auth state machine binds request algorithm to signature algorithm (RFC 8332 anti-downgrade, closes ssh-rsa/SHA-1 downgrade); rejection_count no longer increments on partial_success; zero maximum_packet_size in CHANNEL_OPEN rejected (prevents write stall); cipher byte counters zeroed per key epoch with rekey timer (fixes rekey accounting); agent add_key bounds constraint flood and honors RSA-SHA2 flags. No new unsafe, no algorithm removals, added unwraps are test-only. Handler trait changed: auth_publickey now receives VerifiedPublicKey (post-verify) and auth_publickey_offered receives PublicKeyOffer; git-server adapted accordingly. Full report in session audit of /var/tmp/russh-delta.diff, 2026-10-31."
+
+[[audits.russh]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+delta = "0.63.3 -> 0.65.0"
+
+[[audits.russh]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+delta = "0.63.3 -> 0.65.0"
+
+[[audits.rustls-native-certs]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.8.5"
+
+[[audits.rustls-pki-types]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.15.1"
+
+[[audits.rustls-platform-verifier]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.7.1"
+
+[[audits.rustls-platform-verifier-android]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0"
+
+[[audits.schannel]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.1.30"
+
+[[audits.sha2]]
+who = "Michael Kinney (Claude Code audit session)"
+criteria = "safe-to-deploy"
+delta = "0.11.0 -> 0.11.1"
+notes = "Delta 0.11.0->0.11.1 reviewed line-by-line: refactor of hw-accel backends (aarch64_sha2, riscv_zknh, wasm32_simd128, x86_sha/x86_avx2). unsafe fn compress made safe with target_feature gating (stricter), compile_error feature assertions added, intrinsics wrapped in unsafe blocks at use sites. No algorithm changes, no constant changes (K32/K64 untouched), no input-handling changes. Soft backend refactor only."
+
+[[audits.smallvec]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.16.4"
+
+[[audits.spki]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.8.1"
+
+[[audits.syn]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "3.0.9"
+
+[[audits.synstructure]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.14.0"
+
+[[audits.time]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.3.55"
+
+[[audits.tinystr]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.8.5"
+
+[[audits.tokio-macros]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.7.2"
+
+[[audits.tokio-rustls]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.26.6"
+
+[[audits.unicode-ident]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.0.27"
+
+[[audits.utf8_iter]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0"
+
+[[audits.utf_types]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+
+[[audits.uuid]]
+who = "Michael Kinney (Claude Code audit session)"
+criteria = "safe-to-deploy"
+delta = "1.26.1 -> 1.29.0"
+notes = "Delta 1.26.1->1.29.0 reviewed (1086-line diff, 47 hunks): adds NonNilUuid constructors (new_v1..v7 with per-call SAFETY comments - version bits guarantee non-nil), Option<Uuid> serde support, const-fn parser extended for braced/URN forms (parse-only, length-gated, no unsafe), feature-gating fixes. No new unsafe blocks beyond documented new_unchecked wrappers, no RNG changes, no dependency additions. Purely additive API over existing generation logic."
+
+[[audits.wasm-bindgen]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.2.129"
+
+[[audits.wasm-bindgen-futures]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.4.79"
+
+[[audits.wasm-bindgen-macro]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.2.129"
+
+[[audits.wasm-bindgen-macro-support]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.2.129"
+
+[[audits.wasm-bindgen-shared]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.2.129"
+
+[[audits.web-sys]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.3.106"
+
+[[audits.whoami]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.1.3"
+
+[[audits.writeable]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.6.4"
+
+[[audits.yoke]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.8.4"
+
+[[audits.yoke-derive]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.8.4"
+
+[[audits.zerocopy]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.8.63"
+
+[[audits.zerocopy-derive]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.8.63"
+
+[[audits.zerofrom-derive]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.1.8"
+
+[[audits.zerotrie]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.2.5"
+
+[[audits.zerovec]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.11.9"
+
+[[audits.zerovec-derive]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.11.7"
+
+[[audits.zlib-rs]]
+who = "Michael Kinney <14325925+aliasfoxkde@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.6.8"
 
 [[trusted.aho-corasick]]
 criteria = "safe-to-deploy"
@@ -206,6 +636,30 @@ user-id = 3618 # David Tolnay (dtolnay)
 start = "2025-09-13"
 end = "2027-09-09"
 
+[[trusted.serde_json]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-02-28"
+end = "2027-10-31"
+
+[[trusted.serde_spanned]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-01-20"
+end = "2027-10-31"
+
+[[trusted.thiserror]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-09"
+end = "2027-10-31"
+
+[[trusted.thiserror-impl]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-09"
+end = "2027-10-31"
+
 [[trusted.thread_local]]
 criteria = "safe-to-deploy"
 user-id = 2915 # Amanieu d'Antras (Amanieu)
@@ -213,11 +667,41 @@ start = "2019-09-07"
 end = "2027-10-02"
 notes = "peer-attested publisher trust: delegated to peer registries (isrg/mozilla/bytecode-alliance/zcash) per cargo-vet suggest NOTE, 2026-10-02"
 
+[[trusted.tokio]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2020-12-25"
+end = "2027-10-31"
+
 [[trusted.tokio-test]]
 criteria = "safe-to-deploy"
 user-id = 6741 # Alice Ryhl (Darksonn)
 start = "2021-05-14"
 end = "2027-09-20"
+
+[[trusted.tokio-util]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2021-01-12"
+end = "2027-10-31"
+
+[[trusted.toml]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2022-12-14"
+end = "2027-10-31"
+
+[[trusted.toml_datetime]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2022-10-21"
+end = "2027-10-31"
+
+[[trusted.toml_parser]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2025-07-08"
+end = "2027-10-31"
 
 [[trusted.toml_writer]]
 criteria = "safe-to-deploy"
@@ -237,6 +721,12 @@ user-id = 189 # Andrew Gallant (BurntSushi)
 start = "2019-06-09"
 end = "2027-10-02"
 notes = "peer-attested publisher trust: delegated to peer registries (isrg/mozilla/bytecode-alliance/zcash) per cargo-vet suggest NOTE, 2026-10-02"
+
+[[trusted.want]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2019-03-19"
+end = "2027-10-31"
 
 [[trusted.winapi-util]]
 criteria = "safe-to-deploy"
