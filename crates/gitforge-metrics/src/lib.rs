@@ -1,12 +1,19 @@
-//! Prometheus metrics for GitForge API
+//! Shared Prometheus metrics for GitForge services.
 //!
-//! Provides observability into API operations, CI/CD pipelines, and runner status.
+//! One collector type, one registry, used by the API gateway and the CI
+//! scheduler so every service exports the same metric names.
+
+pub mod middleware;
+
+pub use middleware::{normalize_path, MetricsLayer, MetricsMiddleware};
 
 use prometheus::{
-    Counter, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry,
+    Counter, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry,
 };
 
 /// GitForge metrics collector
+#[derive(Clone)]
 pub struct Metrics {
     pub registry: Registry,
 
@@ -24,6 +31,12 @@ pub struct Metrics {
     pub jobs_total: IntGauge,
     pub job_duration_seconds: Histogram,
 
+    // Queue / lane metrics (#338, Gate 1 observability)
+    pub jobs_enqueued_total: IntCounterVec,
+    pub jobs_queued: IntGaugeVec,
+    pub job_deferrals_total: IntCounterVec,
+    pub job_dispatch_latency_seconds: HistogramVec,
+
     // Runner metrics
     pub runners_online: IntGauge,
     pub runners_busy: IntGauge,
@@ -37,6 +50,11 @@ pub struct Metrics {
     // Storage metrics
     pub artifacts_total: IntGauge,
     pub artifact_size_bytes: Histogram,
+
+    // Database metrics (M8c)
+    pub db_write_duration_seconds: HistogramVec,
+    pub db_write_retries_total: IntCounterVec,
+    pub db_pool_acquire_seconds: Histogram,
 }
 
 impl Metrics {
@@ -45,9 +63,7 @@ impl Metrics {
     /// All metric names and label sets are compile-time constants
     /// registered once into a fresh `Registry`, so construction cannot
     /// fail at runtime — a malformed name or duplicate registration is a
-    /// defect in this table, not an input condition. The expect below
-    /// documents that invariant instead of threading a `Result` through
-    /// every server constructor for an error that is unreachable.
+    /// defect in this table, not an input condition.
     #[allow(clippy::expect_used)] // static metric table — see doc comment
     pub fn new() -> Self {
         Self::build().expect("static metric table must build")
@@ -111,6 +127,43 @@ impl Metrics {
         )?;
         registry.register(Box::new(job_duration_seconds.clone()))?;
 
+        // Queue / lane metrics
+        let jobs_enqueued_total = IntCounterVec::new(
+            Opts::new(
+                "gitforge_jobs_enqueued_total",
+                "Total jobs enqueued, by lane",
+            ),
+            &["lane"],
+        )?;
+        registry.register(Box::new(jobs_enqueued_total.clone()))?;
+
+        let jobs_queued = IntGaugeVec::new(
+            Opts::new("gitforge_jobs_queued", "Jobs currently queued, by lane"),
+            &["lane"],
+        )?;
+        registry.register(Box::new(jobs_queued.clone()))?;
+
+        let job_deferrals_total = IntCounterVec::new(
+            Opts::new(
+                "gitforge_job_deferrals_total",
+                "Admission deferrals, by lane and reason",
+            ),
+            &["lane", "reason"],
+        )?;
+        registry.register(Box::new(job_deferrals_total.clone()))?;
+
+        let job_dispatch_latency_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "gitforge_job_dispatch_latency_seconds",
+                "Time a job spends queued before assignment",
+            )
+            .buckets(vec![
+                0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 15.0, 60.0, 300.0, 900.0,
+            ]),
+            &["lane"],
+        )?;
+        registry.register(Box::new(job_dispatch_latency_seconds.clone()))?;
+
         // Runner metrics
         let runners_online = IntGauge::new("gitforge_runners_online", "Number of online runners")?;
         registry.register(Box::new(runners_online.clone()))?;
@@ -158,6 +211,37 @@ impl Metrics {
         )?;
         registry.register(Box::new(artifact_size_bytes.clone()))?;
 
+        // Database metrics
+        let db_write_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "gitforge_db_write_duration_seconds",
+                "Duration of BEGIN IMMEDIATE write transactions, by context",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 19.0, 40.0,
+            ]),
+            &["context"],
+        )?;
+        registry.register(Box::new(db_write_duration_seconds.clone()))?;
+
+        let db_write_retries_total = IntCounterVec::new(
+            Opts::new(
+                "gitforge_db_write_retries_total",
+                "Durable-write retry passes after transient failures, by context",
+            ),
+            &["context"],
+        )?;
+        registry.register(Box::new(db_write_retries_total.clone()))?;
+
+        let db_pool_acquire_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "gitforge_db_pool_acquire_seconds",
+                "Time waiting for a pooled database connection",
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]),
+        )?;
+        registry.register(Box::new(db_pool_acquire_seconds.clone()))?;
+
         Ok(Self {
             registry,
             http_requests_total,
@@ -168,6 +252,10 @@ impl Metrics {
             pipeline_runs_total,
             jobs_total,
             job_duration_seconds,
+            jobs_enqueued_total,
+            jobs_queued,
+            job_deferrals_total,
+            job_dispatch_latency_seconds,
             runners_online,
             runners_busy,
             runners_offline,
@@ -176,6 +264,9 @@ impl Metrics {
             events_consumed_total,
             artifacts_total,
             artifact_size_bytes,
+            db_write_duration_seconds,
+            db_write_retries_total,
+            db_pool_acquire_seconds,
         })
     }
 
@@ -215,6 +306,27 @@ impl Metrics {
         self.job_assignments_total.inc();
     }
 
+    /// Record a job enqueue on its lane
+    pub fn record_job_enqueued(&self, lane: &str) {
+        self.jobs_enqueued_total.with_label_values(&[lane]).inc();
+        self.jobs_queued.with_label_values(&[lane]).inc();
+    }
+
+    /// Record an admission deferral for a queued job
+    pub fn record_job_deferral(&self, lane: &str, reason: &str) {
+        self.job_deferrals_total
+            .with_label_values(&[lane, reason])
+            .inc();
+    }
+
+    /// Record the queue-to-assignment latency for a dispatched job
+    pub fn record_job_dispatch_latency(&self, lane: &str, duration_secs: f64) {
+        self.jobs_queued.with_label_values(&[lane]).dec();
+        self.job_dispatch_latency_seconds
+            .with_label_values(&[lane])
+            .observe(duration_secs);
+    }
+
     /// Increment event published counter
     pub fn record_event_published(&self, event_type: &str) {
         self.events_published_total
@@ -233,6 +345,25 @@ impl Metrics {
     pub fn record_artifact_size(&self, size_bytes: u64) {
         self.artifact_size_bytes.observe(size_bytes as f64);
     }
+
+    /// Record the duration of a BEGIN IMMEDIATE write transaction
+    pub fn record_db_write(&self, context: &str, duration_secs: f64) {
+        self.db_write_duration_seconds
+            .with_label_values(&[context])
+            .observe(duration_secs);
+    }
+
+    /// Count one retry pass of a durable write after a transient failure
+    pub fn record_db_write_retry(&self, context: &str) {
+        self.db_write_retries_total
+            .with_label_values(&[context])
+            .inc();
+    }
+
+    /// Record time spent waiting for a pooled connection
+    pub fn record_db_pool_acquire(&self, duration_secs: f64) {
+        self.db_pool_acquire_seconds.observe(duration_secs);
+    }
 }
 
 impl Default for Metrics {
@@ -248,7 +379,6 @@ mod tests {
     #[test]
     fn test_metrics_creation() {
         let metrics = Metrics::new();
-        // Verify metrics were created by recording and gathering
         metrics.record_http_request("GET", "/health", 200);
         let families = metrics.registry.gather();
         assert!(!families.is_empty());
@@ -313,7 +443,6 @@ mod tests {
     #[test]
     fn test_runners_gauges() {
         let metrics = Metrics::new();
-        // Test that we can access the runner gauges
         metrics.runners_online.inc();
         metrics.runners_busy.inc();
         metrics.runners_offline.inc();
@@ -321,5 +450,29 @@ mod tests {
         metrics.pipelines_total.set(5);
         metrics.jobs_total.set(20);
         metrics.artifacts_total.set(100);
+    }
+
+    #[test]
+    fn test_queue_gauge_round_trip() {
+        let metrics = Metrics::new();
+        metrics.record_job_enqueued("heavy");
+        metrics.record_job_deferral("heavy", "lane_limit");
+        let queued = metrics.jobs_queued.with_label_values(&["heavy"]).get();
+        assert_eq!(queued, 1);
+        metrics.record_job_dispatch_latency("heavy", 0.5);
+        let queued = metrics.jobs_queued.with_label_values(&["heavy"]).get();
+        assert_eq!(queued, 0);
+    }
+
+    #[test]
+    fn test_db_metrics() {
+        let metrics = Metrics::new();
+        metrics.record_db_write("job insert", 0.012);
+        metrics.record_db_write_retry("job insert");
+        metrics.record_db_pool_acquire(0.003);
+        let families = metrics.registry.gather();
+        assert!(families
+            .iter()
+            .any(|family| family.name().contains("db_write")));
     }
 }
