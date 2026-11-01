@@ -8,6 +8,7 @@ use gitforge_db::models::{
     RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS,
 };
 use gitforge_db::Pool;
+use gitforge_metrics::Metrics;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -373,6 +374,9 @@ pub struct Scheduler {
     /// Per-lane running caps (#338), read once at construction from
     /// `GITFORGE_LANE_LIMIT_<LANE>`; `None` = unbounded.
     lane_limits: HashMap<Lane, Option<usize>>,
+    /// Prometheus collector (Gate 1 observability). `None` in tests that
+    /// construct the scheduler directly; every emission is advisory.
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl Scheduler {
@@ -388,6 +392,7 @@ impl Scheduler {
             fence_grace_secs: DEFAULT_JOB_FENCE_GRACE_SECS,
             dispatch_wake: Arc::new(tokio::sync::Notify::new()),
             lane_limits: read_lane_limit_env(),
+            metrics: None,
         }
     }
 
@@ -403,6 +408,7 @@ impl Scheduler {
             fence_grace_secs: DEFAULT_JOB_FENCE_GRACE_SECS,
             dispatch_wake: Arc::new(tokio::sync::Notify::new()),
             lane_limits: read_lane_limit_env(),
+            metrics: None,
         }
     }
 
@@ -435,7 +441,15 @@ impl Scheduler {
             fence_grace_secs: self.fence_grace_secs,
             dispatch_wake: self.dispatch_wake,
             lane_limits: self.lane_limits,
+            metrics: self.metrics,
         }
+    }
+
+    /// Attach a Prometheus collector (Gate 1 observability). Emissions are
+    /// advisory; a scheduler without one behaves identically.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Get whether scheduler has database connection
@@ -609,6 +623,9 @@ impl Scheduler {
             .await?;
         }
         let job = QueuedJob::new(job_id, pipeline_run_id, repo_id).with_lane(definition.lane);
+        if let Some(metrics) = &self.metrics {
+            metrics.record_job_enqueued(definition.lane.as_str());
+        }
         let mut state = self.state.write().await;
         state.queue.enqueue(job);
         state.job_definitions.insert(
@@ -646,6 +663,14 @@ impl Scheduler {
         state
             .deferred_reasons
             .insert(job_id, reason.as_str().to_string());
+        if let Some(metrics) = &self.metrics {
+            let lane = state
+                .job_definitions
+                .get(&job_id)
+                .map(|definition| definition.lane)
+                .unwrap_or_default();
+            metrics.record_job_deferral(lane.as_str(), reason.as_str());
+        }
         if let Some(pool) = &self.db_pool {
             let pool = pool.clone();
             let value = reason.as_str().to_string();
@@ -1479,6 +1504,7 @@ impl Scheduler {
             let pipeline_run_id = job.pipeline_run_id;
             let repo_id = job.repo_id;
             let job_lane = job.lane;
+            let job_queued_at = job.queued_at;
             let definition = state.job_definitions.get(&job_id).cloned();
 
             // Lane admission (#338). A deferral is durable and explainable:
@@ -1566,6 +1592,14 @@ impl Scheduler {
                         .insert(job_id, (r_id, pipeline_run_id, repo_id));
                     tracing::info!("assigned job {} to runner {}", job_id, r_id);
                     state.deferred_reasons.remove(&job_id);
+                    if let Some(metrics) = &self.metrics {
+                        let queued_for = now_millis().saturating_sub(job_queued_at);
+                        metrics.record_job_dispatch_latency(
+                            job_lane.as_str(),
+                            (queued_for / 1000) as f64,
+                        );
+                        metrics.record_job_assignment();
+                    }
                     *lane_running.entry(job_lane).or_default() += 1;
                     if job_lane == Lane::Fast {
                         fast_admitted_this_batch += 1;

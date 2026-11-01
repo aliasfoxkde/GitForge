@@ -22,6 +22,7 @@ use gitforge_events::{
     EventBus, EventEnvelope, EventFilter, EventPayload, EventType, InMemoryEventBus,
     PushReceivedPayload,
 };
+use gitforge_metrics::Metrics;
 use gitforge_process::{create_shutdown_flag, spawn_shutdown_handler, wait_for_shutdown};
 use gitforge_scheduler::{
     assigner::{job_fence_grace_secs_from_env, JobExecutionDefinition, DEFAULT_JOB_TIMEOUT_SECS},
@@ -185,19 +186,27 @@ async fn main() -> anyhow::Result<()> {
     // Initialize scheduler. Production deployments provide a database URL so
     // job definitions and completion receipts survive service restarts;
     // development keeps the in-memory fallback explicit and usable.
+    // Prometheus collector shared by the scheduler and this service's
+    // /metrics endpoint (Gate 1 observability).
+    let metrics = std::sync::Arc::new(Metrics::new());
+    gitforge_db::set_metrics((*metrics).clone());
     let (scheduler, scheduler_db) = if let Ok(database_url) = std::env::var("GITFORGE_DATABASE_URL")
     {
         let pool = gitforge_db::Pool::new(&database_url).await?;
         pool.migrate().await?;
         tracing::info!(database_url = %database_url, "using durable GitForge scheduler database");
         (
-            Scheduler::with_db(pool.clone()).with_fence_grace_secs(job_fence_grace_secs_from_env()),
+            Scheduler::with_db(pool.clone())
+                .with_fence_grace_secs(job_fence_grace_secs_from_env())
+                .with_metrics(metrics.clone()),
             Some(pool),
         )
     } else {
         tracing::warn!("GITFORGE_DATABASE_URL is unset; scheduler state is in-memory only");
         (
-            Scheduler::new().with_fence_grace_secs(job_fence_grace_secs_from_env()),
+            Scheduler::new()
+                .with_fence_grace_secs(job_fence_grace_secs_from_env())
+                .with_metrics(metrics.clone()),
             None,
         )
     };
@@ -231,6 +240,28 @@ async fn main() -> anyhow::Result<()> {
         run_waiters: run_waiters.clone(),
     });
 
+    let metrics_for_router = metrics.clone();
+    let metrics_route = Router::new().route(
+        "/metrics",
+        axum::routing::get(move || {
+            let metrics = metrics_for_router.clone();
+            async move {
+                let encoder = prometheus::TextEncoder::new();
+                let families = metrics.registry.gather();
+                match encoder.encode_to_string(&families) {
+                    Ok(body) => ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body),
+                    Err(error) => {
+                        tracing::error!("Failed to encode metrics: {}", error);
+                        (
+                            [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+                            String::new(),
+                        )
+                    }
+                }
+            }
+        }),
+    );
+
     let scheduler_app = Router::new()
         .route("/health", axum::routing::get(health_check))
         .route(
@@ -243,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(middleware::from_fn(require_trigger_auth)),
         )
         .merge(scheduler_routes(scheduler_state))
+        .merge(metrics_route)
         .layer(Extension(trigger_state))
         .layer(TraceLayer::new_for_http());
 

@@ -13,6 +13,7 @@ path = "src/main.rs"
 gitforge-common = { path = "../../crates/gitforge-common" }
 gitforge-db = { path = "../../crates/gitforge-db" }
 gitforge-events = { path = "../../crates/gitforge-events" }
+gitforge-metrics = { path = "../../crates/gitforge-metrics" }
 gitforge-ci = { path = "../../crates/gitforge-ci" }
 gitforge-scheduler = { path = "../../crates/gitforge-scheduler" }
 gitforge-storage = { path = "../../crates/gitforge-storage" }
@@ -29,6 +30,7 @@ uuid = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
+prometheus = "0.14"
 
 [dev-dependencies]
 reqwest = { workspace = true }

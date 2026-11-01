@@ -36,6 +36,7 @@ reqwest = { workspace = true }
 ssh-key = "=0.7.0-rc.11"
 
 # Prometheus metrics
+gitforge-metrics = { path = "../gitforge-metrics" }
 prometheus = "0.14"
 
 [dev-dependencies]

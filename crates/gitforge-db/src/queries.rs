@@ -2,7 +2,7 @@
 //!
 //! This module provides real SQLite query implementations for all database operations.
 
-use crate::connection::begin_immediate;
+use crate::connection::{acquire_timed, begin_immediate};
 use crate::models::JobStatus;
 use crate::Pool;
 use chrono::{DateTime, Utc};
@@ -54,7 +54,10 @@ const DISPATCHABLE_PAGE_SIZE: i64 = 500;
 /// feature of a busy failure is that a retry succeeds — while validation
 /// and not-found errors propagate immediately: retrying them cannot change
 /// the outcome.
-pub async fn persist_with_retry<T, F, Fut>(mut operation: F) -> Result<T>
+///
+/// The `context` tag attributes retry passes to one durable-write site in
+/// the `gitforge_db_write_retries_total` metric.
+pub async fn persist_with_retry_ctx<T, F, Fut>(context: &str, mut operation: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
@@ -66,6 +69,9 @@ where
                 .saturating_mul(1 << (attempt - 1).min(4))
                 .min(PERSIST_BACKOFF_CAP);
             tokio::time::sleep(backoff).await;
+            if let Some(m) = crate::connection::metrics() {
+                m.record_db_write_retry(context);
+            }
         }
         match operation().await {
             Ok(value) => return Ok(value),
@@ -83,6 +89,16 @@ where
         }
     }
     Err(last_error.unwrap_or_else(|| Error::database("durable write made no attempts")))
+}
+
+/// Run a durable write until it commits or the retry budget is exhausted,
+/// without metrics attribution.
+pub async fn persist_with_retry<T, F, Fut>(operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    persist_with_retry_ctx("unattributed", operation).await
 }
 
 fn parse_timestamp_column(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<DateTime<Utc>> {
@@ -1390,7 +1406,7 @@ impl JobQueries {
         // with a busy timeout. BEGIN IMMEDIATE serializes only this short
         // append transaction and keeps the lease check plus sequence
         // allocation atomic.
-        let mut conn = pool.pool().acquire().await.map_err(|e| {
+        let mut conn = acquire_timed(pool.pool()).await.map_err(|e| {
             Error::database(format!("failed to acquire log append connection: {e}"))
         })?;
         sqlx::query("BEGIN IMMEDIATE")
