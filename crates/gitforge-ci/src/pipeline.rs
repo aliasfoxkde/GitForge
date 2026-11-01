@@ -1,6 +1,6 @@
 //! Pipeline definition and parsing
 
-use gitforge_common::{JobCache, PipelineId, RepoId, VolumeSpec};
+use gitforge_common::{Fault, JobCache, PipelineId, RepoId, RolloutFlags, VolumeSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -118,14 +118,25 @@ pub struct PipelineDefinition {
 }
 
 impl PipelineDefinition {
-    /// Parse pipeline definition from YAML
-    pub fn parse(yaml: &str) -> Result<Self, serde_yaml::Error> {
+    /// Parse a pipeline definition with the deployment's rollout flags.
+    ///
+    /// The flags are data on purpose: the decision (accept or reject the
+    /// `fault:` surface) never reads the environment itself — the edge
+    /// (`RolloutFlags::from_env`, service startup) reads it once.
+    pub fn parse_with_flags(yaml: &str, flags: &RolloutFlags) -> Result<Self, serde_yaml::Error> {
         let value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
-        reject_unknown_keys(&value).map_err(|message| {
+        reject_unknown_keys(&value, flags.fault_injection).map_err(|message| {
             use serde::de::Error as _;
             serde_yaml::Error::custom(message)
         })?;
         serde_yaml::from_value(value)
+    }
+
+    /// Parse pipeline definition from YAML. Fault injection is a rollout
+    /// surface, so the default (flag-off) parse REJECTS a `fault:` key with
+    /// a clear error instead of silently dropping or honouring it.
+    pub fn parse(yaml: &str) -> Result<Self, serde_yaml::Error> {
+        Self::parse_with_flags(yaml, &RolloutFlags::default())
     }
 
     /// Convert to YAML
@@ -175,6 +186,12 @@ pub struct JobDefinition {
     /// legacy scheduling behavior exactly.
     #[serde(default)]
     pub lane: gitforge_common::Lane,
+    /// Failure-injection request (M10). Only parsed when the deployment
+    /// enabled fault injection (`RolloutFlags::fault_injection`); the
+    /// unknown-key gate rejects the key outright otherwise. `None` keeps
+    /// legacy behavior: the runner executes the steps for real.
+    #[serde(default)]
+    pub fault: Option<Fault>,
 }
 
 impl JobDefinition {
@@ -212,7 +229,7 @@ lazy_static::lazy_static! {
 const PIPELINE_KEYS: &[&str] = &["name", "version", "trigger_on", "environment", "jobs"];
 const JOB_KEYS: &[&str] = &[
     "name", "image", "needs", "env", "steps", "timeout", "retry", "skip_if", "volumes", "cache",
-    "lane",
+    "lane", "fault",
 ];
 
 /// Reject YAML keys the parser would otherwise silently drop. A stale binary
@@ -220,7 +237,7 @@ const JOB_KEYS: &[&str] = &[
 /// dropped `cache:` cold-builds every job, a dropped `skip_if:` runs jobs
 /// that should have been skipped — so failing loudly is the safe behavior.
 /// The error names the offending key and points at deploy skew.
-fn reject_unknown_keys(value: &serde_yaml::Value) -> Result<(), String> {
+fn reject_unknown_keys(value: &serde_yaml::Value, allow_fault: bool) -> Result<(), String> {
     fn check(
         mapping: &serde_yaml::Mapping,
         allowed: &[&str],
@@ -234,6 +251,15 @@ fn reject_unknown_keys(value: &serde_yaml::Value) -> Result<(), String> {
                         Some(name) => format!("job '{name}'"),
                         None => what.to_string(),
                     };
+                    if what == "job" && k == "fault" {
+                        let label = job_name.map_or_else(|| what.to_string(), str::to_owned);
+                        return Err(format!(
+                            "{label} sets 'fault' but fault injection is disabled on this \
+                             deployment: set GITFORGE_ENABLE_FAULT_INJECTION=1 on the API \
+                             and CI services to enable the rollout flag, or remove the \
+                             'fault' key before committing the pipeline"
+                        ));
+                    }
                     return Err(format!(
                         "unknown {what} key '{k}' in {label}: the deployed binary predates \
                          this pipeline field, or the key is misspelled — refusing to \
@@ -260,11 +286,34 @@ fn reject_unknown_keys(value: &serde_yaml::Value) -> Result<(), String> {
                 .get(serde_yaml::Value::from("name"))
                 .and_then(|v| v.as_str())
                 .map_or_else(|| format!("#{idx}"), str::to_owned);
-            check(job, JOB_KEYS, "job", Some(&name))?;
+            let allowed: &[&str] = if allow_fault {
+                JOB_KEYS
+            } else {
+                JOB_KEYS_NO_FAULT
+            };
+            check(job, allowed, "job", Some(&name))?;
+            if !allow_fault {
+                if let Some(fault_val) = job.get(serde_yaml::Value::from("fault")) {
+                    return Err(format!(
+                        "job '{name}' sets 'fault' ({fault_val:?}) but fault injection is \
+                         disabled on this deployment: set GITFORGE_ENABLE_FAULT_INJECTION=1 \
+                         on the API and CI services to enable the rollout flag, or remove \
+                         the 'fault' key before committing the pipeline"
+                    ));
+                }
+            }
         }
     }
     Ok(())
 }
+
+/// Job keys accepted when fault injection is disabled: `fault` is excluded
+/// so a fault-bearing pipeline fails validation with the standard
+/// unknown-key error plus a rollout-specific hint.
+const JOB_KEYS_NO_FAULT: &[&str] = &[
+    "name", "image", "needs", "env", "steps", "timeout", "retry", "skip_if", "volumes", "cache",
+    "lane",
+];
 
 #[cfg(test)]
 mod tests {
@@ -473,6 +522,7 @@ jobs:
             volumes: Vec::new(),
             cache: None,
             lane: Default::default(),
+            fault: None,
         };
         assert!(job.has_dependencies());
 
@@ -488,6 +538,7 @@ jobs:
             volumes: Vec::new(),
             cache: None,
             lane: Default::default(),
+            fault: None,
         };
         assert!(!job2.has_dependencies());
     }
@@ -543,6 +594,83 @@ jobs:
         .with_ref("refs/heads/main".to_string());
 
         assert_eq!(event.ref_name, Some("refs/heads/main".to_string()));
+    }
+
+    // --- fault injection rollout gate (M10) ------------------------------
+
+    const FAULT_YAML: &str = r#"
+name: faulty
+version: "1.0"
+trigger_on: [push]
+jobs:
+  - name: build
+    image: img:1
+    fault: oom
+    steps:
+      - name: build
+        run: cargo build
+"#;
+
+    #[test]
+    fn test_parse_rejects_fault_key_when_injection_disabled() {
+        // Default flags: fault injection is OFF. The key must be rejected
+        // with a clear, actionable error - never silently dropped.
+        let error = PipelineDefinition::parse(FAULT_YAML)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fault"), "error names the key: {error}");
+        assert!(
+            error.contains("GITFORGE_ENABLE_FAULT_INJECTION"),
+            "error explains the rollout gate: {error}"
+        );
+    }
+
+    #[test]
+    fn test_parse_accepts_fault_key_when_injection_enabled() {
+        let flags = RolloutFlags {
+            fault_injection: true,
+        };
+        let pipeline = PipelineDefinition::parse_with_flags(FAULT_YAML, &flags).unwrap();
+        assert_eq!(pipeline.jobs[0].fault, Some(Fault::Oom));
+    }
+
+    #[test]
+    fn test_parse_with_disabled_flags_rejects_fault_key() {
+        assert!(
+            PipelineDefinition::parse_with_flags(FAULT_YAML, &RolloutFlags::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn test_parse_fault_all_kinds_and_rejects_bad_value() {
+        let flags = RolloutFlags {
+            fault_injection: true,
+        };
+        for fault in Fault::all() {
+            let yaml = format!(
+                "name: f\nversion: \"1.0\"\ntrigger_on: [push]\njobs:\n  - name: j\n    image: i\n    fault: {}\n    steps: []\n",
+                fault.as_str()
+            );
+            let pipeline = PipelineDefinition::parse_with_flags(&yaml, &flags).unwrap();
+            assert_eq!(pipeline.jobs[0].fault, Some(fault));
+        }
+        let bad = "name: f\nversion: \"1.0\"\ntrigger_on: [push]\njobs:\n  - name: j\n    image: i\n    fault: segfault\n    steps: []\n";
+        assert!(PipelineDefinition::parse_with_flags(bad, &flags).is_err());
+    }
+
+    #[test]
+    fn test_parse_without_fault_key_is_unaffected_by_flag() {
+        let plain = "name: p\nversion: \"1.0\"\ntrigger_on: [push]\njobs:\n  - name: j\n    image: i\n    steps: []\n";
+        let on = PipelineDefinition::parse_with_flags(
+            plain,
+            &RolloutFlags {
+                fault_injection: true,
+            },
+        )
+        .unwrap();
+        let off = PipelineDefinition::parse_with_flags(plain, &RolloutFlags::default()).unwrap();
+        assert!(on.jobs[0].fault.is_none());
+        assert!(off.jobs[0].fault.is_none());
     }
 
     #[test]

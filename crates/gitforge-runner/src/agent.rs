@@ -793,6 +793,10 @@ pub struct JobAssignment {
     /// assignments from a pre-mount scheduler still decode.
     #[serde(default)]
     pub volumes: Vec<VolumeSpec>,
+    /// Failure-injection request (M10). Defaults to `None` so assignments
+    /// from a pre-fault scheduler still decode.
+    #[serde(default)]
+    pub fault: Option<gitforge_common::Fault>,
 }
 
 fn default_job_timeout_secs() -> u64 {
@@ -1368,6 +1372,7 @@ impl RunnerAgent {
             volumes: assignment.volumes.clone(),
             working_dir: assignment.working_dir.clone(),
             timeout_secs: assignment.timeout_secs.clamp(5, 24 * 60 * 60),
+            fault: assignment.fault,
         };
 
         tracing::info!("executing job {} in container", assignment.job_id);
@@ -2732,6 +2737,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
@@ -2758,6 +2764,7 @@ mod tests {
                 read_only: false,
                 size: None,
             }],
+            fault: None,
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
@@ -2809,6 +2816,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
         assert!(assignment.working_dir.is_none());
     }
@@ -2832,6 +2840,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
         let debug_str = format!("{assignment:?}");
         assert!(debug_str.contains("job-123"));
@@ -2865,6 +2874,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
 
         // Test JSON serialization
@@ -2892,6 +2902,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
         assert!(assignment.commands.is_empty());
         assert!(assignment.working_dir.is_none());
@@ -2915,6 +2926,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
         assert_eq!(assignment.commands.len(), 4);
     }
@@ -3013,6 +3025,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
         let assignment2 = JobAssignment {
             job_id: "job-1".to_string(),
@@ -3024,6 +3037,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
         // JobAssignment should implement PartialEq if we add it
         // For now just verify individual field equality
@@ -3043,6 +3057,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
@@ -3123,6 +3138,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
         assert_eq!(assignment.commands.len(), 100);
     }
@@ -3139,6 +3155,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
         let cloned = assignment.clone();
         assert_eq!(cloned.job_id, assignment.job_id);
@@ -3157,6 +3174,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
         assert_eq!(assignment.name, "测试任务");
     }
@@ -3177,6 +3195,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
         assert_eq!(assignment.commands.len(), 3);
     }
@@ -3256,6 +3275,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::new(),
             volumes: Vec::new(),
+            fault: None,
         };
         assert!(assignment.working_dir.is_some());
     }

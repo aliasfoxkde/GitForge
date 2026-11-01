@@ -725,6 +725,7 @@ mod tests {
                     volumes: Vec::new(),
                     cache: None,
                     lane: Default::default(),
+                    fault: None,
                 },
                 JobDefinition {
                     name: "test".to_string(),
@@ -744,6 +745,7 @@ mod tests {
                     volumes: Vec::new(),
                     cache: None,
                     lane: Default::default(),
+                    fault: None,
                 },
             ],
         }
@@ -770,6 +772,7 @@ mod tests {
             volumes: Vec::new(),
             cache: None,
             lane: Default::default(),
+            fault: None,
         };
         PipelineDefinition {
             name: "test-parallel".to_string(),
@@ -899,6 +902,7 @@ mod tests {
             volumes: Vec::new(),
             cache: None,
             lane: Default::default(),
+            fault: None,
         });
 
         let engine = CiEngine::new(event, chain).await.unwrap();
@@ -958,6 +962,7 @@ mod tests {
             volumes: Vec::new(),
             cache: None,
             lane: Default::default(),
+            fault: None,
         });
 
         let engine = CiEngine::new(event, chain).await.unwrap();
@@ -1354,6 +1359,7 @@ mod tests {
                     volumes: Vec::new(),
                     cache: None,
                     lane: Default::default(),
+                    fault: None,
                 },
                 JobDefinition {
                     name: "clippy".to_string(),
@@ -1367,6 +1373,7 @@ mod tests {
                     volumes: Vec::new(),
                     cache: None,
                     lane: Default::default(),
+                    fault: None,
                 },
             ],
         }

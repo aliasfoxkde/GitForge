@@ -58,6 +58,9 @@ pub struct PendingJobInfo {
     /// never read this key; this side always sends it, so no version
     /// negotiation is needed.
     pub volumes: Vec<VolumeSpec>,
+    /// Failure-injection request (M10). Absent (`None`) for every job
+    /// enqueued without a fault; runners on an older contract ignore it.
+    pub fault: Option<gitforge_common::Fault>,
     pub runner_id: String,
     pub lease_token: String,
 }
@@ -532,6 +535,7 @@ async fn get_pending_jobs(
                     timeout_secs: definition.timeout_secs,
                     env: definition.env,
                     volumes: definition.volumes,
+                    fault: definition.fault,
                     runner_id: runner_id.to_string(),
                     lease_token,
                 });
@@ -1833,6 +1837,7 @@ mod tests {
             timeout_secs: 300,
             env: HashMap::from([("RUST_BACKTRACE".to_string(), "1".to_string())]),
             volumes: Vec::new(),
+            fault: None,
             runner_id: "runner-123".to_string(),
             lease_token: "lease-123".to_string(),
         };
