@@ -11,6 +11,12 @@
 # vs the merge-base with origin/main and classifies them. Downstream jobs
 # use skip_if to skip themselves when their class of file hasn't changed:
 #   - clippy: skips when no Rust source or crates/ changed
+#     NOTE (2026-11-01, debt): clippy --all-targets also lints tests, but a
+#     tests-only change (CI_CHANGE_INCLUDE_TESTS=1, CODE=CRATES=0) skips the
+#     clippy job — caught live on 3dbd166d's parent (48618cf0): an E0425 in
+#     services/api/tests compiled only by the test job. Acceptable because
+#     test compiles everything, but clippy-grade lints on tests-only diffs
+#     are unenforced until the skip_if includes TESTS.
 #   - test: skips when no source, crates/, or tests changed
 #   - coverage: skips when no source, crates/, or tests changed
 #   - fuzz: skips when no source or crates/ changed
