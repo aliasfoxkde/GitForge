@@ -1,0 +1,24 @@
+[package]
+name = "gitforge-cas"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+gitforge-common = { path = "../gitforge-common" }
+gitforge-db = { path = "../gitforge-db" }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# SQLite for the CAS refcount index - embedded, dedicated file
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
