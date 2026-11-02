@@ -34,21 +34,35 @@ const BEGIN_RECOVERY_PASSES: usize = 3;
 /// Begin a `BEGIN IMMEDIATE` transaction, recovering a poisoned connection.
 ///
 /// sqlx tracks transaction depth per connection, but a write that loses a
-/// race against task cancellation or a write freeze can leave the SQLite
-/// handle inside a transaction while the depth counter says zero (the
-/// rollback paths that would resync the pair only run when the original
-/// command both succeeded and was acknowledged). The poisoned connection
-/// returns to the pool, and because the pool hands out the most recently
-/// used connection first, every subsequent `begin_with` fails with
-/// `(code: 1) cannot start a transaction within a transaction`. That is
-/// not a transient lock: `persist_with_retry` alone cannot clear it,
-/// because every retry is handed the same poisoned connection.
+/// race against task cancellation or a write freeze can desync that counter
+/// from the SQLite handle in either direction:
 ///
-/// Recovery is a bare `ROLLBACK` on a fresh pooled connection — a no-op
-/// error on a healthy one — then the begin is retried. Observed live
-/// 2026-10-08: five `persist_with_retry` attempts at job completion all
-/// failed against the same poisoned connection while the runner's work had
-/// succeeded; the lease-dead fence then graded the run failed.
+/// 1. *Handle inside a transaction, counter at zero* — the next
+///    `begin_with` fails with `(code: 1) cannot start a transaction within
+///    a transaction`. Recovery is a bare `ROLLBACK` on a fresh pooled
+///    connection — a no-op error on a healthy one — then the begin is
+///    retried. Observed live 2026-10-08: five `persist_with_retry` attempts
+///    at job completion all failed against the same poisoned connection
+///    while the runner's work had succeeded; the lease-dead fence then
+///    graded the run failed.
+/// 2. *Counter above zero with no live `Transaction` owner* — the next
+///    `begin_with` carrying a custom statement fails with `attempted to
+///    call begin_with at non-zero transaction depth` (sqlx rejects a custom
+///    BEGIN inside what it believes is an open transaction) before any
+///    statement reaches SQLite. A raw ROLLBACK cannot fix this direction:
+///    it clears the SQLite side but the counter only moves through sqlx's
+///    managed commit/rollback commands. Recovery opens plain managed
+///    transactions (`pool.begin()`, which issues a SAVEPOINT at depth > 0)
+///    and rolls them back, decrementing the counter one level per pass.
+///    Observed live 2026-11-02: every `pipeline activation` trigger failed
+///    five times with the non-zero-depth error while healthy runs kept
+///    serving from the same pool, so commit `c844a4b` (OpenCodifier) sat
+///    un-run for hours.
+///
+/// Neither failure is a transient lock: `persist_with_retry` alone cannot
+/// clear either, because every retry is handed the same poisoned
+/// connection (the pool hands out the most recently used connection
+/// first).
 pub(crate) async fn begin_immediate(
     pool: &SqlitePool,
     context: &str,
@@ -62,11 +76,61 @@ pub(crate) async fn begin_immediate(
             Ok(tx)
         }
         Err(begin_error) => {
+            let counter_stuck = begin_error
+                .to_string()
+                .contains("non-zero transaction depth");
             let mut last = begin_error;
             for _ in 0..BEGIN_RECOVERY_PASSES {
                 let Ok(mut conn) = pool.acquire().await else {
                     break;
                 };
+                if counter_stuck {
+                    // Direction 2: unwind sqlx's own counter. A managed
+                    // begin at depth > 0 issues a SAVEPOINT (no custom
+                    // statement, so sqlx allows it); the managed rollback
+                    // decrements the counter one level. Keep the
+                    // connection out of the pool across the unwind —
+                    // dropping it mid-desync would hand the next caller
+                    // the same stuck counter.
+                    drop(conn);
+                    let Ok(mut unwind_conn) = pool.acquire().await else {
+                        break;
+                    };
+                    let unwind =
+                        match sqlx::Transaction::<sqlx::Sqlite>::begin(&mut *unwind_conn, None)
+                            .await
+                        {
+                            Ok(tx) => tx.rollback().await,
+                            Err(error) => Err(error),
+                        };
+                    match unwind {
+                        Ok(()) => {
+                            tracing::warn!(
+                                context = %context,
+                                "unwound a stuck sqlx transaction-depth counter with a managed SAVEPOINT rollback"
+                            );
+                        }
+                        Err(error) => {
+                            // The counter cannot be unwound on this
+                            // connection, and the pool keeps handing it
+                            // back: further passes would repeat the same
+                            // failure. Surface the unwind error instead.
+                            last = error;
+                            break;
+                        }
+                    }
+                    drop(unwind_conn);
+                    match pool.begin_with("BEGIN IMMEDIATE").await {
+                        Ok(tx) => {
+                            if let Some(m) = metrics() {
+                                m.record_db_write(context, write_start.elapsed().as_secs_f64());
+                            }
+                            return Ok(tx);
+                        }
+                        Err(error) => last = error,
+                    }
+                    continue;
+                }
                 // A bare ROLLBACK clears the desynced SQLite-side
                 // transaction. On a healthy connection it fails with
                 // "no transaction is active", which carries no signal.

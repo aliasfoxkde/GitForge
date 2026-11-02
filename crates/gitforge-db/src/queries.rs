@@ -4162,6 +4162,68 @@ mod tests {
         pool.close().await;
     }
 
+    /// Regression for the 2026-11-02 pipeline-activation failures (commit
+    /// `c844a4b` on OpenCodifier sat un-run for hours): a pooled connection
+    /// whose sqlx depth counter is stuck ABOVE zero with no live
+    /// `Transaction` owner rejects every `begin_with` carrying a custom
+    /// statement with `attempted to call begin_with at non-zero transaction
+    /// depth` — before any statement reaches SQLite, so the raw-ROLLBACK
+    /// recovery for direction 1 is useless here. `begin_immediate` must
+    /// unwind the counter with managed SAVEPOINT rollbacks and yield a
+    /// usable transaction.
+    ///
+    /// The pool is capped at one connection so every borrower
+    /// deterministically gets the stuck one; the poison is injected with
+    /// `pool.begin()` followed by leaking the transaction (simulating the
+    /// lost-ack path that leaves the counter raised without an owner).
+    #[tokio::test]
+    async fn test_begin_immediate_unwinds_stuck_depth_counter() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Raise the counter without a live owner: begin managed (depth 1),
+        // then drop the connection without commit/rollback (Transaction's
+        // Drop tries an async rollback, but detaching the connection
+        // prevents it — instead we simulate the stuck state by leaking the
+        // Transaction's handle via std::mem::forget, so no rollback fires).
+        let mut conn = pool.acquire().await.unwrap();
+        let tx = sqlx::Transaction::<sqlx::Sqlite>::begin(&mut *conn, None)
+            .await
+            .unwrap();
+        std::mem::forget(tx);
+        drop(conn);
+
+        // Sanity: the custom-statement begin now fails with the live error
+        // signature.
+        let stuck = pool.begin_with("BEGIN IMMEDIATE").await;
+        let message = format!("{}", stuck.unwrap_err());
+        assert!(
+            message.contains("non-zero transaction depth"),
+            "expected the stuck-counter begin to fail with the depth error, \
+             got: {message}"
+        );
+
+        // Recovery: the begin must succeed and the transaction must work.
+        let mut tx = begin_immediate(&pool, "pipeline activation").await.unwrap();
+        sqlx::query("CREATE TABLE depth_probe (id INTEGER)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // And the pool keeps serving healthy transactions afterwards.
+        let mut tx = begin_immediate(&pool, "pipeline activation").await.unwrap();
+        sqlx::query("INSERT INTO depth_probe (id) VALUES (1)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        pool.close().await;
+    }
+
     /// Regression for the swallowed-write flavor of connection poisoning
     /// (run `99c463db`, 2026-10-08): a single-statement write routed in
     /// autocommit to a connection with an orphaned SQLite transaction
