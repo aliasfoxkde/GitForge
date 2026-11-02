@@ -451,11 +451,48 @@ fn parse_size_bytes(raw: &str) -> Option<i64> {
     value.checked_mul(multiplier)
 }
 
+/// Host directories a pipeline-authored bind mount may draw from. The
+/// cache root is always trusted (the runner owns it); workspace roots come
+/// from `GITFORGE_BIND_ROOTS` / `GITFORGE_WORKSPACE_ROOT(S)` so integrations
+/// with their own checkout trees can extend the set. Read ONCE at the edge
+/// and passed down as a value — never read inside a decision.
+fn bind_roots(cache_root: &str) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![std::path::PathBuf::from(cache_root)];
+    if let Ok(value) = std::env::var("GITFORGE_BIND_ROOTS") {
+        roots.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(std::path::PathBuf::from),
+        );
+    } else {
+        for var in ["GITFORGE_WORKSPACE_ROOTS", "GITFORGE_WORKSPACE_ROOT"] {
+            if let Ok(value) = std::env::var(var) {
+                roots.extend(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty())
+                        .map(std::path::PathBuf::from),
+                );
+                break;
+            }
+        }
+    }
+    roots
+}
+
 /// Turn the requested volumes into docker mounts.
 ///
 /// Binds become `HostConfig.binds` entries so they inherit the daemon's
 /// SELinux relabel behaviour (the workspace mount already relies on `:z`);
 /// tmpfs and named volumes become structured mounts.
+///
+/// A bind source outside [`bind_roots`] is a policy violation: the mount is
+/// skipped with a WARN, never mounted. A pipeline declaring
+/// `source: /var/lib/gitforge` must not get host state into a job container,
+/// and a silently cold cache must be visible in the runner log.
 fn build_volume_mounts(
     volumes: &[VolumeSpec],
     image: &str,
@@ -463,6 +500,7 @@ fn build_volume_mounts(
 ) -> Result<(Vec<String>, Vec<Mount>)> {
     let mut binds = Vec::new();
     let mut mounts = Vec::new();
+    let roots = bind_roots(cache_root);
 
     for volume in volumes {
         volume
@@ -480,6 +518,16 @@ fn build_volume_mounts(
                     return Err(Error::sandbox(format!(
                         "volume mount source must be an absolute path: {source}"
                     )));
+                }
+                let source_path = std::path::PathBuf::from(&source);
+                if !roots.iter().any(|root| source_path.starts_with(root)) {
+                    tracing::warn!(
+                        %source,
+                        destination = %volume.destination,
+                        allowed = ?roots,
+                        "pipeline bind mount rejected: source outside trusted roots"
+                    );
+                    continue;
                 }
                 // The daemon creates a missing bind source as root, which
                 // the job's user could not write to. Create it here, as the
@@ -746,6 +794,22 @@ impl Sandbox for DockerSandbox {
         if !workspace.is_absolute() || !workspace.is_dir() {
             return Err(Error::sandbox(format!(
                 "workspace must be an existing absolute directory: {workspace_path}"
+            )));
+        }
+        // The workspace path can arrive from pipeline-authored
+        // `working_directory` values, so it gets the same trust check as a
+        // bind source: only directories under a trusted root may be mounted
+        // at /workspace. Unlike a cache mount this cannot degrade — a
+        // workspace pointing at host state IS the job's filesystem.
+        let canonical = std::fs::canonicalize(workspace)
+            .map_err(|error| Error::sandbox(format!("cannot resolve workspace: {error}")))?;
+        if !bind_roots(&cache_root())
+            .iter()
+            .any(|root| canonical.starts_with(root))
+        {
+            return Err(Error::sandbox(format!(
+                "workspace {} is outside the trusted roots; refusing to mount it",
+                canonical.display()
             )));
         }
 
@@ -1396,6 +1460,94 @@ mod tests {
         }];
 
         assert!(build_volume_mounts(&volumes, "dsc-ci-rust:10", "/var/cache/gitforge").is_err());
+    }
+
+    #[test]
+    fn test_build_volume_mounts_skips_bind_outside_trusted_roots() {
+        let root =
+            std::env::temp_dir().join(format!("gitforge-mount-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let volumes = vec![
+            VolumeSpec {
+                volume_type: Some(VolumeType::Bind),
+                source: Some("/var/lib/gitforge".to_string()),
+                destination: "/host-state".to_string(),
+                read_only: false,
+                size: None,
+            },
+            // A cache-root-relative mount in the same request still mounts:
+            // the rejection targets the out-of-policy source only.
+            VolumeSpec {
+                volume_type: Some(VolumeType::Bind),
+                source: Some(format!("{}/cargo/{{image}}", root.display())),
+                destination: "/cargo-target".to_string(),
+                read_only: false,
+                size: None,
+            },
+        ];
+
+        let _guard = EnvVarGuard::remove("GITFORGE_BIND_ROOTS");
+        let (binds, _) =
+            build_volume_mounts(&volumes, "dsc-ci-rust:10", &root.display().to_string()).unwrap();
+        assert_eq!(binds.len(), 1);
+        assert!(binds[0].starts_with(&format!("{}/cargo/", root.display())));
+        assert!(!std::path::Path::new("/var/lib/gitforge").starts_with(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_build_volume_mounts_allows_explicit_bind_roots() {
+        let root =
+            std::env::temp_dir().join(format!("gitforge-mount-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let volumes = vec![VolumeSpec {
+            volume_type: Some(VolumeType::Bind),
+            source: Some(format!("{}/shared", root.display())),
+            destination: "/shared".to_string(),
+            read_only: true,
+            size: None,
+        }];
+
+        let _guard = EnvVarGuard::set("GITFORGE_BIND_ROOTS", format!("{}/shared", root.display()));
+        let (binds, _) =
+            build_volume_mounts(&volumes, "dsc-ci-rust:10", "/var/cache/gitforge").unwrap();
+        assert_eq!(
+            binds,
+            vec![format!("{}/shared:/shared:ro,z", root.display())]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Set or remove an environment variable for one test and always
+    /// restore the previous state on drop. The decision under test takes
+    /// the root as a value; this only isolates the edge's read of it from
+    /// concurrent tests (the 2026-10-22 coverage-job lesson).
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: String) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
     }
 
     #[test]
