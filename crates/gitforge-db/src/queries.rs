@@ -118,6 +118,7 @@ fn parse_optional_timestamp_column(
         .try_get(column)
         .map_err(|error| Error::database(format!("invalid {column} column: {error}")))?;
     value
+        .and_then(|value| (!value.trim().is_empty()).then_some(value))
         .map(|value| {
             DateTime::parse_from_rfc3339(&value)
                 .map(|date| date.with_timezone(&Utc))

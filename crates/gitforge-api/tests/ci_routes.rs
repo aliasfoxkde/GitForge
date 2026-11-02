@@ -293,6 +293,49 @@ async fn pipeline_run_endpoints_scoped_and_expose_jobs_with_receipts() {
 }
 
 #[tokio::test]
+async fn pipeline_run_list_treats_blank_optional_finish_time_as_null() {
+    let f = seed().await;
+    sqlx::query("UPDATE pipeline_runs SET finished_at = '' WHERE id = ?")
+        .bind(f.run_id.to_string())
+        .execute(f.pool.pool())
+        .await
+        .unwrap();
+
+    let (status, runs) = request_json(
+        f.app,
+        "GET",
+        "/api/pipeline-runs",
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "response: {runs}");
+    assert_eq!(runs.as_array().unwrap().len(), 1);
+    assert_eq!(runs[0]["finished_at"], Value::Null);
+}
+
+#[tokio::test]
+async fn pipeline_run_list_still_rejects_malformed_nonblank_finish_time() {
+    let f = seed().await;
+    sqlx::query("UPDATE pipeline_runs SET finished_at = 'not-a-timestamp' WHERE id = ?")
+        .bind(f.run_id.to_string())
+        .execute(f.pool.pool())
+        .await
+        .unwrap();
+
+    let (status, body) = request_json(
+        f.app,
+        "GET",
+        "/api/pipeline-runs",
+        Some(&f.owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"], "database_error");
+}
+
+#[tokio::test]
 async fn submit_job_rejects_invalid_payloads() {
     let f = seed().await;
     let uri = "/api/jobs";
