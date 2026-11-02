@@ -102,6 +102,8 @@ services:
       - GITFORGE_SCHEDULER_URL=http://ci:42781
       - GITFORGE_RUNNER_NAME=docker-runner-1
       - GITFORGE_RUNNER_CAPACITY=4
+      - GITFORGE_SANDBOX_CPU_CORES=${GITFORGE_SANDBOX_CPU_CORES:-1}
+      - GITFORGE_SANDBOX_MEMORY_MB=${GITFORGE_SANDBOX_MEMORY_MB:-4096}
       - GITFORGE_SCHEDULER_TOKEN=${GITFORGE_SCHEDULER_TOKEN:?set GITFORGE_SCHEDULER_TOKEN in .env}
       # Registration credential accepted by the scheduler's POST /runners
       # bootstrap surface (#357). Falls back to GITFORGE_SCHEDULER_TOKEN.
