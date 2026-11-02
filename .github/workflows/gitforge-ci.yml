@@ -38,8 +38,12 @@ jobs:
   # Enqueue build job to GitForge queue instead of running directly
   enqueue-build:
     name: Enqueue Build to GitForge
-    if: vars.GITFORGE_ENABLED == 'true'
-    runs-on: [self-hosted, linux, x64, gitforge-github]
+    # Fork PRs never reach the private GitForge instance: secrets are
+    # unavailable and their head commits are not on the mirror. The
+    # required-check gap this would leave is acceptable — the live
+    # Safeguards ruleset carries no required_status_checks rule.
+    if: vars.GITFORGE_ENABLED == 'true' && !github.event.pull_request.head.repo.fork
+    runs-on: ${{ !github.event.pull_request.head.repo.fork && fromJSON('["self-hosted", "linux", "x64", "gitforge-github"]') || 'ubuntu-latest' }}
     outputs:
       run_id: ${{ steps.enqueue.outputs.run_id }}
       commit: ${{ steps.enqueue.outputs.commit }}
@@ -138,7 +142,7 @@ jobs:
     name: Poll GitForge Build Status
     needs: enqueue-build
     if: needs.enqueue-build.outputs.build_status == 'enqueued'
-    runs-on: [self-hosted, linux, x64, gitforge-github]
+    runs-on: ${{ !github.event.pull_request.head.repo.fork && fromJSON('["self-hosted", "linux", "x64", "gitforge-github"]') || 'ubuntu-latest' }}
     outputs:
       terminal_status: ${{ steps.poll.outputs.terminal_status }}
     steps:
@@ -247,8 +251,8 @@ jobs:
   report-status:
     name: Report Build Status
     needs: [enqueue-build, poll-build]
-    if: always() && vars.GITFORGE_ENABLED == 'true'
-    runs-on: [self-hosted, linux, x64, gitforge-github]
+    if: always() && vars.GITFORGE_ENABLED == 'true' && !github.event.pull_request.head.repo.fork
+    runs-on: ${{ !github.event.pull_request.head.repo.fork && fromJSON('["self-hosted", "linux", "x64", "gitforge-github"]') || 'ubuntu-latest' }}
     steps:
       - name: Report completion
         run: |

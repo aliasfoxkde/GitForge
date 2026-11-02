@@ -26,7 +26,7 @@ jobs:
   # ─── Code Formatting ─────────────────────────────────────────────────────────
   fmt:
     name: Format
-    runs-on: [self-hosted, linux, x64, gitforge-github]
+    runs-on: ${{ !github.event.pull_request.head.repo.fork && fromJSON('["self-hosted", "linux", "x64", "gitforge-github"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -40,7 +40,7 @@ jobs:
   # ─── Linting ────────────────────────────────────────────────────────────────
   clippy:
     name: Clippy
-    runs-on: [self-hosted, linux, x64, gitforge-github]
+    runs-on: ${{ !github.event.pull_request.head.repo.fork && fromJSON('["self-hosted", "linux", "x64", "gitforge-github"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -86,7 +86,7 @@ jobs:
   # GITFORGE_SANDBOX_ACQUIRE_SECS raises the acquire window alongside it.
   test:
     name: Test
-    runs-on: [self-hosted, linux, x64, gitforge-github]
+    runs-on: ${{ !github.event.pull_request.head.repo.fork && fromJSON('["self-hosted", "linux", "x64", "gitforge-github"]') || 'ubuntu-latest' }}
     env:
       GITFORGE_DOCKER_TIMEOUT_SECS: "600"
       GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
@@ -104,7 +104,7 @@ jobs:
   # race detector requires a separate supported toolchain/target strategy.
   test-serialized:
     name: Test (Serialized)
-    runs-on: [self-hosted, linux, x64, gitforge-github]
+    runs-on: ${{ !github.event.pull_request.head.repo.fork && fromJSON('["self-hosted", "linux", "x64", "gitforge-github"]') || 'ubuntu-latest' }}
     env:
       GITFORGE_DOCKER_TIMEOUT_SECS: "600"
       GITFORGE_SANDBOX_ACQUIRE_SECS: "300"
@@ -129,7 +129,7 @@ jobs:
   # 120 s-timeout signature on 2026-09-24 while the Test jobs stayed green).
   coverage:
     name: Coverage
-    runs-on: [self-hosted, linux, x64, gitforge-github]
+    runs-on: ${{ !github.event.pull_request.head.repo.fork && fromJSON('["self-hosted", "linux", "x64", "gitforge-github"]') || 'ubuntu-latest' }}
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
       GITFORGE_DOCKER_TIMEOUT_SECS: "600"
@@ -192,7 +192,7 @@ jobs:
   # ─── Security Audit ─────────────────────────────────────────────────────────
   security:
     name: Security Audit
-    runs-on: [self-hosted, linux, x64, gitforge-github]
+    runs-on: ${{ !github.event.pull_request.head.repo.fork && fromJSON('["self-hosted", "linux", "x64", "gitforge-github"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -226,7 +226,7 @@ jobs:
   # ─── Build ──────────────────────────────────────────────────────────────────
   build:
     name: Build
-    runs-on: [self-hosted, linux, x64, gitforge-github]
+    runs-on: ${{ !github.event.pull_request.head.repo.fork && fromJSON('["self-hosted", "linux", "x64", "gitforge-github"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
