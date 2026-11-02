@@ -159,6 +159,8 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 | `GITFORGE_SCHEDULER_URL` | **Yes** | — | Scheduler HTTP endpoint (e.g. `http://localhost:42781`). Startup fails without this. |
 | `GITFORGE_RUNNER_NAME` | Recommended | `runner` | Stable unique identity; restarts refresh this row instead of creating another one |
 | `GITFORGE_RUNNER_CAPACITY` | No | `2` | Maximum concurrent jobs |
+| `GITFORGE_SANDBOX_CPU_CORES` | No | `1` | Per-job CPU core ceiling; capped to the host's available parallelism. Capacity times this value is the runner's maximum aggregate sandbox CPU allocation. |
+| `GITFORGE_SANDBOX_MEMORY_MB` | No | `4096` | Per-job memory ceiling. Keep this multiplied by runner capacity within the host's memory budget, leaving room for GitForge and the OS. |
 | `GITFORGE_HEARTBEAT_INTERVAL` | No | `30` | Heartbeat interval in seconds |
 | `GITFORGE_JOB_HEARTBEAT_INTERVAL` | No | `15` | Per-job lease-heartbeat interval in seconds (#243): sent while a job runs to renew its fence grace |
 | `GITFORGE_FETCH_INTERVAL` | No | `5` | Job-poll interval in seconds |
