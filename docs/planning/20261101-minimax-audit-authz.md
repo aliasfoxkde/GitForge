@@ -164,29 +164,3 @@ Legend: AU = any authenticated user; role names are instance-wide roles.
 2. F2: add `authorize_repo(&pool, &claims, pipeline.repo_id)` before the trigger
    delegation in `trigger_pipeline` (webhook.rs, after the existence check at 234).
 3. F3: gate `list_runners`/`get_runner` behind `can_manage_jobs`.
-
-## Dispositions (2026-11-03)
-
-- **F1 — RESOLVED**: runner registration requires a token
-  (`GITFORGE_RUNNER_REGISTRATION_TOKEN`); enforced in `register_runner`.
-  Commit `338a43b1` / PR #365.
-- **F2 — RESOLVED**: `trigger_pipeline` authorizes the pipeline's repo
-  before delegating to the CI service. Commit `338a43b1` / PR #365.
-- **F3 — RESOLVED**: `GET /api/runners` and `GET /api/runners/{id}` are
-  gated to maintainer/admin via `can_manage_jobs`. Commits `607667e1`,
-  `45547d40` (branch `integrate/audit-fixes-20261102`).
-- **F4 — WONTFIX (design decision, recorded)**: the instance-wide role
-  model (owner or admin/maintainer, no per-repo collaborator table) is
-  retained deliberately. No product document calls for per-repo
-  collaboration; the deployment model is a single-operator instance
-  (RUNBOOK), and the maintainers-on-every-repo semantic matches the
-  platform's stated trust boundary. If a multi-tenant offering is ever
-  scoped, this becomes the first design item — introduce a
-  `repo_collaborators` table and thread it through `can_access_repo` /
-  `authorize_repo` / `can_manage_jobs`.
-- **F5 — RESOLVED**: `/metrics` and `/dashboard` now require
-  authentication unless `GITFORGE_PUBLIC_TELEMETRY=1` is set
-  (`middleware.rs`); `/health` stays public (liveness probe, no data).
-  Decision core `telemetry_is_public` is unit-tested including the
-  middleware branch. This changes the default for existing deployments:
-  set the env var to keep scrape access after upgrade.
