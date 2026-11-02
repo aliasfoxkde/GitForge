@@ -163,6 +163,7 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 | `GITFORGE_JOB_HEARTBEAT_INTERVAL` | No | `15` | Per-job lease-heartbeat interval in seconds (#243): sent while a job runs to renew its fence grace |
 | `GITFORGE_FETCH_INTERVAL` | No | `5` | Job-poll interval in seconds |
 | `GITFORGE_SCHEDULER_TOKEN` | No | _(none)_ | Bearer token for scheduler API authentication |
+| `GITFORGE_RUNNER_REGISTRATION_TOKEN` | No | _(none)_ | Bearer token presented to the scheduler's runner-registration surface (`POST /runners` on the CI/scheduler port, and `POST /api/runners` on the gateway). Falls back to `GITFORGE_SCHEDULER_TOKEN` when unset. Registration is fail-closed: with no token configured on the scheduler, every registration is refused (503) |
 | `GITFORGE_REGISTER_ATTEMPTS` | No | `6` | Registration attempts before giving up when the scheduler is unreachable |
 | `GITFORGE_REGISTER_BACKOFF_SECS` | No | `1` | Initial registration retry delay; doubles per attempt up to 30s |
 | `GITFORGE_CACHE_ROOT` | No | `~/.cache/gitforge` | Host root for job cache mounts (compiled cargo artifacts). Used when a job declares a `cache:` block: the runner bind-mounts `<root>/cargo/<image>` at the job's `mount_path` inside the container. Falls back to `/var/cache/gitforge` when `$HOME` is unset. A cache that cannot be prepared is skipped with a warning — jobs still run cold. |
@@ -299,6 +300,7 @@ Before `docker compose up`, set the required deployment variables in `.env`
 | Variable | Why it is required |
 |----------|--------------------|
 | `GITFORGE_SCHEDULER_TOKEN` | Shared scheduler/trigger credential; scheduler auth is fail-closed without it |
+| `GITFORGE_RUNNER_REGISTRATION_TOKEN` | Credential for the scheduler's runner-registration surface (`POST /runners`, and `POST /api/runners` on the gateway); registration is fail-closed without it |
 | `DOCKER_GID` | Host group id of `/var/run/docker.sock` (`stat -c %g /var/run/docker.sock`) so the non-root runner can use the mounted socket |
 | `GITFORGE_WORKSPACE_HOST_DIR` | Host directory (create it first) where CI checks out run workspaces; bind-mounted at the same absolute path in ci and runner because the runner passes workspace paths to the host Docker daemon as bind sources |
 
@@ -435,6 +437,7 @@ and auth token), which it writes after `gitforge auth --login`.
 | `GITFORGE_JOB_HEARTBEAT_INTERVAL` | runner | 15 | Per-job lease-heartbeat interval in seconds (#243) |
 | `GITFORGE_FETCH_INTERVAL` | runner | 5 | Job-poll interval in seconds |
 | `GITFORGE_SCHEDULER_TOKEN` | runner | _(none)_ | Bearer token for scheduler API. Required in compose: the scheduler rejects runner/operator requests when unset |
+| `GITFORGE_RUNNER_REGISTRATION_TOKEN` | api, ci, runner | _(none)_ | Bearer token for runner registration at the scheduler (`POST /runners`) and the gateway (`POST /api/runners`). Required in compose: registration is refused when unset. The runner falls back to `GITFORGE_SCHEDULER_TOKEN` when it is unset locally |
 | `GITFORGE_RUNNER_STANDALONE` | runner | `deny` | `deny` exits the runner when scheduler registration fails; `allow` falls back to standalone execution |
 | `GITFORGE_REGISTER_ATTEMPTS` | runner | `6` | Registration attempts against an unreachable scheduler before giving up |
 | `GITFORGE_REGISTER_BACKOFF_SECS` | runner | `1` | Initial registration backoff; doubles per failed attempt up to a 30s cap. Auth rejections (401/403) are never retried |

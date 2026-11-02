@@ -39,11 +39,38 @@ impl ApiServer {
         Self::with_storage(jwt_secret, pool, None)
     }
 
+    /// Create a new API server with an explicit runner registration token.
+    ///
+    /// Production reads the token from `GITFORGE_RUNNER_REGISTRATION_TOKEN`
+    /// (see `new`); tests inject a known value so the registration contract
+    /// is exercised without touching the process environment.
+    pub fn with_registration_token(
+        jwt_secret: &str,
+        pool: Pool,
+        registration_token: Option<Arc<String>>,
+    ) -> Self {
+        Self::build(jwt_secret, pool, None, registration_token)
+    }
+
     /// Create a new API server with custom storage path
     pub fn with_storage(
         jwt_secret: &str,
         pool: Pool,
+        storage_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::build(
+            jwt_secret,
+            pool,
+            storage_path,
+            crate::routes::runners::registration_token_from_env(),
+        )
+    }
+
+    fn build(
+        jwt_secret: &str,
+        pool: Pool,
         _storage_path: Option<std::path::PathBuf>,
+        registration_token: Option<Arc<String>>,
     ) -> Self {
         let auth = ApiAuth::new(jwt_secret);
         let metrics = Metrics::new();
@@ -98,7 +125,7 @@ impl ApiServer {
             requests_per_minute: 60,
             burst_size: 20,
         });
-        let runner_registration = public_runner_routes()
+        let runner_registration = public_runner_routes(registration_token)
             .layer(RateLimitLayer::new(runner_registration_limiter.clone()))
             .layer(Extension(Arc::new(pool.clone())));
         public_routes = public_routes

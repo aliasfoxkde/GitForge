@@ -27,6 +27,9 @@ services:
       - GIT_ROOT=/git
       - RUST_LOG=info
       - JWT_SECRET=${JWT_SECRET:-changeme-in-production}
+      # Runner registration is fail-closed without this secret (#357):
+      # POST /api/runners is refused (503) when it is unset.
+      - GITFORGE_RUNNER_REGISTRATION_TOKEN=${GITFORGE_RUNNER_REGISTRATION_TOKEN:?set GITFORGE_RUNNER_REGISTRATION_TOKEN in .env}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:42780/health"]
       interval: 30s
@@ -66,6 +69,9 @@ services:
       # Scheduler API auth is fail-closed: runners cannot register, fetch, or
       # complete jobs unless this shared credential is configured.
       - GITFORGE_SCHEDULER_TOKEN=${GITFORGE_SCHEDULER_TOKEN:?set GITFORGE_SCHEDULER_TOKEN in .env}
+      # The scheduler's POST /runners registration surface (#357) accepts this
+      # credential in addition to the runner/scheduler token.
+      - GITFORGE_RUNNER_REGISTRATION_TOKEN=${GITFORGE_RUNNER_REGISTRATION_TOKEN:?set GITFORGE_RUNNER_REGISTRATION_TOKEN in .env}
     depends_on:
       - git-server
     networks:
@@ -97,6 +103,9 @@ services:
       - GITFORGE_RUNNER_NAME=docker-runner-1
       - GITFORGE_RUNNER_CAPACITY=4
       - GITFORGE_SCHEDULER_TOKEN=${GITFORGE_SCHEDULER_TOKEN:?set GITFORGE_SCHEDULER_TOKEN in .env}
+      # Registration credential accepted by the scheduler's POST /runners
+      # bootstrap surface (#357). Falls back to GITFORGE_SCHEDULER_TOKEN.
+      - GITFORGE_RUNNER_REGISTRATION_TOKEN=${GITFORGE_RUNNER_REGISTRATION_TOKEN:?set GITFORGE_RUNNER_REGISTRATION_TOKEN in .env}
     depends_on:
       - ci
     networks:
@@ -151,6 +160,9 @@ services:
       - GITFORGE_RUNNER_NAME=docker-runner-2
       - GITFORGE_RUNNER_CAPACITY=2
       - GITFORGE_SCHEDULER_TOKEN=${GITFORGE_SCHEDULER_TOKEN:?set GITFORGE_SCHEDULER_TOKEN in .env}
+      # Registration credential accepted by the scheduler's POST /runners
+      # bootstrap surface (#357). Falls back to GITFORGE_SCHEDULER_TOKEN.
+      - GITFORGE_RUNNER_REGISTRATION_TOKEN=${GITFORGE_RUNNER_REGISTRATION_TOKEN:?set GITFORGE_RUNNER_REGISTRATION_TOKEN in .env}
     depends_on:
       - ci
     networks:
