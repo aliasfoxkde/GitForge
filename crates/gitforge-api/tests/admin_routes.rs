@@ -72,7 +72,12 @@ async fn seed() -> Fixture {
     let auth = ApiAuth::new("test-secret");
     let token_for =
         |user: &User, role: &str| auth.generate_token(user.id, &user.username, role).unwrap();
-    let app = ApiServer::new("test-secret", pool.clone()).into_router();
+    let app = ApiServer::with_registration_token(
+        "test-secret",
+        pool.clone(),
+        Some(std::sync::Arc::new("admin-suite-registration".to_string())),
+    )
+    .into_router();
     Fixture {
         app,
         pool,
@@ -154,6 +159,10 @@ async fn get_json(app: Router, uri: &str, token: Option<&str>) -> (StatusCode, V
     )
 }
 
+/// Registration is the one runner endpoint served without a user JWT; it
+/// proves itself with the shared registration token instead (#357).
+const REGISTRATION_TOKEN: &str = "admin-suite-registration";
+
 #[tokio::test]
 async fn register_runner_is_public_and_normalizes_the_payload() {
     let f = seed().await;
@@ -163,7 +172,7 @@ async fn register_runner_is_public_and_normalizes_the_payload() {
     let (status, body) = post_json(
         f.app.clone(),
         "/api/runners",
-        None,
+        Some(REGISTRATION_TOKEN),
         json!({"name": "edge-runner", "type": "firecracker", "capacity": 4}),
     )
     .await;
@@ -176,7 +185,13 @@ async fn register_runner_is_public_and_normalizes_the_payload() {
     // Defaults and aliases: no payload means stock docker runner; the
     // baremetal spelling maps to the same type as bare_metal; unknown types
     // fall back to docker.
-    let (status, body) = post_json(f.app.clone(), "/api/runners", None, json!({})).await;
+    let (status, body) = post_json(
+        f.app.clone(),
+        "/api/runners",
+        Some(REGISTRATION_TOKEN),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(body["name"], "runner");
     assert_eq!(body["type"], "docker");
@@ -190,7 +205,7 @@ async fn register_runner_is_public_and_normalizes_the_payload() {
         let (status, body) = post_json(
             f.app.clone(),
             "/api/runners",
-            None,
+            Some(REGISTRATION_TOKEN),
             json!({"name": format!("runner-{sent}"), "type": sent}),
         )
         .await;

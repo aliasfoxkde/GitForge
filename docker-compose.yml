@@ -27,6 +27,9 @@ services:
       - GIT_ROOT=/git
       - RUST_LOG=info
       - JWT_SECRET=${JWT_SECRET:-changeme-in-production}
+      # Runner registration is fail-closed without this secret (#357):
+      # POST /api/runners is refused (503) when it is unset.
+      - GITFORGE_RUNNER_REGISTRATION_TOKEN=${GITFORGE_RUNNER_REGISTRATION_TOKEN:?set GITFORGE_RUNNER_REGISTRATION_TOKEN in .env}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:42780/health"]
       interval: 30s
@@ -97,6 +100,9 @@ services:
       - GITFORGE_RUNNER_NAME=docker-runner-1
       - GITFORGE_RUNNER_CAPACITY=4
       - GITFORGE_SCHEDULER_TOKEN=${GITFORGE_SCHEDULER_TOKEN:?set GITFORGE_SCHEDULER_TOKEN in .env}
+      # Registration credential presented to the API gateway's public
+      # runner-registration surface (#357).
+      - GITFORGE_RUNNER_REGISTRATION_TOKEN=${GITFORGE_RUNNER_REGISTRATION_TOKEN:?set GITFORGE_RUNNER_REGISTRATION_TOKEN in .env}
     depends_on:
       - ci
     networks:
@@ -151,6 +157,9 @@ services:
       - GITFORGE_RUNNER_NAME=docker-runner-2
       - GITFORGE_RUNNER_CAPACITY=2
       - GITFORGE_SCHEDULER_TOKEN=${GITFORGE_SCHEDULER_TOKEN:?set GITFORGE_SCHEDULER_TOKEN in .env}
+      # Registration credential presented to the API gateway's public
+      # runner-registration surface (#357).
+      - GITFORGE_RUNNER_REGISTRATION_TOKEN=${GITFORGE_RUNNER_REGISTRATION_TOKEN:?set GITFORGE_RUNNER_REGISTRATION_TOKEN in .env}
     depends_on:
       - ci
     networks:

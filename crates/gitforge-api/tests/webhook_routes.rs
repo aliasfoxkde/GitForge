@@ -346,6 +346,62 @@ async fn webhook_replay_is_idempotent_and_cancels_the_duplicate_run() {
     assert_eq!(jobs[0].commands, vec!["echo hi".to_string()]);
 }
 
+/// A non-owner must not be able to trigger a pipeline on a repository they
+/// do not own, even with a valid session token. The route collapses the
+/// refusal into 404 so existence is not leaked, and no run is persisted.
+#[tokio::test]
+async fn webhook_refuses_a_non_owner_of_the_pipelines_repository() {
+    let f = seed().await;
+    let commit = "9".repeat(40);
+
+    let outsider = User::new(
+        "wh-outsider".to_string(),
+        "wh-outsider@example.com".to_string(),
+        "hash".to_string(),
+    );
+    UserQueries::create(&f.pool, &outsider).await.unwrap();
+    let outsider_token = ApiAuth::new("test-secret")
+        .generate_token(outsider.id, &outsider.username, "developer")
+        .unwrap();
+
+    let (status, body) = post_webhook(
+        f.app.clone(),
+        &f.valid_pipeline,
+        &outsider_token,
+        webhook_payload(&f.repo_id, &commit),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["success"], false);
+    assert_eq!(body["message"], "Pipeline not found");
+    assert!(body["pipeline_id"].is_null());
+
+    // Nothing was triggered: no run, and therefore no queued job.
+    let runs = PipelineRunQueries::list(&f.pool).await.unwrap();
+    assert!(runs.is_empty(), "authorization precedes persistence");
+}
+
+/// The owner still works after the cross-tenant refusal — the check must
+/// not over-reject.
+#[tokio::test]
+async fn webhook_owner_trigger_is_unaffected_by_the_authorization_check() {
+    let f = seed().await;
+    let commit = "8".repeat(40);
+
+    let (status, body) = post_webhook(
+        f.app.clone(),
+        &f.valid_pipeline,
+        &f.owner_token,
+        webhook_payload(&f.repo_id, &commit),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["success"], true);
+
+    let runs = PipelineRunQueries::list(&f.pool).await.unwrap();
+    assert_eq!(runs.len(), 1);
+}
+
 #[tokio::test]
 async fn webhook_rejects_definitions_that_cannot_produce_an_entry_job() {
     let f = seed().await;
