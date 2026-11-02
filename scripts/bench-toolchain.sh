@@ -33,8 +33,7 @@ END_NS="$(date +%s.%N)"
 
 WALL="$(awk -v s="$START_NS" -v e="$END_NS" 'BEGIN{printf "%.2f", e-s}')"
 
-JSON_FMT='{"cell_id":"%s","command":"%s","wall_seconds":%s,"exit_code":%d,"host":"%s","timestamp_utc":"%s","git_sha":"%s","target_dir":"%s","load_avg":"%s"}\n'
-json="$(printf "$JSON_FMT" \
+json="$(printf '{"cell_id":"%s","command":"%s","wall_seconds":%s,"exit_code":%d,"host":"%s","timestamp_utc":"%s","git_sha":"%s","target_dir":"%s","load_avg":"%s"}\n' \
   "$CELL_ID" "$CMD_STR" "$WALL" "$EXIT_CODE" \
   "$HOSTNAME_NOW" "$TIMESTAMP_UTC" "$GIT_SHA" "$TARGET_DIR" "$LOAD_AVG")"
 
