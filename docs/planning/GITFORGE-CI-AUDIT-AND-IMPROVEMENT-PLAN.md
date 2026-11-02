@@ -507,3 +507,51 @@ ssh mkinney@192.168.1.202 "podman images dsc-ci-rust"
 # Trigger a specific pipeline run manually
 ssh mkinney@192.168.1.202 "cd /home/mkinney/work/gitforge-audit-20260822/runtime-repos/<repo-id> && git push local <branch>"
 ```
+
+---
+
+## Update: 2026-11-02 — live-queue incident and confirmed findings
+
+Evidence from the SWARMONE instance (this host) on the night of 2026-11-02;
+all figures read from `/var/lib/gitforge/gitforge.db` at claim time.
+
+### Confirmed: capacity-1 serialization is THE backlog mechanism
+- One online runner: `swarmone-docker` (capacity 1, heartbeat fresh).
+  `fedora-docker` (capacity 5) has been **offline since 2026-10-22** — no
+  unit installed on that host. Six pushes to backend-fixed between
+  21:52–22:07 UTC each spawned a 16-job pipeline → 109-job backlog,
+  ~23 min serial per run ≈ 2.3 h to drain at ~23 jobs/hr observed
+  throughput.
+- A 4-hour dead window (16:42–20:56 UTC, near-zero completions) with no
+  runner restart (NRestarts=0) and no error lines — cause unverified;
+  consistent with the runner simply having nothing assigned while pending
+  rows sat in the queue. The 2026-10-20 draft's capacity recommendation
+  stands, now with fresh numbers: bringing up `fedora-docker` (capacity 5,
+  NVMe 1.9T) drains bursts ~5× faster and matches the storage-placement
+  rule that CI workloads belong on Fedora.
+
+### New finding: no per-branch supersede policy
+Webhook idempotency keys on `(pipeline, commit_hash)` only
+(`crates/gitforge-api/src/routes/webhook.rs:395`); the engine cascades
+cancels on failure/manual cancel
+(`crates/gitforge-ci/src/engine.rs:601`) but nothing cancels a superseded
+SHA's queued jobs when a newer push lands. GitHub-Actions-style
+`concurrency` semantics (newest-SHA-wins per repo+branch+pipeline) would
+have cut the 109-job backlog to ~16. Feature gap, not a defect; ~30–60
+lines in the engine enqueue path plus a pinned test.
+
+### New incident: image-tag drift reds the self pipeline
+GitForge's own CI was red 2026-11-01 09:10 → 2026-11-02 22:40 UTC: the
+pipeline pinned `dsc-ci-rust:16` but the host only had tag 14; every run
+failed in `detect-changes` with a Docker 404 (pull denied, offline
+contract). Recovery: rebuilt tag 16 on Fedora from HEAD (ce06089e) per the
+storage-placement rule, shipped the tarball to SWARMONE, reran via
+`/api/pipeline-runs/{id}/rerun`. Structural remedy candidates, in order:
+(1) a pipeline-lint gate at push time that rejects `image:` tags absent
+from the runner host, or (2) CI-image builds wired into a tiny bootstrap
+pipeline so the tag always exists before the main chain needs it.
+
+### Applied security hardening (same night, commit 2fc1fa25)
+Pipeline-authored bind mounts and `working_directory` are now allowlisted
+in the sandbox (see `docs/planning/SECURITY_AUDIT_RECEIPT_2026-11-02.md`).
+No live pipeline used the dangerous paths; cache blocks pass unchanged.
