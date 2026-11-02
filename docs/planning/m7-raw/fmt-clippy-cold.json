@@ -1,0 +1,1 @@
+{"cell_id":"fmt-clippy-cold","command":"bash -c cargo\ fmt\ --all\ --check\ \&\&\ cargo\ clippy\ --workspace\ --all-targets\ --\ -D\ warnings ","wall_seconds":63.55,"exit_code":0,"host":"SWARMONE","timestamp_utc":"2026-11-01T07:53:11Z","git_sha":"d476baf7","target_dir":"/var/tmp/gitforge-target","load_avg":"31.76 28.26 35.10"}
