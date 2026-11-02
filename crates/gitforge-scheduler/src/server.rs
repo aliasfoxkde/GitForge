@@ -251,9 +251,7 @@ async fn require_registration_auth(
         .flatten()
         .collect();
     if accepted.is_empty() {
-        tracing::error!(
-            "runner registration refused: no registration credential is configured"
-        );
+        tracing::error!("runner registration refused: no registration credential is configured");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "registration_disabled"})),
@@ -2047,9 +2045,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        let response = register(app.clone(), None, "anonymous")
-            .await
-            .unwrap();
+        let response = register(app.clone(), None, "anonymous").await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         // The registration token must not authorize the job lifecycle: it is
