@@ -863,7 +863,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("  Run `gitforge pipeline create <name>` to create a pipeline.");
                     }
                     Err(e) => {
-                        println!("❌ {e}");
+                        anyhow::bail!("failed to list pipelines: {e}");
                     }
                 }
             } else if let Some(id) = show {
@@ -875,7 +875,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         println!("   Enabled: {}", pipeline.enabled);
                     }
                     Err(e) => {
-                        println!("❌ {e}");
+                        anyhow::bail!("failed to fetch pipeline {id}: {e}");
                     }
                 }
             } else if let Some(id) = run {
@@ -887,18 +887,26 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                                 println!("   Run: {run_id}");
                                 println!("   Watch it: gitforge pipeline --watch {run_id}");
                             }
-                            None => println!(
-                                "   Accepted, but the orchestrator did not schedule a run \
-                                 (pipeline may not be registered with the scheduler)"
-                            ),
+                            None => {
+                                anyhow::bail!(
+                                    "pipeline {id} accepted the trigger, but the orchestrator \
+                                     did not schedule a run (pipeline may not be registered \
+                                     with the scheduler)"
+                                );
+                            }
                         }
                     }
-                    Err(e) => println!("❌ {e}"),
+                    Err(e) => anyhow::bail!("failed to trigger pipeline {id}: {e}"),
                 }
             } else if let Some(run_id) = watch {
                 match watch_pipeline_run(&api_client, run_id).await {
-                    Ok(status) => println!("👁️  Run {run_id} finished: {status}"),
-                    Err(e) => println!("❌ {e}"),
+                    Ok(status) => {
+                        println!("👁️  Run {run_id} finished: {status}");
+                        if status != "succeeded" {
+                            anyhow::bail!("run {run_id} finished with status: {status}");
+                        }
+                    }
+                    Err(e) => anyhow::bail!("failed to watch run {run_id}: {e}"),
                 }
             } else if let Some(repo) = create {
                 let path = create_file.as_deref().unwrap_or(".gitforge.yml");
@@ -909,9 +917,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             println!("   ID: {}", pipeline.id);
                             println!("   Run it: gitforge pipeline --run {}", pipeline.id);
                         }
-                        Err(e) => println!("❌ {e}"),
+                        Err(e) => anyhow::bail!("failed to create pipeline: {e}"),
                     },
-                    Err(e) => println!("❌ Failed to read {path}: {e}"),
+                    Err(e) => anyhow::bail!("failed to read {path}: {e}"),
                 }
             } else if let Some(id) = delete {
                 match api_client.delete_pipeline(id).await {
@@ -922,7 +930,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             .unwrap_or("pipeline removed");
                         println!("🗑️  Pipeline {id}: {message}");
                     }
-                    Err(e) => println!("❌ {e}"),
+                    Err(e) => anyhow::bail!("failed to delete pipeline {id}: {e}"),
                 }
             }
         }
@@ -1465,6 +1473,10 @@ mod tests {
         }
     }
 
+    fn test_command(command: Commands) -> Commands {
+        command
+    }
+
     #[tokio::test]
     async fn test_auth_status_not_authenticated() {
         let cli = test_cli(Commands::Auth {
@@ -1580,19 +1592,30 @@ mod tests {
         assert!(run_cli(cli).await.is_ok());
     }
 
+    /// An address nothing can listen on: the API call must surface as an
+    /// error now that command arms propagate failures instead of printing.
+    fn unreachable() -> Option<String> {
+        Some("http://127.0.0.1:1".to_string())
+    }
+
     #[tokio::test]
-    async fn test_pipeline_list() {
-        let cli = test_cli(Commands::Pipeline {
-            list: true,
-            show: None,
-            run: None,
-            ref_: None,
-            watch: None,
-            create: None,
-            file: None,
-            delete: None,
-        });
-        assert!(run_cli(cli).await.is_ok());
+    async fn test_pipeline_list_unreachable_server_is_err() {
+        let cli = Cli {
+            verbose: false,
+            server: unreachable(),
+            token: None,
+            command: test_command(Commands::Pipeline {
+                list: true,
+                show: None,
+                run: None,
+                ref_: None,
+                watch: None,
+                create: None,
+                file: None,
+                delete: None,
+            }),
+        };
+        assert!(run_cli(cli).await.is_err());
     }
 
     #[tokio::test]
@@ -1754,77 +1777,102 @@ mod tests {
 
     #[tokio::test]
     async fn test_pipeline_show() {
-        let cli = test_cli(Commands::Pipeline {
-            list: false,
-            show: Some("pipeline-123".to_string()),
-            run: None,
-            ref_: None,
-            watch: None,
-            create: None,
-            file: None,
-            delete: None,
-        });
-        assert!(run_cli(cli).await.is_ok());
+        let cli = Cli {
+            verbose: false,
+            server: unreachable(),
+            token: None,
+            command: test_command(Commands::Pipeline {
+                list: false,
+                show: Some("pipeline-123".to_string()),
+                run: None,
+                ref_: None,
+                watch: None,
+                create: None,
+                file: None,
+                delete: None,
+            }),
+        };
+        assert!(run_cli(cli).await.is_err());
     }
 
     #[tokio::test]
     async fn test_pipeline_run() {
-        let cli = test_cli(Commands::Pipeline {
-            list: false,
-            show: None,
-            run: Some("pipeline-123".to_string()),
-            ref_: None,
-            watch: None,
-            create: None,
-            file: None,
-            delete: None,
-        });
-        assert!(run_cli(cli).await.is_ok());
+        let cli = Cli {
+            verbose: false,
+            server: unreachable(),
+            token: None,
+            command: test_command(Commands::Pipeline {
+                list: false,
+                show: None,
+                run: Some("pipeline-123".to_string()),
+                ref_: None,
+                watch: None,
+                create: None,
+                file: None,
+                delete: None,
+            }),
+        };
+        assert!(run_cli(cli).await.is_err());
     }
 
     #[tokio::test]
     async fn test_pipeline_watch() {
-        let cli = test_cli(Commands::Pipeline {
-            list: false,
-            show: None,
-            run: None,
-            ref_: None,
-            watch: Some("pipeline-123".to_string()),
-            create: None,
-            file: None,
-            delete: None,
-        });
-        assert!(run_cli(cli).await.is_ok());
+        let cli = Cli {
+            verbose: false,
+            server: unreachable(),
+            token: None,
+            command: test_command(Commands::Pipeline {
+                list: false,
+                show: None,
+                run: None,
+                ref_: None,
+                watch: Some("pipeline-123".to_string()),
+                create: None,
+                file: None,
+                delete: None,
+            }),
+        };
+        assert!(run_cli(cli).await.is_err());
     }
 
     #[tokio::test]
     async fn test_pipeline_create() {
-        let cli = test_cli(Commands::Pipeline {
-            list: false,
-            show: None,
-            run: None,
-            ref_: None,
-            watch: None,
-            create: Some("new-pipeline".to_string()),
-            file: None,
-            delete: None,
-        });
-        assert!(run_cli(cli).await.is_ok());
+        let cli = Cli {
+            verbose: false,
+            server: unreachable(),
+            token: None,
+            command: test_command(Commands::Pipeline {
+                list: false,
+                show: None,
+                run: None,
+                ref_: None,
+                watch: None,
+                create: Some("new-pipeline".to_string()),
+                file: None,
+                delete: None,
+            }),
+        };
+        assert!(run_cli(cli).await.is_err());
     }
 
     #[tokio::test]
     async fn test_pipeline_delete() {
-        let cli = test_cli(Commands::Pipeline {
-            list: false,
-            show: None,
-            run: None,
-            ref_: None,
-            watch: None,
-            create: None,
-            file: None,
-            delete: Some("pipeline-123".to_string()),
-        });
-        assert!(run_cli(cli).await.is_ok());
+        let cli = Cli {
+            verbose: false,
+            server: unreachable(),
+            token: None,
+            command: test_command(Commands::Pipeline {
+                list: false,
+                show: None,
+                run: None,
+                ref_: None,
+                watch: None,
+                create: None,
+                file: None,
+                delete: Some("pipeline-123".to_string()),
+            }),
+        };
+        assert!(run_cli(cli).await.is_err());
     }
 
     #[tokio::test]
