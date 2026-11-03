@@ -152,11 +152,12 @@ async fn test_metrics_endpoint() {
     // served behind the auth middleware (F5) and must reject anonymous
     // access. The wiring boundary (route placement, not just the
     // middleware decision) is what this test pins.
+    let pool = Pool::memory().await.unwrap();
     let _guard = TELEMETRY_ENV_LOCK.lock().unwrap();
     unsafe { std::env::remove_var("GITFORGE_PUBLIC_TELEMETRY") };
-    let pool = Pool::memory().await.unwrap();
     let server = ApiServer::new("test-secret", pool);
     let app = server.into_router();
+    drop(_guard);
 
     // Request metrics
     let response = app
@@ -688,11 +689,12 @@ async fn test_delete_nonexistent_repo() {
 #[tokio::test]
 async fn test_dashboard_endpoint() {
     // Default posture: authenticated only (F5 wiring boundary).
+    let pool = Pool::memory().await.unwrap();
     let _guard = TELEMETRY_ENV_LOCK.lock().unwrap();
     unsafe { std::env::remove_var("GITFORGE_PUBLIC_TELEMETRY") };
-    let pool = Pool::memory().await.unwrap();
     let server = ApiServer::new("test-secret", pool);
     let app = server.into_router();
+    drop(_guard);
 
     let response = app
         .oneshot(
@@ -710,11 +712,12 @@ async fn test_dashboard_endpoint() {
 #[tokio::test]
 async fn test_dashboard_endpoint_public_opt_in() {
     // Operator opt-in keeps both telemetry surfaces public.
+    let pool = Pool::memory().await.unwrap();
     let _guard = TELEMETRY_ENV_LOCK.lock().unwrap();
     unsafe { std::env::set_var("GITFORGE_PUBLIC_TELEMETRY", "1") };
-    let pool = Pool::memory().await.unwrap();
     let server = ApiServer::new("test-secret", pool);
     let app = server.into_router();
+    drop(_guard);
 
     let response = app
         .oneshot(
