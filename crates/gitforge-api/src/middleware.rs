@@ -19,7 +19,7 @@ const PUBLIC_PATHS: &[&str] = &["/health", "/metrics", "/swagger-ui", "/api-docs
 /// instance the aggregate counters leak activity to anonymous parties, so
 /// the default is authenticated access. `/health` stays public either way
 /// — a liveness probe carries no instance data (F5).
-fn telemetry_is_public(raw: Option<&str>) -> bool {
+pub(crate) fn telemetry_is_public(raw: Option<&str>) -> bool {
     matches!(raw, Some(v) if v.trim() == "1")
 }
 
