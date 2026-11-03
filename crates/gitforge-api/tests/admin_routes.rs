@@ -226,7 +226,11 @@ async fn runner_listing_requires_auth_and_shows_registered_runners() {
     let (status, _) = get_json(f.app.clone(), "/api/runners", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    let (status, body) = get_json(f.app.clone(), "/api/runners", Some(&f.developer_token)).await;
+    // Runner inventory is maintainer/admin-only (2026-11-02 authz audit F3).
+    let (status, _) = get_json(f.app.clone(), "/api/runners", Some(&f.developer_token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = get_json(f.app.clone(), "/api/runners", Some(&f.admin_token)).await;
     assert_eq!(status, StatusCode::OK);
     let runners = body.as_array().unwrap();
     assert_eq!(runners.len(), 1);
@@ -259,10 +263,18 @@ async fn get_runner_validates_the_id_and_missing_rows() {
 
     let runner = Runner::new("visible-runner".to_string(), RunnerType::BareMetal, 8);
     RunnerQueries::create(&f.pool, &runner).await.unwrap();
-    let (status, body) = get_json(
+    // Single-runner reads carry the same maintainer/admin gate.
+    let (status, _) = get_json(
         f.app.clone(),
         &format!("/api/runners/{}", runner.id),
         Some(&f.developer_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = get_json(
+        f.app.clone(),
+        &format!("/api/runners/{}", runner.id),
+        Some(&f.admin_token),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
