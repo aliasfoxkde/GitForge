@@ -43,6 +43,9 @@ pub struct RunnerConfig {
     pub fetch_interval_secs: u64,
     /// Bearer token used for scheduler service authentication.
     pub scheduler_token: Option<String>,
+    /// Bearer token for runner registration (#357). Falls back to
+    /// `scheduler_token` when unset.
+    pub registration_token: Option<String>,
     /// Registration attempts against an unreachable scheduler before giving
     /// up. Covers the compose race where a runner starts before the
     /// scheduler's listener is up.
@@ -91,6 +94,10 @@ impl fmt::Debug for RunnerConfig {
                 "scheduler_token",
                 &self.scheduler_token.as_ref().map(|_| "<redacted>"),
             )
+            .field(
+                "registration_token",
+                &self.registration_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("register_attempts", &self.register_attempts)
             .field("register_backoff_secs", &self.register_backoff_secs)
             .field("allow_standalone", &self.allow_standalone)
@@ -111,6 +118,7 @@ impl Default for RunnerConfig {
             job_heartbeat_interval_secs: 15,
             fetch_interval_secs: 5,
             scheduler_token: None,
+            registration_token: None,
             register_attempts: 6,
             register_backoff_secs: 1,
             allow_standalone: false,
@@ -151,6 +159,7 @@ impl RunnerConfig {
         let mut job_heartbeat_interval_secs: Option<u64> = None;
         let mut fetch_interval_secs: Option<u64> = None;
         let mut scheduler_token: Option<Option<String>> = None;
+        let mut registration_token: Option<Option<String>> = None;
         let mut register_attempts: Option<u32> = None;
         let mut register_backoff_secs: Option<u64> = None;
         let mut allow_standalone: Option<bool> = None;
@@ -239,6 +248,14 @@ impl RunnerConfig {
                         Some(v.to_string())
                     });
                 }
+                "GITFORGE_RUNNER_REGISTRATION_TOKEN" => {
+                    let v = value.trim();
+                    registration_token = Some(if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.to_string())
+                    });
+                }
                 "GITFORGE_REGISTER_ATTEMPTS" => {
                     let v = value.trim();
                     if !v.is_empty() {
@@ -306,6 +323,7 @@ impl RunnerConfig {
             job_heartbeat_interval_secs: job_heartbeat_interval_secs.unwrap_or(15),
             fetch_interval_secs: fetch_interval_secs.unwrap_or(5),
             scheduler_token: scheduler_token.unwrap_or(None),
+            registration_token: registration_token.unwrap_or(None),
             register_attempts: register_attempts.unwrap_or(6),
             register_backoff_secs: register_backoff_secs.unwrap_or(1),
             allow_standalone: allow_standalone.unwrap_or(false),
@@ -326,6 +344,8 @@ impl RunnerConfig {
     ///
     /// **Optional credentials** (no default — runner runs unauthenticated if unset):
     /// - `GITFORGE_SCHEDULER_TOKEN`  — bearer token for scheduler API
+    /// - `GITFORGE_RUNNER_REGISTRATION_TOKEN` — bearer token for runner
+    ///   registration (#357); falls back to `GITFORGE_SCHEDULER_TOKEN`
     ///
     /// **Optional policy:**
     /// - `GITFORGE_RUNNER_STANDALONE` — `deny` (default) makes registration
@@ -386,6 +406,33 @@ mod config_tests {
         assert_eq!(cfg.fetch_interval_secs, 10);
         assert_eq!(cfg.scheduler_token.as_deref(), Some("secret-token"));
         assert_eq!(cfg.runner_type, "docker");
+    }
+
+    /// Registration token parsing (#357): explicit value wins, empty value
+    /// means unset (falls back to the scheduler token), absent means unset.
+    #[test]
+    fn test_parse_registration_token() {
+        let cfg = RunnerConfig::parse_from_iter(env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://ci:42781")),
+            ("GITFORGE_SCHEDULER_TOKEN", Some("job-token")),
+            ("GITFORGE_RUNNER_REGISTRATION_TOKEN", Some("reg-token")),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.registration_token.as_deref(), Some("reg-token"));
+
+        let cfg = RunnerConfig::parse_from_iter(env([
+            ("GITFORGE_SCHEDULER_URL", Some("http://ci:42781")),
+            ("GITFORGE_RUNNER_REGISTRATION_TOKEN", Some("")),
+        ]))
+        .unwrap();
+        assert!(cfg.registration_token.is_none());
+
+        let cfg = RunnerConfig::parse_from_iter(env([(
+            "GITFORGE_SCHEDULER_URL",
+            Some("http://ci:42781"),
+        )]))
+        .unwrap();
+        assert!(cfg.registration_token.is_none());
     }
 
     // ── Optional fields absent → defaults ───────────────────────────────────
@@ -882,7 +929,15 @@ impl RunnerAgent {
 
         for attempt in 1..=attempts {
             let mut register_request = self.client.post(&register_url).json(&request);
-            if let Some(token) = &self.config.scheduler_token {
+            // Registration authenticates with the dedicated registration
+            // token; the scheduler job token is the fallback so a deployment
+            // with one shared secret keeps working.
+            let registration_token = self
+                .config
+                .registration_token
+                .as_deref()
+                .or(self.config.scheduler_token.as_deref());
+            if let Some(token) = registration_token {
                 register_request = register_request.bearer_auth(token);
             }
             match register_request.send().await {
@@ -2462,6 +2517,7 @@ mod tests {
         // Registration failure is fatal by default: a runner must not appear
         // healthy when it cannot reach the scheduler that assigns it work.
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: "http://localhost:99999".to_string(), // Invalid URL
             register_attempts: 1, // no retries: keeps this test instantaneous
             ..Default::default()
@@ -2484,6 +2540,7 @@ mod tests {
         // Legacy standalone fallback remains available behind an explicit
         // policy opt-in.
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: "http://localhost:99999".to_string(),
             register_attempts: 1, // no retries: keeps this test instantaneous
             allow_standalone: true,
@@ -2564,6 +2621,7 @@ mod tests {
         // and adopt the runner id once the scheduler accepts.
         let (url, connections) = spawn_status_server(&[503, 503, 201]).await;
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: url,
             register_attempts: 5,
             register_backoff_secs: 0,
@@ -2589,6 +2647,7 @@ mod tests {
         // is made and the error names the authentication failure.
         let (url, connections) = spawn_status_server(&[401]).await;
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: url,
             register_attempts: 5,
             register_backoff_secs: 0,
@@ -2622,6 +2681,7 @@ mod tests {
         drop(reserved);
 
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: format!("http://127.0.0.1:{port}"),
             register_attempts: 3,
             register_backoff_secs: 0,
@@ -2705,6 +2765,7 @@ mod tests {
     #[test]
     fn test_runner_config_custom_values() {
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: "http://custom:8081".to_string(),
             name: "custom-runner".to_string(),
             runner_type: "kubernetes".to_string(),
@@ -2950,6 +3011,7 @@ mod tests {
             return;
         }
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: "http://localhost:99999".to_string(),
             allow_standalone: true,
             ..Default::default()
@@ -2969,6 +3031,7 @@ mod tests {
     #[test]
     fn test_runner_config_all_fields() {
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: "http://example.com:8081".to_string(),
             name: "test-runner".to_string(),
             runner_type: "firecracker".to_string(),
@@ -3085,6 +3148,7 @@ mod tests {
             return;
         }
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: "http://localhost:99999".to_string(),
             allow_standalone: true,
             ..Default::default()
@@ -3110,6 +3174,7 @@ mod tests {
     #[test]
     fn test_runner_config_with_zero_capacity() {
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: "http://localhost:42781".to_string(),
             name: "zero-cap".to_string(),
             runner_type: "docker".to_string(),
@@ -3203,6 +3268,7 @@ mod tests {
     #[test]
     fn test_runner_config_with_special_url() {
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: "http://user:pass@host:9090/path".to_string(),
             name: "special-url-runner".to_string(),
             runner_type: "docker".to_string(),
@@ -3239,6 +3305,7 @@ mod tests {
             return;
         }
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: "http://custom-scheduler:8081".to_string(),
             name: "custom-runner".to_string(),
             runner_type: "kubernetes".to_string(),
@@ -3298,6 +3365,7 @@ mod tests {
             return;
         }
         let config = RunnerConfig {
+            registration_token: None,
             scheduler_url: "http://localhost:99999".to_string(),
             allow_standalone: true,
             ..Default::default()

@@ -3,6 +3,7 @@
 //! Allows external services to trigger pipeline runs via webhooks.
 
 use crate::middleware::AuthenticatedUser;
+use crate::routes::ci::authorize_repo;
 use axum::{
     extract::{Extension, Path},
     http::StatusCode,
@@ -212,7 +213,7 @@ pub fn webhook_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 async fn trigger_pipeline(
     Extension(pool): Extension<Arc<Pool>>,
     ci_trigger: Option<Extension<Arc<CiTriggerClient>>>,
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     Path(pipeline_id): Path<String>,
     Json(payload): Json<WebhookTriggerPayload>,
 ) -> impl IntoResponse {
@@ -255,6 +256,29 @@ async fn trigger_pipeline(
                         .into_response();
                 }
             };
+
+            // The caller must own the pipeline's repository. Without this,
+            // any authenticated instance user could enumerate pipeline UUIDs
+            // and trigger CI runs (arbitrary command execution on the runner)
+            // against repositories they do not own.
+            if let Err(status) = authorize_repo(&pool, &user.claims, pipeline.repo_id).await {
+                // Collapse "forbidden" into "not found" so a non-owner cannot
+                // probe for the existence of another tenant's pipeline.
+                let status = if status == StatusCode::FORBIDDEN {
+                    StatusCode::NOT_FOUND
+                } else {
+                    status
+                };
+                return (
+                    status,
+                    Json(WebhookTriggerResponse {
+                        success: false,
+                        message: "Pipeline not found".to_string(),
+                        pipeline_id: None,
+                    }),
+                )
+                    .into_response();
+            }
 
             if let Some(Extension(client)) = ci_trigger {
                 match client

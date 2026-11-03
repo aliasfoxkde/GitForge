@@ -1182,7 +1182,11 @@ async fn test_api_runner_registration_adopts_existing_name() {
         .await
         .unwrap();
 
-    let server = ApiServer::new("test-secret", pool);
+    let server = ApiServer::with_registration_token(
+        "test-secret",
+        pool,
+        Some(std::sync::Arc::new("integration-registration".to_string())),
+    );
     let app = server.into_router();
     let auth = ApiAuth::new("test-secret");
     let token = auth
@@ -1197,6 +1201,7 @@ async fn test_api_runner_registration_adopts_existing_name() {
                 .method("POST")
                 .uri("/api/runners")
                 .header("content-type", "application/json")
+                .header("Authorization", "Bearer integration-registration")
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -1215,6 +1220,7 @@ async fn test_api_runner_registration_adopts_existing_name() {
                 .method("POST")
                 .uri("/api/runners")
                 .header("content-type", "application/json")
+                .header("Authorization", "Bearer integration-registration")
                 .body(Body::from(body))
                 .unwrap(),
         )

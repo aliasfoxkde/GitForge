@@ -27,6 +27,11 @@ pub struct SchedulerServerState {
     pub scheduler: Arc<Scheduler>,
     runner_auth_token: Option<Arc<str>>,
     operator_auth_token: Option<Arc<str>>,
+    /// Alternate credential accepted only on `POST /runners`
+    /// (`GITFORGE_RUNNER_REGISTRATION_TOKEN`, #357). A deployment can rotate
+    /// the runner job token without re-provisioning every runner, and the
+    /// registration secret never authorizes job fetch/complete/heartbeat.
+    registration_auth_token: Option<Arc<str>>,
     artifact_storage: Option<Arc<FileStorage>>,
 }
 
@@ -114,6 +119,12 @@ pub fn create_state_with_artifact_storage(
         .filter(|token| !token.is_empty())
         .map(Arc::from)
         .or_else(|| shared.clone());
+    // The dedicated registration token is read here (not in the CI service)
+    // so the credential decision stays inside the crate that enforces it.
+    let registration = std::env::var("GITFORGE_RUNNER_REGISTRATION_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(Arc::from);
     let operator = std::env::var("GITFORGE_SCHEDULER_OPERATOR_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())
@@ -123,6 +134,7 @@ pub fn create_state_with_artifact_storage(
         scheduler: Arc::new(scheduler),
         runner_auth_token: runner,
         operator_auth_token: operator,
+        registration_auth_token: registration,
         artifact_storage,
     }
 }
@@ -152,8 +164,9 @@ pub fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
     runner_auth_token: Option<Arc<str>>,
     operator_auth_token: Option<Arc<str>>,
 ) -> Router<S> {
+    let registration_auth_token = state.registration_auth_token.clone();
+    let lifecycle_runner_token = runner_auth_token.clone();
     let runner_routes = Router::new()
-        .route("/runners", post(register_runner))
         .route("/runners/{id}/heartbeat", post(runner_heartbeat))
         .route("/jobs/pending", get(get_pending_jobs))
         .route("/queue/status", get(get_queue_status))
@@ -166,7 +179,20 @@ pub fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
         .route("/jobs/{id}/cancelled", get(job_cancelled))
         .route("/jobs/{id}/complete", post(complete_job))
         .layer(middleware::from_fn(move |request, next: Next| {
-            require_scheduler_auth(request, next, runner_auth_token.clone(), "runner")
+            require_scheduler_auth(request, next, lifecycle_runner_token.clone(), "runner")
+        }));
+    // Registration is its own credential scope: it accepts the runner token
+    // (back-compat) or the dedicated registration token (#357), but the
+    // registration token must not reach job lifecycle routes.
+    let registration_routes = Router::new()
+        .route("/runners", post(register_runner))
+        .layer(middleware::from_fn(move |request, next: Next| {
+            require_registration_auth(
+                request,
+                next,
+                runner_auth_token.clone(),
+                registration_auth_token.clone(),
+            )
         }));
     let operator_routes = Router::new()
         .route("/jobs/{id}/cancel", post(cancel_job))
@@ -175,7 +201,10 @@ pub fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
         .layer(middleware::from_fn(move |request, next: Next| {
             require_scheduler_auth(request, next, operator_auth_token.clone(), "operator")
         }));
-    runner_routes.merge(operator_routes).with_state(state)
+    runner_routes
+        .merge(registration_routes)
+        .merge(operator_routes)
+        .with_state(state)
 }
 
 async fn require_scheduler_auth(
@@ -197,6 +226,44 @@ async fn require_scheduler_auth(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
     if supplied == Some(&format!("Bearer {expected}")) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "scheduler_auth_required"})),
+        )
+            .into_response()
+    }
+}
+
+/// Registration bootstrap credential check (#357): accepts the runner job
+/// token (single-secret deployments) or the dedicated registration token.
+/// When neither is configured the endpoint fails closed with 503, mirroring
+/// the gateway's registration-disabled contract.
+async fn require_registration_auth(
+    request: Request,
+    next: Next,
+    runner_token: Option<Arc<str>>,
+    registration_token: Option<Arc<str>>,
+) -> Response {
+    let accepted: Vec<Arc<str>> = [runner_token, registration_token]
+        .into_iter()
+        .flatten()
+        .collect();
+    if accepted.is_empty() {
+        tracing::error!("runner registration refused: no registration credential is configured");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "registration_disabled"})),
+        )
+            .into_response();
+    }
+    let supplied = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if supplied.is_some_and(|token| accepted.iter().any(|entry| &**entry == token)) {
         next.run(request).await
     } else {
         (
@@ -1882,6 +1949,7 @@ mod tests {
             scheduler: Arc::new(crate::Scheduler::new()),
             runner_auth_token: Some(Arc::from("runner-secret")),
             operator_auth_token: Some(Arc::from("operator-secret")),
+            registration_auth_token: None,
             artifact_storage: None,
         }
     }
@@ -1925,6 +1993,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Registration credential contract (#357): the dedicated registration
+    /// token registers, a wrong token is refused, the registration token
+    /// never reaches job lifecycle routes, and with no credential configured
+    /// the endpoint fails closed with 503.
+    #[tokio::test]
+    async fn test_registration_token_scoping() {
+        let state = SchedulerServerState {
+            scheduler: Arc::new(crate::Scheduler::new()),
+            runner_auth_token: Some(Arc::from("runner-secret")),
+            operator_auth_token: Some(Arc::from("operator-secret")),
+            registration_auth_token: Some(Arc::from("registration-secret")),
+            artifact_storage: None,
+        };
+        let app: Router = scheduler_routes_with_tokens(
+            state,
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+
+        let payload = |name: &str| {
+            axum::body::Body::from(
+                serde_json::json!({"name": name, "type": "docker", "capacity": 1}).to_string(),
+            )
+        };
+        let register = |app: Router, token: Option<&str>, name: &str| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/runners")
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                builder = builder.header("authorization", format!("Bearer {token}"));
+            }
+            app.oneshot(builder.body(payload(name)).unwrap())
+        };
+
+        let response = register(app.clone(), Some("registration-secret"), "reg-token-runner")
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = register(app.clone(), Some("runner-secret"), "runner-token-reg")
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = register(app.clone(), Some("wrong-secret"), "attacker")
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = register(app.clone(), None, "anonymous").await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The registration token must not authorize the job lifecycle: it is
+        // a bootstrap credential, not a runner credential.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/jobs/pending")
+                    .header("authorization", "Bearer registration-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_registration_without_credentials_fails_closed() {
+        let state = SchedulerServerState {
+            scheduler: Arc::new(crate::Scheduler::new()),
+            runner_auth_token: None,
+            operator_auth_token: None,
+            registration_auth_token: None,
+            artifact_storage: None,
+        };
+        let app: Router = scheduler_routes_with_tokens(state, None, None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runners")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"name": "orphan", "type": "docker"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -1988,6 +2150,7 @@ mod tests {
             scheduler: Arc::new(crate::Scheduler::with_db(pool)),
             runner_auth_token: Some(Arc::from("runner-secret")),
             operator_auth_token: Some(Arc::from("operator-secret")),
+            registration_auth_token: None,
             artifact_storage: None,
         };
         let app: Router = scheduler_routes_with_tokens(

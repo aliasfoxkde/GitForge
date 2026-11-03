@@ -105,7 +105,7 @@ pub(crate) fn can_manage_jobs(claims: &Claims) -> bool {
 }
 
 /// Require ownership of a repository, with admin/maintainer override.
-async fn authorize_repo(
+pub(crate) async fn authorize_repo(
     pool: &Pool,
     claims: &Claims,
     repo_id: gitforge_common::RepoId,
