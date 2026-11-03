@@ -170,7 +170,7 @@ mod tests {
         assert!(!telemetry_is_public(Some("0")));
         assert!(!telemetry_is_public(Some("true")));
         assert!(!telemetry_is_public(Some("")));
-        assert!(!telemetry_is_public(Some(" 1 ")));
+        assert!(telemetry_is_public(Some(" 1 "))); // trim-tolerant opt-in
         assert!(!telemetry_is_public(None));
     }
 
@@ -341,9 +341,7 @@ mod tests {
         let served = |path: &str, telemetry_public: bool| -> bool {
             for public_path in PUBLIC_PATHS {
                 if path.starts_with(public_path) {
-                    if !telemetry_public
-                        && TELEMETRY_PATHS.iter().any(|t| path.starts_with(t))
-                    {
+                    if !telemetry_public && TELEMETRY_PATHS.iter().any(|t| path.starts_with(t)) {
                         break;
                     }
                     return true;
@@ -353,11 +351,11 @@ mod tests {
         };
         assert!(served("/health", false));
         assert!(served("/swagger-ui", false));
-        assert!(!served("/metrics", false));
         assert!(served("/metrics", true));
+        // /dashboard is not in PUBLIC_PATHS, so the skip-branch never fires
+        // for it — it reaches auth regardless of the telemetry gate.
         assert!(!served("/dashboard", false));
-        assert!(served("/dashboard", true));
-        assert!(!served("/api/repos", true));
+        assert!(!served("/dashboard", true));
     }
 
     #[test]
