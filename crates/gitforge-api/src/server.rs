@@ -109,8 +109,8 @@ impl ApiServer {
         let telemetry_public = crate::middleware::telemetry_is_public(
             std::env::var("GITFORGE_PUBLIC_TELEMETRY").ok().as_deref(),
         );
+        let metrics_router = Router::new().route("/metrics", get(metrics_handler));
         let health = Router::new().route("/health", get(health_check));
-        let metrics = Router::new().route("/metrics", get(metrics_handler));
         let swagger = Router::new()
             .route("/swagger-ui", get(crate::openapi::swagger_ui))
             .route("/api-docs/openapi.json", get(crate::openapi::openapi_spec));
@@ -120,7 +120,7 @@ impl ApiServer {
         public_routes = public_routes.merge(swagger);
         if telemetry_public {
             let dashboard = crate::dashboard::dashboard_routes();
-            public_routes = public_routes.merge(metrics).merge(dashboard);
+            public_routes = public_routes.merge(metrics_router.clone()).merge(dashboard);
         }
         // Runner registration is unauthenticated by design (the runner
         // proves itself with its registration token inside the handler), so
@@ -168,7 +168,7 @@ impl ApiServer {
             .merge(review_routes());
         if !telemetry_public {
             let dashboard = crate::dashboard::dashboard_routes();
-            protected_routes = protected_routes.merge(metrics).merge(dashboard);
+            protected_routes = protected_routes.merge(metrics_router).merge(dashboard);
         }
         let protected_routes = protected_routes
             // Authenticate once at the protected-route boundary. Individual
