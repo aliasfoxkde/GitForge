@@ -2727,6 +2727,7 @@ mod tests {
                 finished_at: None,
                 created_at: chrono::Utc::now(),
                 error: None,
+                ref_name: None,
             },
         )
         .await

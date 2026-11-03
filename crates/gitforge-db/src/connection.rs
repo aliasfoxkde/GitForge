@@ -432,6 +432,7 @@ impl Pool {
                 finished_at TEXT,
                 created_at TEXT NOT NULL,
                 error TEXT,
+                ref_name TEXT,
                 FOREIGN KEY (pipeline_id) REFERENCES pipelines(id),
                 FOREIGN KEY (repo_id) REFERENCES repositories(id)
             )
@@ -447,7 +448,10 @@ impl Pool {
         // process log, which is unreadable after the fact. SQLite has no
         // portable IF NOT EXISTS form for ADD COLUMN, so tolerate only the
         // known duplicate-column case.
-        for statement in ["ALTER TABLE pipeline_runs ADD COLUMN error TEXT"] {
+        for statement in [
+            "ALTER TABLE pipeline_runs ADD COLUMN error TEXT",
+            "ALTER TABLE pipeline_runs ADD COLUMN ref_name TEXT",
+        ] {
             if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
                 if !error.to_string().contains("duplicate column name") {
                     return Err(Error::database(format!(

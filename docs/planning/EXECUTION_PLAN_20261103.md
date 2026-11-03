@@ -4,6 +4,28 @@ Systematic sweep of the remaining GitForge audit findings and operational
 gaps, worked end to end. All state claims below were read from the
 authoritative stores (gitforge.db, the API, the filesystem) at claim time.
 
+## Session update (later, 2026-11-03)
+
+- **F5 RESOLVED**: `/metrics` and `/dashboard` require auth unless
+  `GITFORGE_PUBLIC_TELEMETRY=1` (`crates/gitforge-api/src/middleware.rs`);
+  decision core + middleware-branch unit tests added. `/health` stays
+  public.
+- **F4 WONTFIX (design decision recorded)**: instance-wide role model kept
+  deliberately; verdict in
+  `docs/planning/20261101-minimax-audit-authz.md` §Dispositions.
+- **A1 complete**: the three release-gate skip tests landed in
+  `tests/test_release_gate.py` (21 tests / 39 subtests green); the gate's
+  unconditional-job check now accepts satisfied (succeeded *or* skipped)
+  rows — quality-chain names remain fails-closed via the dedicated check.
+- **ref_name column landed** on `integrate/audit-fixes-20261102`:
+  `pipeline_runs.ref_name` (new column + tolerated-duplicate migration),
+  webhook/ci paths populate it, supersede filters by it.
+- **Ledger verdicts recorded** for the 2026-11-02 findings
+  (`GITFORGE-CI-AUDIT-AND-IMPROVEMENT-PLAN.md` §Verdicts).
+- Merge order fixed: PR #365 (F1/F2, MERGEABLE) → PR #362 (blank
+  timestamps, MERGEABLE) → `integrate/audit-fixes-20261102` → release cut.
+
+
 ## Completed this session
 
 | Item | Evidence |
@@ -56,3 +78,19 @@ authoritative stores (gitforge.db, the API, the filesystem) at claim time.
 - Quality roadmap (A/B/C phases): `docs/planning/QUALITY_ROADMAP_2026-10-25.md`
 - Queue incident + supersede rationale:
   `docs/planning/GITFORGE-CI-AUDIT-AND-IMPROVEMENT-PLAN.md` §Update 2026-11-02
+
+## Architecture audit (2026-11-03, static)
+
+Ship-blocking: none — no unwrap/expect in production code, zero
+TODO/FIXME, WAL+busy_timeout discipline held, raw SQL confined to
+gitforge-db/cas.
+
+Next cycle (ordered):
+1. Split `crates/gitforge-db/src/queries.rs` (7,253 lines, 193 fns) into
+   per-aggregate modules under `src/queries/` — mechanical, no API change.
+2. Docs: add `docs/PROJECT_STRUCTURE.md`/`CONVENTIONS.md` or record the
+   exception (scaffolding rule).
+3. Execute roadmap C1: archive superseded plan generations with pointers.
+4. Move the image-allowlist env read (gitforge-ci engine.rs) to the edge,
+   matching the decision-core rule.
+5. Coverage Phase B: re-baseline in-sandbox before any threshold change.

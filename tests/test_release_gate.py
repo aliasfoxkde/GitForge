@@ -200,7 +200,7 @@ class ReleaseGateContractTests(unittest.TestCase):
                 "2026-10-06T10:00:00Z", "2026-10-06T10:06:00Z",
                 "2026-10-06T10:00:00Z", None)
 
-    def _job_row(self, run_id=RUN_ID, commands=(), status="succeeded"):
+    def _job_row(self, run_id=RUN_ID, commands=(), status="succeeded", name=None):
         # commands=None stores a SQL NULL — the durable row that proves
         # nothing. Otherwise the list must be serialized exactly as SQLite's
         # json_group_array does (compact, no spaces), because the coverage
@@ -210,7 +210,8 @@ class ReleaseGateContractTests(unittest.TestCase):
         commands_text = (
             None if commands is None
             else json.dumps(list(commands), separators=(",", ":")))
-        return (f"job-{uuid4().hex}", run_id, f"job-{uuid4().hex}", status,
+        job_name = name if name is not None else f"job-{uuid4().hex}"
+        return (f"job-{uuid4().hex}", run_id, job_name, status,
                 "runner-1", "2026-10-06T10:00:00Z", "2026-10-06T10:05:00Z", 0,
                 "2026-10-06T10:00:00Z", commands_text, "dsc-ci-rust:7",
                 "/workspace", None, None, None, 900)
@@ -515,6 +516,60 @@ class ReleaseGateContractTests(unittest.TestCase):
                 or "unconditional job(s) have no succeeded row" in result.stderr,
                 result.stderr,
             )
+
+    def test_skipped_quality_job_fails_closed(self):
+        # A `skipped` clippy/test/coverage row means the run graded green
+        # without compiling or testing the tree — for a release source
+        # commit that is exactly the change-detection misclassification
+        # class (2026-10-24: a main push skipped all four quality jobs).
+        # The gate refuses unless the operator explicitly overrides.
+        db_path = self._build_db(
+            pipelines=[self._pipeline_row()],
+            runs=[self._run_row()],
+            jobs=[self._job_row(commands=DEF_COMMANDS["fmt"]),
+                  self._job_row(commands=DEF_COMMANDS["clippy"]),
+                  self._job_row(commands=DEF_COMMANDS["test"], status="skipped",
+                                name="test")],
+        )
+        results = self._run_both_backends(db_path)
+        for result in results.values():
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("quality job(s) skipped", result.stderr)
+            self.assertIn("test=skipped", result.stderr)
+            self.assertIn("GITFORGE_RELEASE_ALLOW_SKIPPED=1", result.stderr)
+
+    def test_allow_skipped_override_admits_a_docs_only_cut(self):
+        # The same run with the override set passes: the admission is
+        # explicit (the operator set the variable), never silent.
+        db_path = self._build_db(
+            pipelines=[self._pipeline_row()],
+            runs=[self._run_row()],
+            jobs=[self._job_row(commands=DEF_COMMANDS["fmt"]),
+                  self._job_row(commands=DEF_COMMANDS["clippy"]),
+                  self._job_row(commands=DEF_COMMANDS["test"], status="skipped",
+                                name="test")],
+        )
+        results = self._run_both_backends(
+            db_path, extra_env={"GITFORGE_RELEASE_ALLOW_SKIPPED": "1"})
+        for result in results.values():
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("PASSED", result.stdout + result.stderr)
+
+    def test_skipped_nonquality_job_does_not_trip_the_quality_gate(self):
+        # `skipped` is legitimate for jobs outside the compile/test evidence
+        # chain. The quality gate matches the known quality job names only,
+        # so a skipped row under any other name passes.
+        db_path = self._build_db(
+            pipelines=[self._pipeline_row()],
+            runs=[self._run_row()],
+            jobs=[self._job_row(commands=DEF_COMMANDS["fmt"]),
+                  self._job_row(commands=DEF_COMMANDS["clippy"]),
+                  self._job_row(commands=DEF_COMMANDS["test"], status="skipped",
+                                name="docs-publish")],
+        )
+        results = self._run_both_backends(db_path)
+        for result in results.values():
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_coverage_query_failure_fails_closed_on_both_readers(self):
         # Schema drift: a jobs table without the commands column. The count

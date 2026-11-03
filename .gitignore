@@ -47,6 +47,9 @@ template-parts/rust/target/
 
 # ─── Rust ─────────────────────────────────────────────────────────────────────
 target/
+
+# Python bytecode from the script test harness
+__pycache__/
 target/quality/
 
 # ─── Coverage & Profiling ───────────────────────────────────────────────────────────

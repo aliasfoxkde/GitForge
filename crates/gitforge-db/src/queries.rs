@@ -243,6 +243,9 @@ fn hydrate_pipeline_run(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::P
         error: row
             .try_get("error")
             .map_err(|error| Error::database(format!("invalid pipeline run error: {error}")))?,
+        ref_name: row
+            .try_get("ref_name")
+            .map_err(|error| Error::database(format!("invalid pipeline run ref: {error}")))?,
     })
 }
 
@@ -912,12 +915,14 @@ impl PipelineQueries {
         let stale: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM pipeline_runs \
              WHERE repo_id = ? AND pipeline_id = ? AND id != ? \
+             AND ref_name = ? \
              AND status IN ('pending', 'running', 'queued') \
              AND created_at < (SELECT created_at FROM pipeline_runs WHERE id = ?)",
         )
         .bind(repo_id.to_string())
         .bind(pipeline_id.to_string())
         .bind(keep_run_id.to_string())
+        .bind(ref_name)
         .bind(keep_run_id.to_string())
         .fetch_all(&mut *transaction)
         .await
@@ -1033,8 +1038,8 @@ impl PipelineRunQueries {
     pub async fn create(pool: &Pool, run: &crate::models::PipelineRun) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at, error, ref_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(run.id.to_string())
@@ -1047,6 +1052,7 @@ impl PipelineRunQueries {
         .bind(run.finished_at.map(|dt| dt.to_rfc3339()))
         .bind(run.created_at.to_rfc3339())
         .bind(&run.error)
+        .bind(&run.ref_name)
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline run: {e}")))?;
@@ -4859,6 +4865,7 @@ mod tests {
             "a".repeat(40),
         );
         stale.created_at = Utc::now() - chrono::Duration::hours(1);
+        stale.ref_name = Some("refs/heads/main".to_string());
         PipelineRunQueries::create(&pool, &stale).await.unwrap();
         let stale_pending = crate::models::Job::new(stale.id, "stale-pending".to_string());
         JobQueries::create(&pool, &stale_pending).await.unwrap();
@@ -4901,16 +4908,31 @@ mod tests {
             "c".repeat(40),
         );
         other.created_at = Utc::now() - chrono::Duration::hours(1);
+        other.ref_name = Some("refs/heads/main".to_string());
         PipelineRunQueries::create(&pool, &other).await.unwrap();
 
         // The new run (the winner).
-        let fresh = crate::models::PipelineRun::new(
+        let mut fresh = crate::models::PipelineRun::new(
             pipeline.id,
             repo.id,
             "push".to_string(),
             "d".repeat(40),
         );
+        fresh.created_at = Utc::now();
+        fresh.ref_name = Some("refs/heads/main".to_string());
         PipelineRunQueries::create(&pool, &fresh).await.unwrap();
+
+        // A queued run on the SAME pipeline but a DIFFERENT branch must be
+        // untouched — supersede is per (repo, ref, pipeline).
+        let mut cross_ref = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "e".repeat(40),
+        );
+        cross_ref.created_at = Utc::now() - chrono::Duration::hours(1);
+        cross_ref.ref_name = Some("refs/heads/feature".to_string());
+        PipelineRunQueries::create(&pool, &cross_ref).await.unwrap();
 
         let superseded = PipelineQueries::supersede_stale_runs(
             &pool,
@@ -4946,6 +4968,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(running_row.status, "running");
+
+        let cross_ref_row = PipelineRunQueries::get(&pool, cross_ref.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cross_ref_row.status, "pending",
+            "a queued run on another branch is not superseded"
+        );
 
         let done_row = PipelineRunQueries::get(&pool, done.id)
             .await
