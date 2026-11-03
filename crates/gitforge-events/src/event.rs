@@ -182,6 +182,12 @@ pub struct PushReceivedPayload {
     pub old_hash: String,
     pub new_hash: String,
     pub pusher_id: Option<UserId>,
+    /// Pipeline row a manual API trigger asked for. Push events leave this
+    /// unset — the committed `.gitforge.yml` governs pushes. When set and
+    /// the revision carries no committed definition, this row's persisted
+    /// config runs instead of cache/default fallback.
+    #[serde(default)]
+    pub pipeline_id: Option<PipelineId>,
 }
 
 /// Ref updated payload
@@ -316,6 +322,7 @@ mod tests {
             old_hash: "abc123".to_string(),
             new_hash: "def456".to_string(),
             pusher_id: None,
+            pipeline_id: None,
         };
 
         let event = EventEnvelope::new(
@@ -450,6 +457,7 @@ mod tests {
             old_hash: "abc123".to_string(),
             new_hash: "def456".to_string(),
             pusher_id: Some(UserId::new()),
+            pipeline_id: None,
         };
         assert!(payload.pusher_id.is_some());
         assert_eq!(payload.old_hash, "abc123");
@@ -514,6 +522,7 @@ mod tests {
             old_hash: "abc123".to_string(),
             new_hash: "def456".to_string(),
             pusher_id: None,
+            pipeline_id: None,
         };
 
         let correlation_id = Uuid::new_v4();
@@ -536,6 +545,7 @@ mod tests {
             old_hash: "abc123".to_string(),
             new_hash: "def456".to_string(),
             pusher_id: None,
+            pipeline_id: None,
         };
 
         let event = EventEnvelope::new(
@@ -614,6 +624,7 @@ mod tests {
             old_hash: "abc123".to_string(),
             new_hash: "def456".to_string(),
             pusher_id: None,
+            pipeline_id: None,
         };
 
         let event = EventEnvelope::new(
@@ -636,6 +647,7 @@ mod tests {
             old_hash: "abc123".to_string(),
             new_hash: "def456".to_string(),
             pusher_id: None,
+            pipeline_id: None,
         };
 
         let event = EventEnvelope::new(
@@ -690,6 +702,7 @@ mod tests {
             old_hash: "abc123".to_string(),
             new_hash: "def456".to_string(),
             pusher_id: None,
+            pipeline_id: None,
         };
 
         let event = EventEnvelope::new(
@@ -711,6 +724,7 @@ mod tests {
             old_hash: "abc123".to_string(),
             new_hash: "def456".to_string(),
             pusher_id: None,
+            pipeline_id: None,
         };
 
         let before = chrono::Utc::now().timestamp_millis();
