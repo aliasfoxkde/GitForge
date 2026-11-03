@@ -75,7 +75,7 @@ fn acquire_timeout_secs(default_secs: u64, load1: Option<f64>, cores: usize) -> 
 /// jsonwebtoken 11, libgit2) transiently pins the full 4GiB default and
 /// gets SIGKILLed by the cgroup, so operators on CI-capable hosts can
 /// raise the ceiling per deployment.
-fn sandbox_limits() -> SandboxLimits {
+fn sandbox_limits(job_timeout_secs: u64) -> SandboxLimits {
     const DEFAULT_MB: u64 = 4096;
     const DEFAULT_CPU_CORES: u32 = 1;
     let memory_mb = std::env::var("GITFORGE_SANDBOX_MEMORY_MB")
@@ -88,9 +88,15 @@ fn sandbox_limits() -> SandboxLimits {
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|cores| (1..=64).contains(cores))
         .unwrap_or(DEFAULT_CPU_CORES);
+    // The keep-alive process inside the container lives for
+    // `limits.timeout_secs`; a hardcoded ceiling here killed any job
+    // whose stored timeout exceeded it (run 0d4b44c4: the ktl 8h test
+    // job died at exactly 3600.000s when `sleep 3600` exited and the
+    // container stopped under the running exec).
     SandboxLimits {
         memory_mb,
         cpu_cores,
+        timeout_secs: job_timeout_secs.clamp(5, 24 * 60 * 60),
         ..SandboxLimits::default()
     }
 }
@@ -184,7 +190,16 @@ impl ContainerPool {
 
         while instances.len() < count {
             let id = JobId::new();
-            match self.sandbox.create(id, image, sandbox_limits(), &[]).await {
+            match self
+                .sandbox
+                .create(
+                    id,
+                    image,
+                    sandbox_limits(SandboxLimits::default().timeout_secs),
+                    &[],
+                )
+                .await
+            {
                 Ok(instance) => {
                     tracing::info!("pre-warmed container for image {}", image);
                     instances.push(instance);
@@ -204,17 +219,26 @@ impl ContainerPool {
     /// directories, tmpfs scratch). They are honoured when the container
     /// is created; a pooled container is only reused for jobs that need no
     /// mounts, because a pooled container cannot gain a mount afterwards.
+    /// `job_timeout_secs` bounds the newly created container's keep-alive
+    /// (and the sandbox's declared timeout) to the job's own budget.
     pub async fn acquire(
         &self,
         job_id: &JobId,
         image: &str,
         workspace_path: Option<&str>,
         volumes: &[VolumeSpec],
+        job_timeout_secs: u64,
     ) -> Result<SandboxInstance> {
         if workspace_path.is_some() {
             return self
                 .sandbox
-                .create_with_workspace(*job_id, image, sandbox_limits(), workspace_path, volumes)
+                .create_with_workspace(
+                    *job_id,
+                    image,
+                    sandbox_limits(job_timeout_secs),
+                    workspace_path,
+                    volumes,
+                )
                 .await;
         }
         if !volumes.is_empty() {
@@ -222,7 +246,7 @@ impl ContainerPool {
             // (created without one) cannot serve this job.
             return self
                 .sandbox
-                .create(*job_id, image, sandbox_limits(), volumes)
+                .create(*job_id, image, sandbox_limits(job_timeout_secs), volumes)
                 .await;
         }
         let mut pools = self.pools.write().await;
@@ -238,7 +262,7 @@ impl ContainerPool {
         // Pool empty or no pool for this image, create new
         tracing::debug!("creating new container for job {} (pool empty)", job_id);
         self.sandbox
-            .create(*job_id, image, sandbox_limits(), &[])
+            .create(*job_id, image, sandbox_limits(job_timeout_secs), &[])
             .await
     }
 
@@ -265,7 +289,16 @@ impl ContainerPool {
             }
             // Create fresh instance for the pool
             let id = JobId::new();
-            match self.sandbox.create(id, image, sandbox_limits(), &[]).await {
+            match self
+                .sandbox
+                .create(
+                    id,
+                    image,
+                    sandbox_limits(SandboxLimits::default().timeout_secs),
+                    &[],
+                )
+                .await
+            {
                 Ok(new_instance) => {
                     instances.push(new_instance);
                     tracing::debug!("returned container to pool");
@@ -503,6 +536,7 @@ impl JobExecutor {
                 &job.image,
                 job.working_dir.as_deref(),
                 &job.volumes,
+                job.timeout_secs,
             ),
         )
         .await
@@ -1089,25 +1123,42 @@ mod tests {
         // Default: the historical 4GiB ceiling.
         std::env::remove_var("GITFORGE_SANDBOX_MEMORY_MB");
         std::env::remove_var("GITFORGE_SANDBOX_CPU_CORES");
-        assert_eq!(sandbox_limits().cpu_cores, 1);
+        assert_eq!(sandbox_limits(3600).cpu_cores, 1);
 
         std::env::set_var("GITFORGE_SANDBOX_CPU_CORES", "2");
-        assert_eq!(sandbox_limits().cpu_cores, 2);
+        assert_eq!(sandbox_limits(3600).cpu_cores, 2);
         std::env::set_var("GITFORGE_SANDBOX_CPU_CORES", "0");
-        assert_eq!(sandbox_limits().cpu_cores, 1);
+        assert_eq!(sandbox_limits(3600).cpu_cores, 1);
         std::env::remove_var("GITFORGE_SANDBOX_CPU_CORES");
-        assert_eq!(sandbox_limits().memory_mb, 4096);
+        assert_eq!(sandbox_limits(3600).memory_mb, 4096);
 
         // CI-capable hosts can raise it for the native-crypto link step.
         std::env::set_var("GITFORGE_SANDBOX_MEMORY_MB", "6144");
-        assert_eq!(sandbox_limits().memory_mb, 6144);
+        assert_eq!(sandbox_limits(3600).memory_mb, 6144);
 
         // Garbage and sub-floor values fall back to the default.
         std::env::set_var("GITFORGE_SANDBOX_MEMORY_MB", "not-a-number");
-        assert_eq!(sandbox_limits().memory_mb, 4096);
+        assert_eq!(sandbox_limits(3600).memory_mb, 4096);
         std::env::set_var("GITFORGE_SANDBOX_MEMORY_MB", "64");
-        assert_eq!(sandbox_limits().memory_mb, 4096);
+        assert_eq!(sandbox_limits(3600).memory_mb, 4096);
         std::env::remove_var("GITFORGE_SANDBOX_MEMORY_MB");
+    }
+
+    #[test]
+    fn test_sandbox_limits_timeout_tracks_job_budget() {
+        // REGRESSION (run 0d4b44c4): the sandbox limits carried a fixed 3600s
+        // timeout while the job's stored timeout was 8h — the container
+        // keep-alive died at exactly 3600.000s and SIGKILLed the running
+        // job. The sandbox timeout must be derived from the job budget and
+        // clamped to the same 5s..24h window the executor enforces.
+        assert_eq!(sandbox_limits(3600).timeout_secs, 3600);
+        assert_eq!(sandbox_limits(28_800).timeout_secs, 28_800);
+        assert_eq!(sandbox_limits(3).timeout_secs, 5, "floor at 5s");
+        assert_eq!(
+            sandbox_limits(48 * 3600).timeout_secs,
+            24 * 3600,
+            "ceiling at 24h"
+        );
     }
 
     #[test]

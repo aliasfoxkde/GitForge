@@ -707,10 +707,17 @@ impl Sandbox for DockerSandbox {
                 ..Default::default()
             };
 
-            // Create container
+            // Create container. The keep-alive sleep IS the sandbox's
+            // effective lifetime: when it exits the container stops and any
+            // running job exec dies with it, so it must cover the job's
+            // whole timeout budget, not a fixed hour (a >1h job was
+            // SIGKILLed at exactly 3600s, run 0d4b44c4). Slack lets the
+            // executor's own deadline enforcement grade the timeout before
+            // the container dies under it.
+            let keep_alive = limits.timeout_secs.saturating_add(60);
             let config = ContainerCreateBody {
                 image: Some(image.to_owned()),
-                cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]), // Keep container alive
+                cmd: Some(vec!["sleep".to_owned(), keep_alive.to_string()]), // Keep container alive
                 host_config: Some(host_config),
                 labels: Some(labels),
                 ..Default::default()
@@ -817,7 +824,12 @@ impl Sandbox for DockerSandbox {
             };
             let config = ContainerCreateBody {
                 image: Some(image.to_owned()),
-                cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
+                // Keep-alive must cover the job's whole budget — see the
+                // plain-create path for why this is not a fixed hour.
+                cmd: Some(vec![
+                    "sleep".to_owned(),
+                    limits.timeout_secs.saturating_add(60).to_string(),
+                ]),
                 working_dir: Some("/workspace".to_owned()),
                 // The workspace bind-mount keeps the host checkout's uid (the
                 // job user inside the image is usually root), and git's
