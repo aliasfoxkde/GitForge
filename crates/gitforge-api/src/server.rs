@@ -168,9 +168,7 @@ impl ApiServer {
             .merge(review_routes());
         if !telemetry_public {
             let dashboard = crate::dashboard::dashboard_routes();
-            protected_routes = protected_routes
-                .merge(metrics)
-                .merge(dashboard);
+            protected_routes = protected_routes.merge(metrics).merge(dashboard);
         }
         let protected_routes = protected_routes
             // Authenticate once at the protected-route boundary. Individual
