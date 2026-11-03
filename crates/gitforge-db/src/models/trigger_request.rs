@@ -1,7 +1,7 @@
 //! Durable pipeline trigger request model
 
 use chrono::{DateTime, Utc};
-use gitforge_common::{PipelineRunId, RepoId};
+use gitforge_common::{PipelineId, PipelineRunId, RepoId};
 
 /// A durably recorded request to run a pipeline for one pushed revision.
 ///
@@ -27,6 +27,11 @@ pub struct PipelineTriggerRequest {
     pub status: String,
     /// The run this request produced, once known.
     pub run_id: Option<PipelineRunId>,
+    /// The pipeline row an explicit (manual API) trigger asked to run.
+    /// Push triggers leave this unset; the committed `.gitforge.yml`
+    /// governs those. Part of the dedup key so two pipelines on one
+    /// commit can both run (G1).
+    pub pipeline_id: Option<PipelineId>,
     /// How many times the consumer has attempted this request.
     pub attempts: i64,
     /// Terminal failure cause, when `status = failed`.
@@ -47,6 +52,7 @@ impl PipelineTriggerRequest {
             new_hash,
             status: "pending".to_string(),
             run_id: None,
+            pipeline_id: None,
             attempts: 0,
             error: None,
             created_at: now,

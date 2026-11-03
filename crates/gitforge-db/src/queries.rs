@@ -3368,7 +3368,14 @@ impl TriggerRequestQueries {
         pool: &Pool,
         request: &crate::models::PipelineTriggerRequest,
     ) -> Result<(crate::models::PipelineTriggerRequest, bool)> {
-        if let Some(existing) = Self::find_active(pool, request.repo_id, &request.new_hash).await? {
+        if let Some(existing) = Self::find_active(
+            pool,
+            request.repo_id,
+            &request.new_hash,
+            request.pipeline_id,
+        )
+        .await?
+        {
             return Ok((existing, false));
         }
         persist_with_retry(|| async {
@@ -3377,11 +3384,19 @@ impl TriggerRequestQueries {
             let existing_id: Option<String> =
                 sqlx::query_scalar(
                     "SELECT id FROM pipeline_trigger_requests \
-                     WHERE repo_id = ? AND new_hash = ? AND status IN ('pending', 'processing') \
+                     WHERE repo_id = ? AND new_hash = ? \
+                     AND COALESCE(pipeline_id, '') = ? \
+                     AND status IN ('pending', 'processing') \
                      LIMIT 1",
                 )
                 .bind(request.repo_id.to_string())
                 .bind(&request.new_hash)
+                .bind(
+                    request
+                        .pipeline_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                )
                 .fetch_optional(&mut *transaction)
                 .await
                 .map_err(|e| {
@@ -3406,8 +3421,8 @@ impl TriggerRequestQueries {
             sqlx::query(
                 r#"
                 INSERT INTO pipeline_trigger_requests
-                    (id, repo_id, ref_name, old_hash, new_hash, status, run_id, attempts, error, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, repo_id, ref_name, old_hash, new_hash, status, run_id, pipeline_id, attempts, error, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(request.id.to_string())
@@ -3417,6 +3432,7 @@ impl TriggerRequestQueries {
             .bind(&request.new_hash)
             .bind(&request.status)
             .bind(request.run_id.map(|id| id.to_string()))
+            .bind(request.pipeline_id.map(|id| id.to_string()))
             .bind(request.attempts)
             .bind(&request.error)
             .bind(request.created_at.to_rfc3339())
@@ -3439,14 +3455,21 @@ impl TriggerRequestQueries {
         pool: &Pool,
         repo_id: RepoId,
         new_hash: &str,
+        pipeline_id: Option<PipelineId>,
     ) -> Result<Option<crate::models::PipelineTriggerRequest>> {
+        // The dedup key mirrors the partial unique index:
+        // COALESCE(pipeline_id, '') so push triggers (NULL pipeline) dedup
+        // per (repo, hash) while explicit pipelines dedup per id.
         let id: Option<String> = sqlx::query_scalar(
             "SELECT id FROM pipeline_trigger_requests \
-             WHERE repo_id = ? AND new_hash = ? AND status IN ('pending', 'processing') \
+             WHERE repo_id = ? AND new_hash = ? \
+             AND COALESCE(pipeline_id, '') = ? \
+             AND status IN ('pending', 'processing') \
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(repo_id.to_string())
         .bind(new_hash)
+        .bind(pipeline_id.map(|id| id.to_string()).unwrap_or_default())
         .fetch_optional(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to find active trigger request: {e}")))?;
@@ -3680,6 +3703,15 @@ fn hydrate_trigger_request(
             })
             .transpose()?
             .map(gitforge_common::PipelineRunId::from),
+        pipeline_id: row
+            .try_get::<Option<String>, _>("pipeline_id")
+            .map_err(|error| Error::database(format!("invalid pipeline_id: {error}")))?
+            .map(|id| {
+                Uuid::parse_str(&id)
+                    .map_err(|error| Error::database(format!("invalid pipeline_id: {error}")))
+            })
+            .transpose()?
+            .map(gitforge_common::PipelineId::from),
         attempts: row
             .try_get("attempts")
             .map_err(|error| Error::database(format!("invalid attempts: {error}")))?,

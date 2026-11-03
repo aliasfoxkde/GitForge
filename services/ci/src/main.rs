@@ -519,6 +519,7 @@ async fn main() -> anyhow::Result<()> {
                             old_hash: request.old_hash.clone(),
                             new_hash: request.new_hash.clone(),
                             pusher_id: None,
+                            pipeline_id: None,
                         }),
                         Some(request.repo_id),
                         None,
@@ -726,6 +727,11 @@ struct PipelineTriggerRequest {
     #[serde(default)]
     pusher_id: Option<gitforge_common::UserId>,
     working_dir: Option<String>,
+    /// Manual API triggers name the pipeline row to execute. Push events
+    /// leave this unset: the committed `.gitforge.yml` at the revision is
+    /// authoritative for pushes (CI config is code).
+    #[serde(default)]
+    pipeline_id: Option<gitforge_common::PipelineId>,
 }
 
 /// Trigger a pipeline through the same typed push-event path used by Git
@@ -885,6 +891,8 @@ async fn trigger_pipeline(
             )
         }
     };
+    // Captured before `request` is consumed by the event payload below.
+    let request_pipeline_id = request.pipeline_id;
 
     let working_dir = match request.working_dir {
         Some(path) => match validate_workspace_path(&path) {
@@ -916,12 +924,15 @@ async fn trigger_pipeline(
     // live instance. A racing trigger for the same commit dedups onto the
     // in-flight row instead of minting a duplicate run.
     let trigger_request = if let Some(pool) = trigger_state.db.as_ref() {
-        let request = gitforge_db::models::PipelineTriggerRequest::new(
+        let mut request = gitforge_db::models::PipelineTriggerRequest::new(
             repo_id,
             request.ref_name.clone(),
             request.old_hash.clone(),
             request.new_hash.clone(),
         );
+        // Part of the dedup key: two explicit pipelines on one commit must
+        // both run (G1).
+        request.pipeline_id = request_pipeline_id;
         match gitforge_db::queries::TriggerRequestQueries::create_or_existing(pool, &request).await
         {
             Ok((existing, was_new)) => {
@@ -968,6 +979,7 @@ async fn trigger_pipeline(
             old_hash: request.old_hash,
             new_hash: request.new_hash.clone(),
             pusher_id: request.pusher_id,
+            pipeline_id: request.pipeline_id,
         }),
         Some(repo_id),
         None,
@@ -2406,6 +2418,25 @@ async fn handle_push_event(
             repo_id
         );
         committed
+    } else if let Some(requested_id) = payload.pipeline_id {
+        // A manual API trigger named its pipeline row: run that row's
+        // persisted config, not the repo cache/default fallback (G2). The
+        // committed definition still wins when the revision carries one —
+        // CI config is code — but the caller's explicit row beats cache.
+        let persisted = match scheduler_db {
+            Some(pool) => gitforge_db::queries::PipelineQueries::get(pool, requested_id)
+                .await
+                .map_err(|e| TriggerFailure::retryable(e.into()))?
+                .and_then(|pipeline| {
+                    serde_json::from_value::<PipelineDefinition>(pipeline.config).ok()
+                }),
+            None => None,
+        };
+        persisted.ok_or_else(|| {
+            TriggerFailure::terminal(anyhow::anyhow!(
+                "trigger named pipeline {requested_id} but its persisted config is missing or unparseable"
+            ))
+        })?
     } else {
         let cached_pipeline = {
             pipeline_cache
@@ -3344,6 +3375,7 @@ mod tests {
                     old_hash: "a".repeat(40),
                     new_hash: "b".repeat(40),
                     pusher_id: None,
+                    pipeline_id: None,
                 }),
                 Some(repo),
                 None,
@@ -5830,6 +5862,7 @@ jobs:
                 old_hash: "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
                 new_hash: "0000000000000000000000000000000000000000".to_string(),
                 pusher_id: None,
+                pipeline_id: None,
             }),
             Some(repo_id),
             None,
