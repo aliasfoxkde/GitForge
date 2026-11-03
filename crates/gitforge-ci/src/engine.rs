@@ -164,31 +164,24 @@ pub async fn eval_skip_if(skip_if: &Option<String>, env: &HashMap<String, String
     let Some(expr) = skip_if else {
         return Ok(true); // No condition means always run
     };
-    // Build the bash environment from the detect-changes output vars
-    let bash_env: Vec<String> = env
-        .iter()
-        .filter(|(k, _)| k.starts_with("CI_CHANGE_"))
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
-    // Add CI_CHANGE_FILE_COUNT for convenience (count of all changed files)
-    let file_count = env.get("CI_CHANGE_FILE_COUNT");
-    let combined_env = if bash_env.is_empty() && file_count.is_none() {
-        format!("set -e; {expr}")
-    } else {
-        let env_str = bash_env.join(" ")
-            + &format!(
-                " CI_CHANGE_FILE_COUNT={}",
-                file_count.unwrap_or(&"0".to_string())
-            );
-        format!("export {env_str}; set -e; {expr}")
-    };
+    // The environment is delivered through Command::envs below - never
+    // interpolated into the script text. A receipt-controlled value that
+    // reached the script as `export KEY=value` could execute arbitrary
+    // shell (via ;, backticks, or $() in the value).
+    let combined_env = format!("set -e; {expr}");
     // Timeout: 10s max to prevent a malicious expression from stalling the engine
     let result = timeout(
         Duration::from_secs(10),
         Command::new("bash")
             .arg("-c")
             .arg(&combined_env)
-            .envs(env.iter().filter(|(k, _)| !k.starts_with("CI_CHANGE_")))
+            .envs(env.iter())
+            // CI_CHANGE_FILE_COUNT is always defined for expressions, even
+            // when the detect-changes job did not report it.
+            .env(
+                "CI_CHANGE_FILE_COUNT",
+                env.get("CI_CHANGE_FILE_COUNT").map_or("0", String::as_str),
+            )
             .output(),
     )
     .await;
@@ -1430,6 +1423,45 @@ mod tests {
         assert!(extract_change_env(&receipt).is_empty());
         assert!(extract_change_env("not json at all").is_empty());
         assert!(extract_change_env("{}").is_empty());
+    }
+
+    /// A receipt-controlled `CI_CHANGE_*` value must reach the expression
+    /// as a value, never as shell code. The detect-changes job is job
+    /// output; interpolating it into the script text would let a value
+    /// like `1; touch /tmp/pwned` execute in the CI service.
+    #[tokio::test]
+    async fn a_change_env_value_cannot_execute_as_shell_code() {
+        let marker = std::env::temp_dir().join("gitforge-skipif-injection-regression");
+        let _ = std::fs::remove_file(&marker);
+        let receipt = serde_json::json!({
+            "step_results": [{
+                "stdout": format!(
+                    "CI_CHANGE_INCLUDE_CODE=1; touch {}\n",
+                    marker.display()
+                )
+            }]
+        })
+        .to_string();
+        let env = extract_change_env(&receipt);
+        let expr = Some(r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string());
+        let should_run = eval_skip_if(&expr, &env).await.unwrap();
+        assert!(
+            !marker.exists(),
+            "the receipt value executed as shell code in the CI service"
+        );
+        // The value is still readable as a variable: delivered inertly,
+        // not silently dropped.
+        assert!(!should_run, "the expression must see the literal value");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// `CI_CHANGE_FILE_COUNT` is always defined for expressions, even when
+    /// the detect-changes job reported nothing.
+    #[tokio::test]
+    async fn a_change_file_count_is_always_defined() {
+        let env = HashMap::new();
+        let expr = Some(r#"[[ "$CI_CHANGE_FILE_COUNT" == "0" ]]"#.to_string());
+        assert!(eval_skip_if(&expr, &env).await.unwrap());
     }
 
     /// The defect this guards: an unmerged receipt leaves the expression
