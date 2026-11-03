@@ -64,10 +64,24 @@ pub fn public_runner_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 }
 
 /// List runners
+///
+/// Runner inventory (names, capacity, heartbeat) is operational data; only
+/// admin/maintainer roles may read it. Any-authenticated listing let a
+/// plain developer enumerate the fleet.
 async fn list_runners(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     Extension(pool): Extension<Arc<Pool>>,
 ) -> impl IntoResponse {
+    if !crate::routes::ci::can_manage_jobs(&user.claims) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "forbidden",
+                "message": "runner administration requires maintainer role"
+            })),
+        )
+            .into_response();
+    }
     match RunnerQueries::list(&pool).await {
         Ok(runners) => {
             let response: Vec<RunnerResponse> =
@@ -133,11 +147,24 @@ async fn register_runner(
 }
 
 /// Get runner
+///
+/// Same role gate as `list_runners` — a single runner's row carries the
+/// same operational detail the list does.
 async fn get_runner(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     Extension(pool): Extension<Arc<Pool>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if !crate::routes::ci::can_manage_jobs(&user.claims) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "forbidden",
+                "message": "runner administration requires maintainer role"
+            })),
+        )
+            .into_response();
+    }
     tracing::debug!("get runner: {}", id);
 
     match Uuid::parse_str(&id) {

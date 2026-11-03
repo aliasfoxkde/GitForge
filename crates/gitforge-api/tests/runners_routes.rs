@@ -193,7 +193,7 @@ async fn get_runner_returns_wire_contract_and_404s() {
         f.app.clone(),
         "GET",
         &format!("/api/runners/{id}"),
-        Some(&f.developer_token),
+        Some(&f.admin_token),
         None,
     )
     .await;
@@ -211,7 +211,7 @@ async fn get_runner_returns_wire_contract_and_404s() {
         f.app.clone(),
         "GET",
         &format!("/api/runners/{}", uuid::Uuid::new_v4()),
-        Some(&f.developer_token),
+        Some(&f.admin_token),
         None,
     )
     .await;
@@ -222,7 +222,7 @@ async fn get_runner_returns_wire_contract_and_404s() {
         f.app.clone(),
         "GET",
         "/api/runners/not-a-uuid",
-        Some(&f.developer_token),
+        Some(&f.admin_token),
         None,
     )
     .await;
@@ -370,11 +370,24 @@ async fn list_runners_exposes_the_registered_fleet() {
         assert_eq!(status, StatusCode::CREATED);
     }
 
-    let (status, fleet) = request_json(
+    // Runner inventory is operational data: a plain developer is refused
+    // and the same request succeeds with a maintainer/admin token.
+    let (dev_status, dev_body) = request_json(
         f.app.clone(),
         "GET",
         "/api/runners",
         Some(&f.developer_token),
+        None,
+    )
+    .await;
+    assert_eq!(dev_status, StatusCode::FORBIDDEN, "{dev_body}");
+    assert_eq!(dev_body["error"], "forbidden");
+
+    let (status, fleet) = request_json(
+        f.app.clone(),
+        "GET",
+        "/api/runners",
+        Some(&f.admin_token),
         None,
     )
     .await;
