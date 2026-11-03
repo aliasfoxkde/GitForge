@@ -26,6 +26,12 @@ use gitforge_storage::{Artifact, ArtifactStore};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+/// Serializes the tests that mutate GITFORGE_PUBLIC_TELEMETRY. The
+/// decision is read at router-build time from the process env, which is
+/// shared by every test thread in this binary — without the lock the
+/// default-posture tests race the opt-in test and randomly invert.
+static TELEMETRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 async fn webhook_fixture(
     config: serde_json::Value,
 ) -> (
@@ -146,6 +152,7 @@ async fn test_metrics_endpoint() {
     // served behind the auth middleware (F5) and must reject anonymous
     // access. The wiring boundary (route placement, not just the
     // middleware decision) is what this test pins.
+    let _guard = TELEMETRY_ENV_LOCK.lock().unwrap();
     unsafe { std::env::remove_var("GITFORGE_PUBLIC_TELEMETRY") };
     let pool = Pool::memory().await.unwrap();
     let server = ApiServer::new("test-secret", pool);
@@ -681,6 +688,7 @@ async fn test_delete_nonexistent_repo() {
 #[tokio::test]
 async fn test_dashboard_endpoint() {
     // Default posture: authenticated only (F5 wiring boundary).
+    let _guard = TELEMETRY_ENV_LOCK.lock().unwrap();
     unsafe { std::env::remove_var("GITFORGE_PUBLIC_TELEMETRY") };
     let pool = Pool::memory().await.unwrap();
     let server = ApiServer::new("test-secret", pool);
@@ -702,6 +710,7 @@ async fn test_dashboard_endpoint() {
 #[tokio::test]
 async fn test_dashboard_endpoint_public_opt_in() {
     // Operator opt-in keeps both telemetry surfaces public.
+    let _guard = TELEMETRY_ENV_LOCK.lock().unwrap();
     unsafe { std::env::set_var("GITFORGE_PUBLIC_TELEMETRY", "1") };
     let pool = Pool::memory().await.unwrap();
     let server = ApiServer::new("test-secret", pool);
