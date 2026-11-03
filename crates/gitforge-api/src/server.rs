@@ -157,7 +157,7 @@ impl ApiServer {
 
         // Protected routes (auth required)
         let pool_arc = Arc::new(pool);
-        let mut protected_routes = Router::new()
+        let protected_routes = Router::new()
             .merge(repo_routes())
             .merge(ci_routes())
             .merge(runner_routes())
@@ -166,10 +166,6 @@ impl ApiServer {
             .merge(artifact_routes())
             .merge(webhook_routes())
             .merge(review_routes());
-        if !telemetry_public {
-            let dashboard = crate::dashboard::dashboard_routes();
-            protected_routes = protected_routes.merge(metrics_router).merge(dashboard);
-        }
         let protected_routes = protected_routes
             // Authenticate once at the protected-route boundary. Individual
             // handlers may still apply resource authorization, but token
@@ -179,9 +175,12 @@ impl ApiServer {
             .layer(Extension(Arc::new(auth.clone())))
             .layer(Extension(pool_arc.clone()));
 
-        // Metrics layer for automatic request recording
+        // Telemetry surfaces stay at top level either way; when the
+        // operator has not opted into public access they are merged in
+        // behind their own auth-middleware layer (F5). They cannot ride
+        // the /api-nested protected router — nesting would move them to
+        // /api/metrics and leave the canonical paths unrouted.
         let metrics_layer = MetricsLayer::new(metrics_arc.clone());
-
         let app = public_routes
             .layer(cors)
             .layer(metrics_layer)
@@ -189,6 +188,17 @@ impl ApiServer {
             .layer(Extension(metrics_arc))
             .merge(auth_routes)
             .nest("/api", protected_routes);
+        let app = if telemetry_public {
+            app
+        } else {
+            let dashboard = crate::dashboard::dashboard_routes();
+            let telemetry = metrics_router
+                .merge(dashboard)
+                .layer(middleware::from_fn(crate::middleware::auth_middleware))
+                .layer(Extension(Arc::new(auth.clone())))
+                .layer(Extension(pool_arc));
+            app.merge(telemetry)
+        };
 
         Self {
             router: app,
