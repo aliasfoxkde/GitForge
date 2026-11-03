@@ -2573,6 +2573,7 @@ async fn handle_push_event(
             payload.new_hash.clone(),
         );
         db_run.id = state.run_id;
+        db_run.ref_name = Some(payload.ref_name.clone());
         db_run.start();
         gitforge_db::queries::PipelineQueries::activate_pipeline_and_create_run(
             pool,

@@ -555,3 +555,33 @@ pipeline so the tag always exists before the main chain needs it.
 Pipeline-authored bind mounts and `working_directory` are now allowlisted
 in the sandbox (see `docs/planning/SECURITY_AUDIT_RECEIPT_2026-11-02.md`).
 No live pipeline used the dangerous paths; cache blocks pass unchanged.
+
+---
+
+## Verdicts (2026-11-03) — branch `integrate/audit-fixes-20261102`
+
+- **Per-branch supersede (feature gap above) — SHIPPED.** Newest-SHA-wins
+  per (repo, pipeline, **ref**): `PipelineQueries::supersede_stale_runs`
+  cancels queued jobs and grades stale runs `cancelled`; the trigger path
+  populates the new `pipeline_runs.ref_name` column and the dedup/supersede
+  filters scope by ref. Commit `ee3809b5` + `ref_name` column work; pinned
+  by db regression tests and the api integration suite.
+- **Entity gauges never set (G3 residual) — SHIPPED.** 30s gauge-refresh
+  sweep + `JobQueries::count_all`; commit `f6829c0c`. Awaiting deploy to
+  202 (part of this cycle's release cut).
+- **Image-tag drift incident — partially remediated.** Structural remedy
+  (pipeline-lint gate on image tags / bootstrap image pipeline) remains
+  OPEN and is recorded for the next cycle; the incident itself recovered
+  2026-11-02 via the tag-16 rebuild.
+- **Queue incident (capacity-1 serialization) — operational remedy in
+  flight:** supersede removes the duplicate-run amplification; the
+  fedora-docker runner (capacity 5) unpause is scheduled after this
+  cycle's deploy per the storage-placement rule.
+- **Quality-chain `skip_if` false-green — closed by gate hardening**
+  (Phase A1): the release gate refuses a cut whose run skipped clippy/
+  test/coverage/fuzz without `GITFORGE_RELEASE_ALLOW_SKIPPED=1`, and
+  refuses any run whose unconditional definition jobs lack satisfied
+  rows. Tests: `tests/test_release_gate.py` (21 tests / 39 subtests green).
+- **Audit F1–F5 verdicts** live in `docs/planning/20261101-minimax-audit-authz.md`
+  §Dispositions: F1/F2 resolved (PR #365), F3 resolved, F4 wontfix-design-
+  recorded, F5 resolved (`GITFORGE_PUBLIC_TELEMETRY` gate).

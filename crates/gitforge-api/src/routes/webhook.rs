@@ -367,13 +367,14 @@ async fn trigger_pipeline(
 
             // Persist the run before queueing so scheduler job foreign keys
             // and recovery have a durable parent record.
-            let run = gitforge_db::models::PipelineRun::new(
+            let mut run = gitforge_db::models::PipelineRun::new(
                 pipeline.id,
                 repo_id,
                 "webhook".to_string(),
                 payload.commit_hash.clone(),
             );
             let run_id = run.id;
+            run.ref_name = Some(payload.branch.clone());
             if let Err(error) = PipelineRunQueries::create(&pool, &run).await {
                 tracing::error!(%error, %pipeline_id, "failed to persist webhook pipeline run");
                 return (
