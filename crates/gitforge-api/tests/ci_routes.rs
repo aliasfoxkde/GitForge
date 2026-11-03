@@ -1749,4 +1749,12 @@ async fn run_trigger_delegation_ladder_relays_the_orchestrator_answers() {
     assert_eq!(seen[0].body["ref_name"], commit);
     assert_eq!(seen[0].body["new_hash"], commit);
     assert_eq!(seen[0].body["old_hash"], "0".repeat(40));
+    // G1: the delegated trigger must carry the requested pipeline id, or
+    // the orchestrator binds the run to whichever definition its cache
+    // resolves and two pipelines on one commit cannot both run.
+    assert_eq!(
+        seen[0].body["pipeline_id"],
+        pipeline_id.to_string(),
+        "trigger payload must name the pipeline row being run"
+    );
 }

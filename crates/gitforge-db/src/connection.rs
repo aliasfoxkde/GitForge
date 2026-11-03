@@ -488,17 +488,63 @@ impl Pool {
             ))
         })?;
 
-        // At most one in-flight trigger per (repository, commit): the API
-        // and the webhook both fire on the same push, and the correlation
-        // window can answer `queued` to one of them while the other is still
-        // cloning — without this index every retry minted another duplicate
-        // run for the same commit. Completed and failed rows are excluded so
-        // an explicit re-trigger (manual re-run of an old commit) stays
-        // possible.
+        // Migration for G1 (2026-11-02): an explicit pipeline trigger names
+        // the row to run. The dedup key must include that id, or a second
+        // pipeline triggered on the same commit dedups onto the first's
+        // row and never runs. Existing rows read as push triggers (NULL =
+        // no explicit pipeline), which keeps the old key semantics.
+        let has_pipeline_id: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('pipeline_trigger_requests') \
+             WHERE name = 'pipeline_id'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::database(format!(
+                "failed to inspect pipeline_trigger_requests columns: {e}"
+            ))
+        })?;
+        if has_pipeline_id.is_none() {
+            sqlx::query("ALTER TABLE pipeline_trigger_requests ADD COLUMN pipeline_id TEXT")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    Error::database(format!(
+                        "failed to add pipeline_id to pipeline_trigger_requests: {e}"
+                    ))
+                })?;
+            // The old active-triggers index keyed on (repo_id, new_hash)
+            // only; drop it so the widened replacement can be created.
+            sqlx::query("DROP INDEX IF EXISTS idx_trigger_requests_active")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    Error::database(format!(
+                        "failed to drop superseded trigger dedup index: {e}"
+                    ))
+                })?;
+        }
+
+        // At most one in-flight trigger per (repository, commit, pipeline):
+        // the API and the webhook both fire on the same push, and the
+        // correlation window can answer `queued` to one of them while the
+        // other is still cloning — without this index every retry minted
+        // another duplicate run for the same commit. Completed and failed
+        // rows are excluded so an explicit re-trigger (manual re-run of an
+        // old commit) stays possible. The pipeline id is part of the key so
+        // two explicit pipelines on one commit can both run (G1). SQLite
+        // treats NULLs as distinct in a UNIQUE index, so the key uses a
+        // COALESCE expression: push triggers (NULL pipeline) dedup on
+        // (repo_id, hash, '') exactly as the pre-G1 (repo_id, hash) index
+        // did, while explicit pipelines dedup per id.
         sqlx::query(
             r#"
             CREATE UNIQUE INDEX IF NOT EXISTS idx_trigger_requests_active
-            ON pipeline_trigger_requests(repo_id, new_hash)
+            ON pipeline_trigger_requests(
+                repo_id,
+                new_hash,
+                COALESCE(pipeline_id, '')
+            )
             WHERE status IN ('pending', 'processing')
             "#,
         )

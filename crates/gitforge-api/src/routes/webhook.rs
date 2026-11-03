@@ -161,10 +161,12 @@ impl CiTriggerClient {
         branch: &str,
         old_commit_hash: Option<&str>,
         commit_hash: &str,
+        pipeline_id: Option<PipelineId>,
     ) -> Result<Option<String>, String> {
         let old_hash = old_commit_hash
-            .filter(|hash| !hash.is_empty())
-            .unwrap_or("0000000000000000000000000000000000000000");
+            .filter(|hash| !hash.is_empty() && !gitforge_common::is_zero_hash(hash))
+            // git's fixed ref-deletion sentinel: all-zero SHA-1 length.
+            .map_or_else(|| "0".repeat(40), str::to_string);
         let response = self
             .client
             // The configured value is validated at startup, but never reaches
@@ -176,7 +178,13 @@ impl CiTriggerClient {
                 "ref_name": branch,
                 "old_hash": old_hash,
                 "new_hash": commit_hash,
-                "working_dir": null
+                "working_dir": null,
+                // Without the id the consumer falls back to the repo's
+                // cache/persisted/default definition: two pipelines on one
+                // commit could not both run, and an API-uploaded config was
+                // bypassed when the revision had no committed file
+                // (G1/G2, docs/planning/PRODUCTION_VALIDATION_20261102.md).
+                "pipeline_id": pipeline_id.map(|id| id.to_string()),
             }))
             .send()
             .await
@@ -279,6 +287,7 @@ async fn trigger_pipeline(
                         &payload.branch,
                         payload.old_commit_hash.as_deref(),
                         &payload.commit_hash,
+                        None,
                     )
                     .await
                 {
