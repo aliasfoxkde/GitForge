@@ -2531,6 +2531,34 @@ async fn handle_push_event(
         )
         .await
         .map_err(|e| TriggerFailure::retryable(e.into()))?;
+        // Newest-SHA-wins per (repo, ref, pipeline): a push that lands while
+        // an older run for the same branch is still queued cancels that run
+        // and its never-dispatched jobs, so runner capacity serves the tip
+        // instead of already-stale code.
+        match gitforge_db::queries::PipelineQueries::supersede_stale_runs(
+            pool,
+            repo_id,
+            &payload.ref_name,
+            pipeline_id,
+            state.run_id,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(count) => {
+                tracing::info!(
+                    run = %state.run_id,
+                    count,
+                    "superseded older queued runs on the same branch"
+                );
+            }
+            Err(error) => {
+                // Supersede is an optimization, not a correctness gate: a
+                // failed pass logs and lets the stale runs drain normally
+                // rather than failing the new push.
+                tracing::warn!(%error, "supersede pass failed; stale runs will drain");
+            }
+        }
     }
 
     let workspace_path = match requested_workspace {
