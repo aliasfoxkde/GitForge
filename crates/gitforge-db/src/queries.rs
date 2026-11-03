@@ -4678,6 +4678,77 @@ mod tests {
         assert!(was_new);
     }
 
+    /// G1: an explicit pipeline trigger is part of the dedup key. Two
+    /// pipelines on one commit must both get their own trigger request —
+    /// keying on (repo, hash) alone made the second one dedup onto the
+    /// first's row, so it never ran.
+    #[tokio::test]
+    async fn test_trigger_request_dedup_is_scoped_per_pipeline() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "pipeline-owner".to_string(),
+            "pipeline-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "pipeline-repo".to_string(),
+            owner.id,
+            "/git/pipeline-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let first_pipeline = gitforge_common::PipelineId::new();
+        let second_pipeline = gitforge_common::PipelineId::new();
+
+        let mut first = crate::models::PipelineTriggerRequest::new(
+            repo.id,
+            "refs/heads/main".to_string(),
+            "0".repeat(40),
+            "b".repeat(40),
+        );
+        first.pipeline_id = Some(first_pipeline);
+        let (first_row, was_new) = TriggerRequestQueries::create_or_existing(&pool, &first)
+            .await
+            .unwrap();
+        assert!(was_new);
+        assert_eq!(first_row.pipeline_id, Some(first_pipeline));
+
+        // The same pipeline on the same commit dedups onto its own row.
+        let mut same_pipeline = crate::models::PipelineTriggerRequest::new(
+            repo.id,
+            "refs/heads/main".to_string(),
+            "0".repeat(40),
+            "b".repeat(40),
+        );
+        same_pipeline.pipeline_id = Some(first_pipeline);
+        let (deduped, was_new) = TriggerRequestQueries::create_or_existing(&pool, &same_pipeline)
+            .await
+            .unwrap();
+        assert!(!was_new);
+        assert_eq!(deduped.id, first_row.id);
+
+        // A different pipeline on the same commit gets its own row: the
+        // second pipeline must be able to run on that commit too.
+        let mut second = crate::models::PipelineTriggerRequest::new(
+            repo.id,
+            "refs/heads/main".to_string(),
+            "0".repeat(40),
+            "b".repeat(40),
+        );
+        second.pipeline_id = Some(second_pipeline);
+        let (second_row, was_new) = TriggerRequestQueries::create_or_existing(&pool, &second)
+            .await
+            .unwrap();
+        assert!(was_new, "a second pipeline must not dedup onto the first");
+        assert_ne!(second_row.id, first_row.id);
+        assert_eq!(second_row.pipeline_id, Some(second_pipeline));
+    }
+
     #[tokio::test]
     async fn test_trigger_request_requeue_stale_and_terminal_failure() {
         let pool = Pool::memory().await.unwrap();
