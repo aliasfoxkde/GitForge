@@ -56,6 +56,10 @@ const JOB_TIMEOUT_SWEEP_SECS: u64 = 60;
 /// How often the durable trigger-request sweep recovers interrupted work.
 const TRIGGER_SWEEP_SECS: u64 = 30;
 
+/// How often the entity gauges (repos/pipelines/jobs/runners) re-read their
+/// counts from the durable rows.
+const GAUGE_REFRESH_SECS: u64 = 30;
+
 /// A `pending` trigger request older than this is republished: its bus event
 /// was lost (ring lag, restart) or a retry's backoff has elapsed. The gap
 /// doubles as the retry backoff.
@@ -691,6 +695,52 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         tracing::info!("job timeout watchdog shutting down");
+    });
+
+    // Entity gauges (repos/pipelines/jobs/artifacts/runners-online) are
+    // counters over durable rows no single write path can maintain, so a
+    // periodic refresh from the database is the only correct source. Without
+    // this they stay at zero forever while real work flows through the
+    // service — a silent observability defect (2026-11-02).
+    let gauge_db = scheduler_db.clone();
+    let gauge_metrics = metrics.clone();
+    let gauge_shutdown = shutdown.clone();
+    let _gauge_handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(GAUGE_REFRESH_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if gauge_shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Some(pool) = &gauge_db else { continue };
+                    match gitforge_db::queries::StatsQueries::dashboard(pool).await {
+                        Ok(stats) => {
+                            gauge_metrics.repos_total.set(stats.repositories);
+                            gauge_metrics.pipelines_total.set(stats.pipelines);
+                            gauge_metrics.artifacts_total.set(stats.artifacts);
+                            gauge_metrics.runners_online.set(stats.runners_online);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "gauge refresh failed; keeping last values");
+                        }
+                    }
+                    match gitforge_db::queries::JobQueries::count_all(pool).await {
+                        Ok(count) => gauge_metrics.jobs_total.set(count),
+                        Err(error) => {
+                            tracing::warn!(%error, "gauge refresh: job count failed");
+                        }
+                    }
+                }
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if gauge_shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!("entity gauge refresh shutting down");
     });
 
     tracing::info!("CI Orchestrator initialized successfully");

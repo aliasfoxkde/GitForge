@@ -1415,6 +1415,15 @@ type ExpiredJobRow = (
 );
 
 impl JobQueries {
+    /// Total durable job rows, for the metrics entity gauges.
+    pub async fn count_all(pool: &Pool) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) FROM jobs")
+            .fetch_one(pool.pool())
+            .await
+            .map_err(|e| Error::database(format!("job count failed: {e}")))?;
+        Ok(row.get::<i64, _>(0))
+    }
+
     /// Append a log chunk only when the runner still owns the active lease.
     /// `None` means the job is missing, terminal, or fenced by another lease.
     pub async fn append_log_with_lease(
