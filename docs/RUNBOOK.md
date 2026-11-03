@@ -290,6 +290,13 @@ Fedora operational notes:
   A fresh `online` runner row with a stale heartbeat is the stale-registry
   defect class F26 — `gitforge-status` reports stale-online counts and
   degrades the verdict.
+- **Fleet pause policy.** Only ONE runner is active at a time until the
+  lease-supersede race (409 reassign loop, 2026-10-03) is retired by the
+  newest-SHA-wins supersede (2026-11-03) plus lease-lifecycle repair.
+  `fedora-docker` is kept paused on its host via
+  `~/.config/gitforge/runner.paused` (the cron guard honors the flag);
+  resume by removing that file. Pausing the second runner before starting
+  work on it is mandatory, not optional.
 - **Fedora standalone instance.** The user-unit instance above for release
   validation; cut over with `scripts/gitforge-remote-cutover --units user`.
 
@@ -467,11 +474,15 @@ structured `tracing` events.
 
 ## Metrics
 
-Prometheus metrics available at `/metrics`:
+Prometheus metrics available at `/metrics` on both the API (:42780) and the
+scheduler (:42781); the scheduler's endpoint carries the fuller set (job,
+lane, and dispatch counters).
 
 - `gitforge_http_requests_total` - HTTP request count by method and path
 - `gitforge_job_duration_seconds` - Job execution duration
-- `gitforge_runners_online` - Number of online runners
+- `gitforge_runners_online` - Number of online runners (scheduler side;
+  refreshed from durable rows every 30s — before 2026-11-03 this gauge
+  never moved off zero)
 - `gitforge_pipeline_runs_total` - Pipeline runs by status
 - `gitforge_artifact_size_bytes` - Artifact sizes
 

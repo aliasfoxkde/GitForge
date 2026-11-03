@@ -892,6 +892,68 @@ impl PipelineQueries {
         Ok(count)
     }
 
+    /// Supersede older runs on the same (repo, ref, pipeline) when a newer
+    /// push lands: grade their non-terminal rows `cancelled` and cancel the
+    /// runs' never-dispatched job rows. The newest SHA wins — executing a
+    /// stale SHA's queued jobs after its successor arrived only burns
+    /// runner capacity on code that is already history (2026-11-02 queue
+    /// incident: a 109-job backlog that a supersede policy would have cut
+    /// ~7×). Rows already `assigned`/`running` belong to the runner
+    /// lifecycle and are left alone; their runs still finalize from the
+    /// job outcomes. Returns the number of runs superseded.
+    pub async fn supersede_stale_runs(
+        pool: &Pool,
+        repo_id: RepoId,
+        ref_name: &str,
+        pipeline_id: PipelineId,
+        keep_run_id: PipelineRunId,
+    ) -> Result<u64> {
+        let mut transaction = begin_immediate(pool.pool(), "run supersede").await?;
+        let stale: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM pipeline_runs \
+             WHERE repo_id = ? AND pipeline_id = ? AND id != ? \
+             AND status IN ('pending', 'running', 'queued') \
+             AND created_at < (SELECT created_at FROM pipeline_runs WHERE id = ?)",
+        )
+        .bind(repo_id.to_string())
+        .bind(pipeline_id.to_string())
+        .bind(keep_run_id.to_string())
+        .bind(keep_run_id.to_string())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|e| Error::database(format!("failed to list stale runs: {e}")))?;
+        let mut superseded = 0u64;
+        for run_id in &stale {
+            sqlx::query(
+                "UPDATE jobs SET status = ?, finished_at = COALESCE(finished_at, ?) \
+                 WHERE pipeline_run_id = ? AND status IN ('pending', 'queued')",
+            )
+            .bind(JobStatus::Cancelled.as_str())
+            .bind(Utc::now().to_rfc3339())
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| Error::database(format!("failed to cancel superseded jobs: {e}")))?;
+            sqlx::query(
+                "UPDATE pipeline_runs SET status = 'cancelled', \
+                 finished_at = COALESCE(finished_at, ?), \
+                 error = COALESCE(error, 'superseded by a newer push') \
+                 WHERE id = ?",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| Error::database(format!("failed to supersede run: {e}")))?;
+            superseded += 1;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|e| Error::database(format!("failed to commit supersede: {e}")))?;
+        Ok(superseded)
+    }
+
     /// Delete a pipeline row outright.
     ///
     /// Only safe for definitions with no runs: runs reference their
@@ -4747,6 +4809,148 @@ mod tests {
         assert!(was_new, "a second pipeline must not dedup onto the first");
         assert_ne!(second_row.id, first_row.id);
         assert_eq!(second_row.pipeline_id, Some(second_pipeline));
+    }
+
+    #[tokio::test]
+    async fn test_supersede_stale_runs_cancels_older_branch_runs() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "supersede-owner".to_string(),
+            "supersede-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "supersede-repo".to_string(),
+            owner.id,
+            "/git/supersede-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+        PipelineQueries::create(&pool, &pipeline).await.unwrap();
+
+        // Older queued run on the same branch, with a pending and a queued
+        // job plus one already-running job.
+        let mut stale = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "a".repeat(40),
+        );
+        stale.created_at = Utc::now() - chrono::Duration::hours(1);
+        PipelineRunQueries::create(&pool, &stale).await.unwrap();
+        let stale_pending = crate::models::Job::new(stale.id, "stale-pending".to_string());
+        JobQueries::create(&pool, &stale_pending).await.unwrap();
+        let stale_running = crate::models::Job::new(stale.id, "stale-running".to_string());
+        JobQueries::create(&pool, &stale_running).await.unwrap();
+        JobQueries::update_status(&pool, stale_running.id, "running")
+            .await
+            .unwrap();
+
+        // A succeeded run on the same branch must be untouched (history).
+        let mut done = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "b".repeat(40),
+        );
+        done.created_at = Utc::now() - chrono::Duration::hours(2);
+        PipelineRunQueries::create(&pool, &done).await.unwrap();
+        PipelineRunQueries::update_status(&pool, done.id, "succeeded")
+            .await
+            .unwrap();
+
+        // A queued run on a DIFFERENT pipeline must be untouched.
+        let other_pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "docs".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+        PipelineQueries::create(&pool, &other_pipeline)
+            .await
+            .unwrap();
+        let mut other = crate::models::PipelineRun::new(
+            other_pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "c".repeat(40),
+        );
+        other.created_at = Utc::now() - chrono::Duration::hours(1);
+        PipelineRunQueries::create(&pool, &other).await.unwrap();
+
+        // The new run (the winner).
+        let fresh = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "d".repeat(40),
+        );
+        PipelineRunQueries::create(&pool, &fresh).await.unwrap();
+
+        let superseded = PipelineQueries::supersede_stale_runs(
+            &pool,
+            repo.id,
+            "refs/heads/main",
+            pipeline.id,
+            fresh.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(superseded, 1, "only the stale ci run is superseded");
+
+        let stale_row = PipelineRunQueries::get(&pool, stale.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale_row.status, "cancelled");
+        assert_eq!(
+            stale_row.error.as_deref(),
+            Some("superseded by a newer push")
+        );
+        assert!(stale_row.finished_at.is_some());
+
+        // Pending/queued jobs of the stale run are cancelled; the already
+        // running job belongs to the runner lifecycle and is left alone.
+        let pending_row = JobQueries::get(&pool, stale_pending.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_row.status, "cancelled");
+        let running_row = JobQueries::get(&pool, stale_running.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running_row.status, "running");
+
+        let done_row = PipelineRunQueries::get(&pool, done.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done_row.status, "succeeded", "history is untouched");
+        let other_row = PipelineRunQueries::get(&pool, other.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            other_row.status, "pending",
+            "a different pipeline's run is untouched"
+        );
     }
 
     #[tokio::test]
