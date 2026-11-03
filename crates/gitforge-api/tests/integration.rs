@@ -1133,6 +1133,11 @@ async fn test_api_runners_endpoint() {
     gitforge_db::queries::UserQueries::create(&pool, &user)
         .await
         .unwrap();
+    // Runner reads are maintainer/admin-only (2026-11-02 authz audit F3);
+    // the middleware re-resolves the persisted role, so the row carries it.
+    gitforge_db::queries::UserQueries::set_role(&pool, user.id, "admin")
+        .await
+        .unwrap();
 
     let server = ApiServer::new("test-secret", pool);
     let app = server.into_router();
@@ -1169,6 +1174,10 @@ async fn test_api_runner_registration_adopts_existing_name() {
         "hash".to_string(),
     );
     gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+    // Runner reads are maintainer/admin-only (F3); persist the role.
+    gitforge_db::queries::UserQueries::set_role(&pool, user.id, "admin")
         .await
         .unwrap();
 
@@ -1258,6 +1267,10 @@ async fn test_api_runner_list_derives_status_from_heartbeat() {
         "hash".to_string(),
     );
     gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+    // Runner reads are maintainer/admin-only (F3); persist the role.
+    gitforge_db::queries::UserQueries::set_role(&pool, user.id, "admin")
         .await
         .unwrap();
 

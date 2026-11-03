@@ -100,7 +100,7 @@ pub fn ci_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/jobs", post(submit_job))
 }
 
-fn can_manage_jobs(claims: &Claims) -> bool {
+pub(crate) fn can_manage_jobs(claims: &Claims) -> bool {
     matches!(claims.role.as_str(), "admin" | "maintainer")
 }
 
