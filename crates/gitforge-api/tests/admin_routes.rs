@@ -72,7 +72,12 @@ async fn seed() -> Fixture {
     let auth = ApiAuth::new("test-secret");
     let token_for =
         |user: &User, role: &str| auth.generate_token(user.id, &user.username, role).unwrap();
-    let app = ApiServer::new("test-secret", pool.clone()).into_router();
+    let app = ApiServer::with_registration_token(
+        "test-secret",
+        pool.clone(),
+        Some(std::sync::Arc::new("admin-suite-registration".to_string())),
+    )
+    .into_router();
     Fixture {
         app,
         pool,
@@ -154,6 +159,10 @@ async fn get_json(app: Router, uri: &str, token: Option<&str>) -> (StatusCode, V
     )
 }
 
+/// Registration is the one runner endpoint served without a user JWT; it
+/// proves itself with the shared registration token instead (#357).
+const REGISTRATION_TOKEN: &str = "admin-suite-registration";
+
 #[tokio::test]
 async fn register_runner_is_public_and_normalizes_the_payload() {
     let f = seed().await;
@@ -163,7 +172,7 @@ async fn register_runner_is_public_and_normalizes_the_payload() {
     let (status, body) = post_json(
         f.app.clone(),
         "/api/runners",
-        None,
+        Some(REGISTRATION_TOKEN),
         json!({"name": "edge-runner", "type": "firecracker", "capacity": 4}),
     )
     .await;
@@ -176,7 +185,13 @@ async fn register_runner_is_public_and_normalizes_the_payload() {
     // Defaults and aliases: no payload means stock docker runner; the
     // baremetal spelling maps to the same type as bare_metal; unknown types
     // fall back to docker.
-    let (status, body) = post_json(f.app.clone(), "/api/runners", None, json!({})).await;
+    let (status, body) = post_json(
+        f.app.clone(),
+        "/api/runners",
+        Some(REGISTRATION_TOKEN),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(body["name"], "runner");
     assert_eq!(body["type"], "docker");
@@ -190,7 +205,7 @@ async fn register_runner_is_public_and_normalizes_the_payload() {
         let (status, body) = post_json(
             f.app.clone(),
             "/api/runners",
-            None,
+            Some(REGISTRATION_TOKEN),
             json!({"name": format!("runner-{sent}"), "type": sent}),
         )
         .await;
@@ -211,7 +226,11 @@ async fn runner_listing_requires_auth_and_shows_registered_runners() {
     let (status, _) = get_json(f.app.clone(), "/api/runners", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    let (status, body) = get_json(f.app.clone(), "/api/runners", Some(&f.developer_token)).await;
+    // Runner inventory is maintainer/admin-only (2026-11-02 authz audit F3).
+    let (status, _) = get_json(f.app.clone(), "/api/runners", Some(&f.developer_token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = get_json(f.app.clone(), "/api/runners", Some(&f.admin_token)).await;
     assert_eq!(status, StatusCode::OK);
     let runners = body.as_array().unwrap();
     assert_eq!(runners.len(), 1);
@@ -244,10 +263,18 @@ async fn get_runner_validates_the_id_and_missing_rows() {
 
     let runner = Runner::new("visible-runner".to_string(), RunnerType::BareMetal, 8);
     RunnerQueries::create(&f.pool, &runner).await.unwrap();
-    let (status, body) = get_json(
+    // Single-runner reads carry the same maintainer/admin gate.
+    let (status, _) = get_json(
         f.app.clone(),
         &format!("/api/runners/{}", runner.id),
         Some(&f.developer_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = get_json(
+        f.app.clone(),
+        &format!("/api/runners/{}", runner.id),
+        Some(&f.admin_token),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

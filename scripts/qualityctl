@@ -52,7 +52,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [[ ! -S "$SOCKET" ]]; then
-    "$BUILD_DAEMON" >"$log_dir/daemon.log" 2>&1 &
+    GITFORGE_BUILD_SOCKET="$SOCKET" "$BUILD_DAEMON" >"$log_dir/daemon.log" 2>&1 &
     daemon_pid=$!
     for _ in $(seq 1 100); do
         [[ -S "$SOCKET" ]] && break
@@ -129,7 +129,7 @@ PY
 failed=0
 record_stage format fmt --all -- --check || failed=1
 record_stage clippy clippy --workspace --all-targets -- -D warnings || failed=1
-record_stage test test --workspace --locked --no-fail-fast || failed=1
+record_stage test test --workspace --locked --no-fail-fast -- --test-threads=2 || failed=1
 if [[ "$FAST" != true ]]; then
     record_stage coverage llvm-cov --workspace --all-features --locked --no-fail-fast \
         --cobertura --output-path target/quality/cobertura.xml --fail-under-lines 79.9 || failed=1

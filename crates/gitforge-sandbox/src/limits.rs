@@ -5,8 +5,11 @@ use serde::{Deserialize, Serialize};
 /// Resource limits for sandbox execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxLimits {
-    /// CPU time limit in milliseconds
+    /// Legacy CPU budget metadata in milliseconds; this is not the CFS core cap.
     pub cpu_ms: u64,
+    /// Maximum parallel CPU cores available to the sandbox.
+    #[serde(default = "default_cpu_cores")]
+    pub cpu_cores: u32,
     /// Memory limit in megabytes
     pub memory_mb: u64,
     /// Disk limit in megabytes
@@ -17,10 +20,15 @@ pub struct SandboxLimits {
     pub network: bool,
 }
 
+fn default_cpu_cores() -> u32 {
+    1
+}
+
 impl Default for SandboxLimits {
     fn default() -> Self {
         Self {
-            cpu_ms: 3600000,    // 1 hour
+            cpu_ms: 3600000, // 1 hour
+            cpu_cores: 1,
             memory_mb: 4096,    // 4GB
             disk_mb: 10240,     // 10GB
             timeout_secs: 3600, // 1 hour
@@ -34,6 +42,7 @@ impl SandboxLimits {
     pub fn small() -> Self {
         Self {
             cpu_ms: 300000, // 5 minutes
+            cpu_cores: 1,
             memory_mb: 512,
             disk_mb: 1024,
             timeout_secs: 300,
@@ -44,6 +53,7 @@ impl SandboxLimits {
     pub fn medium() -> Self {
         Self {
             cpu_ms: 1800000, // 30 minutes
+            cpu_cores: 1,
             memory_mb: 2048,
             disk_mb: 5120,
             timeout_secs: 1800,
@@ -54,6 +64,7 @@ impl SandboxLimits {
     pub fn large() -> Self {
         Self {
             cpu_ms: 3600000,
+            cpu_cores: 2,
             memory_mb: 8192,
             disk_mb: 20480,
             timeout_secs: 3600,
@@ -70,6 +81,7 @@ mod tests {
     fn test_sandbox_limits_default() {
         let limits = SandboxLimits::default();
         assert_eq!(limits.cpu_ms, 3600000);
+        assert_eq!(limits.cpu_cores, 1);
         assert_eq!(limits.memory_mb, 4096);
         assert!(limits.network);
     }
@@ -78,6 +90,7 @@ mod tests {
     fn test_sandbox_limits_small() {
         let limits = SandboxLimits::small();
         assert_eq!(limits.cpu_ms, 300000);
+        assert_eq!(limits.cpu_cores, 1);
         assert_eq!(limits.memory_mb, 512);
         assert!(!limits.network);
     }
@@ -86,6 +99,7 @@ mod tests {
     fn test_sandbox_limits_medium() {
         let limits = SandboxLimits::medium();
         assert_eq!(limits.cpu_ms, 1800000);
+        assert_eq!(limits.cpu_cores, 1);
         assert_eq!(limits.memory_mb, 2048);
         assert!(limits.network);
     }
@@ -94,6 +108,7 @@ mod tests {
     fn test_sandbox_limits_large() {
         let limits = SandboxLimits::large();
         assert_eq!(limits.cpu_ms, 3600000);
+        assert_eq!(limits.cpu_cores, 2);
         assert_eq!(limits.memory_mb, 8192);
         assert!(limits.network);
     }

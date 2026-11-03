@@ -77,13 +77,20 @@ fn acquire_timeout_secs(default_secs: u64, load1: Option<f64>, cores: usize) -> 
 /// raise the ceiling per deployment.
 fn sandbox_limits() -> SandboxLimits {
     const DEFAULT_MB: u64 = 4096;
+    const DEFAULT_CPU_CORES: u32 = 1;
     let memory_mb = std::env::var("GITFORGE_SANDBOX_MEMORY_MB")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|mb| *mb >= 128)
         .unwrap_or(DEFAULT_MB);
+    let cpu_cores = std::env::var("GITFORGE_SANDBOX_CPU_CORES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|cores| (1..=64).contains(cores))
+        .unwrap_or(DEFAULT_CPU_CORES);
     SandboxLimits {
         memory_mb,
+        cpu_cores,
         ..SandboxLimits::default()
     }
 }
@@ -1081,6 +1088,14 @@ mod tests {
     fn test_sandbox_limits_default_and_env_override() {
         // Default: the historical 4GiB ceiling.
         std::env::remove_var("GITFORGE_SANDBOX_MEMORY_MB");
+        std::env::remove_var("GITFORGE_SANDBOX_CPU_CORES");
+        assert_eq!(sandbox_limits().cpu_cores, 1);
+
+        std::env::set_var("GITFORGE_SANDBOX_CPU_CORES", "2");
+        assert_eq!(sandbox_limits().cpu_cores, 2);
+        std::env::set_var("GITFORGE_SANDBOX_CPU_CORES", "0");
+        assert_eq!(sandbox_limits().cpu_cores, 1);
+        std::env::remove_var("GITFORGE_SANDBOX_CPU_CORES");
         assert_eq!(sandbox_limits().memory_mb, 4096);
 
         // CI-capable hosts can raise it for the native-crypto link step.

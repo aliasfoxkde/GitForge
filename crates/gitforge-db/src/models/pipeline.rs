@@ -77,6 +77,9 @@ pub struct PipelineRun {
     /// finalized the run. `None` for successes and for runs that predate
     /// the column.
     pub error: Option<String>,
+    /// Git ref the run was triggered for. `None` for rows that predate the
+    /// column; supersede filtering skips such runs rather than guessing.
+    pub ref_name: Option<String>,
 }
 
 impl PipelineRun {
@@ -98,6 +101,7 @@ impl PipelineRun {
             finished_at: None,
             created_at: Utc::now(),
             error: None,
+            ref_name: None,
         }
     }
 

@@ -39,11 +39,38 @@ impl ApiServer {
         Self::with_storage(jwt_secret, pool, None)
     }
 
+    /// Create a new API server with an explicit runner registration token.
+    ///
+    /// Production reads the token from `GITFORGE_RUNNER_REGISTRATION_TOKEN`
+    /// (see `new`); tests inject a known value so the registration contract
+    /// is exercised without touching the process environment.
+    pub fn with_registration_token(
+        jwt_secret: &str,
+        pool: Pool,
+        registration_token: Option<Arc<String>>,
+    ) -> Self {
+        Self::build(jwt_secret, pool, None, registration_token)
+    }
+
     /// Create a new API server with custom storage path
     pub fn with_storage(
         jwt_secret: &str,
         pool: Pool,
+        storage_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::build(
+            jwt_secret,
+            pool,
+            storage_path,
+            crate::routes::runners::registration_token_from_env(),
+        )
+    }
+
+    fn build(
+        jwt_secret: &str,
+        pool: Pool,
         _storage_path: Option<std::path::PathBuf>,
+        registration_token: Option<Arc<String>>,
     ) -> Self {
         let auth = ApiAuth::new(jwt_secret);
         let metrics = Metrics::new();
@@ -76,19 +103,25 @@ impl ApiServer {
                 .allow_headers(Any)
         };
 
-        // Public routes (no auth required)
+        // Public routes (no auth required). Telemetry surfaces are added
+        // only when the operator opted in; otherwise they ride behind the
+        // auth middleware via the protected router (F5).
+        let telemetry_public = crate::middleware::telemetry_is_public(
+            std::env::var("GITFORGE_PUBLIC_TELEMETRY").ok().as_deref(),
+        );
+        let metrics_router = Router::new().route("/metrics", get(metrics_handler));
         let health = Router::new().route("/health", get(health_check));
-        let metrics = Router::new().route("/metrics", get(metrics_handler));
         let swagger = Router::new()
             .route("/swagger-ui", get(crate::openapi::swagger_ui))
             .route("/api-docs/openapi.json", get(crate::openapi::openapi_spec));
-        let dashboard = crate::dashboard::dashboard_routes();
 
         let mut public_routes = Router::new();
         public_routes = public_routes.merge(health);
-        public_routes = public_routes.merge(metrics);
-        public_routes = public_routes.merge(dashboard);
         public_routes = public_routes.merge(swagger);
+        if telemetry_public {
+            let dashboard = crate::dashboard::dashboard_routes();
+            public_routes = public_routes.merge(metrics_router.clone()).merge(dashboard);
+        }
         // Runner registration is unauthenticated by design (the runner
         // proves itself with its registration token inside the handler), so
         // it is the other public write surface and gets its own rate-limit
@@ -98,7 +131,7 @@ impl ApiServer {
             requests_per_minute: 60,
             burst_size: 20,
         });
-        let runner_registration = public_runner_routes()
+        let runner_registration = public_runner_routes(registration_token)
             .layer(RateLimitLayer::new(runner_registration_limiter.clone()))
             .layer(Extension(Arc::new(pool.clone())));
         public_routes = public_routes
@@ -132,7 +165,8 @@ impl ApiServer {
             .merge(ssh_key_routes())
             .merge(artifact_routes())
             .merge(webhook_routes())
-            .merge(review_routes())
+            .merge(review_routes());
+        let protected_routes = protected_routes
             // Authenticate once at the protected-route boundary. Individual
             // handlers may still apply resource authorization, but token
             // parsing and validation must not depend on every handler
@@ -141,9 +175,12 @@ impl ApiServer {
             .layer(Extension(Arc::new(auth.clone())))
             .layer(Extension(pool_arc.clone()));
 
-        // Metrics layer for automatic request recording
+        // Telemetry surfaces stay at top level either way; when the
+        // operator has not opted into public access they are merged in
+        // behind their own auth-middleware layer (F5). They cannot ride
+        // the /api-nested protected router — nesting would move them to
+        // /api/metrics and leave the canonical paths unrouted.
         let metrics_layer = MetricsLayer::new(metrics_arc.clone());
-
         let app = public_routes
             .layer(cors)
             .layer(metrics_layer)
@@ -151,6 +188,17 @@ impl ApiServer {
             .layer(Extension(metrics_arc))
             .merge(auth_routes)
             .nest("/api", protected_routes);
+        let app = if telemetry_public {
+            app
+        } else {
+            let dashboard = crate::dashboard::dashboard_routes();
+            let telemetry = metrics_router
+                .merge(dashboard)
+                .layer(middleware::from_fn(crate::middleware::auth_middleware))
+                .layer(Extension(Arc::new(auth.clone())))
+                .layer(Extension(pool_arc));
+            app.merge(telemetry)
+        };
 
         Self {
             router: app,

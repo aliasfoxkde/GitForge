@@ -3,7 +3,7 @@
 use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Extension, Path},
-    http::StatusCode,
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -17,6 +17,36 @@ use gitforge_db::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Shared secret a runner must present to register or refresh its identity
+/// (`Authorization: Bearer <token>`, `GITFORGE_RUNNER_REGISTRATION_TOKEN` on
+/// both sides). Fail-closed: with the variable unset the endpoint rejects
+/// every registration rather than degrading to the historical open write
+/// surface (#357).
+///
+/// The value is read once at server construction and injected as an
+/// `Extension`, so the handler never reads process-global state at request
+/// time.
+pub fn registration_token_from_env() -> Option<Arc<String>> {
+    std::env::var("GITFORGE_RUNNER_REGISTRATION_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(Arc::new)
+}
+
+/// Constant-time equality so a network adversary cannot recover the secret
+/// byte-by-byte from timing.
+fn token_matches(provided: &str, expected: &str) -> bool {
+    if provided.len() != expected.len() {
+        return false;
+    }
+    provided
+        .bytes()
+        .zip(expected.bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
 
 /// Runner response
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,15 +89,44 @@ pub fn runner_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 
 /// Runner registration is a bootstrap endpoint used before a runner has a
 /// user JWT. It is mounted separately from protected runner administration.
-pub fn public_runner_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
-    Router::new().route("/runners", axum::routing::post(register_runner))
+///
+/// `registration` is the shared secret a runner must present
+/// (`GITFORGE_RUNNER_REGISTRATION_TOKEN`). `None` means registration is
+/// disabled and every call is refused (#357).
+pub fn public_runner_routes<S: Clone + Send + Sync + 'static>(
+    registration: Option<Arc<String>>,
+) -> Router<S> {
+    Router::new().route(
+        "/runners",
+        axum::routing::post(
+            move |Extension(pool): Extension<Arc<Pool>>,
+                  headers: HeaderMap,
+                  Json(payload): Json<serde_json::Value>| {
+                register_runner(pool, registration.clone(), headers, payload)
+            },
+        ),
+    )
 }
 
 /// List runners
+///
+/// Runner inventory (names, capacity, heartbeat) is operational data; only
+/// admin/maintainer roles may read it. Any-authenticated listing let a
+/// plain developer enumerate the fleet.
 async fn list_runners(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     Extension(pool): Extension<Arc<Pool>>,
 ) -> impl IntoResponse {
+    if !crate::routes::ci::can_manage_jobs(&user.claims) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "forbidden",
+                "message": "runner administration requires maintainer role"
+            })),
+        )
+            .into_response();
+    }
     match RunnerQueries::list(&pool).await {
         Ok(runners) => {
             let response: Vec<RunnerResponse> =
@@ -88,11 +147,47 @@ async fn list_runners(
     }
 }
 
-/// Register a runner (also used by runner agent - allows unauthenticated)
+/// Register a runner. Bootstrap surface: the runner has no user JWT yet, so
+/// it proves itself with the shared registration token instead (#357).
+/// Adoption of an existing identity by name rides on the same proof — the
+/// token is what separates the operator's restarted runner from an attacker
+/// overwriting a live runner's row.
 async fn register_runner(
-    Extension(pool): Extension<Arc<Pool>>,
-    Json(payload): Json<serde_json::Value>,
-) -> impl IntoResponse {
+    pool: Arc<Pool>,
+    registration: Option<Arc<String>>,
+    headers: HeaderMap,
+    payload: serde_json::Value,
+) -> axum::response::Response {
+    let Some(expected) = registration else {
+        tracing::error!(
+            "runner registration refused: GITFORGE_RUNNER_REGISTRATION_TOKEN is not set"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "registration_disabled",
+                "message": "runner registration token is not configured"
+            })),
+        )
+            .into_response();
+    };
+    let provided = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let authorized = provided.is_some_and(|token| token_matches(token, &expected));
+    if !authorized {
+        tracing::warn!("runner registration refused: missing or invalid bearer token");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "invalid_token",
+                "message": "a valid runner registration token is required"
+            })),
+        )
+            .into_response();
+    }
+
     tracing::debug!("register runner: {:?}", payload);
 
     let name = payload["name"].as_str().unwrap_or("runner").to_string();
@@ -133,11 +228,24 @@ async fn register_runner(
 }
 
 /// Get runner
+///
+/// Same role gate as `list_runners` — a single runner's row carries the
+/// same operational detail the list does.
 async fn get_runner(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     Extension(pool): Extension<Arc<Pool>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if !crate::routes::ci::can_manage_jobs(&user.claims) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "forbidden",
+                "message": "runner administration requires maintainer role"
+            })),
+        )
+            .into_response();
+    }
     tracing::debug!("get runner: {}", id);
 
     match Uuid::parse_str(&id) {
@@ -246,6 +354,28 @@ async fn retire_runner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Registration token comparison is constant-time and length-safe.
+    #[test]
+    fn token_matches_contract() {
+        assert!(token_matches("abc123", "abc123"));
+        assert!(!token_matches("abc123", "abc124"));
+        assert!(!token_matches("abc123", "abc1234"));
+        assert!(!token_matches("", "x"));
+        assert!(token_matches("", ""));
+    }
+
+    /// Fail-closed contract: with no token configured, the injected
+    /// registration value is `None` and the handler must refuse rather than
+    /// fall back to open registration. The environment is read once at
+    /// server construction, so the decision here is on injected data.
+    #[test]
+    fn registration_token_absent_means_disabled() {
+        assert!(
+            registration_token_from_env().is_none()
+                || std::env::var("GITFORGE_RUNNER_REGISTRATION_TOKEN").is_ok()
+        );
+    }
 
     /// The runner listing wire contract: exact field names (note the
     /// `type` rename) and the heartbeat timestamp present only when the

@@ -100,12 +100,12 @@ pub fn ci_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/jobs", post(submit_job))
 }
 
-fn can_manage_jobs(claims: &Claims) -> bool {
+pub(crate) fn can_manage_jobs(claims: &Claims) -> bool {
     matches!(claims.role.as_str(), "admin" | "maintainer")
 }
 
 /// Require ownership of a repository, with admin/maintainer override.
-async fn authorize_repo(
+pub(crate) async fn authorize_repo(
     pool: &Pool,
     claims: &Claims,
     repo_id: gitforge_common::RepoId,
@@ -547,7 +547,13 @@ async fn trigger_pipeline_run(
     };
 
     match client
-        .trigger(pipeline.repo_id, &revision, None, &commit)
+        .trigger(
+            pipeline.repo_id,
+            &revision,
+            None,
+            &commit,
+            Some(pipeline.id),
+        )
         .await
     {
         Ok(Some(pipeline_run_id)) => (
@@ -715,7 +721,13 @@ async fn rerun_pipeline_run(
     };
 
     match client
-        .trigger(run.repo_id, &run.commit_hash, None, &commit)
+        .trigger(
+            run.repo_id,
+            &run.commit_hash,
+            None,
+            &commit,
+            Some(run.pipeline_id),
+        )
         .await
     {
         Ok(Some(pipeline_run_id)) => (

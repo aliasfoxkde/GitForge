@@ -43,6 +43,7 @@ prometheus = "0.14"
 hyper = "1.5"
 tempfile = "3"
 gitforge-review = { path = "../gitforge-review" }
+sqlx = { workspace = true }
 
 [lints]
 workspace = true

@@ -18,6 +18,24 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::time::{sleep, timeout, Duration};
 
+/// Docker's CFS bandwidth period, in microseconds.
+const CPU_PERIOD_MICROS: i64 = 100_000;
+
+/// Convert a requested core count to a safe CFS quota, bounded by the
+/// host's available parallelism. `cpu_ms` is a runtime budget and must not
+/// be used as a per-period quota.
+fn cpu_quota_micros(requested_cores: u32, available_cores: u32) -> i64 {
+    let available_cores = available_cores.max(1);
+    let bounded_cores = requested_cores.clamp(1, available_cores);
+    i64::from(bounded_cores) * CPU_PERIOD_MICROS
+}
+
+fn host_cpu_quota_micros(requested_cores: u32) -> i64 {
+    let available_cores = std::thread::available_parallelism()
+        .map_or(1, |count| u32::try_from(count.get()).unwrap_or(u32::MAX));
+    cpu_quota_micros(requested_cores, available_cores)
+}
+
 /// Sandbox instance handle
 #[derive(Debug, Clone)]
 pub struct SandboxInstance {
@@ -673,8 +691,8 @@ impl Sandbox for DockerSandbox {
             // Build host config with resource limits
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
-                cpu_period: Some(100000), // 100ms in microseconds
-                cpu_quota: Some((limits.cpu_ms * 1000) as i64), // Convert ms to microseconds
+                cpu_period: Some(CPU_PERIOD_MICROS),
+                cpu_quota: Some(host_cpu_quota_micros(limits.cpu_cores)),
                 network_mode: if limits.network {
                     None
                 } else {
@@ -773,8 +791,8 @@ impl Sandbox for DockerSandbox {
                 };
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
-                cpu_period: Some(100000),
-                cpu_quota: Some((limits.cpu_ms * 1000) as i64),
+                cpu_period: Some(CPU_PERIOD_MICROS),
+                cpu_quota: Some(host_cpu_quota_micros(limits.cpu_cores)),
                 network_mode: if limits.network {
                     None
                 } else {
@@ -1800,6 +1818,7 @@ mod tests {
         let limits = SandboxLimits::default();
         assert_eq!(limits.memory_mb, 4096);
         assert_eq!(limits.cpu_ms, 3600000);
+        assert_eq!(limits.cpu_cores, 1);
         assert!(limits.network);
     }
 
@@ -1808,6 +1827,7 @@ mod tests {
         let limits = SandboxLimits::medium();
         assert_eq!(limits.memory_mb, 2048);
         assert_eq!(limits.cpu_ms, 1800000);
+        assert_eq!(limits.cpu_cores, 1);
         assert!(limits.network);
     }
 
@@ -1816,7 +1836,17 @@ mod tests {
         let limits = SandboxLimits::large();
         assert_eq!(limits.memory_mb, 8192);
         assert_eq!(limits.cpu_ms, 3600000);
+        assert_eq!(limits.cpu_cores, 2);
         assert!(limits.network);
+    }
+
+    #[test]
+    fn test_cpu_quota_uses_bounded_core_count_not_cpu_time_budget() {
+        assert_eq!(cpu_quota_micros(1, 16), 100_000);
+        assert_eq!(cpu_quota_micros(2, 16), 200_000);
+        assert_eq!(cpu_quota_micros(16, 4), 400_000);
+        assert_eq!(cpu_quota_micros(0, 0), 100_000);
+        assert_ne!(cpu_quota_micros(1, 16), 3_600_000_000);
     }
 
     #[test]

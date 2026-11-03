@@ -26,6 +26,12 @@ use gitforge_storage::{Artifact, ArtifactStore};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+/// Serializes the tests that mutate GITFORGE_PUBLIC_TELEMETRY. The
+/// decision is read at router-build time from the process env, which is
+/// shared by every test thread in this binary — without the lock the
+/// default-posture tests race the opt-in test and randomly invert.
+static TELEMETRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 async fn webhook_fixture(
     config: serde_json::Value,
 ) -> (
@@ -142,9 +148,16 @@ async fn test_health_check_endpoint() {
 
 #[tokio::test]
 async fn test_metrics_endpoint() {
+    // Opt-in telemetry: with GITFORGE_PUBLIC_TELEMETRY unset, /metrics is
+    // served behind the auth middleware (F5) and must reject anonymous
+    // access. The wiring boundary (route placement, not just the
+    // middleware decision) is what this test pins.
     let pool = Pool::memory().await.unwrap();
+    let _guard = TELEMETRY_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::remove_var("GITFORGE_PUBLIC_TELEMETRY") };
     let server = ApiServer::new("test-secret", pool);
     let app = server.into_router();
+    drop(_guard);
 
     // Request metrics
     let response = app
@@ -157,7 +170,7 @@ async fn test_metrics_endpoint() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -675,9 +688,36 @@ async fn test_delete_nonexistent_repo() {
 
 #[tokio::test]
 async fn test_dashboard_endpoint() {
+    // Default posture: authenticated only (F5 wiring boundary).
     let pool = Pool::memory().await.unwrap();
+    let _guard = TELEMETRY_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::remove_var("GITFORGE_PUBLIC_TELEMETRY") };
     let server = ApiServer::new("test-secret", pool);
     let app = server.into_router();
+    drop(_guard);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_dashboard_endpoint_public_opt_in() {
+    // Operator opt-in keeps both telemetry surfaces public.
+    let pool = Pool::memory().await.unwrap();
+    let _guard = TELEMETRY_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::set_var("GITFORGE_PUBLIC_TELEMETRY", "1") };
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+    drop(_guard);
 
     let response = app
         .oneshot(
@@ -690,6 +730,7 @@ async fn test_dashboard_endpoint() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    unsafe { std::env::remove_var("GITFORGE_PUBLIC_TELEMETRY") };
 }
 
 #[tokio::test]
@@ -1065,6 +1106,7 @@ async fn test_api_artifacts_are_scoped_to_job_repository_owner() {
             finished_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
             error: None,
+            ref_name: None,
         },
     )
     .await
@@ -1133,6 +1175,11 @@ async fn test_api_runners_endpoint() {
     gitforge_db::queries::UserQueries::create(&pool, &user)
         .await
         .unwrap();
+    // Runner reads are maintainer/admin-only (2026-11-02 authz audit F3);
+    // the middleware re-resolves the persisted role, so the row carries it.
+    gitforge_db::queries::UserQueries::set_role(&pool, user.id, "admin")
+        .await
+        .unwrap();
 
     let server = ApiServer::new("test-secret", pool);
     let app = server.into_router();
@@ -1171,8 +1218,16 @@ async fn test_api_runner_registration_adopts_existing_name() {
     gitforge_db::queries::UserQueries::create(&pool, &user)
         .await
         .unwrap();
+    // Runner reads are maintainer/admin-only (F3); persist the role.
+    gitforge_db::queries::UserQueries::set_role(&pool, user.id, "admin")
+        .await
+        .unwrap();
 
-    let server = ApiServer::new("test-secret", pool);
+    let server = ApiServer::with_registration_token(
+        "test-secret",
+        pool,
+        Some(std::sync::Arc::new("integration-registration".to_string())),
+    );
     let app = server.into_router();
     let auth = ApiAuth::new("test-secret");
     let token = auth
@@ -1187,6 +1242,7 @@ async fn test_api_runner_registration_adopts_existing_name() {
                 .method("POST")
                 .uri("/api/runners")
                 .header("content-type", "application/json")
+                .header("Authorization", "Bearer integration-registration")
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -1205,6 +1261,7 @@ async fn test_api_runner_registration_adopts_existing_name() {
                 .method("POST")
                 .uri("/api/runners")
                 .header("content-type", "application/json")
+                .header("Authorization", "Bearer integration-registration")
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -1252,6 +1309,10 @@ async fn test_api_runner_list_derives_status_from_heartbeat() {
         "hash".to_string(),
     );
     gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+    // Runner reads are maintainer/admin-only (F3); persist the role.
+    gitforge_db::queries::UserQueries::set_role(&pool, user.id, "admin")
         .await
         .unwrap();
 
@@ -2231,6 +2292,7 @@ async fn test_api_job_control_enforces_repository_ownership_and_persists_cancel(
             finished_at: None,
             created_at: chrono::Utc::now(),
             error: None,
+            ref_name: None,
         },
     )
     .await
@@ -2378,6 +2440,7 @@ async fn test_api_pipeline_runs_with_jobs() {
         finished_at: None,
         created_at: chrono::Utc::now(),
         error: None,
+        ref_name: None,
     };
     gitforge_db::queries::PipelineRunQueries::create(&pool, &run)
         .await

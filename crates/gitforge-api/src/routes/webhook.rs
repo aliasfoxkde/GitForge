@@ -3,6 +3,7 @@
 //! Allows external services to trigger pipeline runs via webhooks.
 
 use crate::middleware::AuthenticatedUser;
+use crate::routes::ci::authorize_repo;
 use axum::{
     extract::{Extension, Path},
     http::StatusCode,
@@ -160,10 +161,12 @@ impl CiTriggerClient {
         branch: &str,
         old_commit_hash: Option<&str>,
         commit_hash: &str,
+        pipeline_id: Option<PipelineId>,
     ) -> Result<Option<String>, String> {
         let old_hash = old_commit_hash
-            .filter(|hash| !hash.is_empty())
-            .unwrap_or("0000000000000000000000000000000000000000");
+            .filter(|hash| !hash.is_empty() && !gitforge_common::is_zero_hash(hash))
+            // git's fixed ref-deletion sentinel: all-zero SHA-1 length.
+            .map_or_else(|| "0".repeat(40), str::to_string);
         let response = self
             .client
             // The configured value is validated at startup, but never reaches
@@ -175,7 +178,13 @@ impl CiTriggerClient {
                 "ref_name": branch,
                 "old_hash": old_hash,
                 "new_hash": commit_hash,
-                "working_dir": null
+                "working_dir": null,
+                // Without the id the consumer falls back to the repo's
+                // cache/persisted/default definition: two pipelines on one
+                // commit could not both run, and an API-uploaded config was
+                // bypassed when the revision had no committed file
+                // (G1/G2, docs/planning/PRODUCTION_VALIDATION_20261102.md).
+                "pipeline_id": pipeline_id.map(|id| id.to_string()),
             }))
             .send()
             .await
@@ -204,7 +213,7 @@ pub fn webhook_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 async fn trigger_pipeline(
     Extension(pool): Extension<Arc<Pool>>,
     ci_trigger: Option<Extension<Arc<CiTriggerClient>>>,
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     Path(pipeline_id): Path<String>,
     Json(payload): Json<WebhookTriggerPayload>,
 ) -> impl IntoResponse {
@@ -248,6 +257,29 @@ async fn trigger_pipeline(
                 }
             };
 
+            // The caller must own the pipeline's repository. Without this,
+            // any authenticated instance user could enumerate pipeline UUIDs
+            // and trigger CI runs (arbitrary command execution on the runner)
+            // against repositories they do not own.
+            if let Err(status) = authorize_repo(&pool, &user.claims, pipeline.repo_id).await {
+                // Collapse "forbidden" into "not found" so a non-owner cannot
+                // probe for the existence of another tenant's pipeline.
+                let status = if status == StatusCode::FORBIDDEN {
+                    StatusCode::NOT_FOUND
+                } else {
+                    status
+                };
+                return (
+                    status,
+                    Json(WebhookTriggerResponse {
+                        success: false,
+                        message: "Pipeline not found".to_string(),
+                        pipeline_id: None,
+                    }),
+                )
+                    .into_response();
+            }
+
             if let Some(Extension(client)) = ci_trigger {
                 match client
                     .trigger(
@@ -255,6 +287,7 @@ async fn trigger_pipeline(
                         &payload.branch,
                         payload.old_commit_hash.as_deref(),
                         &payload.commit_hash,
+                        None,
                     )
                     .await
                 {
@@ -334,13 +367,14 @@ async fn trigger_pipeline(
 
             // Persist the run before queueing so scheduler job foreign keys
             // and recovery have a durable parent record.
-            let run = gitforge_db::models::PipelineRun::new(
+            let mut run = gitforge_db::models::PipelineRun::new(
                 pipeline.id,
                 repo_id,
                 "webhook".to_string(),
                 payload.commit_hash.clone(),
             );
             let run_id = run.id;
+            run.ref_name = Some(payload.branch.clone());
             if let Err(error) = PipelineRunQueries::create(&pool, &run).await {
                 tracing::error!(%error, %pipeline_id, "failed to persist webhook pipeline run");
                 return (

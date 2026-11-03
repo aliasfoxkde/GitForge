@@ -84,7 +84,14 @@ async fn seed() -> Fixture {
     let auth = ApiAuth::new("test-secret");
     let token_for =
         |user: &User, role: &str| auth.generate_token(user.id, &user.username, role).unwrap();
-    let app = ApiServer::new("test-secret", pool.clone()).into_router();
+    // Registration routes are built with the suite's registration token
+    // baked in (production injects GITFORGE_RUNNER_REGISTRATION_TOKEN).
+    let app = ApiServer::with_registration_token(
+        "test-secret",
+        pool.clone(),
+        Some(std::sync::Arc::new(REGISTRATION_TOKEN.to_string())),
+    )
+    .into_router();
     Fixture {
         app,
         pool,
@@ -128,9 +135,66 @@ async fn request_json(
     (status, parsed)
 }
 
-/// Register a runner and return its status code and response body.
+/// Register a runner and return its status code and response body. The
+/// suite injects a known registration token into the router and presents
+/// it, mirroring the production contract (#357).
+const REGISTRATION_TOKEN: &str = "test-registration-token";
+
 async fn register(app: Router, body: Value) -> (StatusCode, Value) {
-    request_json(app, "POST", "/api/runners", None, Some(body)).await
+    request_json(
+        app,
+        "POST",
+        "/api/runners",
+        Some(REGISTRATION_TOKEN),
+        Some(body),
+    )
+    .await
+}
+
+/// Registration without the shared token is refused (fail-closed, #357).
+#[tokio::test]
+async fn register_without_token_is_unauthorized() {
+    let f = seed().await;
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/runners",
+        None,
+        Some(json!({"name": "attacker"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "invalid_token");
+
+    // A wrong token is equally refused — identity adoption cannot be
+    // reached without the secret.
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/runners",
+        Some("wrong-token"),
+        Some(json!({"name": "edge-runner"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "invalid_token");
+}
+
+/// With no registration token configured, the endpoint fails closed.
+#[tokio::test]
+async fn register_without_configured_token_is_disabled() {
+    let f = seed().await;
+    let app = ApiServer::with_registration_token("test-secret", f.pool.clone(), None).into_router();
+    let (status, body) = request_json(
+        app,
+        "POST",
+        "/api/runners",
+        None,
+        Some(json!({"name": "legacy-runner"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "registration_disabled");
 }
 
 #[tokio::test]
@@ -193,7 +257,7 @@ async fn get_runner_returns_wire_contract_and_404s() {
         f.app.clone(),
         "GET",
         &format!("/api/runners/{id}"),
-        Some(&f.developer_token),
+        Some(&f.admin_token),
         None,
     )
     .await;
@@ -211,7 +275,7 @@ async fn get_runner_returns_wire_contract_and_404s() {
         f.app.clone(),
         "GET",
         &format!("/api/runners/{}", uuid::Uuid::new_v4()),
-        Some(&f.developer_token),
+        Some(&f.admin_token),
         None,
     )
     .await;
@@ -222,7 +286,7 @@ async fn get_runner_returns_wire_contract_and_404s() {
         f.app.clone(),
         "GET",
         "/api/runners/not-a-uuid",
-        Some(&f.developer_token),
+        Some(&f.admin_token),
         None,
     )
     .await;
@@ -370,11 +434,24 @@ async fn list_runners_exposes_the_registered_fleet() {
         assert_eq!(status, StatusCode::CREATED);
     }
 
-    let (status, fleet) = request_json(
+    // Runner inventory is operational data: a plain developer is refused
+    // and the same request succeeds with a maintainer/admin token.
+    let (dev_status, dev_body) = request_json(
         f.app.clone(),
         "GET",
         "/api/runners",
         Some(&f.developer_token),
+        None,
+    )
+    .await;
+    assert_eq!(dev_status, StatusCode::FORBIDDEN, "{dev_body}");
+    assert_eq!(dev_body["error"], "forbidden");
+
+    let (status, fleet) = request_json(
+        f.app.clone(),
+        "GET",
+        "/api/runners",
+        Some(&f.admin_token),
         None,
     )
     .await;

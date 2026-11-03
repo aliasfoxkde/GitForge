@@ -56,6 +56,10 @@ const JOB_TIMEOUT_SWEEP_SECS: u64 = 60;
 /// How often the durable trigger-request sweep recovers interrupted work.
 const TRIGGER_SWEEP_SECS: u64 = 30;
 
+/// How often the entity gauges (repos/pipelines/jobs/runners) re-read their
+/// counts from the durable rows.
+const GAUGE_REFRESH_SECS: u64 = 30;
+
 /// A `pending` trigger request older than this is republished: its bus event
 /// was lost (ring lag, restart) or a retry's backoff has elapsed. The gap
 /// doubles as the retry backoff.
@@ -519,6 +523,7 @@ async fn main() -> anyhow::Result<()> {
                             old_hash: request.old_hash.clone(),
                             new_hash: request.new_hash.clone(),
                             pusher_id: None,
+                            pipeline_id: None,
                         }),
                         Some(request.repo_id),
                         None,
@@ -692,6 +697,52 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("job timeout watchdog shutting down");
     });
 
+    // Entity gauges (repos/pipelines/jobs/artifacts/runners-online) are
+    // counters over durable rows no single write path can maintain, so a
+    // periodic refresh from the database is the only correct source. Without
+    // this they stay at zero forever while real work flows through the
+    // service — a silent observability defect (2026-11-02).
+    let gauge_db = scheduler_db.clone();
+    let gauge_metrics = metrics.clone();
+    let gauge_shutdown = shutdown.clone();
+    let _gauge_handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(GAUGE_REFRESH_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if gauge_shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Some(pool) = &gauge_db else { continue };
+                    match gitforge_db::queries::StatsQueries::dashboard(pool).await {
+                        Ok(stats) => {
+                            gauge_metrics.repos_total.set(stats.repositories);
+                            gauge_metrics.pipelines_total.set(stats.pipelines);
+                            gauge_metrics.artifacts_total.set(stats.artifacts);
+                            gauge_metrics.runners_online.set(stats.runners_online);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "gauge refresh failed; keeping last values");
+                        }
+                    }
+                    match gitforge_db::queries::JobQueries::count_all(pool).await {
+                        Ok(count) => gauge_metrics.jobs_total.set(count),
+                        Err(error) => {
+                            tracing::warn!(%error, "gauge refresh: job count failed");
+                        }
+                    }
+                }
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if gauge_shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!("entity gauge refresh shutting down");
+    });
+
     tracing::info!("CI Orchestrator initialized successfully");
 
     // Wait for shutdown signal
@@ -726,6 +777,11 @@ struct PipelineTriggerRequest {
     #[serde(default)]
     pusher_id: Option<gitforge_common::UserId>,
     working_dir: Option<String>,
+    /// Manual API triggers name the pipeline row to execute. Push events
+    /// leave this unset: the committed `.gitforge.yml` at the revision is
+    /// authoritative for pushes (CI config is code).
+    #[serde(default)]
+    pipeline_id: Option<gitforge_common::PipelineId>,
 }
 
 /// Trigger a pipeline through the same typed push-event path used by Git
@@ -885,6 +941,8 @@ async fn trigger_pipeline(
             )
         }
     };
+    // Captured before `request` is consumed by the event payload below.
+    let request_pipeline_id = request.pipeline_id;
 
     let working_dir = match request.working_dir {
         Some(path) => match validate_workspace_path(&path) {
@@ -916,12 +974,15 @@ async fn trigger_pipeline(
     // live instance. A racing trigger for the same commit dedups onto the
     // in-flight row instead of minting a duplicate run.
     let trigger_request = if let Some(pool) = trigger_state.db.as_ref() {
-        let request = gitforge_db::models::PipelineTriggerRequest::new(
+        let mut request = gitforge_db::models::PipelineTriggerRequest::new(
             repo_id,
             request.ref_name.clone(),
             request.old_hash.clone(),
             request.new_hash.clone(),
         );
+        // Part of the dedup key: two explicit pipelines on one commit must
+        // both run (G1).
+        request.pipeline_id = request_pipeline_id;
         match gitforge_db::queries::TriggerRequestQueries::create_or_existing(pool, &request).await
         {
             Ok((existing, was_new)) => {
@@ -968,6 +1029,7 @@ async fn trigger_pipeline(
             old_hash: request.old_hash,
             new_hash: request.new_hash.clone(),
             pusher_id: request.pusher_id,
+            pipeline_id: request.pipeline_id,
         }),
         Some(repo_id),
         None,
@@ -2406,6 +2468,25 @@ async fn handle_push_event(
             repo_id
         );
         committed
+    } else if let Some(requested_id) = payload.pipeline_id {
+        // A manual API trigger named its pipeline row: run that row's
+        // persisted config, not the repo cache/default fallback (G2). The
+        // committed definition still wins when the revision carries one —
+        // CI config is code — but the caller's explicit row beats cache.
+        let persisted = match scheduler_db {
+            Some(pool) => gitforge_db::queries::PipelineQueries::get(pool, requested_id)
+                .await
+                .map_err(|e| TriggerFailure::retryable(e.into()))?
+                .and_then(|pipeline| {
+                    serde_json::from_value::<PipelineDefinition>(pipeline.config).ok()
+                }),
+            None => None,
+        };
+        persisted.ok_or_else(|| {
+            TriggerFailure::terminal(anyhow::anyhow!(
+                "trigger named pipeline {requested_id} but its persisted config is missing or unparseable"
+            ))
+        })?
     } else {
         let cached_pipeline = {
             pipeline_cache
@@ -2492,6 +2573,7 @@ async fn handle_push_event(
             payload.new_hash.clone(),
         );
         db_run.id = state.run_id;
+        db_run.ref_name = Some(payload.ref_name.clone());
         db_run.start();
         gitforge_db::queries::PipelineQueries::activate_pipeline_and_create_run(
             pool,
@@ -2500,6 +2582,34 @@ async fn handle_push_event(
         )
         .await
         .map_err(|e| TriggerFailure::retryable(e.into()))?;
+        // Newest-SHA-wins per (repo, ref, pipeline): a push that lands while
+        // an older run for the same branch is still queued cancels that run
+        // and its never-dispatched jobs, so runner capacity serves the tip
+        // instead of already-stale code.
+        match gitforge_db::queries::PipelineQueries::supersede_stale_runs(
+            pool,
+            repo_id,
+            &payload.ref_name,
+            pipeline_id,
+            state.run_id,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(count) => {
+                tracing::info!(
+                    run = %state.run_id,
+                    count,
+                    "superseded older queued runs on the same branch"
+                );
+            }
+            Err(error) => {
+                // Supersede is an optimization, not a correctness gate: a
+                // failed pass logs and lets the stale runs drain normally
+                // rather than failing the new push.
+                tracing::warn!(%error, "supersede pass failed; stale runs will drain");
+            }
+        }
     }
 
     let workspace_path = match requested_workspace {
@@ -3344,6 +3454,7 @@ mod tests {
                     old_hash: "a".repeat(40),
                     new_hash: "b".repeat(40),
                     pusher_id: None,
+                    pipeline_id: None,
                 }),
                 Some(repo),
                 None,
@@ -5830,6 +5941,7 @@ jobs:
                 old_hash: "681fb4dfa3059321947bc3cfad93e11f0527f24a".to_string(),
                 new_hash: "0000000000000000000000000000000000000000".to_string(),
                 pusher_id: None,
+                pipeline_id: None,
             }),
             Some(repo_id),
             None,

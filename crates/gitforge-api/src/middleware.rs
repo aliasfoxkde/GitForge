@@ -14,6 +14,18 @@ use std::sync::Arc;
 /// Paths that don't require authentication
 const PUBLIC_PATHS: &[&str] = &["/health", "/metrics", "/swagger-ui", "/api-docs", "/docs"];
 
+/// Telemetry paths (`/metrics`, `/dashboard`) are public only when the
+/// operator opted in: `GITFORGE_PUBLIC_TELEMETRY=1`. On a multi-tenant
+/// instance the aggregate counters leak activity to anonymous parties, so
+/// the default is authenticated access. `/health` stays public either way
+/// — a liveness probe carries no instance data (F5).
+pub(crate) fn telemetry_is_public(raw: Option<&str>) -> bool {
+    matches!(raw, Some(v) if v.trim() == "1")
+}
+
+/// Paths that are public only when GITFORGE_PUBLIC_TELEMETRY=1.
+const TELEMETRY_PATHS: &[&str] = &["/metrics", "/dashboard"];
+
 /// Error response for auth failures
 #[derive(Debug, serde::Serialize)]
 pub struct AuthErrorResponse {
@@ -30,9 +42,15 @@ pub async fn auth_middleware(
 ) -> Response {
     let path = request.uri().path().to_string();
 
-    // Skip auth for public paths
+    // Skip auth for public paths. Telemetry paths fall back to
+    // authenticated access unless GITFORGE_PUBLIC_TELEMETRY=1.
+    let telemetry_public =
+        telemetry_is_public(std::env::var("GITFORGE_PUBLIC_TELEMETRY").ok().as_deref());
     for public_path in PUBLIC_PATHS {
         if path.starts_with(public_path) {
+            if !telemetry_public && TELEMETRY_PATHS.iter().any(|t| path.starts_with(t)) {
+                break;
+            }
             return next.run(request).await;
         }
     }
@@ -142,6 +160,28 @@ mod tests {
         assert!(PUBLIC_PATHS.iter().any(|p| "/health".starts_with(p)));
         assert!(PUBLIC_PATHS.iter().any(|p| "/metrics".starts_with(p)));
         assert!(!PUBLIC_PATHS.iter().any(|p| "/repos".starts_with(p)));
+    }
+
+    #[test]
+    fn test_telemetry_publicity_gate() {
+        // Decision core: explicit opt-in only; unset, empty, or any other
+        // value keeps /metrics and /dashboard behind authentication (F5).
+        assert!(telemetry_is_public(Some("1")));
+        assert!(!telemetry_is_public(Some("0")));
+        assert!(!telemetry_is_public(Some("true")));
+        assert!(!telemetry_is_public(Some("")));
+        assert!(telemetry_is_public(Some(" 1 "))); // trim-tolerant opt-in
+        assert!(!telemetry_is_public(None));
+    }
+
+    #[test]
+    fn test_telemetry_paths_cover_both_surfaces() {
+        // /dashboard is not in PUBLIC_PATHS (it has its own route merge),
+        // so the authenticated fallback must cover it explicitly.
+        assert!(PUBLIC_PATHS.iter().any(|p| "/metrics".starts_with(p)));
+        assert!(!PUBLIC_PATHS.iter().any(|p| "/dashboard".starts_with(p)));
+        assert!(TELEMETRY_PATHS.contains(&"/dashboard"));
+        assert!(TELEMETRY_PATHS.contains(&"/metrics"));
     }
 
     #[test]
@@ -291,6 +331,31 @@ mod tests {
         assert!(PUBLIC_PATHS.contains(&"/swagger-ui"));
         assert!(PUBLIC_PATHS.contains(&"/api-docs"));
         assert!(PUBLIC_PATHS.contains(&"/docs"));
+    }
+
+    #[test]
+    fn test_middleware_logic_telemetry_fallback() {
+        // Replicates the middleware branch: telemetry paths are served
+        // only when the gate is on; every other public path is always
+        // served; non-public paths never hit the skip.
+        let served = |path: &str, telemetry_public: bool| -> bool {
+            for public_path in PUBLIC_PATHS {
+                if path.starts_with(public_path) {
+                    if !telemetry_public && TELEMETRY_PATHS.iter().any(|t| path.starts_with(t)) {
+                        break;
+                    }
+                    return true;
+                }
+            }
+            false
+        };
+        assert!(served("/health", false));
+        assert!(served("/swagger-ui", false));
+        assert!(served("/metrics", true));
+        // /dashboard is not in PUBLIC_PATHS, so the skip-branch never fires
+        // for it — it reaches auth regardless of the telemetry gate.
+        assert!(!served("/dashboard", false));
+        assert!(!served("/dashboard", true));
     }
 
     #[test]

@@ -25,7 +25,7 @@ and fill in the deployment variables:
 ```bash
 cp .env.example .env.local
 # Edit .env.local: JWT_SECRET, DATABASE_URL, GITFORGE_SCHEDULER_TOKEN,
-# DOCKER_GID, GITFORGE_WORKSPACE_HOST_DIR
+# GITFORGE_RUNNER_REGISTRATION_TOKEN, DOCKER_GID, GITFORGE_WORKSPACE_HOST_DIR
 ```
 
 3. Set a secure JWT secret:

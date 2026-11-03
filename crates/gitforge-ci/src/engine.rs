@@ -119,6 +119,59 @@ impl CiEngineState {
     }
 }
 
+/// Enforce the job-image allowlist when one is configured.
+///
+/// `GITFORGE_ALLOWED_IMAGE_REGISTRIES` (comma-separated registry prefixes,
+/// e.g. `localhost:5001,docker.io/library`) restricts which registries a
+/// pipeline-authored `image:` may reference; unset means unrestricted, so
+/// existing single-host deployments keep working. Without this gate a
+/// pipeline author can make the runner pull — and execute steps from — any
+/// registry the runner's daemon can reach. An unpinned reference is
+/// additionally refused when the allowlist is active: an allowlisted
+/// registry with a floating tag still lets content change under the same
+/// reference, so enforcement requires an immutable reference (digest).
+fn validate_job_images(pipeline: &PipelineDefinition, run_id: PipelineRunId) -> Result<()> {
+    let raw = std::env::var("GITFORGE_ALLOWED_IMAGE_REGISTRIES")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    validate_job_images_with(pipeline, run_id, raw.as_deref())
+}
+
+/// The decision core: takes the allowlist as data so tests inject it
+/// without mutating process-global state.
+fn validate_job_images_with(
+    pipeline: &PipelineDefinition,
+    run_id: PipelineRunId,
+    allowlist_raw: Option<&str>,
+) -> Result<()> {
+    let Some(raw) = allowlist_raw else {
+        return Ok(());
+    };
+    let allowed: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    for job in &pipeline.jobs {
+        let image = job.image.trim();
+        let pinned = image.contains('@');
+        let ok_registry = allowed.iter().any(|prefix| {
+            image == *prefix
+                || image.starts_with(&format!("{prefix}/"))
+                || image.starts_with(&format!("{prefix}:"))
+        });
+        if !ok_registry || !pinned {
+            return Err(gitforge_common::Error::invalid_input(format!(
+                "run {run_id}: job '{}' image '{image}' is not an allowlisted, digest-pinned \
+                 reference (allowlist: {allowed:?}); every image must resolve to a fixed \
+                 digest under an allowed registry",
+                job.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Extract the `CI_CHANGE_*` variables a completed job published.
 ///
 /// The `detect-changes` job prints its classification as `KEY=value` lines on
@@ -164,31 +217,24 @@ pub async fn eval_skip_if(skip_if: &Option<String>, env: &HashMap<String, String
     let Some(expr) = skip_if else {
         return Ok(true); // No condition means always run
     };
-    // Build the bash environment from the detect-changes output vars
-    let bash_env: Vec<String> = env
-        .iter()
-        .filter(|(k, _)| k.starts_with("CI_CHANGE_"))
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
-    // Add CI_CHANGE_FILE_COUNT for convenience (count of all changed files)
-    let file_count = env.get("CI_CHANGE_FILE_COUNT");
-    let combined_env = if bash_env.is_empty() && file_count.is_none() {
-        format!("set -e; {expr}")
-    } else {
-        let env_str = bash_env.join(" ")
-            + &format!(
-                " CI_CHANGE_FILE_COUNT={}",
-                file_count.unwrap_or(&"0".to_string())
-            );
-        format!("export {env_str}; set -e; {expr}")
-    };
+    // The environment is delivered through Command::envs below - never
+    // interpolated into the script text. A receipt-controlled value that
+    // reached the script as `export KEY=value` could execute arbitrary
+    // shell (via ;, backticks, or $() in the value).
+    let combined_env = format!("set -e; {expr}");
     // Timeout: 10s max to prevent a malicious expression from stalling the engine
     let result = timeout(
         Duration::from_secs(10),
         Command::new("bash")
             .arg("-c")
             .arg(&combined_env)
-            .envs(env.iter().filter(|(k, _)| !k.starts_with("CI_CHANGE_")))
+            .envs(env.iter())
+            // CI_CHANGE_FILE_COUNT is always defined for expressions, even
+            // when the detect-changes job did not report it.
+            .env(
+                "CI_CHANGE_FILE_COUNT",
+                env.get("CI_CHANGE_FILE_COUNT").map_or("0", String::as_str),
+            )
             .output(),
     )
     .await;
@@ -292,6 +338,8 @@ impl CiEngine {
         pipeline: PipelineDefinition,
         run_id: PipelineRunId,
     ) -> Result<Self> {
+        validate_job_images(&pipeline, run_id)?;
+
         // Build DAG from pipeline
         let graph = DagBuilder::build(&pipeline, run_id)?;
 
@@ -699,6 +747,107 @@ mod tests {
     use crate::pipeline::{JobDefinition, StepDefinition, TriggerType};
     use gitforge_common::PipelineId;
     use std::collections::HashMap;
+
+    fn job_with_image(name: &str, image: &str) -> JobDefinition {
+        JobDefinition {
+            name: name.to_string(),
+            image: image.to_string(),
+            needs: vec![],
+            env: HashMap::new(),
+            steps: vec![StepDefinition {
+                name: "run".to_string(),
+                run: "true".to_string(),
+                env: None,
+                working_directory: None,
+                condition: None,
+            }],
+            timeout: None,
+            retry: None,
+            skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
+            lane: Default::default(),
+            fault: None,
+        }
+    }
+
+    #[test]
+    fn test_image_allowlist_unset_permits_anything() {
+        let pipeline = PipelineDefinition {
+            name: "p".to_string(),
+            version: "1".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![job_with_image("j", "random-registry.example/img:latest")],
+        };
+        assert!(validate_job_images_with(&pipeline, PipelineRunId::new(), None).is_ok());
+    }
+
+    #[test]
+    fn test_image_allowlist_refuses_non_allowlisted_registry() {
+        let pipeline = PipelineDefinition {
+            name: "p".to_string(),
+            version: "1".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![job_with_image("j", "evil.example/img@sha256:0123")],
+        };
+        let error =
+            validate_job_images_with(&pipeline, PipelineRunId::new(), Some("localhost:5001"))
+                .unwrap_err();
+        assert!(error.to_string().contains("evil.example/img"), "{error}");
+    }
+
+    #[test]
+    fn test_image_allowlist_refuses_unpinned_reference() {
+        let pipeline = PipelineDefinition {
+            name: "p".to_string(),
+            version: "1".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![job_with_image("j", "localhost:5001/ci-rust:16")],
+        };
+        let error =
+            validate_job_images_with(&pipeline, PipelineRunId::new(), Some("localhost:5001"))
+                .unwrap_err();
+        assert!(error.to_string().contains("digest-pinned"), "{error}");
+    }
+
+    #[test]
+    fn test_image_allowlist_accepts_digest_pinned_allowlisted() {
+        let pipeline = PipelineDefinition {
+            name: "p".to_string(),
+            version: "1".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![job_with_image(
+                "j",
+                "localhost:5001/ci-rust@sha256:0123456789abcdef",
+            )],
+        };
+        assert!(
+            validate_job_images_with(&pipeline, PipelineRunId::new(), Some("localhost:5001"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_image_allowlist_prefix_boundary_is_exact() {
+        // A registry "5001" must not match "localhost:50010/..." — prefix
+        // matching extends only at '/' or ':' after the full prefix.
+        let pipeline = PipelineDefinition {
+            name: "p".to_string(),
+            version: "1".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![job_with_image("j", "localhost:50010/evil@sha256:0123")],
+        };
+        assert!(
+            validate_job_images_with(&pipeline, PipelineRunId::new(), Some("localhost:5001"))
+                .is_err(),
+            "a longer port must not match a shorter allowlist prefix"
+        );
+    }
 
     fn make_pipeline() -> PipelineDefinition {
         PipelineDefinition {
@@ -1430,6 +1579,45 @@ mod tests {
         assert!(extract_change_env(&receipt).is_empty());
         assert!(extract_change_env("not json at all").is_empty());
         assert!(extract_change_env("{}").is_empty());
+    }
+
+    /// A receipt-controlled `CI_CHANGE_*` value must reach the expression
+    /// as a value, never as shell code. The detect-changes job is job
+    /// output; interpolating it into the script text would let a value
+    /// like `1; touch /tmp/pwned` execute in the CI service.
+    #[tokio::test]
+    async fn a_change_env_value_cannot_execute_as_shell_code() {
+        let marker = std::env::temp_dir().join("gitforge-skipif-injection-regression");
+        let _ = std::fs::remove_file(&marker);
+        let receipt = serde_json::json!({
+            "step_results": [{
+                "stdout": format!(
+                    "CI_CHANGE_INCLUDE_CODE=1; touch {}\n",
+                    marker.display()
+                )
+            }]
+        })
+        .to_string();
+        let env = extract_change_env(&receipt);
+        let expr = Some(r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string());
+        let should_run = eval_skip_if(&expr, &env).await.unwrap();
+        assert!(
+            !marker.exists(),
+            "the receipt value executed as shell code in the CI service"
+        );
+        // The value is still readable as a variable: delivered inertly,
+        // not silently dropped.
+        assert!(!should_run, "the expression must see the literal value");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// `CI_CHANGE_FILE_COUNT` is always defined for expressions, even when
+    /// the detect-changes job reported nothing.
+    #[tokio::test]
+    async fn a_change_file_count_is_always_defined() {
+        let env = HashMap::new();
+        let expr = Some(r#"[[ "$CI_CHANGE_FILE_COUNT" == "0" ]]"#.to_string());
+        assert!(eval_skip_if(&expr, &env).await.unwrap());
     }
 
     /// The defect this guards: an unmerged receipt leaves the expression

@@ -440,6 +440,7 @@ async fn test_trigger_http_contract_rejects_malformed_requests() {
         &pool,
         service.yaml_broken.repo_id,
         &service.yaml_broken.commit_hash,
+        None,
     )
     .await
     .expect("query active trigger requests");
