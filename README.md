@@ -80,7 +80,7 @@ docker-compose up -d
 | **User Guides** | [Deployment](docs/DEPLOYMENT.md) · [Runbook](docs/RUNBOOK.md) · [API Reference](docs/API.md) |
 | **Architecture** | [Architecture Overview](docs/ARCHITECTURE.md) · [Hooks](docs/HOOKS.md) · [Testing Strategy](docs/TESTING_STRATEGY.md) |
 | **Development** | [Contributing](docs/CONTRIBUTING.md) · [Branch Strategy](docs/BRANCH_STRATEGY.md) |
-| **Project** | [Changelog](docs/CHANGELOG_RECENT.md) · [Security](docs/SECURITY.md) · [Release readiness](docs/RELEASE_READINESS.md) |
+| **Project** | [Changelog](docs/CHANGELOG_RECENT.md) · [Security](docs/SECURITY.md) · [Release readiness](docs/RELEASE_READINESS.md) · [CI runner trust policy](docs/CI_RUNNER_TRUST_POLICY.md) |
 
 ## Project Structure
 
