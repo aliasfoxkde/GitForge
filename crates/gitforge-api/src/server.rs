@@ -103,19 +103,25 @@ impl ApiServer {
                 .allow_headers(Any)
         };
 
-        // Public routes (no auth required)
+        // Public routes (no auth required). Telemetry surfaces are added
+        // only when the operator opted in; otherwise they ride behind the
+        // auth middleware via the protected router (F5).
+        let telemetry_public = crate::middleware::telemetry_is_public(
+            std::env::var("GITFORGE_PUBLIC_TELEMETRY").ok().as_deref(),
+        );
         let health = Router::new().route("/health", get(health_check));
         let metrics = Router::new().route("/metrics", get(metrics_handler));
         let swagger = Router::new()
             .route("/swagger-ui", get(crate::openapi::swagger_ui))
             .route("/api-docs/openapi.json", get(crate::openapi::openapi_spec));
-        let dashboard = crate::dashboard::dashboard_routes();
 
         let mut public_routes = Router::new();
         public_routes = public_routes.merge(health);
-        public_routes = public_routes.merge(metrics);
-        public_routes = public_routes.merge(dashboard);
         public_routes = public_routes.merge(swagger);
+        if telemetry_public {
+            let dashboard = crate::dashboard::dashboard_routes();
+            public_routes = public_routes.merge(metrics).merge(dashboard);
+        }
         // Runner registration is unauthenticated by design (the runner
         // proves itself with its registration token inside the handler), so
         // it is the other public write surface and gets its own rate-limit
@@ -151,7 +157,7 @@ impl ApiServer {
 
         // Protected routes (auth required)
         let pool_arc = Arc::new(pool);
-        let protected_routes = Router::new()
+        let mut protected_routes = Router::new()
             .merge(repo_routes())
             .merge(ci_routes())
             .merge(runner_routes())
@@ -159,7 +165,14 @@ impl ApiServer {
             .merge(ssh_key_routes())
             .merge(artifact_routes())
             .merge(webhook_routes())
-            .merge(review_routes())
+            .merge(review_routes());
+        if !telemetry_public {
+            let dashboard = crate::dashboard::dashboard_routes();
+            protected_routes = protected_routes
+                .merge(metrics)
+                .merge(dashboard);
+        }
+        let protected_routes = protected_routes
             // Authenticate once at the protected-route boundary. Individual
             // handlers may still apply resource authorization, but token
             // parsing and validation must not depend on every handler

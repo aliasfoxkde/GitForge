@@ -142,6 +142,11 @@ async fn test_health_check_endpoint() {
 
 #[tokio::test]
 async fn test_metrics_endpoint() {
+    // Opt-in telemetry: with GITFORGE_PUBLIC_TELEMETRY unset, /metrics is
+    // served behind the auth middleware (F5) and must reject anonymous
+    // access. The wiring boundary (route placement, not just the
+    // middleware decision) is what this test pins.
+    unsafe { std::env::remove_var("GITFORGE_PUBLIC_TELEMETRY") };
     let pool = Pool::memory().await.unwrap();
     let server = ApiServer::new("test-secret", pool);
     let app = server.into_router();
@@ -157,7 +162,7 @@ async fn test_metrics_endpoint() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -675,6 +680,29 @@ async fn test_delete_nonexistent_repo() {
 
 #[tokio::test]
 async fn test_dashboard_endpoint() {
+    // Default posture: authenticated only (F5 wiring boundary).
+    unsafe { std::env::remove_var("GITFORGE_PUBLIC_TELEMETRY") };
+    let pool = Pool::memory().await.unwrap();
+    let server = ApiServer::new("test-secret", pool);
+    let app = server.into_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_dashboard_endpoint_public_opt_in() {
+    // Operator opt-in keeps both telemetry surfaces public.
+    unsafe { std::env::set_var("GITFORGE_PUBLIC_TELEMETRY", "1") };
     let pool = Pool::memory().await.unwrap();
     let server = ApiServer::new("test-secret", pool);
     let app = server.into_router();
@@ -690,6 +718,7 @@ async fn test_dashboard_endpoint() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    unsafe { std::env::remove_var("GITFORGE_PUBLIC_TELEMETRY") };
 }
 
 #[tokio::test]
