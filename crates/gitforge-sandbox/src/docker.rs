@@ -1127,16 +1127,26 @@ fn resolve_runner_uid_gid() -> Result<(u32, u32)> {
 
 /// Git environment for workspace execs. The checkout is created on the host
 /// by the runner user but execs run as the container's root, so git refuses
-/// every operation with "detected dubious ownership in repository at
-/// '/workspace'" — which silently turned any pipeline step guarding with
-/// `|| true` (tag probes, version detection) into a no-op. Tell git this
-/// one mount is trusted; scoped to `/workspace` rather than `*` so it
-/// cannot leak meaning into repositories steps create themselves.
+/// every operation with "detected dubious ownership" — which silently turned
+/// any pipeline step guarding with `|| true` (tag probes, version detection)
+/// into a no-op. Trust every repository the exec can touch.
+///
+/// This must stay `*`, not `/workspace`: repositories are not only mounted
+/// at the mount root, they are also created inside the workspace by steps
+/// and test fixtures (e.g. `git init seed && git config user.email ...`
+/// under `/workspace/target/...`). `safe.directory` matches the exact path,
+/// never a prefix, so a `/workspace` entry leaves every such sub-repository
+/// rejected — observed on fedora-docker where the workspace rides an sshfs
+/// mount mapping all files to uid 1000 while the container runs as root:
+/// `git config` in a freshly-created fixture repo failed with "not in a git
+/// directory" and dropped 10 ci unit tests (run f2a1a2d9, 2026-11-04).
+/// Within a job sandbox whose only host surface is the workspace mount,
+/// blanket trust costs nothing real: the mount is per-run scratch data.
 fn workspace_exec_git_env() -> Vec<&'static str> {
     vec![
         "GIT_CONFIG_COUNT=1",
         "GIT_CONFIG_KEY_0=safe.directory",
-        "GIT_CONFIG_VALUE_0=/workspace",
+        "GIT_CONFIG_VALUE_0=*",
     ]
 }
 
@@ -1255,13 +1265,13 @@ mod tests {
         let env = workspace_git_env();
         // git's env-based config protocol: COUNT declares the entries, each
         // KEY_n/VALUE_n pair supplies one. The key must be the safe.directory
-        // setting and the value must be the mounted workspace path — this trio
-        // keeps host-owned workspace mounts usable without trusting unrelated
-        // repositories.
+        // setting and the value must be the blanket-trust wildcard — exact
+        // paths cannot cover repositories steps create under the mount
+        // (safe.directory matches exact paths, never prefixes).
         assert_eq!(env.len(), 3);
         assert_eq!(env[0], "GIT_CONFIG_COUNT=1");
         assert_eq!(env[1], "GIT_CONFIG_KEY_0=safe.directory");
-        assert_eq!(env[2], "GIT_CONFIG_VALUE_0=/workspace");
+        assert_eq!(env[2], "GIT_CONFIG_VALUE_0=*");
     }
 
     /// Pipeline env reaches the exec as `KEY=VALUE` pairs layered after the
@@ -2090,7 +2100,7 @@ mod tests {
         let env = super::workspace_exec_git_env();
         assert!(env.contains(&"GIT_CONFIG_COUNT=1"));
         assert!(env.contains(&"GIT_CONFIG_KEY_0=safe.directory"));
-        assert!(env.contains(&"GIT_CONFIG_VALUE_0=/workspace"));
+        assert!(env.contains(&"GIT_CONFIG_VALUE_0=*"));
         assert_eq!(env.len(), 3);
     }
 
