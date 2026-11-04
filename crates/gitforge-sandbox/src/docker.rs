@@ -890,11 +890,17 @@ impl Sandbox for DockerSandbox {
             // Create exec instance. The workspace git trust vars are always
             // layered in for workspace execs; caller env (`KEY=VALUE` pairs)
             // rides alongside them and never displaces them.
-            let exec_env = compose_exec_env(instance.workspace_path.is_some(), env);
+            let has_workspace = instance.workspace_path.is_some();
+            let exec_env = compose_exec_env(has_workspace, env);
+            let exec_command: Vec<&str> = if has_workspace {
+                wrap_with_git_config_bootstrap(command)
+            } else {
+                command.to_vec()
+            };
             let config = CreateExecOptions {
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
-                cmd: Some(command.to_vec()),
+                cmd: Some(exec_command),
                 // `create_with_workspace` mounts the host checkout at this
                 // fixed container path. Docker exec does not inherit the
                 // container's configured working directory, so set it here
@@ -1143,11 +1149,27 @@ fn resolve_runner_uid_gid() -> Result<(u32, u32)> {
 /// Within a job sandbox whose only host surface is the workspace mount,
 /// blanket trust costs nothing real: the mount is per-run scratch data.
 fn workspace_exec_git_env() -> Vec<&'static str> {
-    vec![
-        "GIT_CONFIG_COUNT=1",
-        "GIT_CONFIG_KEY_0=safe.directory",
-        "GIT_CONFIG_VALUE_0=*",
-    ]
+    vec!["GIT_CONFIG_GLOBAL=/tmp/.gitforge-gitconfig"]
+}
+
+/// Git protects the blanket `safe.directory = *` wildcard: it is honored
+/// only from system or global configuration, never from command-scoped
+/// `GIT_CONFIG_*` env entries (an exact path works there, but fixtures and
+/// steps create repositories at unpredictable paths under the mount).
+/// `GIT_CONFIG_GLOBAL` however can point anywhere via env, so each exec
+/// materializes a tiny global config granting the wildcard before it runs.
+const GIT_GLOBAL_CONFIG_BOOTSTRAP: &str = "mkdir -p /tmp && \
+printf '[safe]\n\tdirectory = *\n' > /tmp/.gitforge-gitconfig; exec \"$@\"";
+
+/// Wrap `command` so the exec first writes the global git config that the
+/// `GIT_CONFIG_GLOBAL` env entry (see `workspace_exec_git_env`) points at,
+/// then execs the original command. `sh` is present in every job image this
+/// runner serves; the write is idempotent and costs one fork per step.
+fn wrap_with_git_config_bootstrap<'a>(command: &[&'a str]) -> Vec<&'a str> {
+    let mut wrapped: Vec<&str> = Vec::with_capacity(command.len() + 4);
+    wrapped.extend_from_slice(&["sh", "-ec", GIT_GLOBAL_CONFIG_BOOTSTRAP, "--"]);
+    wrapped.extend_from_slice(command);
+    wrapped
 }
 
 /// Container-level variant of `workspace_exec_git_env` (owned strings for
@@ -1263,15 +1285,10 @@ mod tests {
     #[test]
     fn test_workspace_git_env_grants_safe_directory_via_env_config() {
         let env = workspace_git_env();
-        // git's env-based config protocol: COUNT declares the entries, each
-        // KEY_n/VALUE_n pair supplies one. The key must be the safe.directory
-        // setting and the value must be the blanket-trust wildcard — exact
-        // paths cannot cover repositories steps create under the mount
-        // (safe.directory matches exact paths, never prefixes).
-        assert_eq!(env.len(), 3);
-        assert_eq!(env[0], "GIT_CONFIG_COUNT=1");
-        assert_eq!(env[1], "GIT_CONFIG_KEY_0=safe.directory");
-        assert_eq!(env[2], "GIT_CONFIG_VALUE_0=*");
+        // The blanket `safe.directory = *` wildcard is honored only from
+        // global/system config, so the exec exports GIT_CONFIG_GLOBAL aimed
+        // at the file the bootstrap wrapper materializes.
+        assert_eq!(env, &["GIT_CONFIG_GLOBAL=/tmp/.gitforge-gitconfig"]);
     }
 
     /// Pipeline env reaches the exec as `KEY=VALUE` pairs layered after the
@@ -1281,10 +1298,10 @@ mod tests {
         let caller = vec!["PYTHONPATH=src".to_string(), "DI_ENV=test".to_string()];
 
         let with_workspace = compose_exec_env(true, &caller);
-        assert_eq!(with_workspace.len(), 5);
-        assert_eq!(with_workspace[0], "GIT_CONFIG_COUNT=1");
-        assert_eq!(with_workspace[3], "PYTHONPATH=src");
-        assert_eq!(with_workspace[4], "DI_ENV=test");
+        assert_eq!(with_workspace.len(), 3);
+        assert!(with_workspace[0].starts_with("GIT_CONFIG_GLOBAL="));
+        assert_eq!(with_workspace[1], "PYTHONPATH=src");
+        assert_eq!(with_workspace[2], "DI_ENV=test");
 
         let without_workspace = compose_exec_env(false, &caller);
         assert_eq!(without_workspace, caller);
@@ -2098,10 +2115,8 @@ mod tests {
     #[test]
     fn workspace_git_env_marks_the_mount_trusted() {
         let env = super::workspace_exec_git_env();
-        assert!(env.contains(&"GIT_CONFIG_COUNT=1"));
-        assert!(env.contains(&"GIT_CONFIG_KEY_0=safe.directory"));
-        assert!(env.contains(&"GIT_CONFIG_VALUE_0=*"));
-        assert_eq!(env.len(), 3);
+        assert_eq!(env.len(), 1);
+        assert!(env[0].starts_with("GIT_CONFIG_GLOBAL="));
     }
 
     /// Verify that `create_with_workspace` called with no path also produces
