@@ -692,7 +692,16 @@ impl Sandbox for DockerSandbox {
             // Create container
             let config = ContainerCreateBody {
                 image: Some(image.to_owned()),
-                cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]), // Keep container alive
+                // Keep the container alive for the whole job. A 3600s keepalive
+                // capped every job at one hour: when sleep exited, Docker
+                // stopped the container and SIGKILLed any running exec
+                // (exit 137 at exactly 3600s, OOMKilled=false). The container
+                // is removed per-job in destroy(), so this only bounds a
+                // leaked container's lifetime.
+                cmd: Some(vec![
+                    "sleep".to_owned(),
+                    "86400".to_owned(), // 24h; job deadlines clamp to 24h
+                ]),
                 host_config: Some(host_config),
                 labels: Some(labels),
                 ..Default::default()
@@ -799,7 +808,12 @@ impl Sandbox for DockerSandbox {
             };
             let config = ContainerCreateBody {
                 image: Some(image.to_owned()),
-                cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
+                // Same keepalive-lifetime rationale as the plain sandbox:
+                // a 3600s sleep SIGKILLed running execs at exactly 1h.
+                cmd: Some(vec![
+                    "sleep".to_owned(),
+                    "86400".to_owned(), // 24h; job deadlines clamp to 24h
+                ]),
                 working_dir: Some("/workspace".to_owned()),
                 // The workspace bind-mount keeps the host checkout's uid (the
                 // job user inside the image is usually root), and git's
