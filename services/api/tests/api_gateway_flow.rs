@@ -83,6 +83,7 @@ async fn spawn_api() -> ApiService {
         .env("DATABASE_URL", format!("sqlite:{}", db_path.display()))
         .env("JWT_SECRET", "harness-jwt-secret")
         .env("GITFORGE_ARTIFACT_ROOT", &artifacts)
+        .env("GIT_ROOT", base.join("git-root"))
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
