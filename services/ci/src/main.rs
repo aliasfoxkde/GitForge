@@ -2840,14 +2840,43 @@ async fn run_scheduler_event_consumer(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(_) => break,
         };
-        let SchedulerEvent::JobCompleted {
-            job_id,
-            pipeline_run_id,
-            runner_id,
-            success,
-        } = event
-        else {
-            continue;
+        let (job_id, pipeline_run_id, runner_id, success) = match event {
+            SchedulerEvent::JobAssigned {
+                job_id,
+                runner_id,
+                pipeline_run_id,
+            } => {
+                // The engine's mirror must leave `Queued` when the job is
+                // dispatched: `ready_jobs()` releases every job that is
+                // still `Queued`, so a dispatched job whose mirror stayed
+                // `Queued` was re-enqueued by every later completion of
+                // the run. That duplicate enqueue demoted the running
+                // job's durable row, which refused the runner's heartbeat
+                // and rotated its lease token (GF-12).
+                let engine = pipeline_registry
+                    .read()
+                    .await
+                    .get(&pipeline_run_id)
+                    .cloned();
+                let Some(engine) = engine else {
+                    tracing::warn!(
+                        "assignment received for unknown pipeline run {}",
+                        pipeline_run_id
+                    );
+                    continue;
+                };
+                if let Err(error) = engine.assign_job(job_id, runner_id).await {
+                    tracing::error!(%job_id, %error, "failed to mark the dispatched job assigned");
+                }
+                continue;
+            }
+            SchedulerEvent::JobCompleted {
+                job_id,
+                pipeline_run_id,
+                runner_id,
+                success,
+            } => (job_id, pipeline_run_id, runner_id, success),
+            _ => continue,
         };
         let engine = pipeline_registry
             .read()

@@ -1865,6 +1865,33 @@ impl JobQueries {
         Ok(())
     }
 
+    /// Move a job to `queued`, but only while it is not live.
+    ///
+    /// A job a runner holds is `assigned` or `running`, and that durable
+    /// status is the invariant every later write is fenced by: the
+    /// heartbeat, the start, and the completion are all gated on it. An
+    /// enqueue that demotes such a row to `queued` takes the lease away
+    /// from the runner that holds it - the heartbeat is refused, the row
+    /// becomes dispatchable again, the scheduler rotates the lease token,
+    /// and the completion is rejected (GF-12, measured 2026-11-05 on the
+    /// GitForge CI service: a running job was demoted by a duplicate
+    /// enqueue, and three executions of that job were then rejected with
+    /// `completion_persistence_failed` before the job was fenced as
+    /// `runner_lost_while_running`).
+    ///
+    /// Returns whether a row changed. `false` means the job is live (or
+    /// terminal) and must not be queued again.
+    pub async fn mark_queued_if_dispatchable(pool: &Pool, id: JobId) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'queued' WHERE id = ? AND status IN ('pending', 'queued')",
+        )
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to mark job queued: {e}")))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Cancel every never-dispatched (`pending`/`queued`) job of one run and
     /// return how many rows changed.
     ///
