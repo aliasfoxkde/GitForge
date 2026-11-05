@@ -443,6 +443,7 @@ impl Pool {
                 created_at TEXT NOT NULL,
                 error TEXT,
                 ref_name TEXT,
+                push_base_sha TEXT,
                 FOREIGN KEY (pipeline_id) REFERENCES pipelines(id),
                 FOREIGN KEY (repo_id) REFERENCES repositories(id)
             )
@@ -461,6 +462,7 @@ impl Pool {
         for statement in [
             "ALTER TABLE pipeline_runs ADD COLUMN error TEXT",
             "ALTER TABLE pipeline_runs ADD COLUMN ref_name TEXT",
+            "ALTER TABLE pipeline_runs ADD COLUMN push_base_sha TEXT",
         ] {
             execute_tolerating_duplicate(&self.pool, statement).await?;
         }

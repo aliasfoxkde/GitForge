@@ -2728,6 +2728,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 error: None,
                 ref_name: None,
+                push_base_sha: None,
             },
         )
         .await

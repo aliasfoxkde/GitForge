@@ -355,6 +355,37 @@ mod tests {
     }
 
     #[test]
+    fn test_push_base_reaches_every_job() {
+        // The push base is published through the pipeline `environment`
+        // map, so the DAG builder is what carries it into every job — a
+        // job that never receives it cannot diff against the push.
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![
+                make_job("detect-changes", vec![]),
+                make_job("clippy", vec![]),
+            ],
+        };
+
+        let augmented = crate::pipeline::with_push_base(&pipeline, Some("abc123"));
+        let run_id = gitforge_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&augmented, run_id).unwrap();
+
+        assert_eq!(graph.nodes.len(), 2);
+        for node in &graph.nodes {
+            assert_eq!(
+                node.definition.env.get(crate::pipeline::PUSH_BASE_ENV),
+                Some(&"abc123".to_string()),
+                "job {} must carry the push base",
+                node.name
+            );
+        }
+    }
+
+    #[test]
     fn test_detect_cycle() {
         let jobs = vec![
             make_job("a", vec!["c"]),
