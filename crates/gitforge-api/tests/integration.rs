@@ -26,11 +26,36 @@ use gitforge_storage::{Artifact, ArtifactStore};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+/// Build an API server whose bare-repository storage is a scratch
+/// directory the test owns.
+///
+/// The server resolves its storage root once at startup, so the test
+/// injects the root rather than relying on a `GIT_ROOT` environment
+/// variable or a CWD-relative fallback. The returned guard keeps the
+/// directory alive for as long as the server is used.
+fn api_with_scratch_storage(
+    pool: gitforge_db::Pool,
+) -> (gitforge_api::ApiServer, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let server =
+        gitforge_api::ApiServer::with_storage("test-secret", pool, Some(dir.path().to_path_buf()));
+    (server, dir)
+}
+
 /// Serializes the tests that mutate GITFORGE_PUBLIC_TELEMETRY. The
 /// decision is read at router-build time from the process env, which is
 /// shared by every test thread in this binary — without the lock the
 /// default-posture tests race the opt-in test and randomly invert.
 static TELEMETRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes the tests that mutate GIT_ROOT.
+///
+/// The repository storage root is read from the environment at
+/// server-build time, and the environment is shared by every test thread
+/// in this binary. Only the tests that create a repository touch it, and
+/// they inject their own scratch root, so a concurrent `GIT_ROOT` write
+/// cannot redirect a repository another test provisions.
+static REPO_STORAGE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 async fn webhook_fixture(
     config: serde_json::Value,
@@ -349,7 +374,7 @@ async fn test_create_repo_with_valid_auth() {
         .await
         .unwrap();
 
-    let server = ApiServer::new("test-secret", pool);
+    let (server, _storage) = api_with_scratch_storage(pool);
     let app = server.into_router();
 
     // Generate valid token
@@ -399,7 +424,7 @@ async fn test_repository_access_is_owner_scoped() {
         .await
         .unwrap();
 
-    let server = ApiServer::new("test-secret", pool);
+    let (server, _storage) = api_with_scratch_storage(pool);
     let app = server.into_router();
     let auth = ApiAuth::new("test-secret");
     let owner_token = auth.generate_token(owner.id, "owner", "developer").unwrap();
@@ -457,6 +482,85 @@ async fn test_repository_access_is_owner_scoped() {
             .unwrap()
             .len(),
         0
+    );
+}
+
+/// The repository storage root is resolved once, at the startup edge, and
+/// carried into the request path as data.
+///
+/// A handler that re-read the environment on every request would let a
+/// sibling thread move where repositories are provisioned underneath a
+/// live request. This pins that contract: the root injected when the
+/// server is built wins over the environment, and the environment is not
+/// consulted again once a request is in flight.
+#[tokio::test]
+async fn test_repo_storage_root_is_resolved_at_startup_not_per_request() {
+    let from_env = tempfile::tempdir().unwrap();
+    let injected = tempfile::tempdir().unwrap();
+
+    // The environment names one root...
+    {
+        let _guard = REPO_STORAGE_ENV_LOCK.lock().unwrap();
+        // Safety: the lock serialises every GIT_ROOT mutation in this
+        // binary, and the previous value is restored below.
+        unsafe { std::env::set_var("GIT_ROOT", from_env.path()) };
+    }
+
+    let pool = Pool::memory().await.unwrap();
+    pool.migrate().await.unwrap();
+
+    let user = gitforge_db::models::User::new(
+        "storage-root".to_string(),
+        "storage-root@example.com".to_string(),
+        "hash".to_string(),
+    );
+    gitforge_db::queries::UserQueries::create(&pool, &user)
+        .await
+        .unwrap();
+
+    // ...and the server is built with a different one injected.
+    let server = ApiServer::with_storage("test-secret", pool, Some(injected.path().to_path_buf()));
+    let app = server.into_router();
+    let auth = ApiAuth::new("test-secret");
+    let token = auth
+        .generate_token(user.id, "storage-root", "developer")
+        .unwrap();
+
+    {
+        let _guard = REPO_STORAGE_ENV_LOCK.lock().unwrap();
+        // Safety: as above.
+        unsafe { std::env::remove_var("GIT_ROOT") };
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/repos")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"name":"root-pinning"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // The bare repository landed under the injected root, and the
+    // environment root was never written to.
+    let provisioned = std::fs::read_dir(injected.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("HEAD").exists())
+        .count();
+    assert_eq!(
+        provisioned, 1,
+        "expected exactly one bare repository under the injected root"
+    );
+    assert!(
+        std::fs::read_dir(from_env.path()).unwrap().next().is_none(),
+        "the environment root must not have been written to"
     );
 }
 

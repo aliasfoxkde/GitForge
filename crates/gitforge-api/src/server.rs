@@ -3,7 +3,7 @@
 use crate::auth::ApiAuth;
 use crate::routes::{
     artifact_routes, ci_routes, public_runner_routes, repo_routes, review_routes, runner_routes,
-    ssh_key_routes, user_routes, webhook_routes,
+    ssh_key_routes, user_routes, webhook_routes, RepoStorageRoot,
 };
 use axum::{
     extract::Extension,
@@ -23,6 +23,22 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::rate_limit::{RateLimitConfig, RateLimitLayer, RateLimiter};
+
+/// Resolve the bare-repository storage root from an explicit path or the
+/// environment.
+///
+/// The environment is read exactly once, at the startup edge. The result
+/// is a value that is threaded into the request path, so a request never
+/// observes a root another thread changed mid-flight.
+fn resolve_repo_storage_root(storage_path: Option<std::path::PathBuf>) -> RepoStorageRoot {
+    if let Some(path) = storage_path {
+        return RepoStorageRoot::new(path.to_string_lossy().into_owned());
+    }
+    let from_env = std::env::var("GIT_ROOT")
+        .ok()
+        .filter(|root| !root.trim().is_empty());
+    RepoStorageRoot::new(from_env.unwrap_or_else(|| "target/gitforge-repos".to_string()))
+}
 
 /// API server
 pub struct ApiServer {
@@ -52,7 +68,12 @@ impl ApiServer {
         Self::build(jwt_secret, pool, None, registration_token)
     }
 
-    /// Create a new API server with custom storage path
+    /// Create a new API server with an explicit bare-repository storage root.
+    ///
+    /// The root is where bare repositories are provisioned and where the
+    /// git server reads them from, so it must be the same path the git
+    /// server is configured with. When it is `None` the root is taken
+    /// from `GIT_ROOT` in the environment, read once here.
     pub fn with_storage(
         jwt_secret: &str,
         pool: Pool,
@@ -69,9 +90,16 @@ impl ApiServer {
     fn build(
         jwt_secret: &str,
         pool: Pool,
-        _storage_path: Option<std::path::PathBuf>,
+        storage_path: Option<std::path::PathBuf>,
         registration_token: Option<Arc<String>>,
     ) -> Self {
+        // The repository storage root is resolved once, here at the
+        // startup edge, and handed to the routes as data. Reading
+        // `GIT_ROOT` inside a request handler made every request depend
+        // on process-global state that another thread could change
+        // underneath it, and left the API with no way to be pointed at a
+        // scratch root.
+        let repo_storage_root = resolve_repo_storage_root(storage_path);
         let auth = ApiAuth::new(jwt_secret);
         let metrics = Metrics::new();
         gitforge_db::set_metrics(metrics.clone());
@@ -158,7 +186,7 @@ impl ApiServer {
         // Protected routes (auth required)
         let pool_arc = Arc::new(pool);
         let protected_routes = Router::new()
-            .merge(repo_routes())
+            .merge(repo_routes(repo_storage_root))
             .merge(ci_routes())
             .merge(runner_routes())
             .merge(user_routes())
