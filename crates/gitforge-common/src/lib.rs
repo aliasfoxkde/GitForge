@@ -25,7 +25,9 @@ pub use ids::{
 pub use lane::Lane;
 pub use rollout::RolloutFlags;
 pub use time::DateTime;
-pub use volume::{image_cache_key, JobCache, VolumeSpec, VolumeType};
+pub use volume::{
+    cache_root, image_cache_key, JobCache, VolumeSpec, VolumeType, DEFAULT_CACHE_ROOT,
+};
 
 /// True when `hash` is git's "ref does not exist" sentinel: empty or all
 /// zero digits. `git receive-pack` sends an all-zero new hash on branch

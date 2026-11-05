@@ -12,7 +12,7 @@ use bollard::query_parameters::{
 use bollard::Docker;
 use bollard::API_DEFAULT_VERSION;
 use futures_util::StreamExt;
-use gitforge_common::{Error, JobId, Result, VolumeSpec, VolumeType};
+use gitforge_common::{cache_root, Error, JobId, Result, VolumeSpec, VolumeType};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -431,23 +431,6 @@ impl DockerSandbox {
 // ---------------------------------------------------------------------------
 // Volume mounts
 // ---------------------------------------------------------------------------
-
-/// Where the runner keeps job caches when the pipeline does not name an
-/// absolute location. Overridable with `GITFORGE_CACHE_ROOT`; the default
-/// matches the usual system cache path.
-const DEFAULT_CACHE_ROOT: &str = "/var/cache/gitforge";
-
-/// The runner's cache root, read from the environment ONCE at the edge
-/// (where a container is created) and passed down as a value. A decision
-/// function that reads process-global state internally inherits whatever
-/// any other thread is doing to it at that instant.
-fn cache_root() -> String {
-    std::env::var("GITFORGE_CACHE_ROOT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_CACHE_ROOT.to_string())
-}
 
 /// Parse a human-readable size (`4G`, `512M`, `1024K`) into bytes.
 fn parse_size_bytes(raw: &str) -> Option<i64> {

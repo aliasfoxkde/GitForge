@@ -1,6 +1,7 @@
 //! Job executor with container pooling
 
 use crate::fault::{fault_error, fault_outcome};
+use crate::mount_lock::lock_job_mounts;
 use gitforge_common::{Fault, JobId, PipelineRunId, RepoId, Result, VolumeSpec};
 use gitforge_sandbox::{
     DockerSandbox, OutputSink, Sandbox, SandboxInstance, SandboxLimits, StepResult,
@@ -427,7 +428,7 @@ impl JobExecutor {
     /// original accumulated-result behavior.
     pub async fn execute_with_output(
         &self,
-        job: ExecutableJob,
+        mut job: ExecutableJob,
         output_sink: Option<Arc<dyn OutputSink>>,
     ) -> JobResult {
         let job_id = job.job_id; // Copy type
@@ -490,6 +491,44 @@ impl JobExecutor {
                 workspace_path: job.working_dir.clone(),
             };
         }
+
+        // GF-11: two jobs that mount the same host directory must not run
+        // at the same time. A shared build cache is exactly that: a
+        // rebuild in one run replaces the binaries another run is about to
+        // execute, and that run dies with ENOENT on the missing binary
+        // (measured 2026-11-05 on the DIL repository, where two coverage
+        // jobs lost their test binaries to a concurrent rebuild). The
+        // runner holds an exclusive advisory lock on every writable host
+        // directory the job mounts for the whole job. The wait is charged
+        // to the job's own budget: a job that cannot get the directory is
+        // refused instead of running against a directory another job is
+        // writing to.
+        let lock_wait = deadline.saturating_duration_since(Instant::now());
+        let cache_root = gitforge_common::cache_root();
+        let (mount_locks, locked_volumes) =
+            match lock_job_mounts(&job.image, &job.volumes, &cache_root, lock_wait).await {
+                Ok(locked) => locked,
+                Err(error) => {
+                    let completed_at = chrono::Utc::now();
+                    tracing::warn!(%job_id, %error, "could not lock the job's shared host mounts");
+                    return JobResult {
+                        job_id,
+                        success: false,
+                        exit_code: -1,
+                        step_results: Vec::new(),
+                        artifacts: Vec::new(),
+                        logs: None,
+                        started_at,
+                        completed_at,
+                        timed_out: false,
+                        error: Some(format!("shared mount unavailable: {error}")),
+                        workspace_path: job.working_dir.clone(),
+                        infrastructure_failure: true,
+                    };
+                }
+            };
+        let _mount_locks = mount_locks;
+        job.volumes = locked_volumes;
 
         // Acquire container from pool. Both failure shapes here are the
         // container backend failing, not the commit (F40's wedged podman

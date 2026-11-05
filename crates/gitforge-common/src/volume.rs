@@ -155,6 +155,30 @@ impl JobCache {
     }
 }
 
+/// Where the runner keeps job caches when the pipeline does not name an
+/// absolute location. Overridable with `GITFORGE_CACHE_ROOT`; the default
+/// matches the usual system cache path.
+pub const DEFAULT_CACHE_ROOT: &str = "/var/cache/gitforge";
+
+/// The runner's cache root, taken from the environment.
+///
+/// Call this once at the edge - where a job starts, and where a container
+/// is created - and pass the value down. A decision function that reads
+/// process-global state internally inherits whatever any other thread is
+/// doing to it at that instant.
+///
+/// One definition for the whole platform: the runner (which locks the
+/// directory a job mounts) and the sandbox (which mounts it) must agree
+/// on which host directory a cache points at, or the lock would guard a
+/// path nobody writes to.
+pub fn cache_root() -> String {
+    std::env::var("GITFORGE_CACHE_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_CACHE_ROOT.to_string())
+}
+
 /// A filesystem-safe key for an image reference.
 ///
 /// Caches are keyed by this value so a rebuilt image (new tag) starts from
