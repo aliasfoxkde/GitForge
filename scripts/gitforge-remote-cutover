@@ -95,22 +95,41 @@ esac
 
 # A masked unit is retired on this host; restarting it fails the whole
 # cutover for no operational reason (2026-10-10: the NAS runner mask made
-# every promote roll back). list-unit-files state 'masked' is the only
-# reliable discriminator — `systemctl cat` exits 0 even for masked units.
-# list-unit-files is strict about names: a bare "gitforge-ci" matches
-# nothing while "gitforge-ci.service" does (only globs are lenient).
+# every promote roll back). `systemctl cat` exits 0 even for masked units,
+# so the retired state comes from LoadState below. Names are normalised to
+# the full unit name because a bare "gitforge-ci" matches nothing while
+# "gitforge-ci.service" does (only globs are lenient).
 unit_file_name() { printf '%s.service' "${1%.service}"; }
+# `systemctl list-unit-files` enumerates unit FILES, not template INSTANCES.
+# On the NAS profile every unit is an instance of the gitforge@.service
+# template, so every one of them resolved to "not installed": the cutover
+# flipped the release symlink, stopped nothing and started nothing, and the
+# old processes kept serving the old binaries - a silent no-op release that
+# reports success. Detection is therefore instance-aware:
+#   - LoadState is the unit's own state. A retired unit reports "masked",
+#     which list-unit-files cannot see for an instance.
+#   - list-units --all reports whether the manager actually knows the
+#     instance.
+# A concrete unit file (the fedora user profile: gitforge-api.service) is
+# still detected through list-unit-files.
+unit_load_state() {
+    systemctl "${scope[@]}" show "$(unit_file_name "$1")" -p LoadState --value 2>/dev/null
+}
 unit_masked() {
-    [[ "$(systemctl "${scope[@]}" list-unit-files "$(unit_file_name "$1")" --no-legend 2>/dev/null | awk '{print $2}')" == "masked" ]]
+    [[ "$(unit_load_state "$1")" == "masked" ]]
 }
 unit_present() {
-    systemctl "${scope[@]}" list-unit-files "$(unit_file_name "$1")" --no-legend 2>/dev/null | grep -q .
+    local name
+    name="$(unit_file_name "$1")"
+    systemctl "${scope[@]}" list-unit-files "$name" --no-legend 2>/dev/null \
+        | awk -v u="$name" '$1 == u { found = 1 } END { exit !found }' && return 0
+    systemctl "${scope[@]}" list-units --all --no-legend --plain "$name" 2>/dev/null | grep -q .
 }
 for u in "$api_unit" "$ci_unit" "$git_unit" "$runner_unit"; do
-    if ! unit_present "$u"; then
-        say "skipping $u: not installed on this host"
-    elif unit_masked "$u"; then
+    if unit_masked "$u"; then
         say "skipping $u: masked (retired on this host)"
+    elif ! unit_present "$u"; then
+        say "skipping $u: not installed on this host"
     fi
 done
 

@@ -101,6 +101,15 @@ jobs:
         # runs) every gated job. These synthetic-repo cases pin the
         # contract, including the main-push tip-diff fallback.
         run: bash tests/detect-changes-selftest.sh
+      - name: Cutover unit-detection selftest
+        # The release cutover decides which units to stop and start from
+        # what systemctl reports. A detection gap there is a silent no-op
+        # release: the symlink flips, nothing restarts, the old binaries
+        # keep serving, and the cutover reports success. The NAS profile
+        # runs template INSTANCES, which `systemctl list-unit-files` does
+        # not enumerate at all - so this selftest pins the instance-aware
+        # detection against a stubbed systemctl.
+        run: bash tests/remote-cutover-unit-detection-selftest.sh
     timeout: 10m
 
   - name: fmt

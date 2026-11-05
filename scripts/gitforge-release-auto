@@ -56,8 +56,12 @@ die() { printf 'release-auto: %s\n' "$1" >&2; exit 1; }
 # restart set is what the host actually runs. Failing the whole cutover on
 # a masked unit made every promote roll back forever (2026-10-10: the NAS
 # runner was retired via mask when CI moved to the fedora host).
+# A masked TEMPLATE INSTANCE is invisible to list-unit-files (it enumerates
+# unit files, not instances), so the retired-component check fell through and
+# the cutover tried to restart a masked unit. LoadState is the unit's own
+# state and reports "masked" for concrete units and instances alike.
 unit_masked() {
-    [[ "$(systemctl list-unit-files "$1" --no-legend 2>/dev/null | awk '{print $2}')" == "masked" ]]
+    [[ "$(systemctl show "$1" -p LoadState --value 2>/dev/null)" == "masked" ]]
 }
 RESTART_STATELESS=()
 for u in gitforge@api.service gitforge@git-server.service; do
