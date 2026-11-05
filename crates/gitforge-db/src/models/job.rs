@@ -69,6 +69,40 @@ impl JobStatus {
         )
     }
 
+    /// Classify a recorded completion receipt into a terminal status.
+    ///
+    /// Receipts reach the durable row in more than one shape. The
+    /// scheduler's runner-completion receipt carries `success` (a boolean)
+    /// and an `outcome` class; the reconciler's own timeout receipt carries
+    /// a `status` string. Reading only `status` graded every
+    /// runner-completion receipt as `failed`, so a job that really
+    /// succeeded was recorded as failed (GF-01).
+    ///
+    /// Precedence is strict and per-field: `status`, then `outcome`, then
+    /// the `success` boolean. The first field that is present decides the
+    /// verdict, and a present-but-unusable value yields `None` rather than
+    /// falling through to a weaker field — bad evidence must not be
+    /// laundered into a different verdict. The caller fails closed.
+    pub fn from_receipt(receipt: &serde_json::Value) -> Option<Self> {
+        if let Some(status) = receipt.get("status") {
+            return status
+                .as_str()
+                .and_then(Self::from_str)
+                .filter(Self::is_terminal);
+        }
+        if let Some(outcome) = receipt.get("outcome") {
+            return outcome
+                .as_str()
+                .and_then(Self::from_str)
+                .filter(Self::is_terminal);
+        }
+        match receipt.get("success").and_then(serde_json::Value::as_bool) {
+            Some(true) => Some(JobStatus::Succeeded),
+            Some(false) => Some(JobStatus::Failed),
+            None => None,
+        }
+    }
+
     /// Map the durable status onto the engine's copy of the enum.
     ///
     /// Restart recovery grafts durable rows onto a rebuilt CI engine, whose

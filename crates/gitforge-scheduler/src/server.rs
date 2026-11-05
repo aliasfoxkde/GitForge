@@ -1045,9 +1045,18 @@ async fn complete_job(
         .map(RunnerId::from);
     let lease_token = request["lease_token"].as_str();
 
+    // An explicit, known `outcome` classifies the terminal row; anything
+    // else keeps the historical boolean mapping (older runners).
+    let outcome = JobOutcome::from_request(success, request["outcome"].as_str());
+    // The receipt records the classification the durable row was graded
+    // with, not just the runner's boolean. A receipt that kept only
+    // `success` could not say "the backend failed, not the commit", so a
+    // stranded infrastructure failure was indistinguishable from a code
+    // failure when the durable status write was lost (GF-01).
     let receipt = serde_json::json!({
         "job_id": job_id.to_string(),
         "success": success,
+        "outcome": outcome.as_str(),
         "exit_code": exit_code,
         "error": error,
         "step_results": request["step_results"].clone(),
@@ -1063,9 +1072,6 @@ async fn complete_job(
     }
 
     let assigned_runner = state.scheduler.is_assigned(job_id).await;
-    // An explicit, known `outcome` classifies the terminal row; anything
-    // else keeps the historical boolean mapping (older runners).
-    let outcome = JobOutcome::from_request(success, request["outcome"].as_str());
     let completion = match (runner_id, lease_token, assigned_runner) {
         (Some(runner_id), Some(lease_token), Some(_)) => {
             state

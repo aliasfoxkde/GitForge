@@ -2492,13 +2492,7 @@ impl JobQueries {
             let verdict = result_json
                 .as_deref()
                 .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-                .and_then(|receipt| {
-                    receipt
-                        .get("status")
-                        .and_then(|status| status.as_str())
-                        .and_then(JobStatus::from_str)
-                })
-                .filter(JobStatus::is_terminal)
+                .and_then(|receipt| JobStatus::from_receipt(&receipt))
                 .unwrap_or(JobStatus::Failed);
             let result = sqlx::query(
                 "UPDATE jobs SET status = ?, runner_id = NULL, lease_token = NULL WHERE id = ? AND status IN ('pending', 'queued', 'assigned', 'running') AND finished_at IS NOT NULL",
@@ -6202,11 +6196,24 @@ mod tests {
         let mut unknown_receipt = crate::models::Job::new(run.id, "receipt-unknown".to_string());
         let mut garbage_receipt = crate::models::Job::new(run.id, "receipt-garbage".to_string());
         let mut live_queued = crate::models::Job::new(run.id, "still-queued".to_string());
+        // GF-01: the scheduler's runner-completion receipt carries
+        // `success`, not `status`. Grading only `status` read this row's
+        // `success: true` as no verdict at all and failed it closed, so a
+        // green job was recorded as failed.
+        let mut runner_completion =
+            crate::models::Job::new(run.id, "receipt-runner-completion".to_string());
+        // A backend failure keeps its class through the receipt: the
+        // runner records `outcome`, and the row must not come back as a
+        // plain code failure.
+        let mut runner_infrastructure =
+            crate::models::Job::new(run.id, "receipt-runner-infrastructure".to_string());
         for job in [
             &mut succeeded_receipt,
             &mut unknown_receipt,
             &mut garbage_receipt,
             &mut live_queued,
+            &mut runner_completion,
+            &mut runner_infrastructure,
         ] {
             JobQueries::create(&pool, job).await.unwrap();
         }
@@ -6244,8 +6251,18 @@ mod tests {
         tear(unknown_receipt.id, r#"{"status":"exploded"}"#).await;
         tear(garbage_receipt.id, "runner died mid-write").await;
         tear(assigned_receipt.id, r#"{"status":"failed"}"#).await;
+        tear(
+            runner_completion.id,
+            r#"{"job_id":"x","success":true,"exit_code":0,"step_results":[],"artifacts":[]}"#,
+        )
+        .await;
+        tear(
+            runner_infrastructure.id,
+            r#"{"job_id":"y","success":false,"outcome":"infrastructure_failure","exit_code":-1}"#,
+        )
+        .await;
 
-        assert_eq!(JobQueries::reconcile_evidence_rows(&pool).await.unwrap(), 4);
+        assert_eq!(JobQueries::reconcile_evidence_rows(&pool).await.unwrap(), 6);
 
         let graded = |job_id: gitforge_common::JobId| {
             let pool = &pool;
@@ -6256,6 +6273,14 @@ mod tests {
         assert_eq!(graded(unknown_receipt.id).await.status, "failed");
         assert_eq!(graded(garbage_receipt.id).await.status, "failed");
         assert_eq!(graded(assigned_receipt.id).await.status, "failed");
+        // A runner-completion receipt grades from its `success` boolean.
+        assert_eq!(graded(runner_completion.id).await.status, "succeeded");
+        // A backend failure keeps `infrastructure_failure`, not `failed`:
+        // the two mean different things to an operator (R6.3).
+        assert_eq!(
+            graded(runner_infrastructure.id).await.status,
+            "infrastructure_failure"
+        );
 
         // The repair grades from evidence without rewriting it: the receipt
         // columns keep their values and no start time is invented.
