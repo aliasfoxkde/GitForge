@@ -28,16 +28,12 @@
 # .gitforce.yml):
 # - The job graph is a LINEAR CHAIN (detect-changes → lint → fmt → clippy →
 #   test → coverage → fuzz), not a fan-out,
+# - `environment: {}` is required by the parser (PipelineDefinition has no
+#   serde default) even though it is never forwarded.
 #   because all jobs of one run share the SAME workspace directory on this
 #   runner. Concurrent jobs would run cargo against the same target/
 #   directory and corrupt each other's build locks.
-<<<<<<< HEAD
 # - The image is pre-built on the host (dsc-ci-rust:16 — cargo, clippy,
-=======
-# - `environment: {}` is required by the parser (PipelineDefinition has no
-#   serde default) even though it is never forwarded.
-# - The image is pre-built on the host (dsc-ci-rust:13 — cargo, clippy,
->>>>>>> 31de5bc3b675e1e0803e35e8e3c9ca27884ff5f0
 #   rustfmt, llvm-tools + cargo-llvm-cov for the coverage gate, python3
 #   for the route-docs drift gate, and the GitForge workspace cargo
 #   registry cache baked in for offline builds).
@@ -45,10 +41,7 @@
 #   prior tag failed offline on the newly locked libc 0.2.191 crate.
 #   Rebuild and bump the tag whenever Cargo.lock changes or the baked
 #   tooling changes — a stale cache fails every cargo job in seconds with
-#   "candidate versions found which didn't match" (v13 rebuilt the
-#   full recipe: the deployed v12 was missing shellcheck, python3, g++
-#   and cargo-fuzz — built before those recipe entries were applied, and
-#   its lint job failed on "shellcheck: not found"; v11 baked the
+#   "candidate versions found which didn't match" (v11 baked the
 #   cargo-audit dependency-bump lockfile; v10 added shellcheck
 #   for the new head-of-chain lint job; v9 added python3 for
 #   the drift checker; v8 documents the
@@ -80,11 +73,7 @@ trigger_on:
 environment: {}
 jobs:
   - name: detect-changes
-<<<<<<< HEAD
     image: dsc-ci-rust:16
-=======
-    image: dsc-ci-rust:13
->>>>>>> 31de5bc3b675e1e0803e35e8e3c9ca27884ff5f0
     steps:
       - name: Enumerate changed files and classify
         # Populates CI_CHANGE_* vars used by downstream skip_if conditions.
@@ -93,11 +82,7 @@ jobs:
     timeout: 5m
 
   - name: lint
-<<<<<<< HEAD
     image: dsc-ci-rust:16
-=======
-    image: dsc-ci-rust:13
->>>>>>> 31de5bc3b675e1e0803e35e8e3c9ca27884ff5f0
     needs: [detect-changes]
     steps:
       - name: Shellcheck (including extensionless ops scripts)
@@ -119,11 +104,7 @@ jobs:
     timeout: 10m
 
   - name: fmt
-<<<<<<< HEAD
     image: dsc-ci-rust:16
-=======
-    image: dsc-ci-rust:13
->>>>>>> 31de5bc3b675e1e0803e35e8e3c9ca27884ff5f0
     needs: [lint]
 
     steps:
@@ -141,11 +122,7 @@ jobs:
     timeout: 15m
 
   - name: clippy
-<<<<<<< HEAD
     image: dsc-ci-rust:16
-=======
-    image: dsc-ci-rust:13
->>>>>>> 31de5bc3b675e1e0803e35e8e3c9ca27884ff5f0
     needs: [fmt]
     cache:
       # Compiled-artifact cache: the runner bind-mounts a host directory
@@ -170,11 +147,7 @@ jobs:
     timeout: 60m
 
   - name: test
-<<<<<<< HEAD
     image: dsc-ci-rust:16
-=======
-    image: dsc-ci-rust:13
->>>>>>> 31de5bc3b675e1e0803e35e8e3c9ca27884ff5f0
     needs: [clippy]
     cache:
       # Compiled-artifact cache: the runner bind-mounts a host directory
@@ -208,11 +181,7 @@ jobs:
     timeout: 90m
 
   - name: coverage
-<<<<<<< HEAD
     image: dsc-ci-rust:16
-=======
-    image: dsc-ci-rust:13
->>>>>>> 31de5bc3b675e1e0803e35e8e3c9ca27884ff5f0
     needs: [test]
     cache:
       # Compiled-artifact cache: the runner bind-mounts a host directory
@@ -273,11 +242,7 @@ jobs:
     timeout: 90m
 
   - name: fuzz
-<<<<<<< HEAD
     image: dsc-ci-rust:16
-=======
-    image: dsc-ci-rust:13
->>>>>>> 31de5bc3b675e1e0803e35e8e3c9ca27884ff5f0
     needs: [coverage]
     skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" ]]'
     steps:
@@ -312,11 +277,7 @@ jobs:
   - name: release-contract
     # The CI image already ships python3; reusing it avoids a second
     # image pull per run.
-<<<<<<< HEAD
     image: dsc-ci-rust:16
-=======
-    image: dsc-ci-rust:13
->>>>>>> 31de5bc3b675e1e0803e35e8e3c9ca27884ff5f0
     needs: [coverage]
     steps:
       - name: Verify release bundle contract
