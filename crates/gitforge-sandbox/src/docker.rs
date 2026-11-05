@@ -227,6 +227,35 @@ impl DockerSandbox {
         Ok(())
     }
 
+    /// Check whether a job still owns a managed sandbox container.
+    /// This is used by runtime integration tests to verify automatic teardown.
+    pub async fn has_job_containers(&self, job_id: JobId) -> Result<bool> {
+        let Some(ref docker) = self.docker else {
+            return Ok(false);
+        };
+        let mut filters = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec!["com.gitforce.managed=true".to_string()],
+        );
+        let containers = docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+            .map_err(|error| Error::sandbox(format!("failed to list job containers: {error}")))?;
+        let job_id = job_id.to_string();
+        Ok(containers.into_iter().any(|container| {
+            container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("com.gitforce.job_id"))
+                .is_some_and(|label| label == &job_id)
+        }))
+    }
+
     /// Create a new Docker sandbox, requiring Docker to be available.
     /// Returns an error if Docker is not available or cannot be reached.
     pub async fn connect_required() -> Result<Self> {
@@ -1062,10 +1091,28 @@ impl Sandbox for DockerSandbox {
                 ..Default::default()
             };
 
-            docker
+            match docker
                 .remove_container(&instance.container_id, Some(remove_options))
                 .await
-                .map_err(|e| Error::sandbox(format!("failed to remove container: {e}")))?;
+            {
+                Ok(()) => {}
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404 | 409,
+                    ..
+                }) => {
+                    tracing::debug!(
+                        container_id = %instance.container_id,
+                        job_id = %instance.job_id,
+                        "sandbox container already removed"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(Error::sandbox(format!(
+                        "failed to remove container: {error}"
+                    )));
+                }
+            }
 
             tracing::info!(
                 "Destroyed container {} for job {}",

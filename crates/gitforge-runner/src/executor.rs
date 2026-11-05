@@ -11,14 +11,94 @@ use gitforge_storage::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::sync::RwLock;
-use tokio::time::{timeout, Duration, Instant};
+use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::time::{sleep, timeout, Duration, Instant};
 
 /// Default number of pre-warmed containers per image
 const POOL_SIZE: usize = 2;
+
+const CLEANUP_QUEUE_CAPACITY: usize = 64;
+const CLEANUP_CONCURRENCY: usize = 2;
+const CLEANUP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+const CLEANUP_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+struct CleanupRequest {
+    job_id: JobId,
+    instance: SandboxInstance,
+    reason: &'static str,
+}
+
+fn cleanup_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs((1_u64 << attempt.min(6)).min(CLEANUP_MAX_BACKOFF.as_secs()))
+}
+
+async fn retry_cleanup_until_success<F, Fut>(
+    mut destroy: F,
+    job_id: JobId,
+    container_id: String,
+    reason: &'static str,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<(), String>>,
+{
+    let mut attempt = 0_u32;
+    loop {
+        match timeout(CLEANUP_ATTEMPT_TIMEOUT, destroy()).await {
+            Ok(Ok(())) => {
+                tracing::info!(%job_id, %container_id, reason, attempt, "sandbox cleanup completed");
+                return;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%job_id, %container_id, reason, attempt, %error, "sandbox cleanup failed; retrying");
+            }
+            Err(_) => {
+                tracing::warn!(%job_id, %container_id, reason, attempt, "sandbox cleanup attempt timed out; retrying");
+            }
+        }
+        sleep(cleanup_retry_delay(attempt)).await;
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+fn spawn_cleanup_reaper(sandbox: Arc<DockerSandbox>) -> mpsc::Sender<CleanupRequest> {
+    let (sender, mut receiver) = mpsc::channel::<CleanupRequest>(CLEANUP_QUEUE_CAPACITY);
+    let permits = Arc::new(Semaphore::new(CLEANUP_CONCURRENCY));
+    tokio::spawn(async move {
+        while let Some(request) = receiver.recv().await {
+            let permit = match Arc::clone(&permits).acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+            let sandbox = Arc::clone(&sandbox);
+            tokio::spawn(async move {
+                let _permit = permit;
+                let instance = request.instance;
+                let container_id = instance.container_id.clone();
+                retry_cleanup_until_success(
+                    || {
+                        let sandbox = Arc::clone(&sandbox);
+                        let instance = instance.clone();
+                        async move {
+                            sandbox
+                                .destroy(instance)
+                                .await
+                                .map_err(|error| error.to_string())
+                        }
+                    },
+                    request.job_id,
+                    container_id,
+                    request.reason,
+                )
+                .await;
+            });
+        }
+    });
+    sender
+}
 
 /// Sandbox acquisition ceiling in seconds. Container creation under load
 /// (whole layer-stack copies on the daemon's old vfs storage) could
@@ -165,15 +245,18 @@ fn runtime_toolchain_fetch(steps: &[JobStep]) -> Option<String> {
 pub struct ContainerPool {
     pools: Arc<RwLock<HashMap<String, Vec<SandboxInstance>>>>, // image -> instances
     sandbox: Arc<DockerSandbox>,
+    cleanup_sender: mpsc::Sender<CleanupRequest>,
 }
 
 impl ContainerPool {
     /// Create a new container pool
     pub async fn new() -> Result<Self> {
-        let sandbox = DockerSandbox::connect_required().await?;
+        let sandbox = Arc::new(DockerSandbox::connect_required().await?);
+        let cleanup_sender = spawn_cleanup_reaper(Arc::clone(&sandbox));
         Ok(Self {
             pools: Arc::new(RwLock::new(HashMap::new())),
-            sandbox: Arc::new(sandbox),
+            sandbox,
+            cleanup_sender,
         })
     }
 
@@ -242,6 +325,52 @@ impl ContainerPool {
             .await
     }
 
+    async fn destroy_or_schedule(
+        &self,
+        instance: SandboxInstance,
+        reason: &'static str,
+    ) -> Result<bool> {
+        let job_id = instance.job_id;
+        let container_id = instance.container_id.clone();
+        let result = timeout(
+            CLEANUP_ATTEMPT_TIMEOUT,
+            self.sandbox.destroy(instance.clone()),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(error)) => {
+                tracing::warn!(%job_id, %container_id, reason, %error, "sandbox teardown failed; scheduling retry");
+                self.schedule_cleanup(instance, reason).await?;
+                Ok(false)
+            }
+            Err(_) => {
+                tracing::warn!(%job_id, %container_id, reason, "sandbox teardown timed out; scheduling retry");
+                self.schedule_cleanup(instance, reason).await?;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn schedule_cleanup(
+        &self,
+        instance: SandboxInstance,
+        reason: &'static str,
+    ) -> Result<()> {
+        let job_id = instance.job_id;
+        let container_id = instance.container_id.clone();
+        self.cleanup_sender
+            .send(CleanupRequest {
+                job_id,
+                instance,
+                reason,
+            })
+            .await
+            .map_err(|_| gitforge_common::Error::internal("sandbox cleanup reaper stopped"))?;
+        tracing::info!(%job_id, %container_id, reason, "sandbox cleanup queued for retry");
+        Ok(())
+    }
+
     /// Return a container to the pool
     pub async fn release(
         &self,
@@ -250,8 +379,11 @@ impl ContainerPool {
         workspace_path: Option<&str>,
     ) {
         if workspace_path.is_some() {
-            if let Err(error) = self.sandbox.destroy(instance).await {
-                tracing::warn!("failed to destroy workspace container: {}", error);
+            if let Err(error) = self
+                .destroy_or_schedule(instance, "workspace release")
+                .await
+            {
+                tracing::error!(%error, "could not queue workspace sandbox cleanup");
             }
             return;
         }
@@ -259,26 +391,34 @@ impl ContainerPool {
         let instances = pools.entry(image.to_string()).or_insert_with(Vec::new);
 
         if instances.len() < POOL_SIZE {
-            if let Err(e) = self.sandbox.destroy(instance).await {
-                tracing::warn!("failed to reset pooled container: {}", e);
-                return;
+            match self
+                .destroy_or_schedule(instance, "pooled container reset")
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    tracing::error!(%error, "could not queue pooled sandbox cleanup");
+                    return;
+                }
             }
-            // Create fresh instance for the pool
+            // Create fresh instance for the pool only after the previous
+            // container is confirmed gone.
             let id = JobId::new();
             match self.sandbox.create(id, image, sandbox_limits(), &[]).await {
                 Ok(new_instance) => {
                     instances.push(new_instance);
                     tracing::debug!("returned container to pool");
                 }
-                Err(e) => {
-                    tracing::warn!("failed to create replacement container: {}", e);
+                Err(error) => {
+                    tracing::warn!("failed to create replacement container: {}", error);
                 }
             }
-        } else {
-            // Pool full, destroy
-            if let Err(e) = self.sandbox.destroy(instance).await {
-                tracing::warn!("failed to destroy excess container: {}", e);
-            }
+        } else if let Err(error) = self
+            .destroy_or_schedule(instance, "excess pooled container")
+            .await
+        {
+            tracing::error!(%error, "could not queue excess sandbox cleanup");
         }
     }
 }
@@ -705,15 +845,14 @@ impl JobExecutor {
         // inside the container has exited.  Tear down the exact container
         // immediately on timeout, before artifact/log collection, so timed-out
         // jobs cannot leave an active exec or conmon helper behind.
-        if timed_out
-            && timeout(
-                Duration::from_secs(15),
-                self.pool.sandbox.destroy(instance.clone()),
-            )
-            .await
-            .is_err()
-        {
-            tracing::error!(%job_id, "timed-out sandbox teardown exceeded 15 seconds");
+        if timed_out {
+            if let Err(error) = self
+                .pool
+                .destroy_or_schedule(instance.clone(), "job timeout")
+                .await
+            {
+                tracing::error!(%job_id, %error, "could not queue timed-out sandbox cleanup");
+            }
         }
 
         // Collect artifacts
@@ -806,8 +945,10 @@ impl JobExecutor {
             let mut instances = self.active_instances.write().await;
             instances.remove(job_id)
         };
-        if let Some((_image, _workspace, inst)) = instance {
-            self.pool.sandbox.destroy(inst).await?;
+        if let Some((_image, _workspace, instance)) = instance {
+            self.pool
+                .destroy_or_schedule(instance, "job cancellation")
+                .await?;
         }
         Ok(())
     }
@@ -841,8 +982,12 @@ impl JobExecutor {
         };
 
         for (_job_id, (_image, _workspace, instance)) in instances {
-            if let Err(e) = self.pool.sandbox.destroy(instance).await {
-                tracing::warn!("failed to destroy sandbox during cancel_all_jobs: {}", e);
+            if let Err(error) = self
+                .pool
+                .destroy_or_schedule(instance, "runner shutdown")
+                .await
+            {
+                tracing::error!(%error, "could not queue sandbox cleanup during shutdown");
             }
         }
 
@@ -1043,6 +1188,31 @@ impl JobResult {
 mod tests {
     use super::*;
     use gitforge_sandbox::StepResult;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn cleanup_retries_transient_destroy_errors() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_counter = Arc::clone(&attempts);
+        retry_cleanup_until_success(
+            move || {
+                let attempts = Arc::clone(&attempt_counter);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                        Err(String::from("temporary container-runtime failure"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            JobId::new(),
+            String::from("container-id"),
+            "test cleanup",
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn test_acquire_timeout_scales_with_host_load() {
@@ -1148,6 +1318,56 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
+    async fn test_real_docker_job_cancel_reaps_sandbox() {
+        let executor = Arc::new(JobExecutor::new().await.expect("Docker must be available"));
+        let job_id = JobId::new();
+        let job = ExecutableJob::new(job_id, PipelineRunId::new(), "alpine:latest".to_string())
+            .with_steps(vec![JobStep::new("hang", "sleep 30")])
+            .with_timeout(600);
+        let running_executor = Arc::clone(&executor);
+        let running_job = tokio::spawn(async move { running_executor.execute(job).await });
+
+        let started = timeout(Duration::from_secs(30), async {
+            loop {
+                match executor.pool.sandbox.has_job_containers(job_id).await {
+                    Ok(true) => break,
+                    Ok(false) => sleep(Duration::from_millis(100)).await,
+                    Err(error) => panic!("failed to inspect job containers: {error}"),
+                }
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "job sandbox was not created");
+        sleep(Duration::from_secs(1)).await;
+        executor
+            .cancel(&job_id)
+            .await
+            .expect("cancellation cleanup should be queued");
+
+        let result = timeout(Duration::from_secs(30), running_job)
+            .await
+            .expect("cancelled execution did not settle")
+            .expect("job task panicked");
+        assert!(!result.success);
+
+        let cleanup = timeout(Duration::from_secs(30), async {
+            loop {
+                match executor.pool.sandbox.has_job_containers(job_id).await {
+                    Ok(false) => break,
+                    Ok(true) => sleep(Duration::from_millis(250)).await,
+                    Err(error) => panic!("failed to inspect job containers: {error}"),
+                }
+            }
+        })
+        .await;
+        assert!(
+            cleanup.is_ok(),
+            "cancelled job container was not removed automatically"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
     async fn test_real_docker_job_timeout_reaps_sandbox() {
         let executor = JobExecutor::new().await.expect("Docker must be available");
         let job_id = JobId::new();
@@ -1164,12 +1384,20 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error.contains("timeout")));
         assert_eq!(executor.active_job_count().await, 0);
-        assert!(executor
-            .pool
-            .sandbox
-            .remove_job_containers(job_id)
-            .await
-            .is_ok());
+        let cleanup = timeout(Duration::from_secs(30), async {
+            loop {
+                match executor.pool.sandbox.has_job_containers(job_id).await {
+                    Ok(false) => break,
+                    Ok(true) => sleep(Duration::from_millis(250)).await,
+                    Err(error) => panic!("failed to inspect job containers: {error}"),
+                }
+            }
+        })
+        .await;
+        assert!(
+            cleanup.is_ok(),
+            "timed-out job container was not removed automatically"
+        );
     }
 
     #[test]
