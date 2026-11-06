@@ -1010,14 +1010,44 @@ impl Sandbox for DockerSandbox {
             // the runner user on the host can delete the artifact files without
             // requiring privileged escalation.
             if let Some(ref workspace) = instance.workspace_path {
-                if let Err(e) = cleanup_workspace(docker, &instance.container_id, workspace).await {
-                    tracing::warn!(
-                        "workspace ownership cleanup failed for {}: {} \
-                         (artifact files may require privileged deletion)",
-                        workspace,
-                        e
-                    );
-                    // Proceed to container teardown even if chown fails
+                // The ownership cleanup is a convenience, not a precondition
+                // of the teardown: the CI service removes a workspace it
+                // cannot delete with a container-assisted cleanup. The
+                // teardown, on the other hand, MUST happen - a cancelled
+                // teardown leaves the container running forever.
+                //
+                // The recursive chown walks the whole workspace tree. On a
+                // network filesystem, over a vendored source tree, that walk
+                // takes minutes: the runner's teardown budget expired first,
+                // and the container was never stopped or removed (measured
+                // 2026-11-05: nine leaked job containers, each one a "timed
+                // out cleaning up sandbox" warning - and the leak blocks
+                // every release cutover, whose drain gate counts live job
+                // containers). So the cleanup runs under its own budget and
+                // the container is always torn down.
+                match bounded_cleanup(
+                    cleanup_workspace(docker, &instance.container_id, workspace),
+                    WORKSPACE_CLEANUP_BUDGET,
+                )
+                .await
+                {
+                    WorkspaceCleanup::Completed => {}
+                    WorkspaceCleanup::Failed(error) => {
+                        tracing::warn!(
+                            "workspace ownership cleanup failed for {}: {} \
+                             (artifact files may require privileged deletion)",
+                            workspace,
+                            error
+                        );
+                    }
+                    WorkspaceCleanup::TimedOut => {
+                        tracing::warn!(
+                            "workspace ownership cleanup exceeded {}s for {} \
+                             (artifact files may require privileged deletion)",
+                            WORKSPACE_CLEANUP_BUDGET.as_secs(),
+                            workspace
+                        );
+                    }
                 }
             }
 
@@ -1164,6 +1194,38 @@ fn workspace_git_env() -> Vec<String> {
 ///   call; if the stream is still running the exit code may not yet be visible.
 /// - Failures are warned but never block container teardown (caller handles
 ///   fail-open semantics).
+/// - The cleanup runs under a budget of its own (`WORKSPACE_CLEANUP_BUDGET`)
+///   so a tree that takes minutes to walk can never cancel the teardown.
+const WORKSPACE_CLEANUP_BUDGET: Duration = Duration::from_secs(15);
+
+/// Outcome of a bounded workspace ownership cleanup.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkspaceCleanup {
+    /// The cleanup finished: the tree belongs to the runner user.
+    Completed,
+    /// The cleanup failed; the reason is reported.
+    Failed(String),
+    /// The cleanup exceeded its budget and was abandoned.
+    TimedOut,
+}
+
+/// Run the workspace ownership cleanup under its own budget.
+///
+/// The cleanup is best-effort: whatever it does or does not achieve, the
+/// caller's container teardown continues. A cleanup that never returns must
+/// not be able to swallow the teardown that follows it - that is what left
+/// nine job containers running on the NAS instance (2026-11-05).
+async fn bounded_cleanup<F>(cleanup: F, budget: Duration) -> WorkspaceCleanup
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    match timeout(budget, cleanup).await {
+        Ok(Ok(())) => WorkspaceCleanup::Completed,
+        Ok(Err(error)) => WorkspaceCleanup::Failed(error.to_string()),
+        Err(_) => WorkspaceCleanup::TimedOut,
+    }
+}
+
 async fn cleanup_workspace(docker: &Docker, container_id: &str, workspace: &str) -> Result<()> {
     let (uid, gid) = resolve_runner_uid_gid()?;
 
@@ -2388,5 +2450,106 @@ mod tests {
             result.is_ok(),
             "stub destroy must not fail even with workspace_path set"
         );
+    }
+
+    /// The ownership cleanup must never be able to swallow the teardown that
+    /// follows it: a cleanup that never returns is abandoned and the caller
+    /// proceeds. The regression is the leaked job container (2026-11-05).
+    #[tokio::test]
+    async fn test_a_cleanup_that_never_returns_is_abandoned() {
+        let outcome = bounded_cleanup(
+            async {
+                sleep(Duration::from_secs(30)).await;
+                Ok(())
+            },
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome, WorkspaceCleanup::TimedOut);
+    }
+
+    /// A failed cleanup is reported, not propagated: the teardown continues.
+    #[tokio::test]
+    async fn test_a_failed_cleanup_is_reported() {
+        let outcome = bounded_cleanup(
+            async { Err(Error::sandbox("chown failed")) },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(matches!(outcome, WorkspaceCleanup::Failed(_)));
+    }
+
+    /// A cleanup that finishes in time is reported as completed.
+    #[tokio::test]
+    async fn test_a_completed_cleanup_is_reported_as_completed() {
+        let outcome = bounded_cleanup(async { Ok(()) }, Duration::from_secs(5)).await;
+        assert_eq!(outcome, WorkspaceCleanup::Completed);
+    }
+
+    /// The backstop the runner uses when a teardown overruns its budget:
+    /// the container is removed by its job label. The label is the only
+    /// ownership evidence, and another job's container is never touched.
+    ///
+    /// This is the primitive that makes the leak class closeable. The
+    /// background reconciler refuses to remove a RUNNING container - its
+    /// policy keeps running containers eligible for nobody - so a teardown
+    /// that overran its budget could only be cleaned up by an explicit,
+    /// label-scoped removal (2026-11-05: eight leaked containers that no
+    /// other mechanism would ever reap).
+    #[tokio::test]
+    #[ignore] // requires a Docker daemon
+    async fn test_remove_job_containers_removes_only_that_jobs_containers() {
+        let sandbox = match DockerSandbox::connect_required().await {
+            Ok(sandbox) => sandbox,
+            Err(_) => return,
+        };
+        let owner = JobId::new();
+        let other = JobId::new();
+        let image = "backend-ci-rust:1";
+        let owned = match sandbox
+            .create(owner, image, SandboxLimits::default(), &[])
+            .await
+        {
+            Ok(instance) => instance,
+            Err(_) => return,
+        };
+        let foreign = match sandbox
+            .create(other, image, SandboxLimits::default(), &[])
+            .await
+        {
+            Ok(instance) => instance,
+            Err(_) => {
+                let _ = sandbox.remove_job_containers(owner).await;
+                return;
+            }
+        };
+        let docker = match sandbox.docker.as_ref() {
+            Some(docker) => docker,
+            None => return,
+        };
+        assert!(docker
+            .inspect_container(&owned.container_id, None)
+            .await
+            .is_ok());
+        assert!(docker
+            .inspect_container(&foreign.container_id, None)
+            .await
+            .is_ok());
+
+        sandbox
+            .remove_job_containers(owner)
+            .await
+            .expect("the label-scoped removal must succeed");
+
+        assert!(docker
+            .inspect_container(&owned.container_id, None)
+            .await
+            .is_err());
+        assert!(docker
+            .inspect_container(&foreign.container_id, None)
+            .await
+            .is_ok());
+
+        let _ = sandbox.remove_job_containers(other).await;
     }
 }

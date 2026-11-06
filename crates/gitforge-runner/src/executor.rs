@@ -769,14 +769,70 @@ impl JobExecutor {
             instances.remove(&job_id)
         };
         if let (Some((image, workspace, inst)), false) = (released, timed_out) {
+            // The teardown has to COMPLETE. A cancelled teardown leaves the
+            // job's container running forever (measured 2026-11-05: nine
+            // leaked containers, one per DIL job whose workspace walk
+            // exceeded the budget - and a leaked container blocks every
+            // release cutover, whose drain gate counts live job
+            // containers). The workspace ownership cleanup is bounded
+            // inside the sandbox, so what remains here is a stop and a
+            // remove; the budget covers them with room to spare.
             if timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 self.pool.release(&image, inst, workspace.as_deref()),
             )
             .await
             .is_err()
             {
-                tracing::warn!("timed out cleaning up sandbox for job {}", job_id);
+                // The teardown did not finish. Leaving the container behind
+                // is not an option: a container nobody stops runs forever,
+                // and the release drain gate counts live job containers, so
+                // one abandoned container blocks every future cutover
+                // (measured 2026-11-05: eight leaked containers from
+                // succeeded jobs, and a release that could not drain for
+                // four hours). Remove it by job label, forcefully, without
+                // the workspace walk that timed out.
+                tracing::error!(
+                    "timed out cleaning up sandbox for job {}; forcing container removal",
+                    job_id
+                );
+                match uuid::Uuid::parse_str(&job_id.to_string()) {
+                    Ok(uuid) => {
+                        let removed = timeout(
+                            Duration::from_secs(30),
+                            self.pool.sandbox.remove_job_containers(JobId::from(uuid)),
+                        )
+                        .await;
+                        match removed {
+                            Ok(Ok(())) => {
+                                tracing::info!(
+                                    "forced container removal finished for job {}",
+                                    job_id
+                                );
+                            }
+                            Ok(Err(error)) => {
+                                tracing::error!(
+                                    "forced container removal failed for job {}: {}",
+                                    job_id,
+                                    error
+                                );
+                            }
+                            Err(_) => {
+                                tracing::error!(
+                                    "forced container removal did not finish for job {}",
+                                    job_id
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            "job {} has no parseable id, so its container cannot be removed by label: {}",
+                            job_id,
+                            error
+                        );
+                    }
+                }
             }
         }
 
