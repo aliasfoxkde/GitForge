@@ -19,6 +19,28 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// The filesystem root under which bare repositories live.
+///
+/// The root is resolved once at the startup edge (see `ApiServer::build`)
+/// and carried into the handlers as data. Reading `GIT_ROOT` inside a
+/// handler made every request depend on process-global state that another
+/// thread could change underneath it, and left the routes with no way to
+/// be pointed at a scratch root in a test.
+#[derive(Clone, Debug)]
+pub struct RepoStorageRoot(Arc<String>);
+
+impl RepoStorageRoot {
+    /// Wrap an already-resolved storage root.
+    pub fn new(root: impl Into<String>) -> Self {
+        Self(Arc::new(root.into()))
+    }
+
+    /// The root as a path string.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 /// Validate repository name to prevent path traversal and injection attacks
 fn validate_repo_name(name: &str) -> Result<(), String> {
     // Check for empty name
@@ -91,7 +113,13 @@ pub struct CreateRepoRequest {
 }
 
 /// Repository routes
-pub fn repo_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
+///
+/// `storage_root` is the resolved filesystem root for bare repositories.
+/// It is carried in as data rather than read from the environment inside a
+/// handler: a request must not depend on process-global state that another
+/// thread can change underneath it, and a caller must be able to point the
+/// routes at a scratch root.
+pub fn repo_routes<S: Clone + Send + Sync + 'static>(storage_root: RepoStorageRoot) -> Router<S> {
     Router::new()
         .route("/repos", get(list_repos).post(create_repo))
         .route("/repos/{id}", get(get_repo).delete(delete_repo))
@@ -103,6 +131,7 @@ pub fn repo_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
             "/repos/{owner}/{repo}/commits/{sha}/status",
             get(get_commit_status),
         )
+        .layer(Extension(storage_root))
 }
 
 fn can_access_repo(claims: &Claims, owner_id: UserId) -> bool {
@@ -212,6 +241,7 @@ async fn list_repos(
 async fn create_repo(
     Extension(pool): Extension<Arc<Pool>>,
     Extension(claims): Extension<Claims>,
+    Extension(storage_root): Extension<RepoStorageRoot>,
     Json(req): Json<CreateRepoRequest>,
 ) -> impl IntoResponse {
     let owner_id = claims.user_id;
@@ -231,11 +261,7 @@ async fn create_repo(
     }
 
     let repo_id = RepoId::new();
-    let storage_root = std::env::var("GIT_ROOT")
-        .ok()
-        .filter(|root| !root.trim().is_empty())
-        .unwrap_or_else(|| "target/gitforge-repos".to_string());
-    let storage = FileStorageBackend::new(&storage_root);
+    let storage = FileStorageBackend::new(storage_root.as_str());
 
     if let Err(error) = storage.ensure_root().await {
         tracing::error!(%error, "failed to initialize git storage root");
@@ -458,6 +484,7 @@ async fn get_ref_policy(
 async fn update_ref_policy(
     Extension(pool): Extension<Arc<Pool>>,
     Extension(claims): Extension<Claims>,
+    Extension(storage_root): Extension<RepoStorageRoot>,
     Path((owner, repo)): Path<(String, String)>,
     Json(request): Json<UpdateRefPolicyRequest>,
 ) -> impl IntoResponse {
@@ -485,11 +512,7 @@ async fn update_ref_policy(
         .deny_non_fast_forward
         .unwrap_or(repository.deny_non_fast_forward);
 
-    let storage_root = std::env::var("GIT_ROOT")
-        .ok()
-        .filter(|root| !root.trim().is_empty())
-        .unwrap_or_else(|| "target/gitforge-repos".to_string());
-    let storage = FileStorageBackend::new(&storage_root);
+    let storage = FileStorageBackend::new(storage_root.as_str());
 
     let tightening = deny_non_fast_forward && !repository.deny_non_fast_forward;
     if tightening {

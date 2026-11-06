@@ -12,7 +12,10 @@ use bollard::query_parameters::{
 use bollard::Docker;
 use bollard::API_DEFAULT_VERSION;
 use futures_util::StreamExt;
-use gitforge_common::{Error, JobId, Result, VolumeSpec, VolumeType};
+use gitforge_common::{
+    cache_root, is_socket_source, Error, JobId, Result, VolumeSpec, VolumeType,
+    DEFAULT_DOCKER_SOCKET,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -20,6 +23,19 @@ use tokio::time::{sleep, timeout, Duration};
 
 /// Docker's CFS bandwidth period, in microseconds.
 const CPU_PERIOD_MICROS: i64 = 100_000;
+
+/// The Docker client timeout, in seconds.
+///
+/// bollard's default is 120 seconds. An operator can raise it for a daemon
+/// on slow storage, where a client timeout failed jobs before any
+/// acquisition window the runner granted could elapse.
+pub(crate) fn docker_client_timeout() -> u64 {
+    std::env::var("GITFORGE_DOCKER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(120) // bollard's DEFAULT_TIMEOUT
+}
 
 /// Convert a requested core count to a safe CFS quota, bounded by the
 /// host's available parallelism. `cpu_ms` is a runtime budget and must not
@@ -142,6 +158,12 @@ pub struct DockerSandbox {
     default_limits: SandboxLimits,
     /// If true, this is a stub sandbox for testing and should not be used in production
     is_stub: bool,
+    /// The daemon socket this sandbox talks to, as a host path.
+    ///
+    /// A `{docker_socket}` mount binds this exact path, so the socket a
+    /// job mounts is the socket the sandbox talks to - not whatever the
+    /// environment says at container-creation time.
+    docker_socket: String,
 }
 
 impl DockerSandbox {
@@ -237,18 +259,12 @@ impl DockerSandbox {
         // granted could elapse. (Storage has since moved to overlay2, but
         // the rule stands: keep bollard's default unless the operator
         // raises it.)
-        let client_timeout = std::env::var("GITFORGE_DOCKER_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|secs| *secs > 0)
-            .unwrap_or(120); // bollard's DEFAULT_TIMEOUT
-                             // Same socket selection as `connect_with_local_defaults`: an explicit
-                             // unix:// DOCKER_HOST wins, otherwise the well-known socket path
-                             // (bollard's DEFAULT_SOCKET; the constant is not re-exported).
-        let socket = std::env::var("DOCKER_HOST")
-            .ok()
-            .filter(|host| host.starts_with("unix://"))
-            .unwrap_or_else(|| "unix:///var/run/docker.sock".to_owned());
+        let client_timeout = docker_client_timeout();
+        // One definition for the whole platform: the sandbox connects to
+        // this socket, the reconciler reconciles this daemon's
+        // containers, and a `{docker_socket}` mount binds this socket
+        // into the job's container.
+        let socket = gitforge_common::docker_socket();
         let docker = Docker::connect_with_unix(&socket, client_timeout, API_DEFAULT_VERSION)
             .map_err(|e| Error::sandbox(format!("failed to connect to Docker: {e}")))?;
 
@@ -264,6 +280,7 @@ impl DockerSandbox {
             docker: Some(docker),
             default_limits: SandboxLimits::default(),
             is_stub: false,
+            docker_socket: socket,
         })
     }
 
@@ -331,6 +348,7 @@ impl DockerSandbox {
             docker: None,
             default_limits: SandboxLimits::default(),
             is_stub: true,
+            docker_socket: DEFAULT_DOCKER_SOCKET.to_owned(),
         }
     }
 
@@ -345,6 +363,7 @@ impl DockerSandbox {
             docker: None,
             default_limits: limits,
             is_stub: true,
+            docker_socket: DEFAULT_DOCKER_SOCKET.to_owned(),
         }
     }
 
@@ -426,28 +445,149 @@ impl DockerSandbox {
         }
         Ok(())
     }
+    /// Create a container, stamping `extra_labels` onto it in addition to
+    /// the managed and job-id labels every container carries.
+    async fn create_with_extra_labels(
+        &self,
+        job_id: JobId,
+        image: &str,
+        limits: SandboxLimits,
+        volumes: &[VolumeSpec],
+        extra_labels: &[(String, String)],
+    ) -> Result<SandboxInstance> {
+        if let Some(ref docker) = self.docker {
+            // Ensure image is available
+            self.ensure_image(image).await?;
+            self.remove_job_containers(job_id).await?;
+
+            let container_name = Self::container_name(job_id);
+            let job_label = job_id.to_string();
+            let mut labels = HashMap::from([
+                ("com.gitforce.managed".to_owned(), "true".to_owned()),
+                ("com.gitforce.job_id".to_owned(), job_label.clone()),
+            ]);
+            // Pool containers carry the pool's ownership labels on top of
+            // the managed/job-id pair, so the pool can tell its own
+            // containers from job containers without guessing.
+            for (key, value) in extra_labels {
+                labels.insert(key.clone(), value.clone());
+            }
+
+            // A mount the runner cannot prepare is a contract it cannot
+            // keep: the pipeline declared this directory and the job
+            // needs it. Failing here is what makes the reason visible -
+            // the runner reports it as an infrastructure failure, so it
+            // reaches the job's own result instead of a log line (GF-10,
+            // 2026-11-05: the whole mount set used to be dropped, and a
+            // job whose cache had vanished just ran cold and timed out).
+            let volume_mounts =
+                build_volume_mounts(volumes, image, &cache_root(), &self.docker_socket)?;
+
+            // Build host config with resource limits
+            let host_config = HostConfig {
+                memory: Some((limits.memory_mb * 1024 * 1024) as i64),
+                cpu_period: Some(CPU_PERIOD_MICROS),
+                cpu_quota: Some(host_cpu_quota_micros(limits.cpu_cores)),
+                network_mode: if limits.network {
+                    None
+                } else {
+                    Some("none".to_string())
+                },
+                binds: if volume_mounts.binds.is_empty() {
+                    None
+                } else {
+                    Some(volume_mounts.binds)
+                },
+                mounts: if volume_mounts.mounts.is_empty() {
+                    None
+                } else {
+                    Some(volume_mounts.mounts)
+                },
+                // A container that mounts the daemon socket cannot keep
+                // SELinux labeling: the socket's label does not match the
+                // container's, and an enforcing host refuses the
+                // connection.
+                security_opt: if volume_mounts.disable_selinux {
+                    Some(vec!["label=disable".to_string()])
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+
+            // Create container
+            let config = ContainerCreateBody {
+                image: Some(image.to_owned()),
+                // Keep the container alive for the whole job. A 3600s keepalive
+                // capped every job at one hour: when sleep exited, Docker
+                // stopped the container and SIGKILLed any running exec
+                // (exit 137 at exactly 3600s, OOMKilled=false). The container
+                // is removed per-job in destroy(), so this only bounds a
+                // leaked container's lifetime.
+                cmd: Some(vec![
+                    "sleep".to_owned(),
+                    "86400".to_owned(), // 24h; job deadlines clamp to 24h
+                ]),
+                host_config: Some(host_config),
+                labels: Some(labels),
+                ..Default::default()
+            };
+
+            let options = CreateContainerOptions {
+                name: Some(container_name.clone()),
+                platform: String::new(),
+            };
+
+            let response = docker
+                .create_container(Some(options), config)
+                .await
+                .map_err(|e| Error::sandbox(format!("failed to create container: {e}")))?;
+
+            // Start container
+            docker
+                .start_container(&response.id, None)
+                .await
+                .map_err(|e| Error::sandbox(format!("failed to start container: {e}")))?;
+
+            tracing::info!("Created container {} for job {}", response.id, job_id);
+
+            Ok(SandboxInstance {
+                container_id: response.id,
+                job_id,
+                workspace_path: None,
+            })
+        } else {
+            // Stub mode - no Docker available
+            Ok(SandboxInstance {
+                container_id: format!("gitforce-job-{job_id}"),
+                job_id,
+                workspace_path: None,
+            })
+        }
+    }
+
+    /// Create a container that belongs to a warm pool.
+    ///
+    /// A pooled container is created with a placeholder job id (it is not
+    /// a job) and with the pool's ownership labels, so a later runner
+    /// process can recognise the containers this pool left behind and
+    /// reclaim them (GF-17).
+    pub async fn create_pooled(
+        &self,
+        identity: &crate::pool::PoolIdentity,
+        image: &str,
+        limits: SandboxLimits,
+    ) -> Result<SandboxInstance> {
+        let job_id = JobId::new();
+        let extra: Vec<(String, String)> = crate::pool::pool_labels(identity).into_iter().collect();
+        self.create_with_extra_labels(job_id, image, limits, &[], &extra)
+            .await
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Volume mounts
 // ---------------------------------------------------------------------------
-
-/// Where the runner keeps job caches when the pipeline does not name an
-/// absolute location. Overridable with `GITFORGE_CACHE_ROOT`; the default
-/// matches the usual system cache path.
-const DEFAULT_CACHE_ROOT: &str = "/var/cache/gitforge";
-
-/// The runner's cache root, read from the environment ONCE at the edge
-/// (where a container is created) and passed down as a value. A decision
-/// function that reads process-global state internally inherits whatever
-/// any other thread is doing to it at that instant.
-fn cache_root() -> String {
-    std::env::var("GITFORGE_CACHE_ROOT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_CACHE_ROOT.to_string())
-}
 
 /// Parse a human-readable size (`4G`, `512M`, `1024K`) into bytes.
 fn parse_size_bytes(raw: &str) -> Option<i64> {
@@ -469,18 +609,44 @@ fn parse_size_bytes(raw: &str) -> Option<i64> {
     value.checked_mul(multiplier)
 }
 
+/// The container mounts a job asked for.
+#[derive(Debug)]
+struct VolumeMounts {
+    /// Bind sources in `HostConfig.binds` form.
+    binds: Vec<String>,
+    /// Structured mounts (tmpfs, named volumes).
+    mounts: Vec<Mount>,
+    /// The container mounts a unix socket, so SELinux labeling has to be
+    /// disabled for it.
+    ///
+    /// The daemon socket's own label does not match the label a container
+    /// gets by default, so an enforcing host refuses the connection
+    /// (measured on the Fedora runner, 2026-11-06: the connection is
+    /// refused without the opt). Relabeling the socket instead - `:z` -
+    /// rewrites the label of a host file the runner does not own, so the
+    /// bind goes in unlabeled and the container runs with labeling
+    /// disabled.
+    disable_selinux: bool,
+}
+
 /// Turn the requested volumes into docker mounts.
 ///
 /// Binds become `HostConfig.binds` entries so they inherit the daemon's
 /// SELinux relabel behaviour (the workspace mount already relies on `:z`);
 /// tmpfs and named volumes become structured mounts.
+///
+/// A bind whose source is a unix socket is the one exception to the
+/// relabel: the source is the daemon's own socket, not a host directory
+/// the runner owns.
 fn build_volume_mounts(
     volumes: &[VolumeSpec],
     image: &str,
     cache_root: &str,
-) -> Result<(Vec<String>, Vec<Mount>)> {
+    docker_socket: &str,
+) -> Result<VolumeMounts> {
     let mut binds = Vec::new();
     let mut mounts = Vec::new();
+    let mut disable_selinux = false;
 
     for volume in volumes {
         volume
@@ -488,27 +654,39 @@ fn build_volume_mounts(
             .map_err(|reason| Error::sandbox(format!("invalid volume mount: {reason}")))?;
         match volume.resolved_type() {
             VolumeType::Bind => {
-                let source = volume.expanded_source(image, cache_root).ok_or_else(|| {
-                    Error::sandbox(format!(
-                        "volume mount {} requires a source",
-                        volume.destination
-                    ))
-                })?;
+                let source = volume
+                    .expanded_source(image, cache_root, docker_socket)
+                    .ok_or_else(|| {
+                        Error::sandbox(format!(
+                            "volume mount {} requires a source",
+                            volume.destination
+                        ))
+                    })?;
                 if !source.starts_with('/') {
                     return Err(Error::sandbox(format!(
                         "volume mount source must be an absolute path: {source}"
                     )));
                 }
-                // The daemon creates a missing bind source as root, which
-                // the job's user could not write to. Create it here, as the
-                // runner's own user, so a cache mount is writable.
-                if let Err(error) = std::fs::create_dir_all(&source) {
-                    return Err(Error::sandbox(format!(
-                        "could not prepare volume mount source {source}: {error}"
-                    )));
-                }
                 let access = if volume.read_only { "ro" } else { "rw" };
-                binds.push(format!("{source}:{}:{access},z", volume.destination));
+                if is_socket_source(&source) {
+                    // A socket is not a directory: the daemon created it,
+                    // and creating it here would fail. The bind goes in
+                    // without a relabel - `:z` would rewrite the label of
+                    // the host's own socket file - and the container runs
+                    // with SELinux labeling disabled instead.
+                    binds.push(format!("{source}:{}:{access}", volume.destination));
+                    disable_selinux = true;
+                } else {
+                    // The daemon creates a missing bind source as root, which
+                    // the job's user could not write to. Create it here, as the
+                    // runner's own user, so a cache mount is writable.
+                    if let Err(error) = std::fs::create_dir_all(&source) {
+                        return Err(Error::sandbox(format!(
+                            "could not prepare volume mount source {source}: {error}"
+                        )));
+                    }
+                    binds.push(format!("{source}:{}:{access},z", volume.destination));
+                }
             }
             VolumeType::Tmpfs => {
                 let tmpfs_options =
@@ -552,7 +730,11 @@ fn build_volume_mounts(
         }
     }
 
-    Ok((binds, mounts))
+    Ok(VolumeMounts {
+        binds,
+        mounts,
+        disable_selinux,
+    })
 }
 
 /// Sandbox trait
@@ -660,93 +842,8 @@ impl Sandbox for DockerSandbox {
         limits: SandboxLimits,
         volumes: &[VolumeSpec],
     ) -> Result<SandboxInstance> {
-        if let Some(ref docker) = self.docker {
-            // Ensure image is available
-            self.ensure_image(image).await?;
-            self.remove_job_containers(job_id).await?;
-
-            let container_name = Self::container_name(job_id);
-            let job_label = job_id.to_string();
-            let labels = HashMap::from([
-                ("com.gitforce.managed".to_owned(), "true".to_owned()),
-                ("com.gitforce.job_id".to_owned(), job_label.clone()),
-            ]);
-
-            let (binds, mounts) = match build_volume_mounts(volumes, image, &cache_root()) {
-                Ok(mounts) => mounts,
-                Err(error) => {
-                    // A cache mount that cannot be prepared degrades to a
-                    // cold build: the job still runs, it just does not
-                    // reuse the previous run's artifacts. Failing the job
-                    // here would turn a missing cache directory into a red
-                    // pipeline for a change that is only an optimisation.
-                    tracing::warn!(
-                        %error,
-                        "volume mounts unavailable; continuing without them"
-                    );
-                    (Vec::new(), Vec::new())
-                }
-            };
-
-            // Build host config with resource limits
-            let host_config = HostConfig {
-                memory: Some((limits.memory_mb * 1024 * 1024) as i64),
-                cpu_period: Some(CPU_PERIOD_MICROS),
-                cpu_quota: Some(host_cpu_quota_micros(limits.cpu_cores)),
-                network_mode: if limits.network {
-                    None
-                } else {
-                    Some("none".to_string())
-                },
-                binds: if binds.is_empty() { None } else { Some(binds) },
-                mounts: if mounts.is_empty() {
-                    None
-                } else {
-                    Some(mounts)
-                },
-                ..Default::default()
-            };
-
-            // Create container
-            let config = ContainerCreateBody {
-                image: Some(image.to_owned()),
-                cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]), // Keep container alive
-                host_config: Some(host_config),
-                labels: Some(labels),
-                ..Default::default()
-            };
-
-            let options = CreateContainerOptions {
-                name: Some(container_name.clone()),
-                platform: String::new(),
-            };
-
-            let response = docker
-                .create_container(Some(options), config)
-                .await
-                .map_err(|e| Error::sandbox(format!("failed to create container: {e}")))?;
-
-            // Start container
-            docker
-                .start_container(&response.id, None)
-                .await
-                .map_err(|e| Error::sandbox(format!("failed to start container: {e}")))?;
-
-            tracing::info!("Created container {} for job {}", response.id, job_id);
-
-            Ok(SandboxInstance {
-                container_id: response.id,
-                job_id,
-                workspace_path: None,
-            })
-        } else {
-            // Stub mode - no Docker available
-            Ok(SandboxInstance {
-                container_id: format!("gitforce-job-{job_id}"),
-                job_id,
-                workspace_path: None,
-            })
-        }
+        self.create_with_extra_labels(job_id, image, limits, volumes, &[])
+            .await
     }
 
     async fn create_with_workspace(
@@ -776,19 +873,10 @@ impl Sandbox for DockerSandbox {
                 ("com.gitforce.managed".to_owned(), "true".to_owned()),
                 ("com.gitforce.job_id".to_owned(), job_label),
             ]);
-            let (volume_binds, volume_mounts) =
-                match build_volume_mounts(volumes, image, &cache_root()) {
-                    Ok(mounts) => mounts,
-                    Err(error) => {
-                        // See `create`: an unusable cache mount degrades to a
-                        // cold build instead of failing the job.
-                        tracing::warn!(
-                            %error,
-                            "volume mounts unavailable; continuing without them"
-                        );
-                        (Vec::new(), Vec::new())
-                    }
-                };
+            // See `create`: a mount the runner cannot prepare fails the
+            // job rather than vanishing from the contract.
+            let volume_mounts =
+                build_volume_mounts(volumes, image, &cache_root(), &self.docker_socket)?;
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
                 cpu_period: Some(CPU_PERIOD_MICROS),
@@ -805,19 +893,33 @@ impl Sandbox for DockerSandbox {
                 // checkout and can leave one container unable to see files.
                 binds: Some({
                     let mut binds = vec![format!("{}:/workspace:z", workspace_path)];
-                    binds.extend(volume_binds);
+                    binds.extend(volume_mounts.binds);
                     binds
                 }),
-                mounts: if volume_mounts.is_empty() {
+                mounts: if volume_mounts.mounts.is_empty() {
                     None
                 } else {
-                    Some(volume_mounts)
+                    Some(volume_mounts.mounts)
+                },
+                // A container that mounts the daemon socket cannot keep
+                // SELinux labeling: the socket's label does not match the
+                // container's, and an enforcing host refuses the
+                // connection.
+                security_opt: if volume_mounts.disable_selinux {
+                    Some(vec!["label=disable".to_string()])
+                } else {
+                    None
                 },
                 ..Default::default()
             };
             let config = ContainerCreateBody {
                 image: Some(image.to_owned()),
-                cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
+                // Same keepalive-lifetime rationale as the plain sandbox:
+                // a 3600s sleep SIGKILLed running execs at exactly 1h.
+                cmd: Some(vec![
+                    "sleep".to_owned(),
+                    "86400".to_owned(), // 24h; job deadlines clamp to 24h
+                ]),
                 working_dir: Some("/workspace".to_owned()),
                 // The workspace bind-mount keeps the host checkout's uid (the
                 // job user inside the image is usually root), and git's
@@ -876,11 +978,17 @@ impl Sandbox for DockerSandbox {
             // Create exec instance. The workspace git trust vars are always
             // layered in for workspace execs; caller env (`KEY=VALUE` pairs)
             // rides alongside them and never displaces them.
-            let exec_env = compose_exec_env(instance.workspace_path.is_some(), env);
+            let has_workspace = instance.workspace_path.is_some();
+            let exec_env = compose_exec_env(has_workspace, env);
+            let exec_command: Vec<&str> = if has_workspace {
+                wrap_with_git_config_bootstrap(command)
+            } else {
+                command.to_vec()
+            };
             let config = CreateExecOptions {
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
-                cmd: Some(command.to_vec()),
+                cmd: Some(exec_command),
                 // `create_with_workspace` mounts the host checkout at this
                 // fixed container path. Docker exec does not inherit the
                 // container's configured working directory, so set it here
@@ -1024,14 +1132,44 @@ impl Sandbox for DockerSandbox {
             // the runner user on the host can delete the artifact files without
             // requiring privileged escalation.
             if let Some(ref workspace) = instance.workspace_path {
-                if let Err(e) = cleanup_workspace(docker, &instance.container_id, workspace).await {
-                    tracing::warn!(
-                        "workspace ownership cleanup failed for {}: {} \
-                         (artifact files may require privileged deletion)",
-                        workspace,
-                        e
-                    );
-                    // Proceed to container teardown even if chown fails
+                // The ownership cleanup is a convenience, not a precondition
+                // of the teardown: the CI service removes a workspace it
+                // cannot delete with a container-assisted cleanup. The
+                // teardown, on the other hand, MUST happen - a cancelled
+                // teardown leaves the container running forever.
+                //
+                // The recursive chown walks the whole workspace tree. On a
+                // network filesystem, over a vendored source tree, that walk
+                // takes minutes: the runner's teardown budget expired first,
+                // and the container was never stopped or removed (measured
+                // 2026-11-05: nine leaked job containers, each one a "timed
+                // out cleaning up sandbox" warning - and the leak blocks
+                // every release cutover, whose drain gate counts live job
+                // containers). So the cleanup runs under its own budget and
+                // the container is always torn down.
+                match bounded_cleanup(
+                    cleanup_workspace(docker, &instance.container_id, workspace),
+                    WORKSPACE_CLEANUP_BUDGET,
+                )
+                .await
+                {
+                    WorkspaceCleanup::Completed => {}
+                    WorkspaceCleanup::Failed(error) => {
+                        tracing::warn!(
+                            "workspace ownership cleanup failed for {}: {} \
+                             (artifact files may require privileged deletion)",
+                            workspace,
+                            error
+                        );
+                    }
+                    WorkspaceCleanup::TimedOut => {
+                        tracing::warn!(
+                            "workspace ownership cleanup exceeded {}s for {} \
+                             (artifact files may require privileged deletion)",
+                            WORKSPACE_CLEANUP_BUDGET.as_secs(),
+                            workspace
+                        );
+                    }
                 }
             }
 
@@ -1113,17 +1251,43 @@ fn resolve_runner_uid_gid() -> Result<(u32, u32)> {
 
 /// Git environment for workspace execs. The checkout is created on the host
 /// by the runner user but execs run as the container's root, so git refuses
-/// every operation with "detected dubious ownership in repository at
-/// '/workspace'" — which silently turned any pipeline step guarding with
-/// `|| true` (tag probes, version detection) into a no-op. Tell git this
-/// one mount is trusted; scoped to `/workspace` rather than `*` so it
-/// cannot leak meaning into repositories steps create themselves.
+/// every operation with "detected dubious ownership" — which silently turned
+/// any pipeline step guarding with `|| true` (tag probes, version detection)
+/// into a no-op. Trust every repository the exec can touch.
+///
+/// This must stay `*`, not `/workspace`: repositories are not only mounted
+/// at the mount root, they are also created inside the workspace by steps
+/// and test fixtures (e.g. `git init seed && git config user.email ...`
+/// under `/workspace/target/...`). `safe.directory` matches the exact path,
+/// never a prefix, so a `/workspace` entry leaves every such sub-repository
+/// rejected — observed on fedora-docker where the workspace rides an sshfs
+/// mount mapping all files to uid 1000 while the container runs as root:
+/// `git config` in a freshly-created fixture repo failed with "not in a git
+/// directory" and dropped 10 ci unit tests (run f2a1a2d9, 2026-11-04).
+/// Within a job sandbox whose only host surface is the workspace mount,
+/// blanket trust costs nothing real: the mount is per-run scratch data.
 fn workspace_exec_git_env() -> Vec<&'static str> {
-    vec![
-        "GIT_CONFIG_COUNT=1",
-        "GIT_CONFIG_KEY_0=safe.directory",
-        "GIT_CONFIG_VALUE_0=/workspace",
-    ]
+    vec!["GIT_CONFIG_GLOBAL=/tmp/.gitforge-gitconfig"]
+}
+
+/// Git protects the blanket `safe.directory = *` wildcard: it is honored
+/// only from system or global configuration, never from command-scoped
+/// `GIT_CONFIG_*` env entries (an exact path works there, but fixtures and
+/// steps create repositories at unpredictable paths under the mount).
+/// `GIT_CONFIG_GLOBAL` however can point anywhere via env, so each exec
+/// materializes a tiny global config granting the wildcard before it runs.
+const GIT_GLOBAL_CONFIG_BOOTSTRAP: &str = "mkdir -p /tmp && \
+printf '[safe]\n\tdirectory = *\n' > /tmp/.gitforge-gitconfig; exec \"$@\"";
+
+/// Wrap `command` so the exec first writes the global git config that the
+/// `GIT_CONFIG_GLOBAL` env entry (see `workspace_exec_git_env`) points at,
+/// then execs the original command. `sh` is present in every job image this
+/// runner serves; the write is idempotent and costs one fork per step.
+fn wrap_with_git_config_bootstrap<'a>(command: &[&'a str]) -> Vec<&'a str> {
+    let mut wrapped: Vec<&str> = Vec::with_capacity(command.len() + 4);
+    wrapped.extend_from_slice(&["sh", "-ec", GIT_GLOBAL_CONFIG_BOOTSTRAP, "--"]);
+    wrapped.extend_from_slice(command);
+    wrapped
 }
 
 /// Container-level variant of `workspace_exec_git_env` (owned strings for
@@ -1152,6 +1316,38 @@ fn workspace_git_env() -> Vec<String> {
 ///   call; if the stream is still running the exit code may not yet be visible.
 /// - Failures are warned but never block container teardown (caller handles
 ///   fail-open semantics).
+/// - The cleanup runs under a budget of its own (`WORKSPACE_CLEANUP_BUDGET`)
+///   so a tree that takes minutes to walk can never cancel the teardown.
+const WORKSPACE_CLEANUP_BUDGET: Duration = Duration::from_secs(15);
+
+/// Outcome of a bounded workspace ownership cleanup.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkspaceCleanup {
+    /// The cleanup finished: the tree belongs to the runner user.
+    Completed,
+    /// The cleanup failed; the reason is reported.
+    Failed(String),
+    /// The cleanup exceeded its budget and was abandoned.
+    TimedOut,
+}
+
+/// Run the workspace ownership cleanup under its own budget.
+///
+/// The cleanup is best-effort: whatever it does or does not achieve, the
+/// caller's container teardown continues. A cleanup that never returns must
+/// not be able to swallow the teardown that follows it - that is what left
+/// nine job containers running on the NAS instance (2026-11-05).
+async fn bounded_cleanup<F>(cleanup: F, budget: Duration) -> WorkspaceCleanup
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    match timeout(budget, cleanup).await {
+        Ok(Ok(())) => WorkspaceCleanup::Completed,
+        Ok(Err(error)) => WorkspaceCleanup::Failed(error.to_string()),
+        Err(_) => WorkspaceCleanup::TimedOut,
+    }
+}
+
 async fn cleanup_workspace(docker: &Docker, container_id: &str, workspace: &str) -> Result<()> {
     let (uid, gid) = resolve_runner_uid_gid()?;
 
@@ -1239,15 +1435,10 @@ mod tests {
     #[test]
     fn test_workspace_git_env_grants_safe_directory_via_env_config() {
         let env = workspace_git_env();
-        // git's env-based config protocol: COUNT declares the entries, each
-        // KEY_n/VALUE_n pair supplies one. The key must be the safe.directory
-        // setting and the value must be the mounted workspace path — this trio
-        // keeps host-owned workspace mounts usable without trusting unrelated
-        // repositories.
-        assert_eq!(env.len(), 3);
-        assert_eq!(env[0], "GIT_CONFIG_COUNT=1");
-        assert_eq!(env[1], "GIT_CONFIG_KEY_0=safe.directory");
-        assert_eq!(env[2], "GIT_CONFIG_VALUE_0=/workspace");
+        // The blanket `safe.directory = *` wildcard is honored only from
+        // global/system config, so the exec exports GIT_CONFIG_GLOBAL aimed
+        // at the file the bootstrap wrapper materializes.
+        assert_eq!(env, &["GIT_CONFIG_GLOBAL=/tmp/.gitforge-gitconfig"]);
     }
 
     /// Pipeline env reaches the exec as `KEY=VALUE` pairs layered after the
@@ -1257,10 +1448,10 @@ mod tests {
         let caller = vec!["PYTHONPATH=src".to_string(), "DI_ENV=test".to_string()];
 
         let with_workspace = compose_exec_env(true, &caller);
-        assert_eq!(with_workspace.len(), 5);
-        assert_eq!(with_workspace[0], "GIT_CONFIG_COUNT=1");
-        assert_eq!(with_workspace[3], "PYTHONPATH=src");
-        assert_eq!(with_workspace[4], "DI_ENV=test");
+        assert_eq!(with_workspace.len(), 3);
+        assert!(with_workspace[0].starts_with("GIT_CONFIG_GLOBAL="));
+        assert_eq!(with_workspace[1], "PYTHONPATH=src");
+        assert_eq!(with_workspace[2], "DI_ENV=test");
 
         let without_workspace = compose_exec_env(false, &caller);
         assert_eq!(without_workspace, caller);
@@ -1347,17 +1538,67 @@ mod tests {
             size: None,
         }];
 
-        let (binds, mounts) =
-            build_volume_mounts(&volumes, "dsc-ci-rust:10", &root.display().to_string()).unwrap();
-        assert!(mounts.is_empty());
-        assert_eq!(binds.len(), 1);
+        let volume_mounts = build_volume_mounts(
+            &volumes,
+            "dsc-ci-rust:10",
+            &root.display().to_string(),
+            "/var/run/docker.sock",
+        )
+        .unwrap();
+        assert!(volume_mounts.mounts.is_empty());
+        assert_eq!(volume_mounts.binds.len(), 1);
         assert_eq!(
-            binds[0],
+            volume_mounts.binds[0],
             format!("{}/cargo/dsc-ci-rust-10:/cargo-target:rw,z", root.display())
+        );
+        assert!(
+            !volume_mounts.disable_selinux,
+            "a directory mount keeps the container's own labeling"
         );
         // The mount source is created by the runner, as the runner's own
         // user, so the job's user can write into it.
         assert!(root.join("cargo/dsc-ci-rust-10").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_volume_mounts_binds_the_daemon_socket_without_a_relabel() {
+        // The docker-integration job declares `source: "{docker_socket}"`.
+        // Before the placeholder was expanded, the runner tried to bind the
+        // literal string and the job died with "volume mount source must be
+        // an absolute path: {docker_socket}" (CI run f2292b0e, 2026-11-06).
+        let root =
+            std::env::temp_dir().join(format!("gitforge-socket-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("a scratch directory");
+        let socket = root.join("docker.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("a unix socket");
+        let volumes = vec![VolumeSpec {
+            volume_type: Some(VolumeType::Bind),
+            source: Some("{docker_socket}".to_string()),
+            destination: "/var/run/docker.sock".to_string(),
+            read_only: true,
+            size: None,
+        }];
+
+        let volume_mounts = build_volume_mounts(
+            &volumes,
+            "dsc-ci-rust:16",
+            "/var/cache/gitforge",
+            &socket.to_string_lossy(),
+        )
+        .expect("a socket mount is a mount the runner can honour");
+
+        assert_eq!(
+            volume_mounts.binds,
+            vec![format!("{}:/var/run/docker.sock:ro", socket.display())],
+            "the socket bind carries no relabel: `:z` would rewrite the host socket's label"
+        );
+        assert!(
+            volume_mounts.disable_selinux,
+            "a container that mounts the daemon socket cannot keep SELinux labeling"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1373,9 +1614,17 @@ mod tests {
             size: None,
         }];
 
-        let (binds, _) =
-            build_volume_mounts(&volumes, "dsc-ci-rust:10", &root.display().to_string()).unwrap();
-        assert_eq!(binds[0], format!("{}:/cache:ro,z", root.display()));
+        let volume_mounts = build_volume_mounts(
+            &volumes,
+            "dsc-ci-rust:10",
+            &root.display().to_string(),
+            "/var/run/docker.sock",
+        )
+        .unwrap();
+        assert_eq!(
+            volume_mounts.binds[0],
+            format!("{}:/cache:ro,z", root.display())
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1389,13 +1638,18 @@ mod tests {
             size: Some("4G".to_string()),
         }];
 
-        let (binds, mounts) =
-            build_volume_mounts(&volumes, "dsc-ci-rust:10", "/var/cache/gitforge").unwrap();
-        assert!(binds.is_empty());
-        assert_eq!(mounts.len(), 1);
-        assert_eq!(mounts[0].target.as_deref(), Some("/scratch"));
+        let volume_mounts = build_volume_mounts(
+            &volumes,
+            "dsc-ci-rust:10",
+            "/var/cache/gitforge",
+            "/var/run/docker.sock",
+        )
+        .unwrap();
+        assert!(volume_mounts.binds.is_empty());
+        assert_eq!(volume_mounts.mounts.len(), 1);
+        assert_eq!(volume_mounts.mounts[0].target.as_deref(), Some("/scratch"));
         assert_eq!(
-            mounts[0]
+            volume_mounts.mounts[0]
                 .tmpfs_options
                 .as_ref()
                 .and_then(|options| options.size_bytes),
@@ -1413,7 +1667,43 @@ mod tests {
             size: None,
         }];
 
-        assert!(build_volume_mounts(&volumes, "dsc-ci-rust:10", "/var/cache/gitforge").is_err());
+        assert!(build_volume_mounts(
+            &volumes,
+            "dsc-ci-rust:10",
+            "/var/cache/gitforge",
+            "/var/run/docker.sock"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_build_volume_mounts_reports_a_source_it_cannot_prepare() {
+        // A bind source under a regular file can never become a directory,
+        // so the runner cannot prepare it. That is an error the job has to
+        // report, not a mount to drop quietly: the job would otherwise run
+        // with a contract the pipeline never declared (GF-10, 2026-11-05).
+        let binary = std::env::current_exe().expect("the test binary's own path");
+        let volumes = vec![VolumeSpec {
+            volume_type: Some(VolumeType::Bind),
+            source: Some(binary.join("cache").to_string_lossy().into_owned()),
+            destination: "/cargo-target".to_string(),
+            read_only: false,
+            size: None,
+        }];
+
+        let error = build_volume_mounts(
+            &volumes,
+            "dsc-ci-rust:10",
+            "/var/cache/gitforge",
+            "/var/run/docker.sock",
+        )
+        .expect_err("a source the runner cannot prepare must be an error");
+        assert!(
+            error
+                .to_string()
+                .contains("could not prepare volume mount source"),
+            "the error must name the mount it could not prepare, got {error}"
+        );
     }
 
     #[test]
@@ -2074,10 +2364,8 @@ mod tests {
     #[test]
     fn workspace_git_env_marks_the_mount_trusted() {
         let env = super::workspace_exec_git_env();
-        assert!(env.contains(&"GIT_CONFIG_COUNT=1"));
-        assert!(env.contains(&"GIT_CONFIG_KEY_0=safe.directory"));
-        assert!(env.contains(&"GIT_CONFIG_VALUE_0=/workspace"));
-        assert_eq!(env.len(), 3);
+        assert_eq!(env.len(), 1);
+        assert!(env[0].starts_with("GIT_CONFIG_GLOBAL="));
     }
 
     /// Verify that `create_with_workspace` called with no path also produces
@@ -2358,5 +2646,106 @@ mod tests {
             result.is_ok(),
             "stub destroy must not fail even with workspace_path set"
         );
+    }
+
+    /// The ownership cleanup must never be able to swallow the teardown that
+    /// follows it: a cleanup that never returns is abandoned and the caller
+    /// proceeds. The regression is the leaked job container (2026-11-05).
+    #[tokio::test]
+    async fn test_a_cleanup_that_never_returns_is_abandoned() {
+        let outcome = bounded_cleanup(
+            async {
+                sleep(Duration::from_secs(30)).await;
+                Ok(())
+            },
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome, WorkspaceCleanup::TimedOut);
+    }
+
+    /// A failed cleanup is reported, not propagated: the teardown continues.
+    #[tokio::test]
+    async fn test_a_failed_cleanup_is_reported() {
+        let outcome = bounded_cleanup(
+            async { Err(Error::sandbox("chown failed")) },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(matches!(outcome, WorkspaceCleanup::Failed(_)));
+    }
+
+    /// A cleanup that finishes in time is reported as completed.
+    #[tokio::test]
+    async fn test_a_completed_cleanup_is_reported_as_completed() {
+        let outcome = bounded_cleanup(async { Ok(()) }, Duration::from_secs(5)).await;
+        assert_eq!(outcome, WorkspaceCleanup::Completed);
+    }
+
+    /// The backstop the runner uses when a teardown overruns its budget:
+    /// the container is removed by its job label. The label is the only
+    /// ownership evidence, and another job's container is never touched.
+    ///
+    /// This is the primitive that makes the leak class closeable. The
+    /// background reconciler refuses to remove a RUNNING container - its
+    /// policy keeps running containers eligible for nobody - so a teardown
+    /// that overran its budget could only be cleaned up by an explicit,
+    /// label-scoped removal (2026-11-05: eight leaked containers that no
+    /// other mechanism would ever reap).
+    #[tokio::test]
+    #[ignore] // requires a Docker daemon
+    async fn test_remove_job_containers_removes_only_that_jobs_containers() {
+        let sandbox = match DockerSandbox::connect_required().await {
+            Ok(sandbox) => sandbox,
+            Err(_) => return,
+        };
+        let owner = JobId::new();
+        let other = JobId::new();
+        let image = "backend-ci-rust:1";
+        let owned = match sandbox
+            .create(owner, image, SandboxLimits::default(), &[])
+            .await
+        {
+            Ok(instance) => instance,
+            Err(_) => return,
+        };
+        let foreign = match sandbox
+            .create(other, image, SandboxLimits::default(), &[])
+            .await
+        {
+            Ok(instance) => instance,
+            Err(_) => {
+                let _ = sandbox.remove_job_containers(owner).await;
+                return;
+            }
+        };
+        let docker = match sandbox.docker.as_ref() {
+            Some(docker) => docker,
+            None => return,
+        };
+        assert!(docker
+            .inspect_container(&owned.container_id, None)
+            .await
+            .is_ok());
+        assert!(docker
+            .inspect_container(&foreign.container_id, None)
+            .await
+            .is_ok());
+
+        sandbox
+            .remove_job_containers(owner)
+            .await
+            .expect("the label-scoped removal must succeed");
+
+        assert!(docker
+            .inspect_container(&owned.container_id, None)
+            .await
+            .is_err());
+        assert!(docker
+            .inspect_container(&foreign.container_id, None)
+            .await
+            .is_ok());
+
+        let _ = sandbox.remove_job_containers(other).await;
     }
 }

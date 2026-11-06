@@ -1694,4 +1694,51 @@ mod tests {
         assert_eq!(state.status, PipelineStatus::Succeeded);
         assert_eq!(engine.skipped_jobs().await, vec![clippy]);
     }
+
+    /// GF-12: a dispatched job must not be released again, and the
+    /// completion that replays its assignment must land.
+    ///
+    /// `ready_jobs()` releases every job whose mirror still says
+    /// `Queued`. The scheduler announces a dispatch with `JobAssigned`,
+    /// and until that event was consumed the mirror kept saying
+    /// `Queued`: every later completion of the run then re-enqueued the
+    /// running job, and that duplicate enqueue demoted the job's durable
+    /// row, refused the runner's heartbeat and rotated its lease.
+    #[tokio::test]
+    async fn a_dispatched_job_is_not_released_again() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, make_parallel_pipeline())
+            .await
+            .unwrap();
+        engine.start().await.unwrap();
+
+        let ready = engine.ready_jobs().await;
+        assert_eq!(ready.len(), 2);
+        let dispatched = ready[0];
+        let runner_id = gitforge_common::RunnerId::new();
+        engine.assign_job(dispatched, runner_id).await.unwrap();
+
+        assert!(
+            !engine.ready_jobs().await.contains(&dispatched),
+            "a dispatched job must not be released again"
+        );
+
+        // The completion consumer replays the assignment when the runner
+        // reports back: the replay is idempotent, and a job that fails
+        // while it is still assigned is a failure, not an invalid
+        // transition.
+        engine.assign_job(dispatched, runner_id).await.unwrap();
+        engine.start_job(dispatched).await.unwrap();
+        engine
+            .fail_job(dispatched, -1, "runner reported failure".to_string())
+            .await
+            .unwrap();
+        let state = engine.state().await;
+        assert_eq!(state.jobs[&dispatched].status(), JobStatus::Failed);
+    }
 }

@@ -246,6 +246,9 @@ fn hydrate_pipeline_run(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::P
         ref_name: row
             .try_get("ref_name")
             .map_err(|error| Error::database(format!("invalid pipeline run ref: {error}")))?,
+        push_base_sha: row
+            .try_get("push_base_sha")
+            .map_err(|error| Error::database(format!("invalid pipeline run push base: {error}")))?,
     })
 }
 
@@ -829,8 +832,8 @@ impl PipelineQueries {
         .map_err(|e| Error::database(format!("failed to create pipeline: {e}")))?;
         sqlx::query(
             r#"
-            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at, error, ref_name, push_base_sha)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(run.id.to_string())
@@ -842,6 +845,9 @@ impl PipelineQueries {
         .bind(run.started_at.map(|dt| dt.to_rfc3339()))
         .bind(run.finished_at.map(|dt| dt.to_rfc3339()))
         .bind(run.created_at.to_rfc3339())
+        .bind(&run.error)
+        .bind(&run.ref_name)
+        .bind(&run.push_base_sha)
         .execute(&mut *transaction)
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline run: {e}")))?;
@@ -904,6 +910,13 @@ impl PipelineQueries {
     /// ~7×). Rows already `assigned`/`running` belong to the runner
     /// lifecycle and are left alone; their runs still finalize from the
     /// job outcomes. Returns the number of runs superseded.
+    ///
+    /// "Same pipeline" is the pipeline's logical identity — its name and
+    /// trigger type within the repo — not the `pipelines` row id. The push
+    /// path mints a fresh `PipelineId` and activates a new version row for
+    /// every push, so consecutive pushes of one repo carry different row
+    /// ids on their runs; matching on the row id could therefore never
+    /// reach the previous push's run, and the policy was vacuous.
     pub async fn supersede_stale_runs(
         pool: &Pool,
         repo_id: RepoId,
@@ -913,14 +926,18 @@ impl PipelineQueries {
     ) -> Result<u64> {
         let mut transaction = begin_immediate(pool.pool(), "run supersede").await?;
         let stale: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM pipeline_runs \
-             WHERE repo_id = ? AND pipeline_id = ? AND id != ? \
-             AND ref_name = ? \
-             AND status IN ('pending', 'running', 'queued') \
-             AND created_at < (SELECT created_at FROM pipeline_runs WHERE id = ?)",
+            "SELECT pr.id FROM pipeline_runs pr \
+             JOIN pipelines p ON p.id = pr.pipeline_id \
+             JOIN pipelines target ON target.id = ? AND target.repo_id = pr.repo_id \
+             WHERE pr.repo_id = ? \
+             AND p.name = target.name AND p.trigger_type = target.trigger_type \
+             AND pr.id != ? \
+             AND pr.ref_name = ? \
+             AND pr.status IN ('pending', 'running', 'queued') \
+             AND pr.created_at < (SELECT created_at FROM pipeline_runs WHERE id = ?)",
         )
-        .bind(repo_id.to_string())
         .bind(pipeline_id.to_string())
+        .bind(repo_id.to_string())
         .bind(keep_run_id.to_string())
         .bind(ref_name)
         .bind(keep_run_id.to_string())
@@ -1038,8 +1055,8 @@ impl PipelineRunQueries {
     pub async fn create(pool: &Pool, run: &crate::models::PipelineRun) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at, error, ref_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at, error, ref_name, push_base_sha)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(run.id.to_string())
@@ -1053,6 +1070,7 @@ impl PipelineRunQueries {
         .bind(run.created_at.to_rfc3339())
         .bind(&run.error)
         .bind(&run.ref_name)
+        .bind(&run.push_base_sha)
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline run: {e}")))?;
@@ -1847,6 +1865,33 @@ impl JobQueries {
         Ok(())
     }
 
+    /// Move a job to `queued`, but only while it is not live.
+    ///
+    /// A job a runner holds is `assigned` or `running`, and that durable
+    /// status is the invariant every later write is fenced by: the
+    /// heartbeat, the start, and the completion are all gated on it. An
+    /// enqueue that demotes such a row to `queued` takes the lease away
+    /// from the runner that holds it - the heartbeat is refused, the row
+    /// becomes dispatchable again, the scheduler rotates the lease token,
+    /// and the completion is rejected (GF-12, measured 2026-11-05 on the
+    /// GitForge CI service: a running job was demoted by a duplicate
+    /// enqueue, and three executions of that job were then rejected with
+    /// `completion_persistence_failed` before the job was fenced as
+    /// `runner_lost_while_running`).
+    ///
+    /// Returns whether a row changed. `false` means the job is live (or
+    /// terminal) and must not be queued again.
+    pub async fn mark_queued_if_dispatchable(pool: &Pool, id: JobId) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'queued' WHERE id = ? AND status IN ('pending', 'queued')",
+        )
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to mark job queued: {e}")))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Cancel every never-dispatched (`pending`/`queued`) job of one run and
     /// return how many rows changed.
     ///
@@ -2492,13 +2537,7 @@ impl JobQueries {
             let verdict = result_json
                 .as_deref()
                 .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-                .and_then(|receipt| {
-                    receipt
-                        .get("status")
-                        .and_then(|status| status.as_str())
-                        .and_then(JobStatus::from_str)
-                })
-                .filter(JobStatus::is_terminal)
+                .and_then(|receipt| JobStatus::from_receipt(&receipt))
                 .unwrap_or(JobStatus::Failed);
             let result = sqlx::query(
                 "UPDATE jobs SET status = ?, runner_id = NULL, lease_token = NULL WHERE id = ? AND status IN ('pending', 'queued', 'assigned', 'running') AND finished_at IS NOT NULL",
@@ -4993,6 +5032,264 @@ mod tests {
         );
     }
 
+    // The push base and the ref name must survive the durable write. The
+    // `jobs` table has no env column, so the run row is the only durable
+    // carrier of the base: without it a restarted control plane cannot
+    // re-publish the base to the run's jobs.
+    #[tokio::test]
+    async fn test_activate_pipeline_and_create_run_persists_ref_name_and_push_base() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "push-base-owner".to_string(),
+            "push-base-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "push-base-repo".to_string(),
+            owner.id,
+            "/git/push-base-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+        let mut run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "b".repeat(40),
+        );
+        run.ref_name = Some("refs/heads/main".to_string());
+        let base = "a".repeat(40);
+        run.push_base_sha = Some(base.clone());
+
+        PipelineQueries::activate_pipeline_and_create_run(&pool, &pipeline, &run)
+            .await
+            .unwrap();
+
+        let stored = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .expect("run row");
+        assert_eq!(stored.ref_name.as_deref(), Some("refs/heads/main"));
+        assert_eq!(stored.push_base_sha.as_deref(), Some(base.as_str()));
+    }
+
+    // Regression: the push path writes its run through
+    // `activate_pipeline_and_create_run`, and that INSERT used to drop
+    // `ref_name`. The supersede filter is `AND ref_name = ?`, so a NULL
+    // ref_name made the documented "newest-SHA-wins" pass a no-op for every
+    // push run: an older queued run on the same branch was never cancelled.
+    //
+    // The shape here is the production one: every push mints a fresh
+    // pipeline version row, so the two runs carry different `pipeline_id`s
+    // even though they are the same pipeline. Matching on the version row
+    // id could never reach the previous push's run.
+    #[tokio::test]
+    async fn test_supersede_stale_runs_cancels_an_older_run_created_by_the_push_path() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "supersede-push-owner".to_string(),
+            "supersede-push-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "supersede-push-repo".to_string(),
+            owner.id,
+            "/git/supersede-push-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+
+        // The older run is created exactly the way a push creates it: its
+        // own pipeline version row, carrying the pre-push base.
+        let mut older = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "a".repeat(40),
+        );
+        older.created_at = Utc::now() - chrono::Duration::hours(1);
+        older.ref_name = Some("refs/heads/main".to_string());
+        older.push_base_sha = Some("c".repeat(40));
+        PipelineQueries::activate_pipeline_and_create_run(&pool, &pipeline, &older)
+            .await
+            .unwrap();
+
+        // The newer push mints its own pipeline version row for the same
+        // (repo, name) — the version-row id differs, the pipeline does not.
+        let newer_pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+        let mut newer = crate::models::PipelineRun::new(
+            newer_pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "b".repeat(40),
+        );
+        newer.created_at = Utc::now();
+        newer.ref_name = Some("refs/heads/main".to_string());
+        PipelineQueries::activate_pipeline_and_create_run(&pool, &newer_pipeline, &newer)
+            .await
+            .unwrap();
+        assert_ne!(
+            newer_pipeline.id, pipeline.id,
+            "consecutive pushes must carry different pipeline version row ids"
+        );
+
+        let superseded = PipelineQueries::supersede_stale_runs(
+            &pool,
+            repo.id,
+            "refs/heads/main",
+            newer_pipeline.id,
+            newer.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            superseded, 1,
+            "an older queued push run on the same ref must be superseded"
+        );
+
+        let older_row = PipelineRunQueries::get(&pool, older.id)
+            .await
+            .unwrap()
+            .expect("older run row");
+        assert_eq!(older_row.status, "cancelled");
+        assert_eq!(
+            older_row.error.as_deref(),
+            Some("superseded by a newer push")
+        );
+        assert_eq!(older_row.ref_name.as_deref(), Some("refs/heads/main"));
+    }
+
+    // A repo can hold a manual-triggered pipeline and a push-triggered
+    // pipeline under the same name (they alternate which version is
+    // active). A push must not cancel the manual pipeline's queued runs:
+    // the supersede scope is the pipeline's identity — its name AND
+    // trigger type — not the name alone.
+    #[tokio::test]
+    async fn test_supersede_stale_runs_leaves_a_same_named_manual_pipeline_alone() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "supersede-manual-owner".to_string(),
+            "supersede-manual-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "supersede-manual-repo".to_string(),
+            owner.id,
+            "/git/supersede-manual-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let manual_pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+        PipelineQueries::create(&pool, &manual_pipeline)
+            .await
+            .unwrap();
+
+        let mut manual = crate::models::PipelineRun::new(
+            manual_pipeline.id,
+            repo.id,
+            "webhook".to_string(),
+            "a".repeat(40),
+        );
+        manual.created_at = Utc::now() - chrono::Duration::hours(1);
+        manual.ref_name = Some("refs/heads/main".to_string());
+        PipelineRunQueries::create(&pool, &manual).await.unwrap();
+
+        // The push activates its own version row for the same (repo, name)
+        // and retires the manual one — exactly what the push path does.
+        let push_pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+        let mut pushed = crate::models::PipelineRun::new(
+            push_pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "b".repeat(40),
+        );
+        pushed.created_at = Utc::now();
+        pushed.ref_name = Some("refs/heads/main".to_string());
+        PipelineQueries::activate_pipeline_and_create_run(&pool, &push_pipeline, &pushed)
+            .await
+            .unwrap();
+
+        let superseded = PipelineQueries::supersede_stale_runs(
+            &pool,
+            repo.id,
+            "refs/heads/main",
+            push_pipeline.id,
+            pushed.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            superseded, 0,
+            "a push must not cancel a manual pipeline's run"
+        );
+
+        let manual_row = PipelineRunQueries::get(&pool, manual.id)
+            .await
+            .unwrap()
+            .expect("manual run row");
+        assert_eq!(
+            manual_row.status, "pending",
+            "the manual pipeline's run is untouched"
+        );
+    }
+
     #[tokio::test]
     async fn test_trigger_request_requeue_stale_and_terminal_failure() {
         let pool = Pool::memory().await.unwrap();
@@ -6202,11 +6499,24 @@ mod tests {
         let mut unknown_receipt = crate::models::Job::new(run.id, "receipt-unknown".to_string());
         let mut garbage_receipt = crate::models::Job::new(run.id, "receipt-garbage".to_string());
         let mut live_queued = crate::models::Job::new(run.id, "still-queued".to_string());
+        // GF-01: the scheduler's runner-completion receipt carries
+        // `success`, not `status`. Grading only `status` read this row's
+        // `success: true` as no verdict at all and failed it closed, so a
+        // green job was recorded as failed.
+        let mut runner_completion =
+            crate::models::Job::new(run.id, "receipt-runner-completion".to_string());
+        // A backend failure keeps its class through the receipt: the
+        // runner records `outcome`, and the row must not come back as a
+        // plain code failure.
+        let mut runner_infrastructure =
+            crate::models::Job::new(run.id, "receipt-runner-infrastructure".to_string());
         for job in [
             &mut succeeded_receipt,
             &mut unknown_receipt,
             &mut garbage_receipt,
             &mut live_queued,
+            &mut runner_completion,
+            &mut runner_infrastructure,
         ] {
             JobQueries::create(&pool, job).await.unwrap();
         }
@@ -6244,8 +6554,18 @@ mod tests {
         tear(unknown_receipt.id, r#"{"status":"exploded"}"#).await;
         tear(garbage_receipt.id, "runner died mid-write").await;
         tear(assigned_receipt.id, r#"{"status":"failed"}"#).await;
+        tear(
+            runner_completion.id,
+            r#"{"job_id":"x","success":true,"exit_code":0,"step_results":[],"artifacts":[]}"#,
+        )
+        .await;
+        tear(
+            runner_infrastructure.id,
+            r#"{"job_id":"y","success":false,"outcome":"infrastructure_failure","exit_code":-1}"#,
+        )
+        .await;
 
-        assert_eq!(JobQueries::reconcile_evidence_rows(&pool).await.unwrap(), 4);
+        assert_eq!(JobQueries::reconcile_evidence_rows(&pool).await.unwrap(), 6);
 
         let graded = |job_id: gitforge_common::JobId| {
             let pool = &pool;
@@ -6256,6 +6576,14 @@ mod tests {
         assert_eq!(graded(unknown_receipt.id).await.status, "failed");
         assert_eq!(graded(garbage_receipt.id).await.status, "failed");
         assert_eq!(graded(assigned_receipt.id).await.status, "failed");
+        // A runner-completion receipt grades from its `success` boolean.
+        assert_eq!(graded(runner_completion.id).await.status, "succeeded");
+        // A backend failure keeps `infrastructure_failure`, not `failed`:
+        // the two mean different things to an operator (R6.3).
+        assert_eq!(
+            graded(runner_infrastructure.id).await.status,
+            "infrastructure_failure"
+        );
 
         // The repair grades from evidence without rewriting it: the receipt
         // columns keep their values and no start time is invented.

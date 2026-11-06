@@ -1,11 +1,15 @@
 //! Runner agent
 
 use crate::executor::{ExecutableJob, JobExecutor, JobStep};
-use gitforge_common::{Error, JobId, PipelineRunId, Result, RunnerId, VolumeSpec};
+use gitforge_common::{
+    Error, JobExistenceRequest, JobExistenceResponse, JobId, JobRowState, PipelineRunId, Result,
+    RunnerId, VolumeSpec,
+};
 use gitforge_db::models::Runner;
 use gitforge_sandbox::{
-    ActiveJobRegistry, DockerContainerSource, DockerSandbox, OutputSink, OutputStream,
-    ReconcileReport, Reconciler, ReconcilerPolicy, StepResult,
+    reclaim_orphaned_pool_containers, ActiveJobRegistry, DockerContainerSource, DockerSandbox,
+    JobExistenceResolver, OutputSink, OutputStream, PoolIdentity, PoolPolicy, ReconcileReport,
+    Reconciler, ReconcilerPolicy, StepResult,
 };
 use gitforge_storage::ArtifactReceipt;
 use reqwest::Client;
@@ -886,7 +890,7 @@ impl RunnerAgent {
             .map_err(|e| Error::internal(format!("failed to create HTTP client: {e}")))?;
 
         let sandbox = DockerSandbox::connect_required().await?;
-        let executor = JobExecutor::new().await?;
+        let executor = JobExecutor::new(pool_identity(&config)).await?;
 
         Ok(Self {
             config,
@@ -1104,6 +1108,13 @@ impl RunnerAgent {
         // service explicitly enables deletion via GITFORGE_RECONCILE_DELETE.
         self.spawn_reconciler(active_jobs.clone()).await;
 
+        // Spawn the warm-pool reaper: it reclaims the pooled containers a
+        // previous runner process left behind when it died or restarted.
+        // The pool lives only in memory, so its containers outlive the
+        // process that made them and nothing else in the tree can reach
+        // them (GF-17).
+        self.spawn_pool_reaper().await;
+
         // Start job fetch loop
         let fetch_interval = self.config.fetch_interval_secs;
         let fetch_client = self.client.clone();
@@ -1230,6 +1241,34 @@ impl RunnerAgent {
         Ok(())
     }
 
+    /// Spawn the background warm-pool reaper loop.
+    ///
+    /// The reaper owns the pool's orphans: containers that carry this
+    /// pool's owner label but a generation from a process that is gone.
+    /// It never touches the current process's own pool, and it never
+    /// touches a container whose creating process is still alive.
+    async fn spawn_pool_reaper(&self) {
+        let identity = self.executor.pool_identity().clone();
+        let policy = PoolPolicy {
+            ttl: crate::executor::pool_ttl(),
+            ..PoolPolicy::default()
+        };
+        let interval_secs = match std::env::var("GITFORGE_POOL_REAP_INTERVAL_SECS") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) if secs > 0 => secs,
+                _ => {
+                    tracing::warn!(
+                        "GITFORGE_POOL_REAP_INTERVAL_SECS is not a positive number of seconds; using the default"
+                    );
+                    300
+                }
+            },
+            Err(_) => 300,
+        };
+        let handle = tokio::spawn(run_pool_reaper_loop(identity, policy, interval_secs));
+        self.background_tasks.lock().await.push(handle);
+    }
+
     /// Spawn the background abandoned-container reconciler loop.
     ///
     /// Env policy (documented defaults keep startup safe):
@@ -1246,15 +1285,34 @@ impl RunnerAgent {
     /// always retained. A policy failure is logged and the loop is not
     /// started: the reconciler must never guess.
     async fn spawn_reconciler(&self, active_jobs: ActiveJobRegistry) {
-        let config = match load_reconciler_config_from_env() {
+        let mut config = match load_reconciler_config_from_env() {
             Ok(config) => config,
             Err(error) => {
                 tracing::error!(%error, "abandoned-container reconciler NOT started");
                 return;
             }
         };
+        config.store = self.store_lookup();
         let handle = tokio::spawn(run_reconciler_loop(active_jobs, config));
         *self.reconciler_task.lock().await = Some(handle);
+    }
+
+    /// The store lookup the reconciler uses: the scheduler's bulk
+    /// job-existence endpoint, reached with the credential the runner
+    /// already presents for every other scheduler call.
+    ///
+    /// Absent when the runner has no scheduler credential: the
+    /// store-backed rule then has no store to consult and retains every
+    /// container it could have reached.
+    fn store_lookup(&self) -> Option<StoreLookup> {
+        let token = self.config.scheduler_token.as_deref()?;
+        if token.is_empty() {
+            return None;
+        }
+        Some(StoreLookup {
+            scheduler_url: self.config.scheduler_url.clone(),
+            scheduler_token: Arc::from(token),
+        })
     }
 
     /// Stop the runner agent
@@ -1804,6 +1862,32 @@ pub(crate) struct ReconcilerLoopConfig {
     policy: ReconcilerPolicy,
     interval: Duration,
     receipt_path: Option<PathBuf>,
+    /// Where to ask the store about job ids, and with what credential.
+    /// Absent means the store-backed rule has no store to consult and
+    /// retains every container it could have reached.
+    store: Option<StoreLookup>,
+}
+
+/// The store lookup the reconciler uses: the scheduler's bulk
+/// job-existence endpoint.
+///
+/// The scheduler owns the authoritative store, so the runner asks it
+/// rather than reading the database itself.
+#[derive(Clone)]
+pub(crate) struct StoreLookup {
+    scheduler_url: String,
+    scheduler_token: Arc<str>,
+}
+
+/// The credential is redacted: a derived `Debug` would put the bearer
+/// token into every log line that formats a loop config.
+impl fmt::Debug for StoreLookup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoreLookup")
+            .field("scheduler_url", &self.scheduler_url)
+            .field("scheduler_token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Outcome of a single receipt write. Used by tests and the production loop
@@ -1828,6 +1912,15 @@ fn load_reconciler_config_from_env() -> std::result::Result<ReconcilerLoopConfig
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
+    // The store-backed legacy-orphan rule is armed explicitly: a
+    // reconciler that removes a running container on the strength of a
+    // store lookup must be a decision somebody took, not a default.
+    let orphan_reclaim_enabled = std::env::var("GITFORGE_RECONCILE_ORPHANS")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let orphan_ttl_secs: u64 = std::env::var("GITFORGE_RECONCILE_ORPHAN_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
     let receipt_path = match std::env::var("GITFORGE_RECONCILE_RECEIPT") {
         Ok(raw) => match validate_reconciler_receipt_path(&raw) {
             Ok(path) => Some(path),
@@ -1845,6 +1938,8 @@ fn load_reconciler_config_from_env() -> std::result::Result<ReconcilerLoopConfig
     let policy = ReconcilerPolicy {
         deletion_enabled,
         grace: Duration::from_secs(grace_secs),
+        orphan_reclaim_enabled,
+        orphan_ttl: Duration::from_secs(orphan_ttl_secs),
         ..ReconcilerPolicy::default()
     };
     policy
@@ -1854,6 +1949,7 @@ fn load_reconciler_config_from_env() -> std::result::Result<ReconcilerLoopConfig
         policy,
         interval: Duration::from_secs(interval_secs.max(30)),
         receipt_path,
+        store: None,
     })
 }
 
@@ -1882,6 +1978,155 @@ pub(crate) async fn write_reconciler_receipt(
 /// Background loop body. Extracted from `spawn_reconciler` so the
 /// cancellation/restart lifecycle can be exercised in tests without
 /// touching the process environment.
+/// Reclaim the warm-pool containers a previous runner process orphaned.
+///
+/// The pass is bounded by the policy's blast radius and is idempotent: a
+/// container that is already gone counts as reclaimed.
+pub(crate) async fn run_pool_reaper_loop(
+    identity: PoolIdentity,
+    policy: PoolPolicy,
+    interval_secs: u64,
+) {
+    let source = match DockerContainerSource::connect_with_timeout(POOL_REAPER_CALL_TIMEOUT) {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::warn!("warm-pool reaper unavailable: {}", error);
+            return;
+        }
+    };
+    // The owner's liveness is injected, not read from process-global state
+    // inside the decision: the reaper passes the resolver in, so the
+    // decision is testable without touching the process table.
+    let owner_state: Box<dyn Fn(u32) -> Option<bool> + Send + Sync> =
+        Box::new(|pid: u32| gitforge_sandbox::process_alive(pid));
+    let mut ticker = interval(Duration::from_secs(interval_secs));
+    loop {
+        // Startup pass runs immediately, then bounded periodic.
+        ticker.tick().await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        match reclaim_orphaned_pool_containers(&source, &identity, &policy, now_ms, &owner_state)
+            .await
+        {
+            Ok(report) => {
+                if !report.reclaimed.is_empty() || !report.failed.is_empty() {
+                    tracing::info!(
+                        reclaimed = report.reclaimed.len(),
+                        failed = report.failed.len(),
+                        retained = report.retained.len(),
+                        bounded = report.bounded,
+                        "warm-pool reclaim pass complete"
+                    );
+                }
+                for (id, reason) in &report.failed {
+                    tracing::warn!("failed to reclaim pooled container {}: {}", id, reason);
+                }
+            }
+            Err(error) => tracing::warn!("warm-pool reclaim pass failed: {}", error),
+        }
+    }
+}
+
+/// Bounded timeout for every Docker call the reaper makes.
+const POOL_REAPER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The identity that owns this runner's warm pool.
+///
+/// The owner separates pools that belong to different runners on the same
+/// host; the generation separates the containers this process created from
+/// the ones a previous process left behind.
+fn pool_identity(config: &RunnerConfig) -> PoolIdentity {
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .map(|name| name.trim().to_string())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown-host".to_string());
+    let owner = format!("{}@{}", config.name, host);
+    // A fresh UUID per process: two processes of the same runner never
+    // share a generation, so neither can reclaim the other's pool.
+    let generation = JobId::new().to_string();
+    PoolIdentity::new(owner, generation)
+}
+
+/// Resolve job existence through the scheduler's bulk endpoint.
+///
+/// The scheduler owns the authoritative store, so the runner asks it
+/// rather than reading the database itself. Every failure — an
+/// unreachable scheduler, a rejected credential, an unparsable answer —
+/// leaves every id `unknown`, which retains the containers.
+struct SchedulerJobExistence {
+    client: Client,
+    url: String,
+    token: Arc<str>,
+}
+
+impl SchedulerJobExistence {
+    fn new(store: &StoreLookup) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(STORE_LOOKUP_TIMEOUT)
+            .build()
+            .map_err(|e| Error::internal(format!("failed to create store-lookup client: {e}")))?;
+        let url = format!(
+            "{}/jobs/existence",
+            store.scheduler_url.trim_end_matches('/')
+        );
+        Ok(Self {
+            client,
+            url,
+            token: store.scheduler_token.clone(),
+        })
+    }
+}
+
+/// Bounded timeout for one store lookup. The lookup is on the reconcile
+/// pass's critical path, so a hung scheduler delays the pass instead of
+/// stalling it forever.
+const STORE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[async_trait::async_trait]
+impl JobExistenceResolver for SchedulerJobExistence {
+    async fn resolve(&self, job_ids: &[String]) -> HashMap<String, JobRowState> {
+        let mut states: HashMap<String, JobRowState> = job_ids
+            .iter()
+            .map(|job_id| (job_id.clone(), JobRowState::Unknown))
+            .collect();
+        if job_ids.is_empty() {
+            return states;
+        }
+        let response = self
+            .client
+            .post(&self.url)
+            .bearer_auth(self.token.as_ref())
+            .json(&JobExistenceRequest {
+                job_ids: job_ids.to_vec(),
+            })
+            .send()
+            .await;
+        let Ok(response) = response else {
+            tracing::warn!("store lookup failed; every job id stays unknown");
+            return states;
+        };
+        if !response.status().is_success() {
+            tracing::warn!(
+                status = %response.status(),
+                "store lookup was refused; every job id stays unknown"
+            );
+            return states;
+        }
+        let Ok(body) = response.json::<JobExistenceResponse>().await else {
+            tracing::warn!("store lookup answer was unparsable; every job id stays unknown");
+            return states;
+        };
+        for (job_id, state) in body.states {
+            states.insert(job_id, state);
+        }
+        states
+    }
+}
+
 pub(crate) async fn run_reconciler_loop(
     active_jobs: ActiveJobRegistry,
     config: ReconcilerLoopConfig,
@@ -1893,7 +2138,22 @@ pub(crate) async fn run_reconciler_loop(
             return;
         }
     };
-    let reconciler = Reconciler::new(source, config.policy);
+    let orphan_rule_armed = config.policy.orphan_reclaim_enabled;
+    let mut reconciler = Reconciler::new(source, config.policy);
+    if orphan_rule_armed {
+        match config.store.as_ref().map(SchedulerJobExistence::new) {
+            Some(Ok(resolver)) => {
+                reconciler = reconciler.with_resolver(Arc::new(resolver));
+            }
+            Some(Err(error)) => tracing::warn!(
+                %error,
+                "store lookup unavailable; the legacy-orphan rule retains every container"
+            ),
+            None => tracing::warn!(
+                "the legacy-orphan rule is armed but no store lookup is configured; every container is retained"
+            ),
+        }
+    }
     let mut ticker = interval(config.interval);
     loop {
         // Startup pass runs immediately, then bounded periodic.
@@ -1910,6 +2170,9 @@ pub(crate) async fn run_reconciler_loop(
                     already_gone = report.already_gone,
                     failed = report.failed,
                     deletion_enabled = report.policy_deletion_enabled,
+                    legacy_orphans = report.legacy_orphans,
+                    store_requested = report.store_requested,
+                    store_answered = report.store_answered,
                     "abandoned-container reconcile pass complete"
                 );
                 if let Some(path) = &config.receipt_path {
@@ -2060,6 +2323,9 @@ mod reconciler_loop_tests {
             removed: 1,
             already_gone: 0,
             failed: 0,
+            store_requested: 0,
+            store_answered: 0,
+            legacy_orphans: 0,
             entries: Vec::new(),
         };
 
@@ -2129,6 +2395,7 @@ mod reconciler_loop_tests {
             },
             interval: Duration::from_secs(60),
             receipt_path: None,
+            store: None,
         };
         let registry_one = registry.clone();
         let first = tokio::spawn(run_reconciler_loop(registry_one, config.clone()));
@@ -2497,6 +2764,32 @@ mod tests {
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         assert!(agent.runner.is_none());
+    }
+
+    #[test]
+    fn pool_identity_separates_runners_and_generations() {
+        let config = RunnerConfig {
+            name: "runner-a".to_string(),
+            ..RunnerConfig::default()
+        };
+        let first = pool_identity(&config);
+        let second = pool_identity(&config);
+        // Same runner, same owner: the owner is what lets one runner
+        // reclaim its own orphans.
+        assert_eq!(first.owner, second.owner);
+        assert!(first.owner.starts_with("runner-a@"));
+        // Different generation: a container from one process is never
+        // mistaken for the current process's own container.
+        assert_ne!(first.generation, second.generation);
+        // The creating process is the current one.
+        assert_eq!(first.pid, std::process::id());
+
+        let other_config = RunnerConfig {
+            name: "runner-b".to_string(),
+            ..RunnerConfig::default()
+        };
+        let other = pool_identity(&other_config);
+        assert_ne!(other.owner, first.owner);
     }
 
     #[tokio::test]
@@ -4131,5 +4424,141 @@ mod tests {
         guard.observe(HeartbeatOutcome::IdentityRejected(401));
         assert_eq!(guard.unreachable_streak, 0);
         assert_eq!(guard.identity_rejections, 1);
+    }
+}
+
+/// The runner half of the store-backed legacy-orphan rule.
+///
+/// These tests pin both ends of the wire: the request the runner sends
+/// (method, path, credential, body) and the way it reads the answer. The
+/// fail-closed contract is the point: every way the lookup can fail must
+/// leave every id `unknown`, because `unknown` is the only answer that
+/// never authorises a container removal.
+#[cfg(test)]
+mod store_lookup_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serve exactly one HTTP request with `response` and hand back the
+    /// raw request text the client sent.
+    async fn spawn_stub(response: String) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                let Some(header_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let content_length = text[..header_end]
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                if text.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            String::from_utf8_lossy(&request).to_string()
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn resolver_for(url: &str) -> SchedulerJobExistence {
+        SchedulerJobExistence::new(&StoreLookup {
+            scheduler_url: url.to_string(),
+            scheduler_token: Arc::from("runner-secret"),
+        })
+        .expect("resolver")
+    }
+
+    /// The runner asks the scheduler's bulk endpoint with its own bearer
+    /// credential, and reads the answer back per id.
+    #[tokio::test]
+    async fn the_resolver_asks_the_scheduler_with_the_runner_credential() {
+        let body = serde_json::json!({
+            "states": { "id-a": "absent", "id-b": "present" }
+        })
+        .to_string();
+        let (url, handle) = spawn_stub(http_response("200 OK", &body)).await;
+        let resolver = resolver_for(&url);
+        let ids = vec!["id-a".to_string(), "id-b".to_string()];
+        let states = resolver.resolve(&ids).await;
+        let request = handle.await.unwrap();
+        let lowered = request.to_lowercase();
+        assert!(
+            lowered.starts_with("post /jobs/existence "),
+            "unexpected request line: {request}"
+        );
+        assert!(
+            lowered.contains("authorization: bearer runner-secret"),
+            "the runner credential must authorize the lookup: {request}"
+        );
+        assert!(
+            lowered.contains("\"id-a\""),
+            "the requested ids must travel in the body: {request}"
+        );
+        assert_eq!(states.get("id-a"), Some(&JobRowState::Absent));
+        assert_eq!(states.get("id-b"), Some(&JobRowState::Present));
+    }
+
+    /// A refused lookup is not evidence of absence: every id stays
+    /// `unknown`.
+    #[tokio::test]
+    async fn a_refused_lookup_leaves_every_id_unknown() {
+        let (url, handle) = spawn_stub(http_response(
+            "500 Internal Server Error",
+            &serde_json::json!({ "error": "boom" }).to_string(),
+        ))
+        .await;
+        let resolver = resolver_for(&url);
+        let ids = vec!["id-a".to_string(), "id-b".to_string()];
+        let states = resolver.resolve(&ids).await;
+        let _ = handle.await.unwrap();
+        assert!(states.values().all(|state| *state == JobRowState::Unknown));
+    }
+
+    /// An unparsable answer is not evidence of absence either.
+    #[tokio::test]
+    async fn an_unparsable_answer_leaves_every_id_unknown() {
+        let (url, handle) = spawn_stub(http_response("200 OK", "not json at all")).await;
+        let resolver = resolver_for(&url);
+        let ids = vec!["id-a".to_string()];
+        let states = resolver.resolve(&ids).await;
+        let _ = handle.await.unwrap();
+        assert!(states.values().all(|state| *state == JobRowState::Unknown));
+    }
+
+    /// An unreachable scheduler is the same contract: the lookup fails, so
+    /// every id stays `unknown` and every container is retained.
+    #[tokio::test]
+    async fn an_unreachable_scheduler_leaves_every_id_unknown() {
+        let resolver = resolver_for("http://127.0.0.1:1");
+        let ids = vec!["id-a".to_string(), "id-b".to_string()];
+        let states = resolver.resolve(&ids).await;
+        assert!(states.values().all(|state| *state == JobRowState::Unknown));
     }
 }

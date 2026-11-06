@@ -8,6 +8,15 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 pub const MIN_TIMEOUT_SECS: u64 = 5;
 pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
+/// Environment variable carrying the commit the pushed ref pointed at
+/// *before* the push.
+///
+/// This is the only base that describes the whole push: a push may carry
+/// several commits, and the tip commit alone is not the push. A consumer
+/// that diffs against the tip misses every commit but the last one, which
+/// can skip clippy/test/coverage on a code change — a false green.
+pub const PUSH_BASE_ENV: &str = "CI_PUSH_BASE_SHA";
+
 /// Parse a human-readable job timeout into bounded seconds.
 ///
 /// Supported forms are plain seconds (`900`) and a single suffix of `s`,
@@ -143,6 +152,31 @@ impl PipelineDefinition {
     pub fn to_yaml(&self) -> Result<String, serde_yaml::Error> {
         serde_yaml::to_string(self)
     }
+}
+
+/// Return a copy of `pipeline` whose shared environment carries the push
+/// base commit.
+///
+/// The clone is deliberate: the committed definition stays pristine for the
+/// persisted pipeline config and the pipeline cache, while the augmented
+/// copy is what the engine turns into job definitions. `None` (or an empty
+/// string) means the push had no pre-push base — a branch creation — and
+/// the clone is returned unchanged so consumers see no variable at all and
+/// fail safe.
+pub fn with_push_base(
+    pipeline: &PipelineDefinition,
+    push_base: Option<&str>,
+) -> PipelineDefinition {
+    let mut augmented = pipeline.clone();
+    if let Some(sha) = push_base {
+        let sha = sha.trim();
+        if !sha.is_empty() {
+            augmented
+                .environment
+                .insert(PUSH_BASE_ENV.to_string(), sha.to_string());
+        }
+    }
+    augmented
 }
 
 /// Job definition within a pipeline
@@ -674,6 +708,68 @@ jobs:
     }
 
     #[test]
+    fn test_with_push_base_publishes_the_base_in_the_clone_only() {
+        let original = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![],
+        };
+
+        let augmented = with_push_base(&original, Some("abc123"));
+
+        assert_eq!(
+            augmented.environment.get(PUSH_BASE_ENV),
+            Some(&"abc123".to_string())
+        );
+        // The committed definition must stay pristine: it is what the
+        // pipeline cache and the persisted pipeline config hold.
+        assert!(!original.environment.contains_key(PUSH_BASE_ENV));
+    }
+
+    #[test]
+    fn test_with_push_base_without_a_base_publishes_nothing() {
+        let original = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![],
+        };
+
+        for push_base in [None, Some(""), Some("   ")] {
+            let augmented = with_push_base(&original, push_base);
+            assert!(
+                !augmented.environment.contains_key(PUSH_BASE_ENV),
+                "no push base must publish no variable (push_base={push_base:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_with_push_base_keeps_the_existing_environment() {
+        let original = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::from([("EXISTING".to_string(), "value".to_string())]),
+            jobs: vec![],
+        };
+
+        let augmented = with_push_base(&original, Some("abc123"));
+
+        assert_eq!(
+            augmented.environment.get("EXISTING"),
+            Some(&"value".to_string())
+        );
+        assert_eq!(
+            augmented.environment.get(PUSH_BASE_ENV),
+            Some(&"abc123".to_string())
+        );
+    }
+
+    #[test]
     fn test_pipeline_trigger_event_with_actor() {
         let user_id = gitforge_common::UserId::new();
         let event = PipelineTriggerEvent::new(
@@ -685,5 +781,46 @@ jobs:
         .with_actor(user_id);
 
         assert_eq!(event.actor_id, Some(user_id));
+    }
+
+    /// The repo's own pipeline is a product artifact: the CI service parses
+    /// it at push time and a syntax or key error there turns every push
+    /// into a red pipeline with no useful diagnostic. Parsing it here
+    /// turns that into a local test failure.
+    #[test]
+    fn test_committed_pipeline_parses_and_keeps_its_docker_socket_mount() {
+        let yaml = include_str!("../../../.gitforge.yml");
+        let pipeline = PipelineDefinition::parse(yaml).expect("committed pipeline must parse");
+
+        let job = pipeline
+            .jobs
+            .iter()
+            .find(|job| job.name == "docker-integration")
+            .expect("docker-integration job");
+        let socket = job
+            .volumes
+            .iter()
+            .find(|volume| volume.destination == "/var/run/docker.sock")
+            .expect("docker socket mount");
+        // The placeholder, not a fixed path: the socket of the daemon the
+        // runner actually uses is deployment-specific (a rootless podman
+        // runner's socket is not /var/run/docker.sock).
+        assert_eq!(socket.source.as_deref(), Some("{docker_socket}"));
+        assert!(socket.read_only);
+        assert_eq!(
+            job.env.get("DOCKER_HOST").map(String::as_str),
+            Some("unix:///var/run/docker.sock")
+        );
+
+        // The job runs the daemon-dependent tests that `cargo test` skips;
+        // without the `--ignored` filter the job would pass while running
+        // nothing.
+        let step = job
+            .steps
+            .iter()
+            .find(|step| step.run.contains("--ignored"))
+            .expect("a step running the ignored tests");
+        assert!(step.run.contains("gitforge-sandbox"));
+        assert!(step.run.contains("gitforge-runner"));
     }
 }

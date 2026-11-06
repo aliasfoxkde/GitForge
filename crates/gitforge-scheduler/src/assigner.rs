@@ -2,7 +2,8 @@
 
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
-use gitforge_common::{JobId, Lane, PipelineRunId, RepoId, RunnerId, VolumeSpec};
+use crate::resource_class::workspace_cargo_test;
+use gitforge_common::{JobId, JobRowState, Lane, PipelineRunId, RepoId, RunnerId, VolumeSpec};
 use gitforge_db::models::{
     Job as DbJob, JobStatus, PipelineRun as DbPipelineRun, Runner,
     RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS,
@@ -65,6 +66,11 @@ pub enum DeferredReason {
     LaneLimit,
     FastReservedCapacity,
     ScratchHeadroom,
+    /// The job's exclusive resource class was already in flight on every
+    /// runner that had capacity. The class is an admission rule of the
+    /// scheduler, so the exclusion has to be named: a job blocked by it used
+    /// to sit queued with no reason at all (GF-14).
+    ResourceClassConflict,
 }
 
 impl DeferredReason {
@@ -73,6 +79,7 @@ impl DeferredReason {
             DeferredReason::LaneLimit => "lane_limit",
             DeferredReason::FastReservedCapacity => "fast_reserved_capacity",
             DeferredReason::ScratchHeadroom => "scratch_headroom",
+            DeferredReason::ResourceClassConflict => "resource_class_conflict",
         }
     }
 }
@@ -212,8 +219,18 @@ pub enum SchedulerCommand {
 /// Scheduler event
 #[derive(Debug, Clone)]
 pub enum SchedulerEvent {
-    /// Job assigned to runner
-    JobAssigned { job_id: JobId, runner_id: RunnerId },
+    /// Job assigned to runner.
+    ///
+    /// The run id travels with the event: the CI service keys its engines
+    /// by run, and the engine's mirror has to leave `Queued` when the job
+    /// is dispatched. A dispatched job that stays `Queued` in the mirror
+    /// is re-released by every later completion of the run, and that
+    /// duplicate enqueue demoted the running job's durable row (GF-12).
+    JobAssigned {
+        job_id: JobId,
+        runner_id: RunnerId,
+        pipeline_run_id: PipelineRunId,
+    },
     /// No runner available for job
     NoRunnerAvailable { job_id: JobId },
     /// Runner submitted a terminal job receipt.
@@ -283,21 +300,18 @@ pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 300;
 /// Return the scheduler resource class for jobs that must not overlap on one
 /// runner. Workspace-wide Cargo tests contend for the same checkout and build
 /// artifacts, so a runner admits at most one of them at a time.
+///
+/// The class is decided by the cargo SUBCOMMAND the command runs, not by the
+/// presence of the words `cargo`, `test` and `--workspace` anywhere in the
+/// command text (GF-14). The word scan classified a command that merely
+/// MENTIONED them — in a comment, or in another cargo subcommand such as
+/// `cargo llvm-cov` — as a workspace cargo test, and such a job was then
+/// excluded from runners that were free to take it.
 fn resource_class(definition: &JobExecutionDefinition) -> Option<&'static str> {
     definition
         .commands
         .iter()
-        .any(|command| {
-            command
-                .split_whitespace()
-                .any(|argument| argument == "cargo")
-                && command
-                    .split_whitespace()
-                    .any(|argument| argument == "test")
-                && command
-                    .split_whitespace()
-                    .any(|argument| argument == "--workspace")
-        })
+        .any(|command| workspace_cargo_test(command))
         .then_some("workspace-cargo-test")
 }
 
@@ -479,6 +493,47 @@ impl Scheduler {
             || state.queue.contains(job_id)
     }
 
+    /// Resolve the authoritative store's view of a batch of job ids.
+    ///
+    /// The answer comes from the durable store only. A scheduler without a
+    /// store cannot speak for jobs another process planned, so it answers
+    /// `Unknown` for every id — the fail-closed answer, because `Unknown`
+    /// is the one that never turns into a removal.
+    ///
+    /// The distinction matters because the runner stamps a job-shaped id on
+    /// every container it creates, including the warm-pool containers that
+    /// were never given to a job. A real job always has a durable row: the
+    /// row is written when the job is enqueued, which is before the job can
+    /// be dispatched to a runner.
+    pub async fn job_row_states(&self, job_ids: &[JobId]) -> HashMap<JobId, JobRowState> {
+        let mut states: HashMap<JobId, JobRowState> = job_ids
+            .iter()
+            .map(|job_id| (*job_id, JobRowState::Unknown))
+            .collect();
+        let Some(pool) = &self.db_pool else {
+            return states;
+        };
+        let loaded = match gitforge_db::queries::JobQueries::get_many(pool, job_ids).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "job existence lookup failed; every id stays unknown"
+                );
+                return states;
+            }
+        };
+        for job_id in job_ids {
+            let state = if loaded.contains_key(job_id) {
+                JobRowState::Present
+            } else {
+                JobRowState::Absent
+            };
+            states.insert(*job_id, state);
+        }
+        states
+    }
+
     /// Read a durable pipeline run for the CI status adapter.
     pub async fn get_pipeline_run(
         &self,
@@ -588,6 +643,21 @@ impl Scheduler {
         definition: JobExecutionDefinition,
     ) -> anyhow::Result<()> {
         let timeout_secs = definition.timeout_secs.clamp(5, 24 * 60 * 60);
+        // A job this scheduler already dispatched is live: its durable row
+        // is `assigned`/`running` and its runner holds the lease. Queueing
+        // it again demotes that row, which refuses the runner's heartbeat
+        // and rotates its lease token out from under it (GF-12). The
+        // enqueue of a live job is a no-op.
+        {
+            let state = self.state.read().await;
+            if state.assigned_jobs.contains_key(&job_id) {
+                tracing::debug!(
+                    %job_id,
+                    "job is already dispatched; the duplicate enqueue is a no-op"
+                );
+                return Ok(());
+            }
+        }
         if let Some(pool) = &self.db_pool {
             let mut db_job = DbJob::new(pipeline_run_id, format!("job-{job_id}"));
             db_job.id = job_id;
@@ -608,10 +678,20 @@ impl Scheduler {
                 })
                 .await?;
             }
-            persist_with_retry("status update", job_id, || {
-                gitforge_db::queries::JobQueries::update_status(pool, job_id, "queued")
-            })
-            .await?;
+            // The durable status of a job a runner holds is the invariant
+            // every later write is fenced by. Moving such a row back to
+            // `queued` takes the lease away from the runner that holds it
+            // (GF-12), so the transition is guarded: a row that is not
+            // dispatchable stays as it is and is not queued again.
+            let dispatchable =
+                gitforge_db::queries::JobQueries::mark_queued_if_dispatchable(pool, job_id).await?;
+            if !dispatchable {
+                tracing::debug!(
+                    %job_id,
+                    "job row is live; the enqueue leaves it to the runner that holds it"
+                );
+                return Ok(());
+            }
             let commands = definition.commands.clone();
             let image = definition.image.clone();
             let working_dir = definition.working_dir.clone();
@@ -1544,6 +1624,11 @@ impl Scheduler {
 
             // Select runner using policy
             let mut available = runners.clone();
+            // A runner whose free slot is taken away by the exclusive resource
+            // class is a different block from a runner that is simply busy:
+            // only the class is an admission rule of the scheduler, so
+            // remember when the class is what removed the capacity.
+            let mut class_conflict_blocked = false;
             for runner in &mut available {
                 let in_flight = state
                     .assigned_jobs
@@ -1553,6 +1638,9 @@ impl Scheduler {
                 runner.capacity = (runner.capacity - in_flight).max(0);
                 if let Some(definition) = &definition {
                     if runner_has_resource_class_conflict(&state, runner.id, definition) {
+                        if runner.capacity > 0 {
+                            class_conflict_blocked = true;
+                        }
                         runner.capacity = 0;
                     }
                 }
@@ -1581,7 +1669,18 @@ impl Scheduler {
                             Ok(true) => {}
                             Ok(false) => {
                                 state.queue.remove(job_id);
-                                state.job_leases.remove(&job_id);
+                                // The durable row refused the assignment
+                                // because it is already held. If this
+                                // scheduler still mirrors the job as
+                                // assigned, the runner holds the lease this
+                                // scheduler gave it: dropping the mirror's
+                                // lease here would make every completion it
+                                // sends fail the in-memory lease check, and
+                                // the job would be fenced as lost while it
+                                // is running (GF-12).
+                                if !state.assigned_jobs.contains_key(&job_id) {
+                                    state.job_leases.remove(&job_id);
+                                }
                                 tracing::debug!(%job_id, "job assignment won by another scheduler");
                                 continue;
                             }
@@ -1619,6 +1718,7 @@ impl Scheduler {
                     let event = SchedulerEvent::JobAssigned {
                         job_id,
                         runner_id: r_id,
+                        pipeline_run_id,
                     };
                     let _ = self.event_tx.send(event);
                 }
@@ -1626,10 +1726,26 @@ impl Scheduler {
                     // No runner can take this job right now. Leave it queued
                     // and consider the next one so a single blocked job cannot
                     // idle the runner's remaining capacity.
-                    tracing::debug!(
-                        "no runner available for job {}, skipping to next queued job",
-                        job_id
-                    );
+                    if class_conflict_blocked {
+                        // The exclusive resource class is what removed the
+                        // capacity of every runner that had any. Name it
+                        // durably: a job blocked by the class used to sit
+                        // queued with no reason at all (GF-14).
+                        tracing::debug!(
+                            "job {} deferred: resource class already in flight",
+                            job_id
+                        );
+                        self.record_deferral(
+                            &mut state,
+                            job_id,
+                            DeferredReason::ResourceClassConflict,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "no runner available for job {}, skipping to next queued job",
+                            job_id
+                        );
+                    }
                     skipped.insert(job_id);
                 }
             }
@@ -1947,16 +2063,40 @@ impl Scheduler {
     /// Return the current lease for a job, creating one for an existing
     /// assignment when needed. Repeated calls are idempotent.
     pub async fn ensure_job_lease(&self, job_id: JobId) -> Option<String> {
-        let lease = {
-            let mut state = self.state.write().await;
+        let mirrored = {
+            let state = self.state.read().await;
             if !state.assigned_jobs.contains_key(&job_id) {
                 return None;
             }
-            state
-                .job_leases
-                .entry(job_id)
-                .or_insert_with(|| Uuid::new_v4().to_string())
-                .clone()
+            state.job_leases.get(&job_id).cloned()
+        };
+        let lease = match mirrored {
+            Some(lease) => lease,
+            None => {
+                // The mirror has no lease for a job it is assigned. The
+                // durable row may still carry the token the runner holds:
+                // adopting it keeps that lease valid, where minting a new
+                // one would rotate the token under the runner that is
+                // executing the job and every completion it sends would
+                // then be rejected (GF-12).
+                let adopted = match &self.db_pool {
+                    Some(pool) => gitforge_db::queries::JobQueries::get(pool, job_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|job| job.lease_token),
+                    None => None,
+                };
+                let mut state = self.state.write().await;
+                if !state.assigned_jobs.contains_key(&job_id) {
+                    return None;
+                }
+                state
+                    .job_leases
+                    .entry(job_id)
+                    .or_insert_with(|| adopted.unwrap_or_else(|| Uuid::new_v4().to_string()))
+                    .clone()
+            }
         };
         // Keep the durable row in sync with the lease handed to the runner.
         // Lease validation reads the database, and a stale or missing row
@@ -2520,6 +2660,122 @@ mod tests {
         );
     }
 
+    /// The DIL coverage job's command verbatim. It mentions "the test binary"
+    /// in a comment and runs `cargo llvm-cov --workspace` — the shape the
+    /// word scan misfiled into the workspace-cargo-test class (GF-14).
+    fn coverage_definition() -> JobExecutionDefinition {
+        JobExecutionDefinition {
+            commands: vec![
+                "command -v cargo-llvm-cov >/dev/null 2>&1 || { echo \"cargo-llvm-cov not in image; skipping\"; exit 0; }\nexport CARGO_BUILD_JOBS=4\n# This is the job that died on 2026-11-05 with ENOENT on the\n# test binary; the runner's mount lock is what keeps the tree\n# it executes from being replaced under it.\ncargo llvm-cov --workspace --summary-only --fail-under-lines 95".to_string(),
+            ],
+            image: "rust:1".to_string(),
+            working_dir: None,
+            timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+            env: HashMap::new(),
+            volumes: Vec::new(),
+            lane: gitforge_common::Lane::Standard,
+            fault: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_job_that_only_mentions_a_cargo_test_is_not_excluded_by_the_class() {
+        // GF-14: the DIL coverage job runs `cargo llvm-cov --workspace` and its
+        // comment mentions "the test binary". The word scan put it into the
+        // workspace-cargo-test class, so a platform `cargo test --workspace`
+        // job on the only runner excluded it from a runner that was free to
+        // take it.
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+
+        let coverage_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                coverage_job,
+                run_id,
+                repo_id,
+                coverage_definition(),
+            )
+            .await
+            .unwrap();
+
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+
+        // One workspace-cargo-test job already in flight on that runner.
+        let running_test_job = JobId::new();
+        {
+            let mut state = scheduler.state.write().await;
+            state
+                .job_definitions
+                .insert(running_test_job, workspace_test_definition());
+            state
+                .assigned_jobs
+                .insert(running_test_job, (runner_id, run_id, repo_id));
+        }
+
+        scheduler.process_queue().await;
+
+        assert_eq!(
+            scheduler.is_assigned(coverage_job).await,
+            Some(runner_id),
+            "a job that only mentions a cargo test must not be excluded by the class"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_class_excluded_job_names_its_blocker() {
+        // GF-14: the exclusion is invisible unless it is named. A job held
+        // back by the exclusive class has to carry the reason, the same way
+        // a lane-limited job does.
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+
+        let blocked_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                blocked_job,
+                run_id,
+                repo_id,
+                workspace_test_definition(),
+            )
+            .await
+            .unwrap();
+
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+
+        let running_test_job = JobId::new();
+        {
+            let mut state = scheduler.state.write().await;
+            state
+                .job_definitions
+                .insert(running_test_job, workspace_test_definition());
+            state
+                .assigned_jobs
+                .insert(running_test_job, (runner_id, run_id, repo_id));
+        }
+
+        scheduler.process_queue().await;
+
+        assert!(scheduler.is_assigned(blocked_job).await.is_none());
+        let status = scheduler.queue_status().await.unwrap();
+        let deferred = status
+            .queued
+            .iter()
+            .find(|job| job.job_id == blocked_job)
+            .expect("the excluded job is still queued");
+        assert_eq!(
+            deferred.deferred_reason.as_deref(),
+            Some("resource_class_conflict"),
+            "the exclusion must name its blocker"
+        );
+    }
+
     #[tokio::test]
     async fn test_fairness_counts_running_jobs_not_visible_backlog() {
         let scheduler = Scheduler::new();
@@ -2728,6 +2984,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 error: None,
                 ref_name: None,
+                push_base_sha: None,
             },
         )
         .await
@@ -4431,5 +4688,181 @@ mod tests {
         );
         let status = scheduler.queue_status().await.unwrap();
         assert!(status.queued.iter().all(|job| job.job_id != second));
+    }
+
+    /// GF-12: a duplicate enqueue must not break the lease of a job that
+    /// is already running.
+    ///
+    /// The CI service re-enqueues every job its engine still holds as
+    /// `Queued`, and the engine's mirror stayed `Queued` for a dispatched
+    /// job (nothing consumed the scheduler's `JobAssigned` event). The
+    /// duplicate enqueue demoted the live job's durable row to `queued`
+    /// with an unguarded UPDATE: the runner's heartbeat was refused, the
+    /// row became dispatchable again, the lease token was rotated under
+    /// the runner that was executing the job, and every completion it sent
+    /// was rejected - three executions of the job, then a
+    /// `runner_lost_while_running` fence.
+    ///
+    /// The contract pinned here is the runner's: while the job runs, the
+    /// duplicate enqueue leaves the row, the lease and the heartbeat
+    /// alone, and the completion lands.
+    #[tokio::test]
+    async fn a_duplicate_enqueue_does_not_break_a_running_jobs_lease() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (run_id, repo_id) = seed_durable_run(&pool).await;
+        let scheduler = Scheduler::with_db(pool.clone());
+        let job_id = JobId::new();
+        // The durable row's runner is a foreign key: the runner has to
+        // exist before the job can be leased to it.
+        let runner =
+            gitforge_db::models::Runner::new("gf12-runner".to_string(), RunnerType::Docker, 1);
+        gitforge_db::queries::RunnerQueries::create(&pool, &runner)
+            .await
+            .unwrap();
+        let runner_id = runner.id;
+        let lease = "lease-token-of-the-running-job";
+        let definition = JobExecutionDefinition {
+            commands: vec!["cargo test".to_string()],
+            image: "backend-ci-rust:1".to_string(),
+            working_dir: Some("/workspace".to_string()),
+            timeout_secs: 900,
+            env: HashMap::new(),
+            volumes: Vec::new(),
+            lane: gitforge_common::Lane::Standard,
+            fault: None,
+        };
+
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                job_id,
+                run_id,
+                repo_id,
+                definition.clone(),
+            )
+            .await
+            .unwrap();
+
+        // The runner claims the job and starts it.
+        assert!(
+            gitforge_db::queries::JobQueries::assign_with_lease(&pool, job_id, runner_id, lease)
+                .await
+                .unwrap(),
+            "the runner claims the queued job"
+        );
+        assert!(
+            gitforge_db::queries::JobQueries::start_with_lease(&pool, job_id, runner_id, lease)
+                .await
+                .unwrap(),
+            "the runner starts the claimed job"
+        );
+
+        // The duplicate enqueue the CI service issues when another job of
+        // the same run completes.
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(job_id, run_id, repo_id, definition)
+            .await
+            .unwrap();
+
+        let row = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .expect("the job row");
+        assert_eq!(
+            row.status, "running",
+            "the live job's row must not be demoted by a duplicate enqueue"
+        );
+        assert_eq!(
+            row.lease_token.as_deref(),
+            Some(lease),
+            "the lease must not rotate under the running runner"
+        );
+
+        // The runner's heartbeat is accepted and its completion lands.
+        assert!(
+            gitforge_db::queries::JobQueries::heartbeat(&pool, job_id, runner_id, lease)
+                .await
+                .unwrap(),
+            "the running job's heartbeat must still be accepted"
+        );
+        assert!(
+            gitforge_db::queries::JobQueries::complete_with_lease(
+                &pool,
+                job_id,
+                runner_id,
+                lease,
+                "succeeded",
+                "{}",
+            )
+            .await
+            .unwrap(),
+            "the running job's completion must land"
+        );
+    }
+
+    /// GF-12: the lease handed to a runner is the durable row's token.
+    ///
+    /// The mirror dropped its lease when an assignment was refused, and
+    /// the next lease for that job was minted fresh - which rotated the
+    /// token the runner was holding and made every completion it sent
+    /// fail the lease check. The durable token is the lease: it is adopted
+    /// instead of replaced.
+    #[tokio::test]
+    async fn the_lease_handed_to_a_runner_is_the_durable_token() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (run_id, repo_id) = seed_durable_run(&pool).await;
+        let scheduler = Scheduler::with_db(pool.clone());
+        let job_id = JobId::new();
+        let runner = gitforge_db::models::Runner::new(
+            "gf12-adopting-runner".to_string(),
+            RunnerType::Docker,
+            1,
+        );
+        gitforge_db::queries::RunnerQueries::create(&pool, &runner)
+            .await
+            .unwrap();
+        let runner_id = runner.id;
+        let lease = "durable-lease-token";
+
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                job_id,
+                run_id,
+                repo_id,
+                JobExecutionDefinition {
+                    commands: vec!["cargo test".to_string()],
+                    image: "backend-ci-rust:1".to_string(),
+                    working_dir: Some("/workspace".to_string()),
+                    timeout_secs: 900,
+                    env: HashMap::new(),
+                    volumes: Vec::new(),
+                    lane: gitforge_common::Lane::Standard,
+                    fault: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(gitforge_db::queries::JobQueries::assign_with_lease(
+            &pool, job_id, runner_id, lease
+        )
+        .await
+        .unwrap());
+
+        // The scheduler mirrors the assignment, then loses its lease (the
+        // state a refused assignment produced).
+        {
+            let mut state = scheduler.state.write().await;
+            state
+                .assigned_jobs
+                .insert(job_id, (runner_id, run_id, repo_id));
+            state.job_leases.remove(&job_id);
+        }
+
+        let handed_out = scheduler.ensure_job_lease(job_id).await.unwrap();
+        assert_eq!(
+            handed_out, lease,
+            "the runner must be handed the token the durable row carries"
+        );
     }
 }

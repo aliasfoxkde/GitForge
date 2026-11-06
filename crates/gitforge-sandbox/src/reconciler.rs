@@ -16,7 +16,9 @@
 //!    abandonment; the grace period and deletion policy decide the rest.
 //! 3. **Grace period** — a container must have been in a non-running state
 //!    for at least `grace` before it is eligible. Running containers are
-//!    never removed regardless of metadata age.
+//!    never removed regardless of metadata age — with one exception, the
+//!    store-backed legacy-orphan rule below, which is the only way to
+//!    reach the warm pool's pre-fix leftovers.
 //! 4. **Concurrency** — removal is idempotent; Docker 404 (already gone)
 //!    and 409 (concurrent teardown in progress) are treated as successful
 //!    no-ops so a race with the normal teardown never fails.
@@ -28,11 +30,21 @@
 //! 7. **Receipt** — the resulting [`ReconcileReport`] serializes counts,
 //!    container IDs, decisions, and outcomes. It never contains logs,
 //!    tokens, or environment values.
+//! 8. **Store-backed legacy orphans** — a container whose
+//!    `com.gitforce.job_id` the authoritative store has no row for was
+//!    never a job container: the warm pool minted a job-shaped id for a
+//!    container it never gave to a job, and named the container after it.
+//!    Such a container is unreachable by every other rule — it carries no
+//!    pool label, so the pool's own rules do not own it, and it is
+//!    running, so the general rule retains it. The store's answer is
+//!    injected as data ([`JobRowState`]), the rule is armed explicitly,
+//!    and it fails closed at every unknown: an unreadable store, an
+//!    unknown age, and a container inside the TTL all retain.
 
 use crate::active_jobs::ActiveJobRegistry;
 use bollard::query_parameters::{ListContainersOptions, RemoveContainerOptions};
 use chrono::DateTime;
-use gitforge_common::{Error, Result};
+use gitforge_common::{Error, JobRowState, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,6 +65,11 @@ pub enum Decision {
     RetainMalformedLabel,
     /// Container is still running; age is irrelevant.
     RetainRunning,
+    /// Container belongs to a warm pool. The pool owns its own
+    /// containers and reclaims them under the pool's own rules
+    /// (`crate::pool`); the general reconciler never removes them, so
+    /// the two mechanisms cannot disagree about a live container.
+    RetainPool,
     /// Owning job is currently active/claimed per authoritative state.
     RetainActiveJob,
     /// Non-running for less than the configured grace period.
@@ -62,11 +79,23 @@ pub enum Decision {
     /// Abandoned per policy: unknown job, past grace. Subject to removal
     /// only when deletion is enabled.
     Eligible,
+    /// The store has no row for this container's job id, the container is
+    /// past the orphan TTL, and the policy allows removal: the warm
+    /// pool's placeholder, which no other rule can reach.
+    EligibleLegacyOrphan,
+    /// The store could not be consulted for this container's job id.
+    /// Fail-closed: an unknown answer never authorises a removal.
+    RetainStoreUnknown,
+    /// The store has no row for this container's job id, but the
+    /// container is too young to be an orphan.
+    RetainOrphanWithinTtl,
+    /// The container's age is unknown, so its TTL cannot be applied.
+    RetainUnknownAge,
 }
 
 impl Decision {
     pub fn is_eligible(&self) -> bool {
-        matches!(self, Decision::Eligible)
+        matches!(self, Decision::Eligible | Decision::EligibleLegacyOrphan)
     }
 }
 
@@ -112,6 +141,13 @@ pub struct ReconcilerPolicy {
     /// Per-Docker-call timeout so one hung API call cannot stall job
     /// admission. Default: 10 seconds.
     pub call_timeout: Duration,
+    /// Arm the store-backed legacy-orphan rule. When false (the default)
+    /// the reconciler never removes a container on the strength of a
+    /// store lookup alone, and never asks the store at all.
+    pub orphan_reclaim_enabled: bool,
+    /// Minimum age a container must have before the store-backed rule may
+    /// call it an orphan. Default: 1 hour. Must be positive.
+    pub orphan_ttl: Duration,
 }
 
 impl Default for ReconcilerPolicy {
@@ -121,6 +157,8 @@ impl Default for ReconcilerPolicy {
             grace: Duration::from_secs(3600),
             max_removals: 64,
             call_timeout: Duration::from_secs(10),
+            orphan_reclaim_enabled: false,
+            orphan_ttl: Duration::from_secs(3600),
         }
     }
 }
@@ -144,16 +182,27 @@ impl ReconcilerPolicy {
                 "reconciler policy rejected: call timeout must be positive",
             ));
         }
+        if self.orphan_ttl.is_zero() {
+            return Err(Error::sandbox(
+                "reconciler policy rejected: orphan TTL must be positive",
+            ));
+        }
         Ok(())
     }
 }
 
-/// Pure decision function: classify one container against policy and the
-/// authoritative active-job set. No I/O; the same inputs always produce
-/// the same decision.
+/// Pure decision function: classify one container against policy, the
+/// authoritative active-job set, and the authoritative store's view of the
+/// container's job id. No I/O; the same inputs always produce the same
+/// decision.
+///
+/// `store_state` is the store's answer as data — it is resolved once at
+/// the edge and handed in, so this function never reads the store (or any
+/// other process-global state) itself.
 pub fn classify(
     record: &ContainerRecord,
     active_jobs: &std::collections::HashSet<String>,
+    store_state: JobRowState,
     policy: &ReconcilerPolicy,
     now: Now,
 ) -> Decision {
@@ -177,11 +226,57 @@ pub fn classify(
     if active_jobs.contains(raw_job) {
         return Decision::RetainActiveJob;
     }
-    // 4. Never remove a running container.
+    // 4. Pooled containers belong to the warm pool, which reclaims them
+    //    under its own rules (owner, generation, TTL, liveness of the
+    //    creating process). The general reconciler does not remove them:
+    //    a pooled container that is serving a job looks exactly like an
+    //    orphan to any rule that only sees "running" and "not an active
+    //    job id" - and the pool's label for a job container is a
+    //    placeholder, not the job id.
+    if record.labels.contains_key(crate::pool::POOL_LABEL) {
+        return Decision::RetainPool;
+    }
+    // 5. Store-backed legacy-orphan rule.
+    //
+    //    The warm pool minted a job-shaped id for a container it never
+    //    gave to a job, and named the container after it. The store is
+    //    the only authority that can tell such a container apart from a
+    //    real one, because a real job always has a durable row: the row
+    //    is written when the job is enqueued, which is before the job
+    //    can be dispatched to a runner.
+    //
+    //    The rule is armed explicitly and fails closed at every unknown:
+    //    an unreadable store, an unknown age, and a container inside the
+    //    TTL all retain.
+    if policy.orphan_reclaim_enabled {
+        match store_state {
+            // The store could not be consulted. Never a licence to remove.
+            JobRowState::Unknown => return Decision::RetainStoreUnknown,
+            // The store knows this id: it is a real job, and the ordinary
+            // rules below decide.
+            JobRowState::Present => {}
+            // The store has never heard of this id: this container was
+            // never a job container.
+            JobRowState::Absent => {
+                let Some(created_at_ms) = record.created_at_ms else {
+                    return Decision::RetainUnknownAge;
+                };
+                let age_ms = now.now_ms.saturating_sub(created_at_ms);
+                if age_ms < policy.orphan_ttl.as_millis() as i64 {
+                    return Decision::RetainOrphanWithinTtl;
+                }
+                if !policy.deletion_enabled {
+                    return Decision::RetainPolicyDisabled;
+                }
+                return Decision::EligibleLegacyOrphan;
+            }
+        }
+    }
+    // 6. Never remove a running container.
     if record.running {
         return Decision::RetainRunning;
     }
-    // 5. Grace period: must be non-running for at least `grace`.
+    // 7. Grace period: must be non-running for at least `grace`.
     //    Fail-closed: an unknown exit time never qualifies.
     let Some(exited_at) = record.exited_at_ms else {
         return Decision::RetainGracePeriod;
@@ -190,11 +285,51 @@ pub fn classify(
     if non_running_for < policy.grace.as_millis() as i64 {
         return Decision::RetainGracePeriod;
     }
-    // 6. Deletion authority.
+    // 8. Deletion authority.
     if !policy.deletion_enabled {
         return Decision::RetainPolicyDisabled;
     }
     Decision::Eligible
+}
+
+/// Resolves the authoritative store's view of a job id.
+///
+/// The reconciler is the edge that talks to the store; the decision core
+/// takes the answer as data. A resolver that cannot answer must answer
+/// `Unknown`, which never authorises a removal.
+#[async_trait::async_trait]
+pub trait JobExistenceResolver: Send + Sync {
+    /// Resolve the store's view of the given job ids.
+    ///
+    /// Ids the resolver does not mention are `Unknown`: an omitted id is
+    /// not an absent id.
+    async fn resolve(&self, job_ids: &[String]) -> HashMap<String, JobRowState>;
+}
+
+/// A resolver that knows nothing: every id is `Unknown`.
+///
+/// This is the default, so a reconciler with no store connection can never
+/// remove a container on the strength of a store lookup.
+pub struct UnknownJobExistence;
+
+#[async_trait::async_trait]
+impl JobExistenceResolver for UnknownJobExistence {
+    async fn resolve(&self, job_ids: &[String]) -> HashMap<String, JobRowState> {
+        job_ids
+            .iter()
+            .map(|job_id| (job_id.clone(), JobRowState::Unknown))
+            .collect()
+    }
+}
+
+/// The store's answer for one reconcile pass.
+struct StoreAnswers {
+    /// The answer per job id the candidates carry.
+    states: HashMap<String, JobRowState>,
+    /// How many distinct job ids the pass asked about.
+    requested: usize,
+    /// How many of them the store answered (present or absent).
+    answered: usize,
 }
 
 /// Outcome of one removal attempt.
@@ -234,6 +369,12 @@ pub struct ReconcileReport {
     pub active_jobs_hash: String,
     pub candidates_seen: usize,
     pub eligible: usize,
+    /// Distinct job ids the pass asked the store about.
+    pub store_requested: usize,
+    /// How many of them the store answered (present or absent).
+    pub store_answered: usize,
+    /// Containers the store-backed legacy-orphan rule called eligible.
+    pub legacy_orphans: usize,
     pub removed: usize,
     pub already_gone: usize,
     pub failed: usize,
@@ -266,11 +407,64 @@ fn fnv1a_hex(input: &str) -> String {
 pub struct Reconciler<S: ContainerSource> {
     source: Arc<S>,
     policy: ReconcilerPolicy,
+    resolver: Arc<dyn JobExistenceResolver>,
 }
 
 impl<S: ContainerSource> Reconciler<S> {
     pub fn new(source: Arc<S>, policy: ReconcilerPolicy) -> Self {
-        Self { source, policy }
+        Self {
+            source,
+            policy,
+            resolver: Arc::new(UnknownJobExistence),
+        }
+    }
+
+    /// Attach the store resolver the reconciler asks about job ids.
+    ///
+    /// Without one the reconciler answers `unknown` for every id, which
+    /// retains every container the store-backed rule could have reached.
+    pub fn with_resolver(mut self, resolver: Arc<dyn JobExistenceResolver>) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    /// Ask the store about the job ids the candidates carry.
+    ///
+    /// One batched lookup per pass. The lookup is skipped entirely when
+    /// the rule is not armed, so an unarmed reconciler never talks to the
+    /// store at all.
+    async fn resolve_store_states(&self, containers: &[ContainerRecord]) -> StoreAnswers {
+        let mut ids: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for record in containers {
+            if let Some(job_id) = record.labels.get(JOB_ID_LABEL) {
+                if seen.insert(job_id.clone()) {
+                    ids.push(job_id.clone());
+                }
+            }
+        }
+        if !self.policy.orphan_reclaim_enabled || ids.is_empty() {
+            return StoreAnswers {
+                states: HashMap::new(),
+                requested: ids.len(),
+                answered: 0,
+            };
+        }
+        let states = self.resolver.resolve(&ids).await;
+        let answered = ids
+            .iter()
+            .filter(|id| {
+                matches!(
+                    states.get(*id),
+                    Some(JobRowState::Present) | Some(JobRowState::Absent)
+                )
+            })
+            .count();
+        StoreAnswers {
+            states,
+            requested: ids.len(),
+            answered,
+        }
     }
 
     pub fn policy(&self) -> &ReconcilerPolicy {
@@ -294,14 +488,24 @@ impl<S: ContainerSource> Reconciler<S> {
         report.policy_deletion_enabled = self.policy.deletion_enabled;
         report.policy_grace_secs = self.policy.grace.as_secs();
         report.runtime = "docker".to_string();
+        let store = self.resolve_store_states(&containers).await;
+        report.store_requested = store.requested;
+        report.store_answered = store.answered;
 
         for record in containers {
-            let decision = classify(&record, &active_jobs, &self.policy, now);
             let job_id = record.labels.get(JOB_ID_LABEL).cloned();
+            let store_state = job_id
+                .as_deref()
+                .and_then(|id| store.states.get(id).copied())
+                .unwrap_or(JobRowState::Unknown);
+            let decision = classify(&record, &active_jobs, store_state, &self.policy, now);
             let exited_age_ms = record.exited_at_ms.map(|t| now.now_ms.saturating_sub(t));
             report.candidates_seen += 1;
             if decision.is_eligible() {
                 report.eligible += 1;
+            }
+            if decision == Decision::EligibleLegacyOrphan {
+                report.legacy_orphans += 1;
             }
             report.entries.push(ReportEntry {
                 container_id: record.id,
@@ -337,14 +541,24 @@ impl<S: ContainerSource> Reconciler<S> {
         report.policy_deletion_enabled = self.policy.deletion_enabled;
         report.policy_grace_secs = self.policy.grace.as_secs();
         report.runtime = "docker".to_string();
+        let store = self.resolve_store_states(&containers).await;
+        report.store_requested = store.requested;
+        report.store_answered = store.answered;
 
         for record in containers {
-            let decision = classify(&record, &active_jobs, &self.policy, now);
             let job_id = record.labels.get(JOB_ID_LABEL).cloned();
+            let store_state = job_id
+                .as_deref()
+                .and_then(|id| store.states.get(id).copied())
+                .unwrap_or(JobRowState::Unknown);
+            let decision = classify(&record, &active_jobs, store_state, &self.policy, now);
             let exited_age_ms = record.exited_at_ms.map(|t| now.now_ms.saturating_sub(t));
             report.candidates_seen += 1;
             if decision.is_eligible() {
                 report.eligible += 1;
+            }
+            if decision == Decision::EligibleLegacyOrphan {
+                report.legacy_orphans += 1;
             }
             report.entries.push(ReportEntry {
                 container_id: record.id,
@@ -404,6 +618,9 @@ impl<S: ContainerSource> Reconciler<S> {
             ),
             candidates_seen: 0,
             eligible: 0,
+            store_requested: 0,
+            store_answered: 0,
+            legacy_orphans: 0,
             removed: 0,
             already_gone: 0,
             failed: 0,
@@ -434,8 +651,16 @@ impl DockerContainerSource {
                 "reconciler Docker call timeout must be positive",
             ));
         }
-        let docker = bollard::Docker::connect_with_local_defaults()
-            .map_err(|e| Error::sandbox(format!("reconciler docker connect failed: {e}")))?;
+        // The same daemon the sandbox talks to: the reconciler removes the
+        // containers the runner leaked, and a reconciler pointed at another
+        // daemon would never see them.
+        let socket = gitforge_common::docker_socket();
+        let docker = bollard::Docker::connect_with_unix(
+            &socket,
+            crate::docker::docker_client_timeout(),
+            bollard::API_DEFAULT_VERSION,
+        )
+        .map_err(|e| Error::sandbox(format!("reconciler docker connect failed: {e}")))?;
         Ok(Self {
             docker,
             call_timeout,
@@ -583,7 +808,13 @@ mod tests {
             created_at_ms: Some(0),
         };
         assert_eq!(
-            classify(&plain, &HashSet::new(), &policy(), now()),
+            classify(
+                &plain,
+                &HashSet::new(),
+                JobRowState::Unknown,
+                &policy(),
+                now()
+            ),
             Decision::RetainNotOwned
         );
 
@@ -596,7 +827,13 @@ mod tests {
             ..plain.clone()
         };
         assert_eq!(
-            classify(&wrong_value, &HashSet::new(), &policy(), now()),
+            classify(
+                &wrong_value,
+                &HashSet::new(),
+                JobRowState::Unknown,
+                &policy(),
+                now()
+            ),
             Decision::RetainNotOwned
         );
 
@@ -607,7 +844,13 @@ mod tests {
             ..plain.clone()
         };
         assert_eq!(
-            classify(&name_only, &HashSet::new(), &policy(), now()),
+            classify(
+                &name_only,
+                &HashSet::new(),
+                JobRowState::Unknown,
+                &policy(),
+                now()
+            ),
             Decision::RetainNotOwned
         );
     }
@@ -622,7 +865,13 @@ mod tests {
             created_at_ms: Some(0),
         };
         assert_eq!(
-            classify(&plain, &HashSet::new(), &policy(), now()),
+            classify(
+                &plain,
+                &HashSet::new(),
+                JobRowState::Unknown,
+                &policy(),
+                now()
+            ),
             Decision::RetainMalformedLabel
         );
         let bad = ContainerRecord {
@@ -636,9 +885,244 @@ mod tests {
             ..plain.clone()
         };
         assert_eq!(
-            classify(&bad, &HashSet::new(), &policy(), now()),
+            classify(
+                &bad,
+                &HashSet::new(),
+                JobRowState::Unknown,
+                &policy(),
+                now()
+            ),
             Decision::RetainMalformedLabel
         );
+    }
+
+    #[test]
+    fn pooled_container_is_retained_by_the_general_reconciler() {
+        // A pooled container carries a placeholder job id, so it looks
+        // exactly like an abandoned job container to any rule that only
+        // sees "managed" and "not an active job id". The general
+        // reconciler must not touch it: the pool's own reclamation rules
+        // (owner, generation, TTL, liveness) decide, and the two
+        // mechanisms must not disagree about the same container.
+        let rec = ContainerRecord {
+            id: "pooled-1".into(),
+            labels: HashMap::from([
+                (MANAGED_LABEL.to_string(), "true".to_string()),
+                (JOB_ID_LABEL.to_string(), uuid::Uuid::new_v4().to_string()),
+                (crate::pool::POOL_LABEL.to_string(), "true".to_string()),
+            ]),
+            running: true,
+            exited_at_ms: None,
+            created_at_ms: Some(9_000_000),
+        };
+        assert_eq!(
+            classify(
+                &rec,
+                &HashSet::new(),
+                JobRowState::Unknown,
+                &policy(),
+                now()
+            ),
+            Decision::RetainPool
+        );
+    }
+
+    /// The warm pool's pre-fix leftovers: managed, a job-shaped id that
+    /// was never a job, no pool label, running, and old.
+    fn legacy_orphan(job: &str) -> ContainerRecord {
+        ContainerRecord {
+            id: format!("cid-{job}"),
+            labels: HashMap::from([
+                (MANAGED_LABEL.to_string(), "true".to_string()),
+                (JOB_ID_LABEL.to_string(), job.to_string()),
+            ]),
+            running: true,
+            exited_at_ms: None,
+            created_at_ms: Some(NOW_MS - 10_000_000),
+        }
+    }
+
+    /// A policy with the store-backed legacy-orphan rule armed.
+    fn orphan_policy() -> ReconcilerPolicy {
+        ReconcilerPolicy {
+            deletion_enabled: true,
+            orphan_reclaim_enabled: true,
+            ..policy()
+        }
+    }
+
+    /// A resolver that answers from a fixed table. Ids it does not know
+    /// are `Unknown`, exactly as a store that cannot be read would answer.
+    struct FixedResolver {
+        states: HashMap<String, JobRowState>,
+    }
+
+    #[async_trait::async_trait]
+    impl JobExistenceResolver for FixedResolver {
+        async fn resolve(&self, job_ids: &[String]) -> HashMap<String, JobRowState> {
+            job_ids
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        self.states.get(id).copied().unwrap_or(JobRowState::Unknown),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn the_store_backed_rule_is_off_by_default() {
+        let job = uuid::Uuid::new_v4().to_string();
+        let rec = legacy_orphan(&job);
+        assert_eq!(
+            classify(&rec, &HashSet::new(), JobRowState::Absent, &policy(), now()),
+            Decision::RetainRunning,
+            "an unarmed reconciler never removes a container on a store lookup alone"
+        );
+    }
+
+    #[test]
+    fn a_legacy_orphan_the_store_has_never_heard_of_is_eligible() {
+        let job = uuid::Uuid::new_v4().to_string();
+        let rec = legacy_orphan(&job);
+        assert_eq!(
+            classify(
+                &rec,
+                &HashSet::new(),
+                JobRowState::Absent,
+                &orphan_policy(),
+                now()
+            ),
+            Decision::EligibleLegacyOrphan
+        );
+    }
+
+    #[test]
+    fn an_unknown_store_answer_retains_the_container() {
+        let job = uuid::Uuid::new_v4().to_string();
+        let rec = legacy_orphan(&job);
+        assert_eq!(
+            classify(
+                &rec,
+                &HashSet::new(),
+                JobRowState::Unknown,
+                &orphan_policy(),
+                now()
+            ),
+            Decision::RetainStoreUnknown
+        );
+    }
+
+    #[test]
+    fn a_present_store_answer_keeps_the_ordinary_rules() {
+        let job = uuid::Uuid::new_v4().to_string();
+        let rec = legacy_orphan(&job);
+        assert_eq!(
+            classify(
+                &rec,
+                &HashSet::new(),
+                JobRowState::Present,
+                &orphan_policy(),
+                now()
+            ),
+            Decision::RetainRunning,
+            "a job the store knows is decided by the ordinary rules"
+        );
+    }
+
+    #[test]
+    fn an_orphan_inside_its_ttl_is_retained() {
+        let job = uuid::Uuid::new_v4().to_string();
+        let mut rec = legacy_orphan(&job);
+        rec.created_at_ms = Some(NOW_MS - 60_000);
+        assert_eq!(
+            classify(
+                &rec,
+                &HashSet::new(),
+                JobRowState::Absent,
+                &orphan_policy(),
+                now()
+            ),
+            Decision::RetainOrphanWithinTtl
+        );
+    }
+
+    #[test]
+    fn an_orphan_with_an_unknown_age_is_retained() {
+        let job = uuid::Uuid::new_v4().to_string();
+        let mut rec = legacy_orphan(&job);
+        rec.created_at_ms = None;
+        assert_eq!(
+            classify(
+                &rec,
+                &HashSet::new(),
+                JobRowState::Absent,
+                &orphan_policy(),
+                now()
+            ),
+            Decision::RetainUnknownAge
+        );
+    }
+
+    #[test]
+    fn the_pool_keeps_its_containers_even_with_the_rule_armed() {
+        let job = uuid::Uuid::new_v4().to_string();
+        let mut rec = legacy_orphan(&job);
+        rec.labels
+            .insert(crate::pool::POOL_LABEL.to_string(), "true".to_string());
+        assert_eq!(
+            classify(
+                &rec,
+                &HashSet::new(),
+                JobRowState::Absent,
+                &orphan_policy(),
+                now()
+            ),
+            Decision::RetainPool,
+            "the pool's own contract owns pooled containers; the two rules must not disagree"
+        );
+    }
+
+    #[test]
+    fn an_active_job_is_retained_even_with_the_rule_armed() {
+        let job = uuid::Uuid::new_v4().to_string();
+        let rec = legacy_orphan(&job);
+        let active = HashSet::from([job.clone()]);
+        assert_eq!(
+            classify(&rec, &active, JobRowState::Absent, &orphan_policy(), now()),
+            Decision::RetainActiveJob
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconcile_pass_removes_a_legacy_orphan_the_store_denies() {
+        let job = uuid::Uuid::new_v4().to_string();
+        let source = Arc::new(MockSource::new(vec![legacy_orphan(&job)]));
+        let resolver = Arc::new(FixedResolver {
+            states: HashMap::from([(job.clone(), JobRowState::Absent)]),
+        });
+        let reconciler = Reconciler::new(source.clone(), orphan_policy()).with_resolver(resolver);
+        let registry = ActiveJobRegistry::new();
+        let report = reconciler.reconcile(&registry, now()).await.unwrap();
+
+        assert_eq!(report.legacy_orphans, 1);
+        assert_eq!(report.removed, 1);
+        assert_eq!(source.removed_ids(), vec![format!("cid-{job}")]);
+    }
+
+    #[tokio::test]
+    async fn a_reconcile_pass_without_a_resolver_retains_every_container() {
+        let job = uuid::Uuid::new_v4().to_string();
+        let source = Arc::new(MockSource::new(vec![legacy_orphan(&job)]));
+        let reconciler = Reconciler::new(source.clone(), orphan_policy());
+        let registry = ActiveJobRegistry::new();
+        let report = reconciler.reconcile(&registry, now()).await.unwrap();
+
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.legacy_orphans, 0);
+        assert!(source.removed_ids().is_empty());
     }
 
     #[test]
@@ -649,7 +1133,13 @@ mod tests {
             Some(10 * 365 * 24 * 3600 * 1000),
         );
         assert_eq!(
-            classify(&rec, &HashSet::new(), &policy(), now()),
+            classify(
+                &rec,
+                &HashSet::new(),
+                JobRowState::Unknown,
+                &policy(),
+                now()
+            ),
             Decision::RetainRunning
         );
     }
@@ -660,7 +1150,7 @@ mod tests {
         let rec = owned(&job, false, Some(10 * 365 * 24 * 3600 * 1000));
         let active = HashSet::from([job.clone()]);
         assert_eq!(
-            classify(&rec, &active, &policy(), now()),
+            classify(&rec, &active, JobRowState::Unknown, &policy(), now()),
             Decision::RetainActiveJob
         );
     }
@@ -671,19 +1161,37 @@ mod tests {
         // Exited 59 minutes ago: inside grace.
         let fresh = owned(&job, false, Some(59 * 60 * 1000));
         assert_eq!(
-            classify(&fresh, &HashSet::new(), &policy(), now()),
+            classify(
+                &fresh,
+                &HashSet::new(),
+                JobRowState::Unknown,
+                &policy(),
+                now()
+            ),
             Decision::RetainGracePeriod
         );
         // Exited exactly at grace: eligible.
         let boundary = owned(&job, false, Some(3600 * 1000));
         assert_eq!(
-            classify(&boundary, &HashSet::new(), &policy(), now()),
+            classify(
+                &boundary,
+                &HashSet::new(),
+                JobRowState::Unknown,
+                &policy(),
+                now()
+            ),
             Decision::Eligible
         );
         // Unknown exit time: fail closed.
         let unknown = owned(&job, false, None);
         assert_eq!(
-            classify(&unknown, &HashSet::new(), &policy(), now()),
+            classify(
+                &unknown,
+                &HashSet::new(),
+                JobRowState::Unknown,
+                &policy(),
+                now()
+            ),
             Decision::RetainGracePeriod
         );
     }
@@ -697,7 +1205,13 @@ mod tests {
             ..policy()
         };
         assert_eq!(
-            classify(&rec, &HashSet::new(), &census_only, now()),
+            classify(
+                &rec,
+                &HashSet::new(),
+                JobRowState::Unknown,
+                &census_only,
+                now()
+            ),
             Decision::RetainPolicyDisabled
         );
     }

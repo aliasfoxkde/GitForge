@@ -2,16 +2,23 @@
 #
 # The project's own gates, run by the project itself: a shellcheck pass over
 # the release-channel ops scripts, rustfmt --check plus the route-docs drift
-# gate, the strict clippy pass, the workspace test suite, the line-coverage
-# gate, and a bounded fuzz smoke over the untrusted-input parsers. Pushes to
-# any branch run the full chain, so a PR branch is validated here before it
-# merges.
+# gate, the strict clippy pass, the workspace test suite, the docker-dependent
+# tests that `cargo test` skips, the line-coverage gate, and a bounded fuzz
+# smoke over the untrusted-input parsers. Pushes to any branch run the full
+# chain, so a PR branch is validated here before it merges.
 #
 # CHANGE-DETECTION PRUNING: the detect-changes job enumerates files changed
 # vs the merge-base with origin/main and classifies them. Downstream jobs
 # use skip_if to skip themselves when their class of file hasn't changed:
 #   - clippy: skips when no Rust source or crates/ changed
+#     NOTE (2026-11-01, debt): clippy --all-targets also lints tests, but a
+#     tests-only change (CI_CHANGE_INCLUDE_TESTS=1, CODE=CRATES=0) skips the
+#     clippy job — caught live on 3dbd166d's parent (48618cf0): an E0425 in
+#     services/api/tests compiled only by the test job. Acceptable because
+#     test compiles everything, but clippy-grade lints on tests-only diffs
+#     are unenforced until the skip_if includes TESTS.
 #   - test: skips when no source, crates/, or tests changed
+#   - docker-integration: skips when no Rust source or crates/ changed
 #   - coverage: skips when no source, crates/, or tests changed
 #   - fuzz: skips when no source or crates/ changed
 # A doc-only push (e.g. updating a README) runs detect-changes → lint → fmt
@@ -21,7 +28,9 @@
 # Documented constraints (same list proven in gods-eye-view's and dsc's
 # .gitforce.yml):
 # - The job graph is a LINEAR CHAIN (detect-changes → lint → fmt → clippy →
-#   test → coverage → fuzz), not a fan-out,
+#   test → docker-integration → coverage → fuzz), not a fan-out,
+# - `environment: {}` is required by the parser (PipelineDefinition has no
+#   serde default) even though it is never forwarded.
 #   because all jobs of one run share the SAME workspace directory on this
 #   runner. Concurrent jobs would run cargo against the same target/
 #   directory and corrupt each other's build locks.
@@ -55,9 +64,9 @@
 #   every time; the host directory is keyed by image tag ({image}), so a
 #   rebuilt image starts from an empty cache rather than inheriting
 #   artifacts compiled by a different toolchain. The host location comes
-#   from the runner's GITFORGE_CACHE_ROOT. A cache mount that cannot be
-#   prepared degrades to a cold build with a warning — it is an
-#   optimisation, never a correctness requirement.
+#   from the runner's GITFORGE_CACHE_ROOT. A mount that cannot be prepared
+#   fails the job: the runner reports it as an infrastructure failure, so
+#   the reason reaches the job's own result instead of a log line.
 name: gitforge-ci
 version: "1.0"
 trigger_on:
@@ -86,13 +95,38 @@ jobs:
         # The aegis pattern scan stays host-side (make lint / make aegis):
         # the binary is a locally-built tool, not distro-packaged, and is
         # not baked into this image.
-        run: shellcheck scripts/*.sh scripts/gitforge-* scripts/qualityctl scripts/verify-user-systemd-policy systemd/*.sh
+        run: shellcheck scripts/*.sh scripts/gitforge-* scripts/qualityctl scripts/verify-user-systemd-policy systemd/*.sh tests/*.sh
       - name: Change-detection selftest (skip_if classification)
         # detect-changes.sh is a single point of decision for the whole
         # quality chain: a misclassification silently skips (or pointlessly
         # runs) every gated job. These synthetic-repo cases pin the
         # contract, including the main-push tip-diff fallback.
         run: bash tests/detect-changes-selftest.sh
+      - name: Cutover unit-detection selftest
+        # The release cutover decides which units to stop and start from
+        # what systemctl reports. A detection gap there is a silent no-op
+        # release: the symlink flips, nothing restarts, the old binaries
+        # keep serving, and the cutover reports success. The NAS profile
+        # runs template INSTANCES, which `systemctl list-unit-files` does
+        # not enumerate at all - so this selftest pins the instance-aware
+        # detection against a stubbed systemctl.
+        run: bash tests/remote-cutover-unit-detection-selftest.sh
+      - name: Release restart-plan selftest (masked units excluded)
+        # The release channel restarts a hardcoded unit list. A unit
+        # masked on this host is a retired component - restarting it made
+        # every promote roll back (2026-10-10). The skip has to survive
+        # future edits to that list, and only a test pins it: the failure
+        # otherwise shows up on the release channel and nowhere else.
+        run: bash tests/release-auto-restart-plan-selftest.sh
+      - name: Release busy-gate selftest (store, not container names)
+        # The release channel defers a cutover while jobs are in flight.
+        # The busy signal has to come from the authoritative store: the
+        # runner keeps a warm pool of containers that have no job row, so
+        # counting containers deferred every cutover forever (GF-16). The
+        # selftest pins the store-backed count, the stale-row case that
+        # would otherwise wedge the gate, and the fail-closed behaviour
+        # when the store cannot be read.
+        run: bash tests/release-auto-busy-gate-selftest.sh
     timeout: 10m
 
   - name: fmt
@@ -172,9 +206,59 @@ jobs:
         run: cargo test --workspace -- --test-threads=2
     timeout: 90m
 
-  - name: coverage
+  - name: docker-integration
     image: dsc-ci-rust:16
     needs: [test]
+    cache:
+      # Compiled-artifact cache: the runner bind-mounts a host directory
+      # (keyed by the image tag) at /cargo-target and exports
+      # CARGO_TARGET_DIR pointing at it. The mount path inside the
+      # container is FIXED, so cargo can reuse the dependency artifacts
+      # an earlier run compiled instead of rebuilding the world every
+      # time; the host directory is keyed by image tag ({image}), so a
+      # rebuilt image starts from an empty cache rather than inheriting
+      # artifacts compiled by a different toolchain. The host location
+      # comes from the runner's GITFORGE_CACHE_ROOT.
+      source: "{cache_root}/cargo/{image}"
+      mount_path: /cargo-target
+    skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" ]]'
+    env:
+      # The daemon socket is mounted at the well-known path inside the
+      # container, so the tests inside it talk to the daemon there.
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      # The daemon socket, so the job's tests can drive a real daemon.
+      # `{docker_socket}` expands to the socket of the daemon THIS runner
+      # uses — a rootless podman runner's socket is not the system-wide
+      # path. Read-only: the mount grants the daemon API, which is already
+      # host-root-equivalent, and the socket file itself needs no writes.
+      # The sandbox detects the socket and runs this container with SELinux
+      # labeling disabled — the socket's type does not match the
+      # container's label, so the daemon refuses the connection otherwise.
+      - source: "{docker_socket}"
+        destination: /var/run/docker.sock
+        read_only: true
+    steps:
+      - name: Docker-dependent tests (cargo test -- --ignored)
+        # The `#[ignore]`-gated tests are the only coverage of the runner's
+        # container timeout reaping and of the sandbox's real container
+        # lifecycle. They were never run by any gate, so a release could
+        # ship a broken isolation path and every green run would still
+        # report success. `cargo test` alone skips them entirely.
+        #
+        # Scoped to the two crates that carry them and to test targets
+        # only: the workspace's doctests accept no `--ignored` filter, and
+        # the remaining crates have no daemon-dependent tests to run.
+        #
+        # The job container talks to the daemon over the socket mounted
+        # above, so the daemon it drives is the host's — the same daemon
+        # that runs this job.
+        run: cargo test -p gitforge-sandbox -p gitforge-runner --lib --tests -- --ignored --test-threads=2
+    timeout: 30m
+
+  - name: coverage
+    image: dsc-ci-rust:16
+    needs: [docker-integration]
     cache:
       # Compiled-artifact cache: the runner bind-mounts a host directory
       # (keyed by the image tag) at /cargo-target and exports

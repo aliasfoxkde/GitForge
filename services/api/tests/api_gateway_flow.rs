@@ -34,7 +34,7 @@ struct ApiService {
     child: tokio::process::Child,
     port: u16,
     db_path: PathBuf,
-    harness_passphrase: String,
+    passphrase: String,
 }
 
 impl Drop for ApiService {
@@ -83,6 +83,7 @@ async fn spawn_api() -> ApiService {
         .env("DATABASE_URL", format!("sqlite:{}", db_path.display()))
         .env("JWT_SECRET", "harness-jwt-secret")
         .env("GITFORGE_ARTIFACT_ROOT", &artifacts)
+        .env("GIT_ROOT", base.join("git-root"))
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -111,7 +112,7 @@ async fn spawn_api() -> ApiService {
         child,
         port,
         db_path,
-        harness_passphrase,
+        passphrase: harness_passphrase,
     }
 }
 
@@ -145,7 +146,7 @@ async fn test_login_and_authenticated_repository_and_ssh_key_flow() {
         .expect("bad login request");
     assert_eq!(bad.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    let good = login(&service.harness_passphrase)
+    let good = login(&service.passphrase)
         .send()
         .await
         .expect("login request");
@@ -286,7 +287,7 @@ async fn test_pipeline_run_status_rejects_invalid_credentials() {
         .post(format!("{base}/auth/login"))
         .json(&serde_json::json!({
             "username": "gatewayowner",
-            "password": &service.harness_passphrase,
+            "password": &service.passphrase,
         }))
         .send()
         .await

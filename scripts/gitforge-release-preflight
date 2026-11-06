@@ -2,8 +2,9 @@
 set -euo pipefail
 
 source_root="${1:-}"
-if [[ -z "$source_root" ]]; then
-  echo 'usage: gitforge-release-preflight <release-source-root>' >&2
+expected_commit="${2:-}"
+if [[ -z "$source_root" || -z "$expected_commit" ]]; then
+  echo 'usage: gitforge-release-preflight <release-source-root> <expected-source-commit>' >&2
   exit 64
 fi
 
@@ -26,3 +27,10 @@ if ((${#missing[@]})); then
 fi
 
 printf 'release preflight: all candidate binaries present (%d); CI owns scheduler\n' "${#required[@]}"
+
+# Presence and executability are not provenance. The release binaries live in
+# gitignored paths, so stale leftovers are indistinguishable from fresh ones
+# by looking at the checkout: only the binaries themselves can say which
+# commit they were built from (GF-14, 2026-11-05). The expected commit is
+# required here so that no caller can skip the check.
+"$(dirname "$0")/gitforge-release-stamps" "$source_root" "$expected_commit"

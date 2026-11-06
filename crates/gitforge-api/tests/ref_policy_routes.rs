@@ -31,9 +31,10 @@ use serde_json::{json, Value};
 use std::sync::OnceLock;
 use tower::ServiceExt;
 
-/// One shared GIT_ROOT for the whole test binary: `update_ref_policy` reads
-/// the environment variable on every call, and the tests in one binary share
-/// a process. Repositories provisioned through the storage backend land in
+/// One shared storage root for the whole test binary. The tests in one
+/// binary share a process, so the root is created once and injected into
+/// every server rather than read from the process environment on each
+/// request. Repositories provisioned through the storage backend land in
 /// here as real bare repositories so the git config write can succeed.
 fn git_root() -> &'static str {
     static GIT_ROOT: OnceLock<String> = OnceLock::new();
@@ -41,8 +42,6 @@ fn git_root() -> &'static str {
         let dir =
             std::env::temp_dir().join(format!("gitforge-ref-policy-tests-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Safety: single-threaded process-wide initialization via OnceLock.
-        std::env::set_var("GIT_ROOT", &dir);
         dir.to_string_lossy().into_owned()
     })
 }
@@ -93,7 +92,12 @@ async fn seed(owner_username: &str, repo_name: &str) -> Fixture {
     let auth = ApiAuth::new("test-secret");
     let token_for =
         |user: &User, role: &str| auth.generate_token(user.id, &user.username, role).unwrap();
-    let app = ApiServer::new("test-secret", pool.clone()).into_router();
+    let app = ApiServer::with_storage(
+        "test-secret",
+        pool.clone(),
+        Some(std::path::PathBuf::from(git_root())),
+    )
+    .into_router();
     Fixture {
         app,
         pool,

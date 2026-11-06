@@ -168,6 +168,16 @@ impl TriggerFailure {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The release chain asks a binary for the commit it was built from
+    // (scripts/gitforge-release-stamps). Answer before any other work so
+    // that asking for provenance never starts a service, opens a database
+    // or binds a port.
+    if let Some(line) =
+        gitforge_common::build::version_line_if_requested("ci", std::env::args().skip(1))
+    {
+        println!("{line}");
+        return Ok(());
+    }
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -2527,9 +2537,27 @@ async fn handle_push_event(
     let trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
     let pipeline_id = trigger_event.pipeline_id;
 
+    // The commit the ref pointed at BEFORE this push. A branch creation
+    // carries an all-zero old hash: there is no base, so nothing is
+    // published and the consumer fails safe. The base must travel with the
+    // run because the CI workspace clones AFTER the push landed — inside
+    // the workspace `origin/main` already IS the pushed tip, so a merge-base
+    // range diff is empty by construction and the only surviving base is
+    // the one the platform captured at push time.
+    let push_base = if gitforge_common::is_zero_hash(&payload.old_hash) {
+        None
+    } else {
+        Some(payload.old_hash.clone())
+    };
+
+    // The engine runs the augmented definition; the committed definition
+    // stays pristine for the pipeline cache and the persisted pipeline
+    // config, so a later run does not inherit a stale push base.
+    let engine_pipeline = gitforge_ci::pipeline::with_push_base(&pipeline, push_base.as_deref());
+
     // Create and start the CI engine
     let engine = Arc::new(
-        CiEngine::new(trigger_event, pipeline.clone())
+        CiEngine::new(trigger_event, engine_pipeline)
             .await
             .map_err(|e| TriggerFailure::terminal(e.into()))?,
     );
@@ -2574,6 +2602,7 @@ async fn handle_push_event(
         );
         db_run.id = state.run_id;
         db_run.ref_name = Some(payload.ref_name.clone());
+        db_run.push_base_sha = push_base.clone();
         db_run.start();
         gitforge_db::queries::PipelineQueries::activate_pipeline_and_create_run(
             pool,
@@ -2621,6 +2650,25 @@ async fn handle_push_event(
                     state.run_id
                 ))
             })?;
+            // Durable-plan BEFORE the workspace clone. prepare_run_workspace
+            // clones the whole bare repository, and on slow storage it can
+            // take minutes or hang (GF-19: the 2026-11-06 runs stranded as
+            // `running` with ZERO job rows because planning ran only after
+            // the clone returned). The clone does not affect the job SET or
+            // any definition field except the workspace fallback in
+            // `working_dir`, and enqueue_ready_jobs' upsert re-persists the
+            // full execution plan with the real workspace path, so a row
+            // written now is corrected before any runner sees it. A hung
+            // clone now strands a PLANNED run: rows exist, reconciliation
+            // and the store see the run's true shape, and a clone failure
+            // grades the run failed with traceable rows instead of a hollow
+            // `running`.
+            if let Err(error) = persist_planned_jobs(pool, &engine, state.run_id, None).await {
+                tracing::error!(run = %state.run_id, %error, "failed to persist planned jobs before workspace prep");
+                fail_run(pool, state.run_id, &error).await;
+                pipeline_registry.write().await.remove(&state.run_id);
+                return Err(TriggerFailure::terminal_after_run(error, state.run_id));
+            }
             match prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await {
                 Ok(path) => Some(path),
                 Err(error) => {
@@ -2821,14 +2869,43 @@ async fn run_scheduler_event_consumer(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(_) => break,
         };
-        let SchedulerEvent::JobCompleted {
-            job_id,
-            pipeline_run_id,
-            runner_id,
-            success,
-        } = event
-        else {
-            continue;
+        let (job_id, pipeline_run_id, runner_id, success) = match event {
+            SchedulerEvent::JobAssigned {
+                job_id,
+                runner_id,
+                pipeline_run_id,
+            } => {
+                // The engine's mirror must leave `Queued` when the job is
+                // dispatched: `ready_jobs()` releases every job that is
+                // still `Queued`, so a dispatched job whose mirror stayed
+                // `Queued` was re-enqueued by every later completion of
+                // the run. That duplicate enqueue demoted the running
+                // job's durable row, which refused the runner's heartbeat
+                // and rotated its lease token (GF-12).
+                let engine = pipeline_registry
+                    .read()
+                    .await
+                    .get(&pipeline_run_id)
+                    .cloned();
+                let Some(engine) = engine else {
+                    tracing::warn!(
+                        "assignment received for unknown pipeline run {}",
+                        pipeline_run_id
+                    );
+                    continue;
+                };
+                if let Err(error) = engine.assign_job(job_id, runner_id).await {
+                    tracing::error!(%job_id, %error, "failed to mark the dispatched job assigned");
+                }
+                continue;
+            }
+            SchedulerEvent::JobCompleted {
+                job_id,
+                pipeline_run_id,
+                runner_id,
+                success,
+            } => (job_id, pipeline_run_id, runner_id, success),
+            _ => continue,
         };
         let engine = pipeline_registry
             .read()
@@ -3141,6 +3218,18 @@ async fn persist_planned_jobs(
         // Durable-write discipline (F21/F23): losing one row to a transient
         // busy aborts the whole loop and strands a half-planned run (the
         // caller fails it), so each row fights contention instead.
+        // Skip rows the pre-clone planning pass already wrote (GF-19:
+        // planning runs before AND after the workspace clone so a hung
+        // clone cannot strand a jobless `running` row). A plain re-create
+        // would hit the unique id and fail the run; the working_dir the
+        // second pass would correct is fixed at dispatch time anyway, when
+        // enqueue_ready_jobs' upsert rewrites the full definition.
+        if gitforge_db::queries::JobQueries::get(pool, db_job.id)
+            .await
+            .is_ok_and(|row| row.is_some())
+        {
+            continue;
+        }
         persist_with_retry(|| gitforge_db::queries::JobQueries::create(pool, &db_job)).await?;
     }
     tracing::info!(run = %run_id, planned = planned.len(), "persisted planned job rows");
@@ -3276,6 +3365,13 @@ async fn rebuild_live_engines(
         // the engine absorbed it — all leave no running row behind, and the
         // stalled chains observed live (tail rows pending for ~21h across a
         // control-plane restart) are exactly of that shape.
+        // The persisted pipeline config holds the committed definition
+        // (no push base); the run row holds the base the push carried.
+        // Re-injecting it here is what makes the push base survive a
+        // control-plane restart — the `jobs` table has no env column, so
+        // this is the only durable carrier.
+        let definition =
+            gitforge_ci::pipeline::with_push_base(&definition, run.push_base_sha.as_deref());
         let engine = match CiEngine::rebuild(
             run.id,
             run.pipeline_id,
@@ -5988,6 +6084,248 @@ jobs:
                 .is_empty(),
             "a ref-deletion push must not prepare a run workspace"
         );
+    }
+
+    // --- Push base publication (CI_PUSH_BASE_SHA) ---
+    //
+    // The CI workspace clones AFTER the push landed, so inside the
+    // workspace `origin/main` already IS the pushed tip: a merge-base range
+    // diff is empty by construction, and the tip commit alone describes
+    // only the last commit of a multi-commit push. The pre-push tip is the
+    // only base that describes the whole push, and it reaches the consumer
+    // solely through the job environment.
+
+    /// A two-job definition whose pipeline-level environment is empty, so
+    /// the push base is the only variable a job can carry.
+    fn push_base_pipeline() -> PipelineDefinition {
+        let job = |name: &str, needs: &[&str]| JobDefinition {
+            name: name.to_string(),
+            image: "rust:latest".to_string(),
+            needs: needs.iter().map(ToString::to_string).collect(),
+            env: HashMap::new(),
+            steps: vec![StepDefinition {
+                name: format!("{name}-step"),
+                run: "true".to_string(),
+                env: None,
+                working_directory: None,
+                condition: None,
+            }],
+            timeout: None,
+            retry: None,
+            skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
+            lane: Default::default(),
+            fault: None,
+        };
+        PipelineDefinition {
+            name: "push-base-pipeline".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![
+                job("detect-changes", &[]),
+                job("clippy", &["detect-changes"]),
+            ],
+        }
+    }
+
+    /// A push envelope for `repo_id` carrying `old_hash` as the pre-push
+    /// tip of the ref.
+    fn push_envelope(repo_id: gitforge_common::RepoId, old_hash: &str) -> EventEnvelope {
+        EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: old_hash.to_string(),
+                new_hash: "b".repeat(40),
+                pusher_id: None,
+                pipeline_id: None,
+            }),
+            Some(repo_id),
+            None,
+        )
+    }
+
+    /// What one push produced: the durable run row, the environment of every
+    /// planned job, and the definition the pipeline cache kept.
+    struct PushOutcome {
+        run: gitforge_db::models::PipelineRun,
+        job_envs: Vec<(String, HashMap<String, String>)>,
+        cached_environment: HashMap<String, String>,
+        persisted_environment: HashMap<String, String>,
+    }
+
+    /// Drive one push through `handle_push_event` and collect what it
+    /// produced.
+    async fn plan_push(old_hash: &str) -> PushOutcome {
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let user = gitforge_db::models::User::new(
+            "push-base-owner".to_string(),
+            "push-base-owner@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .expect("create user");
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository::new_with_id(
+                repo_id,
+                "push-base-repo".to_string(),
+                user.id,
+                std::env::temp_dir()
+                    .join(format!("gitforge-push-base-{repo_id}"))
+                    .display()
+                    .to_string(),
+            ),
+        )
+        .await
+        .expect("create repository");
+
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        pipeline_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(repo_id, push_base_pipeline());
+        // The workspace is pre-seeded so the push plans without cloning: the
+        // subject here is the environment the jobs carry, not the checkout.
+        let workspace_paths: Arc<
+            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        workspace_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                repo_id,
+                Some("/tmp/gitforge-push-base-workspace".to_string()),
+            );
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let outcome = handle_push_event(
+            &push_envelope(repo_id, old_hash),
+            &scheduler,
+            &pipeline_cache,
+            Some(&pool),
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        .expect("a push plans a run");
+        let TriggerOutcome::Started(run_id) = outcome else {
+            panic!("a push must start a run");
+        };
+
+        let run = gitforge_db::queries::PipelineRunQueries::get(&pool, run_id)
+            .await
+            .expect("read run row")
+            .expect("durable run row");
+        let engine = pipeline_registry
+            .read()
+            .await
+            .get(&run_id)
+            .cloned()
+            .expect("the planned engine is registered");
+        let job_envs = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(job_id, name)| {
+                let env = engine
+                    .job_definition(job_id)
+                    .expect("planned job definition")
+                    .env;
+                (name, env)
+            })
+            .collect();
+
+        let cached_environment = pipeline_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&repo_id)
+            .expect("cached definition")
+            .environment
+            .clone();
+        let persisted_environment =
+            gitforge_db::queries::PipelineQueries::get(&pool, run.pipeline_id)
+                .await
+                .expect("read pipeline row")
+                .expect("durable pipeline row")
+                .config
+                .get("environment")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default();
+
+        PushOutcome {
+            run,
+            job_envs,
+            cached_environment,
+            persisted_environment,
+        }
+    }
+
+    // The pre-push tip must reach EVERY planned job: a classifier that
+    // reads only its own job's environment sees an empty range otherwise.
+    #[tokio::test]
+    async fn test_push_event_publishes_the_push_base_to_every_job() {
+        let old_hash = "a".repeat(40);
+        let outcome = plan_push(&old_hash).await;
+
+        assert_eq!(
+            outcome.run.push_base_sha.as_deref(),
+            Some(old_hash.as_str()),
+            "the durable run row carries the pre-push tip"
+        );
+        assert_eq!(outcome.run.ref_name.as_deref(), Some("refs/heads/main"));
+        assert_eq!(outcome.job_envs.len(), 2, "the pipeline has two jobs");
+        for (name, env) in &outcome.job_envs {
+            assert_eq!(
+                env.get(gitforge_ci::pipeline::PUSH_BASE_ENV),
+                Some(&old_hash),
+                "job {name} must carry the pre-push tip"
+            );
+        }
+
+        // The push base belongs to the RUN, not to the definition: the
+        // cached definition and the persisted pipeline config stay pristine
+        // so a later run cannot inherit a stale base.
+        assert!(
+            !outcome
+                .cached_environment
+                .contains_key(gitforge_ci::pipeline::PUSH_BASE_ENV),
+            "the cached definition must not carry a push base"
+        );
+        assert!(
+            !outcome
+                .persisted_environment
+                .contains_key(gitforge_ci::pipeline::PUSH_BASE_ENV),
+            "the persisted pipeline config must not carry a push base"
+        );
+    }
+
+    // A branch creation has no pre-push tip: nothing is published, so the
+    // consumer sees no variable and fails safe.
+    #[tokio::test]
+    async fn test_push_event_with_a_zero_old_hash_publishes_no_push_base() {
+        let outcome = plan_push(&"0".repeat(40)).await;
+
+        assert_eq!(
+            outcome.run.push_base_sha, None,
+            "a branch creation has no pre-push tip"
+        );
+        for (name, env) in &outcome.job_envs {
+            assert!(
+                !env.contains_key(gitforge_ci::pipeline::PUSH_BASE_ENV),
+                "job {name} must not carry a push base for a branch creation"
+            );
+        }
     }
 
     // --- Trigger settlement classification ---

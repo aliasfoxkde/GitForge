@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Verify that the release binaries in a directory were built from the commit
+# the bundle claims, and describe how they were built.
+#
+# Usage:
+#   gitforge-release-stamps <binary-dir> <expected-commit>
+#   gitforge-release-stamps --field <toolchain|built> <binary-dir>
+#
+# Every release binary answers `--version` with a line carrying
+# `commit=<40-hex>`, `dirty=false`, `toolchain=<rustc version>` and
+# `built=<RFC 3339 UTC>`. A binary that cannot be executed, that names a
+# different commit, that was built from a modified tree, or that cannot say
+# how it was built, is refused.
+#
+# The `--field` mode prints the value the binaries agree on, and is how the
+# bundler and the verifier describe a bundle FROM the binaries it ships
+# instead of from the machine that assembled it (GF-15, 2026-11-06).
+#
+# This check is what makes the bundle's provenance claim true. The release
+# binaries live in gitignored paths, so a bundle assembled from stale
+# leftovers used to pass every other gate while stamping a commit it was
+# never built from (GF-14, 2026-11-05). The claim now has to be carried by
+# the binaries themselves.
+set -euo pipefail
+
+required=(api ci git-server runner)
+
+usage() {
+  echo 'usage: gitforge-release-stamps <binary-dir> <expected-commit>' >&2
+  echo '       gitforge-release-stamps --field <toolchain|built> <binary-dir>' >&2
+  exit 64
+}
+
+# The version line a binary prints, or a refusal.
+version_line_of() {
+  local path="$1" output
+  if [[ ! -x "$path" ]]; then
+    printf 'release stamps: missing or non-executable binary: %s\n' "$path" >&2
+    exit 1
+  fi
+  if ! output=$(timeout 15 "$path" --version 2>/dev/null); then
+    printf 'release stamps: %s did not report a version (non-zero exit or timeout)\n' "$path" >&2
+    exit 1
+  fi
+  printf '%s\n' "$output"
+}
+
+# One field of a version line.
+#
+# `toolchain` carries spaces (a `rustc --version` line does), so it is
+# anchored on the field that follows it rather than on a word boundary.
+field_of() {
+  local output="$1" field="$2" value
+  case "$field" in
+    commit) value=$(printf '%s\n' "$output" | sed -n 's/.*commit=\([0-9a-f]\{40\}\).*/\1/p') ;;
+    dirty) value=$(printf '%s\n' "$output" | sed -n 's/.*dirty=\([a-z]*\).*/\1/p') ;;
+    toolchain) value=$(printf '%s\n' "$output" | sed -n 's/.* toolchain=\(.*\) built=.*/\1/p') ;;
+    built) value=$(printf '%s\n' "$output" | sed -n 's/.* built=\(.*\)/\1/p') ;;
+    *)
+      printf 'release stamps: unknown field: %s\n' "$field" >&2
+      exit 64
+      ;;
+  esac
+  printf '%s' "${value%%$'\n'*}"
+}
+
+if [[ "${1:-}" == "--field" ]]; then
+  field="${2:-}"
+  binary_dir="${3:-}"
+  if [[ -z "$field" || -z "$binary_dir" ]]; then
+    usage
+  fi
+  case "$field" in
+    toolchain|built) ;;
+    *)
+      printf 'release stamps: unknown field: %s\n' "$field" >&2
+      exit 64
+      ;;
+  esac
+
+  agreed=""
+  for binary in "${required[@]}"; do
+    line=$(version_line_of "$binary_dir/$binary")
+    value=$(field_of "$line" "$field")
+    if [[ -z "$value" ]]; then
+      printf 'release stamps: %s does not report %s\n' "$binary_dir/$binary" "$field" >&2
+      exit 1
+    fi
+    if [[ -z "$agreed" ]]; then
+      agreed="$value"
+    elif [[ "$value" != "$agreed" ]]; then
+      printf 'release stamps: the binaries disagree about %s (%s vs %s)\n' \
+        "$field" "$agreed" "$value" >&2
+      exit 1
+    fi
+  done
+  printf '%s\n' "$agreed"
+  exit 0
+fi
+
+binary_dir="${1:-}"
+expected_commit="${2:-}"
+
+if [[ -z "$binary_dir" || -z "$expected_commit" ]]; then
+  usage
+fi
+
+if [[ ! "$expected_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'release stamps: expected commit must be 40 lowercase hex characters: %s\n' "$expected_commit" >&2
+  exit 64
+fi
+
+for binary in "${required[@]}"; do
+  path="$binary_dir/$binary"
+  output=$(version_line_of "$path")
+
+  # sed keeps its exit status at 0 when it matches nothing, so an unstamped
+  # binary lands here as an empty value rather than a failed pipeline.
+  commit=$(field_of "$output" commit)
+  dirty=$(field_of "$output" dirty)
+  toolchain=$(field_of "$output" toolchain)
+  built=$(field_of "$output" built)
+
+  if [[ -z "$commit" ]]; then
+    printf 'release stamps: %s does not report a build commit\n' "$path" >&2
+    exit 1
+  fi
+  if [[ "$commit" != "$expected_commit" ]]; then
+    printf 'release stamps: %s was built from %s but the bundle claims %s\n' \
+      "$path" "$commit" "$expected_commit" >&2
+    exit 1
+  fi
+  if [[ "$dirty" != "false" ]]; then
+    printf 'release stamps: %s was built from a tree that was not clean (dirty=%s)\n' \
+      "$path" "${dirty:-unknown}" >&2
+    exit 1
+  fi
+  if [[ -z "$toolchain" || "$toolchain" == "unknown" ]]; then
+    printf 'release stamps: %s does not report the toolchain it was built with\n' "$path" >&2
+    exit 1
+  fi
+  if [[ -z "$built" || "$built" == "unknown" ]]; then
+    printf 'release stamps: %s does not report when it was built\n' "$path" >&2
+    exit 1
+  fi
+
+  printf 'release stamps: %s commit=%s dirty=%s built=%s toolchain=%s\n' \
+    "$binary" "$commit" "$dirty" "$built" "$toolchain"
+done

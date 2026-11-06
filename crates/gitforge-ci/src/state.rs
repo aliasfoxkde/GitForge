@@ -83,6 +83,18 @@ impl JobStateMachine {
 
     /// Transition to assigned state
     pub fn assign(&mut self, runner_id: RunnerId) -> Result<()> {
+        // Re-asserting an assignment is idempotent: the scheduler emits
+        // `JobAssigned` when it dispatches a job, and the completion
+        // consumer replays the same transition when the runner reports
+        // back. The replay must not read as an invalid transition.
+        if self.status == JobStatus::Assigned {
+            if self.runner_id.is_some_and(|current| current != runner_id) {
+                return Err(gitforge_common::Error::invalid_input(
+                    "job is already assigned to another runner",
+                ));
+            }
+            return Ok(());
+        }
         self.ensure_valid_transition(JobStatus::Assigned)?;
         self.status = JobStatus::Assigned;
         self.runner_id = Some(runner_id);
@@ -187,6 +199,11 @@ impl JobStateMachine {
 
             // From assigned
             (JobStatus::Assigned, JobStatus::Running) => true,
+            // A job that fails while it is assigned to a runner never
+            // reaches `Running` in this mirror: the runner reports the
+            // failure, and the mirror is still at `Assigned` (the
+            // assignment is asserted when the job is dispatched).
+            (JobStatus::Assigned, JobStatus::Failed) => true,
             (JobStatus::Assigned, JobStatus::Cancelled) => true,
             // Same watchdog rationale as the Queued case above.
             (JobStatus::Assigned, JobStatus::TimedOut) => true,

@@ -6,9 +6,11 @@
 //! - Result type aliases
 //! - Time utilities
 
+pub mod build;
 pub mod error;
 pub mod fault;
 pub mod ids;
+pub mod job_row;
 pub mod lane;
 pub mod password;
 pub mod result;
@@ -22,10 +24,14 @@ pub use ids::{
     JobId, JobStatus, PipelineId, PipelineRunId, PipelineStatus, RepoId, RunnerId, SshKeyId,
     StepId, UserId,
 };
+pub use job_row::{JobExistenceRequest, JobExistenceResponse, JobRowState};
 pub use lane::Lane;
 pub use rollout::RolloutFlags;
 pub use time::DateTime;
-pub use volume::{image_cache_key, JobCache, VolumeSpec, VolumeType};
+pub use volume::{
+    cache_root, docker_socket, docker_socket_with, image_cache_key, is_socket_source, JobCache,
+    VolumeSpec, VolumeType, DEFAULT_CACHE_ROOT, DEFAULT_DOCKER_SOCKET,
+};
 
 /// True when `hash` is git's "ref does not exist" sentinel: empty or all
 /// zero digits. `git receive-pack` sends an all-zero new hash on branch
