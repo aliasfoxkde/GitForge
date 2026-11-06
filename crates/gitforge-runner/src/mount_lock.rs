@@ -18,10 +18,12 @@
 //! containers, so every writer of a shared host directory passes through
 //! it.
 //!
-//! A mount the runner cannot lock is not mounted: the job runs without it
-//! and rebuilds cold, rather than sharing a directory with a job that is
-//! writing to it. The sandbox already degrades a mount it cannot create
-//! the same way, so the runner's behaviour matches the mount contract.
+//! A mount the runner cannot lock is refused: the job does not run,
+//! rather than running against a directory with a job that is writing to
+//! it. The sandbox refuses a mount it cannot create the same way, so the
+//! runner's behaviour matches the mount contract, and neither of them can
+//! leave a job running with a contract the pipeline never declared (GF-10,
+//! 2026-11-05).
 
 use std::fmt;
 use std::fs::{self, File};
@@ -179,9 +181,11 @@ pub fn shared_sources(image: &str, volumes: &[VolumeSpec], cache_root: &str) -> 
 ///
 /// A directory that stays busy for the whole wait is a conflict the runner
 /// cannot resolve: the job is refused rather than run against a directory
-/// another job is writing to. A directory the runner cannot open at all is
-/// dropped from the job's mounts, so the job rebuilds cold instead of
-/// sharing a directory it cannot protect.
+/// another job is writing to. A directory the runner cannot lock at all is
+/// refused the same way - a mount the runner cannot protect is a mount it
+/// cannot promise, and mounting it unshared is the corruption this lock
+/// exists to prevent (GF-10, 2026-11-05: the mount used to be dropped, so
+/// the job quietly ran with a contract the pipeline never declared).
 pub async fn lock_job_mounts(
     image: &str,
     volumes: &[VolumeSpec],
@@ -190,7 +194,6 @@ pub async fn lock_job_mounts(
 ) -> Result<(Vec<MountLock>, Vec<VolumeSpec>), MountLockError> {
     let deadline = Instant::now() + wait;
     let mut locks = Vec::new();
-    let mut refused: Vec<PathBuf> = Vec::new();
     for source in shared_sources(image, volumes, cache_root) {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match MountLock::acquire(&source, remaining).await {
@@ -199,23 +202,14 @@ pub async fn lock_job_mounts(
                 tracing::warn!(
                     path = %source.display(),
                     %error,
-                    "shared mount is not lockable; the job runs without it"
+                    "shared mount is not lockable; the job is refused"
                 );
-                refused.push(source);
+                return Err(error);
             }
             Err(error @ MountLockError::Busy { .. }) => return Err(error),
         }
     }
-    let volumes = volumes
-        .iter()
-        .filter(|volume| {
-            volume
-                .expanded_source(image, cache_root)
-                .is_none_or(|source| !refused.contains(&PathBuf::from(source)))
-        })
-        .cloned()
-        .collect();
-    Ok((locks, volumes))
+    Ok((locks, volumes.to_vec()))
 }
 
 #[cfg(test)]
@@ -327,7 +321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mount_that_cannot_be_locked_is_not_mounted() {
+    async fn a_mount_that_cannot_be_locked_refuses_the_job() {
         let root = tempfile::tempdir().expect("a scratch directory");
         // A regular file cannot be a parent directory, so the mount source
         // can neither be created nor opened.
@@ -336,18 +330,16 @@ mod tests {
         let unusable = blocker.join("cache");
         let volume = bind(unusable.to_str().expect("a utf-8 path"));
 
-        let (locks, volumes) = lock_job_mounts(
+        let outcome = lock_job_mounts(
             "backend-ci-rust:1",
             &[volume],
             "/var/cache/gitforge",
             Duration::from_millis(200),
         )
-        .await
-        .expect("an unusable mount does not fail the job");
-        assert!(locks.is_empty(), "an unusable mount takes no lock");
+        .await;
         assert!(
-            volumes.is_empty(),
-            "an unusable mount must not be handed to the sandbox"
+            matches!(outcome, Err(MountLockError::Unavailable { .. })),
+            "a mount the runner cannot lock must refuse the job, got {outcome:?}"
         );
     }
 }

@@ -63,9 +63,9 @@
 #   every time; the host directory is keyed by image tag ({image}), so a
 #   rebuilt image starts from an empty cache rather than inheriting
 #   artifacts compiled by a different toolchain. The host location comes
-#   from the runner's GITFORGE_CACHE_ROOT. A cache mount that cannot be
-#   prepared degrades to a cold build with a warning — it is an
-#   optimisation, never a correctness requirement.
+#   from the runner's GITFORGE_CACHE_ROOT. A mount that cannot be prepared
+#   fails the job: the runner reports it as an infrastructure failure, so
+#   the reason reaches the job's own result instead of a log line.
 name: gitforge-ci
 version: "1.0"
 trigger_on:

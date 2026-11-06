@@ -655,21 +655,14 @@ impl Sandbox for DockerSandbox {
                 ("com.gitforce.job_id".to_owned(), job_label.clone()),
             ]);
 
-            let (binds, mounts) = match build_volume_mounts(volumes, image, &cache_root()) {
-                Ok(mounts) => mounts,
-                Err(error) => {
-                    // A cache mount that cannot be prepared degrades to a
-                    // cold build: the job still runs, it just does not
-                    // reuse the previous run's artifacts. Failing the job
-                    // here would turn a missing cache directory into a red
-                    // pipeline for a change that is only an optimisation.
-                    tracing::warn!(
-                        %error,
-                        "volume mounts unavailable; continuing without them"
-                    );
-                    (Vec::new(), Vec::new())
-                }
-            };
+            // A mount the runner cannot prepare is a contract it cannot
+            // keep: the pipeline declared this directory and the job
+            // needs it. Failing here is what makes the reason visible -
+            // the runner reports it as an infrastructure failure, so it
+            // reaches the job's own result instead of a log line (GF-10,
+            // 2026-11-05: the whole mount set used to be dropped, and a
+            // job whose cache had vanished just ran cold and timed out).
+            let (binds, mounts) = build_volume_mounts(volumes, image, &cache_root())?;
 
             // Build host config with resource limits
             let host_config = HostConfig {
@@ -768,19 +761,9 @@ impl Sandbox for DockerSandbox {
                 ("com.gitforce.managed".to_owned(), "true".to_owned()),
                 ("com.gitforce.job_id".to_owned(), job_label),
             ]);
-            let (volume_binds, volume_mounts) =
-                match build_volume_mounts(volumes, image, &cache_root()) {
-                    Ok(mounts) => mounts,
-                    Err(error) => {
-                        // See `create`: an unusable cache mount degrades to a
-                        // cold build instead of failing the job.
-                        tracing::warn!(
-                            %error,
-                            "volume mounts unavailable; continuing without them"
-                        );
-                        (Vec::new(), Vec::new())
-                    }
-                };
+            // See `create`: a mount the runner cannot prepare fails the
+            // job rather than vanishing from the contract.
+            let (volume_binds, volume_mounts) = build_volume_mounts(volumes, image, &cache_root())?;
             let host_config = HostConfig {
                 memory: Some((limits.memory_mb * 1024 * 1024) as i64),
                 cpu_period: Some(CPU_PERIOD_MICROS),
@@ -1438,6 +1421,31 @@ mod tests {
         }];
 
         assert!(build_volume_mounts(&volumes, "dsc-ci-rust:10", "/var/cache/gitforge").is_err());
+    }
+
+    #[test]
+    fn test_build_volume_mounts_reports_a_source_it_cannot_prepare() {
+        // A bind source under a regular file can never become a directory,
+        // so the runner cannot prepare it. That is an error the job has to
+        // report, not a mount to drop quietly: the job would otherwise run
+        // with a contract the pipeline never declared (GF-10, 2026-11-05).
+        let binary = std::env::current_exe().expect("the test binary's own path");
+        let volumes = vec![VolumeSpec {
+            volume_type: Some(VolumeType::Bind),
+            source: Some(binary.join("cache").to_string_lossy().into_owned()),
+            destination: "/cargo-target".to_string(),
+            read_only: false,
+            size: None,
+        }];
+
+        let error = build_volume_mounts(&volumes, "dsc-ci-rust:10", "/var/cache/gitforge")
+            .expect_err("a source the runner cannot prepare must be an error");
+        assert!(
+            error
+                .to_string()
+                .contains("could not prepare volume mount source"),
+            "the error must name the mount it could not prepare, got {error}"
+        );
     }
 
     #[test]
