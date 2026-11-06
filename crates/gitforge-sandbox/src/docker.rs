@@ -426,6 +426,130 @@ impl DockerSandbox {
         }
         Ok(())
     }
+    /// Create a container, stamping `extra_labels` onto it in addition to
+    /// the managed and job-id labels every container carries.
+    async fn create_with_extra_labels(
+        &self,
+        job_id: JobId,
+        image: &str,
+        limits: SandboxLimits,
+        volumes: &[VolumeSpec],
+        extra_labels: &[(String, String)],
+    ) -> Result<SandboxInstance> {
+        if let Some(ref docker) = self.docker {
+            // Ensure image is available
+            self.ensure_image(image).await?;
+            self.remove_job_containers(job_id).await?;
+
+            let container_name = Self::container_name(job_id);
+            let job_label = job_id.to_string();
+            let mut labels = HashMap::from([
+                ("com.gitforce.managed".to_owned(), "true".to_owned()),
+                ("com.gitforce.job_id".to_owned(), job_label.clone()),
+            ]);
+            // Pool containers carry the pool's ownership labels on top of
+            // the managed/job-id pair, so the pool can tell its own
+            // containers from job containers without guessing.
+            for (key, value) in extra_labels {
+                labels.insert(key.clone(), value.clone());
+            }
+
+            // A mount the runner cannot prepare is a contract it cannot
+            // keep: the pipeline declared this directory and the job
+            // needs it. Failing here is what makes the reason visible -
+            // the runner reports it as an infrastructure failure, so it
+            // reaches the job's own result instead of a log line (GF-10,
+            // 2026-11-05: the whole mount set used to be dropped, and a
+            // job whose cache had vanished just ran cold and timed out).
+            let (binds, mounts) = build_volume_mounts(volumes, image, &cache_root())?;
+
+            // Build host config with resource limits
+            let host_config = HostConfig {
+                memory: Some((limits.memory_mb * 1024 * 1024) as i64),
+                cpu_period: Some(CPU_PERIOD_MICROS),
+                cpu_quota: Some(host_cpu_quota_micros(limits.cpu_cores)),
+                network_mode: if limits.network {
+                    None
+                } else {
+                    Some("none".to_string())
+                },
+                binds: if binds.is_empty() { None } else { Some(binds) },
+                mounts: if mounts.is_empty() {
+                    None
+                } else {
+                    Some(mounts)
+                },
+                ..Default::default()
+            };
+
+            // Create container
+            let config = ContainerCreateBody {
+                image: Some(image.to_owned()),
+                // Keep the container alive for the whole job. A 3600s keepalive
+                // capped every job at one hour: when sleep exited, Docker
+                // stopped the container and SIGKILLed any running exec
+                // (exit 137 at exactly 3600s, OOMKilled=false). The container
+                // is removed per-job in destroy(), so this only bounds a
+                // leaked container's lifetime.
+                cmd: Some(vec![
+                    "sleep".to_owned(),
+                    "86400".to_owned(), // 24h; job deadlines clamp to 24h
+                ]),
+                host_config: Some(host_config),
+                labels: Some(labels),
+                ..Default::default()
+            };
+
+            let options = CreateContainerOptions {
+                name: Some(container_name.clone()),
+                platform: String::new(),
+            };
+
+            let response = docker
+                .create_container(Some(options), config)
+                .await
+                .map_err(|e| Error::sandbox(format!("failed to create container: {e}")))?;
+
+            // Start container
+            docker
+                .start_container(&response.id, None)
+                .await
+                .map_err(|e| Error::sandbox(format!("failed to start container: {e}")))?;
+
+            tracing::info!("Created container {} for job {}", response.id, job_id);
+
+            Ok(SandboxInstance {
+                container_id: response.id,
+                job_id,
+                workspace_path: None,
+            })
+        } else {
+            // Stub mode - no Docker available
+            Ok(SandboxInstance {
+                container_id: format!("gitforce-job-{job_id}"),
+                job_id,
+                workspace_path: None,
+            })
+        }
+    }
+
+    /// Create a container that belongs to a warm pool.
+    ///
+    /// A pooled container is created with a placeholder job id (it is not
+    /// a job) and with the pool's ownership labels, so a later runner
+    /// process can recognise the containers this pool left behind and
+    /// reclaim them (GF-17).
+    pub async fn create_pooled(
+        &self,
+        identity: &crate::pool::PoolIdentity,
+        image: &str,
+        limits: SandboxLimits,
+    ) -> Result<SandboxInstance> {
+        let job_id = JobId::new();
+        let extra: Vec<(String, String)> = crate::pool::pool_labels(identity).into_iter().collect();
+        self.create_with_extra_labels(job_id, image, limits, &[], &extra)
+            .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -643,95 +767,8 @@ impl Sandbox for DockerSandbox {
         limits: SandboxLimits,
         volumes: &[VolumeSpec],
     ) -> Result<SandboxInstance> {
-        if let Some(ref docker) = self.docker {
-            // Ensure image is available
-            self.ensure_image(image).await?;
-            self.remove_job_containers(job_id).await?;
-
-            let container_name = Self::container_name(job_id);
-            let job_label = job_id.to_string();
-            let labels = HashMap::from([
-                ("com.gitforce.managed".to_owned(), "true".to_owned()),
-                ("com.gitforce.job_id".to_owned(), job_label.clone()),
-            ]);
-
-            // A mount the runner cannot prepare is a contract it cannot
-            // keep: the pipeline declared this directory and the job
-            // needs it. Failing here is what makes the reason visible -
-            // the runner reports it as an infrastructure failure, so it
-            // reaches the job's own result instead of a log line (GF-10,
-            // 2026-11-05: the whole mount set used to be dropped, and a
-            // job whose cache had vanished just ran cold and timed out).
-            let (binds, mounts) = build_volume_mounts(volumes, image, &cache_root())?;
-
-            // Build host config with resource limits
-            let host_config = HostConfig {
-                memory: Some((limits.memory_mb * 1024 * 1024) as i64),
-                cpu_period: Some(CPU_PERIOD_MICROS),
-                cpu_quota: Some(host_cpu_quota_micros(limits.cpu_cores)),
-                network_mode: if limits.network {
-                    None
-                } else {
-                    Some("none".to_string())
-                },
-                binds: if binds.is_empty() { None } else { Some(binds) },
-                mounts: if mounts.is_empty() {
-                    None
-                } else {
-                    Some(mounts)
-                },
-                ..Default::default()
-            };
-
-            // Create container
-            let config = ContainerCreateBody {
-                image: Some(image.to_owned()),
-                // Keep the container alive for the whole job. A 3600s keepalive
-                // capped every job at one hour: when sleep exited, Docker
-                // stopped the container and SIGKILLed any running exec
-                // (exit 137 at exactly 3600s, OOMKilled=false). The container
-                // is removed per-job in destroy(), so this only bounds a
-                // leaked container's lifetime.
-                cmd: Some(vec![
-                    "sleep".to_owned(),
-                    "86400".to_owned(), // 24h; job deadlines clamp to 24h
-                ]),
-                host_config: Some(host_config),
-                labels: Some(labels),
-                ..Default::default()
-            };
-
-            let options = CreateContainerOptions {
-                name: Some(container_name.clone()),
-                platform: String::new(),
-            };
-
-            let response = docker
-                .create_container(Some(options), config)
-                .await
-                .map_err(|e| Error::sandbox(format!("failed to create container: {e}")))?;
-
-            // Start container
-            docker
-                .start_container(&response.id, None)
-                .await
-                .map_err(|e| Error::sandbox(format!("failed to start container: {e}")))?;
-
-            tracing::info!("Created container {} for job {}", response.id, job_id);
-
-            Ok(SandboxInstance {
-                container_id: response.id,
-                job_id,
-                workspace_path: None,
-            })
-        } else {
-            // Stub mode - no Docker available
-            Ok(SandboxInstance {
-                container_id: format!("gitforce-job-{job_id}"),
-                job_id,
-                workspace_path: None,
-            })
-        }
+        self.create_with_extra_labels(job_id, image, limits, volumes, &[])
+            .await
     }
 
     async fn create_with_workspace(

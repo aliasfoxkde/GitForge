@@ -53,6 +53,11 @@ pub enum Decision {
     RetainMalformedLabel,
     /// Container is still running; age is irrelevant.
     RetainRunning,
+    /// Container belongs to a warm pool. The pool owns its own
+    /// containers and reclaims them under the pool's own rules
+    /// (`crate::pool`); the general reconciler never removes them, so
+    /// the two mechanisms cannot disagree about a live container.
+    RetainPool,
     /// Owning job is currently active/claimed per authoritative state.
     RetainActiveJob,
     /// Non-running for less than the configured grace period.
@@ -177,11 +182,21 @@ pub fn classify(
     if active_jobs.contains(raw_job) {
         return Decision::RetainActiveJob;
     }
-    // 4. Never remove a running container.
+    // 4. Pooled containers belong to the warm pool, which reclaims them
+    //    under its own rules (owner, generation, TTL, liveness of the
+    //    creating process). The general reconciler does not remove them:
+    //    a pooled container that is serving a job looks exactly like an
+    //    orphan to any rule that only sees "running" and "not an active
+    //    job id" - and the pool's label for a job container is a
+    //    placeholder, not the job id.
+    if record.labels.contains_key(crate::pool::POOL_LABEL) {
+        return Decision::RetainPool;
+    }
+    // 5. Never remove a running container.
     if record.running {
         return Decision::RetainRunning;
     }
-    // 5. Grace period: must be non-running for at least `grace`.
+    // 6. Grace period: must be non-running for at least `grace`.
     //    Fail-closed: an unknown exit time never qualifies.
     let Some(exited_at) = record.exited_at_ms else {
         return Decision::RetainGracePeriod;
@@ -190,7 +205,7 @@ pub fn classify(
     if non_running_for < policy.grace.as_millis() as i64 {
         return Decision::RetainGracePeriod;
     }
-    // 6. Deletion authority.
+    // 7. Deletion authority.
     if !policy.deletion_enabled {
         return Decision::RetainPolicyDisabled;
     }
@@ -638,6 +653,31 @@ mod tests {
         assert_eq!(
             classify(&bad, &HashSet::new(), &policy(), now()),
             Decision::RetainMalformedLabel
+        );
+    }
+
+    #[test]
+    fn pooled_container_is_retained_by_the_general_reconciler() {
+        // A pooled container carries a placeholder job id, so it looks
+        // exactly like an abandoned job container to any rule that only
+        // sees "managed" and "not an active job id". The general
+        // reconciler must not touch it: the pool's own reclamation rules
+        // (owner, generation, TTL, liveness) decide, and the two
+        // mechanisms must not disagree about the same container.
+        let rec = ContainerRecord {
+            id: "pooled-1".into(),
+            labels: HashMap::from([
+                (MANAGED_LABEL.to_string(), "true".to_string()),
+                (JOB_ID_LABEL.to_string(), uuid::Uuid::new_v4().to_string()),
+                (crate::pool::POOL_LABEL.to_string(), "true".to_string()),
+            ]),
+            running: true,
+            exited_at_ms: None,
+            created_at_ms: Some(9_000_000),
+        };
+        assert_eq!(
+            classify(&rec, &HashSet::new(), &policy(), now()),
+            Decision::RetainPool
         );
     }
 

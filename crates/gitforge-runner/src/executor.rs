@@ -4,7 +4,7 @@ use crate::fault::{fault_error, fault_outcome};
 use crate::mount_lock::lock_job_mounts;
 use gitforge_common::{Fault, JobId, PipelineRunId, RepoId, Result, VolumeSpec};
 use gitforge_sandbox::{
-    DockerSandbox, OutputSink, Sandbox, SandboxInstance, SandboxLimits, StepResult,
+    DockerSandbox, OutputSink, PoolIdentity, Sandbox, SandboxInstance, SandboxLimits, StepResult,
 };
 use gitforge_storage::{
     Artifact, ArtifactReceipt, ArtifactStore, FileJobLogStore, FileStorage, JobReceipt, LogReceipt,
@@ -20,6 +20,27 @@ use tokio::time::{timeout, Duration, Instant};
 
 /// Default number of pre-warmed containers per image
 const POOL_SIZE: usize = 2;
+
+/// How long a pooled container may sit in the pool before it is
+/// destroyed. A pooled container is a spare, not a reservation: keeping
+/// one past its TTL only holds resources for a job that may never come.
+const POOL_TTL: Duration = Duration::from_secs(1800);
+
+/// The warm pool's time-to-live.
+///
+/// One definition, shared by the in-process pool (which expires a spare
+/// before handing it out) and the reaper's policy (which decides when an
+/// orphan may be reclaimed). Two different numbers would let the two
+/// mechanisms disagree about the same container.
+pub fn pool_ttl() -> Duration {
+    POOL_TTL
+}
+
+/// A pooled container and the moment it entered the pool.
+struct PooledInstance {
+    instance: SandboxInstance,
+    created_at: Instant,
+}
 
 /// Sandbox acquisition ceiling in seconds. Container creation under load
 /// (whole layer-stack copies on the daemon's old vfs storage) could
@@ -164,18 +185,32 @@ fn runtime_toolchain_fetch(steps: &[JobStep]) -> Option<String> {
 
 /// A pool of pre-warmed container instances
 pub struct ContainerPool {
-    pools: Arc<RwLock<HashMap<String, Vec<SandboxInstance>>>>, // image -> instances
+    pools: Arc<RwLock<HashMap<String, Vec<PooledInstance>>>>, // image -> instances
     sandbox: Arc<DockerSandbox>,
+    /// Ownership identity of this pool. Every pooled container carries it
+    /// as labels, so a later runner process can recognise the containers
+    /// this pool left behind and reclaim them (GF-17).
+    identity: PoolIdentity,
+    /// How long a pooled container may sit before it is destroyed.
+    ttl: Duration,
 }
 
 impl ContainerPool {
-    /// Create a new container pool
-    pub async fn new() -> Result<Self> {
+    /// Create a new container pool owned by `identity`.
+    pub async fn new(identity: PoolIdentity) -> Result<Self> {
         let sandbox = DockerSandbox::connect_required().await?;
         Ok(Self {
             pools: Arc::new(RwLock::new(HashMap::new())),
             sandbox: Arc::new(sandbox),
+            identity,
+            ttl: POOL_TTL,
         })
+    }
+
+    /// The pool's ownership identity. The agent uses it to reclaim the
+    /// containers this pool orphaned when a previous runner process died.
+    pub fn identity(&self) -> &PoolIdentity {
+        &self.identity
     }
 
     /// Pre-warm containers for an image
@@ -184,11 +219,17 @@ impl ContainerPool {
         let instances = pools.entry(image.to_string()).or_insert_with(Vec::new);
 
         while instances.len() < count {
-            let id = JobId::new();
-            match self.sandbox.create(id, image, sandbox_limits(), &[]).await {
+            match self
+                .sandbox
+                .create_pooled(&self.identity, image, sandbox_limits())
+                .await
+            {
                 Ok(instance) => {
                     tracing::info!("pre-warmed container for image {}", image);
-                    instances.push(instance);
+                    instances.push(PooledInstance {
+                        instance,
+                        created_at: Instant::now(),
+                    });
                 }
                 Err(e) => {
                     tracing::warn!("failed to pre-warm container: {}", e);
@@ -226,14 +267,38 @@ impl ContainerPool {
                 .create(*job_id, image, sandbox_limits(), volumes)
                 .await;
         }
-        let mut pools = self.pools.write().await;
-
-        // Try to get from pool
-        if let Some(instances) = pools.get_mut(image) {
-            if let Some(instance) = instances.pop() {
-                tracing::debug!("reusing pooled container for job {}", job_id);
-                return Ok(instance);
+        // Try to get from pool. A container that outlived the pool's TTL
+        // is destroyed rather than handed out: it is a spare, not a
+        // reservation, and a stale spare costs the same resources as a
+        // fresh one without the warmth.
+        let ttl = self.ttl;
+        let mut expired: Vec<SandboxInstance> = Vec::new();
+        let mut fresh: Option<SandboxInstance> = None;
+        {
+            let mut pools = self.pools.write().await;
+            if let Some(instances) = pools.get_mut(image) {
+                while let Some(entry) = instances.pop() {
+                    if entry.created_at.elapsed() >= ttl {
+                        expired.push(entry.instance);
+                    } else {
+                        fresh = Some(entry.instance);
+                        break;
+                    }
+                }
             }
+        }
+        for stale in expired {
+            tracing::info!(
+                "destroying pooled container {} that outlived its TTL",
+                stale.container_id
+            );
+            if let Err(error) = self.sandbox.destroy(stale).await {
+                tracing::warn!("failed to destroy expired pooled container: {}", error);
+            }
+        }
+        if let Some(instance) = fresh {
+            tracing::debug!("reusing pooled container for job {}", job_id);
+            return Ok(instance);
         }
 
         // Pool empty or no pool for this image, create new
@@ -264,11 +329,19 @@ impl ContainerPool {
                 tracing::warn!("failed to reset pooled container: {}", e);
                 return;
             }
-            // Create fresh instance for the pool
-            let id = JobId::new();
-            match self.sandbox.create(id, image, sandbox_limits(), &[]).await {
+            // Create fresh instance for the pool. It carries the pool's
+            // ownership labels, so it is reclaimable if this process dies
+            // with it still warm (GF-17).
+            match self
+                .sandbox
+                .create_pooled(&self.identity, image, sandbox_limits())
+                .await
+            {
                 Ok(new_instance) => {
-                    instances.push(new_instance);
+                    instances.push(PooledInstance {
+                        instance: new_instance,
+                        created_at: Instant::now(),
+                    });
                     tracing::debug!("returned container to pool");
                 }
                 Err(e) => {
@@ -281,6 +354,62 @@ impl ContainerPool {
                 tracing::warn!("failed to destroy excess container: {}", e);
             }
         }
+    }
+
+    /// Destroy every container this pool holds.
+    ///
+    /// The pool exists only in this process's memory, so a runner that
+    /// stops without draining leaves its containers running with nobody
+    /// left to own them: they outlive the process, no job row refers to
+    /// them, and no other cleanup path in the tree can reach them
+    /// (GF-17). Draining on shutdown is what keeps a pooled container
+    /// from outliving the pool that made it.
+    pub async fn drain(&self) {
+        let drained: Vec<SandboxInstance> = {
+            let mut pools = self.pools.write().await;
+            let mut drained = Vec::new();
+            for instances in pools.values_mut() {
+                for entry in instances.drain(..) {
+                    drained.push(entry.instance);
+                }
+            }
+            pools.clear();
+            drained
+        };
+        for instance in drained {
+            if let Err(error) = self.sandbox.destroy(instance).await {
+                tracing::warn!("failed to destroy pooled container on drain: {}", error);
+            }
+        }
+    }
+
+    /// Destroy the pooled containers that have outlived their TTL.
+    /// Returns how many were destroyed.
+    pub async fn sweep_expired(&self) -> usize {
+        let ttl = self.ttl;
+        let expired: Vec<SandboxInstance> = {
+            let mut pools = self.pools.write().await;
+            let mut expired = Vec::new();
+            for instances in pools.values_mut() {
+                let mut kept = Vec::with_capacity(instances.len());
+                for entry in instances.drain(..) {
+                    if entry.created_at.elapsed() >= ttl {
+                        expired.push(entry.instance);
+                    } else {
+                        kept.push(entry);
+                    }
+                }
+                *instances = kept;
+            }
+            expired
+        };
+        let count = expired.len();
+        for instance in expired {
+            if let Err(error) = self.sandbox.destroy(instance).await {
+                tracing::warn!("failed to destroy expired pooled container: {}", error);
+            }
+        }
+        count
     }
 }
 
@@ -295,9 +424,15 @@ pub struct JobExecutor {
 }
 
 impl JobExecutor {
-    /// Create a new job executor
-    pub async fn new() -> Result<Self> {
-        let pool = ContainerPool::new().await?;
+    /// The identity of the pool this executor owns.
+    pub fn pool_identity(&self) -> &PoolIdentity {
+        self.pool.identity()
+    }
+
+    /// Create a new job executor whose container pool is owned by
+    /// `identity`.
+    pub async fn new(identity: PoolIdentity) -> Result<Self> {
+        let pool = ContainerPool::new(identity).await?;
         let storage_root = std::env::var("GITFORGE_ARTIFACT_ROOT")
             .unwrap_or_else(|_| "target/gitforge-artifacts".to_string());
         let artifact_storage = FileStorage::new(storage_root.clone()).await?;
@@ -941,6 +1076,12 @@ impl JobExecutor {
             }
         }
 
+        // The warm pool is drained too. It is not reachable from
+        // `active_instances` (a pooled container never ran a job), and a
+        // pool that outlives its process is a leak with no owner
+        // (GF-17).
+        self.pool.drain().await;
+
         let mut count = self.active_job_count.write().await;
         *count = 0;
     }
@@ -1244,7 +1385,10 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_real_docker_job_timeout_reaps_sandbox() {
-        let executor = JobExecutor::new().await.expect("Docker must be available");
+        let identity = PoolIdentity::new("test@localhost", "test-generation");
+        let executor = JobExecutor::new(identity)
+            .await
+            .expect("Docker must be available");
         let job_id = JobId::new();
         let job = ExecutableJob::new(job_id, PipelineRunId::new(), "alpine:latest".to_string())
             .with_steps(vec![JobStep::new("hang", "sleep 30")])

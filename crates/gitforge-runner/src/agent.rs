@@ -4,8 +4,9 @@ use crate::executor::{ExecutableJob, JobExecutor, JobStep};
 use gitforge_common::{Error, JobId, PipelineRunId, Result, RunnerId, VolumeSpec};
 use gitforge_db::models::Runner;
 use gitforge_sandbox::{
-    ActiveJobRegistry, DockerContainerSource, DockerSandbox, OutputSink, OutputStream,
-    ReconcileReport, Reconciler, ReconcilerPolicy, StepResult,
+    reclaim_orphaned_pool_containers, ActiveJobRegistry, DockerContainerSource, DockerSandbox,
+    OutputSink, OutputStream, PoolIdentity, PoolPolicy, ReconcileReport, Reconciler,
+    ReconcilerPolicy, StepResult,
 };
 use gitforge_storage::ArtifactReceipt;
 use reqwest::Client;
@@ -886,7 +887,7 @@ impl RunnerAgent {
             .map_err(|e| Error::internal(format!("failed to create HTTP client: {e}")))?;
 
         let sandbox = DockerSandbox::connect_required().await?;
-        let executor = JobExecutor::new().await?;
+        let executor = JobExecutor::new(pool_identity(&config)).await?;
 
         Ok(Self {
             config,
@@ -1104,6 +1105,13 @@ impl RunnerAgent {
         // service explicitly enables deletion via GITFORGE_RECONCILE_DELETE.
         self.spawn_reconciler(active_jobs.clone()).await;
 
+        // Spawn the warm-pool reaper: it reclaims the pooled containers a
+        // previous runner process left behind when it died or restarted.
+        // The pool lives only in memory, so its containers outlive the
+        // process that made them and nothing else in the tree can reach
+        // them (GF-17).
+        self.spawn_pool_reaper().await;
+
         // Start job fetch loop
         let fetch_interval = self.config.fetch_interval_secs;
         let fetch_client = self.client.clone();
@@ -1228,6 +1236,34 @@ impl RunnerAgent {
         }
 
         Ok(())
+    }
+
+    /// Spawn the background warm-pool reaper loop.
+    ///
+    /// The reaper owns the pool's orphans: containers that carry this
+    /// pool's owner label but a generation from a process that is gone.
+    /// It never touches the current process's own pool, and it never
+    /// touches a container whose creating process is still alive.
+    async fn spawn_pool_reaper(&self) {
+        let identity = self.executor.pool_identity().clone();
+        let policy = PoolPolicy {
+            ttl: crate::executor::pool_ttl(),
+            ..PoolPolicy::default()
+        };
+        let interval_secs = match std::env::var("GITFORGE_POOL_REAP_INTERVAL_SECS") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) if secs > 0 => secs,
+                _ => {
+                    tracing::warn!(
+                        "GITFORGE_POOL_REAP_INTERVAL_SECS is not a positive number of seconds; using the default"
+                    );
+                    300
+                }
+            },
+            Err(_) => 300,
+        };
+        let handle = tokio::spawn(run_pool_reaper_loop(identity, policy, interval_secs));
+        self.background_tasks.lock().await.push(handle);
     }
 
     /// Spawn the background abandoned-container reconciler loop.
@@ -1882,6 +1918,79 @@ pub(crate) async fn write_reconciler_receipt(
 /// Background loop body. Extracted from `spawn_reconciler` so the
 /// cancellation/restart lifecycle can be exercised in tests without
 /// touching the process environment.
+/// Reclaim the warm-pool containers a previous runner process orphaned.
+///
+/// The pass is bounded by the policy's blast radius and is idempotent: a
+/// container that is already gone counts as reclaimed.
+pub(crate) async fn run_pool_reaper_loop(
+    identity: PoolIdentity,
+    policy: PoolPolicy,
+    interval_secs: u64,
+) {
+    let source = match DockerContainerSource::connect_with_timeout(POOL_REAPER_CALL_TIMEOUT) {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::warn!("warm-pool reaper unavailable: {}", error);
+            return;
+        }
+    };
+    // The owner's liveness is injected, not read from process-global state
+    // inside the decision: the reaper passes the resolver in, so the
+    // decision is testable without touching the process table.
+    let owner_state: Box<dyn Fn(u32) -> Option<bool> + Send + Sync> =
+        Box::new(|pid: u32| gitforge_sandbox::process_alive(pid));
+    let mut ticker = interval(Duration::from_secs(interval_secs));
+    loop {
+        // Startup pass runs immediately, then bounded periodic.
+        ticker.tick().await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        match reclaim_orphaned_pool_containers(&source, &identity, &policy, now_ms, &owner_state)
+            .await
+        {
+            Ok(report) => {
+                if !report.reclaimed.is_empty() || !report.failed.is_empty() {
+                    tracing::info!(
+                        reclaimed = report.reclaimed.len(),
+                        failed = report.failed.len(),
+                        retained = report.retained.len(),
+                        bounded = report.bounded,
+                        "warm-pool reclaim pass complete"
+                    );
+                }
+                for (id, reason) in &report.failed {
+                    tracing::warn!("failed to reclaim pooled container {}: {}", id, reason);
+                }
+            }
+            Err(error) => tracing::warn!("warm-pool reclaim pass failed: {}", error),
+        }
+    }
+}
+
+/// Bounded timeout for every Docker call the reaper makes.
+const POOL_REAPER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The identity that owns this runner's warm pool.
+///
+/// The owner separates pools that belong to different runners on the same
+/// host; the generation separates the containers this process created from
+/// the ones a previous process left behind.
+fn pool_identity(config: &RunnerConfig) -> PoolIdentity {
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .map(|name| name.trim().to_string())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown-host".to_string());
+    let owner = format!("{}@{}", config.name, host);
+    // A fresh UUID per process: two processes of the same runner never
+    // share a generation, so neither can reclaim the other's pool.
+    let generation = JobId::new().to_string();
+    PoolIdentity::new(owner, generation)
+}
+
 pub(crate) async fn run_reconciler_loop(
     active_jobs: ActiveJobRegistry,
     config: ReconcilerLoopConfig,
@@ -2497,6 +2606,32 @@ mod tests {
         let config = RunnerConfig::default();
         let agent = RunnerAgent::new(config).await.unwrap();
         assert!(agent.runner.is_none());
+    }
+
+    #[test]
+    fn pool_identity_separates_runners_and_generations() {
+        let config = RunnerConfig {
+            name: "runner-a".to_string(),
+            ..RunnerConfig::default()
+        };
+        let first = pool_identity(&config);
+        let second = pool_identity(&config);
+        // Same runner, same owner: the owner is what lets one runner
+        // reclaim its own orphans.
+        assert_eq!(first.owner, second.owner);
+        assert!(first.owner.starts_with("runner-a@"));
+        // Different generation: a container from one process is never
+        // mistaken for the current process's own container.
+        assert_ne!(first.generation, second.generation);
+        // The creating process is the current one.
+        assert_eq!(first.pid, std::process::id());
+
+        let other_config = RunnerConfig {
+            name: "runner-b".to_string(),
+            ..RunnerConfig::default()
+        };
+        let other = pool_identity(&other_config);
+        assert_ne!(other.owner, first.owner);
     }
 
     #[tokio::test]
