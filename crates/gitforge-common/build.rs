@@ -18,6 +18,15 @@
 //! The state of the tree is stamped next to the commit: a binary built from
 //! a modified working tree does not correspond to the commit it claims, so
 //! `dirty` records whether the tree was clean at build time.
+//!
+//! The HOW is stamped last: the toolchain that compiled the binary and the
+//! moment it was compiled. A bundle's metadata used to describe the cutting
+//! host instead of the artifact it ships (GF-15, 2026-11-06): it recorded the
+//! `rustc --version` of whichever machine ran the cut, and the time of the
+//! cut, so the metadata of a Fedora-built binary claimed the toolchain of the
+//! instance that assembled it. The only honest description of a build is the
+//! one the build itself records, so the toolchain and the build time are
+//! stamped into the binary and read back out of it.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -28,11 +37,17 @@ const UNKNOWN: &str = "unknown";
 fn main() {
     println!("cargo:rerun-if-env-changed=GITFORGE_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=GITFORGE_BUILD_DIRTY");
+    println!("cargo:rerun-if-env-changed=GITFORGE_BUILD_TOOLCHAIN");
+    println!("cargo:rerun-if-env-changed=GITFORGE_BUILD_EPOCH");
     watch_checkout();
     let commit = resolve_commit();
     let dirty = resolve_dirty();
+    let toolchain = resolve_toolchain();
+    let epoch = resolve_epoch();
     println!("cargo:rustc-env=GITFORGE_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=GITFORGE_BUILD_DIRTY={dirty}");
+    println!("cargo:rustc-env=GITFORGE_BUILD_TOOLCHAIN={toolchain}");
+    println!("cargo:rustc-env=GITFORGE_BUILD_EPOCH={epoch}");
 }
 
 /// Run `git` and return its trimmed stdout, or `None` when git is missing,
@@ -78,6 +93,55 @@ fn resolve_dirty() -> String {
         Some(_) => "true".to_string(),
         None => UNKNOWN.to_string(),
     }
+}
+
+/// The toolchain that is compiling this binary: the `rustc --version` line
+/// of the compiler in use, or `unknown` when there is none to ask.
+///
+/// An explicit `GITFORGE_BUILD_TOOLCHAIN` overrides the answer, the same way
+/// `GITFORGE_BUILD_COMMIT` does: a build host that cannot be asked (a
+/// container with a pinned toolchain, for example) can state the toolchain
+/// it used instead.
+fn resolve_toolchain() -> String {
+    if let Ok(value) = std::env::var("GITFORGE_BUILD_TOOLCHAIN") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    Command::new(rustc)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| stdout.trim().to_string())
+        .filter(|stdout| !stdout.is_empty())
+        .unwrap_or_else(|| UNKNOWN.to_string())
+}
+
+/// The moment this binary was compiled, as seconds since the Unix epoch.
+///
+/// The epoch is stamped rather than a formatted timestamp so that the
+/// formatting (and the calendar arithmetic behind it) stays in the library,
+/// where it is unit-tested, instead of in this build script.
+///
+/// An explicit `GITFORGE_BUILD_EPOCH` overrides the answer, so a build whose
+/// clock cannot be trusted can state when it happened.
+fn resolve_epoch() -> String {
+    if let Ok(value) = std::env::var("GITFORGE_BUILD_EPOCH") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or_else(
+            |_| UNKNOWN.to_string(),
+            |elapsed| elapsed.as_secs().to_string(),
+        )
 }
 
 /// Tell cargo to re-run this build script when the checkout moves.

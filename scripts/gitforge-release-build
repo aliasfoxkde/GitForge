@@ -51,6 +51,13 @@ fi
 export GITFORGE_BUILD_COMMIT="$expected_commit"
 export CARGO_TARGET_DIR="$target_dir"
 
+# Pin how the build happened as well. The bundle's metadata describes the
+# artifact, so the toolchain and the build time have to be the ones the
+# BUILD used - not the ones of whichever host assembles the bundle
+# (GF-15, 2026-11-06). The build script stamps both into every binary.
+export GITFORGE_BUILD_TOOLCHAIN="${GITFORGE_BUILD_TOOLCHAIN:-$(rustc --version 2>/dev/null || true)}"
+export GITFORGE_BUILD_EPOCH="${GITFORGE_BUILD_EPOCH:-$(date -u +%s)}"
+
 printf 'release build: building %s from %s\n' "$expected_commit" "$source_root"
 cargo build --release --manifest-path "$source_root/Cargo.toml" \
   -p api -p ci -p git-server -p runner

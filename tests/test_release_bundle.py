@@ -47,7 +47,17 @@ RESOURCE_POLICIES = (
 # the test independent of whatever the checkout HEAD happens to be.
 SOURCE_COMMIT = "4a1f2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c"
 OTHER_COMMIT = "0f38a46345ac82efec9493310aa5c556c31c1ac5"
-TOOLCHAIN = "test-rustc 1.0.0 (canary)"
+# The toolchain and the build time the BINARIES carry. A toolchain line
+# carries spaces, exactly as `rustc --version` reports it.
+BUILD_TOOLCHAIN = "rustc 1.99.1 (58cf8f9c3 2026-10-13)"
+BUILD_TIME = "2026-11-06T08:15:00Z"
+
+# The toolchain of the host that runs the CUT. It is deliberately different
+# from the one the binaries were built with: a bundle whose metadata names
+# this toolchain describes the cutting host instead of the artifact it
+# ships (GF-15, 2026-11-06).
+CUTTING_HOST_TOOLCHAIN = "rustc 1.99.0 (b940084d7 2026-09-28)"
+
 RELEASE_ID = "20260909-canary"
 
 MANIFEST_FILES = frozenset(
@@ -90,13 +100,22 @@ class ReleaseBundleContractTests(unittest.TestCase):
         path.chmod(0o755)
 
     @staticmethod
-    def _stub(name, commit=SOURCE_COMMIT, dirty="false", stamped=True):
+    def _stub(
+        name,
+        commit=SOURCE_COMMIT,
+        dirty="false",
+        stamped=True,
+        toolchain=BUILD_TOOLCHAIN,
+        built=BUILD_TIME,
+    ):
         """A stand-in for a release binary.
 
         Real release binaries answer `--version` with the commit they were
-        built from; the release chain refuses a bundle whose binaries do not
-        agree with the commit the bundle claims. The stub reproduces that
-        contract so the contract can be tested without a real build.
+        built from, the toolchain that compiled them and the moment they
+        were compiled; the release chain refuses a bundle whose binaries do
+        not agree with the commit the bundle claims, and describes the
+        bundle from those same fields. The stub reproduces that contract so
+        the contract can be tested without a real build.
         """
         if not stamped:
             return f"#!/bin/sh\n# test stub: {name}\nexit 0\n"
@@ -105,7 +124,8 @@ class ReleaseBundleContractTests(unittest.TestCase):
             f"# test stub: {name}\n"
             f'case "$1" in\n'
             f"  --version|-V)\n"
-            f'    echo "{name} 0.0.0-test commit={commit} dirty={dirty}"\n'
+            f'    echo "{name} 0.0.0-test commit={commit} dirty={dirty} '
+            f"toolchain={toolchain} built={built}\"\n"
             f"    exit 0\n"
             f"    ;;\n"
             f"esac\n"
@@ -115,7 +135,9 @@ class ReleaseBundleContractTests(unittest.TestCase):
     def _env(self):
         env = os.environ.copy()
         env["GITFORGE_SOURCE_COMMIT"] = SOURCE_COMMIT
-        env["GITFORGE_TOOLCHAIN"] = TOOLCHAIN
+        # The host that runs the cut states its own toolchain. The bundler
+        # must not use it: the bundle describes the binaries it ships.
+        env["GITFORGE_TOOLCHAIN"] = CUTTING_HOST_TOOLCHAIN
         # The bundler consults the live-instance release gate, which no
         # test fixture can satisfy; the gate itself is covered by
         # tests/test_release_gate.py against a purpose-built database.
@@ -191,9 +213,11 @@ class ReleaseBundleContractTests(unittest.TestCase):
         metadata = self._read_kv(self.release_dir / "RELEASE_METADATA.txt")
         self.assertEqual(metadata.get("release_id"), RELEASE_ID)
         self.assertEqual(metadata.get("source_commit"), SOURCE_COMMIT)
-        self.assertEqual(metadata.get("toolchain"), TOOLCHAIN)
+        # The metadata describes the binaries, not the cutting host.
+        self.assertEqual(metadata.get("toolchain"), BUILD_TOOLCHAIN)
+        self.assertEqual(metadata.get("build_timestamp_utc"), BUILD_TIME)
         self.assertRegex(
-            metadata.get("build_timestamp_utc", ""),
+            metadata.get("bundle_cut_utc", ""),
             r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
         )
 
@@ -451,6 +475,92 @@ class ReleaseBundleContractTests(unittest.TestCase):
         rejected = self._run(STAMPS_SCRIPT, str(self.source_root), OTHER_COMMIT)
         self.assertEqual(rejected.returncode, 1)
         self.assertIn("was built from", rejected.stderr)
+
+
+    # ─── 6. the metadata describes the artifact it ships (GF-15) ────────────
+    #
+    # GF-15 (2026-11-06): the bundle's metadata named the CUTTING host - its
+    # `rustc --version` and the time of the cut - so a bundle of binaries
+    # compiled on one host claimed the toolchain of the host that assembled
+    # it. The metadata has to be read out of the binaries instead.
+
+    def test_metadata_describes_the_binaries_not_the_cutting_host(self):
+        metadata = self._read_kv(self.release_dir / "RELEASE_METADATA.txt")
+        self.assertEqual(metadata.get("toolchain"), BUILD_TOOLCHAIN)
+        self.assertNotEqual(metadata.get("toolchain"), CUTTING_HOST_TOOLCHAIN)
+        self.assertEqual(metadata.get("build_timestamp_utc"), BUILD_TIME)
+        # The cut itself is still recorded - as its own field.
+        self.assertIn("bundle_cut_utc", metadata)
+
+    def test_verifier_refuses_metadata_that_names_another_toolchain(self):
+        metadata_path = self.release_dir / "RELEASE_METADATA.txt"
+        lines = metadata_path.read_text().splitlines()
+        metadata_path.write_text(
+            "\n".join(
+                f"toolchain={CUTTING_HOST_TOOLCHAIN}"
+                if line.startswith("toolchain=")
+                else line
+                for line in lines
+            )
+            + "\n"
+        )
+        self._rewrite_manifest()
+
+        result = self.verify()
+        self.assertNotEqual(
+            result.returncode, 0, "verifier accepted metadata that describes another build"
+        )
+        self.assertIn("does not describe the shipped binaries", result.stderr)
+        self.assertNotIn("valid bundle=", result.stdout)
+
+    def test_verifier_refuses_a_metadata_build_time_the_binaries_do_not_carry(self):
+        metadata_path = self.release_dir / "RELEASE_METADATA.txt"
+        lines = metadata_path.read_text().splitlines()
+        metadata_path.write_text(
+            "\n".join(
+                "build_timestamp_utc=2020-01-01T00:00:00Z"
+                if line.startswith("build_timestamp_utc=")
+                else line
+                for line in lines
+            )
+            + "\n"
+        )
+        self._rewrite_manifest()
+
+        result = self.verify()
+        self.assertNotEqual(
+            result.returncode, 0, "verifier accepted a metadata build time the binaries do not carry"
+        )
+        self.assertIn("does not describe the shipped binaries", result.stderr)
+        self.assertNotIn("valid bundle=", result.stdout)
+
+    def test_bundler_refuses_binaries_that_disagree_about_the_toolchain(self):
+        self._write_executable(
+            self.source_root / "runner", self._stub("runner", toolchain="rustc 0.0.1 (other)")
+        )
+        result = self._refused_cut()
+        self.assertIn("disagree about toolchain", result.stderr)
+
+    def test_bundler_refuses_binaries_that_cannot_say_when_they_were_built(self):
+        self._write_executable(self.source_root / "api", self._stub("api", built="unknown"))
+        result = self._refused_cut()
+        self.assertIn("does not report when it was built", result.stderr)
+
+    def test_stamps_field_mode_reports_the_value_the_binaries_agree_on(self):
+        for field, expected in (("toolchain", BUILD_TOOLCHAIN), ("built", BUILD_TIME)):
+            result = self._run(STAMPS_SCRIPT, "--field", field, str(self.source_root))
+            self.assertEqual(
+                result.returncode, 0, f"field mode refused:\n{result.stdout}\n{result.stderr}"
+            )
+            self.assertEqual(result.stdout.strip(), expected)
+
+    def test_stamps_field_mode_refuses_binaries_that_disagree(self):
+        self._write_executable(
+            self.source_root / "ci", self._stub("ci", toolchain="rustc 0.0.1 (other)")
+        )
+        result = self._run(STAMPS_SCRIPT, "--field", "toolchain", str(self.source_root))
+        self.assertNotEqual(result.returncode, 0, "field mode accepted disagreeing binaries")
+        self.assertIn("disagree about toolchain", result.stderr)
 
 
 if __name__ == "__main__":

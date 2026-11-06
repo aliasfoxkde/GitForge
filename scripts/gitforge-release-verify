@@ -61,6 +61,23 @@ fi
 # 2026-11-05).
 "$(dirname "$0")/gitforge-release-stamps" "$release_dir/bin" "$metadata_commit"
 
+# The metadata has to describe the binaries, not the machine that assembled
+# them. A bundle whose metadata names a different toolchain or a different
+# build time than its own binaries carry is describing something else
+# (GF-15, 2026-11-06).
+binary_toolchain=$("$(dirname "$0")/gitforge-release-stamps" --field toolchain "$release_dir/bin")
+binary_built=$("$(dirname "$0")/gitforge-release-stamps" --field built "$release_dir/bin")
+if [[ "$metadata_toolchain" != "$binary_toolchain" ]]; then
+  printf 'release verify: metadata toolchain (%s) does not describe the shipped binaries (%s)\n' \
+    "$metadata_toolchain" "$binary_toolchain" >&2
+  exit 1
+fi
+if [[ "$metadata_timestamp" != "$binary_built" ]]; then
+  printf 'release verify: metadata build time (%s) does not describe the shipped binaries (%s)\n' \
+    "$metadata_timestamp" "$binary_built" >&2
+  exit 1
+fi
+
 ci_unit="$release_dir/systemd/user/gitforge-ci.service.example"
 runner_unit="$release_dir/systemd/user/gitforge-runner.service.example"
 generic_policy="$release_dir/systemd/user/gitforge-resource-limits.conf"
