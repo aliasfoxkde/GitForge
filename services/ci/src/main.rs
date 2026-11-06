@@ -2650,6 +2650,25 @@ async fn handle_push_event(
                     state.run_id
                 ))
             })?;
+            // Durable-plan BEFORE the workspace clone. prepare_run_workspace
+            // clones the whole bare repository, and on slow storage it can
+            // take minutes or hang (GF-19: the 2026-11-06 runs stranded as
+            // `running` with ZERO job rows because planning ran only after
+            // the clone returned). The clone does not affect the job SET or
+            // any definition field except the workspace fallback in
+            // `working_dir`, and enqueue_ready_jobs' upsert re-persists the
+            // full execution plan with the real workspace path, so a row
+            // written now is corrected before any runner sees it. A hung
+            // clone now strands a PLANNED run: rows exist, reconciliation
+            // and the store see the run's true shape, and a clone failure
+            // grades the run failed with traceable rows instead of a hollow
+            // `running`.
+            if let Err(error) = persist_planned_jobs(pool, &engine, state.run_id, None).await {
+                tracing::error!(run = %state.run_id, %error, "failed to persist planned jobs before workspace prep");
+                fail_run(pool, state.run_id, &error).await;
+                pipeline_registry.write().await.remove(&state.run_id);
+                return Err(TriggerFailure::terminal_after_run(error, state.run_id));
+            }
             match prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await {
                 Ok(path) => Some(path),
                 Err(error) => {
@@ -3199,6 +3218,18 @@ async fn persist_planned_jobs(
         // Durable-write discipline (F21/F23): losing one row to a transient
         // busy aborts the whole loop and strands a half-planned run (the
         // caller fails it), so each row fights contention instead.
+        // Skip rows the pre-clone planning pass already wrote (GF-19:
+        // planning runs before AND after the workspace clone so a hung
+        // clone cannot strand a jobless `running` row). A plain re-create
+        // would hit the unique id and fail the run; the working_dir the
+        // second pass would correct is fixed at dispatch time anyway, when
+        // enqueue_ready_jobs' upsert rewrites the full definition.
+        if gitforge_db::queries::JobQueries::get(pool, db_job.id)
+            .await
+            .is_ok_and(|row| row.is_some())
+        {
+            continue;
+        }
         persist_with_retry(|| gitforge_db::queries::JobQueries::create(pool, &db_job)).await?;
     }
     tracing::info!(run = %run_id, planned = planned.len(), "persisted planned job rows");
