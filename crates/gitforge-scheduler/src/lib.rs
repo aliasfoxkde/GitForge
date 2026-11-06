@@ -5,6 +5,7 @@
 pub mod assigner;
 pub mod policy;
 pub mod queue;
+pub mod resource_class;
 pub mod server;
 
 pub use assigner::{Scheduler, SchedulerEvent};

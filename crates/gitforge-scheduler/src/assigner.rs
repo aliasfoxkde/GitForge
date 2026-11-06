@@ -2,6 +2,7 @@
 
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
+use crate::resource_class::workspace_cargo_test;
 use gitforge_common::{JobId, Lane, PipelineRunId, RepoId, RunnerId, VolumeSpec};
 use gitforge_db::models::{
     Job as DbJob, JobStatus, PipelineRun as DbPipelineRun, Runner,
@@ -65,6 +66,11 @@ pub enum DeferredReason {
     LaneLimit,
     FastReservedCapacity,
     ScratchHeadroom,
+    /// The job's exclusive resource class was already in flight on every
+    /// runner that had capacity. The class is an admission rule of the
+    /// scheduler, so the exclusion has to be named: a job blocked by it used
+    /// to sit queued with no reason at all (GF-14).
+    ResourceClassConflict,
 }
 
 impl DeferredReason {
@@ -73,6 +79,7 @@ impl DeferredReason {
             DeferredReason::LaneLimit => "lane_limit",
             DeferredReason::FastReservedCapacity => "fast_reserved_capacity",
             DeferredReason::ScratchHeadroom => "scratch_headroom",
+            DeferredReason::ResourceClassConflict => "resource_class_conflict",
         }
     }
 }
@@ -293,21 +300,18 @@ pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 300;
 /// Return the scheduler resource class for jobs that must not overlap on one
 /// runner. Workspace-wide Cargo tests contend for the same checkout and build
 /// artifacts, so a runner admits at most one of them at a time.
+///
+/// The class is decided by the cargo SUBCOMMAND the command runs, not by the
+/// presence of the words `cargo`, `test` and `--workspace` anywhere in the
+/// command text (GF-14). The word scan classified a command that merely
+/// MENTIONED them — in a comment, or in another cargo subcommand such as
+/// `cargo llvm-cov` — as a workspace cargo test, and such a job was then
+/// excluded from runners that were free to take it.
 fn resource_class(definition: &JobExecutionDefinition) -> Option<&'static str> {
     definition
         .commands
         .iter()
-        .any(|command| {
-            command
-                .split_whitespace()
-                .any(|argument| argument == "cargo")
-                && command
-                    .split_whitespace()
-                    .any(|argument| argument == "test")
-                && command
-                    .split_whitespace()
-                    .any(|argument| argument == "--workspace")
-        })
+        .any(|command| workspace_cargo_test(command))
         .then_some("workspace-cargo-test")
 }
 
@@ -1579,6 +1583,11 @@ impl Scheduler {
 
             // Select runner using policy
             let mut available = runners.clone();
+            // A runner whose free slot is taken away by the exclusive resource
+            // class is a different block from a runner that is simply busy:
+            // only the class is an admission rule of the scheduler, so
+            // remember when the class is what removed the capacity.
+            let mut class_conflict_blocked = false;
             for runner in &mut available {
                 let in_flight = state
                     .assigned_jobs
@@ -1588,6 +1597,9 @@ impl Scheduler {
                 runner.capacity = (runner.capacity - in_flight).max(0);
                 if let Some(definition) = &definition {
                     if runner_has_resource_class_conflict(&state, runner.id, definition) {
+                        if runner.capacity > 0 {
+                            class_conflict_blocked = true;
+                        }
                         runner.capacity = 0;
                     }
                 }
@@ -1673,10 +1685,26 @@ impl Scheduler {
                     // No runner can take this job right now. Leave it queued
                     // and consider the next one so a single blocked job cannot
                     // idle the runner's remaining capacity.
-                    tracing::debug!(
-                        "no runner available for job {}, skipping to next queued job",
-                        job_id
-                    );
+                    if class_conflict_blocked {
+                        // The exclusive resource class is what removed the
+                        // capacity of every runner that had any. Name it
+                        // durably: a job blocked by the class used to sit
+                        // queued with no reason at all (GF-14).
+                        tracing::debug!(
+                            "job {} deferred: resource class already in flight",
+                            job_id
+                        );
+                        self.record_deferral(
+                            &mut state,
+                            job_id,
+                            DeferredReason::ResourceClassConflict,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "no runner available for job {}, skipping to next queued job",
+                            job_id
+                        );
+                    }
                     skipped.insert(job_id);
                 }
             }
@@ -2588,6 +2616,122 @@ mod tests {
         assert!(
             scheduler.is_assigned(blocked_job).await.is_none(),
             "exclusive-class job must stay queued while its class is running"
+        );
+    }
+
+    /// The DIL coverage job's command verbatim. It mentions "the test binary"
+    /// in a comment and runs `cargo llvm-cov --workspace` — the shape the
+    /// word scan misfiled into the workspace-cargo-test class (GF-14).
+    fn coverage_definition() -> JobExecutionDefinition {
+        JobExecutionDefinition {
+            commands: vec![
+                "command -v cargo-llvm-cov >/dev/null 2>&1 || { echo \"cargo-llvm-cov not in image; skipping\"; exit 0; }\nexport CARGO_BUILD_JOBS=4\n# This is the job that died on 2026-11-05 with ENOENT on the\n# test binary; the runner's mount lock is what keeps the tree\n# it executes from being replaced under it.\ncargo llvm-cov --workspace --summary-only --fail-under-lines 95".to_string(),
+            ],
+            image: "rust:1".to_string(),
+            working_dir: None,
+            timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+            env: HashMap::new(),
+            volumes: Vec::new(),
+            lane: gitforge_common::Lane::Standard,
+            fault: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_job_that_only_mentions_a_cargo_test_is_not_excluded_by_the_class() {
+        // GF-14: the DIL coverage job runs `cargo llvm-cov --workspace` and its
+        // comment mentions "the test binary". The word scan put it into the
+        // workspace-cargo-test class, so a platform `cargo test --workspace`
+        // job on the only runner excluded it from a runner that was free to
+        // take it.
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+
+        let coverage_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                coverage_job,
+                run_id,
+                repo_id,
+                coverage_definition(),
+            )
+            .await
+            .unwrap();
+
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+
+        // One workspace-cargo-test job already in flight on that runner.
+        let running_test_job = JobId::new();
+        {
+            let mut state = scheduler.state.write().await;
+            state
+                .job_definitions
+                .insert(running_test_job, workspace_test_definition());
+            state
+                .assigned_jobs
+                .insert(running_test_job, (runner_id, run_id, repo_id));
+        }
+
+        scheduler.process_queue().await;
+
+        assert_eq!(
+            scheduler.is_assigned(coverage_job).await,
+            Some(runner_id),
+            "a job that only mentions a cargo test must not be excluded by the class"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_class_excluded_job_names_its_blocker() {
+        // GF-14: the exclusion is invisible unless it is named. A job held
+        // back by the exclusive class has to carry the reason, the same way
+        // a lane-limited job does.
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+
+        let blocked_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                blocked_job,
+                run_id,
+                repo_id,
+                workspace_test_definition(),
+            )
+            .await
+            .unwrap();
+
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+
+        let running_test_job = JobId::new();
+        {
+            let mut state = scheduler.state.write().await;
+            state
+                .job_definitions
+                .insert(running_test_job, workspace_test_definition());
+            state
+                .assigned_jobs
+                .insert(running_test_job, (runner_id, run_id, repo_id));
+        }
+
+        scheduler.process_queue().await;
+
+        assert!(scheduler.is_assigned(blocked_job).await.is_none());
+        let status = scheduler.queue_status().await.unwrap();
+        let deferred = status
+            .queued
+            .iter()
+            .find(|job| job.job_id == blocked_job)
+            .expect("the excluded job is still queued");
+        assert_eq!(
+            deferred.deferred_reason.as_deref(),
+            Some("resource_class_conflict"),
+            "the exclusion must name its blocker"
         );
     }
 
