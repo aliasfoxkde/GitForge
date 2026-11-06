@@ -782,4 +782,45 @@ jobs:
 
         assert_eq!(event.actor_id, Some(user_id));
     }
+
+    /// The repo's own pipeline is a product artifact: the CI service parses
+    /// it at push time and a syntax or key error there turns every push
+    /// into a red pipeline with no useful diagnostic. Parsing it here
+    /// turns that into a local test failure.
+    #[test]
+    fn test_committed_pipeline_parses_and_keeps_its_docker_socket_mount() {
+        let yaml = include_str!("../../../.gitforge.yml");
+        let pipeline = PipelineDefinition::parse(yaml).expect("committed pipeline must parse");
+
+        let job = pipeline
+            .jobs
+            .iter()
+            .find(|job| job.name == "docker-integration")
+            .expect("docker-integration job");
+        let socket = job
+            .volumes
+            .iter()
+            .find(|volume| volume.destination == "/var/run/docker.sock")
+            .expect("docker socket mount");
+        // The placeholder, not a fixed path: the socket of the daemon the
+        // runner actually uses is deployment-specific (a rootless podman
+        // runner's socket is not /var/run/docker.sock).
+        assert_eq!(socket.source.as_deref(), Some("{docker_socket}"));
+        assert!(socket.read_only);
+        assert_eq!(
+            job.env.get("DOCKER_HOST").map(String::as_str),
+            Some("unix:///var/run/docker.sock")
+        );
+
+        // The job runs the daemon-dependent tests that `cargo test` skips;
+        // without the `--ignored` filter the job would pass while running
+        // nothing.
+        let step = job
+            .steps
+            .iter()
+            .find(|step| step.run.contains("--ignored"))
+            .expect("a step running the ignored tests");
+        assert!(step.run.contains("gitforge-sandbox"));
+        assert!(step.run.contains("gitforge-runner"));
+    }
 }

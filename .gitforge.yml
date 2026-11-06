@@ -2,10 +2,10 @@
 #
 # The project's own gates, run by the project itself: a shellcheck pass over
 # the release-channel ops scripts, rustfmt --check plus the route-docs drift
-# gate, the strict clippy pass, the workspace test suite, the line-coverage
-# gate, and a bounded fuzz smoke over the untrusted-input parsers. Pushes to
-# any branch run the full chain, so a PR branch is validated here before it
-# merges.
+# gate, the strict clippy pass, the workspace test suite, the docker-dependent
+# tests that `cargo test` skips, the line-coverage gate, and a bounded fuzz
+# smoke over the untrusted-input parsers. Pushes to any branch run the full
+# chain, so a PR branch is validated here before it merges.
 #
 # CHANGE-DETECTION PRUNING: the detect-changes job enumerates files changed
 # vs the merge-base with origin/main and classifies them. Downstream jobs
@@ -18,6 +18,7 @@
 #     test compiles everything, but clippy-grade lints on tests-only diffs
 #     are unenforced until the skip_if includes TESTS.
 #   - test: skips when no source, crates/, or tests changed
+#   - docker-integration: skips when no Rust source or crates/ changed
 #   - coverage: skips when no source, crates/, or tests changed
 #   - fuzz: skips when no source or crates/ changed
 # A doc-only push (e.g. updating a README) runs detect-changes → lint → fmt
@@ -27,7 +28,7 @@
 # Documented constraints (same list proven in gods-eye-view's and dsc's
 # .gitforce.yml):
 # - The job graph is a LINEAR CHAIN (detect-changes → lint → fmt → clippy →
-#   test → coverage → fuzz), not a fan-out,
+#   test → docker-integration → coverage → fuzz), not a fan-out,
 # - `environment: {}` is required by the parser (PipelineDefinition has no
 #   serde default) even though it is never forwarded.
 #   because all jobs of one run share the SAME workspace directory on this
@@ -205,9 +206,59 @@ jobs:
         run: cargo test --workspace -- --test-threads=2
     timeout: 90m
 
-  - name: coverage
+  - name: docker-integration
     image: dsc-ci-rust:16
     needs: [test]
+    cache:
+      # Compiled-artifact cache: the runner bind-mounts a host directory
+      # (keyed by the image tag) at /cargo-target and exports
+      # CARGO_TARGET_DIR pointing at it. The mount path inside the
+      # container is FIXED, so cargo can reuse the dependency artifacts
+      # an earlier run compiled instead of rebuilding the world every
+      # time; the host directory is keyed by image tag ({image}), so a
+      # rebuilt image starts from an empty cache rather than inheriting
+      # artifacts compiled by a different toolchain. The host location
+      # comes from the runner's GITFORGE_CACHE_ROOT.
+      source: "{cache_root}/cargo/{image}"
+      mount_path: /cargo-target
+    skip_if: '[[ "$CI_CHANGE_INCLUDE_CODE" == "1" || "$CI_CHANGE_INCLUDE_CRATES" == "1" ]]'
+    env:
+      # The daemon socket is mounted at the well-known path inside the
+      # container, so the tests inside it talk to the daemon there.
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      # The daemon socket, so the job's tests can drive a real daemon.
+      # `{docker_socket}` expands to the socket of the daemon THIS runner
+      # uses — a rootless podman runner's socket is not the system-wide
+      # path. Read-only: the mount grants the daemon API, which is already
+      # host-root-equivalent, and the socket file itself needs no writes.
+      # The sandbox detects the socket and runs this container with SELinux
+      # labeling disabled — the socket's type does not match the
+      # container's label, so the daemon refuses the connection otherwise.
+      - source: "{docker_socket}"
+        destination: /var/run/docker.sock
+        read_only: true
+    steps:
+      - name: Docker-dependent tests (cargo test -- --ignored)
+        # The `#[ignore]`-gated tests are the only coverage of the runner's
+        # container timeout reaping and of the sandbox's real container
+        # lifecycle. They were never run by any gate, so a release could
+        # ship a broken isolation path and every green run would still
+        # report success. `cargo test` alone skips them entirely.
+        #
+        # Scoped to the two crates that carry them and to test targets
+        # only: the workspace's doctests accept no `--ignored` filter, and
+        # the remaining crates have no daemon-dependent tests to run.
+        #
+        # The job container talks to the daemon over the socket mounted
+        # above, so the daemon it drives is the host's — the same daemon
+        # that runs this job.
+        run: cargo test -p gitforge-sandbox -p gitforge-runner --lib --tests -- --ignored --test-threads=2
+    timeout: 30m
+
+  - name: coverage
+    image: dsc-ci-rust:16
+    needs: [docker-integration]
     cache:
       # Compiled-artifact cache: the runner bind-mounts a host directory
       # (keyed by the image tag) at /cargo-target and exports

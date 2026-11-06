@@ -41,6 +41,83 @@ authoritative stores (gitforge.db, the API, the filesystem) at claim time.
 | F-16: image registry allowlist + digest pinning | `GITFORGE_ALLOWED_IMAGE_REGISTRIES` env-gated check in `gitforge-ci::engine` (core takes allowlist as data; 5 unit tests incl. port-prefix boundary). Unset = unrestricted |
 | RUNBOOK drift | metrics section corrected; one-runner fleet pause policy documented with the unpause path |
 
+## Runner image identity across a multi-host fleet (2026-11-05)
+
+F-16 shipped the *gate* (allowlist + digest pinning required), but the
+fleet cannot currently satisfy it: there is no shared registry the runners
+can reach, so every repository still distributes its job images by hand.
+This section records the measurements that define the durable fix.
+
+**The failure.** A DSC pipeline pinned each job's image by Docker image
+ID. The same content resolves to different IDs per storage driver —
+swarmone's classic overlay2 reports the image's *config* digest
+(`sha256:0402417a…`), fedora's overlayfs + containerd snapshotter reports
+the *manifest-list* digest (`sha256:fede6b3c…`). `SimplePolicy::select_runner`
+filters `status=="online" && capacity>0` and takes `max_by_key(capacity)`,
+so `fedora-docker` (5) outranks `swarmone-docker` (4) and every dsc job
+landed on fedora, where the pinned IDs did not exist — "No such image" at
+sandbox creation, which cancels every job chained behind it. The pipeline's
+correctness depended on which runner won a capacity race.
+
+**What is and is not portable** (measured 2026-11-05, same image content
+on both hosts):
+
+| Identity                                  | Portable across drivers? | Value |
+| ----------------------------------------- | ------------------------ | ----- |
+| `.Id` (local image ID)                    | **no**                   | `0402417a…` (swarmone) vs `fede6b3c…` (fedora) |
+| image **config** digest                   | yes                      | `sha256:0402417a…` on both |
+| **diffID** fingerprint (sorted layer set) | yes                      | `sha256:393acaf2…` on both |
+| registry **manifest** digest, pushed independently per host | **no**   | `6e8aeb89…` (swarmone) vs `71f39742…` (fedora) — each host re-compresses layers differently |
+
+The last row matters: a registry manifest digest identifies *a particular
+publication*, not the content. A shared registry only yields a portable
+digest if it is the **single publisher** — otherwise two hosts that each
+push their own copy mint different digests for identical content.
+
+**The pull path already supports it.** `ensure_image`
+(`crates/gitforge-sandbox/src/docker.rs:361`) passes the whole reference to
+Docker's `create_image` `fromImage`. A combined `repo@sha256:…` reference
+is accepted there — verified live against a temporary registry
+(`POST /v1.44/images/create?fromImage=127.0.0.1:5002/dsc-ci-node@sha256:71f3974…`
+→ HTTP 200, `Digest: sha256:71f3974…`). So F-16's contract is achievable
+without further sandbox changes.
+
+**Why the repo-side workaround is debt, not a fix.** The DSC repository
+(pinned by the tag contract in `.gitforce.yml` + the baked lockfile stamp
+check) makes a tag behave like a fixed reference: the image bakes the
+sha256 of the lockfile it was warmed from, and `lint-node`/`lint-rust` fail
+fast when the checkout's lockfile diverges from it; the diffID fingerprint
+proves the image is byte-identical on every runner host. That is a
+procedure compensating for the missing capability. It is recorded as
+explicit debt, owned by the operator, with the following shape:
+
+1. **One shared registry, reachable from every runner**, published from a
+   single build host so the manifest digest is canonical. Today
+   `gitforge-local-registry.service` publishes `127.0.0.1:5000` only —
+   loopback-only and unreachable from fedora — and both daemons'`
+   `insecure-registries` cover only `127.0.0.0/8`, so a LAN-bound registry
+   additionally needs `insecure-registries` on both daemons (a
+   `/etc/docker/daemon.json` edit plus a docker restart on the CI host).
+   A temporary registry bound to `192.168.0.201:5002` was verified
+   reachable from both hosts (HTTP 200) — the network path is not the
+   blocker; daemon configuration is.
+2. **`GITFORGE_ALLOWED_IMAGE_REGISTRIES`** set to that registry's prefix
+   on the scheduler, so the F-16 gate becomes active and every job image
+   must be a digest-pinned reference under it.
+3. **Job images pinned as `registry/repo@sha256:<manifest-digest>`** in
+   each repository's pipeline definition.
+4. **Runner affinity** (or capacity tuning) so a job's image is present
+   on whichever runner the scheduler selects. There is no affinity
+   mechanism today: the `runners` table has no `repo_id` and `labels` is
+   hardcoded `"[]"`. `select_runner` has no notion of "can this runner
+   serve this image".
+
+Item 4 is the substantive scheduler change: with a shared registry, a
+runner can *pull* an image it does not have, so the cold-pull cost and the
+60-second sandbox acquisition cap (`GITFORGE_SANDBOX_ACQUIRE_SECS`) become
+the binding constraint instead of image presence. An affinity preference
+plus a warm-pull strategy on the runner is the natural follow-on.
+
 ## Known remaining work (ordered)
 
 1. **Gate the three code changes** (gauge refresh, supersede, image
