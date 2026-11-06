@@ -13,7 +13,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use gitforge_common::{JobId, RunnerId, VolumeSpec};
+use gitforge_common::{
+    JobExistenceRequest, JobExistenceResponse, JobId, JobRowState, RunnerId, VolumeSpec,
+};
 use gitforge_db::models::{Runner, RunnerType};
 use gitforge_storage::{Artifact, ArtifactId, ArtifactStore, FileStorage, MAX_ARTIFACT_BYTES};
 use serde::{Deserialize, Serialize};
@@ -169,6 +171,7 @@ pub fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
     let runner_routes = Router::new()
         .route("/runners/{id}/heartbeat", post(runner_heartbeat))
         .route("/jobs/pending", get(get_pending_jobs))
+        .route("/jobs/existence", post(post_job_existence))
         .route("/queue/status", get(get_queue_status))
         .route("/jobs/{id}/claim", post(claim_job))
         .route("/jobs/{id}/started", post(start_job))
@@ -205,6 +208,44 @@ pub fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
         .merge(registration_routes)
         .merge(operator_routes)
         .with_state(state)
+}
+
+/// Answer, per job id, whether the authoritative store has a row for it.
+///
+/// The runner stamps a job-shaped id on every container it creates. For a
+/// real job the store has a row, because the row is written when the job
+/// is enqueued — before the job can be dispatched to a runner. A container
+/// whose job id the store has never heard of was therefore never a job
+/// container, which is the only way to tell the warm pool's leftovers
+/// apart from an abandoned job.
+///
+/// The answer is per id and never global: an id the store cannot speak
+/// for is answered `unknown`, and `unknown` never authorises a removal.
+async fn post_job_existence(
+    State(state): State<SchedulerServerState>,
+    Json(request): Json<JobExistenceRequest>,
+) -> impl IntoResponse {
+    let mut parsed: Vec<JobId> = Vec::with_capacity(request.job_ids.len());
+    let mut states: HashMap<String, JobRowState> = HashMap::new();
+    for raw in request.job_ids {
+        match Uuid::parse_str(raw.trim()) {
+            Ok(uuid) => parsed.push(JobId::from(uuid)),
+            // A malformed id is not evidence of anything. Answer `unknown`
+            // so a parse failure can never become a removal.
+            Err(_) => {
+                states.insert(raw, JobRowState::Unknown);
+            }
+        }
+    }
+    let resolved = state.scheduler.job_row_states(&parsed).await;
+    for job_id in parsed {
+        let answer = resolved
+            .get(&job_id)
+            .copied()
+            .unwrap_or(JobRowState::Unknown);
+        states.insert(job_id.to_string(), answer);
+    }
+    (StatusCode::OK, Json(JobExistenceResponse { states }))
 }
 
 async fn require_scheduler_auth(
@@ -2204,5 +2245,149 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The bulk existence endpoint answers per id against the authoritative
+    /// store: a durable job row reads `present`, an id the store has never
+    /// heard of reads `absent`, and a malformed id reads `unknown`.
+    ///
+    /// The distinction matters because the store row is written at enqueue
+    /// time, before dispatch: "no row" means "never was a job", which is
+    /// the only thing that separates a warm-pool leftover from an
+    /// abandoned job container.
+    #[tokio::test]
+    async fn test_job_existence_answers_present_absent_and_unknown() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (known, _other) = seed_restart_scenario(&pool, "job-existence").await;
+        let absent = JobId::new();
+        let app: Router = scheduler_routes_with_tokens(
+            create_state(crate::Scheduler::with_db(pool)),
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/jobs/existence")
+                    .header("authorization", "Bearer runner-secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "job_ids": [
+                                known.to_string(),
+                                absent.to_string(),
+                                "not-a-uuid",
+                            ],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        assert_eq!(status, StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let payload: JobExistenceResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            payload.states.get(&known.to_string()),
+            Some(&JobRowState::Present),
+            "a seeded job row must read present"
+        );
+        assert_eq!(
+            payload.states.get(&absent.to_string()),
+            Some(&JobRowState::Absent),
+            "an id the store has never heard of must read absent"
+        );
+        assert_eq!(
+            payload.states.get("not-a-uuid"),
+            Some(&JobRowState::Unknown),
+            "a malformed id must read unknown, never absent"
+        );
+    }
+
+    /// A scheduler that owns no store cannot speak for jobs another process
+    /// planned, so every id reads `unknown` — the answer that never
+    /// authorises a removal.
+    #[tokio::test]
+    async fn test_job_existence_without_a_store_answers_unknown() {
+        let job_id = JobId::new();
+        let app: Router = scheduler_routes_with_tokens(
+            create_state(crate::Scheduler::new()),
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/jobs/existence")
+                    .header("authorization", "Bearer runner-secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "job_ids": [job_id.to_string()] }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        assert_eq!(status, StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let payload: JobExistenceResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            payload.states.get(&job_id.to_string()),
+            Some(&JobRowState::Unknown),
+            "a store-less scheduler must answer unknown, never absent"
+        );
+    }
+
+    /// The endpoint sits in the runner's credential scope, because the
+    /// runner is the only component that needs to ask. A wrong or absent
+    /// credential is refused before the store is consulted.
+    #[tokio::test]
+    async fn test_job_existence_requires_the_runner_credential() {
+        let app: Router = scheduler_routes_with_tokens(
+            create_state(crate::Scheduler::new()),
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/jobs/existence")
+                    .header("authorization", "Bearer wrong-secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "job_ids": [JobId::new().to_string()] }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+        let anonymous = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/jobs/existence")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "job_ids": [JobId::new().to_string()] }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
     }
 }

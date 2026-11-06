@@ -10,6 +10,7 @@ pub mod build;
 pub mod error;
 pub mod fault;
 pub mod ids;
+pub mod job_row;
 pub mod lane;
 pub mod password;
 pub mod result;
@@ -23,6 +24,7 @@ pub use ids::{
     JobId, JobStatus, PipelineId, PipelineRunId, PipelineStatus, RepoId, RunnerId, SshKeyId,
     StepId, UserId,
 };
+pub use job_row::{JobExistenceRequest, JobExistenceResponse, JobRowState};
 pub use lane::Lane;
 pub use rollout::RolloutFlags;
 pub use time::DateTime;

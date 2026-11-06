@@ -3,7 +3,7 @@
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
 use crate::resource_class::workspace_cargo_test;
-use gitforge_common::{JobId, Lane, PipelineRunId, RepoId, RunnerId, VolumeSpec};
+use gitforge_common::{JobId, JobRowState, Lane, PipelineRunId, RepoId, RunnerId, VolumeSpec};
 use gitforge_db::models::{
     Job as DbJob, JobStatus, PipelineRun as DbPipelineRun, Runner,
     RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS,
@@ -491,6 +491,47 @@ impl Scheduler {
             || state.job_assignments.contains_key(&job_id)
             || state.assigned_jobs.contains_key(&job_id)
             || state.queue.contains(job_id)
+    }
+
+    /// Resolve the authoritative store's view of a batch of job ids.
+    ///
+    /// The answer comes from the durable store only. A scheduler without a
+    /// store cannot speak for jobs another process planned, so it answers
+    /// `Unknown` for every id — the fail-closed answer, because `Unknown`
+    /// is the one that never turns into a removal.
+    ///
+    /// The distinction matters because the runner stamps a job-shaped id on
+    /// every container it creates, including the warm-pool containers that
+    /// were never given to a job. A real job always has a durable row: the
+    /// row is written when the job is enqueued, which is before the job can
+    /// be dispatched to a runner.
+    pub async fn job_row_states(&self, job_ids: &[JobId]) -> HashMap<JobId, JobRowState> {
+        let mut states: HashMap<JobId, JobRowState> = job_ids
+            .iter()
+            .map(|job_id| (*job_id, JobRowState::Unknown))
+            .collect();
+        let Some(pool) = &self.db_pool else {
+            return states;
+        };
+        let loaded = match gitforge_db::queries::JobQueries::get_many(pool, job_ids).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "job existence lookup failed; every id stays unknown"
+                );
+                return states;
+            }
+        };
+        for job_id in job_ids {
+            let state = if loaded.contains_key(job_id) {
+                JobRowState::Present
+            } else {
+                JobRowState::Absent
+            };
+            states.insert(*job_id, state);
+        }
+        states
     }
 
     /// Read a durable pipeline run for the CI status adapter.

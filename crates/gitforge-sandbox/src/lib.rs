@@ -18,6 +18,7 @@ pub use pool::{
     OwnerState, PoolDecision, PoolIdentity, PoolPolicy, PoolReclaimReport,
 };
 pub use reconciler::{
-    classify, ContainerRecord, ContainerSource, Decision, DockerContainerSource, ReconcileReport,
-    Reconciler, ReconcilerPolicy, RemovalOutcome,
+    classify, ContainerRecord, ContainerSource, Decision, DockerContainerSource,
+    JobExistenceResolver, ReconcileReport, Reconciler, ReconcilerPolicy, RemovalOutcome,
+    UnknownJobExistence,
 };
