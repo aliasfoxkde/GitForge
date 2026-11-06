@@ -32,7 +32,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gitforge_common::{VolumeSpec, VolumeType};
+use gitforge_common::{is_socket_source, VolumeSpec, VolumeType};
 use tokio::time::Instant;
 
 /// How long to wait between attempts to take a busy directory.
@@ -158,14 +158,22 @@ fn try_lock(directory: &File) -> io::Result<bool> {
 /// The host directories a job shares with other jobs.
 ///
 /// Only writable bind mounts of a host path are shared: a read-only mount
-/// cannot be written to, a tmpfs lives inside the container, and a named
+/// cannot be written to, a tmpfs lives inside the container, a named
 /// volume is managed by the container daemon rather than by a host path
-/// the runner can lock.
-pub fn shared_sources(image: &str, volumes: &[VolumeSpec], cache_root: &str) -> Vec<PathBuf> {
+/// the runner can lock, and a unix socket is not a directory at all.
+pub fn shared_sources(
+    image: &str,
+    volumes: &[VolumeSpec],
+    cache_root: &str,
+    docker_socket: &str,
+) -> Vec<PathBuf> {
     let mut sources: Vec<PathBuf> = volumes
         .iter()
         .filter(|volume| !volume.read_only && volume.resolved_type() == VolumeType::Bind)
-        .filter_map(|volume| volume.expanded_source(image, cache_root))
+        .filter_map(|volume| volume.expanded_source(image, cache_root, docker_socket))
+        // The daemon socket is not a lockable directory: locking it would
+        // try to create it, and it is shared by every job on the runner.
+        .filter(|source| !is_socket_source(source))
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .collect();
@@ -190,11 +198,12 @@ pub async fn lock_job_mounts(
     image: &str,
     volumes: &[VolumeSpec],
     cache_root: &str,
+    docker_socket: &str,
     wait: Duration,
 ) -> Result<(Vec<MountLock>, Vec<VolumeSpec>), MountLockError> {
     let deadline = Instant::now() + wait;
     let mut locks = Vec::new();
-    for source in shared_sources(image, volumes, cache_root) {
+    for source in shared_sources(image, volumes, cache_root, docker_socket) {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match MountLock::acquire(&source, remaining).await {
             Ok(lock) => locks.push(lock),
@@ -295,6 +304,7 @@ mod tests {
                 relative,
             ],
             "/var/cache/gitforge",
+            "/var/run/docker.sock",
         );
         assert_eq!(sources, vec![writable]);
     }
@@ -310,6 +320,7 @@ mod tests {
             "backend-ci-rust:1",
             &[bind(shared.to_str().expect("a utf-8 path"))],
             "/var/cache/gitforge",
+            "/var/run/docker.sock",
             Duration::from_millis(200),
         )
         .await;
@@ -334,6 +345,7 @@ mod tests {
             "backend-ci-rust:1",
             &[volume],
             "/var/cache/gitforge",
+            "/var/run/docker.sock",
             Duration::from_millis(200),
         )
         .await;

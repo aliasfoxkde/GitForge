@@ -449,8 +449,16 @@ impl DockerContainerSource {
                 "reconciler Docker call timeout must be positive",
             ));
         }
-        let docker = bollard::Docker::connect_with_local_defaults()
-            .map_err(|e| Error::sandbox(format!("reconciler docker connect failed: {e}")))?;
+        // The same daemon the sandbox talks to: the reconciler removes the
+        // containers the runner leaked, and a reconciler pointed at another
+        // daemon would never see them.
+        let socket = gitforge_common::docker_socket();
+        let docker = bollard::Docker::connect_with_unix(
+            &socket,
+            crate::docker::docker_client_timeout(),
+            bollard::API_DEFAULT_VERSION,
+        )
+        .map_err(|e| Error::sandbox(format!("reconciler docker connect failed: {e}")))?;
         Ok(Self {
             docker,
             call_timeout,

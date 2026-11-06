@@ -27,7 +27,8 @@ pub use lane::Lane;
 pub use rollout::RolloutFlags;
 pub use time::DateTime;
 pub use volume::{
-    cache_root, image_cache_key, JobCache, VolumeSpec, VolumeType, DEFAULT_CACHE_ROOT,
+    cache_root, docker_socket, docker_socket_with, image_cache_key, is_socket_source, JobCache,
+    VolumeSpec, VolumeType, DEFAULT_CACHE_ROOT, DEFAULT_DOCKER_SOCKET,
 };
 
 /// True when `hash` is git's "ref does not exist" sentinel: empty or all

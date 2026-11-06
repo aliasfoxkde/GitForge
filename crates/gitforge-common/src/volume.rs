@@ -54,13 +54,20 @@ impl VolumeSpec {
         }
     }
 
-    /// The host source with the `{image}` and `{cache_root}` placeholders
-    /// expanded against the job's image and the runner's cache root.
-    pub fn expanded_source(&self, image: &str, cache_root: &str) -> Option<String> {
+    /// The host source with the `{image}`, `{cache_root}` and
+    /// `{docker_socket}` placeholders expanded against the job's image, the
+    /// runner's cache root, and the runner's daemon socket.
+    pub fn expanded_source(
+        &self,
+        image: &str,
+        cache_root: &str,
+        docker_socket: &str,
+    ) -> Option<String> {
         self.source.as_ref().map(|source| {
             source
                 .replace("{image}", &image_cache_key(image))
                 .replace("{cache_root}", cache_root)
+                .replace("{docker_socket}", docker_socket)
         })
     }
 
@@ -206,6 +213,55 @@ pub fn cache_root() -> String {
     )
 }
 
+/// The well-known system-wide Docker daemon socket.
+pub const DEFAULT_DOCKER_SOCKET: &str = "/var/run/docker.sock";
+
+/// The Docker daemon socket named by a `DOCKER_HOST` value.
+///
+/// `DOCKER_HOST` wins when it names a unix socket: a rootless podman's
+/// socket is not the system-wide path. The scheme is stripped, because the
+/// value is used as a host bind source, not as a URL.
+pub fn docker_socket_with(docker_host: Option<&str>) -> String {
+    docker_host
+        .and_then(|host| host.strip_prefix("unix://"))
+        .filter(|path| !path.is_empty())
+        .unwrap_or(DEFAULT_DOCKER_SOCKET)
+        .to_string()
+}
+
+/// The Docker daemon socket this runner talks to.
+///
+/// One definition for the whole platform: the sandbox connects to this
+/// socket, the reconciler reconciles this daemon's containers, and a
+/// `{docker_socket}` mount binds this socket into the job's container. A
+/// runner that bound one daemon's socket while talking to another would run
+/// the job against a daemon it does not supervise.
+///
+/// Call this once at the edge - where a job starts, and where a container
+/// is created - and pass the value down.
+pub fn docker_socket() -> String {
+    docker_socket_with(std::env::var("DOCKER_HOST").ok().as_deref())
+}
+
+/// Whether a bind source names a unix socket rather than a directory.
+///
+/// A socket is not a directory: the runner must not create one in its
+/// place, must not relabel it (`:z` rewrites the host socket's SELinux
+/// label - a host-state change the runner does not own), and must not lock
+/// it like a shared build directory.
+#[cfg(unix)]
+pub fn is_socket_source(source: &str) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    std::fs::metadata(source).is_ok_and(|metadata| metadata.file_type().is_socket())
+}
+
+/// Whether a bind source names a unix socket rather than a directory.
+#[cfg(not(unix))]
+pub fn is_socket_source(_source: &str) -> bool {
+    false
+}
+
 /// A filesystem-safe key for an image reference.
 ///
 /// Caches are keyed by this value so a rebuilt image (new tag) starts from
@@ -287,8 +343,12 @@ mod tests {
             size: None,
         };
         assert_eq!(
-            spec.expanded_source("dsc-ci-rust:10", "/var/cache/gitforge")
-                .as_deref(),
+            spec.expanded_source(
+                "dsc-ci-rust:10",
+                "/var/cache/gitforge",
+                "/var/run/docker.sock"
+            )
+            .as_deref(),
             Some("/var/cache/gitforge-cargo/dsc-ci-rust-10")
         );
     }
@@ -335,6 +395,73 @@ mod tests {
 }
 
 #[cfg(test)]
+mod socket_tests {
+    use super::*;
+
+    #[test]
+    fn the_daemon_socket_defaults_to_the_well_known_path() {
+        assert_eq!(docker_socket_with(None), DEFAULT_DOCKER_SOCKET);
+    }
+
+    #[test]
+    fn a_unix_docker_host_names_the_socket() {
+        assert_eq!(
+            docker_socket_with(Some("unix:///run/user/1000/podman/podman.sock")),
+            "/run/user/1000/podman/podman.sock"
+        );
+    }
+
+    #[test]
+    fn a_tcp_docker_host_is_not_a_socket_path() {
+        assert_eq!(
+            docker_socket_with(Some("tcp://127.0.0.1:2375")),
+            DEFAULT_DOCKER_SOCKET
+        );
+    }
+
+    #[test]
+    fn a_blank_docker_host_falls_through() {
+        assert_eq!(docker_socket_with(Some("unix://")), DEFAULT_DOCKER_SOCKET);
+        assert_eq!(docker_socket_with(Some("")), DEFAULT_DOCKER_SOCKET);
+    }
+
+    #[test]
+    fn the_socket_placeholder_expands_to_the_daemon_socket() {
+        let spec = VolumeSpec {
+            volume_type: Some(VolumeType::Bind),
+            source: Some("{docker_socket}".to_string()),
+            destination: "/var/run/docker.sock".to_string(),
+            read_only: true,
+            size: None,
+        };
+        assert_eq!(
+            spec.expanded_source(
+                "dsc-ci-rust:16",
+                "/var/cache/gitforge",
+                "/run/user/1000/podman/podman.sock"
+            )
+            .as_deref(),
+            Some("/run/user/1000/podman/podman.sock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_source_is_not_a_directory() {
+        let root =
+            std::env::temp_dir().join(format!("gitforge-socket-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("a scratch directory");
+        let socket = root.join("docker.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("a unix socket");
+
+        assert!(is_socket_source(&socket.to_string_lossy()));
+        assert!(!is_socket_source(&root.to_string_lossy()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
 mod cache_tests {
     use super::*;
 
@@ -348,8 +475,12 @@ mod cache_tests {
             size: None,
         };
         assert_eq!(
-            spec.expanded_source("dsc-ci-rust:10", "/var/cache/gitforge")
-                .as_deref(),
+            spec.expanded_source(
+                "dsc-ci-rust:10",
+                "/var/cache/gitforge",
+                "/var/run/docker.sock"
+            )
+            .as_deref(),
             Some("/var/cache/gitforge/cargo/dsc-ci-rust-10")
         );
     }

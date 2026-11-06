@@ -640,28 +640,36 @@ impl JobExecutor {
         // writing to.
         let lock_wait = deadline.saturating_duration_since(Instant::now());
         let cache_root = gitforge_common::cache_root();
-        let (mount_locks, locked_volumes) =
-            match lock_job_mounts(&job.image, &job.volumes, &cache_root, lock_wait).await {
-                Ok(locked) => locked,
-                Err(error) => {
-                    let completed_at = chrono::Utc::now();
-                    tracing::warn!(%job_id, %error, "could not lock the job's shared host mounts");
-                    return JobResult {
-                        job_id,
-                        success: false,
-                        exit_code: -1,
-                        step_results: Vec::new(),
-                        artifacts: Vec::new(),
-                        logs: None,
-                        started_at,
-                        completed_at,
-                        timed_out: false,
-                        error: Some(format!("shared mount unavailable: {error}")),
-                        workspace_path: job.working_dir.clone(),
-                        infrastructure_failure: true,
-                    };
-                }
-            };
+        let docker_socket = gitforge_common::docker_socket();
+        let (mount_locks, locked_volumes) = match lock_job_mounts(
+            &job.image,
+            &job.volumes,
+            &cache_root,
+            &docker_socket,
+            lock_wait,
+        )
+        .await
+        {
+            Ok(locked) => locked,
+            Err(error) => {
+                let completed_at = chrono::Utc::now();
+                tracing::warn!(%job_id, %error, "could not lock the job's shared host mounts");
+                return JobResult {
+                    job_id,
+                    success: false,
+                    exit_code: -1,
+                    step_results: Vec::new(),
+                    artifacts: Vec::new(),
+                    logs: None,
+                    started_at,
+                    completed_at,
+                    timed_out: false,
+                    error: Some(format!("shared mount unavailable: {error}")),
+                    workspace_path: job.working_dir.clone(),
+                    infrastructure_failure: true,
+                };
+            }
+        };
         let _mount_locks = mount_locks;
         job.volumes = locked_volumes;
 
