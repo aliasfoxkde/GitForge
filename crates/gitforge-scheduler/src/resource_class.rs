@@ -16,6 +16,24 @@
 //! The scan below is lexical and deliberately conservative: it reads the
 //! subcommand of a cargo invocation and requires `--workspace` (or its
 //! `--all` alias) among that invocation's arguments.
+//!
+//! TWO DIRECTIONS, CHOSEN DELIBERATELY.
+//!
+//! * A false POSITIVE (a job that is not a workspace cargo test, classified as
+//!   one) costs a scheduling deferral. The deferral is recorded in the job's
+//!   durable `deferred_reason`, so the cost is visible and bounded.
+//! * A false NEGATIVE (a workspace cargo test that is not classified) lets
+//!   two workspace cargo tests build the same target tree on one runner. That
+//!   is the failure that killed the coverage jobs with ENOENT on the test
+//!   binary on 2026-11-05, and it is silent.
+//!
+//! So the scan looks for a cargo invocation ANYWHERE in a segment, not only at
+//! the segment's first program word. A wrapper program in front of the
+//! invocation — `flock <lockfile> cargo test --workspace` — still runs that
+//! invocation, and the wrapper is exactly what the older, looser classifier
+//! used to catch. The residual imprecision is an unquoted textual mention of
+//! a cargo test inside a segment; it costs a visible deferral, never a
+//! corrupted build.
 
 /// Cargo's global options that take a separate value argument. The value is
 /// never the subcommand, so the subcommand scan steps over both.
@@ -30,12 +48,12 @@ const CARGO_VALUE_OPTIONS: &[&str] = &[
 
 /// Whether the command runs `cargo test` over the whole workspace.
 ///
-/// The command text is a shell script, so the scan looks for a segment whose
-/// program word is `cargo`, reads the cargo SUBCOMMAND that follows it, and
-/// requires `--workspace` (or its `--all` alias) among that invocation's
-/// arguments. Comment lines are skipped, and only a segment's first program
-/// word is considered, so a mention of "cargo test --workspace" inside a
-/// comment or an echoed string does not create the class.
+/// The command text is a shell script, so the scan looks for a segment that
+/// runs a cargo invocation whose SUBCOMMAND is `test` and whose arguments
+/// include `--workspace` (or its `--all` alias). Comment lines are skipped,
+/// and the workspace flag must belong to the cargo test invocation itself, so
+/// a mention of "cargo test --workspace" inside a comment or an echoed
+/// string does not create the class.
 pub fn workspace_cargo_test(command: &str) -> bool {
     logical_lines(command).iter().any(|line| {
         shell_segments(line)
@@ -155,20 +173,20 @@ fn shell_words(segment: &str) -> Vec<String> {
 }
 
 /// Whether one shell segment runs a workspace-wide cargo test.
+///
+/// Every word position is considered as the start of a cargo invocation, so a
+/// wrapper program in front of the invocation does not hide it.
 fn segment_runs_workspace_cargo_test(segment: &str) -> bool {
     let words = shell_words(segment);
-    let mut index = 0;
-    // A segment may start with environment assignments, or with `env`.
-    while index < words.len() && (words[index] == "env" || is_env_assignment(&words[index])) {
-        index += 1;
-    }
-    let Some(program) = words.get(index) else {
-        return false;
-    };
-    if !is_cargo_program(program) {
-        return false;
-    }
-    index += 1;
+    words.iter().enumerate().any(|(start, word)| {
+        is_cargo_program(word) && cargo_invocation_is_workspace_test(&words, start)
+    })
+}
+
+/// Whether the cargo invocation that starts at `start` is a workspace-wide
+/// cargo test.
+fn cargo_invocation_is_workspace_test(words: &[String], start: usize) -> bool {
+    let mut index = start + 1;
     // Step over cargo's global options to reach the subcommand.
     while let Some(word) = words.get(index) {
         if word.starts_with('+') {
@@ -210,8 +228,13 @@ fn is_env_assignment(word: &str) -> bool {
     characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-/// Whether a program word invokes cargo.
+/// Whether a word invokes cargo.
 fn is_cargo_program(word: &str) -> bool {
+    // An environment assignment is a value, not a program word, even when its
+    // value happens to end in `/cargo`.
+    if is_env_assignment(word) {
+        return false;
+    }
     word == "cargo" || word.ends_with("/cargo")
 }
 
@@ -283,6 +306,16 @@ mod tests {
     }
 
     #[test]
+    fn a_per_package_test_is_not_a_workspace_cargo_test() {
+        // The clippy invocation carries `--workspace`; the test invocation
+        // does not. The old word scan classified this script because the two
+        // words appeared anywhere in it.
+        assert!(!workspace_cargo_test(
+            "cargo clippy --locked --workspace --all-targets -- -D warnings\ncargo test --locked -p aegis-core --all-targets -- --test-threads=1"
+        ));
+    }
+
+    #[test]
     fn cargo_global_options_do_not_hide_the_subcommand() {
         assert!(workspace_cargo_test(
             "cargo --manifest-path /workspace/Cargo.toml test --workspace"
@@ -316,6 +349,28 @@ mod tests {
     fn a_path_to_cargo_is_classified() {
         assert!(workspace_cargo_test(
             "/usr/local/bin/cargo test --workspace"
+        ));
+    }
+
+    #[test]
+    fn a_wrapped_invocation_is_classified() {
+        // A wrapper program runs the cargo invocation it is given, so the
+        // invocation is still a workspace cargo test. Missing it would let two
+        // workspace cargo tests build the same target tree on one runner.
+        assert!(workspace_cargo_test(
+            "flock /cargo-target/.dil-cargo.lock \\\n  cargo test --workspace"
+        ));
+        assert!(workspace_cargo_test("timeout 60 cargo test --workspace"));
+        assert!(workspace_cargo_test("nohup cargo test --workspace"));
+    }
+
+    #[test]
+    fn a_wrapped_non_workspace_invocation_is_not_classified() {
+        assert!(!workspace_cargo_test(
+            "flock /cargo-target/.dil-cargo.lock \\\n  cargo llvm-cov --workspace --summary-only"
+        ));
+        assert!(!workspace_cargo_test(
+            "flock /cargo-target/.dil-cargo.lock \\\n  cargo clippy --workspace --all-targets"
         ));
     }
 }
