@@ -20,8 +20,6 @@ if [[ ! "$release_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   exit 64
 fi
 
-"$(dirname "$0")/gitforge-release-preflight" "$source_root"
-
 source_commit="${GITFORGE_SOURCE_COMMIT:-}"
 if [[ -z "$source_commit" ]]; then
   source_commit=$(git -C "$source_root" rev-parse HEAD 2>/dev/null || true)
@@ -30,6 +28,10 @@ if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'release bundle: exact source commit is required (set GITFORGE_SOURCE_COMMIT or pass a git checkout)\n' >&2
   exit 1
 fi
+
+# The preflight now carries the commit, so it can also prove that the
+# candidate binaries are the ones this bundle claims to ship.
+"$(dirname "$0")/gitforge-release-preflight" "$source_root" "$source_commit"
 
 # A cut may only assemble on top of a full, honest green for this exact
 # commit (see scripts/gitforge-release-gate).
@@ -83,6 +85,12 @@ chmod 2755 "$staging_dir" "$staging_dir/bin" "$staging_dir/scripts" \
 for binary in api ci git-server runner; do
   install -m 0755 "$source_root/$binary" "$staging_dir/bin/$binary"
 done
+
+# Prove the staged bytes carry the claimed commit BEFORE the bundle is
+# published. The verify step below runs after the atomic rename, and a
+# bundle that fails there would sit at the final name, blocking every retry
+# behind the overwrite refusal (GF-14, 2026-11-05).
+"$(dirname "$0")/gitforge-release-stamps" "$staging_dir/bin" "$source_commit"
 
 install -m 0755 "$source_root/scripts/gitforge-status" "$staging_dir/scripts/gitforge-status"
 

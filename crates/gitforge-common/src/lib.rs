@@ -6,6 +6,7 @@
 //! - Result type aliases
 //! - Time utilities
 
+pub mod build;
 pub mod error;
 pub mod fault;
 pub mod ids;

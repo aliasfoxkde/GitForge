@@ -8,7 +8,9 @@ end to end against a throwaway fixture assembled by the test itself:
    checksum manifest, unit examples, and resource policies;
 2. the verifier accepts the valid bundle and its manifest;
 3. tampering with a bundled binary fails verification;
-4. malformed or incomplete bundles fail closed with useful diagnostics.
+4. malformed or incomplete bundles fail closed with useful diagnostics;
+5. the bundle's provenance claim is enforced: binaries that were not built
+   from the claimed commit are refused, by the bundler and by the verifier.
 
 The tests are deterministic: no network, no real build artifacts, and every
 test assembles its own bundle from a fresh temporary fixture. Run with either
@@ -28,6 +30,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUNDLE_SCRIPT = REPO_ROOT / "scripts" / "gitforge-release-bundle"
 VERIFY_SCRIPT = REPO_ROOT / "scripts" / "gitforge-release-verify"
+STAMPS_SCRIPT = REPO_ROOT / "scripts" / "gitforge-release-stamps"
 
 REQUIRED_BINARIES = ("api", "ci", "git-server", "runner")
 UNIT_EXAMPLES = (
@@ -43,6 +46,7 @@ RESOURCE_POLICIES = (
 # The bundler only requires a 40-hex source commit; this synthetic value keeps
 # the test independent of whatever the checkout HEAD happens to be.
 SOURCE_COMMIT = "4a1f2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c"
+OTHER_COMMIT = "0f38a46345ac82efec9493310aa5c556c31c1ac5"
 TOOLCHAIN = "test-rustc 1.0.0 (canary)"
 RELEASE_ID = "20260909-canary"
 
@@ -68,9 +72,7 @@ class ReleaseBundleContractTests(unittest.TestCase):
         self.source_root.mkdir()
         self.bundle_root.mkdir()
         for name in REQUIRED_BINARIES:
-            self._write_executable(
-                self.source_root / name, f"#!/bin/sh\n# test stub: {name}\nexit 0\n"
-            )
+            self._write_executable(self.source_root / name, self._stub(name))
         # The bundler copies the status helper from the candidate source root,
         # not from this repository, so the fixture must provide one.
         self._write_executable(
@@ -86,6 +88,29 @@ class ReleaseBundleContractTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
         path.chmod(0o755)
+
+    @staticmethod
+    def _stub(name, commit=SOURCE_COMMIT, dirty="false", stamped=True):
+        """A stand-in for a release binary.
+
+        Real release binaries answer `--version` with the commit they were
+        built from; the release chain refuses a bundle whose binaries do not
+        agree with the commit the bundle claims. The stub reproduces that
+        contract so the contract can be tested without a real build.
+        """
+        if not stamped:
+            return f"#!/bin/sh\n# test stub: {name}\nexit 0\n"
+        return (
+            f"#!/bin/sh\n"
+            f"# test stub: {name}\n"
+            f'case "$1" in\n'
+            f"  --version|-V)\n"
+            f'    echo "{name} 0.0.0-test commit={commit} dirty={dirty}"\n'
+            f"    exit 0\n"
+            f"    ;;\n"
+            f"esac\n"
+            f"exit 0\n"
+        )
 
     def _env(self):
         env = os.environ.copy()
@@ -313,6 +338,119 @@ class ReleaseBundleContractTests(unittest.TestCase):
         result = self._run(VERIFY_SCRIPT, str(self.workdir / "does-not-exist"))
         self.assertEqual(result.returncode, 1)
         self.assertIn("release verify: directory does not exist:", result.stderr)
+
+    # ─── 5. the bundle's provenance claim is enforced ────────────────────────
+    #
+    # GF-14 (2026-11-05): the bundler copied whatever binaries sat in the
+    # candidate source root and stamped them with the commit the root was
+    # on. The release binaries live in gitignored paths, so a bundle of
+    # stale leftovers passed every other gate while claiming a commit it was
+    # never built from. These cases pin the fix: the claim now has to be
+    # carried by the binaries, and the tooling refuses when it is not.
+
+    def _refused_cut(self):
+        """Run the bundler against a release id that was never used.
+
+        The fixture already published one valid bundle, so a refusal has to
+        be judged on its own release id: the bundler refuses to overwrite an
+        existing release, and that refusal would otherwise mask the
+        provenance diagnostic.
+        """
+        release_id = RELEASE_ID + "-refused"
+        result = self._run(
+            BUNDLE_SCRIPT, str(self.source_root), str(self.bundle_root), release_id
+        )
+        self.assertNotEqual(result.returncode, 0, "the bundler accepted the bundle")
+        self.assertFalse(
+            (self.bundle_root / release_id).exists(),
+            "a refused cut published a bundle anyway",
+        )
+        self.assertEqual(
+            sorted(p.name for p in self.bundle_root.iterdir()),
+            [RELEASE_ID],
+            "a refused cut left a staging tree behind",
+        )
+        return result
+
+    def _rewrite_manifest(self):
+        """Recompute the checksum manifest.
+
+        Used by the cases below so that the checksum gate cannot be the
+        reason a verification fails: they target the provenance gate.
+        """
+        entries = ["READY", "RELEASE_METADATA.txt"]
+        entries += [f"bin/{name}" for name in REQUIRED_BINARIES]
+        entries += ["scripts/gitforge-status"]
+        entries += [f"systemd/user/{name}" for name in UNIT_EXAMPLES]
+        entries += [f"systemd/user/{name}" for name in RESOURCE_POLICIES]
+        lines = []
+        for rel_path in entries:
+            digest = hashlib.sha256((self.release_dir / rel_path).read_bytes()).hexdigest()
+            lines.append(f"{digest}  {rel_path}\n")
+        lines.sort()
+        (self.release_dir / "MANIFEST.sha256").write_text("".join(lines))
+
+    def test_bundler_refuses_binaries_built_from_another_commit(self):
+        self._write_executable(
+            self.source_root / "ci", self._stub("ci", commit=OTHER_COMMIT)
+        )
+        result = self._refused_cut()
+        self.assertIn("was built from", result.stderr)
+        self.assertIn(OTHER_COMMIT, result.stderr)
+        self.assertIn(SOURCE_COMMIT, result.stderr)
+
+    def test_bundler_refuses_binaries_without_a_build_stamp(self):
+        self._write_executable(
+            self.source_root / "runner", self._stub("runner", stamped=False)
+        )
+        result = self._refused_cut()
+        self.assertIn("does not report a build commit", result.stderr)
+
+    def test_bundler_refuses_binaries_built_from_a_modified_tree(self):
+        self._write_executable(self.source_root / "api", self._stub("api", dirty="true"))
+        result = self._refused_cut()
+        self.assertIn("was built from a tree that was not clean", result.stderr)
+
+    def test_verifier_refuses_a_bundle_whose_binary_disagrees_with_metadata(self):
+        # A bundle cut by the pre-fix bundler: the manifest is internally
+        # consistent, the metadata claims SOURCE_COMMIT, and the binary says
+        # otherwise. Only the provenance gate can catch this.
+        self._write_executable(
+            self.release_dir / "bin" / "ci", self._stub("ci", commit=OTHER_COMMIT)
+        )
+        self._rewrite_manifest()
+
+        result = self.verify()
+        self.assertNotEqual(
+            result.returncode, 0, "verifier accepted a bundle whose binary lies about its commit"
+        )
+        self.assertIn("was built from", result.stderr)
+        self.assertIn(OTHER_COMMIT, result.stderr)
+        self.assertNotIn("valid bundle=", result.stdout)
+
+    def test_verifier_refuses_a_bundle_built_from_a_modified_tree(self):
+        self._write_executable(
+            self.release_dir / "bin" / "api", self._stub("api", dirty="true")
+        )
+        self._rewrite_manifest()
+
+        result = self.verify()
+        self.assertNotEqual(
+            result.returncode, 0, "verifier accepted a bundle from a modified tree"
+        )
+        self.assertIn("was built from a tree that was not clean", result.stderr)
+        self.assertNotIn("valid bundle=", result.stdout)
+
+    def test_stamps_check_accepts_matching_binaries_and_rejects_others(self):
+        accepted = self._run(STAMPS_SCRIPT, str(self.source_root), SOURCE_COMMIT)
+        self.assertEqual(
+            accepted.returncode, 0, f"stamps refused matching binaries:\n{accepted.stderr}"
+        )
+        self.assertIn(SOURCE_COMMIT, accepted.stdout)
+
+        rejected = self._run(STAMPS_SCRIPT, str(self.source_root), OTHER_COMMIT)
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("was built from", rejected.stderr)
 
 
 if __name__ == "__main__":

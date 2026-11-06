@@ -196,12 +196,17 @@ pins. The full cycle is mechanical:
 #    the persisted definition, name for name).
 scripts/gitforge-release-gate <40-hex-source-commit>
 
-# 2. Bundle: preflight + build release binaries + MANIFEST.sha256 + READY.
+# 2. Build the release binaries from the checkout and install them into the
+#    source root. Every binary is stamped with the commit it was built from;
+#    one that does not report that commit is never installed.
+scripts/gitforge-release-build /nas/Temp/repos/GitForge
+
+# 3. Bundle: preflight + provenance check + MANIFEST.sha256 + READY.
 GITFORGE_SOURCE_COMMIT=<sha> \
   scripts/gitforge-release-bundle /nas/Temp/repos/GitForge \
   /nas/Temp/repos/GitForge/releases gitforge-<shortsha>-<YYYYMMDD>
 
-# 3. Promote + restart, drain-gated and rollback-ready:
+# 4. Promote + restart, drain-gated and rollback-ready:
 ./scripts/gitforge-release-auto            # dry-run: prints the plan
 ./scripts/gitforge-release-auto --apply    # or AUTO_UPDATE=1
 ```
@@ -220,6 +225,23 @@ Known boot behavior: the ci unit runs migrations, then the startup workspace
 sweep, then spawns the event consumer. Triggers published while the consumer
 is down or busy are durable and land once it drains — a `202` with a null
 `pipeline_run_id` means queued, not lost; re-query before re-triggering.
+
+Every release binary carries the commit it was built from, and the release
+chain proves it. The build stamps the commit into the binaries
+(`crates/gitforge-common/build.rs`, surfaced as `--version` on each service);
+`gitforge-release-build` refuses to install a binary that does not report the
+checkout's commit; `gitforge-release-preflight` and `gitforge-release-verify`
+refuse a bundle whose binaries disagree with the `source_commit` the bundle
+claims. The claim is therefore carried by the binaries themselves rather than
+by whoever assembled the bundle.
+
+This check exists because the release binaries live in gitignored paths at the
+root of the source root: a bundle assembled from stale leftovers passed every
+other gate — they were present, they were executable, and the checksum
+manifest was computed from whatever was copied — while stamping a commit they
+were never built from (GF-14, 2026-11-05). The build must therefore run in a
+git checkout; a build from a source copy sets `GITFORGE_BUILD_COMMIT` (and
+`GITFORGE_BUILD_DIRTY`) explicitly, and the same check applies.
 
 Bundle cuts are atomic as of 2026-10-10: `gitforge-release-bundle` assembles
 under `releases/.incomplete-<release-id>/` and renames into place only once

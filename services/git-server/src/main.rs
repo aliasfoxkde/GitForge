@@ -48,6 +48,16 @@ struct InfoRefsQuery {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The release chain asks a binary for the commit it was built from
+    // (scripts/gitforge-release-stamps). Answer before any other work so
+    // that asking for provenance never starts a service, opens a database
+    // or binds a port.
+    if let Some(line) =
+        gitforge_common::build::version_line_if_requested("git-server", std::env::args().skip(1))
+    {
+        println!("{line}");
+        return Ok(());
+    }
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(

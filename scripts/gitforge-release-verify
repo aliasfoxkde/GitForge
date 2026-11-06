@@ -55,6 +55,12 @@ if [[ -z "$metadata_release" || "$metadata_release" != "$ready_release" || -z "$
   exit 1
 fi
 
+# The bundle's provenance claim has to be carried by the binaries it ships.
+# The manifest only proves the bundle has not been edited since the cut; it
+# says nothing about which commit the binaries were built from (GF-14,
+# 2026-11-05).
+"$(dirname "$0")/gitforge-release-stamps" "$release_dir/bin" "$metadata_commit"
+
 ci_unit="$release_dir/systemd/user/gitforge-ci.service.example"
 runner_unit="$release_dir/systemd/user/gitforge-runner.service.example"
 generic_policy="$release_dir/systemd/user/gitforge-resource-limits.conf"
