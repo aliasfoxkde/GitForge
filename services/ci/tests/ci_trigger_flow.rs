@@ -328,3 +328,78 @@ async fn test_trigger_requires_token_and_runs_committed_pipeline() {
 
     common::shutdown_gracefully(&mut service.child).await;
 }
+
+/// A trigger for a commit the repository does not hold must not create a
+/// run: the workspace clone would fail with `unable to read tree` and the
+/// run would be doomed from the moment it was created. The request is
+/// recorded durably and deferred until the objects arrive, so the sweep
+/// can publish it later — and the racing second trigger for the same
+/// commit dedups onto that row instead of minting a second run.
+#[tokio::test]
+async fn test_trigger_for_an_absent_commit_is_deferred_and_creates_no_run() {
+    let mut service = spawn_ci().await;
+
+    let absent_hash = "d".repeat(40);
+    let trigger_body = format!(
+        "{{\"repo_id\":\"{}\",\"ref_name\":\"refs/heads/main\",\
+          \"old_hash\":\"{}\",\"new_hash\":\"{}\",\"pusher_id\":\"{}\",\
+          \"working_dir\":null}}",
+        service.repo_id,
+        "0".repeat(40),
+        absent_hash,
+        service.user_id
+    );
+
+    let (status, body) = post_trigger(
+        service.scheduler_port,
+        Some("harness-trigger-token"),
+        &trigger_body,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "body: {body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("parse trigger response");
+    assert_eq!(payload["status"], "queued", "body: {body}");
+    assert_eq!(payload["deferred"], true, "body: {body}");
+    assert_eq!(payload["reason"], "commit_not_available", "body: {body}");
+    assert!(
+        payload["pipeline_run_id"].is_null(),
+        "a deferred trigger must not report a run: {body}"
+    );
+    let trigger_id = payload["trigger_id"]
+        .as_str()
+        .expect("trigger_id in response")
+        .to_string();
+
+    // The deferred request is durable and still pending: the sweep probes
+    // again once the objects arrive.
+    let (status, body) = get_trigger_status(
+        service.scheduler_port,
+        Some("harness-trigger-token"),
+        &trigger_id,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    let receipt: serde_json::Value = serde_json::from_str(&body).expect("parse trigger receipt");
+    assert_eq!(receipt["status"], "pending", "body: {body}");
+    assert!(
+        receipt["pipeline_run_id"].is_null(),
+        "a deferred trigger must not have a run: {body}"
+    );
+
+    // The decisive assertion: no run exists for the absent commit.
+    let pool = gitforge_db::Pool::new(&service.db_path.display().to_string())
+        .await
+        .expect("reopen service database");
+    let runs = gitforge_db::queries::PipelineRunQueries::list(&pool)
+        .await
+        .expect("list runs");
+    assert!(
+        runs.is_empty(),
+        "a deferred trigger must not create a run: {:?}",
+        runs.iter()
+            .map(|run| (run.commit_hash.clone(), run.status.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    common::shutdown_gracefully(&mut service.child).await;
+}

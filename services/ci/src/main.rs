@@ -532,7 +532,7 @@ async fn main() -> anyhow::Result<()> {
                     // trigger for a push the mirror has not received yet
                     // waits here until the objects arrive.
                     if let Some(state) =
-                        probe_trigger_commit(pool, request.repo_id, &request.new_hash).await
+                        probe_trigger_commit(Some(pool), request.repo_id, &request.new_hash).await
                     {
                         if !state.is_available() {
                             if defer_budget_exhausted(&request) {
@@ -1148,8 +1148,7 @@ async fn trigger_pipeline(
                 "repo_id": repo_id.to_string(),
                 "new_hash": request.new_hash,
             })),
-        )
-            .into_response();
+        );
     }
 
     let mut event = EventEnvelope::new(
@@ -2219,9 +2218,9 @@ pub(crate) async fn run_git_output(
 ) -> anyhow::Result<std::process::Output> {
     command.kill_on_drop(true);
     match timeout(budget, command.output()).await {
-        Ok(output) => output.map_err(|error| {
-            anyhow::anyhow!("git step '{step}' failed to spawn: {error}")
-        }),
+        Ok(output) => {
+            output.map_err(|error| anyhow::anyhow!("git step '{step}' failed to spawn: {error}"))
+        }
         Err(_) => Err(anyhow::anyhow!(
             "git step '{step}' exceeded its {}s budget and was killed",
             budget.as_secs()
