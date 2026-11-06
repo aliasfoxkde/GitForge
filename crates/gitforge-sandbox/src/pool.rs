@@ -1,7 +1,7 @@
 //! Ownership and reclamation rules for the runner's warm container pool.
 //!
-//! The pool is a pre-warm cache of containers: the runner keeps up to
-//! [`POOL_SIZE`] spare containers per image so a job does not pay container
+//! The pool is a pre-warm cache of containers: the runner keeps a small
+//! number of spare containers per image so a job does not pay container
 //! creation latency. Those containers are created with a placeholder job id
 //! that has no row in the store, and they are never handed a real job id
 //! afterwards — Docker labels are immutable, so a container that leaves the
