@@ -2024,23 +2024,57 @@ async fn prepare_run_workspace(
         return Ok(workspace.to_string_lossy().into_owned());
     }
 
-    // Do not request Git's hard-link-based local clone optimization here.
-    // Workspace and repository storage may be mounted with policies that
-    // reject hard links; a regular clone is portable across those filesystems.
+    // Clone from a persistent per-repo object cache on the workspace volume
+    // instead of the bare repository: the cache lives on the same filesystem
+    // as the workspaces, so the clone is a local pack copy, and the cache is
+    // refreshed incrementally (a fetch of the delta, not a full re-transfer).
+    // A missing or corrupt cache falls back to cloning straight from the
+    // bare repository and then seeds the cache from the fresh workspace.
+    let cache = object_cache_path(repo_id);
+    let cache_ready = refresh_object_cache(&cache, &source, run_id).await;
+    let (clone_source, seed_cache) = match cache_ready {
+        Ok(()) => (cache.clone(), false),
+        Err(error) => {
+            tracing::warn!(
+                run = %run_id,
+                repo = %repo_id,
+                error = %error,
+                "object cache unavailable; cloning from the bare repository"
+            );
+            (source.clone(), true)
+        }
+    };
+
     let mut clone = tokio::process::Command::new("git");
-    // --no-local: avoid hard links and local-object alternates for
-    // portability across protected or differently-owned storage.
     clone
-        .args(["clone", "--no-local", "--no-checkout"])
-        .arg(&source)
+        .args(["clone", "--local", "--no-checkout"])
+        .arg(&clone_source)
         .arg(&workspace);
     let clone = run_git_output(clone, "clone", workspace_prep_timeout()).await?;
     if !clone.status.success() {
-        return Err(anyhow::anyhow!(
-            "checkout clone failed for run {}: {}",
-            run_id,
-            String::from_utf8_lossy(&clone.stderr).trim()
-        ));
+        // `--local` requires the source to be a local path and to permit
+        // hard links or copies; if the cached clone was refused, retry the
+        // portable plain clone from the bare repository before failing.
+        let mut fallback = tokio::process::Command::new("git");
+        fallback
+            .args(["clone", "--no-local", "--no-checkout"])
+            .arg(&source)
+            .arg(&workspace);
+        let fallback = run_git_output(fallback, "clone fallback", workspace_prep_timeout()).await?;
+        if !fallback.status.success() {
+            return Err(anyhow::anyhow!(
+                "checkout clone failed for run {}: {} (local-clone error: {})",
+                run_id,
+                String::from_utf8_lossy(&fallback.stderr).trim(),
+                String::from_utf8_lossy(&clone.stderr).trim()
+            ));
+        }
+    }
+    if seed_cache {
+        if let Err(error) = seed_object_cache(&cache, &workspace, repo_id, run_id).await {
+            tracing::warn!(run = %run_id, repo = %repo_id, error = %error,
+                "could not seed the object cache; future runs clone from the bare repository");
+        }
     }
 
     let mut checkout = tokio::process::Command::new("git");
@@ -2070,6 +2104,106 @@ async fn prepare_run_workspace(
 /// sits far above the slowest observed legitimate clone — the reconciler's
 /// own grace window documents multi-gigabyte clones at minutes — and the
 /// override exists for hosts that legitimately need longer.
+/// Object-cache root: one bare mirror per repository, on the workspace
+/// volume so a workspace clone is a same-filesystem local copy. The bare
+/// repository on the NAS spinner is only ever read incrementally (a fetch
+/// of the delta), never re-transferred wholesale per run.
+fn object_cache_path(repo_id: gitforge_common::RepoId) -> std::path::PathBuf {
+    workspace_root().join("_objects").join(repo_id.to_string())
+}
+
+/// Bring the per-repo object cache up to date with the bare repository.
+///
+/// First use creates the cache as a bare clone (one full transfer, once);
+/// every later run pays only a `git fetch --prune` of the delta. A cache
+/// that exists but cannot be refreshed is an error: the caller falls back
+/// to cloning from the bare repository, so a corrupt cache degrades to the
+/// old slow path instead of failing runs.
+async fn refresh_object_cache(
+    cache: &std::path::Path,
+    source: &std::path::Path,
+    run_id: gitforge_common::PipelineRunId,
+) -> anyhow::Result<()> {
+    if tokio::fs::try_exists(cache).await? {
+        let mut fetch = tokio::process::Command::new("git");
+        fetch
+            .arg("-C")
+            .arg(cache)
+            .args(["fetch", "--prune", "--force", "origin"])
+            .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
+        let fetch = run_git_output(fetch, "cache fetch", workspace_prep_timeout()).await?;
+        if !fetch.status.success() {
+            anyhow::bail!(
+                "object cache fetch failed: {}",
+                String::from_utf8_lossy(&fetch.stderr).trim()
+            );
+        }
+        Ok(())
+    } else {
+        if let Some(parent) = cache.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let staged = cache.with_extension("cloning");
+        let _ = tokio::fs::remove_dir_all(&staged).await;
+        let mut seed = tokio::process::Command::new("git");
+        seed.args(["clone", "--mirror"])
+            .arg(source.as_os_str())
+            .arg(&staged);
+        let seed = run_git_output(seed, "cache seed clone", workspace_prep_timeout()).await?;
+        if !seed.status.success() {
+            let _ = tokio::fs::remove_dir_all(&staged).await;
+            anyhow::bail!(
+                "object cache seed clone failed: {}",
+                String::from_utf8_lossy(&seed.stderr).trim()
+            );
+        }
+        tokio::fs::rename(&staged, cache)
+            .await
+            .map_err(|error| anyhow::anyhow!("object cache rename failed: {error}"))?;
+        tracing::info!(run = %run_id, cache = %cache.display(), "seeded object cache");
+        Ok(())
+    }
+}
+
+/// Seed the object cache from a workspace that was cloned the slow way
+/// (straight from the bare repository). The workspace's `origin` remote
+/// points at the bare repository, so the mirror fetches from it once and
+/// future runs take the fast path. Best-effort: failure only means the
+/// next run pays the slow clone again.
+async fn seed_object_cache(
+    cache: &std::path::Path,
+    workspace: &std::path::Path,
+    repo_id: gitforge_common::RepoId,
+    run_id: gitforge_common::PipelineRunId,
+) -> anyhow::Result<()> {
+    let target = object_cache_path(repo_id);
+    if tokio::fs::try_exists(&target).await? {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut seed = tokio::process::Command::new("git");
+    seed.args(["clone", "--mirror"])
+        .arg(workspace.as_os_str())
+        .arg(cache);
+    let seed = run_git_output(
+        seed,
+        "cache mirror from workspace",
+        workspace_prep_timeout(),
+    )
+    .await?;
+    if !seed.status.success() {
+        let _ = tokio::fs::remove_dir_all(cache).await;
+        anyhow::bail!(
+            "object cache mirror clone failed: {}",
+            String::from_utf8_lossy(&seed.stderr).trim()
+        );
+    }
+    tracing::info!(run = %run_id, cache = %cache.display(), "seeded object cache from workspace");
+    Ok(())
+}
+
 fn workspace_prep_timeout() -> Duration {
     parse_workspace_prep_timeout(std::env::var("GITFORGE_WORKSPACE_PREP_TIMEOUT_SECS").ok())
 }
@@ -6827,5 +6961,101 @@ jobs:
             .expect("skipped job row");
         assert_eq!(row.status, "skipped");
         assert!(row.finished_at.is_some());
+    }
+
+    /// The object-cache lifecycle: a missing cache is seeded by a mirror
+    /// clone, a present cache is refreshed by an incremental fetch that
+    /// observes a new commit, and a corrupt cache is an error the caller
+    /// degrades on rather than a failed run.
+    #[tokio::test]
+    async fn object_cache_seed_refresh_and_corruption_contract() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-object-cache-tests")
+            .join(gitforge_common::PipelineRunId::new().to_string());
+        let source = root.join("bare.git");
+        tokio::fs::create_dir_all(&source).await.unwrap();
+        let run = gitforge_common::PipelineRunId::new();
+
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git")
+        };
+
+        let out = git(&["init", "--bare", "--initial-branch=main"], &source);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // A work tree to commit into the bare repo.
+        let work = root.join("work");
+        tokio::fs::create_dir_all(&work).await.unwrap();
+        let out = git(&["init", "-b", "main"], &work);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        tokio::fs::write(work.join("a.txt"), "one").await.unwrap();
+        let out = git(&["add", "."], &work);
+        assert!(out.status.success());
+        let out = git(&["commit", "-m", "one"], &work);
+        assert!(out.status.success());
+        let out = git(
+            &["remote", "add", "origin", source.to_string_lossy().as_ref()],
+            &work,
+        );
+        assert!(out.status.success());
+        let out = git(&["push", "origin", "main"], &work);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let cache = root.join("_objects").join("cache.git");
+
+        // 1. Missing cache: refresh seeds it and the commit is visible.
+        refresh_object_cache(&cache, &source, run).await.unwrap();
+        let out = git(&["rev-parse", "refs/heads/main"], &cache);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // 2. Present cache: a refresh after a new push observes the delta.
+        tokio::fs::write(work.join("a.txt"), "two").await.unwrap();
+        assert!(git(&["commit", "-am", "two"], &work).status.success());
+        assert!(git(&["push", "origin", "main"], &work).status.success());
+        refresh_object_cache(&cache, &source, run).await.unwrap();
+        let updated = git(&["rev-parse", "refs/heads/main"], &cache);
+        let pushed = git(&["rev-parse", "main"], &work);
+        assert_eq!(
+            String::from_utf8_lossy(&updated.stdout).trim(),
+            String::from_utf8_lossy(&pushed.stdout).trim(),
+            "refreshed cache must observe the new commit"
+        );
+
+        // 3. Corrupt cache: refresh fails (an error the caller degrades on),
+        //    it does not silently pass.
+        tokio::fs::remove_dir_all(cache.join("objects"))
+            .await
+            .unwrap();
+        let corrupt = refresh_object_cache(&cache, &source, run).await;
+        assert!(
+            corrupt.is_err(),
+            "a corrupt cache must not refresh successfully"
+        );
+
+        tokio::fs::remove_dir_all(&root).await.unwrap();
     }
 }
