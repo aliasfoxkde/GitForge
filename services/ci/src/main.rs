@@ -37,6 +37,8 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tower_http::trace::TraceLayer;
 
+mod commit_probe;
+
 type PipelineCache = HashMap<gitforge_common::RepoId, PipelineDefinition>;
 type PipelineRegistry = HashMap<gitforge_common::PipelineRunId, Arc<CiEngine>>;
 
@@ -86,6 +88,21 @@ const ENGINE_REDRIVE_INTERVAL_SECS: u64 = 300;
 /// How many consumer attempts a trigger request gets before its failure is
 /// terminal and visible (`failed`) instead of retried.
 const TRIGGER_MAX_ATTEMPTS: i64 = 5;
+
+/// How long a commit-presence probe may spend in `git` before it is killed.
+///
+/// The probe runs on the trigger path, so it must not be able to wedge the
+/// endpoint: a repository with a slow object store answers "unknown"
+/// instead of holding the request open.
+const TRIGGER_PROBE_TIMEOUT_SECS: u64 = 15;
+
+/// How long a trigger for a commit the repository does not hold yet waits
+/// for the objects to arrive before it fails terminally.
+///
+/// The wait is bounded so a commit that never arrives cannot leave a
+/// trigger pending forever: the row fails visibly, with a cause, instead
+/// of lingering.
+const TRIGGER_DEFER_MAX_AGE_SECS: i64 = 30 * 60;
 
 struct TriggerState {
     event_bus: Arc<dyn EventBus>,
@@ -509,6 +526,33 @@ async fn main() -> anyhow::Result<()> {
                         .await;
                         continue;
                     }
+                    // A trigger for a commit the repository does not hold
+                    // yet must not be published: the run would fail at
+                    // checkout with `unable to read tree`. The relay's
+                    // trigger for a push the mirror has not received yet
+                    // waits here until the objects arrive.
+                    if let Some(state) =
+                        probe_trigger_commit(pool, request.repo_id, &request.new_hash).await
+                    {
+                        if !state.is_available() {
+                            if defer_budget_exhausted(&request) {
+                                let _ = gitforge_db::queries::TriggerRequestQueries::mark_failed(
+                                    pool,
+                                    request.id,
+                                    "the commit never became available in the repository",
+                                    request.run_id,
+                                )
+                                .await;
+                                continue;
+                            }
+                            tracing::warn!(
+                                trigger = %request.id,
+                                repo = %request.repo_id,
+                                "deferring trigger: the commit is not yet available in the repository"
+                            );
+                            continue;
+                        }
+                    }
                     tracing::warn!(
                         trigger = %request.id,
                         repo = %request.repo_id,
@@ -914,6 +958,57 @@ async fn get_trigger_request_status(
         .into_response()
 }
 
+/// Probe the repository's storage for `commit`.
+///
+/// `None` means the probe could not be decided — no durable store to
+/// resolve the repository from, the repository is not registered, or `git`
+/// itself failed. The caller must not read that as "the commit is
+/// unavailable": the probe decides the one failure mode it can decide, and
+/// an undecidable probe must not silence a trigger that would have worked.
+async fn probe_trigger_commit(
+    pool: Option<&gitforge_db::Pool>,
+    repo_id: gitforge_common::RepoId,
+    commit: &str,
+) -> Option<commit_probe::CommitAvailability> {
+    let pool = pool?;
+    let repository = match gitforge_db::queries::RepoQueries::get(pool, repo_id).await {
+        Ok(Some(repository)) => repository,
+        Ok(None) => {
+            tracing::warn!(
+                %repo_id,
+                "commit presence probe skipped: the repository is not registered"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %repo_id,
+                "commit presence probe skipped: the repository lookup failed"
+            );
+            return None;
+        }
+    };
+    match commit_probe::probe(
+        std::path::Path::new(&repository.git_path),
+        commit,
+        Duration::from_secs(TRIGGER_PROBE_TIMEOUT_SECS),
+    )
+    .await
+    {
+        Ok(state) => Some(state),
+        Err(error) => {
+            tracing::warn!(%error, %repo_id, "commit presence probe failed");
+            None
+        }
+    }
+}
+
+/// Whether a deferred trigger has waited past its budget.
+fn defer_budget_exhausted(request: &gitforge_db::models::PipelineTriggerRequest) -> bool {
+    (Utc::now() - request.created_at).num_seconds() > TRIGGER_DEFER_MAX_AGE_SECS
+}
+
 async fn trigger_pipeline(
     Extension(trigger_state): Extension<Arc<TriggerState>>,
     Json(request): Json<PipelineTriggerRequest>,
@@ -943,6 +1038,18 @@ async fn trigger_pipeline(
     };
     // Captured before `request` is consumed by the event payload below.
     let request_pipeline_id = request.pipeline_id;
+
+    // A trigger for a commit the repository does not hold cannot produce a
+    // runnable workspace: the clone fails with `unable to read tree`, and
+    // the run is a doomed one. Two trigger paths race for every push — an
+    // external relay that learns of the push before the mirror received the
+    // objects, and the mirror's own receive path, which arrives later — so
+    // the early trigger is recorded durably and published by the sweep once
+    // the commit is actually checkable. The mirror's trigger for the same
+    // commit dedups onto that row, and exactly one run is created.
+    let commit_state =
+        probe_trigger_commit(trigger_state.db.as_ref(), repo_id, &request.new_hash).await;
+    let commit_deferred = matches!(commit_state, Some(state) if !state.is_available());
 
     let working_dir = match request.working_dir {
         Some(path) => match validate_workspace_path(&path) {
@@ -1020,6 +1127,30 @@ async fn trigger_pipeline(
     } else {
         None
     };
+
+    // The commit is not (yet) in the repository's storage. The trigger
+    // request stays pending and the durable sweep publishes it once the
+    // objects arrive; publishing now would create a run that can only fail
+    // at checkout.
+    if commit_deferred {
+        tracing::warn!(
+            %repo_id,
+            new_hash = %request.new_hash,
+            "trigger deferred: the commit is not yet available in the repository"
+        );
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "queued",
+                "deferred": true,
+                "reason": "commit_not_available",
+                "trigger_id": trigger_request.map(|request| request.id.to_string()),
+                "repo_id": repo_id.to_string(),
+                "new_hash": request.new_hash,
+            })),
+        )
+            .into_response();
+    }
 
     let mut event = EventEnvelope::new(
         EventType::PushReceived,
@@ -2081,7 +2212,7 @@ fn parse_workspace_prep_timeout(value: Option<String>) -> Duration {
 /// `output()` future is dropped, and without the kill flag the child would
 /// outlive its future and keep cloning — the exact unbounded state this
 /// helper exists to prevent.
-async fn run_git_output(
+pub(crate) async fn run_git_output(
     mut command: tokio::process::Command,
     step: &str,
     budget: Duration,
@@ -2089,10 +2220,10 @@ async fn run_git_output(
     command.kill_on_drop(true);
     match timeout(budget, command.output()).await {
         Ok(output) => output.map_err(|error| {
-            anyhow::anyhow!("workspace prep step '{step}' failed to spawn: {error}")
+            anyhow::anyhow!("git step '{step}' failed to spawn: {error}")
         }),
         Err(_) => Err(anyhow::anyhow!(
-            "workspace prep step '{step}' exceeded its {}s budget and was killed",
+            "git step '{step}' exceeded its {}s budget and was killed",
             budget.as_secs()
         )),
     }
