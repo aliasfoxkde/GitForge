@@ -155,10 +155,38 @@ impl JobCache {
     }
 }
 
-/// Where the runner keeps job caches when the pipeline does not name an
-/// absolute location. Overridable with `GITFORGE_CACHE_ROOT`; the default
-/// matches the usual system cache path.
+/// Where the runner keeps job caches when neither an override nor a home
+/// directory is available. Overridable with `GITFORGE_CACHE_ROOT`; the
+/// fallback matches the usual system cache path.
 pub const DEFAULT_CACHE_ROOT: &str = "/var/cache/gitforge";
+
+/// The cache root for the given environment.
+///
+/// The override wins. Failing that, the home directory's conventional
+/// cache location. Only when neither is available does the system path
+/// apply.
+///
+/// The home directory is part of the contract, not a convenience:
+/// `docs/RUNBOOK.md` documents the default as `~/.cache/gitforge`, and a
+/// runner that resolved a path it cannot write lost every job cache
+/// without saying so (2026-11-05, ledger row GF-09: the runner resolved
+/// `/var/cache/gitforge`, which its own unit cannot write, so the
+/// platform's own pipeline cold-built on every run).
+pub fn cache_root_with(override_root: Option<&str>, home: Option<&str>) -> String {
+    let override_root = override_root.map(str::trim).unwrap_or_default();
+    if !override_root.is_empty() {
+        return override_root.to_string();
+    }
+    let home = home.map(str::trim).unwrap_or_default();
+    if !home.is_empty() {
+        return std::path::Path::new(home)
+            .join(".cache")
+            .join("gitforge")
+            .to_string_lossy()
+            .into_owned();
+    }
+    DEFAULT_CACHE_ROOT.to_string()
+}
 
 /// The runner's cache root, taken from the environment.
 ///
@@ -172,11 +200,10 @@ pub const DEFAULT_CACHE_ROOT: &str = "/var/cache/gitforge";
 /// on which host directory a cache points at, or the lock would guard a
 /// path nobody writes to.
 pub fn cache_root() -> String {
-    std::env::var("GITFORGE_CACHE_ROOT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_CACHE_ROOT.to_string())
+    cache_root_with(
+        std::env::var("GITFORGE_CACHE_ROOT").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
 }
 
 /// A filesystem-safe key for an image reference.
@@ -274,6 +301,36 @@ mod tests {
             "registry-repo-name-v1"
         );
         assert_eq!(image_cache_key("a_b.c"), "a_b.c");
+    }
+
+    #[test]
+    fn the_cache_override_wins_over_the_home_directory() {
+        assert_eq!(
+            cache_root_with(Some("/nas/cache"), Some("/home/runner")),
+            "/nas/cache"
+        );
+    }
+
+    #[test]
+    fn the_home_directory_carries_the_documented_default() {
+        assert_eq!(
+            cache_root_with(None, Some("/home/runner")),
+            "/home/runner/.cache/gitforge"
+        );
+    }
+
+    #[test]
+    fn a_blank_override_or_home_falls_through() {
+        assert_eq!(
+            cache_root_with(Some("   "), Some("/home/runner")),
+            "/home/runner/.cache/gitforge"
+        );
+        assert_eq!(cache_root_with(None, Some("")), DEFAULT_CACHE_ROOT);
+    }
+
+    #[test]
+    fn without_an_override_or_a_home_the_system_path_applies() {
+        assert_eq!(cache_root_with(None, None), DEFAULT_CACHE_ROOT);
     }
 }
 
