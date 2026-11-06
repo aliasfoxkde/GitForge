@@ -94,7 +94,7 @@ jobs:
         # The aegis pattern scan stays host-side (make lint / make aegis):
         # the binary is a locally-built tool, not distro-packaged, and is
         # not baked into this image.
-        run: shellcheck scripts/*.sh scripts/gitforge-* scripts/qualityctl scripts/verify-user-systemd-policy systemd/*.sh
+        run: shellcheck scripts/*.sh scripts/gitforge-* scripts/qualityctl scripts/verify-user-systemd-policy systemd/*.sh tests/*.sh
       - name: Change-detection selftest (skip_if classification)
         # detect-changes.sh is a single point of decision for the whole
         # quality chain: a misclassification silently skips (or pointlessly
@@ -110,6 +110,22 @@ jobs:
         # not enumerate at all - so this selftest pins the instance-aware
         # detection against a stubbed systemctl.
         run: bash tests/remote-cutover-unit-detection-selftest.sh
+      - name: Release restart-plan selftest (masked units excluded)
+        # The release channel restarts a hardcoded unit list. A unit
+        # masked on this host is a retired component - restarting it made
+        # every promote roll back (2026-10-10). The skip has to survive
+        # future edits to that list, and only a test pins it: the failure
+        # otherwise shows up on the release channel and nowhere else.
+        run: bash tests/release-auto-restart-plan-selftest.sh
+      - name: Release busy-gate selftest (store, not container names)
+        # The release channel defers a cutover while jobs are in flight.
+        # The busy signal has to come from the authoritative store: the
+        # runner keeps a warm pool of containers that have no job row, so
+        # counting containers deferred every cutover forever (GF-16). The
+        # selftest pins the store-backed count, the stale-row case that
+        # would otherwise wedge the gate, and the fail-closed behaviour
+        # when the store cannot be read.
+        run: bash tests/release-auto-busy-gate-selftest.sh
     timeout: 10m
 
   - name: fmt

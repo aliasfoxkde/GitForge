@@ -4,6 +4,27 @@ All notable changes to GitForge will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The release channel's busy gate counts the store, not the container
+  names** (GF-16): `scripts/gitforge-release-auto` decided whether the fleet
+  was busy by counting the runner's `gitforce-job-*` containers. The runner
+  keeps a warm pool of containers that have no job row at all, so the count
+  was permanently non-zero and every cutover was deferred forever — the
+  release channel could never promote anything, and it reported the
+  condition as an ordinary "deferred", which reads like normal operation.
+  The gate now reads the authoritative store through the new
+  `scripts/gitforge-release-busy`: a job is in flight when its row is
+  `assigned` or `running` AND its proof of life is still inside the fence
+  grace window — the same liveness term the scheduler's `requeue_inflight`
+  uses, so a row left behind by a dead runner cannot wedge the gate either.
+  Queued and pending rows are queued work and do not block. An unreadable
+  store fails closed: the pass refuses the cutover instead of starting on
+  an unknown busy state. Regression:
+  `tests/release-auto-busy-gate-selftest.sh`, wired into the `lint` job,
+  which pins the store-backed count, the stale-row case, the fail-closed
+  behaviour, and the absence of the container filter.
+
 ## [0.6.16] - 2026-10-10
 
 ### Added

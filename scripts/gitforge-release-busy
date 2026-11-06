@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Report how many GitForge jobs are genuinely in flight right now.
+#
+# The release channel asks this before it restarts the scheduler and the
+# runner, so the answer has to come from the authoritative store. It must
+# NOT come from the runner's container names: the runner keeps a warm pool
+# of containers that have no job row at all, so a container count is
+# permanently non-zero and defers every cutover forever (GF-16).
+#
+# A job counts as in flight when
+#   - its status is `assigned` or `running` — the same two statuses the
+#     platform's own `retire_if_idle` and the `gitforge-remote-cutover`
+#     drain gate use. Queued and pending rows are queued work, not
+#     in-flight work: restarting ci around them is a maintenance no-op, and
+#   - its proof of life is still inside the fence grace window — the same
+#     liveness term the scheduler's `requeue_inflight` uses to decide
+#     whether a row is alive. A row left behind by a dead runner would
+#     otherwise wedge this gate forever.
+#
+# The grace window defaults to the scheduler's own default (300s) and is
+# read from GITFORGE_JOB_FENCE_GRACE_SECS — the same knob the scheduler
+# reads — so an operator who widens the scheduler's window widens this
+# gate's window with it. A non-numeric or non-positive value falls back to
+# the default, exactly as the scheduler's own parser does.
+#
+# Evidence reader: the sqlite3 CLI is preferred. When it is absent (the CI
+# image ships no sqlite3 CLI), the Python standard-library sqlite3 module
+# is the fallback, with the same read-only connection and 15s busy timeout
+# the release gate uses. A plain count needs no SQLite JSON1 extension, so
+# the fallback is usable on more hosts than the gate's is.
+#
+# Usage: gitforge-release-busy
+# Output: one line on stdout — the number of in-flight jobs.
+# Exit codes: 0 the count was read, 1 the store could not be read.
+set -u -o pipefail
+
+# The scheduler's own default (crates/gitforge-scheduler/src/assigner.rs:
+# DEFAULT_JOB_FENCE_GRACE_SECS). Kept in step with that constant.
+DEFAULT_FENCE_GRACE_SECS=300
+
+say() { printf 'release-busy: %s\n' "$1"; }
+die() { printf 'release-busy: %s\n' "$1" >&2; exit 1; }
+
+# The live database lives wherever the services find it. The path is read
+# from the same environment the services run with, so a deployment that
+# moves the database does not leave this script reading a stale copy.
+gitforge_database_path() {
+    local root="$1"
+    if [[ -n "${GITFORGE_RELEASE_DB:-}" ]]; then
+        printf '%s\n' "$GITFORGE_RELEASE_DB"
+        return 0
+    fi
+    local url="${GITFORGE_DATABASE_URL:-}"
+    if [[ -z "$url" && -r /etc/gitforge/database.env ]]; then
+        url="$(sed -n 's/^GITFORGE_DATABASE_URL=//p' /etc/gitforge/database.env | tail -n 1)"
+        url="${url%\"}"
+        url="${url#\"}"
+    fi
+    if [[ "$url" == sqlite:* ]]; then
+        url="${url#sqlite://}"
+        url="${url#sqlite:}"
+        url="${url%%\?*}"
+        if [[ -n "$url" ]]; then
+            printf '%s\n' "$url"
+            return 0
+        fi
+    fi
+    printf '%s\n' "$root/data/gitforge.db"
+}
+
+# The fence grace window. Only a positive integer is honoured; anything
+# else falls back to the default, mirroring the scheduler's own parser.
+fence_grace_secs() {
+    local raw="${GITFORGE_JOB_FENCE_GRACE_SECS:-}"
+    if [[ "$raw" =~ ^[0-9]+$ ]] && [[ "$raw" -gt 0 ]]; then
+        printf '%s\n' "$raw"
+        return 0
+    fi
+    printf '%s\n' "$DEFAULT_FENCE_GRACE_SECS"
+}
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+db_path="$(gitforge_database_path "$repo_root")"
+[[ -f "$db_path" ]] || die "live database not found: $db_path (set GITFORGE_RELEASE_DB)"
+
+if command -v sqlite3 >/dev/null 2>&1; then
+    db_reader=cli
+else
+    if ! command -v python3 >/dev/null 2>&1; then
+        die "sqlite3 CLI not found and no python3 for the fallback; one of them is required to read the store"
+    fi
+    if ! python3 -c 'import sqlite3' >/dev/null 2>&1; then
+        die "sqlite3 CLI not found and python3 lacks the sqlite3 module; install either to read the store"
+    fi
+    db_reader=python
+    say "sqlite3 CLI not found; reading the store via the python3 sqlite3 fallback" >&2
+fi
+
+grace="$(fence_grace_secs)"
+# Every value interpolated into the SQL is strictly validated first — the
+# grace window is a positive integer or the default — and both readers
+# execute the identical SQL text.
+sql="SELECT count(*) FROM jobs j LEFT JOIN runners r ON r.id = j.runner_id WHERE j.status IN ('assigned','running') AND datetime(COALESCE(j.heartbeat_at, r.last_heartbeat, j.started_at), '+' || ${grace} || ' seconds') > datetime('now');"
+
+# Read-only access with a busy timeout: the live services hold write locks
+# and a bare reader default is to fail instantly instead of waiting. Both
+# readers emit one value: the count.
+db_count() {
+    if [[ "$db_reader" == "cli" ]]; then
+        sqlite3 -batch -readonly "$db_path" ".timeout 15000" "$sql"
+    else
+        python3 - "$db_path" "$sql" <<'PY'
+import os
+import sqlite3
+import sys
+from urllib.parse import quote
+
+db_path, sql = sys.argv[1], sys.argv[2]
+# mode=ro never writes and never creates a database; timeout=15.0 is the
+# Python equivalent of `.timeout 15000`. The path is percent-escaped so
+# filesystem characters that are URI metacharacters survive.
+try:
+    connection = sqlite3.connect(
+        "file:" + quote(os.path.abspath(db_path)) + "?mode=ro",
+        uri=True,
+        timeout=15.0,
+    )
+    try:
+        rows = connection.execute(sql).fetchall()
+    finally:
+        connection.close()
+except sqlite3.Error as error:
+    print(f"release-busy: python sqlite3 fallback: query failed: {error}", file=sys.stderr)
+    sys.exit(1)
+for row in rows:
+    print("|".join("" if value is None else str(value) for value in row))
+PY
+    fi
+}
+
+count="$(db_count)" || die "query failed: cannot read the in-flight job count from $db_path"
+count="${count//$'\n'/}"
+[[ "$count" =~ ^[0-9]+$ ]] || die "unexpected in-flight job count from $db_path: '$count'"
+printf '%s\n' "$count"

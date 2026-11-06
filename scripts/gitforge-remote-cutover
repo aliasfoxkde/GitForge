@@ -3,9 +3,13 @@
 #
 # Generalizes the 2026-10-10 v0.6.16 fedora cutover, which ran as a one-off
 # hand-edited script. Order of operations is the proven one:
-#   1. Wait for zero in-flight jobs (assigned/running) so no job container
-#      is orphaned mid-flight. A pending-only backlog is fine — that is just
-#      queued work, and waiting for it would deadlock a busy instance.
+#   1. Wait for zero in-flight jobs so no job container is orphaned
+#      mid-flight. The count comes from scripts/gitforge-release-busy: a
+#      job row that is `assigned` or `running` AND still inside the fence
+#      grace window. A pending-only backlog is fine — that is just queued
+#      work, and waiting for it would deadlock a busy instance. A row left
+#      behind by a dead runner does not block either: the scheduler fences
+#      it once its proof of life ages past the grace window (GF-16).
 #   2. Stop the scheduler units FIRST (ci is the dispatcher; stopping the
 #      api first would let push triggers pile onto a dead consumer).
 #   3. Flip the release symlink atomically (symlink-to-temp + mv -T).
@@ -167,17 +171,25 @@ if ((dry_run == 1)); then
 fi
 
 # --- 1. Drain ---------------------------------------------------------------
-command -v sqlite3 >/dev/null 2>&1 \
-    || die "sqlite3 CLI not found; the drain gate cannot read the DB. Install sqlite3 (drain can be hand-verified: SELECT count(*) FROM jobs WHERE status IN ('assigned','running'))"
+# The busy signal comes from the same reader the release channel uses, so
+# both agree on what "in flight" means. The reader prefers the sqlite3 CLI
+# and falls back to the python3 sqlite3 module, and it never writes to the
+# database.
+busy_script="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/gitforge-release-busy"
+[[ -x "$busy_script" ]] || die "the busy-gate helper is missing: $busy_script"
+drain_stderr="$(mktemp)"
+trap 'rm -f "$drain_stderr"' EXIT
 while true; do
-    inflight=$(sqlite3 -readonly "$db_path" ".timeout 15000" \
-        "SELECT count(*) FROM jobs WHERE status IN ('assigned','running');" 2>/dev/null)
+    if ! inflight=$(GITFORGE_RELEASE_DB="$db_path" "$busy_script" 2>"$drain_stderr"); then
+        # An unreadable DB must not spin forever — fail loudly instead.
+        die "drain query failed: cannot verify in-flight jobs on $db_path ($(cat "$drain_stderr"))"
+    fi
+    if [[ ! "$inflight" =~ ^[0-9]+$ ]]; then
+        die "drain query failed (unexpected output '$inflight'): cannot verify in-flight jobs on $db_path"
+    fi
     if [[ "$inflight" == "0" ]]; then
         say "$(date +%H:%M:%S) drained; cutting over"
         break
-    elif [[ -z "$inflight" ]]; then
-        # An unreadable DB must not spin forever — fail loudly instead.
-        die "drain query failed (empty output): cannot verify in-flight jobs on $db_path"
     fi
     say "$(date +%H:%M:%S) in-flight=${inflight}; waiting"
     sleep 5

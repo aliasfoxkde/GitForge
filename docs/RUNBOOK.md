@@ -212,14 +212,35 @@ GITFORGE_SOURCE_COMMIT=<sha> \
 ```
 
 `gitforge-release-auto` refuses to run twice concurrently (flock on
-`releases/.auto-update.lock`), defers while any `gitforge-job-*` container is
-still running (drain gate — pending-only runs are just queued and do not
-block), flips `gitforge-current` atomically, restarts the `gitforge@*` units,
-and leaves the previous bundle in place for instant rollback (re-point the
-symlink and restart). Verify after cutover: `systemctl` unit states, `/health`
-on :42780/:42781/:42782, and `scripts/gitforge-status` with
+`releases/.auto-update.lock`), defers while the authoritative store reports a
+job in flight, flips `gitforge-current` atomically, restarts the `gitforge@*`
+units, and leaves the previous bundle in place for instant rollback
+(re-point the symlink and restart). Verify after cutover: `systemctl` unit
+states, `/health` on :42780/:42781/:42782, and `scripts/gitforge-status` with
 `GITFORGE_RELEASE_ROOT=/nas/Temp/repos/GitForge/releases/gitforge-current`
 (the default path reports false drift on this instance).
+
+The busy signal is read from the authoritative store by
+`scripts/gitforge-release-busy` — never from the runner's container names. A
+job counts as in flight when its row is `assigned` or `running` AND its proof
+of life is still inside the fence grace window
+(`GITFORGE_JOB_FENCE_GRACE_SECS`, default 300s — the scheduler's own
+default, read from the same knob). Queued and pending rows are queued work
+and do not block. Two properties follow from that definition:
+
+  - the gate cannot be wedged by a stale row. A `running` row whose runner
+    died is fenced by the scheduler itself once its proof of life ages past
+    the grace window; counting it as busy would defer every cutover until
+    someone intervened by hand.
+  - the container names cannot be the signal. The runner keeps a warm pool of
+    containers that have no job row at all, so counting them is permanently
+    non-zero (GF-16, 2026-11-06): every cutover was deferred forever, and
+    the channel reported that as an ordinary "deferred", which reads like
+    normal operation.
+
+If the store cannot be read, the pass refuses the cutover (exit 1) rather
+than guessing. An unreadable store is a failure to surface, not a clean
+deferral — a silently unreadable store stalls the channel with no signal.
 
 Known boot behavior: the ci unit runs migrations, then the startup workspace
 sweep, then spawns the event consumer. Triggers published while the consumer
@@ -268,7 +289,10 @@ scripts/gitforge-remote-cutover --units user \
 ```
 
 The script polls the job table until nothing is `assigned`/`running` (a
-pending-only backlog does not block), stops the scheduler units first
+pending-only backlog does not block), using the same reader as the NAS
+promote — so a row left behind by a dead runner does not hold the drain
+either, and the sqlite3 CLI is no longer required on the target host
+(the python3 sqlite3 fallback serves it), stops the scheduler units first
 (`ci`, then `runner`, then `api`/`git-server`), flips the symlink with
 `mv -T`, restarts stateless before schedulers, and prints the boot-adoption
 journal lines. Units that are not installed — or masked (retired) — on the
