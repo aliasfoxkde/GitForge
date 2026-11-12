@@ -64,6 +64,12 @@ refresh credential; presenting an already-rotated credential is rejected
 the same body and revokes the credential server-side, idempotently —
 revoking an already-revoked credential still returns 200.
 
+The bearer token lasts 24 hours. The GitForge CLI automatically rotates it
+when a command runs with ten minutes or less remaining. Each successful
+rotation starts a fresh 30-day refresh window, so normal CLI use does not
+require a daily login; re-authentication is needed after 30 days without a
+successful refresh, or if the session is revoked.
+
 User registration is not exposed by the GitForge API; users must be
 provisioned through the supported local CLI bootstrap path on a fresh
 database. Run `gitforge admin --bootstrap --username <name> --email <email>
