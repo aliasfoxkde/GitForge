@@ -373,15 +373,15 @@ async fn main() -> anyhow::Result<()> {
         // reconciliation spawn on purpose: a rebuilt engine can re-release
         // ready stages, and a run it still owns is protected from grading by
         // its unfinished durable rows rather than by registry custody.
-        let rebuilt = rebuild_live_engines(
+        let redriven = reconcile_live_engines(
             pool,
             &scheduler_arc,
             &pipeline_registry,
             &run_workspace_paths,
         )
         .await;
-        if rebuilt > 0 {
-            tracing::info!(rebuilt, "startup engine rebuild complete");
+        if redriven > 0 {
+            tracing::info!(redriven, "startup engine reconciliation complete");
         }
 
         // The startup rebuild is one-shot: a rebuild that failed (transient
@@ -402,15 +402,15 @@ async fn main() -> anyhow::Result<()> {
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    let rebuilt = rebuild_live_engines(
+                    let redriven = reconcile_live_engines(
                         &redrive_pool,
                         &redrive_scheduler,
                         &redrive_registry,
                         &redrive_workspaces,
                     )
                     .await;
-                    if rebuilt > 0 {
-                        tracing::warn!(rebuilt, "periodic engine redrive recovered stalled runs");
+                    if redriven > 0 {
+                        tracing::info!(redriven, "periodic engine redrive reconciled stalled runs");
                     }
                 }
             });
@@ -650,7 +650,12 @@ async fn main() -> anyhow::Result<()> {
                     let live_run_ids: Vec<gitforge_common::PipelineRunId> =
                         watchdog_registry.read().await.keys().copied().collect();
                     for run_id in live_run_ids {
-                        let engine = watchdog_registry.read().await.get(&run_id).cloned();
+                        // Reconciliation may replace an engine between
+                        // lookup and timeout propagation. Keep the registry
+                        // read guard until the mirror has consumed the
+                        // durable timeout evidence.
+                        let registry = watchdog_registry.read().await;
+                        let engine = registry.get(&run_id).cloned();
                         let Some(engine) = engine else { continue };
                         let jobs = match gitforge_db::queries::JobQueries::list_by_run(pool, run_id)
                             .await
@@ -680,6 +685,7 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        drop(registry);
                         finalize_run_if_terminal(
                             &engine,
                             Some(pool),
@@ -3016,11 +3022,11 @@ async fn run_scheduler_event_consumer(
                 // the run. That duplicate enqueue demoted the running
                 // job's durable row, which refused the runner's heartbeat
                 // and rotated its lease token (GF-12).
-                let engine = pipeline_registry
-                    .read()
-                    .await
-                    .get(&pipeline_run_id)
-                    .cloned();
+                // Keep the registry read guard through the state transition.
+                // Reconciliation replaces engines under the write guard, so
+                // it must not swap out this engine between lookup and mutate.
+                let registry = pipeline_registry.read().await;
+                let engine = registry.get(&pipeline_run_id).cloned();
                 let Some(engine) = engine else {
                     tracing::warn!(
                         "assignment received for unknown pipeline run {}",
@@ -3041,11 +3047,11 @@ async fn run_scheduler_event_consumer(
             } => (job_id, pipeline_run_id, runner_id, success),
             _ => continue,
         };
-        let engine = pipeline_registry
-            .read()
-            .await
-            .get(&pipeline_run_id)
-            .cloned();
+        // Reconciliation may replace a stale engine. Hold the read guard
+        // until this event has been applied so the old Arc cannot be mutated
+        // after a replacement has entered the registry.
+        let registry = pipeline_registry.read().await;
+        let engine = registry.get(&pipeline_run_id).cloned();
         let Some(engine) = engine else {
             tracing::warn!(
                 "completion received for unknown pipeline run {}",
@@ -3101,6 +3107,7 @@ async fn run_scheduler_event_consumer(
             workspace_path,
         )
         .await;
+        drop(registry);
 
         // No-op until every job in the run is terminal; see
         // `finalize_run_if_terminal`.
@@ -3245,17 +3252,26 @@ fn execution_plan(
         .iter()
         .map(|step| step.run.clone())
         .collect();
-    let working_dir = definition
+    let container_working_dir = definition
         .steps
         .iter()
-        .find_map(|step| step.working_directory.clone())
-        .or_else(|| workspace_path.map(str::to_string));
+        .find_map(|step| step.working_directory.clone());
+    let step_working_directories = definition
+        .steps
+        .iter()
+        .map(|step| step.working_directory.clone())
+        .collect();
+    let workspace_path = workspace_path.map(str::to_string);
+    let working_dir = workspace_path.clone();
     let timeout_secs = definition
         .timeout_secs()
         .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
     JobExecutionDefinition {
         commands,
         image: definition.image.clone(),
+        workspace_path,
+        container_working_dir,
+        step_working_directories,
         working_dir,
         timeout_secs,
         // The DAG builder has already merged pipeline `environment` into the
@@ -3390,7 +3406,48 @@ async fn persist_planned_jobs(
 /// - all rows terminal: reconciliation grades the run, which also catches
 ///   the incomplete-chain shortfall a rebuilt engine would wrongly
 ///   finalize as success.
-async fn rebuild_live_engines(
+fn engine_matches_durable_rows(
+    state: &gitforge_ci::engine::CiEngineState,
+    rows: &[(
+        gitforge_common::JobId,
+        String,
+        gitforge_common::JobStatus,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )],
+) -> bool {
+    state.jobs.len() == rows.len()
+        && rows.iter().all(|(job_id, _, durable_status, _)| {
+            state
+                .jobs
+                .get(job_id)
+                .is_some_and(|engine_job| engine_job.status() == *durable_status)
+        })
+}
+
+fn engine_states_match(
+    left: &gitforge_ci::engine::CiEngineState,
+    right: &gitforge_ci::engine::CiEngineState,
+) -> bool {
+    left.jobs.len() == right.jobs.len()
+        && left.jobs.iter().all(|(job_id, left_job)| {
+            right
+                .jobs
+                .get(job_id)
+                .is_some_and(|right_job| left_job.status() == right_job.status())
+        })
+}
+
+#[cfg(test)]
+fn engine_has_in_flight_job(state: &gitforge_ci::engine::CiEngineState) -> bool {
+    state.jobs.values().any(|job| {
+        matches!(
+            job.status(),
+            gitforge_common::JobStatus::Assigned | gitforge_common::JobStatus::Running
+        )
+    })
+}
+
+async fn reconcile_live_engines(
     pool: &gitforge_db::Pool,
     scheduler: &Scheduler,
     pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
@@ -3406,7 +3463,7 @@ async fn rebuild_live_engines(
         }
     };
 
-    let mut rebuilt = 0;
+    let mut redriven = 0;
     for run in runs {
         if matches!(
             run.status.as_str(),
@@ -3491,14 +3548,12 @@ async fn rebuild_live_engines(
             // this class.
             continue;
         }
-        // Custody is not protection here: rebuilding over a held engine is
-        // loss-free exactly when nothing is executing, because the fresh
-        // engine grafts the same durable truth. The stall classes this pass
-        // exists for — a startup rebuild that failed, queued rows lost from
-        // the scheduler's in-memory queue, a completion event dropped before
-        // the engine absorbed it — all leave no running row behind, and the
-        // stalled chains observed live (tail rows pending for ~21h across a
-        // control-plane restart) are exactly of that shape.
+        // Reuse a custody-held engine when its job states already match the
+        // durable rows. The common redrive below still repairs missing queue
+        // entries and releases newly-ready stages, but does not replace a
+        // healthy in-memory graph every five minutes. A mismatch means a
+        // completion event or queue transition may have been lost, so graft
+        // durable state onto a fresh engine.
         // The persisted pipeline config holds the committed definition
         // (no push base); the run row holds the base the push carried.
         // Re-injecting it here is what makes the push base survive a
@@ -3506,20 +3561,34 @@ async fn rebuild_live_engines(
         // this is the only durable carrier.
         let definition =
             gitforge_ci::pipeline::with_push_base(&definition, run.push_base_sha.as_deref());
-        let engine = match CiEngine::rebuild(
-            run.id,
-            run.pipeline_id,
-            run.repo_id,
-            definition,
-            &durable_rows,
-        )
-        .await
-        {
-            Ok(engine) => Arc::new(engine),
-            Err(error) => {
-                tracing::error!(run = %run.id, %error, "engine rebuild failed");
-                continue;
+        let existing_engine = if held {
+            pipeline_registry.read().await.get(&run.id).cloned()
+        } else {
+            None
+        };
+        let existing_state = match existing_engine.as_ref() {
+            Some(engine) => Some(engine.state().await),
+            None => None,
+        };
+        let (mut engine, mut engine_action) = match (&existing_engine, &existing_state) {
+            (Some(engine), Some(state)) if engine_matches_durable_rows(state, &durable_rows) => {
+                (engine.clone(), "reused")
             }
+            _ => match CiEngine::rebuild(
+                run.id,
+                run.pipeline_id,
+                run.repo_id,
+                definition,
+                &durable_rows,
+            )
+            .await
+            {
+                Ok(engine) => (Arc::new(engine), "rebuilt"),
+                Err(error) => {
+                    tracing::error!(run = %run.id, %error, "engine rebuild failed");
+                    continue;
+                }
+            },
         };
         // Bound the guard to its own statement so it never spans the
         // `prepare_run_workspace` await (the future must stay Send).
@@ -3549,10 +3618,56 @@ async fn rebuild_live_engines(
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(run.id, workspace_path.clone());
-        pipeline_registry
-            .write()
-            .await
-            .insert(run.id, engine.clone());
+        // The event consumer holds the registry read guard through each
+        // engine transition. Re-read durable rows after workspace recovery
+        // while holding the write guard: the first snapshot can go stale
+        // while recovery is suspended, and an event may be waiting to update
+        // the engine mirror.
+        let mut registry = pipeline_registry.write().await;
+        let latest_rows = match gitforge_db::queries::JobQueries::list_by_run(pool, run.id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(run = %run.id, %error, "engine reconciliation skipped: latest job rows unreadable");
+                continue;
+            }
+        };
+        let latest_durable_rows: Option<Vec<_>> = latest_rows
+            .iter()
+            .map(|job| {
+                let status = gitforge_db::models::JobStatus::from_str(&job.status)?;
+                Some((job.id, job.name.clone(), status.to_common(), job.started_at))
+            })
+            .collect();
+        if latest_durable_rows.as_ref() != Some(&durable_rows) {
+            tracing::debug!(
+                run = %run.id,
+                "engine reconciliation skipped: durable job rows advanced during workspace recovery"
+            );
+            continue;
+        }
+        if let Some(current_engine) = registry.get(&run.id).cloned() {
+            let current_state = current_engine.state().await;
+            if engine_matches_durable_rows(&current_state, &durable_rows) {
+                // An event may have brought the in-memory engine into
+                // agreement while workspace recovery was awaited. Keep that
+                // engine rather than replacing it with the earlier snapshot.
+                engine = current_engine;
+                engine_action = "reused";
+            } else if existing_state
+                .as_ref()
+                .is_none_or(|before| !engine_states_match(before, &current_state))
+            {
+                // The durable snapshot or engine advanced after the initial
+                // read. Leave the registry untouched and retry from a fresh
+                // snapshot on the next pass.
+                tracing::debug!(
+                    run = %run.id,
+                    "engine reconciliation skipped: live engine advanced during snapshot"
+                );
+                continue;
+            }
+        }
+        registry.insert(run.id, engine.clone());
         // Re-drive the DAG. Rows the scheduler had already queued are
         // re-enqueued (the upsert refreshes the durable row; the scheduler
         // deduplicates its in-memory queue), and any stage whose
@@ -3576,16 +3691,16 @@ async fn rebuild_live_engines(
         if let Err(error) = engine.queue_ready_jobs().await {
             tracing::warn!(run = %run.id, %error, "post-rebuild stage release failed");
         }
+        // Keep the write guard through in-memory environment restoration and
+        // DAG release. Otherwise a completion event could observe the engine
+        // before CI_CHANGE_* receipts have been merged and prune gated jobs.
+        drop(registry);
         persist_skipped_job_rows(Some(pool), &engine).await;
         enqueue_ready_jobs(scheduler, &engine, run.id, run.repo_id, workspace_path).await;
-        if held {
-            tracing::info!(run = %run.id, "redrove stalled chain over live engine");
-        } else {
-            tracing::info!(run = %run.id, "rebuilt live engine for interrupted run");
-        }
-        rebuilt += 1;
+        tracing::info!(run = %run.id, engine_action, "redrove durable pipeline state");
+        redriven += 1;
     }
-    rebuilt
+    redriven
 }
 
 /// Create a trigger event from push payload (extracted for testability)
@@ -3671,6 +3786,56 @@ mod tests {
     use std::sync::OnceLock;
 
     static WORKSPACE_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn engine_matches_durable_rows_requires_exact_job_ids_and_statuses() {
+        let run_id = gitforge_common::PipelineRunId::new();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let repo_id = gitforge_common::RepoId::new();
+        let queued_id = gitforge_common::JobId::new();
+        let pending_id = gitforge_common::JobId::new();
+        let mut state = gitforge_ci::engine::CiEngineState::new(run_id, pipeline_id, repo_id);
+
+        let mut queued = gitforge_ci::JobStateMachine::new(queued_id);
+        queued.restore(gitforge_common::JobStatus::Queued, None);
+        state.jobs.insert(queued_id, queued);
+        state
+            .jobs
+            .insert(pending_id, gitforge_ci::JobStateMachine::new(pending_id));
+
+        let durable_rows = vec![
+            (
+                queued_id,
+                "queued".to_string(),
+                gitforge_common::JobStatus::Queued,
+                None,
+            ),
+            (
+                pending_id,
+                "pending".to_string(),
+                gitforge_common::JobStatus::Pending,
+                None,
+            ),
+        ];
+        assert!(engine_matches_durable_rows(&state, &durable_rows));
+
+        let mut stale_rows = durable_rows.clone();
+        stale_rows[0].2 = gitforge_common::JobStatus::Running;
+        assert!(!engine_matches_durable_rows(&state, &stale_rows));
+
+        assert!(!engine_matches_durable_rows(&state, &durable_rows[..1]));
+        assert!(engine_states_match(&state, &state));
+        assert!(!engine_has_in_flight_job(&state));
+
+        let mut assigned_state = state.clone();
+        assigned_state
+            .jobs
+            .get_mut(&queued_id)
+            .expect("queued state")
+            .restore(gitforge_common::JobStatus::Assigned, None);
+        assert!(!engine_states_match(&state, &assigned_state));
+        assert!(engine_has_in_flight_job(&assigned_state));
+    }
 
     #[test]
     fn lane_key_separates_refs_within_a_repo() {
@@ -4620,7 +4785,7 @@ mod tests {
     }
 
     // The F21 scenario end to end: a trigger plans every stage durably, the
-    // control plane dies mid-chain, and on restart `rebuild_live_engines`
+    // control plane dies mid-chain, and on restart `reconcile_live_engines`
     // reconstructs an engine that resumes the chain from the surviving rows
     // instead of leaving the tail unenqueued.
     #[tokio::test]
@@ -4758,8 +4923,8 @@ mod tests {
             std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
         > = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        let rebuilt = rebuild_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
-        assert_eq!(rebuilt, 1, "the interrupted run gets an engine back");
+        let redriven = reconcile_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        assert_eq!(redriven, 1, "the interrupted run gets an engine back");
 
         let engine = registry
             .read()
@@ -4798,6 +4963,24 @@ mod tests {
         assert_eq!(queue.in_memory_queued, 1);
         assert_eq!(queue.durable_pending, Some(1));
 
+        // The live engine already matches durable job status. A repeated
+        // reconciliation must re-seed idempotently without replacing it.
+        let original_engine = engine.clone();
+        let redriven = reconcile_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        assert_eq!(redriven, 1);
+        let reused_engine = registry
+            .read()
+            .await
+            .get(&run.id)
+            .cloned()
+            .expect("reconciled engine");
+        assert!(
+            Arc::ptr_eq(&original_engine, &reused_engine),
+            "matching durable state must reuse the live engine"
+        );
+        let queue = scheduler.queue_status().await.unwrap();
+        assert_eq!(queue.in_memory_queued, 1, "queue repair is idempotent");
+
         // The completion consumer's advance path: stage b finishes, stage c
         // is released and durably flipped to dispatchable.
         let runner_id = gitforge_common::RunnerId::new();
@@ -4816,10 +4999,10 @@ mod tests {
         assert_eq!(queue.in_memory_queued, 2);
         assert_eq!(queue.durable_pending, Some(2));
 
-        // A later pass re-drives the same run: nothing is executing, so the
-        // fresh engine grafts identical durable truth and the chain is
-        // re-seeded without disturbing live state.
-        let redriven = rebuild_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        // A later pass sees that stage b's engine state (`succeeded`) differs
+        // from the durable row (`queued`), so it grafts durable truth before
+        // re-seeding. This protects the engine after a lost status transition.
+        let redriven = reconcile_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
         assert_eq!(
             redriven, 1,
             "an idle custody-held run is re-driven, not skipped"
@@ -4978,7 +5161,7 @@ mod tests {
         > = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let scheduler = Arc::new(Scheduler::with_db(pool.clone()));
 
-        let redriven = rebuild_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        let redriven = reconcile_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
         assert_eq!(redriven, 1, "the stalled chain is re-driven");
 
         // The fresh engine grafted the durable completion...

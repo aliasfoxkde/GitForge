@@ -154,7 +154,7 @@ async fn request_json(
     let response = app
         .oneshot(
             builder
-                .body(Body::from(body.map(|v| v.to_string()).unwrap_or_default()))
+                .body(Body::from(body.map_or_default(|v| v.to_string())))
                 .unwrap(),
         )
         .await

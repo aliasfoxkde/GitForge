@@ -81,3 +81,23 @@ and require the runner credential. The sandbox contract now exposes bounded
 `OutputSink` delivery while commands run. The current integration test covers
 the scheduler/API HTTP boundary in one process; OS-process restart/recovery
 testing and durable live-stream retry semantics remain follow-up work.
+
+## Unvalidated storage-deferral candidate
+
+The current dirty source candidate adds `POST /jobs/{id}/defer` for a runner
+that receives an assignment but fails local resource admission because the
+lease is busy, pressure is high/unknown, or a build process is active. The
+request carries `runner_id`, the exact `lease_token`, and the bounded reason
+`host_resource_admission_busy` (legacy `host_storage_lease_busy` is accepted
+during rollout); only a matching durable `assigned` row may return to
+`queued`. Runner registration now advertises a `storage_domain`; runners sharing
+the same physical device or network filesystem must use the same value. The
+scheduler limits storage-sensitive work within that domain and can admit
+independent domains concurrently. `GITFORGE_STORAGE_DOMAIN` overrides the
+hostname default on both runner and scheduler. The scheduler samples its own
+host and applies that measurement only to its matching domain; the runner
+candidate independently samples local PSI and build processes before claiming
+work, but does not publish remote pressure telemetry. This candidate has not
+been compiled, tested, or deployed; the live runner still uses the Nov. 12 release.
+The 10-second cooldown remains keyed by runner ID, so busy-lease backoff is not
+yet grouped across multiple runner IDs in one domain.

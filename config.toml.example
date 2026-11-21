@@ -1,5 +1,6 @@
 # GitForge Configuration Example
-# Copy to config.toml and customize for your environment
+# Legacy reference only; the current server binaries do not load this TOML.
+# See docs/RUNBOOK.md and docs/DEPLOYMENT.md for actual runtime configuration.
 
 # =============================================================================
 # Server Configuration
@@ -22,9 +23,10 @@ url = "sqlite:/data/gitforge.db"
 # Authentication
 # =============================================================================
 [auth]
-# JWT secret - CHANGE THIS IN PRODUCTION!
-jwt_secret = "changeme-in-production-min-32-chars"
-token_expiry_hours = 24
+# The API service reads JWT_SECRET_FILE (preferred) or JWT_SECRET from its
+# environment; this sample TOML is not loaded by the API process. Access-token
+# lifetime is set by ACCESS_TTL_SECS in gitforge-api/src/auth.rs (currently
+# seven days). Refresh credentials rotate and extend the session for 30 days.
 
 # =============================================================================
 # Git Server

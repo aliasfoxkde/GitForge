@@ -5,9 +5,10 @@ use gitforge_common::{Error, UserId};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
-/// JWT bearer lifetime (24 h). Short-lived by design: the long-lived
-/// state lives in the revocable refresh credential, not in the JWT.
-pub const ACCESS_TTL_SECS: i64 = 86_400;
+/// JWT bearer lifetime (7 days). The separate 30-day refresh credential
+/// remains revocable and rotates on use; the longer access window reduces
+/// reauthentication churn for API clients that cannot refresh automatically.
+pub const ACCESS_TTL_SECS: i64 = 7 * 86_400;
 
 /// Refresh-credential lifetime (30 days). Stored server-side as a SHA-256
 /// digest and rotated on every use, so the plaintext lives only on the
@@ -144,6 +145,7 @@ mod tests {
         let claims = auth.validate_token(&token).unwrap();
         assert_eq!(claims.username, "testuser");
         assert_eq!(claims.role, "admin");
+        assert_eq!(claims.exp - claims.iat, ACCESS_TTL_SECS);
     }
 
     #[test]

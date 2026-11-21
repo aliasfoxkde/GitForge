@@ -301,8 +301,7 @@ async fn trigger_pipeline(
                                     payload.branch,
                                     run_id
                                         .as_deref()
-                                        .map(|id| format!(" (run {id})"))
-                                        .unwrap_or_default()
+                                        .map_or_default(|id| format!(" (run {id})"))
                                 ),
                                 pipeline_id: Some(pipeline_id),
                             }),

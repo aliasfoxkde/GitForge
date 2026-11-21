@@ -96,6 +96,10 @@ jobs:
         # the binary is a locally-built tool, not distro-packaged, and is
         # not baked into this image.
         run: shellcheck scripts/*.sh scripts/gitforge-* scripts/qualityctl scripts/verify-user-systemd-policy systemd/*.sh tests/*.sh
+      - name: NAS installer runner-policy contract
+        # A control-plane install must not silently turn the SWARMONE host
+        # into a CI executor; local runner startup requires an explicit opt-in.
+        run: python3 tests/test_systemd_install_policy.py -v
       - name: Change-detection selftest (skip_if classification)
         # detect-changes.sh is a single point of decision for the whole
         # quality chain: a misclassification silently skips (or pointlessly

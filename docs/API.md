@@ -64,11 +64,13 @@ refresh credential; presenting an already-rotated credential is rejected
 the same body and revokes the credential server-side, idempotently —
 revoking an already-revoked credential still returns 200.
 
-The bearer token lasts 24 hours. The GitForge CLI automatically rotates it
+The bearer token lasts 7 days. The GitForge CLI automatically rotates it
 when a command runs with ten minutes or less remaining. Each successful
 rotation starts a fresh 30-day refresh window, so normal CLI use does not
-require a daily login; re-authentication is needed after 30 days without a
-successful refresh, or if the session is revoked.
+require repeated logins; re-authentication is needed after 30 days without a
+successful refresh, or if the session is revoked. Direct API clients that
+store only the bearer token must obtain a fresh token through `/auth/refresh`
+before it expires.
 
 User registration is not exposed by the GitForge API; users must be
 provisioned through the supported local CLI bootstrap path on a fresh
@@ -456,6 +458,8 @@ GET /api/runners
 POST /api/runners
 GET /api/runners/{id}
 DELETE /api/runners/{id}
+POST /api/runners/{id}/pause
+POST /api/runners/{id}/resume
 ```
 
 `POST /api/runners` is a public bootstrap endpoint used before a runner
@@ -463,14 +467,31 @@ has credentials. `DELETE /api/runners/{id}` retires an idle runner while
 preserving its record for audit; it requires an administrator or
 maintainer and refuses runners with active jobs (409 `runner_busy`).
 
+Pausing and resuming require an administrator or maintainer. Pause persists a
+separate control flag, returns jobs that are still `assigned` to the queue,
+and fences assignment/start requests at the database. Jobs already marked
+`running` remain owned by their runner. The response reports those running
+jobs and does not claim that their containers have stopped; container drain
+confirmation remains an operator/runner responsibility.
+
 **Register Runner Request:**
 ```json
 {
   "name": "runner-1",
   "type": "docker",
-  "capacity": 4
+  "capacity": 4,
+  "storage_domain": "fedora-local-nvme",
+  "capabilities": ["host-storage-lease-v1"]
 }
 ```
+
+Registration requires the `host-storage-lease-v1` capability. The scheduler
+returns `426 Upgrade Required` for older runners so they cannot receive
+storage-sensitive work without participating in host admission. The
+`storage_domain` identifies shared backing storage: runners using the same
+host disk or shared filesystem must advertise the same value. When omitted,
+the gateway records `default`; the runner agent derives its domain from
+`/etc/hostname` unless `GITFORGE_STORAGE_DOMAIN` overrides it.
 
 **Response:**
 ```json
@@ -480,9 +501,22 @@ maintainer and refuses runners with active jobs (409 `runner_busy`).
   "type": "docker",
   "status": "online",
   "capacity": 4,
+  "storage_domain": "fedora-local-nvme",
+  "paused": false,
+  "pause_generation": 0,
   "last_heartbeat": "2024-01-01T00:00:00Z"
 }
 ```
+
+Pause/resume returns the durable pause generation, job counts, and the
+runner's current-generation container/job attestation:
+
+```json
+{"runner_id":"uuid","paused":true,"pause_generation":1,"requeued_jobs":2,"running_jobs":1,"drain_status":"draining","active_job_ids":["job-uuid"],"owned_container_ids":["container-id"]}
+```
+
+The CLI exposes these controls as `gitforge runner --pause <id>` and
+`gitforge runner --resume <id>`.
 
 #### Artifacts
 

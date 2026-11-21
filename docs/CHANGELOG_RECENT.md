@@ -4,6 +4,19 @@ All notable changes to GitForge will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Durable runner admission control**: pause requeues unstarted assignments
+  and fences new durable assignments and starts. Running jobs remain untouched
+  and must drain before host maintenance.
+
+### Changed
+
+- **Bearer token lifetime increased to seven days**: direct API clients get
+  a longer interval between refreshes, while the revocable, rotating refresh
+  credential retains its 30-day sliding window. The CLI login message now
+  reports the lifetime in seconds, hours, and days.
+
 ### Fixed
 
 - **The release channel's busy gate counts the store, not the container

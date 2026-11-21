@@ -430,8 +430,7 @@ impl DockerSandbox {
                         PULL_RETRIES + 1,
                         last_err
                             .as_ref()
-                            .map(std::string::ToString::to_string)
-                            .unwrap_or_default(),
+                            .map_or_default(std::string::ToString::to_string),
                         PULL_RETRY_DELAY_SECS
                     );
                     sleep(Duration::from_secs(PULL_RETRY_DELAY_SECS)).await;
@@ -440,7 +439,7 @@ impl DockerSandbox {
             return Err(Error::sandbox(format!(
                 "failed to pull image after {} attempt(s): {}",
                 PULL_RETRIES + 1,
-                last_err.map(|e| e.to_string()).unwrap_or_default()
+                last_err.map_or_default(|e| e.to_string())
             )));
         }
         Ok(())

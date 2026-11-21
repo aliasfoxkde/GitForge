@@ -84,6 +84,7 @@ pub struct MountLock {
 impl MountLock {
     /// Take the lock, waiting up to `wait` for a holder to release it.
     pub async fn acquire(path: &Path, wait: Duration) -> Result<Self, MountLockError> {
+        let started_at = Instant::now();
         if let Err(error) = fs::create_dir_all(path) {
             return Err(MountLockError::Unavailable {
                 path: path.to_path_buf(),
@@ -98,10 +99,18 @@ impl MountLock {
         loop {
             match try_lock(&directory) {
                 Ok(true) => {
+                    let waited = started_at.elapsed();
+                    if waited >= Duration::from_secs(1) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            waited_ms = waited.as_millis(),
+                            "acquired shared host mount after waiting"
+                        );
+                    }
                     return Ok(Self {
                         directory,
                         path: path.to_path_buf(),
-                    })
+                    });
                 }
                 Ok(false) => {}
                 Err(error) => {

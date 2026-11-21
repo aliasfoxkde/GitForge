@@ -83,17 +83,22 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 db_path="$(gitforge_database_path "$repo_root")"
 [[ -f "$db_path" ]] || die "live database not found: $db_path (set GITFORGE_RELEASE_DB)"
 
-if command -v sqlite3 >/dev/null 2>&1; then
+sqlite3_cli_available() {
+    command -v sqlite3 >/dev/null 2>&1 || return 1
+    [[ "$(sqlite3 -batch -readonly :memory: 'SELECT 1;' 2>/dev/null)" == "1" ]]
+}
+
+if sqlite3_cli_available; then
     db_reader=cli
 else
     if ! command -v python3 >/dev/null 2>&1; then
-        die "sqlite3 CLI not found and no python3 for the fallback; one of them is required to read the store"
+        die "sqlite3 CLI unavailable and no python3 fallback; one is required to read the store"
     fi
     if ! python3 -c 'import sqlite3' >/dev/null 2>&1; then
-        die "sqlite3 CLI not found and python3 lacks the sqlite3 module; install either to read the store"
+        die "sqlite3 CLI unavailable and python3 lacks the sqlite3 module; install either to read the store"
     fi
     db_reader=python
-    say "sqlite3 CLI not found; reading the store via the python3 sqlite3 fallback" >&2
+    say "sqlite3 CLI unavailable or incompatible; reading the store via the python3 sqlite3 fallback" >&2
 fi
 
 grace="$(fence_grace_secs)"

@@ -60,6 +60,8 @@ jobs:
       - name: Run ShellCheck
         run: |
           shellcheck --version
+          jq . crates/gitforge-api/openapi.json > /dev/null
+          echo "OpenAPI spec is valid JSON"
           shellcheck scripts/*.sh systemd/*.sh
 
   workflow-lint:

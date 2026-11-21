@@ -1,31 +1,31 @@
 //! Classification of the scheduler's exclusive resource classes.
 //!
-//! A resource class marks work that must not overlap on one runner. The only
-//! class today is `workspace-cargo-test`: a workspace-wide Cargo test builds
-//! the whole workspace into one target tree, so two of them on one runner
-//! fight over the same build artifacts.
+//! A resource class marks work that should not overlap on one runner. Cargo
+//! compile workloads share CPU, memory bandwidth, and host storage even when
+//! their target directories are isolated. The scheduler admits one
+//! storage-sensitive job per declared storage domain; independent hosts can
+//! run in parallel, while the per-runner class check remains an additional
+//! guard for runner-local resources.
 //!
 //! The class is decided by the cargo SUBCOMMAND the command actually runs.
-//! The earlier classifier scanned the command TEXT for the words `cargo`,
-//! `test` and `--workspace` independently, so any command that merely
-//! MENTIONED those words landed in the class — a comment line, or another
-//! cargo subcommand such as `cargo llvm-cov`. A job that was not a workspace
-//! cargo test was then excluded from runners that were free to take it, and
-//! the exclusion was invisible in the job's own evidence.
+//! The earlier classifier scanned command text for words independently,
+//! confusing comments and echoed strings with invocations. The scan below
+//! keeps the command-aware parser and recognizes compile-heavy subcommands,
+//! including wrappers such as `trunk` scripts that invoke Cargo in a segment.
 //!
 //! The scan below is lexical and deliberately conservative: it reads the
-//! subcommand of a cargo invocation and requires `--workspace` (or its
-//! `--all` alias) among that invocation's arguments.
+//! subcommand belonging to each Cargo invocation and classifies only known
+//! compile-heavy operations. A command that merely mentions Cargo in a
+//! comment or quoted string does not consume the resource class.
 //!
 //! TWO DIRECTIONS, CHOSEN DELIBERATELY.
 //!
-//! * A false POSITIVE (a job that is not a workspace cargo test, classified as
-//!   one) costs a scheduling deferral. The deferral is recorded in the job's
-//!   durable `deferred_reason`, so the cost is visible and bounded.
-//! * A false NEGATIVE (a workspace cargo test that is not classified) lets
-//!   two workspace cargo tests build the same target tree on one runner. That
-//!   is the failure that killed the coverage jobs with ENOENT on the test
-//!   binary on 2026-11-05, and it is silent.
+//! * A false POSITIVE costs a scheduling deferral. The deferral is recorded in
+//!   the job's durable `deferred_reason`, so the cost is visible.
+//! * A false NEGATIVE lets independently-targeted Cargo jobs saturate the same
+//!   runner's I/O path. Live evidence on 2026-11-11 showed a full-workspace
+//!   test and a WASM build running together on one runner while I/O PSI reached
+//!   35.75% full.
 //!
 //! So the scan looks for a cargo invocation ANYWHERE in a segment, not only at
 //! the segment's first program word. A wrapper program in front of the
@@ -46,6 +46,12 @@ const CARGO_VALUE_OPTIONS: &[&str] = &[
     "-Z",
 ];
 
+/// Cargo subcommands that compile, test, remove, or install build artifacts.
+const CARGO_RESOURCE_SUBCOMMANDS: &[&str] = &[
+    "build", "check", "clippy", "test", "bench", "doc", "run", "rustc", "install", "clean",
+    "llvm-cov", "nextest", "fix",
+];
+
 /// Whether the command runs `cargo test` over the whole workspace.
 ///
 /// The command text is a shell script, so the scan looks for a segment that
@@ -60,6 +66,67 @@ pub fn workspace_cargo_test(command: &str) -> bool {
             .iter()
             .any(|segment| segment_runs_workspace_cargo_test(segment))
     })
+}
+
+/// Whether a command performs compile-heavy Cargo work that should be
+/// serialized with other Cargo builds sharing the scheduler host.
+pub fn cargo_build_workload(command: &str) -> bool {
+    logical_lines(command).iter().any(|line| {
+        shell_segments(line)
+            .iter()
+            .any(|segment| segment_runs_cargo_build_workload(segment))
+    })
+}
+
+/// Whether a command compiles build artifacts or performs a full-repository
+/// Aegis scan that competes for host storage I/O.
+pub fn storage_sensitive_workload(command: &str) -> bool {
+    cargo_build_workload(command) || repository_aegis_scan(command)
+}
+
+fn repository_aegis_scan(command: &str) -> bool {
+    logical_lines(command).iter().any(|line| {
+        shell_segments(line)
+            .iter()
+            .any(|segment| segment_runs_aegis_scan(segment))
+    })
+}
+
+fn segment_runs_aegis_scan(segment: &str) -> bool {
+    let words = shell_words(segment);
+    if words.first().is_some_and(|word| {
+        matches!(
+            word.rsplit('/')
+                .next()
+                .unwrap_or(word)
+                .to_ascii_lowercase()
+                .as_str(),
+            "echo" | "printf" | "print" | "pwd" | "type" | "which"
+        )
+    }) {
+        return false;
+    }
+
+    for (index, word) in words.iter().enumerate() {
+        let program = word.rsplit('/').next().unwrap_or(word).to_ascii_lowercase();
+        if program == "aegis" && words[index + 1..].iter().any(|argument| argument == "scan") {
+            return true;
+        }
+        if matches!(program.as_str(), "bash" | "dash" | "sh" | "zsh") {
+            for (flag_index, flag) in words.iter().enumerate().skip(index + 1) {
+                if (flag == "-c"
+                    || flag == "--command"
+                    || (flag.starts_with('-') && flag[1..].contains('c')))
+                    && words
+                        .get(flag_index + 1)
+                        .is_some_and(|nested| segment_runs_aegis_scan(nested))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Join backslash-continued lines into the logical lines a shell would run.
@@ -183,9 +250,36 @@ fn segment_runs_workspace_cargo_test(segment: &str) -> bool {
     })
 }
 
+fn segment_runs_cargo_build_workload(segment: &str) -> bool {
+    let words = shell_words(segment);
+    words.iter().enumerate().any(|(start, word)| {
+        is_cargo_program(word) && cargo_invocation_is_build_workload(&words, start)
+    })
+}
+
 /// Whether the cargo invocation that starts at `start` is a workspace-wide
 /// cargo test.
 fn cargo_invocation_is_workspace_test(words: &[String], start: usize) -> bool {
+    let Some(index) = cargo_subcommand_index(words, start) else {
+        return false;
+    };
+    if words.get(index).map(String::as_str) != Some("test") {
+        return false;
+    }
+    // `--workspace` (or its `--all` alias) must be an argument of THIS
+    // invocation, not of another command in the same script.
+    words[index + 1..]
+        .iter()
+        .any(|argument| argument == "--workspace" || argument == "--all")
+}
+
+fn cargo_invocation_is_build_workload(words: &[String], start: usize) -> bool {
+    cargo_subcommand_index(words, start)
+        .and_then(|index| words.get(index))
+        .is_some_and(|subcommand| CARGO_RESOURCE_SUBCOMMANDS.contains(&subcommand.as_str()))
+}
+
+fn cargo_subcommand_index(words: &[String], start: usize) -> Option<usize> {
     let mut index = start + 1;
     // Step over cargo's global options to reach the subcommand.
     while let Some(word) = words.get(index) {
@@ -202,17 +296,7 @@ fn cargo_invocation_is_workspace_test(words: &[String], start: usize) -> bool {
         break;
     }
     // The first bare word after cargo is the subcommand.
-    let Some(subcommand) = words.get(index) else {
-        return false;
-    };
-    if subcommand != "test" {
-        return false;
-    }
-    // `--workspace` (or its `--all` alias) must be an argument of THIS
-    // invocation, not of another command in the same script.
-    words[index + 1..]
-        .iter()
-        .any(|argument| argument == "--workspace" || argument == "--all")
+    words.get(index).map(|_| index)
 }
 
 /// Whether a word is a `NAME=value` environment assignment.
@@ -372,5 +456,58 @@ mod tests {
         assert!(!workspace_cargo_test(
             "flock /cargo-target/.dil-cargo.lock \\\n  cargo clippy --workspace --all-targets"
         ));
+    }
+
+    #[test]
+    fn compile_heavy_cargo_commands_share_the_runner_resource_class() {
+        assert!(cargo_build_workload("cargo test --workspace --locked"));
+        assert!(cargo_build_workload(
+            "cargo build --manifest-path /workspace/web/Cargo.toml --bin firecraft-web"
+        ));
+        assert!(cargo_build_workload(
+            "cargo clippy --all-targets -- -D warnings"
+        ));
+        assert!(cargo_build_workload(
+            "cargo llvm-cov --workspace --summary-only"
+        ));
+        assert!(cargo_build_workload("cargo fix --workspace --all-targets"));
+        // Live GitForge release/fuzz workloads use `cargo run` wrappers.
+        assert!(cargo_build_workload(
+            "cargo run --locked -p xtask -- dist --native"
+        ));
+        assert!(cargo_build_workload(
+            "trunk build && cargo build --target wasm32-unknown-unknown"
+        ));
+    }
+
+    #[test]
+    fn non_compiling_cargo_commands_and_mentions_do_not_take_the_resource_class() {
+        assert!(!cargo_build_workload("cargo fmt --all -- --check"));
+        assert!(!cargo_build_workload("cargo metadata --no-deps"));
+        assert!(!cargo_build_workload("echo 'cargo build --workspace'"));
+        assert!(!cargo_build_workload(
+            "# run cargo test --workspace later\ncargo fmt --all"
+        ));
+    }
+
+    #[test]
+    fn a_wrapped_compile_invocation_is_classified() {
+        assert!(cargo_build_workload(
+            "flock /cargo-target/.dil-cargo.lock timeout 120 cargo check --workspace"
+        ));
+    }
+
+    #[test]
+    fn full_aegis_scans_are_storage_sensitive_even_without_heavy_lane() {
+        assert!(storage_sensitive_workload(
+            "aegis --format human -c production scan . --baseline .aegis-baseline.json"
+        ));
+        assert!(storage_sensitive_workload(
+            "flock /run/lock/aegis.lock sudo /usr/bin/aegis scan ."
+        ));
+        assert!(storage_sensitive_workload("bash -lc 'aegis scan .'"));
+        assert!(!storage_sensitive_workload("aegis --version"));
+        assert!(!storage_sensitive_workload("echo 'aegis scan .'"));
+        assert!(!storage_sensitive_workload("cargo fmt --all -- --check"));
     }
 }

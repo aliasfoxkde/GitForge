@@ -141,6 +141,14 @@ pub struct Job {
     /// placeholder or independently reconstructed definition.
     pub commands: Vec<String>,
     pub image: String,
+    /// Explicit host-side checkout path. `working_dir` remains a compatibility
+    /// mirror for older runners that use it as the bind-mount source.
+    pub workspace_path: Option<String>,
+    /// Container-side working directory for commands; never a host path.
+    pub container_working_dir: Option<String>,
+    /// Per-step container working directories, aligned with `commands`.
+    pub step_working_directories: Vec<Option<String>>,
+    /// Legacy host-side workspace path, retained for old runner contracts.
     pub working_dir: Option<String>,
     /// Maximum execution time in seconds. Older databases default to 300.
     pub timeout_secs: u64,
@@ -178,6 +186,9 @@ impl Job {
             created_at: Utc::now(),
             commands: Vec::new(),
             image: "rust:latest".to_string(),
+            workspace_path: None,
+            container_working_dir: None,
+            step_working_directories: Vec::new(),
             working_dir: None,
             timeout_secs: 300,
             result_json: None,

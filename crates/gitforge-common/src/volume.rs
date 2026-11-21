@@ -81,13 +81,7 @@ impl VolumeSpec {
         }
         match self.resolved_type() {
             VolumeType::Bind | VolumeType::Volume => {
-                if self
-                    .source
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or_default()
-                    .is_empty()
-                {
+                if self.source.as_deref().map_or_default(str::trim).is_empty() {
                     return Err(format!(
                         "volume mount requires a source: {}",
                         self.destination
@@ -180,11 +174,11 @@ pub const DEFAULT_CACHE_ROOT: &str = "/var/cache/gitforge";
 /// `/var/cache/gitforge`, which its own unit cannot write, so the
 /// platform's own pipeline cold-built on every run).
 pub fn cache_root_with(override_root: Option<&str>, home: Option<&str>) -> String {
-    let override_root = override_root.map(str::trim).unwrap_or_default();
+    let override_root = override_root.map_or_default(str::trim);
     if !override_root.is_empty() {
         return override_root.to_string();
     }
-    let home = home.map(str::trim).unwrap_or_default();
+    let home = home.map_or_default(str::trim);
     if !home.is_empty() {
         return std::path::Path::new(home)
             .join(".cache")

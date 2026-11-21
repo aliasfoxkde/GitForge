@@ -36,6 +36,13 @@ cargo build --release --workspace
 
 ## Running Services
 
+The NAS installation runs the GitForge control plane. The installer leaves
+`gitforge@runner.service` disabled and masked by default; CI execution belongs
+on the remote runner fleet. Only set `GITFORGE_ENABLE_LOCAL_RUNNER=1` for an
+intentional local-executor deployment after checking host capacity and the
+storage-admission policy. This opt-in must not be used to bypass a runner
+pause/drain or an active-job lease.
+
 ### 1. API Gateway
 
 The API gateway exposes the REST API for frontend integration.
@@ -66,6 +73,7 @@ JWT_SECRET=your-secret PORT=42780 ./target/release/api
 - `GET /api/pipeline-runs` - List pipeline runs (auth required)
 - `GET /api/jobs/:id` - Get job status (auth required)
 - `GET /api/runners` - List runners (auth required)
+- `POST /api/runners/{id}/pause` and `/resume` - Durable runner admission control (admin/maintainer)
 
 ### 2. Git Server
 
@@ -130,6 +138,20 @@ graded `failed` with the cause recorded on the run row (visible as
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `GITFORGE_WORKSPACE_PREP_TIMEOUT_SECS` | No | `300` | Per-command budget for workspace prep. Raise it on hosts that legitimately clone multi-gigabyte repositories; `0`/invalid values fall back to the default. |
+| `GITFORGE_IO_FULL_AVG10_LIMIT_PCT` | No | `25` | Scheduler and runner defer storage-heavy work when local `/proc/pressure/io` full `avg10` exceeds this percentage. Missing/malformed PSI fails closed. |
+| `GITFORGE_CPU_SOME_AVG10_LIMIT_PCT` | No | `80` | Runner defers storage-heavy work when local `/proc/pressure/cpu` some `avg10` exceeds this percentage. Missing/malformed PSI fails closed. |
+| `GITFORGE_STORAGE_DOMAIN` | No | Hostname | Stable identity for the backing storage used by this runner. Set the same value on runners that share a storage device or network filesystem; separate hosts with independent storage should use distinct values. |
+
+Storage-sensitive runner assignments acquire the host lease at
+`/run/lock/codex-host-storage.lock` before the runner claims them, then check
+local I/O/CPU PSI and active build processes. Missing PSI or an unreadable
+process probe defers the assignment. The backend-fixed manager uses the same
+host-local `flock` file while its heavy/normal child is alive. Provision it as
+`root:www-data` mode `0660` with the canonical backend-fixed
+`systemd/tmpfiles.d/codex-host-storage.conf`; the GitForge runner unit needs
+the `www-data` supplementary group and write access to that file. If pressure
+is high or the lease is busy, the runner returns the assignment to the queue
+poll. If the file is unavailable, it refuses to start the job.
 
 Failed runs carry their cause in the `error` field of
 `GET /api/v1/ci/pipeline-runs/{id}`, and a run that ends `failed` or
@@ -137,6 +159,16 @@ Failed runs carry their cause in the `error` field of
 `cancelled`, so no zombie rows outlive a terminal run.
 
 ### 4. Runner Agent
+
+#### Pausing a runner
+
+Use `gitforge runner --pause <runner-id>` to stop new assignments. The API
+requeues jobs that have not started and prevents durable assignment/start
+transitions while paused. Jobs already running are left in place. Check the
+reported `running_jobs` count and wait for the runner's own job/container
+inventory to reach zero before maintenance; the pause response alone is not
+proof that containers drained. Use `gitforge runner --resume <runner-id>` to
+restore scheduling after maintenance.
 
 The runner agent executes jobs in Docker containers.
 
@@ -327,10 +359,36 @@ Fedora operational notes:
 - **NAS (control plane).** System-level template units
   `gitforge@{api,ci,git-server}.service` + the repo-of-record, the API
   gateway (:42780), the scheduler (:42781), and git serving (:42782). The
-  NAS `gitforge@runner.service` unit is **masked — retired, not failed**:
-  local execution moved off the NAS, and `gitforge-release-auto` /
+  NAS `gitforge@runner.service` unit is masked to prevent future starts. A
+  systemd mask does not stop a process that was already running; verify the
+  unit's `MainPID`, runner-owned containers, and durable in-flight jobs before
+  calling local execution retired. `gitforge-release-auto` and
   `gitforge-status` skip masked units instead of failing the promote (the
   pre-fix behavior made every release roll back forever).
+
+  **Audit snapshot — 2026-11-18:** this host violated that retirement
+  assumption. `gitforge@runner.service` was masked but still active with PID
+  3652512, running the 2026-11-12 release binary since Nov 12. Its journal
+  shows it accepted jobs `31fbcd4d-1216-4f65-a6d4-a8f78ce6524e` and
+  `a18e9131-9bb1-4054-a457-04230ecc0b45` concurrently and created their Docker
+  containers on the NAS worktree. The runner also accepted the release job
+  `b18a5439-29a1-42bf-a1e6-799ea91229ee`, which was still active at the time
+  of inspection. Therefore this NAS runner was not retired at that time.
+  Drain it through the durable pause/control-plane path and verify zero active
+  jobs and owned containers before any operator stop or release action; do not
+  infer retirement from `UnitFileState=masked`.
+  The authoritative scheduler database is `/var/lib/gitforge/gitforge.db`,
+  selected by `/etc/gitforge/database.env` (the ignored `/nas/.../data/gitforge.db`
+  file is stale and must not be used for runtime conclusions). A read-only
+  query on 2026-11-18 found `swarmone-docker` online with a fresh heartbeat,
+  while `fedora-docker` was offline (last heartbeat 2026-11-12) and
+  `t5500-docker` was offline (last heartbeat 2026-10-11). Thus the local runner
+  was the only online executor in the authoritative store at that observation.
+  The live `runners` table also lacked the candidate `storage_domain` and
+  `paused` columns, confirming the November 17 scheduler schema changes had
+  not been applied to the production database. Restore and validate at least
+  one intended remote executor before draining the local runner; the running
+  local process is carrying CI work.
 - **Execution fleet.** Remote docker runners register into the NAS
   scheduler: `fedora-docker` on 192.168.1.202 and `t5500-docker`, so jobs
   dispatch off-host while pushes, runs, and logs stay on the NAS instance.

@@ -33,6 +33,10 @@ pub use volume::{
     VolumeSpec, VolumeType, DEFAULT_CACHE_ROOT, DEFAULT_DOCKER_SOCKET,
 };
 
+/// Runner capability required before the scheduler may issue storage-sensitive
+/// jobs under the shared host admission contract.
+pub const HOST_STORAGE_LEASE_CAPABILITY: &str = "host-storage-lease-v1";
+
 /// True when `hash` is git's "ref does not exist" sentinel: empty or all
 /// zero digits. `git receive-pack` sends an all-zero new hash on branch
 /// deletion (and an all-zero old hash on branch creation); only the

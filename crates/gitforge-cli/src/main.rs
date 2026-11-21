@@ -1129,8 +1129,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             let affected = match &scope {
                 CheckScope::Workspace => graph
                     .as_ref()
-                    .map(gitforge_graph::DependencyGraph::crates)
-                    .unwrap_or_default(),
+                    .map_or_default(gitforge_graph::DependencyGraph::crates),
                 CheckScope::Packages(packages) => packages.clone(),
             };
 

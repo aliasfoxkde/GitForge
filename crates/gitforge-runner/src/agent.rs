@@ -1343,11 +1343,7 @@ impl RunnerAgent {
         self.abort_control_tasks().await;
         let settled = self.join_background_tasks_until(timeout).await;
 
-        let runner_id = self
-            .runner
-            .as_ref()
-            .map(|r| r.id.to_string())
-            .unwrap_or_default();
+        let runner_id = self.runner.as_ref().map_or_default(|r| r.id.to_string());
         tracing::info!(runner_id = %runner_id, settled, "runner stopped");
         settled
     }

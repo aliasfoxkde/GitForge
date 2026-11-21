@@ -58,8 +58,7 @@ where
             let duration = start.elapsed().as_secs_f64();
             let status = response
                 .as_ref()
-                .map(axum::http::Response::status)
-                .unwrap_or_default();
+                .map_or_default(axum::http::Response::status);
 
             metrics.record_http_request(&method, &path, status.as_u16());
             metrics.record_http_duration(&method, &path, duration);

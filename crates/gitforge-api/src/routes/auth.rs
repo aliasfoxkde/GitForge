@@ -25,7 +25,7 @@ pub struct LoginRequest {
 /// The refresh fields are optional so the response stays backward
 /// compatible: an older client ignores them, and a login whose refresh
 /// row could not be persisted degrades to the pre-refresh behavior
-/// (24-hour JWT only) instead of failing the whole login.
+/// (access-token only) instead of failing the whole login.
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
     pub token: String,
@@ -514,7 +514,8 @@ mod tests {
         let body = body_json(response).await;
         let rotated = body["refresh_token"].as_str().unwrap().to_string();
         assert_ne!(rotated, credential, "rotation must mint a new credential");
-        assert!(body["refresh_expires_in"].is_i64());
+        assert_eq!(body["expires_in"].as_i64(), Some(ACCESS_TTL_SECS));
+        assert_eq!(body["refresh_expires_in"].as_i64(), Some(REFRESH_TTL_SECS));
         assert!(!body["token"].as_str().unwrap().is_empty());
 
         // Replaying the just-rotated credential fails closed.

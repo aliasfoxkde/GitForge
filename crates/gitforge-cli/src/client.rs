@@ -117,8 +117,7 @@ pub struct PipelineResponse {
     pub id: String,
     pub name: String,
     pub repo_id: String,
-    /// The API list endpoint does not return `enabled`; default it so the
-    /// response still decodes (the run/list flows only need id/name/repo_id).
+    /// Default absent status for compatibility with older API responses.
     #[serde(default)]
     pub enabled: bool,
 }
@@ -183,6 +182,12 @@ pub struct RunnerResponse {
     pub runner_type: String,
     pub status: String,
     pub capacity: i32,
+    #[serde(default)]
+    pub storage_domain: String,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub pause_generation: i64,
     pub last_heartbeat: Option<String>,
 }
 
@@ -614,6 +619,20 @@ impl ApiClient {
         ensure_success(resp, "retire runner").await?;
         Ok(())
     }
+
+    /// Pause a runner or resume its scheduling. The response includes the
+    /// number of requeued assignments and running jobs.
+    pub async fn set_runner_paused(&self, id: &str, paused: bool) -> Result<serde_json::Value> {
+        let action = if paused { "pause" } else { "resume" };
+        let url = format!("{}/api/runners/{id}/{action}", self.base_url);
+        let mut req = self.http.post(&url);
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        let response = req.send().await?;
+        let response = ensure_success(response, action).await?;
+        Ok(response.json().await?)
+    }
 }
 
 pub use ApiClient as GitForgeClient;
@@ -684,6 +703,33 @@ mod tests {
         let client = ApiClient::new(&url, Some("token".to_string()));
         client.delete("/api/test/123").await.unwrap();
         m.assert();
+    }
+
+    #[tokio::test]
+    async fn test_set_runner_paused_uses_authenticated_control_route() {
+        let mut mock_server = mockito::Server::new_async().await;
+        let pause = mock_server
+            .mock("POST", "/api/runners/runner-7/pause")
+            .match_header("Authorization", "Bearer operator-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"paused":true,"requeued_jobs":2,"running_jobs":1}"#)
+            .create();
+        let resume = mock_server
+            .mock("POST", "/api/runners/runner-7/resume")
+            .match_header("Authorization", "Bearer operator-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"paused":false,"requeued_jobs":0,"running_jobs":1}"#)
+            .create();
+
+        let client = ApiClient::new(&mock_server.url(), Some("operator-token".to_string()));
+        let paused = client.set_runner_paused("runner-7", true).await.unwrap();
+        assert_eq!(paused["requeued_jobs"], 2);
+        let resumed = client.set_runner_paused("runner-7", false).await.unwrap();
+        assert_eq!(resumed["paused"], false);
+        pause.assert();
+        resume.assert();
     }
 
     #[tokio::test]

@@ -90,7 +90,8 @@ impl FixGenerator {
                             .replace("+", "?")
                             .replace("'\"+", "\"")
                             .replace("+'\"", "\""),
-                        explanation: "Use parameterized queries instead of string concatenation".to_string(),
+                        explanation: "Use parameterized queries instead of string concatenation"
+                            .to_string(),
                         category: FixCategory::ParameterizedQuery,
                     })
                 },
@@ -108,7 +109,12 @@ impl FixGenerator {
                         file: String::new(),
                         line: 1,
                         original: code.to_string(),
-                        fixed: format!("{} = std::env::var(\"{}\").expect(\"{} must be set\")", var_name, var_name.to_uppercase(), var_name),
+                        fixed: format!(
+                            "{} = std::env::var(\"{}\").expect(\"{} must be set\")",
+                            var_name,
+                            var_name.to_uppercase(),
+                            var_name
+                        ),
                         explanation: "Use environment variables for sensitive data".to_string(),
                         category: FixCategory::UseEnvironmentVariable,
                     })
@@ -127,7 +133,8 @@ impl FixGenerator {
                         line: 1,
                         original: code.to_string(),
                         fixed: code.replace("$1(", "sha256("),
-                        explanation: "Use SHA-256 or a cryptographically secure hash function".to_string(),
+                        explanation: "Use SHA-256 or a cryptographically secure hash function"
+                            .to_string(),
                         category: FixCategory::SecurityHardening,
                     })
                 },
@@ -256,10 +263,7 @@ pub fn is_auto_fixable(finding: &ReviewFinding) -> bool {
     matches!(
         finding.severity,
         Severity::Low | Severity::Medium | Severity::High
-    ) && !matches!(
-        finding.category,
-        FindingCategory::Security
-    ) // Security issues need human review
+    ) && !matches!(finding.category, FindingCategory::Security) // Security issues need human review
 }
 
 #[cfg(test)]

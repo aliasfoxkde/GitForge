@@ -173,7 +173,12 @@ async fn register_runner_is_public_and_normalizes_the_payload() {
         f.app.clone(),
         "/api/runners",
         Some(REGISTRATION_TOKEN),
-        json!({"name": "edge-runner", "type": "firecracker", "capacity": 4}),
+        json!({
+            "name": "edge-runner",
+            "type": "firecracker",
+            "capacity": 4,
+            "capabilities": [gitforge_common::HOST_STORAGE_LEASE_CAPABILITY]
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -189,7 +194,7 @@ async fn register_runner_is_public_and_normalizes_the_payload() {
         f.app.clone(),
         "/api/runners",
         Some(REGISTRATION_TOKEN),
-        json!({}),
+        json!({"capabilities": [gitforge_common::HOST_STORAGE_LEASE_CAPABILITY]}),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -206,7 +211,11 @@ async fn register_runner_is_public_and_normalizes_the_payload() {
             f.app.clone(),
             "/api/runners",
             Some(REGISTRATION_TOKEN),
-            json!({"name": format!("runner-{sent}"), "type": sent}),
+            json!({
+                "name": format!("runner-{sent}"),
+                "type": sent,
+                "capabilities": [gitforge_common::HOST_STORAGE_LEASE_CAPABILITY]
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{sent}: {body}");

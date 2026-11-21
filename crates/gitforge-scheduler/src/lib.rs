@@ -3,6 +3,7 @@
 //! Job queue management, runner assignment, and scheduling policies.
 
 pub mod assigner;
+pub mod io_pressure;
 pub mod policy;
 pub mod queue;
 pub mod resource_class;

@@ -94,6 +94,10 @@ enum TestCommands {
         capacity: Option<i32>,
         #[arg(long)]
         deregister: Option<String>,
+        #[arg(long)]
+        pause: Option<String>,
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// Sync commands
     Sync {

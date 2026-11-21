@@ -5,6 +5,7 @@ use gitforge_metrics::Metrics;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
+use sqlx::Row;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -626,6 +627,9 @@ impl Pool {
                 runner_type TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'offline',
                 capacity INTEGER NOT NULL DEFAULT 1,
+                storage_domain TEXT NOT NULL DEFAULT 'default',
+                paused INTEGER NOT NULL DEFAULT 0,
+                pause_generation INTEGER NOT NULL DEFAULT 0,
                 labels TEXT NOT NULL DEFAULT '[]',
                 last_heartbeat TEXT,
                 created_at TEXT NOT NULL,
@@ -636,6 +640,28 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create runners table: {e}")))?;
+
+        execute_tolerating_duplicate(
+            &self.pool,
+            "ALTER TABLE runners ADD COLUMN paused INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        execute_tolerating_duplicate(
+            &self.pool,
+            "ALTER TABLE runners ADD COLUMN storage_domain TEXT NOT NULL DEFAULT 'default'",
+        )
+        .await?;
+        execute_tolerating_duplicate(
+            &self.pool,
+            "ALTER TABLE runners ADD COLUMN pause_generation INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS runner_drain_receipts (runner_id TEXT PRIMARY KEY REFERENCES runners(id) ON DELETE CASCADE, generation INTEGER NOT NULL, active_job_ids TEXT NOT NULL, owned_container_ids TEXT NOT NULL, acknowledged_at TEXT NOT NULL)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|error| Error::database(format!("failed to create runner drain receipts: {error}")))?;
 
         // Runner names are stable identities: registration adopts the row
         // that already carries the name (RunnerQueries::register_or_refresh).
@@ -684,6 +710,19 @@ impl Pool {
             .await
             .map_err(|e| Error::database(format!("failed to create runners name index: {e}")))?;
 
+        // Detect the legacy layout before CREATE/ALTER adds the new column.
+        // Old `working_dir` values were host workspace paths. Keep them in
+        // that legacy column and backfill the explicit workspace path.
+        let prior_job_columns = sqlx::query("PRAGMA table_info(jobs)")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::database(format!("failed to inspect jobs schema: {e}")))?;
+        let had_jobs_table = !prior_job_columns.is_empty();
+        let had_workspace_path = prior_job_columns.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .is_ok_and(|name| name == "workspace_path")
+        });
+
         // Create jobs table
         sqlx::query(
             r#"
@@ -699,6 +738,9 @@ impl Pool {
                 created_at TEXT NOT NULL,
                 commands TEXT NOT NULL DEFAULT '[]',
                 image TEXT NOT NULL DEFAULT 'rust:latest',
+                workspace_path TEXT,
+                container_working_dir TEXT,
+                step_working_directories TEXT NOT NULL DEFAULT '[]',
                 working_dir TEXT,
                 timeout_secs INTEGER NOT NULL DEFAULT 300,
                 result_json TEXT,
@@ -717,6 +759,9 @@ impl Pool {
         for statement in [
             "ALTER TABLE jobs ADD COLUMN commands TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE jobs ADD COLUMN image TEXT NOT NULL DEFAULT 'rust:latest'",
+            "ALTER TABLE jobs ADD COLUMN workspace_path TEXT",
+            "ALTER TABLE jobs ADD COLUMN container_working_dir TEXT",
+            "ALTER TABLE jobs ADD COLUMN step_working_directories TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE jobs ADD COLUMN working_dir TEXT",
             "ALTER TABLE jobs ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 300",
             "ALTER TABLE jobs ADD COLUMN result_json TEXT",
@@ -738,6 +783,16 @@ impl Pool {
             "ALTER TABLE jobs ADD COLUMN deferred_reason TEXT",
         ] {
             execute_tolerating_duplicate(&self.pool, statement).await?;
+        }
+        if had_jobs_table && !had_workspace_path {
+            sqlx::query(
+                "UPDATE jobs SET workspace_path = working_dir WHERE working_dir IS NOT NULL",
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                Error::database(format!("failed to migrate legacy job workspace paths: {e}"))
+            })?;
         }
 
         // Create artifacts table
@@ -1080,7 +1135,6 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::Row;
 
     #[tokio::test]
     async fn test_memory_pool_creation() {
@@ -1093,6 +1147,37 @@ mod tests {
         let pool = Pool::memory().await.unwrap();
         let result = pool.migrate().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn legacy_runner_table_gains_pause_storage_and_drain_columns() {
+        let pool = Pool::memory().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE runners (id TEXT PRIMARY KEY, name TEXT NOT NULL, runner_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'offline', capacity INTEGER NOT NULL DEFAULT 1, labels TEXT NOT NULL DEFAULT '[]', last_heartbeat TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(pool.pool())
+        .await
+        .unwrap();
+
+        pool.migrate().await.unwrap();
+        let columns = sqlx::query("PRAGMA table_info(runners)")
+            .fetch_all(pool.pool())
+            .await
+            .unwrap();
+        let names = columns
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "paused"));
+        assert!(names.iter().any(|name| name == "storage_domain"));
+        assert!(names.iter().any(|name| name == "pause_generation"));
+        let receipt_table = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runner_drain_receipts'",
+        )
+        .fetch_optional(pool.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipt_table.as_deref(), Some("runner_drain_receipts"));
     }
 
     #[tokio::test]
@@ -1113,6 +1198,17 @@ mod tests {
         assert!(names.iter().any(|name| name == "delivery_token"));
         assert!(names.iter().any(|name| name == "delivery_until"));
         assert!(names.iter().any(|name| name == "delivery_attempts"));
+
+        let runner_columns = sqlx::query("PRAGMA table_info(runners)")
+            .fetch_all(pool.pool())
+            .await
+            .unwrap();
+        let runner_names = runner_columns
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        assert!(runner_names.iter().any(|name| name == "paused"));
+        assert!(runner_names.iter().any(|name| name == "storage_domain"));
     }
 
     #[tokio::test]

@@ -1339,7 +1339,13 @@ async fn test_api_runner_registration_adopts_existing_name() {
         .generate_token(user.id, "runner-admin", "admin")
         .unwrap();
 
-    let body = r#"{"name":"stable-api-runner","type":"docker","capacity":2}"#;
+    let body = serde_json::json!({
+        "name": "stable-api-runner",
+        "type": "docker",
+        "capacity": 2,
+        "capabilities": [gitforge_common::HOST_STORAGE_LEASE_CAPABILITY]
+    })
+    .to_string();
     let first = app
         .clone()
         .oneshot(
@@ -1348,7 +1354,7 @@ async fn test_api_runner_registration_adopts_existing_name() {
                 .uri("/api/runners")
                 .header("content-type", "application/json")
                 .header("Authorization", "Bearer integration-registration")
-                .body(Body::from(body))
+                .body(Body::from(body.clone()))
                 .unwrap(),
         )
         .await

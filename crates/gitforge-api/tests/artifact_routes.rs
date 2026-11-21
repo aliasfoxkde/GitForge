@@ -186,7 +186,7 @@ async fn request(
     }
     let request = builder
         .body(Body::from(
-            body.map(|v| v.to_string().into_bytes()).unwrap_or_default(),
+            body.map_or_default(|v| v.to_string().into_bytes()),
         ))
         .unwrap();
     let response = app.oneshot(request).await.unwrap();

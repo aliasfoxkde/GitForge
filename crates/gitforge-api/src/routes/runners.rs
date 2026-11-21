@@ -57,6 +57,7 @@ pub struct RunnerResponse {
     pub runner_type: String,
     pub status: String,
     pub capacity: i32,
+    pub storage_domain: String,
     pub last_heartbeat: Option<String>,
 }
 
@@ -75,6 +76,7 @@ impl From<gitforge_db::models::Runner> for RunnerResponse {
             runner_type: runner.runner_type,
             status,
             capacity: runner.capacity,
+            storage_domain: runner.storage_domain,
             last_heartbeat: runner.last_heartbeat.map(|dt| dt.to_rfc3339()),
         }
     }
@@ -194,6 +196,10 @@ async fn register_runner(
     let runner_type = payload["type"].as_str().unwrap_or("docker").to_string();
     let capacity = payload["capacity"].as_i64().unwrap_or(1) as i32;
 
+    let storage_domain = payload["storage_domain"]
+        .as_str()
+        .unwrap_or("default")
+        .to_string();
     let rt = match runner_type.as_str() {
         "docker" => RunnerType::Docker,
         "firecracker" => RunnerType::Firecracker,
@@ -201,7 +207,8 @@ async fn register_runner(
         _ => RunnerType::Docker,
     };
 
-    let runner = gitforge_db::models::Runner::new(name, rt, capacity);
+    let mut runner = gitforge_db::models::Runner::new(name, rt, capacity);
+    runner.storage_domain = storage_domain;
 
     // Registration keys on the runner's stable name: a restart adopts the
     // existing row (200 with the adopted id) instead of minting a duplicate
@@ -388,6 +395,7 @@ mod tests {
             runner_type: "docker".to_string(),
             status: "online".to_string(),
             capacity: 4,
+            storage_domain: "shared-nas".to_string(),
             last_heartbeat: Some("2026-01-01T00:00:00Z".to_string()),
         })
         .unwrap();
@@ -399,6 +407,7 @@ mod tests {
                 "type": "docker",
                 "status": "online",
                 "capacity": 4,
+                "storage_domain": "shared-nas",
                 "last_heartbeat": "2026-01-01T00:00:00Z"
             })
         );

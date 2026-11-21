@@ -84,15 +84,20 @@ fi
 # Every value interpolated into SQL below is strictly validated first
 # (40-hex commit; hex-and-dash run id) — nothing else reaches a query,
 # and both readers execute the identical SQL text.
-if command -v sqlite3 >/dev/null 2>&1; then
+sqlite3_cli_available() {
+  command -v sqlite3 >/dev/null 2>&1 || return 1
+  [[ "$(sqlite3 -batch -readonly :memory: 'SELECT 1;' 2>/dev/null)" == "1" ]]
+}
+
+if sqlite3_cli_available; then
   db_reader=cli
 else
   if ! command -v python3 >/dev/null 2>&1; then
-    printf 'release gate: sqlite3 CLI not found and no python3 for the fallback; one of them is required to read run evidence\n' >&2
+    printf 'release gate: sqlite3 CLI unavailable and no python3 for the fallback; one of them is required to read run evidence\n' >&2
     exit 1
   fi
   if ! python3 -c 'import sqlite3' >/dev/null 2>&1; then
-    printf 'release gate: sqlite3 CLI not found and python3 lacks the sqlite3 module; install either to read run evidence\n' >&2
+    printf 'release gate: sqlite3 CLI unavailable and python3 lacks the sqlite3 module; install either to read run evidence\n' >&2
     exit 1
   fi
   # The coverage query needs SQLite JSON1 (json_each / json_extract /
@@ -103,7 +108,7 @@ else
     exit 1
   fi
   db_reader=python
-  printf 'release gate: sqlite3 CLI not found; reading run evidence via the python3 sqlite3 fallback\n' >&2
+  printf 'release gate: sqlite3 CLI unavailable or incompatible; reading run evidence via the python3 sqlite3 fallback\n' >&2
 fi
 
 # Read-only access with a busy timeout: the live services hold write locks

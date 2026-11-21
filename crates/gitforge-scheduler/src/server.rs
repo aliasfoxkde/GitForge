@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
 };
 use gitforge_common::{
-    JobExistenceRequest, JobExistenceResponse, JobId, JobRowState, RunnerId, VolumeSpec,
+    JobExistenceRequest, JobExistenceResponse, JobId, JobRowState, Lane, RunnerId, VolumeSpec,
 };
 use gitforge_db::models::{Runner, RunnerType};
 use gitforge_storage::{Artifact, ArtifactId, ArtifactStore, FileStorage, MAX_ARTIFACT_BYTES};
@@ -44,6 +44,29 @@ pub struct RegisterRunnerRequest {
     #[serde(rename = "type")]
     pub runner_type: String,
     pub capacity: i32,
+    /// Shared host/storage identity used for same-domain admission.
+    #[serde(default)]
+    pub storage_domain: String,
+    /// Admission features this runner enforces locally. Missing capabilities
+    /// are treated as unsupported so a pre-lease runner cannot receive work.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// Optional heartbeat attestation for the currently paused generation.
+#[derive(Debug, Default, Deserialize)]
+pub struct RunnerDrainAckRequest {
+    pub generation: i64,
+    #[serde(default)]
+    pub active_job_ids: Vec<String>,
+    #[serde(default)]
+    pub owned_container_ids: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RunnerHeartbeatRequest {
+    #[serde(default)]
+    pub drain_ack: Option<RunnerDrainAckRequest>,
 }
 
 /// Job info for pending jobs response
@@ -55,8 +78,17 @@ pub struct PendingJobInfo {
     pub pipeline_run_id: String,
     pub commands: Vec<String>,
     pub image: String,
+    /// Explicit runner-host workspace path for the current assignment.
+    pub workspace_path: Option<String>,
+    /// Container cwd, separate from the host workspace bind source.
+    pub container_working_dir: Option<String>,
+    /// Per-command container cwd, aligned with `commands`.
+    pub step_working_directories: Vec<Option<String>>,
+    /// Legacy host workspace path retained for older runners.
     pub working_dir: Option<String>,
     pub timeout_secs: u64,
+    /// Whether this job consumes the shared host storage/build slot.
+    pub storage_sensitive: bool,
     /// Environment variables injected into every step exec. Runners on an
     /// older contract never read this key, and this side always sends it,
     /// so no version negotiation is needed.
@@ -81,6 +113,13 @@ struct PendingJobsQuery {
 struct LeaseRequest {
     runner_id: String,
     lease_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeferJobRequest {
+    runner_id: String,
+    lease_token: String,
+    reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +213,7 @@ pub fn scheduler_routes_with_tokens<S: Clone + Send + Sync + 'static>(
         .route("/jobs/existence", post(post_job_existence))
         .route("/queue/status", get(get_queue_status))
         .route("/jobs/{id}/claim", post(claim_job))
+        .route("/jobs/{id}/defer", post(defer_job))
         .route("/jobs/{id}/started", post(start_job))
         .route("/jobs/{id}/heartbeat", post(job_heartbeat))
         .route("/jobs/{id}/logs", post(append_job_log))
@@ -371,6 +411,20 @@ async fn register_runner(
     State(state): State<SchedulerServerState>,
     Json(request): Json<RegisterRunnerRequest>,
 ) -> impl IntoResponse {
+    if !request
+        .capabilities
+        .iter()
+        .any(|capability| capability.as_str() == gitforge_common::HOST_STORAGE_LEASE_CAPABILITY)
+    {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            Json(serde_json::json!({
+                "error": "runner_capability_required",
+                "capability": gitforge_common::HOST_STORAGE_LEASE_CAPABILITY,
+            })),
+        );
+    }
+
     let runner_type = match request.runner_type.as_str() {
         "docker" => RunnerType::Docker,
         "firecracker" => RunnerType::Firecracker,
@@ -378,7 +432,8 @@ async fn register_runner(
         _ => RunnerType::Docker,
     };
 
-    let runner = Runner::new(request.name, runner_type, request.capacity);
+    let mut runner = Runner::new(request.name, runner_type, request.capacity);
+    runner.storage_domain = request.storage_domain;
 
     let runner = state.scheduler.register_runner(runner).await;
 
@@ -392,6 +447,7 @@ async fn register_runner(
             "type": runner.runner_type,
             "status": runner.status,
             "capacity": runner.capacity,
+            "storage_domain": runner.storage_domain,
         })),
     )
 }
@@ -400,6 +456,7 @@ async fn register_runner(
 async fn runner_heartbeat(
     State(state): State<SchedulerServerState>,
     Path(runner_id): Path<String>,
+    request: Option<Json<RunnerHeartbeatRequest>>,
 ) -> impl IntoResponse {
     let runner_id: RunnerId = match Uuid::parse_str(&runner_id) {
         Ok(id) => RunnerId::from(id),
@@ -414,6 +471,29 @@ async fn runner_heartbeat(
         }
     };
 
+    let mut drain_ack_accepted = None;
+    if let Some(ack) = request.and_then(|Json(request)| request.drain_ack) {
+        match state
+            .scheduler
+            .record_runner_drain_receipt(
+                runner_id,
+                ack.generation,
+                &ack.active_job_ids,
+                &ack.owned_container_ids,
+            )
+            .await
+        {
+            Ok(accepted) => drain_ack_accepted = Some(accepted),
+            Err(error) => {
+                tracing::warn!(%error, %runner_id, "failed to record runner drain receipt");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "drain_receipt_unavailable"})),
+                );
+            }
+        }
+    }
+
     if !state.scheduler.heartbeat(runner_id).await {
         return (
             StatusCode::NOT_FOUND,
@@ -421,10 +501,20 @@ async fn runner_heartbeat(
         );
     }
 
+    let Some((paused, pause_generation)) = state.scheduler.runner_control(runner_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "runner_not_registered"})),
+        );
+    };
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "status": "ok"
+            "status": "ok",
+            "paused": paused,
+            "pause_generation": pause_generation,
+            "drain_ack_accepted": drain_ack_accepted
         })),
     )
 }
@@ -632,6 +722,11 @@ async fn get_pending_jobs(
     for (job_id, runner_id, pipeline_run_id, definition) in assigned_jobs {
         if requested_runner.is_some_and(|requested| requested == runner_id) {
             if let Some(lease_token) = state.scheduler.ensure_job_lease(job_id).await {
+                let storage_sensitive = definition.lane == Lane::Heavy
+                    || definition
+                        .commands
+                        .iter()
+                        .any(|command| crate::resource_class::storage_sensitive_workload(command));
                 job_infos.push(PendingJobInfo {
                     contract_version: "harness.job.v1",
                     job_id: job_id.to_string(),
@@ -639,8 +734,12 @@ async fn get_pending_jobs(
                     pipeline_run_id: pipeline_run_id.to_string(),
                     commands: definition.commands,
                     image: definition.image,
+                    workspace_path: definition.workspace_path,
+                    container_working_dir: definition.container_working_dir,
+                    step_working_directories: definition.step_working_directories,
                     working_dir: definition.working_dir,
                     timeout_secs: definition.timeout_secs,
+                    storage_sensitive,
                     env: definition.env,
                     volumes: definition.volumes,
                     fault: definition.fault,
@@ -743,13 +842,17 @@ async fn claim_job(
             Json(serde_json::json!({"error": "runner_not_assigned"})),
         );
     }
-    if let Some(requested) = request.lease_token {
-        if requested != lease_token {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "invalid_lease"})),
-            );
-        }
+    let Some(requested) = request.lease_token else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing_lease_token"})),
+        );
+    };
+    if requested != lease_token {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "invalid_lease"})),
+        );
     }
     (
         StatusCode::OK,
@@ -761,6 +864,72 @@ async fn claim_job(
             "lease_token": lease_token,
         })),
     )
+}
+
+/// Return a matching unstarted assignment to the queue after local admission
+/// fails. Only the runner holding the current assignment lease may defer it.
+fn valid_defer_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "host_resource_admission_busy" | "host_storage_lease_busy"
+    )
+}
+
+async fn defer_job(
+    State(state): State<SchedulerServerState>,
+    Path(job_id): Path<String>,
+    Json(request): Json<DeferJobRequest>,
+) -> impl IntoResponse {
+    let job_id = match Uuid::parse_str(&job_id) {
+        Ok(id) => JobId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_job_id"})),
+            )
+        }
+    };
+    let runner_id = match Uuid::parse_str(&request.runner_id) {
+        Ok(id) => RunnerId::from(id),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_runner_id"})),
+            )
+        }
+    };
+    if !valid_defer_reason(&request.reason) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_defer_reason"})),
+        );
+    }
+    match state
+        .scheduler
+        .defer_unstarted_assignment(job_id, runner_id, &request.lease_token)
+        .await
+    {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "contract_version": "harness.job.v1",
+                "status": "deferred",
+                "job_id": job_id.to_string(),
+                "reason": request.reason,
+            })),
+        ),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "assignment_not_deferable"})),
+        ),
+        Err(error) => {
+            tracing::error!(%error, %job_id, "failed to defer assigned job");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "defer_unavailable"})),
+            )
+        }
+    }
 }
 
 /// Record the assigned-to-running transition.
@@ -1172,6 +1341,13 @@ mod tests {
         );
     }
 
+    #[test]
+    fn defer_reason_accepts_current_and_legacy_runner_contracts() {
+        assert!(valid_defer_reason("host_resource_admission_busy"));
+        assert!(valid_defer_reason("host_storage_lease_busy"));
+        assert!(!valid_defer_reason("arbitrary_reason"));
+    }
+
     #[tokio::test]
     async fn test_register_runner_handler() {
         let scheduler = crate::Scheduler::new();
@@ -1181,6 +1357,8 @@ mod tests {
             name: "test-runner".to_string(),
             runner_type: "docker".to_string(),
             capacity: 4,
+            storage_domain: "test-domain".to_string(),
+            capabilities: vec![gitforge_common::HOST_STORAGE_LEASE_CAPABILITY.to_string()],
         };
 
         let response = register_runner(axum::extract::State(state), axum::Json(request)).await;
@@ -1197,6 +1375,8 @@ mod tests {
             name: "bare-runner".to_string(),
             runner_type: "bare-metal".to_string(),
             capacity: 8,
+            storage_domain: "bare-domain".to_string(),
+            capabilities: vec![gitforge_common::HOST_STORAGE_LEASE_CAPABILITY.to_string()],
         };
 
         let response = register_runner(axum::extract::State(state), axum::Json(request)).await;
@@ -1215,10 +1395,80 @@ mod tests {
         let response = runner_heartbeat(
             axum::extract::State(state),
             axum::extract::Path(runner_id.to_string()),
+            None,
         )
         .await;
 
         assert_status(response.into_response(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn runner_heartbeat_reports_pause_generation_and_rejects_stale_drain_ack() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let scheduler = crate::Scheduler::with_db(pool.clone());
+        let state = create_state(scheduler);
+        let runner = Runner::new("drain-ack-runner".to_string(), RunnerType::Docker, 1);
+        let runner_id = runner.id;
+        state.scheduler.register_runner(runner).await;
+        gitforge_db::queries::RunnerQueries::set_paused(&pool, runner_id, true)
+            .await
+            .unwrap();
+
+        let response = runner_heartbeat(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(runner_id.to_string()),
+            Some(Json(RunnerHeartbeatRequest {
+                drain_ack: Some(RunnerDrainAckRequest {
+                    generation: 1,
+                    active_job_ids: Vec::new(),
+                    owned_container_ids: Vec::new(),
+                }),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["paused"], true);
+        assert_eq!(body["pause_generation"], 1);
+        assert_eq!(body["drain_ack_accepted"], true);
+
+        gitforge_db::queries::RunnerQueries::set_paused(&pool, runner_id, false)
+            .await
+            .unwrap();
+        gitforge_db::queries::RunnerQueries::set_paused(&pool, runner_id, true)
+            .await
+            .unwrap();
+        let response = runner_heartbeat(
+            axum::extract::State(state),
+            axum::extract::Path(runner_id.to_string()),
+            Some(Json(RunnerHeartbeatRequest {
+                drain_ack: Some(RunnerDrainAckRequest {
+                    generation: 1,
+                    active_job_ids: Vec::new(),
+                    owned_container_ids: Vec::new(),
+                }),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["pause_generation"], 2);
+        assert_eq!(body["drain_ack_accepted"], false);
+        assert!(
+            gitforge_db::queries::RunnerQueries::drain_receipt(&pool, runner_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1227,6 +1477,7 @@ mod tests {
         let response = runner_heartbeat(
             axum::extract::State(state),
             axum::extract::Path(uuid::Uuid::new_v4().to_string()),
+            None,
         )
         .await;
         assert_status(response.into_response(), StatusCode::NOT_FOUND);
@@ -1240,6 +1491,7 @@ mod tests {
         let response = runner_heartbeat(
             axum::extract::State(state),
             axum::extract::Path("not-a-uuid".to_string()),
+            None,
         )
         .await;
 
@@ -1309,6 +1561,63 @@ mod tests {
 
         let resp = response.into_response();
         assert_status(resp, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_claim_job_requires_exact_assignment_lease() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let runner = Runner::new("claim-runner".to_string(), RunnerType::Docker, 1);
+        let runner_id = runner.id;
+        state.scheduler.register_runner(runner).await;
+        let job_id = JobId::new();
+        state
+            .scheduler
+            .enqueue(
+                job_id,
+                gitforge_common::PipelineRunId::new(),
+                gitforge_common::RepoId::new(),
+            )
+            .await
+            .unwrap();
+        state.scheduler.process_queue().await;
+        let lease = state.scheduler.ensure_job_lease(job_id).await.unwrap();
+
+        let missing = claim_job(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(LeaseRequest {
+                runner_id: runner_id.to_string(),
+                lease_token: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_status(missing, StatusCode::BAD_REQUEST);
+
+        let stale = claim_job(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(LeaseRequest {
+                runner_id: runner_id.to_string(),
+                lease_token: Some("stale-lease".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_status(stale, StatusCode::CONFLICT);
+
+        let valid = claim_job(
+            axum::extract::State(state),
+            axum::extract::Path(job_id.to_string()),
+            axum::Json(LeaseRequest {
+                runner_id: runner_id.to_string(),
+                lease_token: Some(lease),
+            }),
+        )
+        .await
+        .into_response();
+        assert_status(valid, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1936,6 +2245,24 @@ mod tests {
         assert_eq!(request.name, "test-runner");
         assert_eq!(request.runner_type, "docker");
         assert_eq!(request.capacity, 4);
+        assert!(request.capabilities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_runner_registration_is_rejected_before_runner_creation() {
+        let scheduler = crate::Scheduler::new();
+        let state = create_state(scheduler);
+        let request = RegisterRunnerRequest {
+            name: "legacy-runner".to_string(),
+            runner_type: "docker".to_string(),
+            capacity: 2,
+            storage_domain: "legacy-domain".to_string(),
+            capabilities: Vec::new(),
+        };
+
+        let response = register_runner(axum::extract::State(state), axum::Json(request)).await;
+
+        assert_status(response.into_response(), StatusCode::UPGRADE_REQUIRED);
     }
 
     #[test]
@@ -1947,8 +2274,12 @@ mod tests {
             pipeline_run_id: "run-456".to_string(),
             commands: vec!["cargo build".to_string()],
             image: "rust:latest".to_string(),
+            workspace_path: Some("/workspace/host/run-1".to_string()),
+            container_working_dir: Some("/workspace".to_string()),
+            step_working_directories: Vec::new(),
             working_dir: Some("/workspace".to_string()),
             timeout_secs: 300,
+            storage_sensitive: true,
             env: HashMap::from([("RUST_BACKTRACE".to_string(), "1".to_string())]),
             volumes: Vec::new(),
             fault: None,
@@ -1959,6 +2290,7 @@ mod tests {
         assert!(json.contains("job-123"));
         assert!(json.contains("build"));
         assert!(json.contains("RUST_BACKTRACE"));
+        assert!(json.contains("\"storage_sensitive\":true"));
     }
 
     #[test]
@@ -1984,6 +2316,8 @@ mod tests {
             name: "fire-runner".to_string(),
             runner_type: "firecracker".to_string(),
             capacity: 2,
+            storage_domain: "fire-domain".to_string(),
+            capabilities: vec![gitforge_common::HOST_STORAGE_LEASE_CAPABILITY.to_string()],
         };
 
         let response = register_runner(axum::extract::State(state), axum::Json(request)).await;
@@ -1999,6 +2333,59 @@ mod tests {
             registration_auth_token: None,
             artifact_storage: None,
         }
+    }
+
+    #[tokio::test]
+    async fn runner_can_defer_matching_unstarted_assignment() {
+        let scheduler = crate::Scheduler::new();
+        let runner = Runner::new("defer-runner".to_string(), RunnerType::Docker, 1);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                gitforge_common::PipelineRunId::new(),
+                gitforge_common::RepoId::new(),
+                vec!["/bin/true".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+        let low_pressure = crate::io_pressure::HostIoPressure::from_text(
+            "some avg10=1 avg60=1 avg300=1 total=1\nfull avg10=1 avg60=1 avg300=1 total=2\n",
+            25.0,
+        );
+        scheduler.process_queue_with_io_pressure(low_pressure).await;
+        let lease_token = scheduler.ensure_job_lease(job_id).await.unwrap();
+        let state = create_state(scheduler);
+        let app: Router = scheduler_routes_with_tokens(
+            state.clone(),
+            Some(Arc::from("runner-secret")),
+            Some(Arc::from("operator-secret")),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/jobs/{job_id}/defer"))
+                    .header("authorization", "Bearer runner-secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "runner_id": runner_id.to_string(),
+                            "lease_token": lease_token,
+                            "reason": "host_resource_admission_busy"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.scheduler.is_assigned(job_id).await.is_none());
+        assert_eq!(state.scheduler.queue_len().await, 1);
     }
 
     #[tokio::test]
@@ -2063,7 +2450,13 @@ mod tests {
 
         let payload = |name: &str| {
             axum::body::Body::from(
-                serde_json::json!({"name": name, "type": "docker", "capacity": 1}).to_string(),
+                serde_json::json!({
+                    "name": name,
+                    "type": "docker",
+                    "capacity": 1,
+                    "capabilities": [gitforge_common::HOST_STORAGE_LEASE_CAPABILITY],
+                })
+                .to_string(),
             )
         };
         let register = |app: Router, token: Option<&str>, name: &str| {
