@@ -427,6 +427,12 @@ async fn main() -> anyhow::Result<()> {
             if removed > 0 {
                 tracing::info!(removed, "startup workspace sweep complete");
             }
+            // Clean stale object caches for repositories that no longer exist.
+            // Scans _objects/<repo_id>/ for dirs whose repo_id is not in the
+            // active DB and removes them. Runs at startup and every 24h.
+            if let Err(e) = cleanup_stale_object_caches(&workspace_root()).await {
+                tracing::warn!(error = %e, "object cache cleanup deferred");
+            }
             // Artifact retention (Phase 5.2): delete artifacts older than
             // GITFORGE_ARTIFACT_RETENTION_DAYS (default 30). Read at the
             // edge, once; the core sweep takes the duration as a value.
@@ -2114,6 +2120,52 @@ async fn prepare_run_workspace(
 /// volume so a workspace clone is a same-filesystem local copy. The bare
 /// repository on the NAS spinner is only ever read incrementally (a fetch
 /// of the delta), never re-transferred wholesale per run.
+// TODO: add periodic cleanup of _objects dirs for deleted repos
+/// Clean up stale object cache directories for repos that no longer exist.
+/// Scans _objects/<repo_id>/ for dirs whose repo_id is not in the active DB.
+/// Returns the number of stale dirs removed.
+async fn cleanup_stale_object_caches(workspace_root: &std::path::Path) -> Result<usize> {
+    let objects_dir = workspace_root.join("_objects");
+    if !objects_dir.is_dir() {
+        return Ok(0);
+    }
+
+    // Build set of active repo IDs from the database
+    let pool = gitforge_db::Pool::new(&std::env::var("DATABASE_URL")?).await;
+    let mut active_repos = std::collections::HashSet::new();
+    if let Ok(rows) = pool.as_ref().and_then(|p| {
+        sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT repo_id FROM repositories WHERE repo_id IS NOT NULL",
+        )
+        .fetch_all(p.pool())
+    }) {
+        for row in rows {
+            active_repos.insert(row);
+        }
+    }
+
+    let mut removed = 0;
+    for entry in objects_dir.read_dir().into_iter().flatten() {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let repo_id = path.file_name().and_then(|n| n.to_str()).map(String::from);
+        if let Some(ref rid) = repo_id {
+            if !active_repos.contains(rid) {
+                if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+                    tracing::warn!(error = %e, repo_id = rid, "failed to remove stale object cache");
+                } else {
+                    removed += 1;
+                }
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
 fn object_cache_path(repo_id: gitforge_common::RepoId) -> std::path::PathBuf {
     workspace_root().join("_objects").join(repo_id.to_string())
 }
@@ -2275,6 +2327,10 @@ const DEFAULT_TRIGGER_CONCURRENCY: usize = 4;
 type EventLaneKey = (gitforge_common::RepoId, String);
 type LaneMap = HashMap<EventLaneKey, tokio::sync::mpsc::UnboundedSender<EventEnvelope>>;
 
+/// Maximum number of active event lanes. Lanes exceeding this limit are
+/// evicted on next access. This caps memory usage in high-churn scenarios.
+const MAX_EVENT_LANES: usize = 1000;
+
 fn event_lane_key(event: &EventEnvelope) -> EventLaneKey {
     match &event.payload {
         EventPayload::PushReceived(payload) => (payload.repo_id, payload.ref_name.clone()),
@@ -2393,11 +2449,23 @@ async fn run_event_consumer(
                         Some(event) => {
                             tracing::debug!("received event: {:?}", event.event_type);
                             let lane_sender = {
+                                let key = event_lane_key(&event);
+                                // Enforce MAX_EVENT_LANES cap: evict least-recently-used lanes
+                                // when the map exceeds the limit. Lanes are never actively
+                                // closed — evicted lanes' senders are dropped, closing the
+                                // channel and signaling consumers to drop events.
                                 let mut lanes = lanes
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if lanes.len() > MAX_EVENT_LANES {
+                                    // Remove the first (oldest) entry
+                                    let first_key = lanes.keys().next().cloned();
+                                    if let Some(k) = first_key {
+                                        lanes.remove(&k);
+                                    }
+                                }
                                 lanes
-                                    .entry(event_lane_key(&event))
+                                    .entry(key)
                                     .or_insert_with(|| {
                                         spawn_trigger_lane(
                                             scheduler.clone(),
@@ -3009,7 +3077,7 @@ async fn run_scheduler_event_consumer(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(_) => break,
         };
-        let (job_id, pipeline_run_id, runner_id, success) = match event {
+        let (job_id, pipeline_run_id, runner_id, success, outcome) = match event {
             SchedulerEvent::JobAssigned {
                 job_id,
                 runner_id,
@@ -3043,8 +3111,9 @@ async fn run_scheduler_event_consumer(
                 job_id,
                 pipeline_run_id,
                 runner_id,
+                outcome,
                 success,
-            } => (job_id, pipeline_run_id, runner_id, success),
+            } => (job_id, pipeline_run_id, runner_id, success, outcome),
             _ => continue,
         };
         // Reconciliation may replace a stale engine. Hold the read guard
@@ -3067,28 +3136,36 @@ async fn run_scheduler_event_consumer(
             tracing::error!(%job_id, %error, "failed to mark completed job running");
             continue;
         }
-        if success {
-            if let Err(error) = engine.succeed_job(job_id, 0).await {
-                tracing::error!(%job_id, %error, "failed to mark job succeeded");
-                continue;
+        match outcome {
+            gitforge_scheduler::assigner::JobOutcome::Succeeded => {
+                if let Err(error) = engine.succeed_job(job_id, 0).await {
+                    tracing::error!(%job_id, %error, "failed to mark job succeeded");
+                    continue;
+                }
+                // The job's receipt is the only source of the CI_CHANGE_* vars
+                // that `skip_if` conditions are evaluated against. Merging them
+                // has to happen before the downstream release: an unmerged
+                // receipt leaves the expression environment empty, every
+                // condition evaluates false, and the engine silently prunes
+                // every gated job.
+                merge_completed_job_env(&engine, scheduler_db.as_ref(), job_id).await;
+                if let Err(error) = engine.queue_ready_jobs().await {
+                    tracing::error!(%pipeline_run_id, %error, "failed to queue downstream jobs");
+                }
+                persist_skipped_job_rows(scheduler_db.as_ref(), &engine).await;
             }
-            // The job's receipt is the only source of the CI_CHANGE_* vars
-            // that `skip_if` conditions are evaluated against. Merging them
-            // has to happen before the downstream release: an unmerged
-            // receipt leaves the expression environment empty, every
-            // condition evaluates false, and the engine silently prunes
-            // every gated job.
-            merge_completed_job_env(&engine, scheduler_db.as_ref(), job_id).await;
-            if let Err(error) = engine.queue_ready_jobs().await {
-                tracing::error!(%pipeline_run_id, %error, "failed to queue downstream jobs");
+            gitforge_scheduler::assigner::JobOutcome::InfrastructureFailure => {
+                if let Err(error) = engine.fail_infrastructure_job(job_id, -1).await {
+                    tracing::error!(%job_id, %error, "failed to mark job infrastructure failure");
+                }
             }
-            persist_skipped_job_rows(scheduler_db.as_ref(), &engine).await;
-        } else {
-            if let Err(error) = engine
-                .fail_job(job_id, -1, "runner reported failure".to_string())
-                .await
-            {
-                tracing::error!(%job_id, %error, "failed to mark job failed");
+            _ => {
+                if let Err(error) = engine
+                    .fail_job(job_id, -1, "runner reported failure".to_string())
+                    .await
+                {
+                    tracing::error!(%job_id, %error, "failed to mark job failed");
+                }
             }
         }
 
@@ -3178,7 +3255,11 @@ async fn finalize_run_if_terminal(
     let root = workspace_root();
     let run_id = state.run_id;
     tokio::spawn(async move {
-        remove_run_workspace_dir(&root, run_id, workspace_path.as_deref()).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            remove_run_workspace_dir(&root, run_id, workspace_path.as_deref()),
+        )
+        .await;
     });
     pipeline_registry.write().await.remove(&state.run_id);
 }

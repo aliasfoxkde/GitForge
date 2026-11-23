@@ -190,7 +190,8 @@ pub struct JobDefinition {
     pub env: HashMap<String, String>,
     pub steps: Vec<StepDefinition>,
     pub timeout: Option<String>,
-    pub retry: Option<u32>,
+    /// Retry this job on failure. Deferred — currently unused. See GF-XXX.
+    #[serde(skip)]
     /// Skip this job entirely when the shell expression evaluates to false.
     /// The expression is evaluated in a bash subshell with access to CI-change
     /// variables written by the `detect-changes` job:
@@ -431,7 +432,6 @@ jobs:
       - name: step
         run: echo hi
     timeout: 45m
-    retry: 1
     skip_if: 'false'
     volumes: []
     cache:
@@ -551,7 +551,6 @@ jobs:
             env: HashMap::new(),
             steps: vec![],
             timeout: None,
-            retry: None,
             skip_if: None,
             volumes: Vec::new(),
             cache: None,
@@ -567,7 +566,6 @@ jobs:
             env: HashMap::new(),
             steps: vec![],
             timeout: None,
-            retry: None,
             skip_if: None,
             volumes: Vec::new(),
             cache: None,

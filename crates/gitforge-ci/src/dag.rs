@@ -18,6 +18,8 @@ pub struct JobNode {
 pub struct JobGraph {
     pub nodes: Vec<JobNode>,
     pub run_id: PipelineRunId,
+    /// Reverse adjacency index: JobId -> list of JobIds that depend on it
+    pub children: HashMap<JobId, Vec<JobId>>,
 }
 
 impl JobGraph {
@@ -185,13 +187,37 @@ impl DagBuilder {
             node.dependencies = dep_ids;
         }
 
-        let graph = JobGraph { nodes, run_id };
+        // Build reverse adjacency index (children map) for O(1) dependant lookups.
+        // Also populate children for each node during construction.
+        let mut children: HashMap<JobId, Vec<JobId>> = HashMap::new();
+        for node in &nodes {
+            for dep_id in &node.dependencies {
+                children.entry(*dep_id).or_default().push(node.id);
+            }
+        }
+
+        let graph = JobGraph {
+            nodes,
+            run_id,
+            children,
+        };
 
         // Validate no cycles
         if graph.has_cycle() {
             return Err(gitforge_common::Error::invalid_input(
                 "pipeline contains circular dependencies",
             ));
+        }
+
+        // Cap pipeline depth to prevent DoS from deeply-nested DAGs.
+        // A 1000-deep pipeline with fan-out would create millions of jobs.
+        const MAX_PIPELINE_DEPTH: usize = 100;
+        let depth = Self::max_depth(&graph);
+        if depth > MAX_PIPELINE_DEPTH {
+            return Err(gitforge_common::Error::invalid_input(format!(
+                "pipeline depth {} exceeds limit of {}",
+                depth, MAX_PIPELINE_DEPTH
+            )));
         }
 
         Ok(graph)
@@ -261,7 +287,6 @@ mod tests {
                 condition: None,
             }],
             timeout: None,
-            retry: None,
             skip_if: None,
             volumes: Vec::new(),
             cache: None,

@@ -6,7 +6,6 @@ pub mod agent;
 pub mod executor;
 pub mod fault;
 pub mod mount_lock;
-pub mod host_storage_lease;
 
 pub use agent::{RunnerAgent, RunnerConfig};
 pub use executor::JobExecutor;

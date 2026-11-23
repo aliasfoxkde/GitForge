@@ -284,6 +284,7 @@ pub enum SchedulerEvent {
         pipeline_run_id: PipelineRunId,
         runner_id: RunnerId,
         success: bool,
+        outcome: JobOutcome,
     },
 }
 
@@ -1455,6 +1456,7 @@ impl Scheduler {
                 pipeline_run_id,
                 runner_id,
                 success: false,
+                outcome: JobOutcome::Failed,
             });
         }
 
@@ -2569,6 +2571,7 @@ impl Scheduler {
                         pipeline_run_id,
                         runner_id,
                         success: false,
+                        outcome: JobOutcome::Failed,
                     });
                 }
             }
@@ -2733,6 +2736,7 @@ impl Scheduler {
                 pipeline_run_id,
                 runner_id,
                 success: outcome.success(),
+                outcome: outcome,
             });
         }
         Ok(())
@@ -3669,6 +3673,7 @@ mod tests {
                 pipeline_run_id: completed_run,
                 runner_id: completed_runner,
                 success: false,
+                outcome: JobOutcome::Failed,
             } if completed_job == job_id && completed_run == run.id && completed_runner == runner_id
         ));
 
@@ -3914,6 +3919,7 @@ mod tests {
                 pipeline_run_id: completed_run,
                 runner_id: completed_runner,
                 success: false,
+                outcome: JobOutcome::Failed,
             } if completed == job_id && completed_run == run_id && completed_runner == runner_id
         ));
     }

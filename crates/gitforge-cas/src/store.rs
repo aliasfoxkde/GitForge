@@ -100,7 +100,19 @@ impl CasStore {
 
     /// Store bytes; idempotent. Does NOT bump any refcount — call [`Self::ref`]
     /// (or [`CasStore::put_ref`]) to take a reference.
+    ///
+    /// Maximum blob size: 100 MiB. Rejects oversized inputs early to prevent
+    /// unbounded memory allocation in hash computation.
+    pub const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024;
+
     pub async fn put(&self, bytes: &[u8]) -> Result<BlobHash> {
+        if bytes.len() > Self::MAX_BLOB_BYTES {
+            return Err(Error::invalid_input(format!(
+                "blob too large: {} bytes, max {}",
+                bytes.len(),
+                Self::MAX_BLOB_BYTES
+            )));
+        }
         let hash = hash_bytes(bytes);
         let path = self.blob_path(&hash);
         if tokio::fs::try_exists(&path)
@@ -149,37 +161,6 @@ impl CasStore {
         Ok(hash)
     }
 
-    /// Fetch blob content by hash.
-    pub async fn get(&self, hash: &BlobHash) -> Result<Vec<u8>> {
-        let path = self.blob_path(hash);
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => Ok(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(Error::not_found("cas blob", hash))
-            }
-            Err(e) => Err(Error::with_source(ErrorKind::Storage, "CAS: read blob", e)),
-        }
-    }
-
-    /// Take one reference on a blob.
-    pub async fn r#ref(&self, hash: &BlobHash) -> Result<()> {
-        let h = hash.0.clone();
-        gitforge_db::queries::persist_with_retry(|| async {
-            // The blob row must exist: referencing an unknown hash is a bug.
-            let result = sqlx::query("UPDATE cas_refs SET refs = refs + 1 WHERE hash = ?1")
-                .bind(&h)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| Error::with_source(ErrorKind::Database, "CAS: ref", e))?;
-            if result.rows_affected() == 0 {
-                return Err(Error::not_found("cas blob", hash));
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    /// Store bytes AND take a reference in one call.
     pub async fn put_ref(&self, bytes: &[u8]) -> Result<BlobHash> {
         let hash = self.put(bytes).await?;
         self.r#ref(&hash).await?;
@@ -189,6 +170,27 @@ impl CasStore {
     /// Release one reference. When the count drops to zero the blob becomes
     /// a GC candidate and `now` (unix seconds) is recorded as its last-unref
     /// time. The caller passes the clock — the decision core never reads it.
+    /// Take a reference to a stored blob, incrementing its refcount.
+    /// Idempotent: multiple refs to the same hash each count.
+    pub async fn r#ref(&self, hash: &BlobHash) -> Result<()> {
+        let h = hash.0.clone();
+        gitforge_db::queries::persist_with_retry(|| async {
+            let result = sqlx::query(
+                "INSERT INTO cas_refs (hash, refs) VALUES (?1, 1)
+                 ON CONFLICT(hash) DO UPDATE SET refs = refs + 1",
+            )
+            .bind(&h)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::with_source(ErrorKind::Database, "CAS: ref", e))?;
+            if result.rows_affected() == 0 {
+                return Err(Error::not_found("cas blob", hash));
+            }
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn unref(&self, hash: &BlobHash, now_unix: i64) -> Result<()> {
         let h = hash.0.clone();
         let now_owned = now_unix;
