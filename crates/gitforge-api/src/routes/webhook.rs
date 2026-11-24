@@ -52,8 +52,6 @@ pub struct WebhookTriggerPayload {
 }
 
 /// Webhook trigger response
-#[derive(Debug, Serialize)]
-
 impl WebhookTriggerPayload {
     /// Validate the webhook payload. Returns an error string if the payload
     /// is malformed. Call this after deserialization.
@@ -75,6 +73,7 @@ impl WebhookTriggerPayload {
     }
 }
 
+#[derive(Debug, Serialize)]
 pub struct WebhookTriggerResponse {
     pub success: bool,
     pub message: String,
