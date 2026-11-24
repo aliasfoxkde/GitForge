@@ -2131,14 +2131,18 @@ async fn cleanup_stale_object_caches(workspace_root: &std::path::Path) -> anyhow
     }
 
     // Build set of active repo IDs from the database
-    let pool = gitforge_db::Pool::new(&std::env::var("DATABASE_URL")?).await;
+    let db_url = std::env::var("DATABASE_URL")?;
+    let pool = gitforge_db::Pool::new(&db_url).await?;
     let mut active_repos = std::collections::HashSet::new();
-    if let Ok(rows) = pool.as_ref().and_then(|p| {
-        sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT repo_id FROM repositories WHERE repo_id IS NOT NULL",
-        )
-        .fetch_all(p.pool())
-    }) {
+    let query = "SELECT DISTINCT repo_id FROM repositories WHERE repo_id IS NOT NULL";
+    let rows = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        sqlx::query_scalar::<_, String>(query).fetch_all(pool.pool()),
+    )
+    .await
+    .ok()
+    .flatten();
+    if let Some(rows) = rows {
         for row in rows {
             active_repos.insert(row);
         }
