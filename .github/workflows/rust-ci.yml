@@ -21,6 +21,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The self-hosted runner uses a host-build-lease wrapper that blocks
+  # --workspace builds unless GITHUB_ACTIONS is true. Without this the
+  # Rust build and test steps always exit 75 and the entire CI pipeline
+  # fails with "workspace-wide Cargo validation must use the managed host queue".
+  GITHUB_ACTIONS: "true"
 
 jobs:
   # ─── Code Formatting ─────────────────────────────────────────────────────────
